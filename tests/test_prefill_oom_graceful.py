@@ -414,7 +414,6 @@ def test_record_chunk_transient_skips_tail_samples():
 
     ns._record_chunk_transient(
         64,
-        0,
         32 * 1024**2,
         request_id="req-tail",
         loop_label="unit",
@@ -423,13 +422,67 @@ def test_record_chunk_transient_skips_tail_samples():
 
     ns._record_chunk_transient(
         256,
-        0,
         32 * 1024**2,
         request_id="req-full",
         loop_label="unit",
     )
     assert tracker.samples == 1
     assert tracker.last_delta_bytes == 32 * 1024**2
+
+
+def test_record_chunk_transient_skips_no_sample_chunks():
+    """A 0-byte observation (no new peak) must leave the tracker untouched."""
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    ns._record_chunk_transient(
+        256,
+        0,
+        request_id="req-nopeak",
+        loop_label="unit",
+    )
+    assert tracker.samples == 0
+    assert tracker.bytes_per_token == 0.0
+
+
+def test_measure_chunk_spike_is_peak_over_end_active():
+    """When the chunk sets a new high-water mark, the spike is the
+    come-and-went memory: peak minus end-of-chunk active."""
+    with (
+        patch.object(sched_mod.mx, "get_peak_memory", return_value=16 * _GB),
+        patch.object(sched_mod.mx, "get_active_memory", return_value=10 * _GB),
+    ):
+        assert sched_mod._measure_chunk_spike(12 * _GB) == 6 * _GB
+
+
+def test_measure_chunk_spike_no_new_peak_yields_no_sample():
+    """A chunk that stays under the prior high-water mark is unobservable
+    (its local peak cannot be read without resetting the global counter) —
+    it must yield 0 so the throttle falls back to the static estimate."""
+    with (
+        patch.object(sched_mod.mx, "get_peak_memory", return_value=20 * _GB),
+        patch.object(sched_mod.mx, "get_active_memory", return_value=10 * _GB),
+    ):
+        assert sched_mod._measure_chunk_spike(20 * _GB) == 0
+
+
+def test_measure_chunk_spike_ignores_resident_growth():
+    """Resident growth (warm-restore materialization, KV append) must NOT be
+    charged to the chunk (#1842 defect 1): it stays in active memory, so a
+    chunk whose allocations all stayed resident measures a zero spike even
+    though the footprint grew by gigabytes."""
+    with (
+        patch.object(sched_mod.mx, "get_peak_memory", return_value=18 * _GB),
+        patch.object(sched_mod.mx, "get_active_memory", return_value=18 * _GB),
+    ):
+        # Footprint grew 6GB (12 -> 18) but nothing came-and-went.
+        assert sched_mod._measure_chunk_spike(12 * _GB) == 0
 
 
 def test_step_prefill_reclaims_before_first_guard():
@@ -470,7 +523,10 @@ def test_step_prefill_reclaims_before_first_guard():
         ),
         patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
-        patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
+        # peak: 100 pre-chunk, 300 post-chunk (new high-water mark);
+        # end-of-chunk active 250 -> spike = 300 - 250 = 50.
+        patch.object(sched_mod.mx, "get_peak_memory", side_effect=[100, 300]),
+        patch.object(sched_mod.mx, "get_active_memory", return_value=250),
     ):
         done = ns._step_prefill_chunk(state)
 
@@ -478,8 +534,7 @@ def test_step_prefill_reclaims_before_first_guard():
     assert events[:3] == ["sync", "adaptive", "guard"]
     ns._record_chunk_transient.assert_called_once_with(
         2,
-        100,
-        300,
+        50,
         request_id="req-prefill",
         loop_label="chunked_step",
     )

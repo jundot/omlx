@@ -211,6 +211,33 @@ def _safe_sync_stream(stream=None):
             raise
 
 
+def _measure_chunk_spike(peak_pre: int) -> int:
+    """Come-and-went Metal memory for the prefill chunk that just ran.
+
+    ``peak_pre`` is ``mx.get_peak_memory()`` sampled immediately before the
+    chunk. When the chunk pushed the process high-water mark above it, the
+    spike is ``peak - end_of_chunk_active``: memory that was allocated during
+    the chunk and released again by the time its eval finished (SDPA/MoE
+    intermediates). Resident growth (this chunk's KV append, lazily
+    materialized warm-restore arrays) stays in ``mx.get_active_memory()`` and
+    is deliberately NOT charged to the chunk — it is already part of the
+    guard's ``current`` baseline at the next check, and the static estimate
+    in ``_predicted_chunk_transient`` covers the per-chunk KV term (#1842).
+
+    Returns 0 (no sample) when the chunk did not set a new high-water mark —
+    its local peak is then unobservable without resetting the global counter,
+    which would corrupt concurrent readers (the admin benchmark brackets
+    ``stream_generate`` with reset/get, see admin/benchmark.py). In the
+    regime where the throttle matters — memory climbing toward the cap —
+    successive chunks keep setting new highs, so samples flow exactly when
+    they are needed; otherwise callers fall back to the static estimate.
+    """
+    peak_post = mx.get_peak_memory()
+    if peak_post <= peak_pre:
+        return 0
+    return int(peak_post - mx.get_active_memory())
+
+
 def _env_int(name: str, default: int = 0) -> int:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -3075,7 +3102,7 @@ class Scheduler:
                 request_id=request.request_id,
             )
 
-            _throttle_pre = get_phys_footprint()
+            _peak_pre = mx.get_peak_memory()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -3105,11 +3132,9 @@ class Scheduler:
                     embeds_array = embeds_array[:, n_to_process:]
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
-            _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
-                _throttle_pre,
-                _throttle_post,
+                _measure_chunk_spike(_peak_pre),
                 request_id=request.request_id,
                 loop_label="external",
             )
@@ -3851,44 +3876,50 @@ class Scheduler:
     def _record_chunk_transient(
         self,
         n_tokens: int,
-        pre_bytes: int,
-        post_bytes: int,
+        transient_bytes: int,
         *,
         request_id: str,
         loop_label: str,
     ) -> None:
-        """Feed one chunk's measured transient into the EWMA tracker."""
-        delta = post_bytes - pre_bytes
+        """Feed one chunk's measured transient spike into the EWMA tracker.
+
+        ``transient_bytes`` is the come-and-went spike from
+        ``_measure_chunk_spike`` — NOT a resident-memory delta. A value of 0
+        means the chunk produced no observable sample (it did not set a new
+        process high-water mark); the tracker is left untouched so the
+        throttle falls back to its static estimate.
+        """
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
             logger.debug(
-                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                "[throttle:%s] measure rid=%s n=%d spike=%.2fMB "
                 "(skipped: tail < min_chunk=%d)",
                 loop_label,
                 request_id,
                 n_tokens,
-                delta / 1024**2,
+                transient_bytes / 1024**2,
                 min_chunk,
             )
             return
-        if delta <= 0:
+        if transient_bytes <= 0:
             logger.debug(
-                "[throttle:%s] measure rid=%s n=%d delta=%dB (skipped: <=0)",
+                "[throttle:%s] measure rid=%s n=%d spike=%dB "
+                "(skipped: no new peak)",
                 loop_label,
                 request_id,
                 n_tokens,
-                delta,
+                transient_bytes,
             )
             return
-        self._prefill_transient_tracker.update(n_tokens, delta)
+        self._prefill_transient_tracker.update(n_tokens, transient_bytes)
         logger.debug(
-            "[throttle:%s] measure rid=%s n=%d transient=%.2fMB "
+            "[throttle:%s] measure rid=%s n=%d spike=%.2fMB "
             "per_token=%.1fKB ewma=%.1fKB samples=%d",
             loop_label,
             request_id,
             n_tokens,
-            delta / 1024**2,
-            (delta / max(n_tokens, 1)) / 1024,
+            transient_bytes / 1024**2,
+            (transient_bytes / max(n_tokens, 1)) / 1024,
             self._prefill_transient_tracker.bytes_per_token / 1024,
             self._prefill_transient_tracker.samples,
         )
@@ -4067,7 +4098,7 @@ class Scheduler:
             request_id=state.request.request_id,
         )
 
-        _throttle_pre = get_phys_footprint()
+        _peak_pre = mx.get_peak_memory()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -4077,11 +4108,9 @@ class Scheduler:
             state.tokens_remaining = state.tokens_remaining[:, n:]
             self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
-        _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
             n,
-            _throttle_pre,
-            _throttle_post,
+            _measure_chunk_spike(_peak_pre),
             request_id=state.request.request_id,
             loop_label="chunked_step",
         )

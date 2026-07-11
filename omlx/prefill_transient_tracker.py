@@ -16,8 +16,10 @@ from __future__ import annotations
 class PrefillTransientTracker:
     """EWMA estimator of MLX prefill chunk transient bytes per token.
 
-    Updated post-chunk from `phys_footprint()` deltas. The first chunk
-    has no measurement yet — callers fall back to a static estimate
+    Updated post-chunk from the measured peak-over-end spike (memory that
+    was allocated during the chunk and released again by the end of its
+    eval — see scheduler._measure_chunk_spike). The first chunk has no
+    measurement yet — callers fall back to a static estimate
     (MemoryMonitor.estimate_prefill_peak_bytes) until samples > 0.
     """
 
@@ -34,9 +36,9 @@ class PrefillTransientTracker:
     def update(self, n_tokens: int, transient_bytes: int) -> None:
         """Record one chunk observation.
 
-        Negative deltas (MLX cache pool reclaim larger than this chunk's
-        allocation) are skipped — they would bias the EWMA toward zero
-        and underestimate the next chunk's footprint.
+        Non-positive observations (the chunk produced no measurable spike)
+        are skipped — they would bias the EWMA toward zero and
+        underestimate the next chunk's footprint.
         """
         if n_tokens <= 0:
             return
