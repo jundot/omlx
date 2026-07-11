@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from omlx.settings import (
+    Aria2Settings,
     BURST_DECODE_MODES,
     DEFAULT_BURST_DECODE_MODE,
     AuthSettings,
@@ -35,6 +36,35 @@ from omlx.settings import (
     reset_settings,
     resolve_default_base_path,
 )
+
+
+class TestAria2Settings:
+    def test_defaults(self):
+        settings = Aria2Settings()
+        assert settings.proxy == ""
+        assert settings.connections_per_file == 8
+        assert settings.concurrent_files == 4
+
+    def test_round_trip(self):
+        settings = Aria2Settings.from_dict(
+            {
+                "proxy": "http://127.0.0.1:7897",
+                "connections_per_file": 12,
+                "concurrent_files": 3,
+            }
+        )
+        assert settings.to_dict() == {
+            "proxy": "http://127.0.0.1:7897",
+            "connections_per_file": 12,
+            "concurrent_files": 3,
+        }
+
+    def test_file_values_are_clamped_to_safe_range(self):
+        settings = Aria2Settings.from_dict(
+            {"connections_per_file": 0, "concurrent_files": 99}
+        )
+        assert settings.connections_per_file == 1
+        assert settings.concurrent_files == 16
 
 
 class TestServerSettings:

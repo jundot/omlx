@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omlx.admin.aria2_downloader import Aria2File
 from omlx.admin.hf_downloader import DownloadStatus, DownloadTask
 from omlx.admin.ms_downloader import (
     MSDownloader,
@@ -21,7 +22,12 @@ from omlx.admin.ms_downloader import (
     _fetch_model_detail_size,
     _get_ms_endpoint,
     _parse_ms_model_entry,
+    _to_aria2_files,
 )
+
+
+async def _slow_aria2(*args, **kwargs) -> None:
+    await asyncio.sleep(10)
 
 
 # =============================================================================
@@ -71,6 +77,72 @@ class TestExtractModelSizeFromFiles:
     def test_with_missing_size(self):
         files = [{"name": "file.bin"}, {"Size": 100}]
         assert _extract_model_size_from_files(files) == 100
+
+
+def test_to_aria2_files_uses_mirror_and_token() -> None:
+    files = _to_aria2_files(
+        "owner/model",
+        [
+            {"Path": "config.json", "Size": 10},
+            {"Path": "weights/model.safetensors", "Size": 100},
+            {"Path": "weights", "Type": "tree"},
+        ],
+        endpoint="https://ms-mirror.example",
+        token="secret",
+    )
+
+    assert [item.relative_path for item in files] == [
+        "config.json",
+        "weights/model.safetensors",
+    ]
+    assert files[1].url == (
+        "https://ms-mirror.example/api/v1/models/owner/model/repo"
+        "?Revision=master&FilePath=weights%2Fmodel.safetensors"
+    )
+    assert files[1].headers == ("Authorization: Bearer secret",)
+    assert sum(item.size for item in files) == 110
+
+
+@pytest.mark.asyncio
+async def test_ms_download_delegates_payload_to_aria2_and_bypasses_proxy_for_mirror(
+    tmp_path: Path,
+) -> None:
+    downloader = MSDownloader(model_dir=str(tmp_path))
+    api = MagicMock()
+    api.get_model_files.return_value = [
+        {"Path": "model.safetensors", "Size": 100}
+    ]
+    runner = MagicMock()
+    runner.download = AsyncMock()
+
+    with patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True), patch(
+        "omlx.admin.ms_downloader._get_ms_api", return_value=api
+    ), patch(
+        "omlx.admin.ms_downloader._get_ms_endpoint",
+        return_value="https://ms-mirror.example",
+    ), patch(
+        "omlx.admin.ms_downloader.configured_aria2_runner", return_value=runner
+    ):
+        task = await downloader.start_download("owner/model", "secret")
+        active = downloader._active_tasks[task.task_id]
+        await active
+
+    runner.download.assert_awaited_once()
+    files, target = runner.download.await_args.args
+    assert files == [
+        Aria2File(
+            url=(
+                "https://ms-mirror.example/api/v1/models/owner/model/repo"
+                "?Revision=master&FilePath=model.safetensors"
+            ),
+            relative_path="model.safetensors",
+            size=100,
+            headers=("Authorization: Bearer secret",),
+        )
+    ]
+    assert target == tmp_path / "owner/model"
+    assert runner.download.await_args.kwargs == {"bypass_proxies": True}
+    assert task.status == DownloadStatus.COMPLETED
 
     def test_with_non_numeric_size(self):
         files = [{"Size": "not_a_number"}, {"Size": 100}]
@@ -139,7 +211,7 @@ class TestMSDownloader:
         ), patch(
             "omlx.admin.ms_downloader._get_ms_api"
         ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download"
+            "omlx.admin.ms_downloader.Aria2Runner.download"
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
@@ -175,7 +247,7 @@ class TestMSDownloader:
         ), patch(
             "omlx.admin.ms_downloader._get_ms_api"
         ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download"
+            "omlx.admin.ms_downloader.Aria2Runner.download"
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
@@ -199,8 +271,8 @@ class TestMSDownloader:
         ), patch(
             "omlx.admin.ms_downloader._get_ms_api"
         ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download",
-            side_effect=lambda **kwargs: asyncio.sleep(10),
+            "omlx.admin.ms_downloader.Aria2Runner.download",
+            side_effect=_slow_aria2,
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
@@ -215,7 +287,7 @@ class TestMSDownloader:
 
     @pytest.mark.asyncio
     async def test_download_uses_owner_model_layout(self, model_dir):
-        """ms_snapshot_download must receive local_dir under the org subfolder."""
+        """aria2 must receive a target directory under the org subfolder."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = MSDownloader(model_dir=str(model_dir))
 
@@ -224,7 +296,7 @@ class TestMSDownloader:
         ), patch(
             "omlx.admin.ms_downloader._get_ms_api"
         ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download"
+            "omlx.admin.ms_downloader.Aria2Runner.download"
         ) as mock_download:
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
@@ -233,9 +305,8 @@ class TestMSDownloader:
             await downloader.start_download("qwen/Qwen2.5-7B-Instruct-MLX")
             await asyncio.sleep(0.5)
 
-            assert mock_download.called
-            call_kwargs = mock_download.call_args[1]
-            assert call_kwargs["local_dir"] == str(
+            assert mock_download.await_count == 1
+            assert mock_download.await_args.args[1] == (
                 model_dir / "qwen" / "Qwen2.5-7B-Instruct-MLX"
             )
 
@@ -250,8 +321,8 @@ class TestMSDownloader:
         ), patch(
             "omlx.admin.ms_downloader._get_ms_api"
         ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            "omlx.admin.ms_downloader.Aria2Runner.download",
+            side_effect=_slow_aria2,
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
@@ -326,7 +397,7 @@ class TestMSDownloader:
         ), patch(
             "omlx.admin.ms_downloader._get_ms_api"
         ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download"
+            "omlx.admin.ms_downloader.Aria2Runner.download"
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []

@@ -52,6 +52,11 @@
     "modelscope": {
         "endpoint": ""
     },
+    "aria2": {
+        "proxy": "http://127.0.0.1:7897",
+        "connections_per_file": 8,
+        "concurrent_files": 4
+    },
     "network": {
         "http_proxy": "",
         "https_proxy": "",
