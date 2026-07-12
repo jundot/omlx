@@ -86,11 +86,25 @@ cd omlx
 pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 
-# Optional: GLM-5.2 / MiniMax M3 native custom kernels
+# GLM-5.2 / MiniMax M3 / Qwen3.5 native custom kernels (strongly recommended
+# if you serve those families -- see note below)
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Requires macOS 15.0+ (Sequoia), Python 3.10+, and Apple Silicon (M1/M2/M3/M4).
+
+> **Note on native custom kernels:** a plain `pip install -e .` does NOT build
+> them, and the affected model families then silently fall back to much slower
+> generic paths -- for GLM-5.2 the fused DSA prefill is roughly 30x faster with
+> the kernels (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also
+> uses more memory (#2137). Building them requires the Metal toolchain, which
+> Command Line Tools alone do not provide (`xcrun: error: unable to find utility
+> "metal"`): install full Xcode, or use the official DMG/Homebrew builds which
+> ship the kernels precompiled. To verify your install:
+>
+> ```bash
+> python -c "from omlx.patches.glm_moe_dsa.kernels import fast; print(fast.native_available())"
+> ```
 
 ## Quickstart
 
