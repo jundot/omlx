@@ -643,13 +643,13 @@ def _patch_text_model(q35: Any) -> None:
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
             raise ValueError(
-                "Native MTP is enabled for this model but the converted "
+                "Lightning MTP is enabled for this model but the converted "
                 "weights are missing the mtp.* tensors. Default mlx-lm "
                 "converters strip them; you need a converter that preserves "
                 "MTP weights (or a Qwen3.6 / DeepSeek-V4 checkpoint that "
                 "already preserves them). To recover without re-converting, "
                 "open the model's settings in the oMLX admin UI and toggle "
-                "'Native MTP' off, then retry."
+                "'Lightning MTP' off, then retry."
             )
 
         if self.args.tie_word_embeddings:

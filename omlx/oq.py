@@ -3957,7 +3957,7 @@ def quantize_oq_streaming(
             faster prefill on M1/M2 Apple Silicon (native fp16 support), but
             is unsupported for DeepSeek V4.
         preserve_mtp: Keep mtp.* tensors and config fields in the output so
-            the Native MTP toggle works after quantization. Stashes mtp.*
+            the Lightning MTP toggle works after quantization. Stashes mtp.*
             keys around the model.sanitize() call (which would otherwise
             strip them) and re-merges. When False (default), mtp.* tensors
             are stripped *and* the output config's mtp_num_hidden_layers /

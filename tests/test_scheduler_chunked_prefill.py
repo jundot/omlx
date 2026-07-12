@@ -15,9 +15,11 @@ from unittest.mock import MagicMock, patch
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
+    PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
     _PrefillAbortedError,
+    _PrefillEvictionNeeded,
     _PrefillState,
 )
 
@@ -1076,3 +1078,70 @@ class TestPrefillRejectionReleasesPagedCache:
         assert rejected[0].request_id == "oom-preflight"
         assert rejected[0].finish_reason == "error"
         sched.block_aware_cache.release_cache.assert_called_once_with("oom-preflight")
+
+
+# ---------------------------------------------------------------------------
+# First-chunk eviction pause must preserve a reconstructed prefix (#2180)
+# ---------------------------------------------------------------------------
+
+
+class TestFirstChunkEvictionPreservesPrefix:
+    def test_first_chunk_eviction_pause_keeps_reconstructed_prefix(self):
+        """_PrefillEvictionNeeded raised before the first chunk's forward
+        pass must not discard a reconstructed SSD prefix. The eviction pause
+        keeps prompt_cache / block_table / cached_tokens / remaining_tokens
+        attached, so when no idle model can be evicted the retry prefills
+        only the uncached suffix instead of recomputing the whole prompt
+        cold (#2180)."""
+        sched = _make_scheduler(step_size=4)
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.fetch_cache.return_value = (None, list(range(100)))
+        req = _make_request("evict-first-chunk", n_tokens=100)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        # Simulate the state _prepare_prefix_cache_for_request leaves after a
+        # successful paged/SSD cache hit + reconstruction: 90 cached tokens,
+        # a 10-token uncached suffix, and a live block table.
+        prompt_cache = [MagicMock()]
+        block_table = MagicMock()
+        sched._prefix_cache_prepared.add(req.request_id)
+        req.prompt_cache = prompt_cache
+        req.cached_tokens = 90
+        req.remaining_tokens = req.prompt_token_ids[90:]
+        req.block_table = block_table
+        req.shared_prefix_blocks = 3
+
+        eviction = PrefillEvictionRequest(
+            request_id=req.request_id,
+            model_id="test",
+            current_bytes=1,
+            target_cap_bytes=1,
+            predicted_transient_bytes=1,
+            requested_tokens=4,
+            reason="adaptive_prefill_throttle",
+        )
+        with patch.object(
+            sched,
+            "_begin_prefill",
+            return_value=_make_prefill_state(sched, req),
+        ):
+            with patch.object(
+                sched,
+                "_step_prefill_chunk",
+                side_effect=_PrefillEvictionNeeded(eviction),
+            ):
+                scheduled, rejected = sched._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        # Paused back into the waiting queue with the eviction request pending.
+        assert req in sched.waiting
+        assert sched._pending_prefill_eviction_request is eviction
+        # The reconstructed prefix must survive the pause untouched.
+        assert req.prompt_cache is prompt_cache
+        assert req.cached_tokens == 90
+        assert req.remaining_tokens == req.prompt_token_ids[90:]
+        assert req.block_table is block_table
+        assert req.shared_prefix_blocks == 3
+        sched.block_aware_cache.release_cache.assert_not_called()

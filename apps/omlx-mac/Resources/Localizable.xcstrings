@@ -6959,19 +6959,19 @@
       }
     },
     "profile.detail.acceleration.mtp" : {
-      "comment" : "Acceleration chip: native multi-token prediction",
+      "comment" : "Acceleration chip: built-in MTP head multi-token prediction",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Native MTP"
+            "value" : "Lightning MTP"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Native MTP"
+            "value" : "Lightning MTP"
           }
         }
       }
@@ -12119,6 +12119,60 @@
         }
       }
     },
+    "settings.acceleration.mtp.label" : {
+      "comment" : "Row label for the Lightning MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtp.sub" : {
+      "comment" : "Default sublabel for the Lightning MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models."
+          }
+        }
+      }
+    },
+    "settings.acceleration.section" : {
+      "comment" : "Section header above the Acceleration settings group",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Acceleration"
+          }
+        }
+      }
+    },
+    "settings.acceleration.subtitle" : {
+      "comment" : "Subtitle for the Acceleration settings section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decoding speedups for models that support them."
+          }
+        }
+      }
+    },
     "settings.advanced.chat_template.add_custom" : {
       "comment" : "Menu item for adding a custom (free-form key/value) chat-template kwarg",
       "extractionState" : "manual",
@@ -13919,42 +13973,6 @@
         }
       }
     },
-    "settings.experimental.mtp.label" : {
-      "comment" : "Row label for the Native MTP toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Native MTP"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Native MTP"
-          }
-        }
-      }
-    },
-    "settings.experimental.mtp.sub" : {
-      "comment" : "Default sublabel for the Native MTP toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Multi-token prediction. Speeds generation when the model supports it."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Multi-token prediction. Ускоряет генерацию, если модель поддерживает эту функцию."
-          }
-        }
-      }
-    },
     "settings.experimental.specprefill.draft.label" : {
       "comment" : "Row label for the SpecPrefill draft-model picker",
       "extractionState" : "manual",
@@ -14424,19 +14442,19 @@
       }
     },
     "settings.mtp.conflict.vlm_mtp" : {
-      "comment" : "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on",
+      "comment" : "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Disable VLM MTP before enabling Native MTP."
+            "value" : "Disable VLM MTP before enabling Lightning MTP."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Отключите VLM MTP перед включением Native MTP."
+            "value" : "Отключите VLM MTP перед включением Lightning MTP."
           }
         }
       }
@@ -15144,19 +15162,19 @@
       }
     },
     "settings.vlm_mtp.conflict.mtp" : {
-      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on",
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because Lightning MTP is on",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Disable Native MTP before enabling VLM MTP."
+            "value" : "Disable Lightning MTP before enabling VLM MTP."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Отключите Native MTP перед включением VLM MTP."
+            "value" : "Отключите Lightning MTP перед включением VLM MTP."
           }
         }
       }

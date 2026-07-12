@@ -901,8 +901,8 @@ struct ProfileDetailCard: View {
             }
             if let on = s["mtp_enabled"].flatMap({ boolOf($0) }) {
                 flagChip(label: String(localized: "profile.detail.acceleration.mtp",
-                                       defaultValue: "Native MTP",
-                                       comment: "Acceleration chip: native multi-token prediction"),
+                                       defaultValue: "Lightning MTP",
+                                       comment: "Acceleration chip: built-in MTP head multi-token prediction"),
                          on: on)
             }
             if let on = s["vlm_mtp_enabled"].flatMap({ boolOf($0) }) {

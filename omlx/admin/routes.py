@@ -643,7 +643,7 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
-            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*)"
+            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa)"
         )
     if not _model_has_mtp_weight_tensors(Path(model_path)):
         return False, (
@@ -2412,7 +2412,8 @@ async def update_model_settings(
                     detail=(
                         f"Model is not MTP-compatible (model_type={model_type!r}, "
                         f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Native MTP requires Qwen3.5/3.6 or DeepSeek-V4 with MTP heads."
+                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4 or "
+                        "GLM-5.2 checkpoint with MTP heads."
                     ),
                 )
             if not _model_has_mtp_weight_tensors(Path(entry.model_path)):

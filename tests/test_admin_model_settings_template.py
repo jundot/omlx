@@ -14,7 +14,7 @@ def _section(html: str, start_marker: str, end_marker: str) -> str:
     return html.split(start_marker, 1)[1].split(end_marker, 1)[0]
 
 
-def test_native_mtp_and_turboquant_are_not_ui_mutexed():
+def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     html = _model_settings_template()
 
     turboquant = _section(
@@ -22,14 +22,14 @@ def test_native_mtp_and_turboquant_are_not_ui_mutexed():
         "<!-- TurboQuant KV Cache -->",
         "<!-- IndexCache (DSA models only) -->",
     )
-    native_mtp = _section(
+    lightning_mtp = _section(
         html,
-        "<!-- Native MTP (mlx-lm PR 990 + PR 15 monkey-patch) -->",
-        "<!-- VLM MTP",
+        "<!-- Lightning MTP (built-in MTP head speculative decoding) -->",
+        "<!-- Experimental Features -->",
     )
 
     assert "modelSettings.mtp_enabled" not in turboquant
-    assert "modelSettings.turboquant_kv_enabled" not in native_mtp
+    assert "modelSettings.turboquant_kv_enabled" not in lightning_mtp
 
 
 def test_vlm_mtp_still_conflicts_with_turboquant():

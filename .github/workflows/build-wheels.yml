@@ -1,0 +1,97 @@
+name: Build wheels
+
+# Builds pip wheels WITH the native custom kernels precompiled, so pip users
+# get the accelerated GLM-5.2 / MiniMax M3 / Qwen3.5 paths without needing
+# the Metal toolchain locally (source installs without it silently fall back
+# to much slower generic kernels; see #2137 / #2208).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheels:
+    # macos-15: the native kernels target MACOSX_DEPLOYMENT_TARGET=15.0, so
+    # the post-build import smoke test needs a Sequoia host.
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Build wheel with native custom kernels
+        env:
+          OMLX_WITH_CUSTOM_KERNEL: "1"
+        # --no-isolation with preinstalled build deps: CMake's Python discovery
+        # does not reliably resolve pip's isolated build env on the hosted
+        # runners (it found the system framework Python without nanobind), so
+        # we build against the job's Python and pin it for CMake explicitly.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==2.13.0" "mlx==0.32.0"
+          export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
+          python -m build --wheel --no-isolation
+
+      - name: Smoke-test wheel (native kernels must import and report available)
+        run: |
+          echo "--- native artifacts in the wheel:"
+          unzip -l dist/*.whl | grep -E "_ext|dylib|metallib" || { echo "no native artifacts in wheel"; exit 1; }
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/pip install --quiet dist/*.whl
+          # run from outside the checkout so `import omlx` resolves to the
+          # installed wheel, not the source tree in cwd
+          cd /tmp
+          /tmp/wheel-smoke/bin/python - <<'PY'
+          import importlib
+          failed = []
+          for pkg in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+              fast = importlib.import_module(f"omlx.custom_kernels.{pkg}.fast")
+              ok = bool(fast.is_native_available())
+              print(f"{pkg}: native_available={ok} import_error={fast.import_error()}")
+              if not ok:
+                  failed.append(pkg)
+          raise SystemExit(f"native kernels missing from wheel: {failed}" if failed else 0)
+          PY
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  attach-to-release:
+    if: github.event_name == 'release'
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach wheels to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" dist/*.whl \
+            --repo "${{ github.repository }}" --clobber

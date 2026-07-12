@@ -72,6 +72,24 @@ def register_tiled_prefill_head_dim(
     _SDPA_TILED_MIN_KV_LEN = int(min_kv_len)
 
 
+def estimate_unfused_sdpa_call_bytes(
+    n_q_heads: int,
+    query_tokens: int,
+    kv_len: int,
+    head_dim: int,
+    score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
+) -> int:
+    """Transient bytes for ONE SDPA call taking the unfused fallback: the
+    materialized ``[n_q, query_tokens, kv_len]`` score matrix plus the fp32
+    output. Shared by the per-request prefill-peak estimate
+    (``MemoryMonitor._estimate_sdpa_activation_bytes``) and the sdpa256 route
+    gate (``patches/sdpa256_attention._tiled_route_required``) so the guard
+    and the router price the unfused path with the same math (issue #2204)."""
+    scores = n_q_heads * query_tokens * kv_len * score_dtype_size
+    output = n_q_heads * query_tokens * head_dim * 4
+    return int(scores + output)
+
+
 @dataclass
 class MemoryInfo:
     """
@@ -533,8 +551,9 @@ class MemoryMonitor:
             tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
             return output + tile_scores
 
-        scores = n_q * query_tokens * kv_len * self._score_dtype_size
-        return scores + output
+        return estimate_unfused_sdpa_call_bytes(
+            n_q, query_tokens, kv_len, hd, self._score_dtype_size
+        )
 
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0

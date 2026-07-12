@@ -246,6 +246,16 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         else:
             self.offset = -left_padding[0]
         self._right_padding = None
+        # Written physical column count (B>1 only; B=1 uses the parent's int
+        # offset). Rows are end-aligned, but this must NOT be derived from
+        # offset.max(): once filter() removes the last zero-left-padding row,
+        # every logical offset is short of the written end, and an
+        # offset-derived position writes INSIDE the survivors' live KV. It
+        # also must not be derived from _state_length(self.keys): that is the
+        # step-allocated capacity, not the written end. (Deliberately not
+        # named `_idx` — mlx-vlm's rollback_speculative_cache changes
+        # behavior on that attribute.)
+        self._phys_end = 0
 
     # ---- update_and_fetch override for B>1 only ----------------------------
 
@@ -255,13 +265,14 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return super().update_and_fetch(keys, values)
         # B>1: track per-request offset separately from state offset
         T_new = keys.shape[2]
-        # Use int offset for state management
-        int_offset = self.offset.max().item()
+        # Append at the written physical end (see __init__._phys_end note).
+        int_offset = self._phys_end
         self.offset += T_new
         saved_offset = self.offset
         self.offset = int_offset
         result = super().update_and_fetch(keys, values)
         self.offset = saved_offset
+        self._phys_end = int_offset + T_new
         return result
 
     # ---- state override for B>1 (offset is mx.array) -----------------------
@@ -270,15 +281,22 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     def state(self):
         if isinstance(self.offset, int):
             return super().state
-        # B>1: use keys length directly (offset is mx.array, can't compare with int)
+        # B>1: slice to the written end — _state_length(self.keys) is the
+        # step-allocated capacity and would expose unwritten columns to
+        # attention after the buffer grows.
         if self.keys is None:
             return None, None
-        length = _state_length(self.keys)
+        length = self._phys_end
         return _slice_state(self.keys, length), _slice_state(self.values, length)
 
     @state.setter
     def state(self, value):
         TurboQuantKVCache.state.fset(self, value)
+        # The parent fset resets to int-offset (B=1) bookkeeping, where the
+        # parent's offset is the write cursor (and trim() may move it back).
+        # Drop any stale batch-mode value so _ensure_array_offset re-derives
+        # _phys_end from that cursor at the B>1 switch.
+        self._phys_end = 0
 
     # ---- make_mask override (batch-aware) ----------------------------------
 
@@ -291,14 +309,22 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         offset = self.offset
         if isinstance(offset, int):
             return create_attention_mask(N, offset, return_array, window_size)
-        if isinstance(offset, mx.array) and offset.size == 1:
+        if (
+            isinstance(offset, mx.array)
+            and offset.size == 1
+            and int(self.left_padding.max().item()) == 0
+        ):
             return create_attention_mask(N, offset.item(), return_array, window_size)
-        # B>1: delegate to mlx-lm's create_causal_mask with the physical column
-        # count + per-request left_padding, exactly like BatchKVCache. The old
-        # hand-rolled term compared each request's sequence length (offset)
-        # against the column index, which masked out valid left-padded tokens —
-        # so left-padded requests attended to ~nothing and decoded garbage.
-        phys = offset.max().item()
+        # B>1 (or a left-padded survivor after filter()): delegate to mlx-lm's
+        # create_causal_mask with the physical column count + per-request
+        # left_padding, exactly like BatchKVCache. The old hand-rolled term
+        # compared each request's sequence length (offset) against the column
+        # index, which masked out valid left-padded tokens — so left-padded
+        # requests attended to ~nothing and decoded garbage. The column count
+        # is the WRITTEN end, not offset.max(): after the zero-left-padding
+        # row departs, offset.max() undercounts and blinds the survivors to
+        # their own tail context.
+        phys = self._phys_end
         return create_causal_mask(
             N, offset=phys, window_size=window_size, left_padding=self.left_padding
         )
@@ -309,6 +335,12 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     def _ensure_array_offset(self):
         if isinstance(self.offset, int):
+            # B=1 tracks written columns in the parent's int offset (plus any
+            # left padding); sync the physical end before switching to
+            # per-request array offsets, where the parent no longer maintains
+            # it.
+            lp0 = int(self.left_padding[0].item()) if self.left_padding is not None else 0
+            self._phys_end = max(self._phys_end, self.offset + lp0)
             self.offset = mx.array([self.offset])
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
@@ -363,9 +395,12 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._ensure_array_offset()
         other._ensure_array_offset()
         max_off = max(self.offset.max().item(), other.offset.max().item())
-        # Use the underlying int offset (total tokens) for state operations
-        s_idx = _state_length(self.keys) if self.keys is not None else 0
-        o_idx = _state_length(other.keys) if other.keys is not None else 0
+        # Align on the WRITTEN ends: _state_length is step-allocated capacity,
+        # and padding a joining row by capacity difference would bury its
+        # content behind unwritten columns. _pad_and_trim also slices each
+        # side down to its written end, normalizing any over-allocation.
+        s_idx = self._phys_end if self.keys is not None else 0
+        o_idx = other._phys_end if other.keys is not None else 0
         max_idx = max(s_idx, o_idx)
         ref_keys = self.keys if self.keys is not None else other.keys
         ref_values = self.values if self.values is not None else other.values
@@ -400,8 +435,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
         self.offset = mx.concatenate([s_off, o_off])
         self.left_padding = mx.concatenate([s_lp, o_lp])
-        # Parent's offset is used for state length — set to max
-        # (state property uses self.offset for slicing)
+        self._phys_end = max_idx
         self._cached_state = None
         self._cached_state_offset = -1
 
@@ -506,4 +540,5 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             mx.eval(batch.keys, batch.values)
 
         batch.offset += max_length
+        batch._phys_end = max_length
         return batch

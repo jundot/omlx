@@ -806,6 +806,16 @@ private struct AdvancedTab: View {
 
         if !vm.isDiffusionModel {
             SectionHeader(
+                String(localized: "settings.acceleration.section",
+                       defaultValue: "Acceleration",
+                       comment: "Section header above the Acceleration settings group"),
+                subtitle: String(localized: "settings.acceleration.subtitle",
+                                 defaultValue: "Decoding speedups for models that support them.",
+                                 comment: "Subtitle for the Acceleration settings section")
+            )
+            AccelerationSection(vm: vm, client: client)
+
+            SectionHeader(
                 String(localized: "settings.advanced.experimental.section",
                        defaultValue: "Experimental",
                        comment: "Section header above the Experimental settings group"),
@@ -1010,6 +1020,49 @@ private struct EntryEditor: View {
         .help(String(localized: "settings.advanced.chat_template.force.help",
                      defaultValue: "Add this key to forced_ct_kwargs so the request body can't override it.",
                      comment: "Tooltip explaining the Force checkbox"))
+    }
+}
+
+// MARK: - Acceleration section
+
+private struct AccelerationSection: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+
+    var body: some View {
+        // Profile-eligible like the experimental fields below — edits
+        // write to the working profile via bindProfile.
+        ListGroup {
+            // Lightning MTP
+            Row(label: String(localized: "settings.acceleration.mtp.label",
+                              defaultValue: "Lightning MTP",
+                              comment: "Row label for the Lightning MTP toggle"),
+                sublabel: mtpSublabel,
+                isLast: true) {
+                Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
+                    .labelsHidden().toggleStyle(.switch)
+                    .disabled(mtpToggleDisabled)
+                    .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
+            }
+        }
+    }
+
+    private var mtpToggleDisabled: Bool {
+        let compatible = vm.model?.mtpCompatible ?? true
+        if !compatible && !vm.mtpEnabled { return true }
+        if vm.mtpConflictReason != nil { return true }
+        return false
+    }
+
+    private var mtpSublabel: String {
+        if let reason = vm.mtpConflictReason { return reason }
+        if let reason = vm.model?.mtpCompatibilityReason,
+           !(vm.model?.mtpCompatible ?? true) {
+            return reason
+        }
+        return String(localized: "settings.acceleration.mtp.sub",
+                      defaultValue: "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models.",
+                      comment: "Default sublabel for the Lightning MTP toggle")
     }
 }
 
@@ -1256,17 +1309,6 @@ private struct ExperimentalSection: View {
                 }
             }
 
-            // Native MTP
-            Row(label: String(localized: "settings.experimental.mtp.label",
-                              defaultValue: "Native MTP",
-                              comment: "Row label for the Native MTP toggle"),
-                sublabel: mtpSublabel) {
-                Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
-                    .labelsHidden().toggleStyle(.switch)
-                    .disabled(mtpToggleDisabled)
-                    .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
-            }
-
             // VLM MTP — last row of the experimental group. Reveals the
             // draft-model picker and block-size field when enabled.
             Row(label: String(localized: "settings.experimental.vlm_mtp.label",
@@ -1363,24 +1405,6 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.dflash.ssd_cache.sub",
                       defaultValue: "L2 spill of evicted L1 entries to disk.",
                       comment: "Default sublabel for the DFlash SSD cache toggle")
-    }
-
-    private var mtpToggleDisabled: Bool {
-        let compatible = vm.model?.mtpCompatible ?? true
-        if !compatible && !vm.mtpEnabled { return true }
-        if vm.mtpConflictReason != nil { return true }
-        return false
-    }
-
-    private var mtpSublabel: String {
-        if let reason = vm.mtpConflictReason { return reason }
-        if let reason = vm.model?.mtpCompatibilityReason,
-           !(vm.model?.mtpCompatible ?? true) {
-            return reason
-        }
-        return String(localized: "settings.experimental.mtp.sub",
-                      defaultValue: "Multi-token prediction. Speeds generation when the model supports it.",
-                      comment: "Default sublabel for the Native MTP toggle")
     }
 
     private var vlmMtpToggleDisabled: Bool {

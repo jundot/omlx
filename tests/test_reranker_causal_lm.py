@@ -320,6 +320,34 @@ class TestCausalLMPromptAffixes:
             ["system", "query", "document"],
         ]
 
+    def test_standard_template_think_prefill_not_duplicated(self):
+        """A standard template that already emits a think prefill must not
+        get a second <think> block appended."""
+        model = MLXRerankerModel("unused")
+
+        class _ThinkingTokenizer(self._StandardTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                return super().apply_chat_template(messages, **kwargs) + (
+                    "<think>\n\n</think>\n\n"
+                )
+
+        prefix, suffix = model._extract_causal_lm_affixes(_ThinkingTokenizer())
+
+        assert prefix == self._EXPECTED_PREFIX
+        assert suffix == self._EXPECTED_SUFFIX
+        assert suffix.count("<think>") == 1
+
+    def test_missing_chat_template_raises_clear_error(self):
+        """A tokenizer with chat_template=None fails fast with a clear error
+        instead of an opaque rendering failure."""
+        model = MLXRerankerModel("unused")
+
+        class _NoTemplateTokenizer:
+            chat_template = None
+
+        with pytest.raises(ValueError, match="no chat template"):
+            model._extract_causal_lm_affixes(_NoTemplateTokenizer())
+
     def test_native_template_rendering_error_falls_through(self):
         """A template that raises on both shapes surfaces both errors."""
         model = MLXRerankerModel("unused")
