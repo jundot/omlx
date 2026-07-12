@@ -374,6 +374,12 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
+    - MTP sidecar glob patch (issue #2062) when the config declares MTP
+      heads and the checkpoint's safetensors index references mtp.*
+      weights in a file mlx-lm's ``model*.safetensors`` glob wouldn't find
+      on its own (e.g. ``mtp.safetensors``). Always applied regardless of
+      ``mtp_enabled`` for the same sanitize-correctness reason as the
+      Native MTP patch below.
     - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
@@ -398,9 +404,13 @@ def maybe_apply_pre_load_patches(
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
+    from ..patches.mlx_lm_extra_tensors import set_extra_tensor_files
     from ..patches.mlx_lm_mtp import set_mtp_active
 
     set_mtp_active(False)
+    # Same reset rationale as above: a model without an MTP sidecar must
+    # not inherit the previous model's sidecar file list.
+    set_extra_tensor_files([])
 
     _patch_mlx_lm_load_config()
 
@@ -591,6 +601,33 @@ def maybe_apply_pre_load_patches(
                 "Muse Glimmer mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
+
+    # Some Native MTP checkpoints (MTPLX-forge exports, issue #2062) ship
+    # the mtp.* weights in a sidecar safetensors file that
+    # model.safetensors.index.json references but whose filename doesn't
+    # match mlx-lm's model*.safetensors glob, so mlx-lm silently skips it.
+    # Detect + register those sidecars before mlx_lm.load() runs so the
+    # patched sanitize actually sees the mtp.* keys instead of raising
+    # "converted weights are missing the mtp.* tensors" on a checkpoint
+    # that has them. Gated on _has_mtp_heads (not mtp_enabled) because
+    # sanitize correctness — like the MTP patch application below — must
+    # hold regardless of whether the head is attached.
+    if _has_mtp_heads(config):
+        from ..patches.mlx_lm_extra_tensors import (
+            apply as apply_extra_tensors_patch,
+            sidecar_files_for,
+        )
+
+        sidecars = sidecar_files_for(model_name)
+        if sidecars:
+            set_extra_tensor_files(sidecars)
+            if apply_extra_tensors_patch():
+                logger.info(
+                    "MTP sidecar glob patch applied for %s (%d file(s): %s)",
+                    model_name,
+                    len(sidecars),
+                    ", ".join(Path(f).name for f in sidecars),
+                )
 
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
