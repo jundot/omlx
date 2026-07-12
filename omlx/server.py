@@ -1394,6 +1394,27 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     return None
 
 
+def _apply_laguna_enable_thinking_default(
+    chat_template_kwargs: dict[str, object],
+    engine_entry: object | None,
+) -> None:
+    """Apply Poolside's recommended Laguna serving default when supported.
+
+    Laguna's template initializes ``enable_thinking`` to false, while Poolside's
+    serving recipe explicitly defaults it to true. Only apply that policy when
+    discovery confirms a Laguna model and a template with a recognized thinking
+    toggle. An explicit model or request value, including ``False``, must win.
+    """
+    if "enable_thinking" in chat_template_kwargs or engine_entry is None:
+        return
+
+    if (
+        getattr(engine_entry, "config_model_type", None) == "laguna"
+        and getattr(engine_entry, "thinking_default", None) is True
+    ):
+        chat_template_kwargs["enable_thinking"] = True
+
+
 def get_model_settings_for_request(model_id: str | None):
     """Return settings for the requested API model name via ModelSettingsManager."""
     sm = _server_state.settings_manager
@@ -3207,6 +3228,7 @@ async def create_chat_completion(
         # get reasoning as a separate field; others fall back to <think> inlined
         # in content.
         _entry = get_engine_pool().get_entry(resolved_model)
+        _apply_laguna_enable_thinking_default(merged_ct_kwargs, _entry)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -5124,6 +5146,9 @@ async def create_anthropic_message(
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
 
+        _entry = get_engine_pool().get_entry(resolved_model)
+        _apply_laguna_enable_thinking_default(merged_ct_kwargs, _entry)
+
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
             f"has_tokenizer={engine.tokenizer is not None}"
@@ -5135,7 +5160,6 @@ async def create_anthropic_message(
         is_dflash_vlm = not is_vlm and getattr(
             engine, "supports_multimodal_fallback", False
         )
-        _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -5640,6 +5664,9 @@ async def create_response(
             if ms.preserve_thinking is not None:
                 merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
 
+        _entry = get_engine_pool().get_entry(resolved_model)
+        _apply_laguna_enable_thinking_default(merged_ct_kwargs, _entry)
+
         # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
         # are NOT called here because convert_responses_input_to_messages() already
         # returns plain dicts in {"role": str, "content": str} format.
@@ -5781,7 +5808,6 @@ async def create_response(
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
         # receive an unknown kwarg.
-        _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
         if (
             native_reasoning

@@ -735,13 +735,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
 
 def detect_thinking_default(model_path: Path) -> bool | None:
-    """Detect whether a model's chat template enables thinking by default.
+    """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour:
+    determines the default behaviour, including narrow model-family serving
+    recommendations when the raw template deliberately defaults to opt-in:
 
     * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``).
+      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
+      servers pass ``enable_thinking=true`` by default).
     * **False** — model suppresses thinking by default (e.g. Gemma 4: only
       enables thinking when ``enable_thinking`` is truthy,
       ``default(false)``).
@@ -767,6 +769,17 @@ def detect_thinking_default(model_path: Path) -> bool | None:
 
     if not template_text or "enable_thinking" not in template_text:
         return None
+
+    # Laguna's Jinja initializes the flag to false for direct tokenizer calls,
+    # while Poolside's serving recipe explicitly sets the default to true. Keep
+    # discovery, the admin "Auto" toggle, and API request policy consistent.
+    try:
+        with (model_path / "config.json").open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        model_config = {}
+    if model_config.get("model_type") == "laguna":
+        return True
 
     # Heuristic: if the template only disables thinking when explicitly
     # ``enable_thinking is false``, then thinking is ON by default.

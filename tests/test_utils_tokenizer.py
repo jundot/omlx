@@ -405,6 +405,20 @@ class TestGetTokenizerConfig:
         config = get_tokenizer_config("some-model", trust_remote_code=True)
         assert config["trust_remote_code"] is True
 
+    def test_laguna_config_enables_mistral_regex_fix(self, tmp_path):
+        """Laguna's Mistral-derived tokenizer needs the corrected regex."""
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "laguna",
+                "architectures": ["LagunaForCausalLM"],
+            },
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert config["fix_mistral_regex"] is True
+
     def test_qwen3_model_config(self):
         """Test Qwen3 model gets eos_token fix."""
         config = get_tokenizer_config("qwen3-8b")
