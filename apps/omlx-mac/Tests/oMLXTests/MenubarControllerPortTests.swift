@@ -318,6 +318,8 @@ final class MenubarControllerPortTests: XCTestCase {
         XCTAssertEqual(activePresentation.itemLength, 133)
         XCTAssertEqual(idlePresentation.iconCenterTrailingOffset, 12)
         XCTAssertEqual(activePresentation.iconCenterTrailingOffset, 12)
+        XCTAssertFalse(idlePresentation.reservesActivityLabelSpace)
+        XCTAssertTrue(activePresentation.reservesActivityLabelSpace)
         XCTAssertEqual(activePresentation.activityTitle, "PP 55% · 6k/11k")
         XCTAssertNil(idlePresentation.accessibilityValue)
         XCTAssertEqual(activePresentation.accessibilityValue, "PP 55% · 6k/11k")

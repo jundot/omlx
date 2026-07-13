@@ -46,6 +46,7 @@ final class MenubarController: NSObject {
     private let activityLabel = NSTextField(labelWithString: "")
     private let statusIconView = NSImageView()
     private var statusContentConstraints: [NSLayoutConstraint] = []
+    private var activityLabelConstraints: [NSLayoutConstraint] = []
     private let menu = NSMenu()
 
     private var statsPoller: MenubarStatsPoller?
@@ -379,6 +380,9 @@ final class MenubarController: NSObject {
         )
         activityLabel.isHidden = statusItemPresentation.activityTitle.isEmpty
         statusItem.length = statusItemPresentation.itemLength
+        setActivityLabelLayoutReserved(
+            statusItemPresentation.reservesActivityLabelSpace
+        )
         let statusItemToolTip = MenubarController.menuBarButtonToolTip(
             serverState: state,
             liveActivity: liveActivity,
@@ -644,6 +648,7 @@ final class MenubarController: NSObject {
 
         let iconCenterTrailingOffset = NSStatusBar.system.thickness / 2
         NSLayoutConstraint.deactivate(statusContentConstraints)
+        NSLayoutConstraint.deactivate(activityLabelConstraints)
         statusContentConstraints = [
             statusContentView.leadingAnchor.constraint(equalTo: statusButton.leadingAnchor),
             statusContentView.trailingAnchor.constraint(equalTo: statusButton.trailingAnchor),
@@ -655,7 +660,9 @@ final class MenubarController: NSObject {
             statusIconView.centerXAnchor.constraint(
                 equalTo: statusContentView.trailingAnchor,
                 constant: -iconCenterTrailingOffset
-            ),
+            )
+        ]
+        activityLabelConstraints = [
             activityLabel.leadingAnchor.constraint(
                 greaterThanOrEqualTo: statusContentView.leadingAnchor,
                 constant: Self.activityLeadingPadding
@@ -667,6 +674,14 @@ final class MenubarController: NSObject {
             activityLabel.centerYAnchor.constraint(equalTo: statusContentView.centerYAnchor)
         ]
         NSLayoutConstraint.activate(statusContentConstraints)
+    }
+
+    private func setActivityLabelLayoutReserved(_ reservesActivityLabelSpace: Bool) {
+        if reservesActivityLabelSpace {
+            NSLayoutConstraint.activate(activityLabelConstraints)
+        } else {
+            NSLayoutConstraint.deactivate(activityLabelConstraints)
+        }
     }
 
     // MARK: - Notification handlers
@@ -967,6 +982,7 @@ extension MenubarController {
         let itemLength: CGFloat
         let iconCenterTrailingOffset: CGFloat
         let activityTitle: String
+        let reservesActivityLabelSpace: Bool
         let accessibilityValue: String?
     }
 
@@ -997,6 +1013,7 @@ extension MenubarController {
             itemLength: itemLength,
             iconCenterTrailingOffset: iconCenterTrailingOffset,
             activityTitle: activityTitle,
+            reservesActivityLabelSpace: !activityTitle.isEmpty,
             accessibilityValue: activityTitle.isEmpty ? nil : activityTitle
         )
     }
