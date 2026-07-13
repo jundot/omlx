@@ -23,6 +23,13 @@
 import AppKit
 
 @MainActor
+private final class MenubarStatusContentView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
+@MainActor
 final class MenubarController: NSObject {
 
     // MARK: - Inputs / state
@@ -35,6 +42,10 @@ final class MenubarController: NSObject {
     private let requestQuit: () -> Void
 
     private var statusItem: NSStatusItem
+    private let statusContentView = MenubarStatusContentView()
+    private let activityLabel = NSTextField(labelWithString: "")
+    private let statusIconView = NSImageView()
+    private var statusContentConstraints: [NSLayoutConstraint] = []
     private let menu = NSMenu()
 
     private var statsPoller: MenubarStatsPoller?
@@ -54,6 +65,7 @@ final class MenubarController: NSObject {
     private var restartItem: NSMenuItem!
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
+    private var showLiveActivityInMenuBarItem: NSMenuItem!
     private var adminPanelItem: NSMenuItem!
     private var webAdminItem: NSMenuItem!
     private var chatItem: NSMenuItem!
@@ -61,6 +73,17 @@ final class MenubarController: NSObject {
 
     private let iconOutline: NSImage?
     private let iconFilled: NSImage?
+
+    private static let showLiveActivityInMenuBarDefaultsKey = "showLiveActivityInMenuBar"
+
+    private var isLiveActivityEnabled: Bool {
+        get {
+            UserDefaults.standard.bool(forKey: Self.showLiveActivityInMenuBarDefaultsKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: Self.showLiveActivityInMenuBarDefaultsKey)
+        }
+    }
 
     // MARK: - Init
 
@@ -79,7 +102,9 @@ final class MenubarController: NSObject {
         self.openAppView = openAppView
         self.requestQuit = requestQuit
 
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // The item grows left as activity text appears. Its custom content
+        // keeps the bird pinned inside the rightmost square segment.
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         // Cap icons at 18×18 pt (the standard macOS menubar icon size).
         // Our SVGs are 497×497 natural; without this, the status item
@@ -99,18 +124,19 @@ final class MenubarController: NSObject {
 
         super.init()
 
-        statusItem.button?.image = outline
+        statusIconView.image = outline
         // SF Symbol fallback for asset-catalog miss in Debug builds.
-        if statusItem.button?.image == nil {
+        if statusIconView.image == nil {
             let fallback = NSImage(
                 systemSymbolName: "cube.transparent",
                 accessibilityDescription: "oMLX"
             )
             fallback?.isTemplate = true
-            statusItem.button?.image = fallback
+            statusIconView.image = fallback
         }
         statusItem.behavior = []
         statusItem.menu = menu
+        configureStatusItemContent()
         // This menu is state-driven by refreshMenuState(). If AppKit's
         // automatic target/action enabling stays on, stopped-server items
         // such as Web Dashboard and Chat can be re-enabled while opening.
@@ -209,6 +235,17 @@ final class MenubarController: NSObject {
         statsParentItem.submenu = statsSubmenu
         menu.addItem(statsParentItem)
         rebuildStatsSubmenu()
+
+        showLiveActivityInMenuBarItem = item(
+            String(
+                localized: "menubar.item.show_live_activity_in_menu_bar",
+                defaultValue: "Show Live Activity in Menu Bar",
+                comment: "Menubar item that toggles current request activity text beside the oMLX icon"
+            ),
+            action: #selector(toggleLiveActivityInMenuBar),
+            symbol: nil
+        )
+        menu.addItem(showLiveActivityInMenuBarItem)
 
         menu.addItem(.separator())
 
@@ -322,11 +359,34 @@ final class MenubarController: NSObject {
         chatItem.isEnabled = availability.chat
 
         refreshUpdateMenuItem()
+        showLiveActivityInMenuBarItem.state = isLiveActivityEnabled ? .on : .off
 
         // Icon swap — outline when not actively serving, filled otherwise
         let serving = state.isRunningLike
-        statusItem.button?.image = serving ? iconFilled : iconOutline
-        statusItem.button?.image?.isTemplate = true
+        statusIconView.image = serving ? iconFilled : iconOutline
+        statusIconView.image?.isTemplate = true
+        let liveActivity = statsPoller?.liveStats?.liveActivity
+        let activityTitle = MenubarController.menuBarButtonTitle(
+            serverState: state,
+            liveActivity: liveActivity,
+            isLiveActivityEnabled: isLiveActivityEnabled
+        )
+        activityLabel.stringValue = activityTitle
+        let statusItemPresentation = MenubarController.menuBarStatusItemPresentation(
+            activityTitle: activityTitle,
+            activityTextWidth: activityLabel.intrinsicContentSize.width,
+            statusBarThickness: NSStatusBar.system.thickness
+        )
+        activityLabel.isHidden = statusItemPresentation.activityTitle.isEmpty
+        statusItem.length = statusItemPresentation.itemLength
+        let statusItemToolTip = MenubarController.menuBarButtonToolTip(
+            serverState: state,
+            liveActivity: liveActivity,
+            isLiveActivityEnabled: isLiveActivityEnabled
+        )
+        statusItem.button?.toolTip = statusItemToolTip
+        statusItem.button?.setAccessibilityValue(statusItemPresentation.accessibilityValue)
+        statusItem.button?.setAccessibilityHelp(statusItemToolTip)
     }
 
     private func refreshUpdateMenuItem() {
@@ -422,6 +482,7 @@ final class MenubarController: NSObject {
             return
         }
         let session = statsPoller?.sessionStats
+        let liveActivity = statsPoller?.liveStats?.liveActivity
         let alltime = statsPoller?.alltimeStats
         if session == nil && alltime == nil {
             statsSubmenu.addItem(disabled(statsPoller == nil
@@ -432,6 +493,17 @@ final class MenubarController: NSObject {
                                                    defaultValue: "Loading stats…",
                                                    comment: "Disabled placeholder shown while stats are loading")))
             return
+        }
+
+        if let liveActivity {
+            statsSubmenu.addItem(disabled(String(
+                localized: "menubar.stats.live_activity",
+                defaultValue: "Live Activity",
+                comment: "Section header inside the Serving Stats submenu for the current active request"
+            )))
+            statsSubmenu.addItem(disabled(liveActivity.menuBarTitle))
+            statsSubmenu.addItem(disabled(liveActivity.detail))
+            statsSubmenu.addItem(.separator())
         }
 
         statsSubmenu.addItem(disabled(String(localized: "menubar.stats.session_section",
@@ -513,6 +585,7 @@ final class MenubarController: NSObject {
             name: MenubarStatsPoller.didUpdateNotification,
             object: p
         )
+        p.setLiveActivityPollingEnabled(isLiveActivityEnabled)
         p.start()
         self.statsPoller = p
         self.statsPollerBaseURL = baseURL
@@ -531,7 +604,7 @@ final class MenubarController: NSObject {
 
     private func startVisibilityWatcher() {
         let watcher = MenubarVisibilityWatcher(initial: statusItem) { [weak self] in
-            self?.recreateStatusItem() ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            self?.recreateStatusItem() ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         }
         watcher.scheduleInitialCheck(after: 3.0)
         self.visibilityWatcher = watcher
@@ -539,12 +612,61 @@ final class MenubarController: NSObject {
 
     private func recreateStatusItem() -> NSStatusItem {
         NSStatusBar.system.removeStatusItem(statusItem)
-        let new = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        new.button?.image = iconOutline
-        new.button?.image?.isTemplate = true
-        new.menu = menu
-        statusItem = new
-        return new
+        let newStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        newStatusItem.behavior = []
+        newStatusItem.menu = menu
+        statusItem = newStatusItem
+        configureStatusItemContent()
+        refreshMenuState()
+        return newStatusItem
+    }
+
+    private func configureStatusItemContent() {
+        guard let statusButton = statusItem.button else { return }
+
+        statusButton.title = ""
+        statusButton.image = nil
+        statusButton.setAccessibilityLabel("oMLX")
+        statusContentView.removeFromSuperview()
+        statusContentView.translatesAutoresizingMaskIntoConstraints = false
+        statusButton.addSubview(statusContentView)
+
+        activityLabel.translatesAutoresizingMaskIntoConstraints = false
+        activityLabel.font = statusButton.font
+        activityLabel.textColor = .labelColor
+        activityLabel.alignment = .right
+        activityLabel.lineBreakMode = .byClipping
+        statusIconView.translatesAutoresizingMaskIntoConstraints = false
+        statusIconView.imageScaling = .scaleProportionallyDown
+        statusIconView.contentTintColor = .labelColor
+        statusContentView.addSubview(activityLabel)
+        statusContentView.addSubview(statusIconView)
+
+        let iconCenterTrailingOffset = NSStatusBar.system.thickness / 2
+        NSLayoutConstraint.deactivate(statusContentConstraints)
+        statusContentConstraints = [
+            statusContentView.leadingAnchor.constraint(equalTo: statusButton.leadingAnchor),
+            statusContentView.trailingAnchor.constraint(equalTo: statusButton.trailingAnchor),
+            statusContentView.topAnchor.constraint(equalTo: statusButton.topAnchor),
+            statusContentView.bottomAnchor.constraint(equalTo: statusButton.bottomAnchor),
+            statusIconView.widthAnchor.constraint(equalToConstant: Self.statusIconSize),
+            statusIconView.heightAnchor.constraint(equalToConstant: Self.statusIconSize),
+            statusIconView.centerYAnchor.constraint(equalTo: statusContentView.centerYAnchor),
+            statusIconView.centerXAnchor.constraint(
+                equalTo: statusContentView.trailingAnchor,
+                constant: -iconCenterTrailingOffset
+            ),
+            activityLabel.leadingAnchor.constraint(
+                greaterThanOrEqualTo: statusContentView.leadingAnchor,
+                constant: Self.activityLeadingPadding
+            ),
+            activityLabel.trailingAnchor.constraint(
+                equalTo: statusIconView.leadingAnchor,
+                constant: -Self.activityToIconSpacing
+            ),
+            activityLabel.centerYAnchor.constraint(equalTo: statusContentView.centerYAnchor)
+        ]
+        NSLayoutConstraint.activate(statusContentConstraints)
     }
 
     // MARK: - Notification handlers
@@ -577,6 +699,7 @@ final class MenubarController: NSObject {
         // Stats only need to redraw if the submenu is open or about to open;
         // menuWillOpen (NSMenuDelegate) handles the latter, so for now we
         // rebuild eagerly — the next render will pick up fresh values.
+        refreshMenuState()
         rebuildStatsSubmenu()
     }
 
@@ -585,6 +708,13 @@ final class MenubarController: NSObject {
     }
 
     // MARK: - Actions
+
+    @objc private func toggleLiveActivityInMenuBar() {
+        isLiveActivityEnabled.toggle()
+        statsPoller?.setLiveActivityPollingEnabled(isLiveActivityEnabled)
+        refreshMenuState()
+        rebuildStatsSubmenu()
+    }
 
     @objc private func startServer() {
         guard let server else { return }
@@ -818,6 +948,72 @@ extension MenubarController {
     /// Companion to `displayPort(server:fallback:)` — same rationale.
     static func displayHost(server: ServerProcess?, fallback: String) -> String {
         server?.host ?? fallback
+    }
+
+    /// Keeps live activity text out of a stopped or transitioning status item.
+    /// Internal so the policy is unit-tested without constructing NSStatusItem.
+    static func menuBarButtonTitle(
+        serverState: ServerProcess.State,
+        liveActivity: MenubarStatsPoller.Stats.LiveActivity?,
+        isLiveActivityEnabled: Bool
+    ) -> String {
+        guard isLiveActivityEnabled, serverState.isRunningLike else {
+            return ""
+        }
+        return liveActivity?.menuBarTitle ?? ""
+    }
+
+    struct MenuBarStatusItemPresentation: Equatable {
+        let itemLength: CGFloat
+        let iconCenterTrailingOffset: CGFloat
+        let activityTitle: String
+        let accessibilityValue: String?
+    }
+
+    private static let statusIconSize: CGFloat = 18
+    private static let activityLeadingPadding: CGFloat = 6
+    private static let activityToIconSpacing: CGFloat = 6
+
+    static func menuBarStatusItemPresentation(
+        activityTitle: String,
+        activityTextWidth: CGFloat,
+        statusBarThickness: CGFloat
+    ) -> MenuBarStatusItemPresentation {
+        let iconCenterTrailingOffset = statusBarThickness / 2
+        let itemLength: CGFloat
+        if activityTitle.isEmpty {
+            itemLength = NSStatusItem.squareLength
+        } else {
+            itemLength = ceil(
+                activityLeadingPadding
+                    + activityTextWidth
+                    + activityToIconSpacing
+                    + statusIconSize / 2
+                    + iconCenterTrailingOffset
+            )
+        }
+
+        return MenuBarStatusItemPresentation(
+            itemLength: itemLength,
+            iconCenterTrailingOffset: iconCenterTrailingOffset,
+            activityTitle: activityTitle,
+            accessibilityValue: activityTitle.isEmpty ? nil : activityTitle
+        )
+    }
+
+    static func menuBarButtonToolTip(
+        serverState: ServerProcess.State,
+        liveActivity: MenubarStatsPoller.Stats.LiveActivity?,
+        isLiveActivityEnabled: Bool
+    ) -> String {
+        guard !menuBarButtonTitle(
+            serverState: serverState,
+            liveActivity: liveActivity,
+            isLiveActivityEnabled: isLiveActivityEnabled
+        ).isEmpty else {
+            return "oMLX"
+        }
+        return liveActivity?.detail ?? "oMLX"
     }
 
     /// Builds the browser URL for the web admin dashboard. Uses the

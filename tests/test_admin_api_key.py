@@ -697,6 +697,22 @@ class TestStatsSecurity:
         # api_key is included for admin-only CLI snippet generation in the dashboard
         assert result["api_key"] == "super-secret-key"
 
+    def test_activity_response_does_not_build_runtime_cache_observability(self):
+        active_models = {"models": [{"id": "model-a"}]}
+
+        with (
+            patch.object(
+                admin_routes,
+                "_build_active_models_data",
+                return_value=active_models,
+            ),
+            patch.object(admin_routes, "_build_runtime_cache_observability") as build_runtime_cache,
+        ):
+            result = asyncio.run(admin_routes.get_server_activity(is_admin=True))
+
+        assert result == {"active_models": active_models}
+        build_runtime_cache.assert_not_called()
+
     def test_active_models_data_ignores_enforcer_status_error(self):
         """Admin stats should not fail when memory telemetry is unavailable."""
         pool = MagicMock()

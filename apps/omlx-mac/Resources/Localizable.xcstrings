@@ -4878,6 +4878,24 @@
         }
       }
     },
+    "menubar.item.show_live_activity_in_menu_bar" : {
+      "comment" : "Menubar item that toggles current request activity text beside the oMLX icon",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show Live Activity in Menu Bar"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Показывать активность в строке меню"
+          }
+        }
+      }
+    },
     "menubar.item.start_server" : {
       "comment" : "Menubar item that starts the server",
       "extractionState" : "manual",
@@ -5054,6 +5072,24 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Загрузка статистики…"
+          }
+        }
+      }
+    },
+    "menubar.stats.live_activity" : {
+      "comment" : "Section header inside the Serving Stats submenu for the current active request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Live Activity"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Текущая активность"
           }
         }
       }

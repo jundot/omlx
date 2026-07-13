@@ -4465,6 +4465,12 @@ async def get_server_stats(
     }
 
 
+@router.get("/api/activity")
+async def get_server_activity(is_admin: bool = Depends(require_admin)):
+    """Return lightweight current model and request activity for live displays."""
+    return {"active_models": _build_active_models_data()}
+
+
 def _build_active_models_data() -> dict:
     """Build active models status for the dashboard Active Models card."""
     from ..model_discovery import format_size
