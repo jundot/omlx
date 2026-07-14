@@ -668,6 +668,7 @@ class BatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            first_token_at=output.first_token_at,
         )
 
     async def stream_generate(

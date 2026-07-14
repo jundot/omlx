@@ -902,10 +902,13 @@ class EngineCore:
 
         # Drain all outputs and get the last one (using the captured reference)
         final_output = None
+        first_token_at = None
         while True:
             output = collector.get_nowait()
             if output is None:
                 break
+            if first_token_at is None and output.generated_at is not None:
+                first_token_at = output.generated_at
             final_output = output
 
         # Cleanup
@@ -917,6 +920,7 @@ class EngineCore:
         if final_output.error:
             _raise_request_output_error(final_output)
 
+        final_output.first_token_at = first_token_at
         return final_output
 
     def generate_batch_sync(

@@ -3078,11 +3078,19 @@ async def create_completion(
                 f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 cached_tokens=total_cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolve_model_id(request.model) or request.model,
             )
 
@@ -3544,10 +3552,18 @@ async def create_chat_completion(
                 f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
                 f"request_max_tokens={request.max_tokens}"
             )
+            first_token_at = getattr(output, "first_token_at", None)
+            ttft = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                generation_duration=elapsed,
+                prefill_duration=ttft,
+                generation_duration=gen_duration,
             )
 
             get_server_metrics().record_request_complete(
@@ -5367,11 +5383,19 @@ async def create_anthropic_message(
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 cached_tokens=output.cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolved_model,
             )
 
@@ -5854,11 +5878,19 @@ async def create_response(
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 cached_tokens=output.cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolved_model,
             )
 
