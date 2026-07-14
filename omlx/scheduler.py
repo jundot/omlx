@@ -1563,6 +1563,16 @@ class Scheduler:
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
         self._prefill_states: dict[str, _PrefillState] = {}
+        # Interactive preemption (OMLX_PREFILL_PREEMPTION, inert unless PRIORITY
+        # scheduling is on). Background chunked prefills parked here when an
+        # interactive request is waiting, so its admission + prefill are never
+        # queued behind a multi-chunk background prefill. The _PrefillState is
+        # retained (cache + token cursor untouched) — we only move the Request
+        # out of self.prefilling so _advance_chunked_prefills stops advancing it.
+        self._suspended_prefills: deque[tuple[Request, _PrefillState]] = deque()
+        self._prefill_rr_cursor: int = 0
+        self._prefill_preemptions: int = 0
+        self._prefill_resumes: int = 0
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -4222,6 +4232,69 @@ class Scheduler:
                 request.num_prompt_tokens,
                 cache_info,
             )
+
+    # -- Interactive preemption helpers ----------------------------------------
+
+    def _has_waiting_interactive(self) -> bool:
+        """Return True if any priority-0 (interactive) request is waiting."""
+        return any(request.priority <= 0 for request in self.waiting)
+
+    def _has_active_interactive(self) -> bool:
+        """Return True if any priority-0 (interactive) request is running."""
+        return any(request.priority <= 0 for request in self.running.values())
+
+    def _park_background_prefills_for_interactive(self) -> int:
+        """Park background chunked prefills when interactive is waiting.
+
+        Moves priority>0 requests out of self.prefilling (and their
+        _PrefillState out of self._prefill_states) into
+        self._suspended_prefills so _advance_chunked_prefills skips them.
+
+        Returns the number of requests parked.
+        """
+        if not self.config.prefill_preemption or not self._has_waiting_interactive():
+            return 0
+
+        kept: list[Request] = []
+        parked = 0
+        for request in self.prefilling:
+            if request.priority > 0:
+                state = self._prefill_states.pop(request.request_id, None)
+                if state is not None:
+                    self._suspended_prefills.append((request, state))
+                    parked += 1
+            else:
+                kept.append(request)
+        self.prefilling = deque(kept)
+        if parked:
+            self._prefill_preemptions += parked
+            logger.debug(
+                "Parked %d background prefill(s) for interactive admission",
+                parked,
+            )
+        return parked
+
+    def _resume_suspended_prefills(self) -> int:
+        """Resume parked background prefills when no interactive is waiting.
+
+        Moves all suspended requests back into self.prefilling and
+        self._prefill_states. Returns the number resumed.
+        """
+        if not self._suspended_prefills:
+            return 0
+
+        resumed = 0
+        while self._suspended_prefills:
+            request, state = self._suspended_prefills.popleft()
+            self.prefilling.append(request)
+            self._prefill_states[request.request_id] = state
+            resumed += 1
+        self._prefill_resumes += resumed
+        if resumed:
+            logger.debug("Resumed %d suspended background prefill(s)", resumed)
+        return resumed
+
+    # -------------------------------------------------------------------------
 
     def _advance_chunked_prefills(
         self,
@@ -6916,6 +6989,11 @@ class Scheduler:
                 r for r in self.prefilling if r.request_id != request_id
             )
 
+        # Remove from suspended prefills (parked by interactive preemption)
+        self._suspended_prefills = deque(
+            (r, s) for r, s in self._suspended_prefills if r.request_id != request_id
+        )
+
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request.request_id]
@@ -9367,6 +9445,15 @@ class Scheduler:
             # Advance in-flight chunked prefills (one chunk per request).
             # Must run before _schedule_waiting() so that completing prefills
             # are inserted into BatchGenerator before the decode step.
+
+            # Interactive preemption: park background prefills when an
+            # interactive request is waiting, resume when it's not.
+            if self.config.prefill_preemption:
+                if self._has_waiting_interactive():
+                    self._park_background_prefills_for_interactive()
+                else:
+                    self._resume_suspended_prefills()
+
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
             if self.prefilling:
@@ -9636,6 +9723,10 @@ class Scheduler:
         self.waiting.clear()
         self.prefilling.clear()
         self._prefill_states.clear()
+        self._suspended_prefills.clear()
+        self._prefill_rr_cursor = 0
+        self._prefill_preemptions = 0
+        self._prefill_resumes = 0
         self.running.clear()
         self.requests.clear()
         self.finished_req_ids.clear()
