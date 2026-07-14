@@ -6767,14 +6767,9 @@ Note: Use the omlx CLI for full feature support.
     if args.mcp_config:
         os.environ["OMLX_MCP_CONFIG"] = args.mcp_config
 
-    # Parse pinned models
-    pinned_models = args.pin.split(",") if args.pin else []
     # Initialize server
     init_server(
-        model_dir=args.model_dir,
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
+        model_dirs=args.model_dir,
     )
 
     # Start server
