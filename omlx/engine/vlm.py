@@ -253,6 +253,270 @@ def _patch_video_processor_bug():
     _video_processor_patched = True
 
 
+def _ensure_torch_free_pixtral_module() -> None:
+    """Make ``transformers.models.pixtral.processing_pixtral`` importable
+    without torch.
+
+    ``processing_pixtral`` imports ``get_resize_output_image_size`` from
+    ``image_processing_pixtral``, which does ``import torch`` /
+    ``from torchvision...`` at module level — so the REAL (non-dummy)
+    ``PixtralProcessor`` cannot be imported on a torch-free install even
+    though the class itself is pure Python. The two functions the sibling
+    module provides are pure math; register a faithful stub so the direct
+    import works.
+    """
+    import sys
+    import types
+    import math
+
+    mod_name = "transformers.models.pixtral.image_processing_pixtral"
+    try:
+        importlib.import_module(mod_name)
+        return  # real module imports fine (torch available)
+    except ImportError:
+        pass
+    if mod_name in sys.modules:
+        return
+
+    stub = types.ModuleType(mod_name)
+
+    def _num_image_tokens(image_size, patch_size):
+        # Faithful copy of transformers' pure-math implementation.
+        height, width = image_size
+        patch_height, patch_width = (
+            patch_size
+            if isinstance(patch_size, (tuple, list))
+            else (patch_size, patch_size)
+        )
+        num_width_tokens = (width - 1) // patch_width + 1
+        num_height_tokens = (height - 1) // patch_height + 1
+        return num_height_tokens, num_width_tokens
+
+    def get_resize_output_image_size(
+        input_image, size, patch_size, input_data_format=None
+    ):
+        from transformers.image_utils import get_image_size
+
+        max_height, max_width = (
+            size if isinstance(size, (tuple, list)) else (size, size)
+        )
+        patch_height, patch_width = (
+            patch_size
+            if isinstance(patch_size, (tuple, list))
+            else (patch_size, patch_size)
+        )
+        height, width = get_image_size(input_image, input_data_format)
+        ratio = max(height / max_height, width / max_width)
+        if ratio > 1:
+            height = int(math.floor(height / ratio))
+            width = int(math.floor(width / ratio))
+        num_height_tokens, num_width_tokens = _num_image_tokens(
+            (height, width), (patch_height, patch_width)
+        )
+        return num_height_tokens * patch_height, num_width_tokens * patch_width
+
+    stub._num_image_tokens = _num_image_tokens
+    stub.get_resize_output_image_size = get_resize_output_image_size
+    sys.modules[mod_name] = stub
+    logger.info("Installed torch-free pixtral image-processing stub")
+
+
+def _build_torch_free_processor(path, **kwargs):
+    """Build a real processor instance for a torch-gated processor class.
+
+    transformers 5.x gates whole processor classes (e.g. ``PixtralProcessor``
+    for mistral3/Mistral-Small-4) behind torch+torchvision because their
+    default image processors are torchvision-backed. The lazy top-level
+    attribute resolves to a dummy whose ``from_pretrained`` raises
+    ImportError, killing both the VLM load and the LM fallback. The real
+    class works fine with the torch-free PIL-backend image processor —
+    import it directly (bypassing the gate) and construct it manually from
+    processor_config.json.
+
+    Returns None when no torch-free construction is possible.
+    """
+    from transformers import AutoTokenizer
+    from transformers.models.auto.processing_auto import PROCESSOR_MAPPING_NAMES
+
+    p = Path(path)
+    cfg = {}
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = p / fname
+        if cfg_path.exists():
+            with open(cfg_path) as fh:
+                cfg = json.load(fh)
+            break
+
+    cls_name = cfg.get("processor_class")
+    if not cls_name:
+        model_type = ""
+        cfg_json = p / "config.json"
+        if cfg_json.exists():
+            with open(cfg_json) as fh:
+                model_type = json.load(fh).get("model_type", "")
+        cls_name = PROCESSOR_MAPPING_NAMES.get(model_type)
+    if not cls_name:
+        return None
+
+    _ensure_torch_free_pixtral_module()
+
+    proc_cls = None
+    for mt, name in PROCESSOR_MAPPING_NAMES.items():
+        if name != cls_name:
+            continue
+        try:
+            mod = importlib.import_module(f"transformers.models.{mt}.processing_{mt}")
+        except ImportError:
+            continue
+        proc_cls = getattr(mod, cls_name, None)
+        if proc_cls is not None:
+            break
+    if proc_cls is None:
+        return None
+
+    # PIL-backend image processor from the (possibly nested) config section.
+    section = cfg.get("image_processor")
+    if not isinstance(section, dict):
+        section = cfg
+    ip_type = section.get("image_processor_type")
+    image_processor = None
+    if ip_type:
+        from transformers.models.auto.auto_mappings import (
+            IMAGE_PROCESSOR_MAPPING_NAMES,
+        )
+
+        candidates = [ip_type]
+        if ip_type.endswith("Fast"):
+            # "…Fast" is the torchvision-backend class name; mappings list
+            # the base and pil names.
+            candidates.append(ip_type[: -len("Fast")])
+        pil_cls = None
+        for cand in candidates:
+            pil_cls = _resolve_pil_image_processor_class(
+                cand, IMAGE_PROCESSOR_MAPPING_NAMES
+            )
+            if pil_cls is not None:
+                break
+        if pil_cls is not None:
+            ip_kwargs = {
+                k: v for k, v in section.items() if k != "image_processor_type"
+            }
+            try:
+                image_processor = pil_cls(**ip_kwargs)
+            except TypeError:
+                image_processor = pil_cls()
+    if image_processor is None:
+        return None
+
+    trust = kwargs.pop("trust_remote_code", True)
+    tokenizer = AutoTokenizer.from_pretrained(str(p), trust_remote_code=trust)
+    if type(tokenizer).__name__ == "MistralCommonBackend" and (p / "tokenizer.json").exists():
+        # transformers 5.x auto-selects the mistral-common backend for all
+        # mistral-family model types when mistral-common is installed, but
+        # mlx-vlm's detokenizer needs the HF tokenizers API (.vocab etc.).
+        # The checkpoint ships tokenizer.json, so load the tokenizers
+        # backend explicitly.
+        from transformers import TokenizersBackend
+
+        tokenizer = TokenizersBackend.from_pretrained(
+            str(p), trust_remote_code=trust
+        )
+        logger.info(
+            "Replaced MistralCommonBackend with TokenizersBackend for %s", p
+        )
+    try:
+        from mlx_vlm.models.base import load_chat_template
+
+        load_chat_template(tokenizer, str(p))
+    except (ImportError, AttributeError):
+        pass
+
+    # Top-level scalar processor kwargs (patch_size, spatial_merge_size,
+    # image_token, …) — essential for correct image-token accounting.
+    proc_kwargs = {
+        k: v
+        for k, v in cfg.items()
+        if k
+        not in (
+            "image_processor",
+            "processor_class",
+            "auto_map",
+            "tokenizer",
+            "feature_extractor",
+            "video_processor",
+        )
+        and not isinstance(v, dict)
+    }
+    chat_template = getattr(tokenizer, "chat_template", None)
+    try:
+        return proc_cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            **proc_kwargs,
+        )
+    except TypeError:
+        return proc_cls(image_processor=image_processor, tokenizer=tokenizer)
+
+
+_torch_free_processor_patched = False
+
+
+def _patch_torch_free_auto_processor():
+    """Give AutoProcessor a torch-free fallback for gated processor classes.
+
+    Wraps ``transformers.AutoProcessor.from_pretrained`` so an ImportError
+    mentioning PyTorch/Torchvision routes to _build_torch_free_processor.
+    Composes with mlx-vlm's own AutoProcessor patch regardless of ordering
+    (whichever wrapper is applied last runs first and delegates inward).
+    """
+    global _torch_free_processor_patched
+    if _torch_free_processor_patched:
+        return
+
+    try:
+        import transformers
+    except ImportError:
+        return
+
+    if not getattr(transformers.AutoImageProcessor, "is_dummy", False):
+        # torch+torchvision available; no gating, nothing to patch.
+        _torch_free_processor_patched = True
+        return
+
+    orig = transformers.AutoProcessor.from_pretrained
+    if getattr(orig, "_omlx_torch_free_processor", False):
+        _torch_free_processor_patched = True
+        return
+    orig_func = orig.__func__
+
+    @classmethod
+    def patched(cls, pretrained_model_name_or_path, **kw):
+        try:
+            return orig_func(cls, pretrained_model_name_or_path, **kw)
+        except ImportError as exc:
+            msg = str(exc)
+            if "Torchvision" not in msg and "PyTorch" not in msg:
+                raise
+            proc = _build_torch_free_processor(
+                pretrained_model_name_or_path, **dict(kw)
+            )
+            if proc is None:
+                raise
+            logger.info(
+                "AutoProcessor torch-gated for %s; built %s via torch-free "
+                "fallback",
+                pretrained_model_name_or_path,
+                type(proc).__name__,
+            )
+            return proc
+
+    patched.__func__._omlx_torch_free_processor = True
+    transformers.AutoProcessor.from_pretrained = patched
+    _torch_free_processor_patched = True
+    logger.debug("Installed torch-free AutoProcessor fallback")
+
+
 _torch_free_ip_patched = False
 
 
@@ -1366,6 +1630,7 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
+            _patch_torch_free_auto_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
