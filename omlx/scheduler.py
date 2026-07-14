@@ -440,6 +440,27 @@ class _PrefillState:
 
 
 @dataclass
+class _SuspendedDecodeState:
+    """State for a background decode request suspended by the decode floor.
+
+    When interactive_decode_floor > 0, excess background decode rows are
+    removed from the BatchGenerator via ``remove(uids, return_prompt_caches=True)``
+    and stashed here.  The KV cache is preserved so the request can be
+    re-inserted (via ``batch_generator.insert``) once interactive work drains.
+    """
+
+    request: Any  # Request object
+    prompt_cache: list  # KV cache extracted by BatchGenerator.remove
+    all_tokens: list  # Generated token IDs so far
+    sampler: Any  # Sampler callable
+    logits_processors: list  # Per-row logits processors
+    state_machine: Any  # SequenceStateMachine
+    remaining_max_tokens: int  # Original max_tokens minus tokens already generated
+    suspended_at: float  # time.monotonic() when suspended
+    batch_uid: int  # Original UID from BatchGenerator (for rope_delta etc.)
+
+
+@dataclass
 class _InflightStoreInfo:
     tokens: list[int]
     extra_keys: tuple[Any, ...] | None = None
@@ -1573,6 +1594,11 @@ class Scheduler:
         self._prefill_rr_cursor: int = 0
         self._prefill_preemptions: int = 0
         self._prefill_resumes: int = 0
+        # Decode floor: suspend excess background decode rows when interactive
+        # requests are active, preserving KV cache for later re-insertion.
+        self._suspended_decodes: dict[str, _SuspendedDecodeState] = {}
+        self._decode_suspensions: int = 0
+        self._decode_resumes: int = 0
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -4294,6 +4320,200 @@ class Scheduler:
             logger.debug("Resumed %d suspended background prefill(s)", resumed)
         return resumed
 
+    # -- Decode floor helpers ---------------------------------------------------
+
+    def _active_interactive_decode_count(self) -> int:
+        """Count running requests with priority <= 0 (interactive)."""
+        return sum(1 for r in self.running.values() if r.priority <= 0)
+
+    def _active_background_decode_count(self) -> int:
+        """Count running requests with priority > 0 (background)."""
+        return sum(1 for r in self.running.values() if r.priority > 0)
+
+    def _target_background_decode_rows(self) -> int:
+        """Calculate how many background decode rows to keep resident.
+
+        At floor 0.5, one interactive row permits one background row.
+        At floor 1.0, no background rows are allowed.
+        At floor 0.0, all background rows are kept (no floor).
+        """
+        floor = self.config.interactive_decode_floor
+        interactive = self._active_interactive_decode_count()
+        if floor <= 0.0 or interactive == 0:
+            return self._active_background_decode_count()
+        # floor ∈ (0, 1]: background_rows = interactive * (1 - floor) / floor
+        import math
+
+        return max(0, math.floor(interactive * (1.0 - floor) / floor))
+
+    def _suspend_decode_request(self, request_id: str) -> bool:
+        """Suspend a background decode request, preserving its KV cache.
+
+        Uses BatchGenerator.remove(uids, return_prompt_caches=True) to
+        extract the KV cache and remove the row from the generation batch.
+        The request stays in self.running but is marked as suspended so
+        _process_batch_responses skips it.
+
+        Returns True if the request was suspended.
+        """
+        if self.batch_generator is None:
+            return False
+        if request_id not in self.request_id_to_uid:
+            return False
+
+        uid = self.request_id_to_uid[request_id]
+        if uid < 0:
+            return False  # vlm_mtp, not in BatchGenerator
+
+        request = self.running.get(request_id)
+        if request is None or request.priority <= 0:
+            return False  # never suspend interactive
+
+        # Extract cache + remove from batch in one call.
+        _safe_sync_stream(self._stream)
+        caches = self.batch_generator.remove([uid], return_prompt_caches=True)
+        cache_entry = caches.get(uid)
+        if cache_entry is None:
+            logger.warning(
+                "decode_floor: remove returned no cache for uid=%d (%s)", uid, request_id
+            )
+            return False
+
+        prompt_cache, all_tokens = cache_entry
+        remaining = request.sampling_params.max_tokens - len(request.output_token_ids)
+
+        self._suspended_decodes[request_id] = _SuspendedDecodeState(
+            request=request,
+            prompt_cache=prompt_cache,
+            all_tokens=all_tokens,
+            sampler=getattr(request, "_sampler", None),
+            logits_processors=getattr(request, "_logits_processors", []),
+            state_machine=getattr(request, "_state_machine", None),
+            remaining_max_tokens=remaining,
+            suspended_at=time.monotonic(),
+            batch_uid=uid,
+        )
+        self._decode_suspensions += 1
+
+        # Unregister uid mappings but keep request in self.running
+        # (status stays RUNNING so _process_batch_responses can detect stale)
+        if hasattr(self.model, "unregister_rope_delta"):
+            self.model.unregister_rope_delta(uid)
+        _unregister_uid_row(self.model, uid)
+        del self.uid_to_request_id[uid]
+        del self.request_id_to_uid[request_id]
+        request.batch_uid = None  # type: ignore[assignment]
+
+        logger.debug(
+            "Suspended background decode %s (uid=%d, cache=%d tokens)",
+            request_id,
+            uid,
+            len(all_tokens) if all_tokens else 0,
+        )
+        return True
+
+    def _resume_suspended_decodes(self) -> int:
+        """Resume all suspended background decode requests.
+
+        Re-inserts each into the BatchGenerator via insert() with the
+        preserved KV cache. The request goes through a re-prefill with
+        cached KV, which is faster than a full prefill.
+
+        Returns the number of requests resumed.
+        """
+        if not self._suspended_decodes or self.batch_generator is None:
+            return 0
+
+        to_resume = list(self._suspended_decodes.items())
+        self._suspended_decodes.clear()
+        resumed = 0
+
+        for request_id, state in to_resume:
+            request = state.request
+            # Request may have been aborted while suspended
+            if request_id not in self.running:
+                continue
+
+            try:
+                _safe_sync_stream(self._stream)
+                uids = self.batch_generator.insert(
+                    [state.all_tokens],
+                    max_tokens=[state.remaining_max_tokens],
+                    caches=[state.prompt_cache] if state.prompt_cache else None,
+                    all_tokens=[state.all_tokens],
+                    samplers=[state.sampler] if state.sampler else None,
+                    logits_processors=[state.logits_processors] if state.logits_processors else None,
+                    state_machines=[state.state_machine] if state.state_machine else None,
+                )
+                if uids:
+                    uid = uids[0]
+                    _register_uid_rows(self.model, [uid], [state.sampler], [state.logits_processors])
+                    self.request_id_to_uid[request_id] = uid
+                    self.uid_to_request_id[uid] = request_id
+                    request.batch_uid = uid
+                    if hasattr(self.model, "register_rope_delta"):
+                        self.model.register_rope_delta(uid, request.rope_deltas)
+                    resumed += 1
+                    logger.debug(
+                        "Resumed background decode %s (uid=%d)", request_id, uid
+                    )
+            except Exception as e:
+                logger.error(
+                    "Failed to resume decode %s: %s — finishing with error",
+                    request_id,
+                    e,
+                )
+                request.finish_reason = "error"
+                request.set_finished(RequestStatus.FINISHED_ABORTED)
+
+        self._decode_resumes += resumed
+        return resumed
+
+    def _apply_decode_floor(self) -> None:
+        """Apply decode floor: suspend excess background rows if interactive active.
+
+        Called after _process_batch_responses in step(). Only acts when
+        interactive_decode_floor > 0 and priority scheduling is enabled.
+        """
+        floor = self.config.interactive_decode_floor
+        if floor <= 0.0:
+            return
+        if not self.running:
+            return
+
+        interactive = self._active_interactive_decode_count()
+        if interactive == 0:
+            # No interactive work — resume all suspended decodes
+            if self._suspended_decodes:
+                self._resume_suspended_decodes()
+            return
+
+        target = self._target_background_decode_rows()
+        current_bg = self._active_background_decode_count()
+        excess = current_bg - target
+
+        if excess <= 0:
+            # Within budget — resume any previously suspended that fit
+            if self._suspended_decodes:
+                self._resume_suspended_decodes()
+            return
+
+        # Suspend excess background rows (oldest first = lowest batch_uid)
+        bg_requests = sorted(
+            [
+                (rid, r)
+                for rid, r in self.running.items()
+                if r.priority > 0 and rid not in self._suspended_decodes
+            ],
+            key=lambda x: x[1].batch_uid or 0,
+        )
+        for request_id, _ in bg_requests[:excess]:
+            self._suspend_decode_request(request_id)
+
+    def _cleanup_suspended_decode(self, request_id: str) -> None:
+        """Remove a request from suspended decodes (e.g. on abort or finish)."""
+        self._suspended_decodes.pop(request_id, None)
+
     # -------------------------------------------------------------------------
 
     def _advance_chunked_prefills(
@@ -6994,6 +7214,9 @@ class Scheduler:
             (r, s) for r, s in self._suspended_prefills if r.request_id != request_id
         )
 
+        # Remove from suspended decodes (decode floor)
+        self._cleanup_suspended_decode(request_id)
+
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request.request_id]
@@ -9524,6 +9747,12 @@ class Scheduler:
 
                     self._cleanup_finished(finished_ids)
 
+                    # Decode floor: suspend excess background decode rows
+                    # when interactive requests are active. Must run AFTER
+                    # _cleanup_finished so finished requests are removed
+                    # from suspended_decodes before we suspend new ones.
+                    self._apply_decode_floor()
+
                     # Periodic Metal allocator cleanup during long decodes.
                     # mx.random.categorical inside the sampler allocates a
                     # tiny scalar via gumbel → uniform on every call.
@@ -9724,6 +9953,9 @@ class Scheduler:
         self.prefilling.clear()
         self._prefill_states.clear()
         self._suspended_prefills.clear()
+        self._suspended_decodes.clear()
+        self._decode_suspensions = 0
+        self._decode_resumes = 0
         self._prefill_rr_cursor = 0
         self._prefill_preemptions = 0
         self._prefill_resumes = 0
