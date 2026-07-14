@@ -253,6 +253,346 @@ def _patch_video_processor_bug():
     _video_processor_patched = True
 
 
+_qwen3_omni_moe_fe_patched = False
+
+
+def _patch_qwen3_omni_moe_feature_extractor():
+    """Fix Qwen3OmniMoeProcessor feature_extractor resolution.
+
+    Qwen3OmniMoeProcessor is a ProcessorMixin that requires a
+    WhisperFeatureExtractor instance.  The processor_config.json ships a
+    ``feature_extractor`` dict, but AutoProcessor.from_pretrained()
+    sometimes passes that raw dict to __init__ instead of resolving it
+    to an actual FeatureExtractionMixin, causing:
+
+        "Received a dict for argument feature_extractor, but a
+         FeatureExtractionMixin was expected."
+
+    This patch intercepts Qwen3OmniMoeProcessor.from_pretrained() calls
+    and resolves the feature_extractor from the config using
+    WhisperFeatureExtractor before constructing the processor.
+    """
+    global _qwen3_omni_moe_fe_patched
+    if _qwen3_omni_moe_fe_patched:
+        logger.debug("_patch_qwen3_omni_moe_feature_extractor: already applied")
+        return
+
+    try:
+        from transformers import AutoProcessor
+        from transformers.feature_extraction_utils import FeatureExtractionMixin
+        from transformers.models.whisper.feature_extraction_whisper import (
+            WhisperFeatureExtractor,
+        )
+
+        _orig_from_pretrained = AutoProcessor.from_pretrained
+        logger.info("_patch_qwen3_omni_moe_feature_extractor: patching AutoProcessor.from_pretrained")
+
+        @classmethod
+        def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+            # Try the normal path first; if it fails with the
+            # feature_extractor dict error, fall back to manual construction.
+            # This catches Qwen3OmniMoeProcessor (and any other model with the
+            # same issue) without needing to detect the model type upfront.
+            try:
+                return _orig_from_pretrained.__func__(
+                    cls, pretrained_model_name_or_path, **kwargs
+                )
+            except (TypeError, ValueError) as exc:
+                msg = str(exc)
+                if "dict for argument feature_extractor" in msg or (
+                    "FeatureExtractionMixin" in msg and "feature_extractor" in msg
+                ):
+                    logger.info(
+                        "AutoProcessor.from_pretrained failed to resolve "
+                        "feature_extractor; constructing manually for %s: %s",
+                        pretrained_model_name_or_path,
+                        exc,
+                    )
+                    return _build_qwen3_omni_moe_processor(
+                        pretrained_model_name_or_path, **kwargs
+                    )
+                raise
+
+        AutoProcessor.from_pretrained = _patched_from_pretrained
+        logger.info("Patched AutoProcessor.from_pretrained for qwen3_omni_moe")
+    except Exception as e:
+        logger.warning(
+            "Skipping qwen3_omni_moe feature_extractor patch: %s", e, exc_info=True
+        )
+
+    _qwen3_omni_moe_fe_patched = True
+
+
+def _build_qwen3_omni_moe_processor(model_path, **kwargs):
+    """Manually construct Qwen3OmniMoeProcessor with resolved sub-processors.
+
+    Reads all sub-processor configs from processor_config.json (which ships
+    as a flat dict with feature_extractor, image_processor, video_processor
+    keys) and instantiates each directly from its type string.
+    """
+    import json
+    from pathlib import Path
+
+    from transformers import AutoTokenizer
+    from transformers.models.whisper.feature_extraction_whisper import (
+        WhisperFeatureExtractor,
+    )
+
+    trust = kwargs.pop("trust_remote_code", True)
+    # Remove any feature_extractor / image_processor / video_processor keys
+    # from kwargs — these are raw dicts from the failed AutoProcessor call
+    # and would corrupt downstream from_pretrained() calls.
+    for _k in ("feature_extractor", "image_processor", "video_processor"):
+        kwargs.pop(_k, None)
+    p = Path(model_path)
+
+    # Load processor_config.json (flat structure with all sub-processors)
+    cfg = None
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = p / fname
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            break
+
+    if cfg is None:
+        raise ValueError(f"No processor_config.json found in {p}")
+
+    # --- Feature extractor ---
+    fe_section = cfg.get("feature_extractor", {})
+    if isinstance(fe_section, dict):
+        fe_config = dict(fe_section)
+        fe_type = fe_config.pop("feature_extractor_type", None)
+    else:
+        fe_config, fe_type = {}, None
+
+    if fe_type is None:
+        fe_type = "WhisperFeatureExtractor"
+
+    fe_cls = _resolve_feature_extractor_class(fe_type)
+    feature_extractor = None
+    if fe_cls is not None:
+        try:
+            feature_extractor = fe_cls.from_pretrained(str(p), **fe_config)
+            logger.debug("Created feature_extractor %s from %s", fe_type, p)
+        except Exception as e:
+            logger.warning("Failed to create feature_extractor %s: %s", fe_type, e)
+    else:
+        try:
+            feature_extractor = WhisperFeatureExtractor.from_pretrained(str(p))
+            logger.debug("Created WhisperFeatureExtractor fallback from %s", p)
+        except Exception as e:
+            logger.warning("Failed to create fallback feature_extractor: %s", e)
+
+    # --- Image processor ---
+    ip_section = cfg.get("image_processor", {})
+    if isinstance(ip_section, dict):
+        ip_config = dict(ip_section)
+        ip_type = ip_config.pop("image_processor_type", None)
+    else:
+        ip_config, ip_type = {}, None
+
+    image_processor = None
+    if ip_type:
+        # Try to resolve via _FEATURE_EXTRACTOR_MAP first (for mlx_vlm types)
+        ip_cls = _resolve_feature_extractor_class(ip_type)
+        if ip_cls is None:
+            # Fall back to importing directly from transformers
+            try:
+                import importlib
+
+                # Map type names to module paths (torchvision-based)
+                _IP_TYPE_TO_MODULE = {
+                    "Qwen2VLImageProcessor": (
+                        "transformers.models.qwen2_vl.image_processing_qwen2_vl",
+                        "Qwen2VLImageProcessor",
+                    ),
+                    "Qwen2VLImageProcessorFast": (
+                        "transformers.models.qwen2_vl.image_processing_qwen2_vl",
+                        "Qwen2VLImageProcessorFast",
+                    ),
+                }
+                mod_info = _IP_TYPE_TO_MODULE.get(ip_type)
+                if mod_info:
+                    mod = importlib.import_module(mod_info[0])
+                    ip_cls = getattr(mod, mod_info[1], None)
+            except (ImportError, AttributeError, KeyError):
+                logger.debug(
+                    "Cannot resolve image_processor_type=%s, trying PIL fallback",
+                    ip_type,
+                )
+
+        # If the torch-based class failed or isn't available, try PIL fallback
+        if ip_cls is None:
+            try:
+                import importlib
+
+                mod = importlib.import_module(
+                    "transformers.models.qwen2_vl.image_processing_pil_qwen2_vl"
+                )
+                ip_cls = getattr(mod, "Qwen2VLImageProcessorPil", None)
+                if ip_cls:
+                    logger.info(
+                        "torchvision unavailable for %s; falling back to Qwen2VLImageProcessorPil",
+                        ip_type,
+                    )
+            except (ImportError, AttributeError):
+                pass
+
+        if ip_cls is not None:
+            try:
+                image_processor = ip_cls.from_pretrained(str(p), **ip_config)
+                logger.debug("Created image_processor %s from %s", ip_type, p)
+            except Exception as e:
+                logger.warning("Failed to create image_processor %s: %s", ip_type, e)
+    else:
+        # No type in config, try AutoImageProcessor
+        try:
+            from transformers import AutoImageProcessor
+
+            image_processor = AutoImageProcessor.from_pretrained(
+                str(p), trust_remote_code=trust
+            )
+            logger.debug("Created image_processor via AutoImageProcessor from %s", p)
+        except Exception as e:
+            logger.warning("Failed to create image_processor: %s", e)
+
+    # --- Video processor ---
+    vp_section = cfg.get("video_processor", {})
+    if isinstance(vp_section, dict):
+        vp_config = dict(vp_section)
+        vp_type = vp_config.pop("video_processor_type", None)
+    else:
+        vp_config, vp_type = {}, None
+
+    video_processor = None
+    if vp_type:
+        try:
+            import importlib
+
+            _VP_TYPE_TO_MODULE = {
+                "Qwen2VLVideoProcessor": (
+                    "transformers.models.qwen2_vl.video_processing_qwen2_vl",
+                    "Qwen2VLVideoProcessor",
+                ),
+            }
+            mod_info = _VP_TYPE_TO_MODULE.get(vp_type)
+            if mod_info:
+                mod = importlib.import_module(mod_info[0])
+                vp_cls = getattr(mod, mod_info[1], None)
+                if vp_cls is not None:
+                    video_processor = vp_cls.from_pretrained(str(p), **vp_config)
+                    logger.debug("Created video_processor %s from %s", vp_type, p)
+        except (ImportError, AttributeError, KeyError):
+            logger.debug("Video processor type %s unavailable, using mock", vp_type)
+        except Exception:
+            logger.debug("Video processor skipped")
+
+    # If video_processor is still None but Qwen3OmniMoeProcessor requires it,
+    # create a minimal mock so ProcessorMixin validation passes.
+    # get_possibly_dynamic_module("BaseVideoProcessor") returns a DummyObject
+    # (not a real class) when torchvision is unavailable, so we can't inherit
+    # from it.  Create a plain object-based mock instead.
+    if video_processor is None:
+        class _MockVideoProcessor:
+            """Minimal mock video processor for torchvision-free environments."""
+
+            model_input_names = ["video_grid_thw"]
+            temporal_patch_size = 2
+            merge_size = 14
+
+            def __call__(self, videos=None, **kwargs):
+                # Return empty batch so callers don't crash.
+                return {"video_grid_thw": []}
+
+        video_processor = _MockVideoProcessor()
+        logger.info("Using mock video_processor (torchvision unavailable)")
+
+    # --- Tokenizer ---
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(p), trust_remote_code=trust, **kwargs
+    )
+
+    # --- Chat template ---
+    try:
+        from mlx_vlm.models.base import load_chat_template
+
+        load_chat_template(tokenizer, str(p))
+    except (ImportError, AttributeError):
+        pass
+
+    # --- Construct processor ---
+    from mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+        Qwen3OmniMoeProcessor,
+    )
+
+    # Debug: log what we're about to pass
+    logger.info(
+        "Building Qwen3OmniMoeProcessor: ip=%s vp=%s fe=%s tok=%s",
+        type(image_processor).__name__ if image_processor else None,
+        type(video_processor).__name__ if video_processor else None,
+        type(feature_extractor).__name__ if feature_extractor else None,
+        type(tokenizer).__name__ if tokenizer else None,
+    )
+
+    # Patch ProcessorMixin.__init__ to log what it receives
+    from transformers.processing_utils import ProcessorMixin
+
+    _orig_pm_init = ProcessorMixin.__init__
+
+    def _debug_pm_init(self, *args, **kwargs):
+        logger.info(
+            "ProcessorMixin.__init__: args=%s kwargs_keys=%s",
+            [type(a).__name__ for a in args],
+            list(kwargs.keys()),
+        )
+        return _orig_pm_init(self, *args, **kwargs)
+
+    ProcessorMixin.__init__ = _debug_pm_init
+
+    try:
+        # Bypass Qwen3OmniMoeProcessor.__init__ because it passes arguments positionally,
+        # which causes a mismatch with ProcessorMixin's internal attribute order.
+        # We instantiate via __new__ and call ProcessorMixin.__init__ with keyword arguments directly.
+        from mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
+        from transformers.processing_utils import ProcessorMixin
+        
+        instance = Qwen3OmniMoeProcessor.__new__(Qwen3OmniMoeProcessor)
+        
+        # Extract chat_template from kwargs safely
+        chat_template = kwargs.pop("chat_template", None)
+        
+        ProcessorMixin.__init__(
+            instance,
+            image_processor=image_processor,
+            video_processor=video_processor,
+            feature_extractor=feature_extractor,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+        )
+        # Explicitly set video_processor — ProcessorMixin.__init__ may skip
+        # attributes that are None or that it doesn't recognise.  The
+        # Qwen3OmniMoeProcessor class lists video_processor in its
+        # attributes, so model_input_names / replace_multimodal_special_tokens
+        # will crash with AttributeError if it's missing.
+        if not hasattr(instance, "video_processor"):
+            instance.video_processor = video_processor
+
+        # Qwen3OmniMoeProcessor.__init__ sets these token attributes from the
+        # tokenizer, but we bypass __init__ so we must set them manually.
+        instance.audio_token = tokenizer.audio_token
+        instance.image_token = tokenizer.image_token
+        instance.video_token = tokenizer.video_token
+        instance.vision_bos_token = tokenizer.vision_bos_token
+        instance.vision_eos_token = tokenizer.vision_eos_token
+        instance.audio_bos_token = tokenizer.audio_bos_token
+        instance.audio_eos_token = tokenizer.audio_eos_token
+
+        return instance
+    finally:
+        ProcessorMixin.__init__ = _orig_pm_init
+
+
 _torch_free_ip_patched = False
 
 
@@ -438,7 +778,9 @@ def _resolve_pil_image_processor_class(ip_type, mapping_names):
     return None
 
 
-# Mapping from feature_extractor_type to (module, class) locations in mlx_vlm
+# Mapping from feature_extractor_type to (module, class) locations.
+# Covers both mlx_vlm-internal extractors and transformers classes needed
+# by multi-modal models (e.g. WhisperFeatureExtractor for qwen3_omni_moe).
 _FEATURE_EXTRACTOR_MAP = {
     "Gemma4UnifiedAudioFeatureExtractor": (
         "mlx_vlm.models.gemma4_unified.processing_gemma4_unified",
@@ -447,6 +789,10 @@ _FEATURE_EXTRACTOR_MAP = {
     "Gemma4AudioFeatureExtractor": (
         "mlx_vlm.models.gemma4.audio_feature_extractor",
         "Gemma4AudioFeatureExtractor",
+    ),
+    "WhisperFeatureExtractor": (
+        "transformers.models.whisper.feature_extraction_whisper",
+        "WhisperFeatureExtractor",
     ),
 }
 
@@ -1366,6 +1712,7 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
+            _patch_qwen3_omni_moe_feature_extractor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
