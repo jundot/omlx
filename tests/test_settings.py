@@ -919,6 +919,20 @@ class TestGlobalSettings:
             assert data["server"]["port"] == 9001
             assert data["auth"]["api_key"] == "saved-key"
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions only")
+    def test_save_restricts_settings_file_permissions(self):
+        """Credential-bearing settings are readable only by their owner."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.save()
+
+            settings_file = Path(tmpdir) / "settings.json"
+            assert settings_file.stat().st_mode & 0o777 == 0o600
+
+            settings_file.chmod(0o644)
+            settings.save()
+            assert settings_file.stat().st_mode & 0o777 == 0o600
+
     def test_save_and_load_cors_origins(self):
         """Test saving and loading cors_origins through settings file."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1426,6 +1440,61 @@ class TestGlobalSettings:
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cli/cache"
             assert settings.cache.ssd_cache_max_size == "500GB"
+
+    def test_cli_override_paged_ssd_cache(self):
+        """Public serve cache flags persist to the matching settings fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                paged_ssd_cache_dir="/cli/cache",
+                paged_ssd_cache_max_size="500GB",
+                hot_cache_max_size="8GB",
+                no_cache=False,
+            )
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.cache.enabled = False
+            settings._apply_cli_overrides(args)
+            assert settings.cache.enabled is True
+            assert settings.cache.ssd_cache_dir == "/cli/cache"
+            assert settings.cache.ssd_cache_max_size == "500GB"
+            assert settings.cache.hot_cache_max_size == "8GB"
+
+    def test_cli_override_no_cache(self):
+        """--no-cache persists an explicit cache disablement."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings.load(
+                base_path=tmpdir,
+                cli_args=Namespace(
+                    paged_ssd_cache_dir="/cli/cache",
+                    no_cache=True,
+                ),
+            )
+            assert settings.cache.enabled is False
+            assert settings.cache.ssd_cache_dir == "/cli/cache"
+
+    def test_save_cli_overrides_preserves_runtime_secrets_and_env(self):
+        """Saving a CLI setting must not serialize transient overrides."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            stored = GlobalSettings(base_path=base_path)
+            stored.auth.api_key = "stored-key"
+            stored.cache.enabled = True
+            stored.save()
+
+            args = Namespace(port=8765, api_key="cli-key")
+            with patch.dict(
+                os.environ,
+                {"OMLX_API_KEY": "env-key", "OMLX_CACHE_ENABLED": "false"},
+                clear=False,
+            ):
+                runtime = GlobalSettings.load(base_path=base_path, cli_args=args)
+                assert runtime.auth.api_key == "cli-key"
+                assert runtime.cache.enabled is False
+                runtime.save_cli_overrides(args)
+
+            persisted = GlobalSettings.load(base_path=base_path)
+            assert persisted.server.port == 8765
+            assert persisted.auth.api_key == "stored-key"
+            assert persisted.cache.enabled is True
 
     def test_cli_override_initial_cache_blocks(self):
         """Test CLI override for initial_cache_blocks."""
