@@ -173,6 +173,31 @@ Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requ
 
 Context scaling support for running smaller context models with Claude Code. Scales reported token counts so that auto-compact triggers at the right timing, and SSE keep-alive prevents read timeouts during long prefill.
 
+### Interactive Prefill Preemption
+
+Priority-based interactive chat isolation. When enabled, background (daemon) requests are parked at chunk boundaries to let interactive (chat) requests proceed immediately. Bounded by TTL, session count, and byte limit.
+
+**Flags (all default off):**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `OMLX_PRIORITY_SCHEDULING` | `0` | Enable priority-based admission (0=interactive, 10=background) |
+| `OMLX_PREFILL_PREEMPTION` | `0` | Park background prefill when interactive requests wait |
+| `OMLX_INTERACTIVE_CACHE_TTL_SECS` | `600` | TTL for interactive trailing KV cache entries |
+| `OMLX_INTERACTIVE_CACHE_MAX_SESSIONS` | `64` | Max entries in interactive cache |
+| `OMLX_INTERACTIVE_CACHE_MAX_BYTES_GB` | `2` | Max bytes for interactive cache |
+
+**Rollback order:**
+
+```bash
+# Disable in this order, reload after each
+OMLX_INTERACTIVE_CACHE_TTL_SECS=0
+OMLX_INTERACTIVE_DECODE_FLOOR=0
+OMLX_PREFILL_PREEMPTION=0
+```
+
+After rollback, existing priority admission, reserved slots, 512-token prefill, and adaptive cache remain active.
+
 ### Multi-Model Serving
 
 Load LLMs, VLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:
