@@ -1314,6 +1314,23 @@ class SchedulerConfig:
     # reduces TTFT for concurrent requests but adds per-step overhead.
     chunked_prefill: bool = False
 
+    # Interactive-isolation controls (staged rollout, all inert by default).
+    # These only take effect under SchedulingPolicy.PRIORITY; under FCFS they
+    # stay disabled regardless of the env toggle so shipping this code is a
+    # no-op until explicitly enabled on the live scheduler.
+    # Park an in-flight background prefill at a chunk boundary when an
+    # interactive request is waiting, then resume it once interactive work drains.
+    prefill_preemption: bool = False
+    # Minimum fraction of decode throughput reserved for interactive requests
+    # while background work is active (0.0 = no floor, 1.0 = interactive-only).
+    interactive_decode_floor: float = 0.0
+    # Interactive response cache TTL in seconds (0.0 = disabled).
+    interactive_cache_ttl_secs: float = 0.0
+    # Max concurrent interactive sessions tracked by the response cache.
+    interactive_cache_max_sessions: int = 8
+    # Max bytes held by the interactive response cache (0 = use default 8GiB).
+    interactive_cache_max_bytes: int = 8 * 1024**3
+
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
     max_cache_blocks: int | None = (

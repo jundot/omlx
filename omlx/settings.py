@@ -1458,6 +1458,56 @@ class GlobalSettings:
         except ValueError:
             reserved_interactive_slots = 0
 
+        # Interactive-isolation controls. All inert unless PRIORITY scheduling
+        # is on (OMLX_PRIORITY_SCHEDULING=1): under FCFS the policy cannot
+        # classify interactive work, so preemption stays off regardless of its
+        # own toggle. This keeps the staged rollout safe — the live FCFS
+        # scheduler is byte-identical until both knobs are enabled.
+        priority_enabled = scheduling_policy == SchedulingPolicy.PRIORITY
+
+        # Prefill preemption: only meaningful under PRIORITY.
+        prefill_preemption = (
+            os.environ.get("OMLX_PREFILL_PREEMPTION") == "1" and priority_enabled
+        )
+
+        # Interactive decode floor: probability-like ratio in [0, 1].
+        interactive_decode_floor = 0.0
+        floor_raw = os.environ.get("OMLX_INTERACTIVE_DECODE_FLOOR")
+        if floor_raw is not None:
+            try:
+                floor_val = float(floor_raw)
+            except ValueError:
+                floor_val = -1.0
+            if not (0.0 <= floor_val <= 1.0):
+                raise ValueError(
+                    "OMLX_INTERACTIVE_DECODE_FLOOR must be between 0 and 1"
+                )
+            interactive_decode_floor = floor_val
+
+        # Interactive response cache controls.
+        interactive_cache_ttl_secs = 0.0
+        if (ttl_raw := os.environ.get("OMLX_INTERACTIVE_CACHE_TTL_SECS")) is not None:
+            try:
+                interactive_cache_ttl_secs = float(ttl_raw)
+            except ValueError:
+                interactive_cache_ttl_secs = 0.0
+
+        try:
+            interactive_cache_max_sessions = int(
+                os.environ.get("OMLX_INTERACTIVE_CACHE_MAX_SESSIONS", "8") or "8"
+            )
+        except ValueError:
+            interactive_cache_max_sessions = 8
+
+        interactive_cache_max_bytes = 8 * 1024**3
+        if (
+            bytes_gb_raw := os.environ.get("OMLX_INTERACTIVE_CACHE_MAX_BYTES_GB")
+        ) is not None:
+            try:
+                interactive_cache_max_bytes = int(float(bytes_gb_raw) * 1024**3)
+            except ValueError:
+                interactive_cache_max_bytes = 8 * 1024**3
+
         return SchedulerConfig(
             policy=scheduling_policy,
             reserved_interactive_slots=max(0, reserved_interactive_slots),
@@ -1466,6 +1516,11 @@ class GlobalSettings:
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_step_size=self.scheduler.prefill_step_size,
+            prefill_preemption=prefill_preemption,
+            interactive_decode_floor=interactive_decode_floor,
+            interactive_cache_ttl_secs=interactive_cache_ttl_secs,
+            interactive_cache_max_sessions=max(1, interactive_cache_max_sessions),
+            interactive_cache_max_bytes=interactive_cache_max_bytes,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

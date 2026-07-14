@@ -1554,6 +1554,69 @@ class TestGlobalSettings:
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.prefill_step_size == 256
 
+    def test_interactive_isolation_defaults_disabled(self):
+        """New interactive-isolation controls must be inert by default."""
+        settings = GlobalSettings()
+        with patch.dict(os.environ, {}, clear=True):
+            scheduler_config = settings.to_scheduler_config()
+
+        assert scheduler_config.prefill_preemption is False
+        assert scheduler_config.interactive_decode_floor == 0.0
+        assert scheduler_config.interactive_cache_ttl_secs == 0.0
+        assert scheduler_config.interactive_cache_max_sessions == 8
+        assert scheduler_config.interactive_cache_max_bytes == 8 * 1024**3
+
+    def test_interactive_isolation_controls_parse_from_env(self):
+        """Operational env controls pass through to SchedulerConfig."""
+        settings = GlobalSettings()
+        with patch.dict(
+            os.environ,
+            {
+                "OMLX_PRIORITY_SCHEDULING": "1",
+                "OMLX_PREFILL_PREEMPTION": "1",
+                "OMLX_INTERACTIVE_DECODE_FLOOR": "0.5",
+                "OMLX_INTERACTIVE_CACHE_TTL_SECS": "120",
+                "OMLX_INTERACTIVE_CACHE_MAX_SESSIONS": "6",
+                "OMLX_INTERACTIVE_CACHE_MAX_BYTES_GB": "4.5",
+            },
+            clear=True,
+        ):
+            scheduler_config = settings.to_scheduler_config()
+
+        assert scheduler_config.prefill_preemption is True
+        assert scheduler_config.interactive_decode_floor == 0.5
+        assert scheduler_config.interactive_cache_ttl_secs == 120.0
+        assert scheduler_config.interactive_cache_max_sessions == 6
+        assert scheduler_config.interactive_cache_max_bytes == int(4.5 * 1024**3)
+
+    def test_prefill_preemption_is_inert_without_priority_policy(self):
+        """Preemption cannot classify interactive work under FCFS."""
+        settings = GlobalSettings()
+        with patch.dict(
+            os.environ,
+            {"OMLX_PREFILL_PREEMPTION": "1"},
+            clear=True,
+        ):
+            scheduler_config = settings.to_scheduler_config()
+
+        assert scheduler_config.prefill_preemption is False
+
+    def test_interactive_decode_floor_rejects_out_of_range_ratio(self):
+        """Decode floor accepts only a probability-like ratio."""
+        settings = GlobalSettings()
+        with (
+            patch.dict(
+                os.environ,
+                {"OMLX_INTERACTIVE_DECODE_FLOOR": "1.1"},
+                clear=True,
+            ),
+            pytest.raises(
+                ValueError,
+                match="OMLX_INTERACTIVE_DECODE_FLOOR must be between 0 and 1",
+            ),
+        ):
+            settings.to_scheduler_config()
+
     def test_to_scheduler_config_initial_cache_blocks(self):
         """Test that initial_cache_blocks passes through to SchedulerConfig."""
         settings = GlobalSettings()
