@@ -119,6 +119,7 @@
         background-color: var(--bg-secondary) !important;
         color: var(--text-primary) !important;
         border-color: var(--border-faint) !important;
+        color-scheme: dark;
     }
     [data-theme="dark"] input:not([type="range"]):focus,
     [data-theme="dark"] select:focus,

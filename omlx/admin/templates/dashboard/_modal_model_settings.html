@@ -461,7 +461,13 @@
                                     </button>
                                 </div>
                                 <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
-                                    <input type="number" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
+                                    <input type="number" x-model="modelSettings.thinking_budget_tokens"
+                                           @focus="modelSettingsThinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
+                                           @keydown.arrow-up.prevent="stepModelSettingsThinkingBudget(1)"
+                                           @keydown.arrow-down.prevent="stepModelSettingsThinkingBudget(-1)"
+                                           @input="onModelSettingsThinkingBudgetInput($event)"
+                                           @blur="clampModelSettingsThinkingBudget()"
+                                           placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="1"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
