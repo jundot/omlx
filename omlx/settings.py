@@ -207,6 +207,16 @@ class ModelSettings:
         False  # Hide dFlash/Assistant/Draft helper models from /v1/models
     )
 
+    def get_configured_model_dirs(self, base_path: Path) -> list[Path]:
+        """Return configured roots without resolving away symlink identity."""
+        if self.model_dirs:
+            configured = [Path(d) for d in self.model_dirs]
+        elif self.model_dir:
+            configured = [Path(self.model_dir)]
+        else:
+            configured = [base_path / "models"]
+        return [path.expanduser().absolute() for path in configured]
+
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
         Get the resolved model directory paths.
@@ -217,11 +227,10 @@ class ModelSettings:
         Returns:
             List of resolved model directory paths.
         """
-        if self.model_dirs:
-            return [Path(d).expanduser().resolve() for d in self.model_dirs]
-        if self.model_dir:
-            return [Path(self.model_dir).expanduser().resolve()]
-        return [base_path / "models"]
+        configured = self.get_configured_model_dirs(base_path)
+        if not self.model_dirs and not self.model_dir:
+            return configured
+        return [path.resolve() for path in configured]
 
     def get_model_dir(self, base_path: Path) -> Path:
         """

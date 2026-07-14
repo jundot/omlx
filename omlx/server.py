@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -61,6 +61,10 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
+
+if TYPE_CHECKING:
+    from .model_discovery import ModelDiscoveryResult
+    from .model_settings import ModelSettingsManager
 
 from .api.anthropic_models import (
     MessagesRequest as AnthropicMessagesRequest,
@@ -1634,11 +1638,125 @@ def validate_context_window(
         )
 
 
+def reconcile_discovered_model_state(
+    settings_manager: "ModelSettingsManager",
+    discovery: "ModelDiscoveryResult",
+    configured_model_dirs: list[str | Path],
+    *,
+    hf_cache_dir: str | Path | None = None,
+    hf_cache_enabled: bool = False,
+    retire_unobserved_configured: bool = False,
+    prune_missing: bool = True,
+) -> list[str]:
+    """Reconcile persisted model state after an explicit inventory refresh.
+
+    ``EnginePool.discover_models`` deliberately remains a best-effort,
+    in-memory operation. Server startup, an explicit model-directory change,
+    and the explicit inventory reload are the only lifecycle points allowed to
+    turn complete discovery evidence into deletion of persisted settings.
+    Other refreshes may set ``prune_missing=False`` to seed inventory without
+    interpreting absence as deletion.
+    """
+    from .model_discovery import discover_models_with_status
+    from .model_settings import ModelRootObservation
+
+    observations = []
+    configured_scan_paths: set[Path] = set()
+    for configured_dir in configured_model_dirs:
+        configured_path = Path(configured_dir).expanduser().absolute()
+        try:
+            scanned_path = configured_path.resolve()
+        except (OSError, RuntimeError):
+            scanned_path = configured_path
+        configured_scan_paths.add(scanned_path)
+        complete = discovery.root_complete.get(scanned_path, False)
+        observations.append(
+            ModelRootObservation(
+                configured_path=configured_path,
+                scanned_path=scanned_path,
+                status="complete" if complete else "incomplete",
+                model_ids=discovery.root_models.get(scanned_path, frozenset()),
+                fingerprint=discovery.root_fingerprints.get(scanned_path),
+                present_model_ids=discovery.root_model_entries.get(
+                    scanned_path,
+                    frozenset(),
+                ),
+            )
+        )
+
+    if hf_cache_dir is not None:
+        configured_path = Path(hf_cache_dir).expanduser().absolute()
+        try:
+            scanned_path = configured_path.resolve()
+        except (OSError, RuntimeError):
+            scanned_path = configured_path
+        if scanned_path not in configured_scan_paths:
+            try:
+                structural_evidence = discover_models_with_status(
+                    scanned_path,
+                    hf_cache_entries_only=True,
+                )
+            except ValueError:
+                try:
+                    scanned_path.stat()
+                except FileNotFoundError:
+                    hf_status = "optional_missing"
+                except OSError:
+                    hf_status = "incomplete"
+                else:
+                    hf_status = "incomplete"
+                structural_evidence = None
+            else:
+                hf_status = (
+                    "complete"
+                    if structural_evidence.root_complete.get(scanned_path, False)
+                    else "incomplete"
+                )
+
+            structural_fingerprint = (
+                structural_evidence.root_fingerprints.get(scanned_path)
+                if structural_evidence is not None
+                else None
+            )
+            discovered_fingerprint = discovery.root_fingerprints.get(scanned_path)
+            model_ids = (
+                discovery.root_models.get(scanned_path, frozenset())
+                if hf_cache_enabled and discovered_fingerprint == structural_fingerprint
+                else frozenset()
+            )
+            observations.append(
+                ModelRootObservation(
+                    configured_path=configured_path,
+                    scanned_path=scanned_path,
+                    status=hf_status,
+                    model_ids=model_ids,
+                    fingerprint=structural_fingerprint,
+                    present_model_ids=(
+                        structural_evidence.root_model_entries.get(
+                            scanned_path,
+                            frozenset(),
+                        )
+                        if structural_evidence is not None
+                        else frozenset()
+                    ),
+                    source="hf_cache",
+                )
+            )
+
+    return settings_manager.reconcile_discovered_models(
+        discovery.models,
+        observations,
+        retire_unobserved_configured=retire_unobserved_configured,
+        prune_missing=prune_missing,
+    )
+
+
 def init_server(
     model_dirs: str | list[str],
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
+    configured_model_dirs: list[str | Path] | None = None,
 ):
     """
     Initialize server with model directories for multi-model serving.
@@ -1648,6 +1766,8 @@ def init_server(
         scheduler_config: Scheduler config for BatchedEngine
         api_key: API key for authentication (optional)
         global_settings: GlobalSettings instance (optional)
+        configured_model_dirs: Pre-validation configured roots. Supplying this
+            preserves unavailable external/network roots that startup skips.
 
     Note:
         - Pinned models and default model are managed via admin page (model_settings.json)
@@ -1737,7 +1857,18 @@ def init_server(
         dir_list = [model_dirs]
     else:
         dir_list = list(model_dirs)
+    reconciliation_model_dirs: list[str | Path] = (
+        list(configured_model_dirs)
+        if configured_model_dirs is not None
+        else list(dir_list)
+    )
     if global_settings and hasattr(global_settings, "get_effective_model_dirs"):
+        if configured_model_dirs is None:
+            reconciliation_model_dirs = list(
+                global_settings.model.get_configured_model_dirs(
+                    global_settings.base_path
+                )
+            )
         dir_list = [str(d) for d in global_settings.get_effective_model_dirs()]
 
     # Create directories if needed
@@ -1756,7 +1887,16 @@ def init_server(
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
-    _server_state.engine_pool.discover_models(dir_list, pinned_models)
+    discovery = _server_state.engine_pool.discover_models(dir_list, pinned_models)
+    reconcile_discovered_model_state(
+        _server_state.settings_manager,
+        discovery,
+        reconciliation_model_dirs,
+        hf_cache_dir=(global_settings.get_hf_cache_dir() if global_settings else None),
+        hf_cache_enabled=bool(
+            global_settings and global_settings.huggingface.hf_cache_enabled
+        ),
+    )
     _server_state.engine_pool.apply_settings_overrides(_server_state.settings_manager)
 
     if _server_state.engine_pool.model_count == 0:
@@ -1808,7 +1948,36 @@ def init_server(
         """Re-discover models when a HuggingFace download completes."""
         if _server_state.engine_pool and _server_state.settings_manager:
             pinned = _server_state.settings_manager.get_pinned_model_ids()
-            _server_state.engine_pool.discover_models(dir_list, pinned)
+            refresh_dirs = dir_list
+            refresh_configured_dirs = reconciliation_model_dirs
+            if global_settings and hasattr(
+                global_settings,
+                "get_effective_model_dirs",
+            ):
+                refresh_dirs = [
+                    str(path) for path in global_settings.get_effective_model_dirs()
+                ]
+                refresh_configured_dirs = list(
+                    global_settings.model.get_configured_model_dirs(
+                        global_settings.base_path
+                    )
+                )
+            discovery = _server_state.engine_pool.discover_models(
+                refresh_dirs,
+                pinned,
+            )
+            reconcile_discovered_model_state(
+                _server_state.settings_manager,
+                discovery,
+                refresh_configured_dirs,
+                hf_cache_dir=(
+                    global_settings.get_hf_cache_dir() if global_settings else None
+                ),
+                hf_cache_enabled=bool(
+                    global_settings and global_settings.huggingface.hf_cache_enabled
+                ),
+                prune_missing=False,
+            )
             _server_state.engine_pool.apply_settings_overrides(
                 _server_state.settings_manager
             )

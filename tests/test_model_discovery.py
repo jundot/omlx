@@ -18,6 +18,8 @@ from omlx.model_discovery import (
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
+    discover_models_from_dirs_with_status,
+    discover_models_with_status,
     estimate_model_size,
     format_size,
     is_helper_config_model_type,
@@ -934,6 +936,150 @@ class TestDiscoverModels:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    def test_incomplete_model_keeps_structural_entry_evidence(self, tmp_path):
+        """A skipped model folder is not proof that the model was deleted."""
+        model_dir = tmp_path / "mid-copy-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+        result = discover_models_with_status(tmp_path)
+
+        assert result.models == {}
+        assert result.root_complete[tmp_path.resolve()] is True
+        assert result.root_model_entries[tmp_path.resolve()] == frozenset(
+            {"mid-copy-model"}
+        )
+
+    def test_model_folder_without_config_keeps_structural_entry_evidence(
+        self, tmp_path
+    ):
+        """An early or interrupted copy still proves that its folder exists."""
+        model_dir = tmp_path / "mid-copy-model"
+        model_dir.mkdir()
+        (model_dir / "model.safetensors").write_bytes(b"partial")
+
+        result = discover_models_with_status(tmp_path)
+
+        assert result.models == {}
+        assert result.root_complete[tmp_path.resolve()] is True
+        assert result.root_model_entries[tmp_path.resolve()] == frozenset(
+            {"mid-copy-model"}
+        )
+
+    def test_incomplete_direct_model_root_keeps_root_name_evidence(self, tmp_path):
+        """A directly configured single-model root remains structurally present."""
+        model_root = tmp_path / "direct-model"
+        model_root.mkdir()
+        (model_root / "model.safetensors").write_bytes(b"partial")
+
+        result = discover_models_with_status(model_root)
+
+        assert result.models == {}
+        assert result.root_complete[model_root.resolve()] is True
+        assert result.root_model_entries[model_root.resolve()] == frozenset(
+            {"direct-model"}
+        )
+
+    def test_inaccessible_model_metadata_marks_root_scan_incomplete(
+        self, tmp_path, monkeypatch
+    ):
+        """A metadata read failure cannot be silently treated as absence."""
+        model_dir = tmp_path / "protected-model"
+        model_dir.mkdir()
+        config_path = model_dir / "config.json"
+        config_path.write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"x" * 100)
+
+        original_stat = Path.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if path == config_path:
+                raise PermissionError("Operation not permitted")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        result = discover_models_with_status(tmp_path)
+
+        assert result.models == {}
+        assert result.root_complete[tmp_path.resolve()] is False
+
+    def test_incomplete_hf_snapshot_keeps_structural_entry_evidence(self, tmp_path):
+        """A present HF cache entry is not a confirmed model deletion."""
+        snapshot = tmp_path / "models--mlx-community--demo" / "snapshots" / "revision"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "llama"}),
+            encoding="utf-8",
+        )
+
+        result = discover_models_with_status(tmp_path)
+
+        assert result.models == {}
+        assert result.root_complete[tmp_path.resolve()] is True
+        assert result.root_models[tmp_path.resolve()] == frozenset()
+        assert result.root_model_entries[tmp_path.resolve()] == frozenset(
+            {"mlx-community--demo"}
+        )
+
+    def test_empty_hf_snapshots_keep_structural_entry_evidence(self, tmp_path):
+        """An empty snapshot tree is still a present HF cache entry."""
+        snapshots = tmp_path / "models--mlx-community--demo" / "snapshots"
+        snapshots.mkdir(parents=True)
+
+        result = discover_models_with_status(tmp_path)
+
+        root = tmp_path.resolve()
+        assert result.models == {}
+        assert result.root_complete[root] is True
+        assert result.root_models[root] == frozenset()
+        assert result.root_model_entries[root] == frozenset({"mlx-community--demo"})
+        assert result.root_fingerprints[root] is not None
+
+    def test_unreadable_hf_snapshots_mark_root_scan_incomplete(
+        self, tmp_path, monkeypatch
+    ):
+        """An inaccessible HF snapshot tree cannot prove model deletion."""
+        snapshots = tmp_path / "models--mlx-community--demo" / "snapshots"
+        snapshots.mkdir(parents=True)
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == snapshots:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        result = discover_models_with_status(tmp_path)
+
+        assert result.models == {}
+        assert result.root_complete[tmp_path.resolve()] is False
+
+    def test_root_identity_change_during_scan_marks_result_incomplete(
+        self, tmp_path, monkeypatch
+    ):
+        """Scan contents cannot be paired with a different mount identity."""
+        model_dir = tmp_path / "model-a"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "llama"}),
+            encoding="utf-8",
+        )
+        (model_dir / "model.safetensors").write_bytes(b"model")
+        fingerprints = iter([(1, 10), (2, 20)])
+
+        def changing_fingerprint(path, *, health=None):
+            return next(fingerprints)
+
+        monkeypatch.setattr(
+            "omlx.model_discovery._root_fingerprint",
+            changing_fingerprint,
+        )
+        result = discover_models_with_status(tmp_path)
+
+        root = tmp_path.resolve()
+        assert result.root_complete[root] is False
+        assert result.root_fingerprints[root] is None
+
     def test_discovered_model_fields(self, tmp_path):
         """Test that DiscoveredModel has all expected fields."""
         model_dir = tmp_path / "test-model"
@@ -1257,6 +1403,21 @@ class TestDiscoverModelsFromDirs:
         models = discover_models_from_dirs([dir_a, dir_b])
         assert len(models) == 1
         assert models["same-model"].model_path == str(dir_a / "same-model")
+
+    def test_status_keeps_model_presence_for_duplicate_root(self, tmp_path):
+        """A duplicate still proves the later root is not newly empty."""
+        dir_a = tmp_path / "dir_a"
+        dir_b = tmp_path / "dir_b"
+        self._make_model(dir_a / "same-model")
+        self._make_model(dir_b / "same-model")
+
+        result = discover_models_from_dirs_with_status([dir_a, dir_b])
+
+        assert result.root_complete == {dir_a.resolve(): True, dir_b.resolve(): True}
+        assert result.root_models == {
+            dir_a.resolve(): frozenset({"same-model"}),
+            dir_b.resolve(): frozenset({"same-model"}),
+        }
 
     def test_empty_list(self, tmp_path):
         """Test with empty directory list."""

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from .model_discovery import ModelDiscoveryResult
     from .model_settings import ModelSettingsManager
 
 import mlx.core as mx
@@ -44,7 +45,7 @@ from .exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
-from .model_discovery import discover_models, format_size
+from .model_discovery import format_size
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -344,18 +345,28 @@ class EnginePool:
                     engine._batch_size = batch_size
 
     def discover_models(
-        self, model_dirs: str | list[str], pinned_models: list[str] | None = None
-    ) -> None:
+        self,
+        model_dirs: str | list[str],
+        pinned_models: list[str] | None = None,
+    ) -> ModelDiscoveryResult:
         """
         Discover models in the specified directory or directories.
 
         Args:
             model_dirs: Path or list of paths to directories containing model subdirectories
             pinned_models: List of model IDs to pin (never evict)
+
+        Returns:
+            Discovery result, including per-root scan completeness. This method
+            only updates the in-memory pool; persistence reconciliation is
+            performed explicitly by the server lifecycle.
         """
         from pathlib import Path
 
-        from .model_discovery import discover_models_from_dirs
+        from .model_discovery import (
+            discover_models_from_dirs_with_status,
+            discover_models_with_status,
+        )
 
         if isinstance(model_dirs, str):
             dirs = [Path(model_dirs)]
@@ -363,9 +374,10 @@ class EnginePool:
             dirs = [Path(d) for d in model_dirs]
 
         if len(dirs) == 1:
-            discovered = discover_models(dirs[0])
+            discovery = discover_models_with_status(dirs[0])
         else:
-            discovered = discover_models_from_dirs(dirs)
+            discovery = discover_models_from_dirs_with_status(dirs)
+        discovered = discovery.models
 
         pinned_set = set(pinned_models or [])
 
@@ -414,6 +426,7 @@ class EnginePool:
                 logger.warning(f"Pinned model not found: {model_id}")
 
         logger.info(f"Discovered {len(self._entries)} models")
+        return discovery
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",

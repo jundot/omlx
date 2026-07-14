@@ -735,7 +735,23 @@ def _apply_log_level_runtime(level: str) -> None:
     logging.getLogger("uvicorn.access").setLevel(log_level)
 
 
-async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
+def _configured_model_dirs(global_settings) -> list[str]:
+    """Return configured roots without resolving away symlink identity."""
+    return [
+        str(path)
+        for path in global_settings.model.get_configured_model_dirs(
+            global_settings.base_path
+        )
+    ]
+
+
+async def _apply_model_dirs_runtime(
+    model_dirs: list[str],
+    *,
+    reconciliation_model_dirs: list[str] | None = None,
+    retire_unobserved_configured: bool = False,
+    prune_missing: bool = True,
+) -> tuple[bool, str]:
     """
     Apply model directories change at runtime by re-scanning models.
 
@@ -744,6 +760,11 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     2. Unload all currently loaded models
     3. Clear the entries dictionary
     4. Re-discover models from the new directories
+
+    ``reconciliation_model_dirs`` supplies logical roots for persistence
+    inventory. Non-deletion refreshes (such as toggling Hugging Face cache
+    visibility) set ``prune_missing=False`` so they can seed inventory without
+    deleting persisted state.
 
     Returns:
         Tuple of (success, message)
@@ -754,7 +775,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         model_directory_access_error,
         model_directory_write_error,
     )
-    from ..server import _server_state
+    from ..server import _server_state, reconcile_discovered_model_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -814,8 +835,25 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
 
     # Re-discover models from new directories
     try:
-        pool.discover_models(active_model_dirs, pinned_models)
+        discovery = pool.discover_models(active_model_dirs, pinned_models)
         if _server_state.settings_manager is not None:
+            if reconciliation_model_dirs is not None:
+                global_settings = _get_global_settings()
+                reconcile_discovered_model_state(
+                    _server_state.settings_manager,
+                    discovery,
+                    reconciliation_model_dirs,
+                    hf_cache_dir=(
+                        global_settings.get_hf_cache_dir()
+                        if global_settings is not None
+                        else None
+                    ),
+                    hf_cache_enabled=bool(
+                        global_settings and global_settings.huggingface.hf_cache_enabled
+                    ),
+                    retire_unobserved_configured=retire_unobserved_configured,
+                    prune_missing=prune_missing,
+                )
             pool.apply_settings_overrides(_server_state.settings_manager)
     except Exception as e:
         return False, f"Failed to discover models: {e}"
@@ -854,9 +892,13 @@ async def _reload_models() -> tuple[bool, str]:
 
     # Get current effective model dirs from global settings
     model_dirs = [str(d) for d in global_settings.get_effective_model_dirs()]
+    reconciliation_model_dirs = _configured_model_dirs(global_settings)
 
     # Unload all, re-discover, re-apply overrides
-    success, msg = await _apply_model_dirs_runtime(model_dirs)
+    success, msg = await _apply_model_dirs_runtime(
+        model_dirs,
+        reconciliation_model_dirs=reconciliation_model_dirs,
+    )
     if not success:
         return False, msg
 
@@ -3458,7 +3500,14 @@ async def update_global_settings(
             effective_dirs = [
                 str(d) for d in global_settings.get_effective_model_dirs(new_dirs)
             ]
-            success, msg = await _apply_model_dirs_runtime(effective_dirs)
+            reconciliation_dirs = new_dirs or [
+                str(Path(global_settings.base_path) / "models")
+            ]
+            success, msg = await _apply_model_dirs_runtime(
+                effective_dirs,
+                reconciliation_model_dirs=reconciliation_dirs,
+                retire_unobserved_configured=True,
+            )
             if success:
                 global_settings.model.model_dirs = new_dirs
                 global_settings.model.model_dir = new_dirs[0] if new_dirs else None
@@ -3620,7 +3669,11 @@ async def update_global_settings(
             effective_dirs = [
                 str(d) for d in global_settings.get_effective_model_dirs()
             ]
-            success, msg = await _apply_model_dirs_runtime(effective_dirs)
+            success, msg = await _apply_model_dirs_runtime(
+                effective_dirs,
+                reconciliation_model_dirs=_configured_model_dirs(global_settings),
+                prune_missing=False,
+            )
             if not success:
                 raise HTTPException(
                     status_code=400,

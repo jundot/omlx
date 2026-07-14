@@ -713,6 +713,7 @@ class TestServeCommandFunctions:
             get_log_dir=lambda base_path: log_dir,
         )
         settings.model = SimpleNamespace(
+            get_configured_model_dirs=lambda base_path: [tmp_path / "models"],
             get_model_dirs=lambda base_path: [tmp_path / "models"],
         )
         settings.get_effective_model_dirs = lambda: [tmp_path / "models"]
@@ -877,6 +878,10 @@ class TestServeCommandFunctions:
 
         host, port = "127.0.0.1", 0
         settings = self._make_settings(tmp_path, host=host, port=port)
+        configured_model_dirs = [tmp_path / "models", tmp_path / "nfs-models"]
+        settings.model.get_configured_model_dirs = lambda base_path: list(
+            configured_model_dirs
+        )
         args = self._make_serve_args(tmp_path, host=host, port=port)
         events = []
 
@@ -927,6 +932,10 @@ class TestServeCommandFunctions:
         serve_command(args)
 
         fake_server.init_server.assert_called_once()
+        assert (
+            fake_server.init_server.call_args.kwargs["configured_model_dirs"]
+            == configured_model_dirs
+        )
         assert events == ["bind", "init", "run"]
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host

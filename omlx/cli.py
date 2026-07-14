@@ -101,6 +101,9 @@ def serve_command(args):
 
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)
+    # Keep the user's configured roots before ensure_directories() filters out
+    # unavailable external/network filesystems for this process.
+    configured_model_dirs = settings.model.get_configured_model_dirs(settings.base_path)
 
     # Register TRACE level (5) — includes full message content
     TRACE = 5
@@ -331,6 +334,7 @@ def serve_command(args):
             scheduler_config=scheduler_config,
             api_key=settings.auth.api_key,
             global_settings=settings,
+            configured_model_dirs=configured_model_dirs,
         )
 
         for h in bind_hosts:
