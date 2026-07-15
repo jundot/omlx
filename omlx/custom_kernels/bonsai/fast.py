@@ -272,13 +272,13 @@ def spec_decode_verify(
 
     # Pure-mlx fallback — exactly the oracle from the Bonsai MLX fork
     # (mlx/fast.cpp::spec_decode_verify fallback lambda).
-    dft = mx.array(draft_tokens, dtype=mx.int32, stream=s) if draft_tokens.dtype != mx.int32 else draft_tokens
+    dft = draft_tokens.astype(mx.int32, stream=s) if draft_tokens.dtype != mx.int32 else draft_tokens
     tgt = mx.argmax(target_logits, axis=-1, stream=s)  # [B, K+1]
-    tgt = mx.array(tgt, dtype=mx.int32, stream=s) if tgt.dtype != mx.int32 else tgt
+    tgt = tgt.astype(mx.int32, stream=s) if tgt.dtype != mx.int32 else tgt
 
     B, K = dft.shape[0], dft.shape[1]
 
-    t_pref = mx.slice(tgt, [0, 0], [B, K], stream=s)           # [B, K]
+    t_pref = tgt[:, :K]                                         # [B, K]
     mism = mx.not_equal(dft, t_pref, stream=s)                  # [B, K] bool
     j = mx.broadcast_to(
         mx.reshape(mx.arange(K, dtype=mx.int32, stream=s), (1, K), stream=s),

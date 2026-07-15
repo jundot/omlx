@@ -455,6 +455,32 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # Bonsai 1-bit / 2-bit affine quantized decode patch.
+    # Applies to any model whose top-level ``quantization`` config declares
+    # bits=1 or bits=2 (the keys written by the Bonsai MLX conversion).
+    # The patch is a no-op for stock 4/8-bit models so it is safe to install
+    # globally once for the process lifetime.
+    quant_cfg = config.get("quantization") or {}
+    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
+    if quant_bits in (1, 2):
+        try:
+            from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
+        except Exception as e:
+            logger.debug("bonsai qmv patch import failed: %s", e)
+        else:
+            if apply_bonsai_qmv_patch():
+                logger.info(
+                    "Bonsai %d-bit qmv decode patch applied for %s",
+                    quant_bits,
+                    model_name,
+                )
+            else:
+                logger.debug(
+                    "Bonsai qmv patch skipped for %s "
+                    "(native extension not available; stock mlx fallback active)",
+                    model_name,
+                )
+
 
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
