@@ -9,10 +9,14 @@ bonsai_q1_affine_qmv(x, w, scales, biases, stream=None) -> mx.array
     1-bit affine decode (M = 1).  Falls back to mx.quantized_matmul when
     the native extension is unavailable.
 
+bonsai_q2_affine_qmv(x, w, scales, biases, stream=None) -> mx.array
+    2-bit affine decode (M = 1).  Falls back to mx.quantized_matmul when
+    the native extension is unavailable.
+
 bonsai_qmv_wide(x, w, scales, biases, bits, stream=None) -> mx.array
-    Small-batch affine decode (M = 2..5, bits = 1 or 2).  Falls back to
-    mx.quantized_matmul.  Routing: 1-bit always uses qmv_fast; 2-bit uses
-    qmv_wide only at M >= 3 on gen-15+.
+    Small-batch affine decode (M = 1..5, bits = 1 or 2).  Falls back to
+    mx.quantized_matmul.  Routing: 1/2-bit M>=2 use qmv_wide on gen-15+
+    for weight reuse; 1-bit M=1 uses qmv_fast; 2-bit M=1 uses qmv_fast.
 
 spec_decode_verify(draft_tokens, target_logits, stream=None)
     -> (n_accepted [B], committed [B, K+1])
@@ -22,6 +26,7 @@ spec_decode_verify(draft_tokens, target_logits, stream=None)
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -42,7 +47,9 @@ def _detach_import_error(exc: Exception) -> Exception:
 
 
 try:
-    from . import _ext
+    # Use absolute import to avoid circular import when __init__.py imports fast
+    # before _ext is registered in sys.modules.
+    _ext = importlib.import_module("omlx.custom_kernels.bonsai._ext")
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
     _IMPORT_ERROR: Exception | None = _detach_import_error(exc)
@@ -155,6 +162,22 @@ def has_symbol(name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def bonsai_q2_affine_qmv(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """2-bit affine quantized matrix-vector multiply (decode, M=1)."""
+    if _ext is not None and has_symbol("bonsai_q2_affine_qmv"):
+        return _ext.bonsai_q2_affine_qmv(x, w, scales, biases, stream=stream)
+    return mx.quantized_matmul(
+        x, w, scales=scales, biases=biases, transpose=True,
+        group_size=_infer_group_size(w, scales, 2), bits=2, stream=stream
+    )
+
+
 def bonsai_q1_affine_qmv(
     x: mx.array,
     w: mx.array,
@@ -200,15 +223,12 @@ def _infer_group_size(w: mx.array, scales: mx.array, bits: int) -> int:
 def _use_qmv_wide(bits: int, M: int) -> bool:
     """True when qmv_wide beats per-row qmv for these batch/bit settings.
 
-    Mirrors the dispatch logic in the Bonsai MLX fork
-    (mlx/backend/metal/quantized.cpp::use_qmv_wide):
-      - fp modes: always route to qmv_wide
-      - affine 1-bit: per-row qmv is faster (weight traffic is tiny)
-      - affine 2-bit: break-even at M=3; qmv_wide wins for M >= 3 on gen-15+
+    For 2-bit M >= 3 on gen-15+, qmv_wide amortises weight loads across
+    all M vectors.  At M <= 2 the overhead isn't worth it.
+    1-bit always uses per-row qmv_fast (different kernel, no wide variant
+    in the hot path).
     """
-    if bits == 1:
-        return False
-    if bits == 2 and M < 3:
+    if bits != 2 or M < 3:
         return False
     return _arch_gen() >= 15
 
@@ -221,20 +241,28 @@ def bonsai_qmv_wide(
     bits: int,
     stream=None,
 ) -> mx.array:
-    """Small-batch affine quantized matmul (decode, M = 2..5, bits = 1 or 2).
+    """Small-batch affine quantized matmul (decode, M = 1..5, bits = 1 or 2).
 
-    Routes to qmv_wide for 2-bit at M >= 3 on gen-15+; otherwise falls back
-    to bonsai_q1_affine_qmv (1-bit) or stock mlx (2-bit narrow).
+    Routing:
+      - 1-bit M=1:  qmv_fast  (no weight reuse possible)
+      - 1-bit M>=2: qmv_wide  (weight loaded once, multiplied with all M vecs)
+      - 2-bit M=1:  stock mlx quantized_matmul
+      - 2-bit M>=2: qmv_wide  (same weight-reuse benefit)
+      - gen < 15:   fall back to qmv_fast (1-bit) or stock mlx (2-bit)
     """
     M = x.shape[-2] if x.ndim >= 2 else 1
 
     if bits == 1:
-        # 1-bit is always faster with the per-row qmv_fast kernel.
+        if _use_qmv_wide(bits, M) and _ext is not None and has_symbol("bonsai_q1_affine_qmv_wide"):
+            return _ext.bonsai_q1_affine_qmv_wide(x, w, scales, biases, stream=stream)
         if _ext is not None and has_symbol("bonsai_q1_affine_qmv"):
             return _ext.bonsai_q1_affine_qmv(x, w, scales, biases, stream=stream)
-    elif _use_qmv_wide(bits, M):
-        if _ext is not None and has_symbol("bonsai_q2_affine_qmv_wide"):
+    else:  # bits == 2
+        if _use_qmv_wide(bits, M) and _ext is not None and has_symbol("bonsai_q2_affine_qmv_wide"):
             return _ext.bonsai_q2_affine_qmv_wide(x, w, scales, biases, stream=stream)
+        # M=1 (or no wide kernel): use 2-bit qmv_fast instead of falling back to stock mlx
+        if _ext is not None and has_symbol("bonsai_q2_affine_qmv"):
+            return _ext.bonsai_q2_affine_qmv(x, w, scales, biases, stream=stream)
 
     group_size = _infer_group_size(w, scales, bits)
     return mx.quantized_matmul(

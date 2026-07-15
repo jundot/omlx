@@ -30,6 +30,7 @@ import mlx.nn as nn
 
 from omlx.custom_kernels.bonsai.fast import (
     bonsai_q1_affine_qmv,
+    bonsai_q2_affine_qmv,
     bonsai_qmv_wide,
     has_native,
     _use_qmv_wide,
@@ -43,6 +44,21 @@ _patch_active = False
 # Maximum input batch size routed through fast decode kernels.
 # Above this threshold the model is prefilling — use stock mlx qmm_t instead.
 _MAX_DECODE_M = 5
+
+
+def _get_cached_scales_biases(
+    self: nn.QuantizedLinear, dtype: Any
+) -> tuple[mx.array, mx.array]:
+    """Return scales/biases cast to `dtype`, caching the result on the layer."""
+    cache_attr = "_bonsai_sb_cache"
+    cache = getattr(self, cache_attr, None)
+    if cache is None or cache[0] != dtype:
+        sc = self.scales.astype(dtype)
+        bi = self.biases.astype(dtype)
+        mx.eval(sc, bi)
+        object.__setattr__(self, cache_attr, (dtype, sc, bi))
+    _, sc, bi = getattr(self, cache_attr)
+    return sc, bi
 
 
 def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
@@ -59,16 +75,17 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
         return _original_quantized_linear_call(self, x)
 
     w = self.weight
-    scales = self.scales
-    biases = self.biases
+    # Cache scales/biases cast to x's dtype (Metal kernel reads them as T).
+    scales, biases = _get_cached_scales_biases(self, x.dtype)
 
     if bits == 1:
         out = bonsai_q1_affine_qmv(x, w, scales, biases)
-    else:
-        # bits == 2: qmv_wide at M >= 3 on gen-15+, else fall through
-        if not _use_qmv_wide(bits, M):
-            return _original_quantized_linear_call(self, x)
+    elif _use_qmv_wide(bits, M):
+        # M>=3 on gen-15+: amortise weight loads across M vectors
         out = bonsai_qmv_wide(x, w, scales, biases, bits=bits)
+    else:
+        # 2-bit M=1 or M=2: qmv_fast
+        out = bonsai_q2_affine_qmv(x, w, scales, biases)
 
     # QuantizedLinear may have a bias term (separate from quantization biases).
     linear_bias = getattr(self, "bias", None)

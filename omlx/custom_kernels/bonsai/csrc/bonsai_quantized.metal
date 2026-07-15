@@ -36,23 +36,29 @@
           "_nv_" #nv "_kl_" #kl "_batch_" #batch,                          \
       affine_qmv_wide, type, group_size, bits, nv, kl, batch)
 
-// ---- 1-bit qmv_fast (new in Bonsai fork) ----------------------------------
+// ---- qmv_fast for bits=1 and bits=2 (Bonsai fork) -------------------------
 // group_sizes 32, 64, 128; types float, float16_t, bfloat16_t
 
-#define bonsai_qmv_fast_b1(type, gs) \
-  bonsai_instantiate_qmv_fast(type, gs, 1, 0) \
-  bonsai_instantiate_qmv_fast(type, gs, 1, 1) \
-  bonsai_instantiate_qmv(type, gs, 1, 0) \
-  bonsai_instantiate_qmv(type, gs, 1, 1)
+#define bonsai_qmv_fast_bits(type, gs, bits) \
+  bonsai_instantiate_qmv_fast(type, gs, bits, 0) \
+  bonsai_instantiate_qmv_fast(type, gs, bits, 1) \
+  bonsai_instantiate_qmv(type, gs, bits, 0) \
+  bonsai_instantiate_qmv(type, gs, bits, 1)
 
-#define bonsai_qmv_fast_b1_types(gs) \
-  bonsai_qmv_fast_b1(float, gs) \
-  bonsai_qmv_fast_b1(float16_t, gs) \
-  bonsai_qmv_fast_b1(bfloat16_t, gs)
+#define bonsai_qmv_fast_types(gs, bits) \
+  bonsai_qmv_fast_bits(float, gs, bits) \
+  bonsai_qmv_fast_bits(float16_t, gs, bits) \
+  bonsai_qmv_fast_bits(bfloat16_t, gs, bits)
 
-bonsai_qmv_fast_b1_types(32)
-bonsai_qmv_fast_b1_types(64)
-bonsai_qmv_fast_b1_types(128)
+// bits=1
+bonsai_qmv_fast_types(32, 1)
+bonsai_qmv_fast_types(64, 1)
+bonsai_qmv_fast_types(128, 1)
+
+// bits=2: qmv_fast for single-row (M=1) decode, with uint32 load optimizations
+bonsai_qmv_fast_types(32, 2)
+bonsai_qmv_fast_types(64, 2)
+bonsai_qmv_fast_types(128, 2)
 
 // ---- qmv_wide: bits=1 and bits=2 -----------------------------------------
 // vecs_per_tg 2..5; k_lanes=8 for affine mode; batch 0 and 1

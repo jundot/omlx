@@ -3,6 +3,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/variant.h>
 
 #include "bonsai_kernels.h"
 
@@ -23,6 +24,18 @@ NB_MODULE(_ext, m) {
     m.def(
         "bonsai_q1_affine_qmv",
         &omlx::bonsai_kernels::bonsai_q1_affine_qmv,
+        "x"_a, "w"_a, "scales"_a, "biases"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "bonsai_q2_affine_qmv",
+        &omlx::bonsai_kernels::bonsai_q2_affine_qmv,
+        "x"_a, "w"_a, "scales"_a, "biases"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "bonsai_q1_affine_qmv_wide",
+        &omlx::bonsai_kernels::bonsai_q1_affine_qmv_wide,
         "x"_a, "w"_a, "scales"_a, "biases"_a,
         "stream"_a = nb::none());
 

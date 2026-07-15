@@ -35,27 +35,28 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   U sum = 0;
 
   if (bits == 1) {
+    // Pre-scale x by 1/2^k so qdot can use FMA (x_thread[k] * (wb & 2^k) = x[k] * bit_k).
     for (int i = 0; i < values_per_thread; i += 8) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
           x[i + 6] + x[i + 7];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1];
-      x_thread[i + 2] = x[i + 2];
-      x_thread[i + 3] = x[i + 3];
-      x_thread[i + 4] = x[i + 4];
-      x_thread[i + 5] = x[i + 5];
-      x_thread[i + 6] = x[i + 6];
-      x_thread[i + 7] = x[i + 7];
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] * U(0.5f);
+      x_thread[i + 2] = x[i + 2] * U(0.25f);
+      x_thread[i + 3] = x[i + 3] * U(0.125f);
+      x_thread[i + 4] = x[i + 4] * U(0.0625f);
+      x_thread[i + 5] = x[i + 5] * U(0.03125f);
+      x_thread[i + 6] = x[i + 6] * U(0.015625f);
+      x_thread[i + 7] = x[i + 7] * U(0.0078125f);
     }
   }
 
   else if (bits == 2) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 4.0f;
-      x_thread[i + 2] = x[i + 2] / 16.0f;
-      x_thread[i + 3] = x[i + 3] / 64.0f;
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] * U(0.25f);
+      x_thread[i + 2] = x[i + 2] * U(0.0625f);
+      x_thread[i + 3] = x[i + 3] * U(0.015625f);
     }
   }
 
@@ -132,24 +133,24 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
     for (int i = 0; i < N; i += 8) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
           x[i + 6] + x[i + 7];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1];
-      x_thread[i + 2] = x[i + 2];
-      x_thread[i + 3] = x[i + 3];
-      x_thread[i + 4] = x[i + 4];
-      x_thread[i + 5] = x[i + 5];
-      x_thread[i + 6] = x[i + 6];
-      x_thread[i + 7] = x[i + 7];
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] * U(0.5f);
+      x_thread[i + 2] = x[i + 2] * U(0.25f);
+      x_thread[i + 3] = x[i + 3] * U(0.125f);
+      x_thread[i + 4] = x[i + 4] * U(0.0625f);
+      x_thread[i + 5] = x[i + 5] * U(0.03125f);
+      x_thread[i + 6] = x[i + 6] * U(0.015625f);
+      x_thread[i + 7] = x[i + 7] * U(0.0078125f);
     }
   }
 
   else if (bits == 2) {
     for (int i = 0; i < N; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 4.0f;
-      x_thread[i + 2] = x[i + 2] / 16.0f;
-      x_thread[i + 3] = x[i + 3] / 64.0f;
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] * U(0.25f);
+      x_thread[i + 2] = x[i + 2] * U(0.0625f);
+      x_thread[i + 3] = x[i + 3] * U(0.015625f);
     }
   }
 
@@ -233,26 +234,40 @@ inline U qdot(
   U accum = 0;
 
   if (bits == 1) {
-    for (int i = 0; i < (values_per_thread / 8); i++) {
-      uint8_t wb = w[i];
-      accum += select(U(0), x_thread[8 * i], bool(wb & 0x01));
-      accum += select(U(0), x_thread[8 * i + 1], bool(wb & 0x02));
-      accum += select(U(0), x_thread[8 * i + 2], bool(wb & 0x04));
-      accum += select(U(0), x_thread[8 * i + 3], bool(wb & 0x08));
-      accum += select(U(0), x_thread[8 * i + 4], bool(wb & 0x10));
-      accum += select(U(0), x_thread[8 * i + 5], bool(wb & 0x20));
-      accum += select(U(0), x_thread[8 * i + 6], bool(wb & 0x40));
-      accum += select(U(0), x_thread[8 * i + 7], bool(wb & 0x80));
+    // One uint32 load per 32 elements; x_thread is pre-scaled by 1/2^k so
+    // x_thread[k] * (wb & 2^k) = x[k] * bit_k — pure FMA, no select/bool.
+    const device uint32_t* wp = (const device uint32_t*)w;
+    for (int i = 0; i < (values_per_thread / 32); i++) {
+      uint32_t wb32 = wp[i];
+      for (int j = 0; j < 4; j++) {
+        uint8_t wb = uint8_t(wb32 >> (8 * j));
+        int base = 32 * i + 8 * j;
+        accum += x_thread[base + 0] * U(wb & 0x01);
+        accum += x_thread[base + 1] * U(wb & 0x02);
+        accum += x_thread[base + 2] * U(wb & 0x04);
+        accum += x_thread[base + 3] * U(wb & 0x08);
+        accum += x_thread[base + 4] * U(wb & 0x10);
+        accum += x_thread[base + 5] * U(wb & 0x20);
+        accum += x_thread[base + 6] * U(wb & 0x40);
+        accum += x_thread[base + 7] * U(wb & 0x80);
+      }
     }
   }
 
   else if (bits == 2) {
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (w[i] & 0x03) +
-           x_thread[4 * i + 1] * (w[i] & 0x0c) +
-           x_thread[4 * i + 2] * (w[i] & 0x30) +
-           x_thread[4 * i + 3] * (w[i] & 0xc0));
+    // One uint32 load covers 16 packed 2-bit values (4× fewer loads than byte-by-byte).
+    // x_thread is pre-scaled by 1/4^k so x_thread[k] * (wb & shifted_mask_k) = x[k]*q_k.
+    const device uint32_t* wp = (const device uint32_t*)w;
+    for (int i = 0; i < (values_per_thread / 16); i++) {
+      uint32_t wb32 = wp[i];
+      for (int j = 0; j < 4; j++) {
+        uint8_t wb = uint8_t(wb32 >> (8 * j));
+        int base = 16 * i + 4 * j;
+        accum += x_thread[base + 0] * U(wb & 0x03)
+              +  x_thread[base + 1] * U(wb & 0x0c)
+              +  x_thread[base + 2] * U(wb & 0x30)
+              +  x_thread[base + 3] * U(wb & 0xc0);
+      }
     }
   }
 
@@ -351,24 +366,37 @@ inline U qdot_safe(
   if (bits == 1) {
     for (int i = 0; i < (N / 8); i++) {
       uint8_t wb = w[i];
-      accum += select(U(0), x_thread[8 * i], bool(wb & 0x01));
-      accum += select(U(0), x_thread[8 * i + 1], bool(wb & 0x02));
-      accum += select(U(0), x_thread[8 * i + 2], bool(wb & 0x04));
-      accum += select(U(0), x_thread[8 * i + 3], bool(wb & 0x08));
-      accum += select(U(0), x_thread[8 * i + 4], bool(wb & 0x10));
-      accum += select(U(0), x_thread[8 * i + 5], bool(wb & 0x20));
-      accum += select(U(0), x_thread[8 * i + 6], bool(wb & 0x40));
-      accum += select(U(0), x_thread[8 * i + 7], bool(wb & 0x80));
+      accum += x_thread[8 * i + 0] * U(wb & 0x01);
+      accum += x_thread[8 * i + 1] * U(wb & 0x02);
+      accum += x_thread[8 * i + 2] * U(wb & 0x04);
+      accum += x_thread[8 * i + 3] * U(wb & 0x08);
+      accum += x_thread[8 * i + 4] * U(wb & 0x10);
+      accum += x_thread[8 * i + 5] * U(wb & 0x20);
+      accum += x_thread[8 * i + 6] * U(wb & 0x40);
+      accum += x_thread[8 * i + 7] * U(wb & 0x80);
     }
   }
 
   else if (bits == 2) {
-    for (int i = 0; i < (N / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (w[i] & 0x03) +
-           x_thread[4 * i + 1] * (w[i] & 0x0c) +
-           x_thread[4 * i + 2] * (w[i] & 0x30) +
-           x_thread[4 * i + 3] * (w[i] & 0xc0));
+    // uint32 loads for 16-aligned chunks; byte loads for any remainder.
+    const device uint32_t* wp = (const device uint32_t*)w;
+    int i = 0;
+    for (; i < (N / 16); i++) {
+      uint32_t wb32 = wp[i];
+      for (int j = 0; j < 4; j++) {
+        uint8_t wb = uint8_t(wb32 >> (8 * j));
+        int base = 16 * i + 4 * j;
+        accum += x_thread[base + 0] * U(wb & 0x03)
+              +  x_thread[base + 1] * U(wb & 0x0c)
+              +  x_thread[base + 2] * U(wb & 0x30)
+              +  x_thread[base + 3] * U(wb & 0xc0);
+      }
+    }
+    for (int k = i * 4; k < (N / 4); k++) {
+      accum += x_thread[4 * k + 0] * U(w[k] & 0x03)
+            +  x_thread[4 * k + 1] * U(w[k] & 0x0c)
+            +  x_thread[4 * k + 2] * U(w[k] & 0x30)
+            +  x_thread[4 * k + 3] * U(w[k] & 0xc0);
     }
   }
 
@@ -562,38 +590,42 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
       "Template undefined for bits not in {1, 2, 3, 4, 5, 6, 8}");
 
   if (bits == 1) {
-    U s[8] = {
-        scale,
-        scale / static_cast<U>(2.0f),
-        scale / static_cast<U>(4.0f),
-        scale / static_cast<U>(8.0f),
-        scale / static_cast<U>(16.0f),
-        scale / static_cast<U>(32.0f),
-        scale / static_cast<U>(64.0f),
-        scale / static_cast<U>(128.0f)};
+    // 1-bit values are always 0 or 1 — each dequantized element is either
+    // bias or (scale + bias). No multiply needed; precompute once per group.
+    U scale_plus_bias = scale + bias;
     for (int i = 0; i < (N / 8); i++) {
-      w_local[8 * i] = s[0] * (w[i] & 0x01) + bias;
-      w_local[8 * i + 1] = s[1] * (w[i] & 0x02) + bias;
-      w_local[8 * i + 2] = s[2] * (w[i] & 0x04) + bias;
-      w_local[8 * i + 3] = s[3] * (w[i] & 0x08) + bias;
-      w_local[8 * i + 4] = s[4] * (w[i] & 0x10) + bias;
-      w_local[8 * i + 5] = s[5] * (w[i] & 0x20) + bias;
-      w_local[8 * i + 6] = s[6] * (w[i] & 0x40) + bias;
-      w_local[8 * i + 7] = s[7] * (w[i] & 0x80) + bias;
+      uint8_t wb = w[i];
+      w_local[8 * i + 0] = select(bias, scale_plus_bias, bool(wb & 0x01));
+      w_local[8 * i + 1] = select(bias, scale_plus_bias, bool(wb & 0x02));
+      w_local[8 * i + 2] = select(bias, scale_plus_bias, bool(wb & 0x04));
+      w_local[8 * i + 3] = select(bias, scale_plus_bias, bool(wb & 0x08));
+      w_local[8 * i + 4] = select(bias, scale_plus_bias, bool(wb & 0x10));
+      w_local[8 * i + 5] = select(bias, scale_plus_bias, bool(wb & 0x20));
+      w_local[8 * i + 6] = select(bias, scale_plus_bias, bool(wb & 0x40));
+      w_local[8 * i + 7] = select(bias, scale_plus_bias, bool(wb & 0x80));
     }
   }
 
   else if (bits == 2) {
-    U s[4] = {
-        scale,
-        scale / static_cast<U>(4.0f),
-        scale / static_cast<U>(16.0f),
-        scale / static_cast<U>(64.0f)};
+    // 4-value mux: decoded[q] = scale*q + bias for q in {0,1,2,3}.
+    // Use select() pairs (3 instructions per value, no dynamic array index which
+    // would spill to device memory on Apple GPU).
+    // Precompute all 4 possible decoded values once; compiler dead-code-eliminates
+    // values when N is a compile-time constant.
+    U d0 = bias;
+    U d1 = scale + bias;
+    U d2 = fma(U(2), scale, bias);
+    U d3 = fma(U(3), scale, bias);
     for (int i = 0; i < (N / 4); i++) {
-      w_local[4 * i] = s[0] * (w[i] & 0x03) + bias;
-      w_local[4 * i + 1] = s[1] * (w[i] & 0x0c) + bias;
-      w_local[4 * i + 2] = s[2] * (w[i] & 0x30) + bias;
-      w_local[4 * i + 3] = s[3] * (w[i] & 0xc0) + bias;
+      uint8_t wb = w[i];
+      // Decode each 2-bit field with two select()s: no FP multiply per element.
+      auto mux2 = [&](uint8_t q) -> U {
+        return select(select(d0, d1, bool(q & 1)), select(d2, d3, bool(q & 1)), bool(q & 2));
+      };
+      w_local[4 * i + 0] = mux2(wb & 0x03);
+      w_local[4 * i + 1] = mux2((wb >> 2) & 0x03);
+      w_local[4 * i + 2] = mux2((wb >> 4) & 0x03);
+      w_local[4 * i + 3] = mux2((wb >> 6) & 0x03);
     }
   }
 
@@ -854,7 +886,7 @@ METAL_FUNC void qmv_fast_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int packs_per_thread = bits <= 2 ? 1 : 2;  // 1-bit: 1 pack (vpt=32) for occupancy
-  constexpr int num_simdgroups = 2;
+  constexpr int num_simdgroups = 4;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
@@ -943,7 +975,7 @@ METAL_FUNC void qmv_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int num_simdgroups = 2;
+  constexpr int num_simdgroups = 4;
   constexpr int results_per_simdgroup = 4;
   constexpr int packs_per_thread = 1;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -1108,7 +1140,7 @@ METAL_FUNC void qmv_wide_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int num_simdgroups = 2;
+  constexpr int num_simdgroups = 4;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
 
@@ -1141,12 +1173,47 @@ METAL_FUNC void qmv_wide_impl(
   for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
     U scale = srow[g];
     U bias = brow[g];
+    // Precompute once per group; compiler dead-code-eliminates unused vars.
+    U spb  = scale + bias;          // bits==1: lut[1]; bits==2: lut[1]
+    U lut2 = fma(U(2), scale, bias); // bits==2: lut[2]; eliminated otherwise
+    U lut3 = fma(U(3), scale, bias); // bits==2: lut[3]; eliminated otherwise
 #pragma unroll
     for (int sc = 0; sc < group_size / sub; sc++) {
       const int k0 = g * group_size + sc * sub;
       const device uint8_t* wc = wrow + k0 * bits / 8;
       U w_dq[sub];
-      dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+      if constexpr (bits == 1) {
+        // sub=8 elements packed in 1 byte; spb hoisted to group scope.
+        uint8_t wb = wc[0];
+        w_dq[0] = select(bias, spb, bool(wb & 0x01));
+        w_dq[1] = select(bias, spb, bool(wb & 0x02));
+        w_dq[2] = select(bias, spb, bool(wb & 0x04));
+        w_dq[3] = select(bias, spb, bool(wb & 0x08));
+        w_dq[4] = select(bias, spb, bool(wb & 0x10));
+        w_dq[5] = select(bias, spb, bool(wb & 0x20));
+        w_dq[6] = select(bias, spb, bool(wb & 0x40));
+        w_dq[7] = select(bias, spb, bool(wb & 0x80));
+      } else if constexpr (bits == 2) {
+        // sub=8 values from 2 bytes. Hoisted d0..d3 (computed once per group)
+        // replace per-element scale*q+bias with 2 select() ops per value.
+        // select() → single hardware instruction; no dynamic array index (avoids
+        // register spilling on Apple GPU).
+        auto mux2 = [&](uint8_t q) -> U {
+          return select(select(bias, spb, bool(q & 1)),
+                        select(lut2, lut3, bool(q & 1)), bool(q & 2));
+        };
+        uint8_t wb0 = wc[0], wb1 = wc[1];
+        w_dq[0] = mux2(wb0 & 0x03);
+        w_dq[1] = mux2((wb0 >> 2) & 0x03);
+        w_dq[2] = mux2((wb0 >> 4) & 0x03);
+        w_dq[3] = mux2((wb0 >> 6) & 0x03);
+        w_dq[4] = mux2(wb1 & 0x03);
+        w_dq[5] = mux2((wb1 >> 2) & 0x03);
+        w_dq[6] = mux2((wb1 >> 4) & 0x03);
+        w_dq[7] = mux2((wb1 >> 6) & 0x03);
+      } else {
+        dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+      }
 #pragma unroll
       for (int v = 0; v < vecs_per_tg; v++) {
         const device T* xc = xv[v] + k0;

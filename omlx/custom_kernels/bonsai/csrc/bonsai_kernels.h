@@ -13,6 +13,7 @@
 
 #include "mlx/array.h"
 #include "mlx/stream.h"
+#include "mlx/utils.h"
 
 #include <optional>
 
@@ -30,6 +31,30 @@ using mlx::core::StreamOrDevice;
 // biases : [..., N, K/gs]   float16 or bfloat16
 // Returns [..., N].
 array bonsai_q1_affine_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s = {});
+
+// ---------------------------------------------------------------------------
+// 2-bit affine qmv_fast (M = 1)
+// ---------------------------------------------------------------------------
+// Same layout as bonsai_q1_affine_qmv but bits=2 (w has K/4 packed uint8 per row).
+array bonsai_q2_affine_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s = {});
+
+// ---------------------------------------------------------------------------
+// 1-bit affine qmv_wide (M = 2..5)
+// ---------------------------------------------------------------------------
+// Same layout as bonsai_q1_affine_qmv but uses the wide kernel for small
+// batch, amortising weight loads across all M vectors.
+// Caller is responsible for the routing decision (use_qmv_wide gate).
+array bonsai_q1_affine_qmv_wide(
     const array& x,
     const array& w,
     const array& scales,

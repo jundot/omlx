@@ -6,6 +6,10 @@
 // Metal kernel sources live in bonsai_quantized.metal (qmv_fast / qmv_wide)
 // and spec_decode.metal, compiled into omlx_bonsai_kernels.metallib by CMake.
 // The metallib is loaded lazily on the first dispatch call and cached.
+//
+// MLX 0.32+ requires Metal dispatch to occur inside Primitive::eval_gpu.
+// All public API functions return an unevaluated array whose Primitive drives
+// the actual Metal dispatch at eval time.
 
 #include "bonsai_kernels.h"
 
@@ -16,11 +20,11 @@
 #include <sstream>
 #include <string>
 
-#include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/ops.h"
+#include "mlx/primitives.h"
 #include "mlx/utils.h"
 
 namespace omlx::bonsai_kernels {
@@ -36,8 +40,6 @@ using namespace mlx::core::metal;
 
 constexpr const char* kMetallibName = "omlx_bonsai_kernels";
 
-static std::atomic<bool> metallib_ok{true};
-
 std::string binary_dir() {
     static std::string dir = []() {
         Dl_info info;
@@ -50,11 +52,10 @@ std::string binary_dir() {
 }
 
 MTL::ComputePipelineState* get_bonsai_kernel(
-    Device& d,
+    metal::Device& d,
     const std::string& kernel_name) {
-    std::string lib_path =
-        binary_dir() + "/" + kMetallibName + ".metallib";
-    return d.get_kernel(kernel_name, lib_path);
+    auto* lib = d.get_library(kMetallibName, binary_dir());
+    return d.get_kernel(kernel_name, lib);
 }
 
 // ---------------------------------------------------------------------------
@@ -71,14 +72,12 @@ std::string type_str(Dtype dt) {
 }
 
 // ---------------------------------------------------------------------------
-// Contiguity helpers
+// Contiguity helper (used in public API before Primitive is created)
 // ---------------------------------------------------------------------------
 
 array ensure_row_contiguous(const array& x, const Stream& s) {
     if (x.flags().row_contiguous) return x;
-    array c = contiguous_copy_gpu(x, s);
-    metal::get_command_encoder(s).add_temporary(c);
-    return c;
+    return contiguous(x, /*allow_col_major=*/false, s);
 }
 
 // ---------------------------------------------------------------------------
@@ -107,18 +106,21 @@ std::string qmv_wide_kname(
 }
 
 // ---------------------------------------------------------------------------
-// Group size derivation: K*bits/8 = w.shape(-1), K/group_size = scales.shape(-1)
+// Group size derivation
 // ---------------------------------------------------------------------------
 
+// MLX packs quantized weights as uint32 (32/bits values per element).
+// Exception: Bonsai 1-bit uses uint8 packing (8 values per byte).
 int derive_group_size(const array& w, const array& scales, int bits) {
-    int64_t K = static_cast<int64_t>(w.shape(-1)) * 8 / bits;
+    int64_t pack = (bits == 1) ? 8 : (32 / bits);
+    int64_t K = static_cast<int64_t>(w.shape(-1)) * pack;
     int64_t n_groups = scales.shape(-1);
     if (n_groups <= 0) return 64;
     return static_cast<int>(K / n_groups);
 }
 
 // ---------------------------------------------------------------------------
-// qmv_fast dispatch (1-bit single-row)
+// qmv_fast dispatch (called from eval_gpu)
 // ---------------------------------------------------------------------------
 
 void dispatch_qmv_fast(
@@ -129,13 +131,12 @@ void dispatch_qmv_fast(
     array& out,
     int M, int N, int K,
     int group_size, int bits,
-    Device& d,
+    metal::Device& d,
     const Stream& s) {
 
     int B = static_cast<int>(out.size()) / M / N;
     bool batched = B > 1;
     bool fast_aligned = (N % 8 == 0) && (K % 512 == 0);
-    std::string variant = fast_aligned ? "qmv_fast" : "qmv";
     std::string kname = (fast_aligned
         ? qmv_fast_kname(type_str(x.dtype()), group_size, bits, batched)
         : ("affine_qmv_" + type_str(x.dtype())
@@ -157,14 +158,14 @@ void dispatch_qmv_fast(
     enc.set_bytes(K, c++);
     enc.set_bytes(N, c++);
 
-    int bn = 8, bk = 32;
-    MTL::Size group_dims(bk, 2, 1);
+    int bn = 16, bk = 32;
+    MTL::Size group_dims(bk, 4, 1);
     MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
     enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 // ---------------------------------------------------------------------------
-// qmv_wide dispatch (2-bit small-batch)
+// qmv_wide dispatch (called from eval_gpu)
 // ---------------------------------------------------------------------------
 
 void dispatch_qmv_wide(
@@ -175,7 +176,7 @@ void dispatch_qmv_wide(
     array& out,
     int M, int N, int K,
     int group_size, int bits,
-    Device& d,
+    metal::Device& d,
     const Stream& s) {
 
     int B = static_cast<int>(out.size()) / M / N;
@@ -186,7 +187,7 @@ void dispatch_qmv_wide(
     int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
     // affine mode uses k_lanes=8 (more rows/simdgroup)
     int k_lanes = 8;
-    int num_simdgroups = 2;
+    int num_simdgroups = 4;
     int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
     std::string kname = qmv_wide_kname(
@@ -214,11 +215,126 @@ void dispatch_qmv_wide(
     enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
+
+// BonsaiQmvPrimitive: wraps qmv_fast and qmv_wide dispatch.
+//   inputs[0] = x  (row-contiguous activations)
+//   inputs[1] = w  (packed quantized weights)
+//   inputs[2] = scales
+//   inputs[3] = biases
+class BonsaiQmvPrimitive : public Primitive {
+ public:
+    BonsaiQmvPrimitive(Stream s, int bits, bool wide)
+        : Primitive(s), bits_(bits), wide_(wide) {}
+
+ private:
+    int bits_;
+    bool wide_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error("BonsaiQmvPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        const auto& x      = inputs[0];
+        const auto& w      = inputs[1];
+        const auto& scales = inputs[2];
+        const auto& biases = inputs[3];
+
+        int64_t pack = (bits_ == 1) ? 8 : (32 / bits_);
+        int64_t K = static_cast<int64_t>(w.shape(-1)) * pack;
+        int N = static_cast<int>(w.shape(-2));
+        int M = static_cast<int>(x.size()) / static_cast<int>(K);
+        int group_size = derive_group_size(w, scales, bits_);
+
+        if (wide_) {
+            dispatch_qmv_wide(x, w, scales, biases, out,
+                              M, N, static_cast<int>(K),
+                              group_size, bits_, d, s);
+        } else {
+            dispatch_qmv_fast(x, w, scales, biases, out,
+                              M, N, static_cast<int>(K),
+                              group_size, bits_, d, s);
+        }
+    }
+
+    DEFINE_NAME(BonsaiQmvPrimitive)
+};
+
+// BonsaiSpecDecodePrimitive: wraps spec_decode_verify kernel.
+//   inputs[0] = draft  [B, K] int32
+//   inputs[1] = target [B, K+1, V] float
+//   outputs[0] = n_accepted [B] int32
+//   outputs[1] = committed  [B, K+1] int32
+class BonsaiSpecDecodePrimitive : public Primitive {
+ public:
+    explicit BonsaiSpecDecodePrimitive(Stream s) : Primitive(s) {}
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error("BonsaiSpecDecodePrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+
+        auto& n_accepted = outputs[0];
+        auto& committed  = outputs[1];
+        n_accepted.set_data(mlx::core::allocator::malloc(n_accepted.nbytes()));
+        committed.set_data(mlx::core::allocator::malloc(committed.nbytes()));
+
+        const auto& draft  = inputs[0];
+        const auto& target = inputs[1];
+
+        int B = draft.shape(0);
+        int K = draft.shape(1);
+
+        auto kernel = get_bonsai_kernel(d, "spec_decode_verify");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        enc.set_input_array(draft,       0);
+        enc.set_input_array(target,      1);
+        enc.set_output_array(n_accepted, 2);
+        enc.set_output_array(committed,  3);
+        enc.set_bytes(K, 4);
+        enc.set_bytes(B, 5);
+
+        int tgroup = std::min(B, 256);
+        MTL::Size grid_dims(B, 1, 1);
+        MTL::Size group_dims(tgroup, 1, 1);
+        enc.dispatch_threads(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(BonsaiSpecDecodePrimitive)
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+// Helper: ensure scales and biases match x's dtype so the Metal kernel
+// (which reads them as T = x's dtype) gets correct data.
+static array ensure_dtype(const array& a, Dtype dt, const Stream& s) {
+    return (a.dtype() == dt) ? a : astype(a, dt, s);
+}
 
 array bonsai_q1_affine_qmv(
     const array& x,
@@ -227,22 +343,51 @@ array bonsai_q1_affine_qmv(
     const array& biases,
     StreamOrDevice s_) {
     auto s = to_stream(s_);
-    auto& d = metal::device(s.device);
-
     auto x_c = ensure_row_contiguous(x, s);
-    int64_t K = static_cast<int64_t>(w.shape(-1)) * 8;  // 1-bit: 8 per byte
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
     int N = static_cast<int>(w.shape(-2));
-    int M = static_cast<int>(x_c.size()) / static_cast<int>(K);
-    int group_size = derive_group_size(w, scales, 1);
-
     auto out_shape = x_c.shape();
     out_shape.back() = N;
-    array out(out_shape, x_c.dtype(), nullptr, {});
-    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 1, /*wide=*/false),
+        {x_c, w, sc, bi});
+}
 
-    dispatch_qmv_fast(x_c, w, scales, biases, out, M, N, static_cast<int>(K),
-                      group_size, 1, d, s);
-    return out;
+array bonsai_q2_affine_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 2, /*wide=*/false),
+        {x_c, w, sc, bi});
+}
+
+array bonsai_q1_affine_qmv_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 1, /*wide=*/true),
+        {x_c, w, sc, bi});
 }
 
 array bonsai_q2_affine_qmv_wide(
@@ -252,22 +397,15 @@ array bonsai_q2_affine_qmv_wide(
     const array& biases,
     StreamOrDevice s_) {
     auto s = to_stream(s_);
-    auto& d = metal::device(s.device);
-
     auto x_c = ensure_row_contiguous(x, s);
-    int64_t K = static_cast<int64_t>(w.shape(-1)) * 4;  // 2-bit: 4 per byte
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
     int N = static_cast<int>(w.shape(-2));
-    int M = static_cast<int>(x_c.size()) / static_cast<int>(K);
-    int group_size = derive_group_size(w, scales, 2);
-
     auto out_shape = x_c.shape();
     out_shape.back() = N;
-    array out(out_shape, x_c.dtype(), nullptr, {});
-    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-
-    dispatch_qmv_wide(x_c, w, scales, biases, out, M, N, static_cast<int>(K),
-                      group_size, 2, d, s);
-    return out;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 2, /*wide=*/true),
+        {x_c, w, sc, bi});
 }
 
 std::pair<array, array> bonsai_spec_decode_verify(
@@ -275,32 +413,12 @@ std::pair<array, array> bonsai_spec_decode_verify(
     const array& target,
     StreamOrDevice s_) {
     auto s = to_stream(s_);
-    auto& d = metal::device(s.device);
-
     int B = draft.shape(0);
     int K = draft.shape(1);
 
-    auto n_accepted = array({B},     mlx::core::int32, nullptr, {});
-    auto committed  = array({B, K+1}, mlx::core::int32, nullptr, {});
-    n_accepted.set_data(mlx::core::allocator::malloc(n_accepted.nbytes()));
-    committed.set_data(mlx::core::allocator::malloc(committed.nbytes()));
-
-    auto kernel = get_bonsai_kernel(d, "spec_decode_verify");
-    auto& enc = metal::get_command_encoder(s);
-    enc.set_compute_pipeline_state(kernel);
-
-    enc.set_input_array(draft,      0);
-    enc.set_input_array(target,     1);
-    enc.set_output_array(n_accepted, 2);
-    enc.set_output_array(committed,  3);
-    enc.set_bytes(K, 4);
-    enc.set_bytes(B, 5);
-
-    int tgroup = std::min(B, 256);
-    MTL::Size grid_dims(B, 1, 1);
-    MTL::Size group_dims(tgroup, 1, 1);
-    enc.dispatch_threads(grid_dims, group_dims);
-
+    auto primitive = std::make_shared<BonsaiSpecDecodePrimitive>(s);
+    array n_accepted({B},      mlx::core::int32, primitive, {draft, target});
+    array committed ({B, K+1}, mlx::core::int32, primitive, {draft, target});
     return {n_accepted, committed};
 }
 
