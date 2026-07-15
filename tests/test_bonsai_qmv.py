@@ -790,3 +790,156 @@ class TestT5FormatDetection:
         object.__setattr__(layer, "weight", mx.zeros((16, 3), dtype=mx.uint8))
         second = _is_t5_format(layer)
         assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Identity I-I: attention scale fold
+# ---------------------------------------------------------------------------
+
+class _FakeAttentionWithQNorm(mx.nn.Module if hasattr(mx, 'nn') else object):
+    """Minimal stub: q_proj (QuantizedLinear) + q_norm (RMSNorm) + scale."""
+    pass
+
+
+def _make_attn_module_with_q_norm(head_dim: int = 128, N: int = 64, K: int = 64):
+    """Build a minimal attention-like module with q_proj + q_norm + scale."""
+    import mlx.nn as nn_inner
+    mod = types.SimpleNamespace()
+    # q_proj: quantized linear (4-bit, standard)
+    q_proj = nn_inner.QuantizedLinear.__new__(nn_inner.QuantizedLinear)
+    n_groups = K // 64
+    object.__setattr__(q_proj, "weight", mx.zeros((N, K // 16), dtype=mx.uint32))
+    object.__setattr__(q_proj, "scales", mx.ones((N, n_groups), dtype=mx.float16))
+    object.__setattr__(q_proj, "biases", mx.zeros((N, n_groups), dtype=mx.float16))
+    object.__setattr__(q_proj, "bits", 4)
+    object.__setattr__(q_proj, "group_size", 64)
+    object.__setattr__(q_proj, "mode", "affine")
+    mod.q_proj = q_proj
+    # q_norm: RMSNorm with learnable weight
+    q_norm = nn_inner.RMSNorm(head_dim)
+    mx.eval(q_norm.weight)
+    mod.q_norm = q_norm
+    # scale: Python float (head_dim**-0.5)
+    mod.scale = head_dim ** -0.5
+    return mod
+
+
+def _make_attn_module_no_q_norm(head_dim: int = 128, N: int = 64, K: int = 64):
+    """Build a minimal attention-like module with q_proj but NO q_norm."""
+    import mlx.nn as nn_inner
+    mod = types.SimpleNamespace()
+    q_proj = nn_inner.QuantizedLinear.__new__(nn_inner.QuantizedLinear)
+    n_groups = K // 64
+    scales = mx.ones((N, n_groups), dtype=mx.float16)
+    object.__setattr__(q_proj, "weight", mx.zeros((N, K // 16), dtype=mx.uint32))
+    object.__setattr__(q_proj, "scales", scales)
+    object.__setattr__(q_proj, "biases", mx.zeros((N, n_groups), dtype=mx.float16))
+    object.__setattr__(q_proj, "bits", 4)
+    object.__setattr__(q_proj, "group_size", 64)
+    object.__setattr__(q_proj, "mode", "affine")
+    mod.q_proj = q_proj
+    mod.scale = head_dim ** -0.5
+    return mod
+
+
+import types
+
+
+class TestAttnScaleFold:
+    """Identity I-I: row-constant fold into q_norm.weight / q_proj.scales."""
+
+    def test_fold_into_q_norm_weight(self):
+        """scale gets folded into q_norm.weight; module.scale becomes 1.0."""
+        from omlx.patches.attn_scale_fold import _fold_one
+        head_dim = 128
+        mod = _make_attn_module_with_q_norm(head_dim=head_dim)
+        original_scale = float(mod.scale)
+        original_w = np.array(mod.q_norm.weight.tolist())
+
+        folded = _fold_one(mod, "self_attn")
+
+        assert folded is True
+        assert mod.scale == 1.0
+        new_w = np.array(mod.q_norm.weight.tolist())
+        np.testing.assert_allclose(new_w, original_w * original_scale, rtol=1e-3)
+
+    def test_fold_q_norm_output_is_identical(self):
+        """After fold, q_norm(x) * original_scale == q_norm_folded(x)."""
+        import mlx.nn as nn_inner
+        from omlx.patches.attn_scale_fold import _fold_one
+        head_dim = 64
+        mod = _make_attn_module_with_q_norm(head_dim=head_dim)
+        original_scale = float(mod.scale)
+
+        rng = np.random.default_rng(42)
+        x = mx.array(rng.standard_normal((1, head_dim)).astype(np.float32))
+
+        # output before fold
+        before = mod.q_norm(x) * original_scale
+        mx.eval(before)
+
+        _fold_one(mod, "self_attn")
+
+        # output after fold — scale is now 1.0, baked into q_norm.weight
+        after = mod.q_norm(x) * mod.scale  # mod.scale == 1.0
+        mx.eval(after)
+
+        np.testing.assert_allclose(
+            np.array(before.tolist()), np.array(after.tolist()), rtol=1e-4
+        )
+
+    def test_fold_into_q_proj_scales_no_q_norm(self):
+        """Without q_norm, scale folds into q_proj.scales."""
+        from omlx.patches.attn_scale_fold import _fold_one
+        head_dim = 128
+        mod = _make_attn_module_no_q_norm(head_dim=head_dim)
+        original_scale = float(mod.scale)
+        original_scales = np.array(mod.q_proj.scales.tolist())
+
+        folded = _fold_one(mod, "self_attn")
+
+        assert folded is True
+        assert mod.scale == 1.0
+        new_scales = np.array(mod.q_proj.scales.tolist())
+        np.testing.assert_allclose(
+            new_scales, original_scales * original_scale, rtol=1e-3
+        )
+
+    def test_already_folded_is_noop(self):
+        """Calling fold twice leaves module unchanged on second call."""
+        from omlx.patches.attn_scale_fold import _fold_one
+        mod = _make_attn_module_with_q_norm(head_dim=64)
+        _fold_one(mod, "self_attn")
+        w_after_first = np.array(mod.q_norm.weight.tolist())
+
+        folded_again = _fold_one(mod, "self_attn")
+
+        assert folded_again is False
+        np.testing.assert_array_equal(
+            np.array(mod.q_norm.weight.tolist()), w_after_first
+        )
+
+    def test_no_scale_attribute_is_noop(self):
+        """Module without scale attribute is skipped."""
+        from omlx.patches.attn_scale_fold import _fold_one
+        mod = types.SimpleNamespace(q_proj=None, q_norm=None)
+        assert _fold_one(mod, "x") is False
+
+    def test_apply_attn_scale_fold_traverses_nested(self):
+        """apply_attn_scale_fold finds modules nested under a parent."""
+        from omlx.patches.attn_scale_fold import apply_attn_scale_fold
+        import mlx.nn as nn_inner
+
+        class FakeModel(nn_inner.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn_inner.Module()
+                mod = _make_attn_module_with_q_norm(head_dim=64)
+                self.attn.q_proj = mod.q_proj
+                self.attn.q_norm = mod.q_norm
+                self.attn.scale = mod.scale
+
+        model = FakeModel()
+        n = apply_attn_scale_fold(model)
+        assert n == 1
+        assert model.attn.scale == 1.0

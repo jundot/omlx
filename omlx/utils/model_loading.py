@@ -639,6 +639,7 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
 
     Currently supports:
     - IndexCache: skip redundant indexer computation in DSA layers
+    - attn_scale_fold (I-I): fold head_dim**-0.5 into q_norm.weight / q_proj.scales
 
     Args:
         model: A loaded mlx-lm model instance.
@@ -647,6 +648,17 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
+    # Identity I-I: row-constant fold — always applied when possible.
+    # Folds the attention softmax scale (head_dim**-0.5) into q_norm.weight
+    # (or q_proj.scales for models without q_norm), eliminating a per-token
+    # elementwise multiply and kernel dispatch. Safe for all model types;
+    # skips silently if no foldable modules are found.
+    try:
+        from ..patches.attn_scale_fold import apply_attn_scale_fold
+        apply_attn_scale_fold(model)
+    except Exception as e:
+        logger.debug("attn_scale_fold skipped: %s", e)
+
     if model_settings is None:
         return model
 
