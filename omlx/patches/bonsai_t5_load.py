@@ -32,6 +32,17 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from omlx.custom_kernels.bonsai.fast import (
+    bonsai_t5_qmv,
+    bonsai_t5_qmv_wide,
+    bonsai_t5_qmm,
+    has_native,
+)
+
+# M threshold below which qmv kernels are used; above this bonsai_t5_qmm is used.
+# Must match _T5_PREFILL_THRESHOLD in bonsai_qmv.py.
+_T5_PREFILL_THRESHOLD = 16
+
 logger = logging.getLogger(__name__)
 
 _original_load_weights = None
@@ -148,34 +159,23 @@ def _t5_quantized_matmul(
         )
 
     # t5 uint8 weight routing:
-    #   Decode (M ≤ 16): fast Metal qmv kernels — weight bytes read once.
-    #   Prefill (M > 16): qmv_wide re-reads weights ceil(M/5) times across
-    #     threadgroup tiles; for M=512 that's 103× DRAM traffic.  Dequantize
-    #     to float16 once and use MLX matmul (weights read exactly twice,
-    #     independent of M).
-    from omlx.custom_kernels.bonsai.fast import (
-        bonsai_t5_qmv,
-        bonsai_t5_qmv_wide,
-        has_native,
-    )
+    #   Decode (M ≤ _T5_PREFILL_THRESHOLD): fast Metal qmv kernels — weight bytes
+    #     read once per vector.
+    #   Prefill (M > threshold): fused MMA GEMM (I-M) — reads each weight byte
+    #     exactly once regardless of M, no float weight materialisation.
     M = x.shape[-2] if x.ndim >= 2 else 1
 
-    if has_native() and M <= 16:
-        sc = scales.astype(x.dtype)
+    if has_native() and M <= _T5_PREFILL_THRESHOLD:
+        # scales dtype coercion is handled by the C++ ensure_dtype layer.
         if M >= 2:
-            return bonsai_t5_qmv_wide(x, w, sc)
-        return bonsai_t5_qmv(x, w, sc)
+            return bonsai_t5_qmv_wide(x, w, scales)
+        return bonsai_t5_qmv(x, w, scales)
 
-    # Prefill path (M > 16): use fused t5 MMA GEMM (Identity I-M).
-    # This reads each weight byte exactly once without materialising float weights.
-    from omlx.custom_kernels.bonsai.fast import bonsai_t5_qmm, has_native
     if has_native():
         x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-        # bonsai_t5_qmm expects transpose=True semantics (w stores rows, so out[m,n]=x@w[n].T)
-        out_flat = bonsai_t5_qmm(x_flat, w, scales.astype(x.dtype))
+        out_flat = bonsai_t5_qmm(x_flat, w, scales)
         out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
         if not transpose:
-            # This case shouldn't occur in practice (all callers use transpose=True)
             return out.mT
         return out
 
@@ -212,10 +212,9 @@ def free_t5_biases(model: nn.Module) -> int:
 
     Call once immediately after model.load_weights() / mlx_vlm.load().
 
-    Returns bytes freed (approximate).
+    Returns bytes freed (approximate — actual reclaim depends on Python GC
+    collecting the replaced bias tensors after model.update()).
     """
-    from mlx.utils import tree_flatten, tree_unflatten
-
     params = dict(tree_flatten(model.parameters()))
     _tiny = mx.zeros((1,), dtype=mx.float16)
     updates: list[tuple[str, mx.array]] = []

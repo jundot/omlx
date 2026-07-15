@@ -1294,6 +1294,8 @@ METAL_FUNC uint t5_div3(uint v)  { return (v * 171u) >> 9u; }
 METAL_FUNC uint t5_div9(uint v)  { return (v * 228u) >> 11u; }  // ⌊v/9⌋
 METAL_FUNC uint t5_div27(uint v) { return (v * 76u)  >> 11u; }  // ⌊v/27⌋
 // ⌊v/81⌋ ∈ {0,1,2}: two independent comparisons, no multiply needed.
+// Precondition: v ∈ [0, 242] (max valid t5 byte = 3^5 − 1 = 242).
+// v=243 cannot appear in a validly-encoded t5 stream, so v/81 ≤ 2 always.
 METAL_FUNC uint t5_div81(uint v) { return uint(v >= 81u) + uint(v >= 162u); }
 
 // ---------------------------------------------------------------------------
@@ -1319,7 +1321,7 @@ METAL_FUNC uint t5_div81(uint v) { return uint(v >= 81u) + uint(v >= 162u); }
 // Each thread strides over groups at step SIMD_SIZE=32.  For n_groups=56
 // (K=7168, gs=128) threads 0-23 get 2 groups, threads 24-31 get 1 group.
 // No pre-scaling trick (incompatible with base-3); direct divmod per byte.
-template <typename T, int group_size, bool batched = false>
+template <typename T, int group_size>
 METAL_FUNC void qmv_fast_t5_impl(
     const device uint8_t* w,     // (N, n_groups * bytes_per_group) t5 bytes
     const device T* scales,      // (N, n_groups) scale per group
@@ -1471,7 +1473,7 @@ METAL_FUNC void qmv_fast_t5_impl(
 // Amortises the weight stream across all M vectors (Identity I-C):
 // decode each t5 byte once, multiply with all M activations.
 // k_lanes threads stride over groups, results_per_simdgroup=SIMD_SIZE/k_lanes.
-template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool batched = false>
+template <typename T, int group_size, int vecs_per_tg, int k_lanes>
 METAL_FUNC void qmv_wide_t5_impl(
     const device uint8_t* w,
     const device T* scales,

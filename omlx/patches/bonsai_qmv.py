@@ -74,6 +74,22 @@ def _get_cached_scales_biases(
     return sc, bi
 
 
+def _get_cached_t5_scales(self: nn.QuantizedLinear, dtype: Any) -> mx.array:
+    """Return t5 scales cast to `dtype`, caching the result on the layer.
+
+    t5 is always symmetric (no biases), so only scales need caching.
+    Analogous to _get_cached_scales_biases for the non-t5 path.
+    """
+    cache_attr = "_bonsai_t5_sc_cache"
+    cache = getattr(self, cache_attr, None)
+    if cache is None or cache[0] != dtype:
+        sc = self.scales.astype(dtype)
+        mx.eval(sc)
+        object.__setattr__(self, cache_attr, (dtype, sc))
+    _, sc = getattr(self, cache_attr)
+    return sc
+
+
 def _is_symmetric(self: nn.QuantizedLinear, bits: int) -> bool:
     """Return True if biases == -scales * ratio (identity I-B), cached per layer.
 
@@ -185,11 +201,11 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     # Prefill (M > threshold): qmv_wide re-reads weights ceil(M/5) times per
     # threadgroup — for M=512 that's 103× DRAM traffic.  Dequantize once to
     # float16 and hand off to MLX's optimised matmul instead.
-    if mode == "affine" and bits == 2 and _is_t5_format(self):
+    if mode == "affine" and _is_t5_format(self):
         if M > _T5_PREFILL_THRESHOLD:
             return _t5_dequant_matmul(self, x)
         w = self.weight
-        scales = self.scales.astype(x.dtype)
+        scales = _get_cached_t5_scales(self, x.dtype)
         if M >= 2:
             out = bonsai_t5_qmv_wide(x, w, scales)
         else:

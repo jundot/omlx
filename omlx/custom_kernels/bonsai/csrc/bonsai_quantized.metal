@@ -147,7 +147,10 @@ bonsai_qmv_wide_sym_types(128, 2)
 // ~1.585 bpw vs 2.0 bpw; always symmetric (no bias tensor).
 // Only gs=64 and gs=128 (the two Bonsai group sizes).
 
-template <typename T, int group_size, bool batched>
+// t5 qmv kernels have no batch dimension — always B=1 in practice and the
+// batched template parameter was never read by the implementations.
+// A single instantiation per (type, gs) avoids ~60 dead kernel variants.
+template <typename T, int group_size>
 [[kernel]] void affine_qmv_fast_t5(
     const device uint8_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -159,11 +162,11 @@ template <typename T, int group_size, bool batched>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]])
 {
-    qmv_fast_t5_impl<T, group_size, batched>(
+    qmv_fast_t5_impl<T, group_size>(
         w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool batched>
+template <typename T, int group_size, int vecs_per_tg, int k_lanes>
 [[kernel]] void affine_qmv_wide_t5(
     const device uint8_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -176,39 +179,30 @@ template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool batched
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]])
 {
-    qmv_wide_t5_impl<T, group_size, vecs_per_tg, k_lanes, batched>(
+    qmv_wide_t5_impl<T, group_size, vecs_per_tg, k_lanes>(
         w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
 }
 
-#define bonsai_instantiate_qmv_fast_t5(type, gs, batched)                  \
+#define bonsai_instantiate_qmv_fast_t5(type, gs)                            \
   instantiate_kernel(                                                        \
-      "affine_qmv_fast_t5_" #type "_gs_" #gs "_batch_" #batched,           \
-      affine_qmv_fast_t5, type, gs, batched)
+      "affine_qmv_fast_t5_" #type "_gs_" #gs,                               \
+      affine_qmv_fast_t5, type, gs)
 
-#define bonsai_instantiate_qmv_wide_t5(type, gs, nv, kl, batch)            \
+#define bonsai_instantiate_qmv_wide_t5(type, gs, nv, kl)                   \
   instantiate_kernel(                                                        \
-      "affine_qmv_wide_t5_" #type "_gs_" #gs "_nv_" #nv "_kl_" #kl        \
-          "_batch_" #batch,                                                  \
-      affine_qmv_wide_t5, type, gs, nv, kl, batch)
-
-#define bonsai_qmv_fast_t5_bits(type, gs)                                   \
-  bonsai_instantiate_qmv_fast_t5(type, gs, 0)                               \
-  bonsai_instantiate_qmv_fast_t5(type, gs, 1)
+      "affine_qmv_wide_t5_" #type "_gs_" #gs "_nv_" #nv "_kl_" #kl,       \
+      affine_qmv_wide_t5, type, gs, nv, kl)
 
 #define bonsai_qmv_fast_t5_types(gs)                                        \
-  bonsai_qmv_fast_t5_bits(float, gs)                                        \
-  bonsai_qmv_fast_t5_bits(float16_t, gs)                                    \
-  bonsai_qmv_fast_t5_bits(bfloat16_t, gs)
+  bonsai_instantiate_qmv_fast_t5(float, gs)                                 \
+  bonsai_instantiate_qmv_fast_t5(float16_t, gs)                             \
+  bonsai_instantiate_qmv_fast_t5(bfloat16_t, gs)
 
 #define bonsai_qmv_wide_t5_gs(type, gs)                                     \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 2, 8, 0)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 2, 8, 1)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 3, 8, 0)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 3, 8, 1)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 4, 8, 0)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 4, 8, 1)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 5, 8, 0)                        \
-  bonsai_instantiate_qmv_wide_t5(type, gs, 5, 8, 1)
+  bonsai_instantiate_qmv_wide_t5(type, gs, 2, 8)                           \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 3, 8)                           \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 4, 8)                           \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 5, 8)
 
 #define bonsai_qmv_wide_t5_types(gs)                                        \
   bonsai_qmv_wide_t5_gs(float, gs)                                          \

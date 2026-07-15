@@ -142,23 +142,19 @@ int derive_t5_group_size(const array& w, const array& scales) {
 // t5 kernel name helpers
 // ---------------------------------------------------------------------------
 
-// affine_qmv_fast_t5_<type>_gs_<gs>_batch_<0|1>
-std::string qmv_fast_t5_kname(
-    const std::string& type, int group_size, bool batched) {
+// affine_qmv_fast_t5_<type>_gs_<gs>
+std::string qmv_fast_t5_kname(const std::string& type, int group_size) {
     return "affine_qmv_fast_t5_" + type
-        + "_gs_" + std::to_string(group_size)
-        + (batched ? "_batch_1" : "_batch_0");
+        + "_gs_" + std::to_string(group_size);
 }
 
-// affine_qmv_wide_t5_<type>_gs_<gs>_nv_<nv>_kl_<kl>_batch_<0|1>
+// affine_qmv_wide_t5_<type>_gs_<gs>_nv_<nv>_kl_<kl>
 std::string qmv_wide_t5_kname(
-    const std::string& type, int group_size,
-    int vecs_per_tg, int k_lanes, bool batched) {
+    const std::string& type, int group_size, int vecs_per_tg, int k_lanes) {
     return "affine_qmv_wide_t5_" + type
         + "_gs_" + std::to_string(group_size)
         + "_nv_" + std::to_string(vecs_per_tg)
-        + "_kl_" + std::to_string(k_lanes)
-        + (batched ? "_batch_1" : "_batch_0");
+        + "_kl_" + std::to_string(k_lanes);
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +173,7 @@ void dispatch_qmv_fast_t5(
     metal::Device& d,
     const Stream& s) {
 
-    int B = static_cast<int>(out.size()) / M / N;
-    bool batched = B > 1;
-    std::string kname = qmv_fast_t5_kname(type_str(x.dtype()), group_size, batched);
+    std::string kname = qmv_fast_t5_kname(type_str(x.dtype()), group_size);
 
     auto kernel = get_bonsai_kernel(d, kname);
     auto& enc = metal::get_command_encoder(s);
@@ -195,7 +189,7 @@ void dispatch_qmv_fast_t5(
 
     int bn = 16, bk = 32;
     MTL::Size group_dims(bk, 4, 1);
-    MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+    MTL::Size grid_dims(M, (N + bn - 1) / bn, 1);
     enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -209,9 +203,6 @@ void dispatch_qmv_wide_t5(
     metal::Device& d,
     const Stream& s) {
 
-    int B = static_cast<int>(out.size()) / M / N;
-    bool batched = B > 1;
-
     int n_tiles = (M + 4) / 5;
     int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
     int k_lanes = 8;
@@ -219,7 +210,7 @@ void dispatch_qmv_wide_t5(
     int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
     std::string kname = qmv_wide_t5_kname(
-        type_str(x.dtype()), group_size, vecs_per_tg, k_lanes, batched);
+        type_str(x.dtype()), group_size, vecs_per_tg, k_lanes);
 
     auto kernel = get_bonsai_kernel(d, kname);
     auto& enc = metal::get_command_encoder(s);
@@ -238,7 +229,7 @@ void dispatch_qmv_wide_t5(
     MTL::Size grid_dims(
         (M + vecs_per_tg - 1) / vecs_per_tg,
         (N + rows_per_tg - 1) / rows_per_tg,
-        B);
+        1);
     enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
