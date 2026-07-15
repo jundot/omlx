@@ -395,6 +395,112 @@ def test_spec_decode_verify_routes_to_ext_when_available(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Symmetric detection and routing (identity I-B)
+# ---------------------------------------------------------------------------
+
+
+def _make_sym_layer(bits: int, N: int = 64, K: int = 256, group_size: int = 128):
+    """QuantizedLinear with biases = -scales * ratio (symmetric Bonsai layout)."""
+    import mlx.nn as nn_inner
+    ratio = 0.5 if bits == 1 else 1.0
+    pack = 32 // bits
+    layer = nn_inner.QuantizedLinear.__new__(nn_inner.QuantizedLinear)
+    scales = mx.ones((N, K // group_size), dtype=mx.float16)
+    biases = mx.full((N, K // group_size), -ratio, dtype=mx.float16)
+    weight = mx.zeros((N, K // pack), dtype=mx.uint32)
+    object.__setattr__(layer, "weight", weight)
+    object.__setattr__(layer, "scales", scales)
+    object.__setattr__(layer, "biases", biases)
+    object.__setattr__(layer, "bits", bits)
+    object.__setattr__(layer, "group_size", group_size)
+    object.__setattr__(layer, "mode", "affine")
+    return layer
+
+
+def test_is_symmetric_detects_bonsai_1bit():
+    from omlx.patches.bonsai_qmv import _is_symmetric
+    layer = _make_sym_layer(bits=1)
+    assert _is_symmetric(layer, bits=1) is True
+
+
+def test_is_symmetric_detects_bonsai_2bit():
+    from omlx.patches.bonsai_qmv import _is_symmetric
+    layer = _make_sym_layer(bits=2)
+    assert _is_symmetric(layer, bits=2) is True
+
+
+def test_is_symmetric_rejects_non_symmetric():
+    from omlx.patches.bonsai_qmv import _is_symmetric
+    layer = _make_sym_layer(bits=1)
+    # Corrupt one bias entry
+    bad_biases = mx.full((64, 2), -0.3, dtype=mx.float16)
+    object.__setattr__(layer, "biases", bad_biases)
+    assert _is_symmetric(layer, bits=1) is False
+
+
+def test_is_symmetric_cached():
+    from omlx.patches.bonsai_qmv import _is_symmetric
+    layer = _make_sym_layer(bits=1)
+    first = _is_symmetric(layer, bits=1)
+    # Alter biases — cached value should still be returned
+    object.__setattr__(layer, "biases", mx.zeros((64, 2), dtype=mx.float16))
+    second = _is_symmetric(layer, bits=1)
+    assert first == second
+
+
+def test_sym_q1_fast_py_fallback_routes_to_same_mlx(monkeypatch):
+    """Symmetric q1 fast fallback calls mx.quantized_matmul with same args as affine."""
+    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    calls = []
+
+    def recording_qmm(x, w, *, scales, biases, transpose, group_size, bits, stream=None):
+        calls.append({"bits": bits, "group_size": group_size})
+        return mx.zeros((1, 64), dtype=mx.float16)
+
+    monkeypatch.setattr(mx, "quantized_matmul", recording_qmm)
+    x, w, scales, biases = _make_q1_tensors()
+    biases_sym = -scales * 0.5
+    bonsai_fast.bonsai_q1_affine_qmv_sym(x, w, scales, biases_sym)
+    # Fallback when ext is None: sym delegates to affine which calls quantized_matmul
+    assert calls, "quantized_matmul should have been called"
+    assert calls[0]["bits"] == 1
+
+
+def test_sym_q2_fast_py_fallback_routes_to_same_mlx(monkeypatch):
+    """Symmetric q2 fast fallback calls mx.quantized_matmul."""
+    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    calls = []
+
+    def recording_qmm(x, w, *, scales, biases, transpose, group_size, bits, stream=None):
+        calls.append({"bits": bits})
+        return mx.zeros((1, 64), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(mx, "quantized_matmul", recording_qmm)
+    x, w, scales, biases = _make_q2_tensors(M=1)
+    biases_sym = -scales
+    bonsai_fast.bonsai_q2_affine_qmv_sym(x, w, scales, biases_sym)
+    assert calls, "quantized_matmul should have been called"
+    assert calls[0]["bits"] == 2
+
+
+def test_sym_routes_to_ext_when_available(monkeypatch):
+    called = {}
+
+    def fake_sym(x, w, scales, biases, stream=None):
+        called["fired"] = True
+        return mx.zeros((1, 64), dtype=mx.float16)
+
+    fake_ext = SimpleNamespace(
+        bonsai_q1_affine_qmv_sym=fake_sym,
+        abi_probe=lambda a: 1,
+    )
+    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
+    x, w, scales, biases = _make_q1_tensors()
+    bonsai_fast.bonsai_q1_affine_qmv_sym(x, w, scales, biases)
+    assert called.get("fired") is True
+
+
+# ---------------------------------------------------------------------------
 # apply_bonsai_qmv_patch lifecycle
 # ---------------------------------------------------------------------------
 

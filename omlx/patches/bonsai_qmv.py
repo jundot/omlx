@@ -31,6 +31,10 @@ import mlx.nn as nn
 from omlx.custom_kernels.bonsai.fast import (
     bonsai_q1_affine_qmv,
     bonsai_q2_affine_qmv,
+    bonsai_q1_affine_qmv_sym,
+    bonsai_q2_affine_qmv_sym,
+    bonsai_q1_affine_qmv_wide_sym,
+    bonsai_q2_affine_qmv_wide_sym,
     bonsai_qmv_wide,
     has_native,
     _use_qmv_wide,
@@ -61,6 +65,30 @@ def _get_cached_scales_biases(
     return sc, bi
 
 
+def _is_symmetric(self: nn.QuantizedLinear, bits: int) -> bool:
+    """Return True if biases == -scales * ratio (identity I-B), cached per layer.
+
+    1-bit: ratio = 0.5  (bias = -scale/2)
+    2-bit: ratio = 1.0  (bias = -scale)
+
+    Evaluated once on the first call; result is cached as _bonsai_sym_cache.
+    """
+    cache_attr = "_bonsai_sym_cache"
+    cached = getattr(self, cache_attr, None)
+    if cached is not None:
+        return cached
+    if bits not in (1, 2):
+        object.__setattr__(self, cache_attr, False)
+        return False
+    ratio = 0.5 if bits == 1 else 1.0
+    try:
+        result = bool(mx.allclose(self.biases, -self.scales * ratio, atol=1e-4).item())
+    except Exception:
+        result = False
+    object.__setattr__(self, cache_attr, result)
+    return result
+
+
 def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
     """Replacement for QuantizedLinear.__call__ for 1-bit and 2-bit layers."""
     bits: int = getattr(self, "bits", 4)
@@ -78,14 +106,25 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     # Cache scales/biases cast to x's dtype (Metal kernel reads them as T).
     scales, biases = _get_cached_scales_biases(self, x.dtype)
 
+    sym = _is_symmetric(self, bits)
+
     if _use_qmv_wide(bits, M):
         # M>=3 on gen-15+: stream weights once across all M vectors
-        out = bonsai_qmv_wide(x, w, scales, biases, bits=bits)
+        if sym and bits == 1:
+            out = bonsai_q1_affine_qmv_wide_sym(x, w, scales, biases)
+        elif sym and bits == 2:
+            out = bonsai_q2_affine_qmv_wide_sym(x, w, scales, biases)
+        else:
+            out = bonsai_qmv_wide(x, w, scales, biases, bits=bits)
     elif bits == 1:
-        out = bonsai_q1_affine_qmv(x, w, scales, biases)
+        out = (bonsai_q1_affine_qmv_sym if sym else bonsai_q1_affine_qmv)(
+            x, w, scales, biases
+        )
     else:
         # 2-bit M=1 or M=2: qmv_fast
-        out = bonsai_q2_affine_qmv(x, w, scales, biases)
+        out = (bonsai_q2_affine_qmv_sym if sym else bonsai_q2_affine_qmv)(
+            x, w, scales, biases
+        )
 
     # QuantizedLinear may have a bias term (separate from quantization biases).
     linear_bias = getattr(self, "bias", None)

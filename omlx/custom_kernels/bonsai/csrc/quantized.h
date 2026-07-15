@@ -873,7 +873,7 @@ METAL_FUNC void qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool symmetric = false>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -909,7 +909,9 @@ METAL_FUNC void qmv_fast_impl(
 
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  if constexpr (!symmetric) {
+    biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  }
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
@@ -921,16 +923,26 @@ METAL_FUNC void qmv_fast_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
 
       U s = sl[0];
-      U b = bl[0];
+      U b;
+      if constexpr (symmetric) {
+        // I-B: bias = -scale * ratio; no DRAM load needed.
+        // bits=1: bias = -scale/2 (q in {0,1}, dequant = scale*(q-0.5))
+        // bits=2: bias = -scale   (q in {0,1,2}, dequant = scale*(q-1))
+        b = -s * U(bits == 1 ? 0.5f : 1.0f);
+      } else {
+        const device T* bl = biases + row * in_vec_size_g;
+        b = bl[0];
+      }
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
     scales += block_size / group_size;
-    biases += block_size / group_size;
+    if constexpr (!symmetric) {
+      biases += block_size / group_size;
+    }
     x += block_size;
   }
 
@@ -947,10 +959,15 @@ METAL_FUNC void qmv_fast_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
 
       U s = in_bounds ? (U)sl[0] : (U)0;
-      U b = in_bounds ? (U)bl[0] : (U)0;
+      U b;
+      if constexpr (symmetric) {
+        b = -s * U(bits == 1 ? 0.5f : 1.0f);
+      } else {
+        const device T* bl = biases + row * in_vec_size_g;
+        b = in_bounds ? (U)bl[0] : (U)0;
+      }
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
     }
   }
@@ -1127,7 +1144,7 @@ METAL_FUNC void qmv_impl(
 // Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
 // each group is decoded in 8-value sub-chunks (scale * q + bias, registers
 // bounded for any group_size) and reused across the vecs_per_tg vectors.
-template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, bool symmetric = false>
 METAL_FUNC void qmv_wide_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1159,7 +1176,8 @@ METAL_FUNC void qmv_wide_impl(
   const int in_vec_size_g = in_vec_size / group_size;
   const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
   const device T* srow = scales + row * in_vec_size_g;
-  const device T* brow = biases + row * in_vec_size_g;
+  // brow not declared when symmetric=true; DCE'd by compiler when false.
+  const device T* brow = symmetric ? nullptr : biases + row * in_vec_size_g;
 
   const device T* xv[vecs_per_tg];
   for (int v = 0; v < vecs_per_tg; v++) {
@@ -1172,7 +1190,14 @@ METAL_FUNC void qmv_wide_impl(
   // 8-value sub-chunks and reuse each chunk across the streamed vectors.
   for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
     U scale = srow[g];
-    U bias = brow[g];
+    // I-B: symmetric layers have bias = -scale * ratio; no DRAM load.
+    // bits=1: ratio=0.5 (bias=-scale/2), bits=2: ratio=1.0 (bias=-scale)
+    U bias;
+    if constexpr (symmetric) {
+      bias = -scale * U(bits == 1 ? 0.5f : 1.0f);
+    } else {
+      bias = brow[g];
+    }
     // Precompute once per group; compiler dead-code-eliminates unused vars.
     U spb  = scale + bias;          // bits==1: lut[1]; bits==2: lut[1]
     U lut2 = fma(U(2), scale, bias); // bits==2: lut[2]; eliminated otherwise
@@ -1826,6 +1851,40 @@ template <typename T, int group_size, int bits, bool batched>
       simd_lid);
 }
 
+// Symmetric variant: skips biases DRAM load; computes bias = -scale*ratio (I-B).
+template <typename T, int group_size, int bits, bool batched>
+[[kernel]] void affine_qmv_fast_sym(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],  // bound but not read
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& x_batch_ndims [[buffer(7)]],
+    const constant int* x_shape [[buffer(8)]],
+    const constant int64_t* x_strides [[buffer(9)]],
+    const constant int& w_batch_ndims [[buffer(10)]],
+    const constant int* w_shape [[buffer(11)]],
+    const constant int64_t* w_strides [[buffer(12)]],
+    const constant int64_t* s_strides [[buffer(13)]],
+    const constant int64_t* b_strides [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched) {
+    int M = x_shape[x_batch_ndims];
+    adjust_matrix_offsets<T>(
+        x, w, scales, biases, y,
+        out_vec_size * M,
+        x_batch_ndims, x_shape, x_strides,
+        w_batch_ndims, w_shape, w_strides,
+        s_strides, b_strides, tid);
+  }
+  qmv_fast_impl<T, group_size, bits, /*symmetric=*/true>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 template <typename T, const int group_size, const int bits, bool batched>
 [[kernel]] void affine_qmv(
     const device uint32_t* w [[buffer(0)]],
@@ -1935,6 +1994,40 @@ template <
       tid,
       simd_gid,
       simd_lid);
+}
+
+// Symmetric wide variant: skips biases DRAM load (I-B).
+template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes, bool batched>
+[[kernel]] void affine_qmv_wide_sym(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,  // bound but not read
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    const constant int64_t* b_strides,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched) {
+    adjust_matrix_offsets<T>(
+        x, w, scales, biases, y,
+        out_vec_size * M,
+        x_batch_ndims, x_shape, x_strides,
+        w_batch_ndims, w_shape, w_strides,
+        s_strides, b_strides, tid);
+  }
+  qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes, /*symmetric=*/true>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
 }
 
 template <typename T, const int group_size, const int bits, bool batched>

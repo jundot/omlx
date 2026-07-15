@@ -46,6 +46,30 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "bonsai_q1_affine_qmv_sym",
+        &omlx::bonsai_kernels::bonsai_q1_affine_qmv_sym,
+        "x"_a, "w"_a, "scales"_a, "biases"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "bonsai_q2_affine_qmv_sym",
+        &omlx::bonsai_kernels::bonsai_q2_affine_qmv_sym,
+        "x"_a, "w"_a, "scales"_a, "biases"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "bonsai_q1_affine_qmv_wide_sym",
+        &omlx::bonsai_kernels::bonsai_q1_affine_qmv_wide_sym,
+        "x"_a, "w"_a, "scales"_a, "biases"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "bonsai_q2_affine_qmv_wide_sym",
+        &omlx::bonsai_kernels::bonsai_q2_affine_qmv_wide_sym,
+        "x"_a, "w"_a, "scales"_a, "biases"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "bonsai_spec_decode_verify",
         &omlx::bonsai_kernels::bonsai_spec_decode_verify,
         "draft"_a, "target"_a,

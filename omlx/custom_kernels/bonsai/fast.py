@@ -291,6 +291,63 @@ def bonsai_qmv_wide(
 
 
 # ---------------------------------------------------------------------------
+# Symmetric decode variants (identity I-B: bias = -scale*ratio)
+# ---------------------------------------------------------------------------
+
+
+def bonsai_q1_affine_qmv_sym(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """1-bit symmetric qmv: skips biases DRAM load (I-B: bias = -scale/2)."""
+    if _ext is not None and has_symbol("bonsai_q1_affine_qmv_sym"):
+        return _ext.bonsai_q1_affine_qmv_sym(x, w, scales, biases, stream=stream)
+    return bonsai_q1_affine_qmv(x, w, scales, biases, stream=stream)
+
+
+def bonsai_q2_affine_qmv_sym(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """2-bit symmetric qmv: skips biases DRAM load (I-B: bias = -scale)."""
+    if _ext is not None and has_symbol("bonsai_q2_affine_qmv_sym"):
+        return _ext.bonsai_q2_affine_qmv_sym(x, w, scales, biases, stream=stream)
+    return bonsai_q2_affine_qmv(x, w, scales, biases, stream=stream)
+
+
+def bonsai_q1_affine_qmv_wide_sym(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """1-bit symmetric wide qmv: skips biases DRAM load (I-B)."""
+    if _ext is not None and has_symbol("bonsai_q1_affine_qmv_wide_sym"):
+        return _ext.bonsai_q1_affine_qmv_wide_sym(x, w, scales, biases, stream=stream)
+    return bonsai_q1_affine_qmv(x, w, scales, biases, stream=stream)
+
+
+def bonsai_q2_affine_qmv_wide_sym(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """2-bit symmetric wide qmv: skips biases DRAM load (I-B)."""
+    if _ext is not None and has_symbol("bonsai_q2_affine_qmv_wide_sym"):
+        return _ext.bonsai_q2_affine_qmv_wide_sym(x, w, scales, biases, stream=stream)
+    return bonsai_q2_affine_qmv_wide(x, w, scales, biases, stream=stream)
+
+
+# ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------
 

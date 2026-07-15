@@ -79,6 +79,34 @@ array bonsai_q2_affine_qmv_wide(
 // draft  : [B, K]     int32 — drafted token ids
 // target : [B, K+1]   int32 — target argmax tokens (caller runs argmax first)
 // Returns {n_accepted [B], committed [B, K+1]}.
+array bonsai_q1_affine_qmv_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s = {});
+
+array bonsai_q2_affine_qmv_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s = {});
+
+array bonsai_q1_affine_qmv_wide_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s = {});
+
+array bonsai_q2_affine_qmv_wide_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,

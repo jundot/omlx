@@ -87,4 +87,59 @@ bonsai_qmv_wide_types(128, 1)
 bonsai_qmv_wide_types(32, 2)
 bonsai_qmv_wide_types(64, 2)
 bonsai_qmv_wide_types(128, 2)
+
+// ---- symmetric variants (identity I-B: bias = -scale*ratio, no DRAM load) --
+// Only instantiated for bits=1 and bits=2 (the only Bonsai quantization widths).
+
+#define bonsai_instantiate_qmv_fast_sym(type, group_size, bits, batched)     \
+  instantiate_kernel(                                                         \
+      "affine_qmv_fast_sym_" #type "_gs_" #group_size "_b_" #bits            \
+          "_batch_" #batched,                                                 \
+      affine_qmv_fast_sym, type, group_size, bits, batched)
+
+#define bonsai_instantiate_qmv_wide_sym(type, group_size, bits, nv, kl, batch) \
+  instantiate_kernel(                                                          \
+      "affine_qmv_wide_sym_" #type "_gs_" #group_size "_b_" #bits             \
+          "_nv_" #nv "_kl_" #kl "_batch_" #batch,                             \
+      affine_qmv_wide_sym, type, group_size, bits, nv, kl, batch)
+
+#define bonsai_qmv_fast_sym_bits(type, gs, bits) \
+  bonsai_instantiate_qmv_fast_sym(type, gs, bits, 0) \
+  bonsai_instantiate_qmv_fast_sym(type, gs, bits, 1)
+
+#define bonsai_qmv_fast_sym_types(gs, bits) \
+  bonsai_qmv_fast_sym_bits(float, gs, bits) \
+  bonsai_qmv_fast_sym_bits(float16_t, gs, bits) \
+  bonsai_qmv_fast_sym_bits(bfloat16_t, gs, bits)
+
+#define bonsai_qmv_wide_sym_bit(type, gs, bits) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 2, 8, 0) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 2, 8, 1) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 3, 8, 0) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 3, 8, 1) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 4, 8, 0) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 4, 8, 1) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 5, 8, 0) \
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 5, 8, 1)
+
+#define bonsai_qmv_wide_sym_types(gs, bits) \
+  bonsai_qmv_wide_sym_bit(float, gs, bits) \
+  bonsai_qmv_wide_sym_bit(float16_t, gs, bits) \
+  bonsai_qmv_wide_sym_bit(bfloat16_t, gs, bits)
+
+// qmv_fast_sym: bits=1 and bits=2
+bonsai_qmv_fast_sym_types(32, 1)
+bonsai_qmv_fast_sym_types(64, 1)
+bonsai_qmv_fast_sym_types(128, 1)
+bonsai_qmv_fast_sym_types(32, 2)
+bonsai_qmv_fast_sym_types(64, 2)
+bonsai_qmv_fast_sym_types(128, 2)
+
+// qmv_wide_sym: bits=1 and bits=2
+bonsai_qmv_wide_sym_types(32, 1)
+bonsai_qmv_wide_sym_types(64, 1)
+bonsai_qmv_wide_sym_types(128, 1)
+bonsai_qmv_wide_sym_types(32, 2)
+bonsai_qmv_wide_sym_types(64, 2)
+bonsai_qmv_wide_sym_types(128, 2)
 // clang-format on

@@ -84,20 +84,24 @@ array ensure_row_contiguous(const array& x, const Stream& s) {
 // Kernel name construction
 // ---------------------------------------------------------------------------
 
-// affine_qmv_fast_<type>_gs_<gs>_b_<bits>_batch_<0|1>
+// affine_qmv_fast_[sym_]<type>_gs_<gs>_b_<bits>_batch_<0|1>
 std::string qmv_fast_kname(
-    const std::string& type, int group_size, int bits, bool batched) {
-    return "affine_qmv_fast_" + type
+    const std::string& type, int group_size, int bits, bool batched,
+    bool symmetric = false) {
+    return std::string(symmetric ? "affine_qmv_fast_sym_" : "affine_qmv_fast_")
+        + type
         + "_gs_" + std::to_string(group_size)
         + "_b_"  + std::to_string(bits)
         + (batched ? "_batch_1" : "_batch_0");
 }
 
-// affine_qmv_wide_<type>_gs_<gs>_b_<bits>_nv_<nv>_kl_<kl>_batch_<0|1>
+// affine_qmv_wide_[sym_]<type>_gs_<gs>_b_<bits>_nv_<nv>_kl_<kl>_batch_<0|1>
 std::string qmv_wide_kname(
     const std::string& type, int group_size, int bits,
-    int vecs_per_tg, int k_lanes, bool batched) {
-    return "affine_qmv_wide_" + type
+    int vecs_per_tg, int k_lanes, bool batched,
+    bool symmetric = false) {
+    return std::string(symmetric ? "affine_qmv_wide_sym_" : "affine_qmv_wide_")
+        + type
         + "_gs_" + std::to_string(group_size)
         + "_b_"  + std::to_string(bits)
         + "_nv_" + std::to_string(vecs_per_tg)
@@ -132,13 +136,17 @@ void dispatch_qmv_fast(
     int M, int N, int K,
     int group_size, int bits,
     metal::Device& d,
-    const Stream& s) {
+    const Stream& s,
+    bool symmetric = false) {
 
     int B = static_cast<int>(out.size()) / M / N;
     bool batched = B > 1;
     bool fast_aligned = (N % 8 == 0) && (K % 512 == 0);
+    // Symmetric fallback: only symmetric fast kernel exists; fall through to
+    // affine_qmv (non-fast) for unaligned shapes when symmetric is true, or
+    // use the affine path entirely when the shape fails the fast_aligned gate.
     std::string kname = (fast_aligned
-        ? qmv_fast_kname(type_str(x.dtype()), group_size, bits, batched)
+        ? qmv_fast_kname(type_str(x.dtype()), group_size, bits, batched, symmetric)
         : ("affine_qmv_" + type_str(x.dtype())
             + "_gs_" + std::to_string(group_size)
             + "_b_"  + std::to_string(bits)
@@ -177,7 +185,8 @@ void dispatch_qmv_wide(
     int M, int N, int K,
     int group_size, int bits,
     metal::Device& d,
-    const Stream& s) {
+    const Stream& s,
+    bool symmetric = false) {
 
     int B = static_cast<int>(out.size()) / M / N;
     bool batched = B > 1;
@@ -191,7 +200,7 @@ void dispatch_qmv_wide(
     int rows_per_tg = (32 / k_lanes) * num_simdgroups;
 
     std::string kname = qmv_wide_kname(
-        type_str(x.dtype()), group_size, bits, vecs_per_tg, k_lanes, batched);
+        type_str(x.dtype()), group_size, bits, vecs_per_tg, k_lanes, batched, symmetric);
 
     auto kernel = get_bonsai_kernel(d, kname);
     auto& enc = metal::get_command_encoder(s);
@@ -226,12 +235,13 @@ void dispatch_qmv_wide(
 //   inputs[3] = biases
 class BonsaiQmvPrimitive : public Primitive {
  public:
-    BonsaiQmvPrimitive(Stream s, int bits, bool wide)
-        : Primitive(s), bits_(bits), wide_(wide) {}
+    BonsaiQmvPrimitive(Stream s, int bits, bool wide, bool symmetric = false)
+        : Primitive(s), bits_(bits), wide_(wide), symmetric_(symmetric) {}
 
  private:
     int bits_;
     bool wide_;
+    bool symmetric_;
 
     void eval_cpu(
         const std::vector<array>& /* inputs */,
@@ -261,11 +271,11 @@ class BonsaiQmvPrimitive : public Primitive {
         if (wide_) {
             dispatch_qmv_wide(x, w, scales, biases, out,
                               M, N, static_cast<int>(K),
-                              group_size, bits_, d, s);
+                              group_size, bits_, d, s, symmetric_);
         } else {
             dispatch_qmv_fast(x, w, scales, biases, out,
                               M, N, static_cast<int>(K),
-                              group_size, bits_, d, s);
+                              group_size, bits_, d, s, symmetric_);
         }
     }
 
@@ -405,6 +415,78 @@ array bonsai_q2_affine_qmv_wide(
     out_shape.back() = N;
     return array(out_shape, x_c.dtype(),
         std::make_shared<BonsaiQmvPrimitive>(s, 2, /*wide=*/true),
+        {x_c, w, sc, bi});
+}
+
+array bonsai_q1_affine_qmv_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 1, /*wide=*/false, /*symmetric=*/true),
+        {x_c, w, sc, bi});
+}
+
+array bonsai_q2_affine_qmv_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 2, /*wide=*/false, /*symmetric=*/true),
+        {x_c, w, sc, bi});
+}
+
+array bonsai_q1_affine_qmv_wide_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 1, /*wide=*/true, /*symmetric=*/true),
+        {x_c, w, sc, bi});
+}
+
+array bonsai_q2_affine_qmv_wide_sym(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    auto bi  = ensure_dtype(biases, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiQmvPrimitive>(s, 2, /*wide=*/true, /*symmetric=*/true),
         {x_c, w, sc, bi});
 }
 
