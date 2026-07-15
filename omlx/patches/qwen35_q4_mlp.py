@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _LINEAR_PATCHED = False
 _LM_LINEAR_PATCHED = False
-_SUPPORTED_QMM_BITS = frozenset((4, 5, 6, 8))
+_SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
 _Q8_MIN_TOKENS = 16384
 
 
@@ -56,7 +56,8 @@ def _is_supported_affine_linear_shape(
         return False
     if ndim < 2 or seq_len <= 1:
         return False
-    if getattr(linear, "group_size", None) != 64:
+    group_size = getattr(linear, "group_size", None)
+    if group_size not in (64, 128):
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
@@ -84,7 +85,7 @@ def _is_supported_affine_linear_shape(
         return False
     if scales.shape != biases.shape:
         return False
-    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // 64
+    return scales.shape[0] == weight.shape[0] and scales.shape[1] == input_dim // group_size
 
 
 def _is_supported_affine_linear(linear: Any, x: mx.array) -> bool:
@@ -150,7 +151,8 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
         return linear(x)
     if not _is_supported_affine_linear(linear, x):
         return linear(x)
-    return qmm(x, linear.weight, linear.scales, linear.biases, variant)
+    gs = int(getattr(linear, "group_size", 64))
+    return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
 
 
 def _make_patched_mlp(

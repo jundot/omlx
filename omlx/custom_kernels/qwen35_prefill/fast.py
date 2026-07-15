@@ -64,6 +64,7 @@ _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 NATIVE_SYMBOLS = (
     "qwen35_fa256_attention",
+    "qwen35_q2_affine_qmm_t",
     "qwen35_q4_affine_qmm_t",
     "qwen35_q5_affine_qmm_t",
     "qwen35_q6_affine_qmm_t",
@@ -286,12 +287,37 @@ def qwen35_fa256_attention(
     raise RuntimeError("qwen35_fa256_attention native kernel is unavailable")
 
 
+def qwen35_q2_affine_qmm_t(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    variant: int = 8,
+    group_size: int = 64,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "qwen35_q2_affine_qmm_t"):
+        return _ext.qwen35_q2_affine_qmm_t(
+            x,
+            weight,
+            scales,
+            biases,
+            variant,
+            **_qmm_nax_kwargs(),
+            group_size=group_size,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("qwen35_q2_affine_qmm_t native kernel is unavailable")
+
+
 def qwen35_q4_affine_qmm_t(
     x: mx.array,
     weight: mx.array,
     scales: mx.array,
     biases: mx.array,
     variant: int = 8,
+    group_size: int = 64,
     *,
     stream=None,
 ) -> mx.array:
@@ -303,6 +329,7 @@ def qwen35_q4_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
+            group_size=group_size,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q4_affine_qmm_t native kernel is unavailable")
@@ -314,6 +341,7 @@ def qwen35_q5_affine_qmm_t(
     scales: mx.array,
     biases: mx.array,
     variant: int = 8,
+    group_size: int = 64,
     *,
     stream=None,
 ) -> mx.array:
@@ -325,6 +353,7 @@ def qwen35_q5_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
+            group_size=group_size,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q5_affine_qmm_t native kernel is unavailable")
@@ -336,6 +365,7 @@ def qwen35_q6_affine_qmm_t(
     scales: mx.array,
     biases: mx.array,
     variant: int = 8,
+    group_size: int = 64,
     *,
     stream=None,
 ) -> mx.array:
@@ -347,6 +377,7 @@ def qwen35_q6_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
+            group_size=group_size,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q6_affine_qmm_t native kernel is unavailable")
@@ -358,6 +389,7 @@ def qwen35_q8_affine_qmm_t(
     scales: mx.array,
     biases: mx.array,
     variant: int = 8,
+    group_size: int = 64,
     *,
     stream=None,
 ) -> mx.array:
@@ -369,6 +401,7 @@ def qwen35_q8_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
+            group_size=group_size,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q8_affine_qmm_t native kernel is unavailable")

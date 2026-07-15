@@ -78,11 +78,11 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     # Cache scales/biases cast to x's dtype (Metal kernel reads them as T).
     scales, biases = _get_cached_scales_biases(self, x.dtype)
 
-    if bits == 1:
-        out = bonsai_q1_affine_qmv(x, w, scales, biases)
-    elif _use_qmv_wide(bits, M):
-        # M>=3 on gen-15+: amortise weight loads across M vectors
+    if _use_qmv_wide(bits, M):
+        # M>=3 on gen-15+: stream weights once across all M vectors
         out = bonsai_qmv_wide(x, w, scales, biases, bits=bits)
+    elif bits == 1:
+        out = bonsai_q1_affine_qmv(x, w, scales, biases)
     else:
         # 2-bit M=1 or M=2: qmv_fast
         out = bonsai_q2_affine_qmv(x, w, scales, biases)

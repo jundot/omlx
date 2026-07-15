@@ -70,7 +70,7 @@ struct QwenQAffineNaxVariant {
 };
 
 bool qwen_q_affine_bits_supported(int bits) {
-  return bits == 4 || bits == 5 || bits == 6 || bits == 8;
+  return bits == 2 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
 bool qwen_q_affine_packed_shape_matches(int packed_dim, int K, int bits) {
@@ -524,15 +524,22 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       int bits,
       int variant,
       bool use_nax,
-      int nax_variant)
+      int nax_variant,
+      int group_size)
       : Primitive(stream),
         bits_(bits),
         variant_(variant),
         use_nax_(use_nax),
-        nax_variant_(nax_variant) {
+        nax_variant_(nax_variant),
+        group_size_(group_size) {
     if (!qwen_q_affine_bits_supported(bits_)) {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm bits " << bits_ << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (group_size_ != 64 && group_size_ != 128) {
+      std::ostringstream msg;
+      msg << "Unsupported Qwen affine qmm group_size " << group_size_ << ".";
       throw std::invalid_argument(msg.str());
     }
     (void)qwen_q_affine_variant(variant_);
@@ -548,11 +555,15 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       const array& biases,
       int bits,
       int variant,
+      int group_size,
       Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
     if (!qwen_q_affine_bits_supported(bits)) {
+      return true;
+    }
+    if (group_size != 64 && group_size != 128) {
       return true;
     }
     if (x.dtype() != float16 && x.dtype() != bfloat16) {
@@ -571,7 +582,6 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       return true;
     }
 
-    constexpr int group_size = 64;
     const auto cfg = qwen_q_affine_variant(variant);
     const int K = x.shape(-1);
     const int N = weight.shape(0);
@@ -671,7 +681,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
         kname,
         "qwen35_q",
         bits_,
-        "_affine_qmm_t_",
+        group_size_ == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_",
         qwen_type_name(x.dtype()),
         "_bm_",
         cfg.bm,
@@ -691,10 +701,11 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
     const auto& rhs =
         static_cast<const Qwen35QAffineQmmTPrimitive&>(other);
     return bits_ == rhs.bits_ && variant_ == rhs.variant_ &&
-        use_nax_ == rhs.use_nax_ && nax_variant_ == rhs.nax_variant_;
+        use_nax_ == rhs.use_nax_ && nax_variant_ == rhs.nax_variant_ &&
+        group_size_ == rhs.group_size_;
   }
   auto state() const {
-    return std::make_tuple(bits_, variant_, use_nax_, nax_variant_);
+    return std::make_tuple(bits_, variant_, use_nax_, nax_variant_, group_size_);
   }
 
  private:
@@ -702,6 +713,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
   int variant_;
   bool use_nax_;
   int nax_variant_;
+  int group_size_;
 };
 
 class Qwen35MoeWeightedSumPrimitive : public Primitive {
@@ -915,6 +927,7 @@ array qwen35_q_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   (void)qwen_q_affine_variant(variant);
   if (!qwen_q_affine_bits_supported(bits)) {
@@ -923,19 +936,24 @@ array qwen35_q_affine_qmm_t(
         << "_affine_qmm_t] unsupported bits.";
     throw std::invalid_argument(msg.str());
   }
+  if (group_size != 64 && group_size != 128) {
+    std::ostringstream msg;
+    msg << "[omlx_qwen35_prefill.qwen35_q" << bits
+        << "_affine_qmm_t] unsupported group_size " << group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
 
   if (x.ndim() < 2 || weight.ndim() != 2 || scales.ndim() != 2 ||
       biases.ndim() != 2) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_q" << bits
         << "_affine_qmm_t] expected x [...,K], packed weight, "
-        << "scales/biases [N,K/64], got " << x.shape() << ", "
-        << weight.shape() << ", " << scales.shape() << ", "
+        << "scales/biases [N,K/" << group_size << "], got " << x.shape()
+        << ", " << weight.shape() << ", " << scales.shape() << ", "
         << biases.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
 
-  constexpr int group_size = 64;
   const int K = x.shape(-1);
   const int N = weight.shape(0);
   if (K <= 0 || N <= 0 || K % group_size != 0 ||
@@ -968,15 +986,15 @@ array qwen35_q_affine_qmm_t(
 
   auto stream = to_stream(s);
   if (Qwen35QAffineQmmTPrimitive::unsupported(
-          x, weight, scales, biases, bits, variant, stream)) {
+          x, weight, scales, biases, bits, variant, group_size, stream)) {
     throw std::invalid_argument(
         "[omlx_qwen35_prefill.qwen35_q_affine_qmm_t] unsupported shape.");
   }
 
-  // NAX candidacy: the classic variant above stays the validated fallback,
-  // so demote instead of throwing when the NAX tile does not fit or the
-  // runtime lacks tensor units / the NAX metallib.
-  bool nax = use_nax && is_nax_available() && nax_qmm_kernels_built() &&
+  // NAX only supports group_size=64; demote rather than throwing when the
+  // NAX tile does not fit or the runtime lacks tensor units / the NAX metallib.
+  bool nax = use_nax && group_size == 64 && is_nax_available() &&
+      nax_qmm_kernels_built() &&
       nax_qmm_runtime_ok.load(std::memory_order_relaxed);
   if (nax) {
     const auto nax_cfg = qwen_q_affine_nax_variant(nax_variant);
@@ -992,8 +1010,22 @@ array qwen35_q_affine_qmm_t(
       std::move(out_shape),
       x.dtype(),
       std::make_shared<Qwen35QAffineQmmTPrimitive>(
-          stream, bits, variant, nax, nax_variant),
+          stream, bits, variant, nax, nax_variant, group_size),
       std::move(inputs));
+}
+
+array qwen35_q2_affine_qmm_t(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    int variant,
+    bool use_nax,
+    int nax_variant,
+    int group_size,
+    StreamOrDevice s) {
+  return qwen35_q_affine_qmm_t(
+      x, weight, scales, biases, 2, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q4_affine_qmm_t(
@@ -1004,9 +1036,10 @@ array qwen35_q4_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 4, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 4, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q5_affine_qmm_t(
@@ -1017,9 +1050,10 @@ array qwen35_q5_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 5, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 5, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q6_affine_qmm_t(
@@ -1030,9 +1064,10 @@ array qwen35_q6_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 6, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 6, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q8_affine_qmm_t(
@@ -1043,9 +1078,10 @@ array qwen35_q8_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 8, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 8, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_moe_weighted_sum(

@@ -47,6 +47,18 @@ NB_MODULE(_ext, m) {
   // dispatch_budget kwarg, so the wrapper only forwards it when present.
   m.attr("FA256_HAS_DISPATCH_BUDGET") = true;
   m.def(
+      "qwen35_q2_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_q2_affine_qmm_t,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "variant"_a = 8,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
+      "group_size"_a = 64,
+      "stream"_a = nb::none());
+  m.def(
       "qwen35_q4_affine_qmm_t",
       &omlx::qwen35_prefill_kernels::qwen35_q4_affine_qmm_t,
       "x"_a,
@@ -56,6 +68,7 @@ NB_MODULE(_ext, m) {
       "variant"_a = 8,
       "use_nax"_a = false,
       "nax_variant"_a = 0,
+      "group_size"_a = 64,
       "stream"_a = nb::none());
   m.def(
       "qwen35_q5_affine_qmm_t",
@@ -67,6 +80,7 @@ NB_MODULE(_ext, m) {
       "variant"_a = 8,
       "use_nax"_a = false,
       "nax_variant"_a = 0,
+      "group_size"_a = 64,
       "stream"_a = nb::none());
   m.def(
       "qwen35_q6_affine_qmm_t",
@@ -78,6 +92,7 @@ NB_MODULE(_ext, m) {
       "variant"_a = 8,
       "use_nax"_a = false,
       "nax_variant"_a = 0,
+      "group_size"_a = 64,
       "stream"_a = nb::none());
   m.def(
       "qwen35_q8_affine_qmm_t",
@@ -89,6 +104,7 @@ NB_MODULE(_ext, m) {
       "variant"_a = 8,
       "use_nax"_a = false,
       "nax_variant"_a = 0,
+      "group_size"_a = 64,
       "stream"_a = nb::none());
   m.def(
       "qwen35_moe_weighted_sum",

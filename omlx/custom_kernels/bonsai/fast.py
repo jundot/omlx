@@ -211,24 +211,43 @@ def bonsai_q1_affine_qmv(
 
 
 def _infer_group_size(w: mx.array, scales: mx.array, bits: int) -> int:
-    """Derive group_size from packed weight / scale shapes."""
-    try:
-        K = w.shape[-1] * (32 // bits)
-        n_groups = scales.shape[-1]
-        return K // n_groups
-    except Exception:
-        return 64
+    """Derive group_size from packed weight / scale shapes.
+
+    Bonsai 1-bit weights use uint8 packing (8 values per byte); the MLX
+    standard format uses uint32 packing (32//bits values per element).
+    Detect the format from w.dtype to compute K correctly for both layouts.
+    """
+    if w.dtype == mx.uint8:
+        pack = 8   # Bonsai 1-bit uint8 format
+    else:
+        pack = 32 // bits  # MLX standard uint32 format
+    K = w.shape[-1] * pack
+    n_groups = scales.shape[-1]
+    if n_groups <= 0 or K <= 0:
+        raise ValueError(
+            f"_infer_group_size: invalid shapes — weight {w.shape} (dtype "
+            f"{w.dtype}), scale {scales.shape}, bits={bits}"
+        )
+    if K % n_groups != 0:
+        raise ValueError(
+            f"_infer_group_size: K={K} not divisible by n_groups={n_groups} "
+            f"(weight {w.shape} dtype {w.dtype}, scale {scales.shape}, bits={bits})"
+        )
+    return K // n_groups
 
 
 def _use_qmv_wide(bits: int, M: int) -> bool:
     """True when qmv_wide beats per-row qmv for these batch/bit settings.
 
-    For 2-bit M >= 3 on gen-15+, qmv_wide amortises weight loads across
-    all M vectors.  At M <= 2 the overhead isn't worth it.
-    1-bit always uses per-row qmv_fast (different kernel, no wide variant
-    in the hot path).
+    For bits ∈ {1, 2} at M >= 3 on gen-15+, qmv_wide amortises the full
+    weight-matrix stream across all M vectors (one stream vs M streams for
+    per-row qmv_fast).  At M <= 2 the dispatch overhead outweighs the gain.
+
+    1-bit wide is instantiated in bonsai_quantized.metal (nv=2..5) and has
+    been benchmarked to win at M >= 3; enabling it here unlocks weight reuse
+    for speculative decode and any other M>1 1-bit use.
     """
-    if bits != 2 or M < 3:
+    if bits not in (1, 2) or M < 3:
         return False
     return _arch_gen() >= 15
 

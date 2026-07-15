@@ -89,16 +89,18 @@ def test_arch_gen_device_info_exception(monkeypatch):
 @pytest.mark.parametrize(
     ("bits", "M", "gen", "expected"),
     [
-        # 1-bit always uses per-row qmv_fast
+        # M < 3: per-row qmv_fast for both 1-bit and 2-bit (overhead > gain)
         (1, 1, 15, False),
-        (1, 5, 18, False),
-        # 2-bit narrow (M < 3) stays with stock
+        (1, 2, 18, False),
         (2, 1, 15, False),
         (2, 2, 18, False),
-        # 2-bit M >= 3 on gen >= 15 → qmv_wide
+        # M >= 3 on gen >= 15 → qmv_wide for both 1-bit and 2-bit
+        (1, 3, 15, True),
+        (1, 5, 18, True),
         (2, 3, 15, True),
         (2, 5, 17, True),
-        # 2-bit M >= 3 on old hardware → fall back
+        # M >= 3 on old hardware (gen < 15) → fall back
+        (1, 3, 14, False),
         (2, 3, 14, False),
         (2, 5, 0, False),
     ],
