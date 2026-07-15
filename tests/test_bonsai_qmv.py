@@ -89,7 +89,7 @@ def test_arch_gen_device_info_exception(monkeypatch):
 @pytest.mark.parametrize(
     ("bits", "M", "gen", "expected"),
     [
-        # M < 3: per-row qmv_fast for both 1-bit and 2-bit (overhead > gain)
+        # M < 3: never use wide
         (1, 1, 15, False),
         (1, 2, 18, False),
         (2, 1, 15, False),
@@ -282,7 +282,7 @@ def test_qmv_wide_2bit_m2_falls_back_to_stock(monkeypatch):
 
 
 def test_qmv_wide_1bit_always_uses_qmv_fast(monkeypatch):
-    """bits=1 always routes through bonsai_q1_affine_qmv (per-row fast path)."""
+    """bits=1 always routes through qmv_fast (wide shows no benefit on M4 Max)."""
     monkeypatch.setattr(bonsai_fast, "_arch_gen_cache", 18)
     called = {}
 

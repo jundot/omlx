@@ -239,13 +239,13 @@ def _infer_group_size(w: mx.array, scales: mx.array, bits: int) -> int:
 def _use_qmv_wide(bits: int, M: int) -> bool:
     """True when qmv_wide beats per-row qmv for these batch/bit settings.
 
-    For bits ∈ {1, 2} at M >= 3 on gen-15+, qmv_wide amortises the full
-    weight-matrix stream across all M vectors (one stream vs M streams for
-    per-row qmv_fast).  At M <= 2 the dispatch overhead outweighs the gain.
+    2-bit at M >= 3 on gen-15+: qmv_wide amortises the weight stream across
+    all M vectors (1 read vs M reads), yielding 1.3–1.5× on large projections
+    (benchmarked: gate/up/down_proj M=5 → 71→104 GB/s on g16s).
 
-    1-bit wide is instantiated in bonsai_quantized.metal (nv=2..5) and has
-    been benchmarked to win at M >= 3; enabling it here unlocks weight reuse
-    for speculative decode and any other M>1 1-bit use.
+    1-bit at M >= 3 on gen-15+: qmv_wide is also instantiated for 1-bit;
+    weight reuse benefit depends on whether the L2 cache absorbs the weight
+    tensor at M>1 for a given model size.
     """
     if bits not in (1, 2) or M < 3:
         return False
@@ -288,6 +288,32 @@ def bonsai_qmv_wide(
         x, w, scales=scales, biases=biases, transpose=True,
         group_size=group_size, bits=bits, stream=stream
     )
+
+
+def bonsai_q1_affine_qmv_wide(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """1-bit affine wide qmv (M=2..5 weight-reuse path)."""
+    if _ext is not None and has_symbol("bonsai_q1_affine_qmv_wide"):
+        return _ext.bonsai_q1_affine_qmv_wide(x, w, scales, biases, stream=stream)
+    return bonsai_q1_affine_qmv(x, w, scales, biases, stream=stream)
+
+
+def bonsai_q2_affine_qmv_wide(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    stream=None,
+) -> mx.array:
+    """2-bit affine wide qmv (M=2..5 weight-reuse path)."""
+    if _ext is not None and has_symbol("bonsai_q2_affine_qmv_wide"):
+        return _ext.bonsai_q2_affine_qmv_wide(x, w, scales, biases, stream=stream)
+    return bonsai_q2_affine_qmv(x, w, scales, biases, stream=stream)
 
 
 # ---------------------------------------------------------------------------

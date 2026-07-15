@@ -109,10 +109,10 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     sym = _is_symmetric(self, bits)
 
     if _use_qmv_wide(bits, M):
-        # M>=3 on gen-15+: stream weights once across all M vectors
-        if sym and bits == 1:
+        # M>=3 on gen-15+: stream weights once across all M vectors (I-C)
+        if bits == 1 and sym:
             out = bonsai_q1_affine_qmv_wide_sym(x, w, scales, biases)
-        elif sym and bits == 2:
+        elif bits == 2 and sym:
             out = bonsai_q2_affine_qmv_wide_sym(x, w, scales, biases)
         else:
             out = bonsai_qmv_wide(x, w, scales, biases, bits=bits)
