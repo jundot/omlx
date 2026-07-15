@@ -168,12 +168,12 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     M = x.shape[-2] if x.ndim >= 2 else 1
 
     # t5 format: uint8 base-3 ternary weights — route before bits check.
+    # bonsai_t5_qmv_wide tiles M into groups of ≤5 in one kernel dispatch,
+    # so it handles arbitrarily large M without float weight materialisation.
     if mode == "affine" and bits == 2 and _is_t5_format(self):
-        if M > _MAX_DECODE_M:
-            return _t5_dequant_matmul(self, x)
         w = self.weight
         scales = self.scales.astype(x.dtype)
-        if _use_qmv_wide(2, M):
+        if M >= 2:
             out = bonsai_t5_qmv_wide(x, w, scales)
         else:
             out = bonsai_t5_qmv(x, w, scales)
