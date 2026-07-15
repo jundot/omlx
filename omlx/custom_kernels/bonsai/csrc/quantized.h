@@ -1701,24 +1701,17 @@ METAL_FUNC void qmm_t5_impl(
       const uint b_hi   = (ke - 1u) / 5u;        // last byte index  (inclusive)
 
       for (uint b = b_lo; b <= b_hi; b++) {
-        // Read t5 byte; pad with 1 (neutral trit=1→dq=0) if out of bounds
+        // Read t5 byte; pad with 1 (neutral trit=1→dq=0) if out of bounds.
+        // T5_TO_B4 LUT replaces 4 divmod chains: trit k = (p >> 2k) & 3.
         const uint bval = (n_ok && b < (uint)bpg) ? (uint)w[w_base + b] : 1u;
-        const uint d1 = t5_div3(bval);
-        const uint d2 = t5_div9(bval);
-        const uint d3 = t5_div27(bval);
-        const uint d4 = t5_div81(bval);
-        const uint t0 = bval - (d1 << 1u) - d1;
-        const uint t1 = d1   - (d2 << 1u) - d2;
-        const uint t2 = d2   - (d3 << 1u) - d3;
-        const uint t3 = d3   - (d4 << 1u) - d4;
-        const uint t4 = d4;
+        const uint p  = T5_TO_B4[bval];
         const uint bk = b * 5u;  // K-index of trit 0 of this byte
         // Write only the trits whose K-position falls in [ks, ke)
-        if (bk     >= ks && bk     < ke) ws[tl_row * ws_ld + bk    ] = T(sc * (float(t0) - 1.f));
-        if (bk+1u  >= ks && bk+1u  < ke) ws[tl_row * ws_ld + bk+1u ] = T(sc * (float(t1) - 1.f));
-        if (bk+2u  >= ks && bk+2u  < ke) ws[tl_row * ws_ld + bk+2u ] = T(sc * (float(t2) - 1.f));
-        if (bk+3u  >= ks && bk+3u  < ke) ws[tl_row * ws_ld + bk+3u ] = T(sc * (float(t3) - 1.f));
-        if (bk+4u  >= ks && bk+4u  < ke) ws[tl_row * ws_ld + bk+4u ] = T(sc * (float(t4) - 1.f));
+        if (bk     >= ks && bk     < ke) ws[tl_row * ws_ld + bk    ] = T(sc * (float( p        & 0x3u) - 1.f));
+        if (bk+1u  >= ks && bk+1u  < ke) ws[tl_row * ws_ld + bk+1u ] = T(sc * (float((p >> 2u) & 0x3u) - 1.f));
+        if (bk+2u  >= ks && bk+2u  < ke) ws[tl_row * ws_ld + bk+2u ] = T(sc * (float((p >> 4u) & 0x3u) - 1.f));
+        if (bk+3u  >= ks && bk+3u  < ke) ws[tl_row * ws_ld + bk+3u ] = T(sc * (float((p >> 6u) & 0x3u) - 1.f));
+        if (bk+4u  >= ks && bk+4u  < ke) ws[tl_row * ws_ld + bk+4u ] = T(sc * (float((p >> 8u) & 0x3u) - 1.f));
       }
     }
 
