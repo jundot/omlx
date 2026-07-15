@@ -1282,6 +1282,12 @@ METAL_FUNC void qmv_wide_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Realization 2.3 (I-K): Granlund-Montgomery magic divmod-3, exact for v ∈ [0,255].
+// ⌊v/3⌋ = (v·171) >> 9  — no integer divide instruction, pure multiply + shift.
+// Then v mod 3 = v − 3q = v − (q<<1) − q.
+METAL_FUNC uint t5_div3(uint v) { return (v * 171u) >> 9u; }
+
+// ---------------------------------------------------------------------------
 // t5: base-3 ternary packing (Identity I-D)
 //
 // Format: ceil(group_size/5) bytes per group, 5 trits per byte.
@@ -1344,25 +1350,26 @@ METAL_FUNC void qmv_fast_t5_impl(
       const U s = U(scales[cur_row * n_groups + g]);
       U accum = 0;
 
-      // Decode full_bytes bytes: each byte encodes exactly 5 trits.
-      // Sequential divmod-by-3; compiler emits multiply-shift (no hw div).
+      // Decode full_bytes bytes: 5 trits per byte via magic divmod-3 (I-K).
       for (int b = 0; b < full_bytes; b++) {
-        uint8_t v = wg[b];
+        uint v = uint(wg[b]);           // promote to uint for magic multiply-shift
+        uint q;
         const int base = b * 5;
-        accum += (U(v % 3) - 1.0f) * U(xg[base + 0]); v /= 3;
-        accum += (U(v % 3) - 1.0f) * U(xg[base + 1]); v /= 3;
-        accum += (U(v % 3) - 1.0f) * U(xg[base + 2]); v /= 3;
-        accum += (U(v % 3) - 1.0f) * U(xg[base + 3]); v /= 3;
-        accum += (U(v)     - 1.0f) * U(xg[base + 4]); // last trit: no div needed
+        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+0]); v = q;
+        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+1]); v = q;
+        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+2]); v = q;
+        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+3]); v = q;
+        accum += (U(v) - 1.0f) * U(xg[base+4]); // last trit: v already = trit value
       }
       // Last partial byte: rem_trits active trits (3 for gs=128, 4 for gs=64).
       if constexpr (rem_trits > 0) {
-        uint8_t v = wg[full_bytes];
+        uint v = uint(wg[full_bytes]);  // promote to uint for magic multiply-shift
+        uint q;
         const int base = full_bytes * 5;
-        if constexpr (rem_trits >= 1) { accum += (U(v % 3) - 1.0f) * U(xg[base + 0]); v /= 3; }
-        if constexpr (rem_trits >= 2) { accum += (U(v % 3) - 1.0f) * U(xg[base + 1]); v /= 3; }
-        if constexpr (rem_trits >= 3) { accum += (U(v % 3) - 1.0f) * U(xg[base + 2]); v /= 3; }
-        if constexpr (rem_trits >= 4) { accum += (U(v)     - 1.0f) * U(xg[base + 3]); }
+        if constexpr (rem_trits >= 1) { q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+0]); v = q; }
+        if constexpr (rem_trits >= 2) { q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+1]); v = q; }
+        if constexpr (rem_trits >= 3) { q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+2]); v = q; }
+        if constexpr (rem_trits >= 4) { accum += (U(v) - 1.0f) * U(xg[base+3]); }
       }
       result[row] += s * accum;
     }
@@ -1425,16 +1432,17 @@ METAL_FUNC void qmv_wide_t5_impl(
     const U s = U(srow[g]);
     const int k0 = g * group_size;
 
-    // Full bytes: decode 5 dequantized values and multiply with all M vecs.
+    // Full bytes: decode 5 dequantized values via magic divmod-3 (I-K), multiply all M vecs.
     for (int b = 0; b < full_bytes; b++) {
-      uint8_t v = wg[b];
+      uint v = uint(wg[b]);           // promote to uint for magic multiply-shift
+      uint q;
       const int base = k0 + b * 5;
       // Named variables avoid dynamic array indexing (prevents register spill).
-      U dq0 = s * (U(v % 3) - 1.0f); v /= 3;
-      U dq1 = s * (U(v % 3) - 1.0f); v /= 3;
-      U dq2 = s * (U(v % 3) - 1.0f); v /= 3;
-      U dq3 = s * (U(v % 3) - 1.0f); v /= 3;
-      U dq4 = s * (U(v)     - 1.0f);
+      q = t5_div3(v); U dq0 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
+      q = t5_div3(v); U dq1 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
+      q = t5_div3(v); U dq2 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
+      q = t5_div3(v); U dq3 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
+      U dq4 = s * (U(v) - 1.0f);
 #pragma unroll
       for (int vi = 0; vi < vecs_per_tg; vi++) {
         result[vi] += U(xv[vi][base + 0]) * dq0
@@ -1444,15 +1452,16 @@ METAL_FUNC void qmv_wide_t5_impl(
                     + U(xv[vi][base + 4]) * dq4;
       }
     }
-    // Last partial byte.
+    // Last partial byte via magic divmod-3 (I-K).
     if constexpr (rem_trits > 0) {
-      uint8_t v = wg[full_bytes];
+      uint v = uint(wg[full_bytes]);  // promote to uint for magic multiply-shift
+      uint q;
       const int base = k0 + full_bytes * 5;
       U dq0 = U(0), dq1 = U(0), dq2 = U(0), dq3 = U(0);
-      if constexpr (rem_trits >= 1) { dq0 = s * (U(v % 3) - 1.0f); v /= 3; }
-      if constexpr (rem_trits >= 2) { dq1 = s * (U(v % 3) - 1.0f); v /= 3; }
-      if constexpr (rem_trits >= 3) { dq2 = s * (U(v % 3) - 1.0f); v /= 3; }
-      if constexpr (rem_trits >= 4) { dq3 = s * (U(v)     - 1.0f); }
+      if constexpr (rem_trits >= 1) { q = t5_div3(v); dq0 = s*(U(v-(q<<1u)-q)-1.0f); v = q; }
+      if constexpr (rem_trits >= 2) { q = t5_div3(v); dq1 = s*(U(v-(q<<1u)-q)-1.0f); v = q; }
+      if constexpr (rem_trits >= 3) { q = t5_div3(v); dq2 = s*(U(v-(q<<1u)-q)-1.0f); v = q; }
+      if constexpr (rem_trits >= 4) { dq3 = s * (U(v) - 1.0f); }
 #pragma unroll
       for (int vi = 0; vi < vecs_per_tg; vi++) {
         if constexpr (rem_trits >= 1) result[vi] += U(xv[vi][base + 0]) * dq0;
