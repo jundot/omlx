@@ -1298,6 +1298,51 @@ METAL_FUNC uint t5_div27(uint v) { return (v * 76u)  >> 11u; }  // ⌊v/27⌋
 // v=243 cannot appear in a validly-encoded t5 stream, so v/81 ≤ 2 always.
 METAL_FUNC uint t5_div81(uint v) { return uint(v >= 81u) + uint(v >= 162u); }
 
+// T5_TO_B4: radix-conversion LUT — maps each t5 byte (0..242) to its 5 trits
+// repacked as 2-bit fields in a uint.  Field k occupies bits [2k+1 : 2k]:
+//   bits[1:0] = t0,  bits[3:2] = t1,  bits[5:4] = t2,
+//   bits[7:6] = t3,  bits[9:8] = t4,  tₖ ∈ {0,1,2}.
+//
+// This enables the same pre-scaling trick as 2-bit affine (I-L):
+//   x_pre[k] = x[k] × 4^{−k}
+//   x_pre[k] × (T5_TO_B4[v] & (3 << 2k))  =  x[k] × tₖ   (no division)
+// The −1 offset is absorbed via x_sum: result = s × (Σ x[k]tₖ − Σ x[k]).
+// 256 entries × 4 bytes = 1 KB; permanently L1-resident during GEMV.
+constant constexpr uint T5_TO_B4[256] = {
+    0x000, 0x001, 0x002, 0x004, 0x005, 0x006, 0x008, 0x009,
+    0x00A, 0x010, 0x011, 0x012, 0x014, 0x015, 0x016, 0x018,
+    0x019, 0x01A, 0x020, 0x021, 0x022, 0x024, 0x025, 0x026,
+    0x028, 0x029, 0x02A, 0x040, 0x041, 0x042, 0x044, 0x045,
+    0x046, 0x048, 0x049, 0x04A, 0x050, 0x051, 0x052, 0x054,
+    0x055, 0x056, 0x058, 0x059, 0x05A, 0x060, 0x061, 0x062,
+    0x064, 0x065, 0x066, 0x068, 0x069, 0x06A, 0x080, 0x081,
+    0x082, 0x084, 0x085, 0x086, 0x088, 0x089, 0x08A, 0x090,
+    0x091, 0x092, 0x094, 0x095, 0x096, 0x098, 0x099, 0x09A,
+    0x0A0, 0x0A1, 0x0A2, 0x0A4, 0x0A5, 0x0A6, 0x0A8, 0x0A9,
+    0x0AA, 0x100, 0x101, 0x102, 0x104, 0x105, 0x106, 0x108,
+    0x109, 0x10A, 0x110, 0x111, 0x112, 0x114, 0x115, 0x116,
+    0x118, 0x119, 0x11A, 0x120, 0x121, 0x122, 0x124, 0x125,
+    0x126, 0x128, 0x129, 0x12A, 0x140, 0x141, 0x142, 0x144,
+    0x145, 0x146, 0x148, 0x149, 0x14A, 0x150, 0x151, 0x152,
+    0x154, 0x155, 0x156, 0x158, 0x159, 0x15A, 0x160, 0x161,
+    0x162, 0x164, 0x165, 0x166, 0x168, 0x169, 0x16A, 0x180,
+    0x181, 0x182, 0x184, 0x185, 0x186, 0x188, 0x189, 0x18A,
+    0x190, 0x191, 0x192, 0x194, 0x195, 0x196, 0x198, 0x199,
+    0x19A, 0x1A0, 0x1A1, 0x1A2, 0x1A4, 0x1A5, 0x1A6, 0x1A8,
+    0x1A9, 0x1AA, 0x200, 0x201, 0x202, 0x204, 0x205, 0x206,
+    0x208, 0x209, 0x20A, 0x210, 0x211, 0x212, 0x214, 0x215,
+    0x216, 0x218, 0x219, 0x21A, 0x220, 0x221, 0x222, 0x224,
+    0x225, 0x226, 0x228, 0x229, 0x22A, 0x240, 0x241, 0x242,
+    0x244, 0x245, 0x246, 0x248, 0x249, 0x24A, 0x250, 0x251,
+    0x252, 0x254, 0x255, 0x256, 0x258, 0x259, 0x25A, 0x260,
+    0x261, 0x262, 0x264, 0x265, 0x266, 0x268, 0x269, 0x26A,
+    0x280, 0x281, 0x282, 0x284, 0x285, 0x286, 0x288, 0x289,
+    0x28A, 0x290, 0x291, 0x292, 0x294, 0x295, 0x296, 0x298,
+    0x299, 0x29A, 0x2A0, 0x2A1, 0x2A2, 0x2A4, 0x2A5, 0x2A6,
+    0x2A8, 0x2A9, 0x2AA, 0x000, 0x000, 0x000, 0x000, 0x000,
+    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000,
+};
+
 // ---------------------------------------------------------------------------
 // t5: base-3 ternary packing (Identity I-D)
 //
@@ -1318,9 +1363,14 @@ METAL_FUNC uint t5_div81(uint v) { return uint(v >= 81u) + uint(v >= 162u); }
 // qmv_fast_t5: single-batch decode (M=1).
 //
 // Thread geometry: same as qmv_fast_impl (4 simdgroups × 4 rows, 32 threads).
-// Each thread strides over groups at step SIMD_SIZE=32.  For n_groups=56
-// (K=7168, gs=128) threads 0-23 get 2 groups, threads 24-31 get 1 group.
-// No pre-scaling trick (incompatible with base-3); direct divmod per byte.
+// Each thread strides over groups at step SIMD_SIZE=32.
+//
+// Decode via T5_TO_B4 LUT + 2-bit pre-scaling trick (I-L):
+//   p = T5_TO_B4[byte]  — one constant-cache load replaces 4 divmod chains
+//   x_pre[k] = x[k] × 4^{−k}
+//   x_pre[k] × (p & (3<<2k))  =  x[k] × tₖ   (no integer division)
+//   result = s × (Σ x[k]tₖ − Σ x[k])           (−1 offset via x_sum)
+// x_sum is shared across all 4 rows, computed once per group.
 template <typename T, int group_size>
 METAL_FUNC void qmv_fast_t5_impl(
     const device uint8_t* w,     // (N, n_groups * bytes_per_group) t5 bytes
@@ -1333,10 +1383,9 @@ METAL_FUNC void qmv_fast_t5_impl(
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
 
-  // ceil(group_size / 5) bytes encode the group, last byte partially used.
   constexpr int bytes_per_group = (group_size + 4) / 5;
-  constexpr int full_bytes = group_size / 5;      // bytes with all 5 trits active
-  constexpr int rem_trits  = group_size % 5;      // active trits in last byte (3 or 4)
+  constexpr int full_bytes = group_size / 5;
+  constexpr int rem_trits  = group_size % 5;
   constexpr int num_simdgroups = 4;
   constexpr int results_per_simdgroup = 4;
 
@@ -1348,13 +1397,8 @@ METAL_FUNC void qmv_fast_t5_impl(
                        simd_gid * results_per_simdgroup;
 
   const device T* x_batch = x + tid.x * in_vec_size;
-
-  // Interleaved 4-row decode: all results_per_simdgroup row chains run in
-  // lockstep so the GPU can issue t5_div3 for all rows before any single
-  // chain's result is ready, hiding the ~4-cycle multiply-shift latency.
-  // Fast path handles the common case (all rows in bounds); the boundary
-  // fallback covers the last partial threadgroup (rare for aligned N).
   const int ng_bpg = n_groups * bytes_per_group;
+
   for (int g = simd_lid; g < n_groups; g += SIMD_SIZE) {
     const device T* xg = x_batch + g * group_size;
 
@@ -1366,69 +1410,52 @@ METAL_FUNC void qmv_fast_t5_impl(
       const device uint8_t* wg3 = w + (out_row+3)*ng_bpg + g*bytes_per_group;
       const U s0=U(scales[(out_row+0)*n_groups+g]), s1=U(scales[(out_row+1)*n_groups+g]);
       const U s2=U(scales[(out_row+2)*n_groups+g]), s3=U(scales[(out_row+3)*n_groups+g]);
-      U a0=0,a1=0,a2=0,a3=0;
+      U a0=0, a1=0, a2=0, a3=0, x_sum=0;
 
       for (int b = 0; b < full_bytes; b++) {
-        const uint v0=uint(wg0[b]),v1=uint(wg1[b]),v2=uint(wg2[b]),v3=uint(wg3[b]);
+        // One LUT load per row replaces 4 divmod chains (no integer division).
+        const uint p0=T5_TO_B4[wg0[b]], p1=T5_TO_B4[wg1[b]];
+        const uint p2=T5_TO_B4[wg2[b]], p3=T5_TO_B4[wg3[b]];
         const int base = b * 5;
-        // Parallel decode (I-L): all d_i computed from the original byte value —
-        // no serial v=q reassignment.  All 16 multiplies can be issued at once.
-        const uint d1_0=t5_div3(v0),  d1_1=t5_div3(v1),  d1_2=t5_div3(v2),  d1_3=t5_div3(v3);
-        const uint d2_0=t5_div9(v0),  d2_1=t5_div9(v1),  d2_2=t5_div9(v2),  d2_3=t5_div9(v3);
-        const uint d3_0=t5_div27(v0), d3_1=t5_div27(v1), d3_2=t5_div27(v2), d3_3=t5_div27(v3);
-        const uint t4_0=t5_div81(v0), t4_1=t5_div81(v1), t4_2=t5_div81(v2), t4_3=t5_div81(v3);
-        // Trit 0: v % 3
-        U xa=U(xg[base+0]);
-        a0+=(U(v0-(d1_0<<1u)-d1_0)-1.0f)*xa; a1+=(U(v1-(d1_1<<1u)-d1_1)-1.0f)*xa;
-        a2+=(U(v2-(d1_2<<1u)-d1_2)-1.0f)*xa; a3+=(U(v3-(d1_3<<1u)-d1_3)-1.0f)*xa;
-        // Trit 1: (v/3) % 3 = d1 % 3
-        U xb=U(xg[base+1]);
-        a0+=(U(d1_0-(d2_0<<1u)-d2_0)-1.0f)*xb; a1+=(U(d1_1-(d2_1<<1u)-d2_1)-1.0f)*xb;
-        a2+=(U(d1_2-(d2_2<<1u)-d2_2)-1.0f)*xb; a3+=(U(d1_3-(d2_3<<1u)-d2_3)-1.0f)*xb;
-        // Trit 2: (v/9) % 3 = d2 % 3
-        U xc=U(xg[base+2]);
-        a0+=(U(d2_0-(d3_0<<1u)-d3_0)-1.0f)*xc; a1+=(U(d2_1-(d3_1<<1u)-d3_1)-1.0f)*xc;
-        a2+=(U(d2_2-(d3_2<<1u)-d3_2)-1.0f)*xc; a3+=(U(d2_3-(d3_3<<1u)-d3_3)-1.0f)*xc;
-        // Trit 3: (v/27) % 3 = d3 % 3
-        U xd=U(xg[base+3]);
-        a0+=(U(d3_0-(t4_0<<1u)-t4_0)-1.0f)*xd; a1+=(U(d3_1-(t4_1<<1u)-t4_1)-1.0f)*xd;
-        a2+=(U(d3_2-(t4_2<<1u)-t4_2)-1.0f)*xd; a3+=(U(d3_3-(t4_3<<1u)-t4_3)-1.0f)*xd;
-        // Trit 4: v/81 (direct)
-        U xe=U(xg[base+4]);
-        a0+=(U(t4_0)-1.0f)*xe; a1+=(U(t4_1)-1.0f)*xe;
-        a2+=(U(t4_2)-1.0f)*xe; a3+=(U(t4_3)-1.0f)*xe;
+        // Load x values; pre-scale by 4^{−k} so (mask × x_pre) = trit_k × x[k].
+        const U xv0=U(xg[base+0]), xv1=U(xg[base+1]), xv2=U(xg[base+2]);
+        const U xv3=U(xg[base+3]), xv4=U(xg[base+4]);
+        x_sum += xv0 + xv1 + xv2 + xv3 + xv4;
+        const U xp1=xv1*U(0.25f), xp2=xv2*U(0.0625f);
+        const U xp3=xv3*U(0.015625f), xp4=xv4*U(0.00390625f);
+        a0 += xv0*U(p0&0x003u)+xp1*U(p0&0x00Cu)+xp2*U(p0&0x030u)+xp3*U(p0&0x0C0u)+xp4*U(p0&0x300u);
+        a1 += xv0*U(p1&0x003u)+xp1*U(p1&0x00Cu)+xp2*U(p1&0x030u)+xp3*U(p1&0x0C0u)+xp4*U(p1&0x300u);
+        a2 += xv0*U(p2&0x003u)+xp1*U(p2&0x00Cu)+xp2*U(p2&0x030u)+xp3*U(p2&0x0C0u)+xp4*U(p2&0x300u);
+        a3 += xv0*U(p3&0x003u)+xp1*U(p3&0x00Cu)+xp2*U(p3&0x030u)+xp3*U(p3&0x0C0u)+xp4*U(p3&0x300u);
       }
       if constexpr (rem_trits > 0) {
-        const uint v0=uint(wg0[full_bytes]),v1=uint(wg1[full_bytes]);
-        const uint v2=uint(wg2[full_bytes]),v3=uint(wg3[full_bytes]);
+        const uint p0=T5_TO_B4[wg0[full_bytes]], p1=T5_TO_B4[wg1[full_bytes]];
+        const uint p2=T5_TO_B4[wg2[full_bytes]], p3=T5_TO_B4[wg3[full_bytes]];
         const int base = full_bytes * 5;
-        // Compute only the divisors needed for the active rem_trits.
-        const uint d1_0=t5_div3(v0),  d1_1=t5_div3(v1),  d1_2=t5_div3(v2),  d1_3=t5_div3(v3);
         if constexpr (rem_trits >= 1) {
-          U xa=U(xg[base+0]);
-          a0+=(U(v0-(d1_0<<1u)-d1_0)-1.0f)*xa; a1+=(U(v1-(d1_1<<1u)-d1_1)-1.0f)*xa;
-          a2+=(U(v2-(d1_2<<1u)-d1_2)-1.0f)*xa; a3+=(U(v3-(d1_3<<1u)-d1_3)-1.0f)*xa;
+          const U xv=U(xg[base+0]); x_sum+=xv;
+          a0+=xv*U(p0&0x003u); a1+=xv*U(p1&0x003u);
+          a2+=xv*U(p2&0x003u); a3+=xv*U(p3&0x003u);
         }
         if constexpr (rem_trits >= 2) {
-          const uint d2_0=t5_div9(v0),d2_1=t5_div9(v1),d2_2=t5_div9(v2),d2_3=t5_div9(v3);
-          U xb=U(xg[base+1]);
-          a0+=(U(d1_0-(d2_0<<1u)-d2_0)-1.0f)*xb; a1+=(U(d1_1-(d2_1<<1u)-d2_1)-1.0f)*xb;
-          a2+=(U(d1_2-(d2_2<<1u)-d2_2)-1.0f)*xb; a3+=(U(d1_3-(d2_3<<1u)-d2_3)-1.0f)*xb;
-          if constexpr (rem_trits >= 3) {
-            const uint d3_0=t5_div27(v0),d3_1=t5_div27(v1),d3_2=t5_div27(v2),d3_3=t5_div27(v3);
-            U xc=U(xg[base+2]);
-            a0+=(U(d2_0-(d3_0<<1u)-d3_0)-1.0f)*xc; a1+=(U(d2_1-(d3_1<<1u)-d3_1)-1.0f)*xc;
-            a2+=(U(d2_2-(d3_2<<1u)-d3_2)-1.0f)*xc; a3+=(U(d2_3-(d3_3<<1u)-d3_3)-1.0f)*xc;
-            if constexpr (rem_trits >= 4) {
-              const uint t4_0=t5_div81(v0),t4_1=t5_div81(v1),t4_2=t5_div81(v2),t4_3=t5_div81(v3);
-              U xd=U(xg[base+3]);
-              a0+=(U(d3_0-(t4_0<<1u)-t4_0)-1.0f)*xd; a1+=(U(d3_1-(t4_1<<1u)-t4_1)-1.0f)*xd;
-              a2+=(U(d3_2-(t4_2<<1u)-t4_2)-1.0f)*xd; a3+=(U(d3_3-(t4_3<<1u)-t4_3)-1.0f)*xd;
-            }
-          }
+          const U xp=U(xg[base+1])*U(0.25f); x_sum+=U(xg[base+1]);
+          a0+=xp*U(p0&0x00Cu); a1+=xp*U(p1&0x00Cu);
+          a2+=xp*U(p2&0x00Cu); a3+=xp*U(p3&0x00Cu);
+        }
+        if constexpr (rem_trits >= 3) {
+          const U xp=U(xg[base+2])*U(0.0625f); x_sum+=U(xg[base+2]);
+          a0+=xp*U(p0&0x030u); a1+=xp*U(p1&0x030u);
+          a2+=xp*U(p2&0x030u); a3+=xp*U(p3&0x030u);
+        }
+        if constexpr (rem_trits >= 4) {
+          const U xp=U(xg[base+3])*U(0.015625f); x_sum+=U(xg[base+3]);
+          a0+=xp*U(p0&0x0C0u); a1+=xp*U(p1&0x0C0u);
+          a2+=xp*U(p2&0x0C0u); a3+=xp*U(p3&0x0C0u);
         }
       }
-      result[0]+=s0*a0; result[1]+=s1*a1; result[2]+=s2*a2; result[3]+=s3*a3;
+      // Apply scale and −1 offset: s × Σ(tₖ−1)xₖ = s × (accum − x_sum).
+      result[0]+=s0*(a0-x_sum); result[1]+=s1*(a1-x_sum);
+      result[2]+=s2*(a2-x_sum); result[3]+=s3*(a3-x_sum);
 
     } else {
       // ---- Boundary fallback: partial last threadgroup ----
@@ -1437,25 +1464,26 @@ METAL_FUNC void qmv_fast_t5_impl(
         if (cur_row >= out_vec_size) continue;
         const device uint8_t* wg = w + cur_row*ng_bpg + g*bytes_per_group;
         const U s = U(scales[cur_row * n_groups + g]);
-        U accum = 0;
+        U accum = 0, xsum = 0;
         for (int b = 0; b < full_bytes; b++) {
-          uint v = uint(wg[b]); uint q;
+          const uint p = T5_TO_B4[wg[b]];
           const int base = b * 5;
-          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+0]); v=q;
-          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+1]); v=q;
-          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+2]); v=q;
-          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+3]); v=q;
-          accum+=(U(v)-1.0f)*U(xg[base+4]);
+          const U xv0=U(xg[base+0]),xv1=U(xg[base+1]),xv2=U(xg[base+2]);
+          const U xv3=U(xg[base+3]),xv4=U(xg[base+4]);
+          xsum += xv0+xv1+xv2+xv3+xv4;
+          accum += xv0*U(p&0x003u) + xv1*U(0.25f)*U(p&0x00Cu)
+                 + xv2*U(0.0625f)*U(p&0x030u) + xv3*U(0.015625f)*U(p&0x0C0u)
+                 + xv4*U(0.00390625f)*U(p&0x300u);
         }
         if constexpr (rem_trits > 0) {
-          uint v=uint(wg[full_bytes]); uint q;
-          const int base=full_bytes*5;
-          if constexpr (rem_trits>=1){q=t5_div3(v);accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+0]);v=q;}
-          if constexpr (rem_trits>=2){q=t5_div3(v);accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+1]);v=q;}
-          if constexpr (rem_trits>=3){q=t5_div3(v);accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+2]);v=q;}
-          if constexpr (rem_trits>=4){accum+=(U(v)-1.0f)*U(xg[base+3]);}
+          const uint p = T5_TO_B4[wg[full_bytes]];
+          const int base = full_bytes * 5;
+          if constexpr (rem_trits>=1){const U xv=U(xg[base+0]);xsum+=xv;accum+=xv*U(p&0x003u);}
+          if constexpr (rem_trits>=2){const U xv=U(xg[base+1]);xsum+=xv;accum+=xv*U(0.25f)*U(p&0x00Cu);}
+          if constexpr (rem_trits>=3){const U xv=U(xg[base+2]);xsum+=xv;accum+=xv*U(0.0625f)*U(p&0x030u);}
+          if constexpr (rem_trits>=4){const U xv=U(xg[base+3]);xsum+=xv;accum+=xv*U(0.015625f)*U(p&0x0C0u);}
         }
-        result[row] += s * accum;
+        result[row] += s * (accum - xsum);
       }
     }
   }
@@ -1517,17 +1545,16 @@ METAL_FUNC void qmv_wide_t5_impl(
     const U s = U(srow[g]);
     const int k0 = g * group_size;
 
-    // Full bytes: decode 5 dequantized values via magic divmod-3 (I-K), multiply all M vecs.
+    // Full bytes: T5_TO_B4 LUT replaces serial divmod chain; all 5 dq values
+    // are independent (no v=q reassignment), hiding decode latency.
     for (int b = 0; b < full_bytes; b++) {
-      uint v = uint(wg[b]);           // promote to uint for magic multiply-shift
-      uint q;
+      const uint p = T5_TO_B4[wg[b]];
       const int base = k0 + b * 5;
-      // Named variables avoid dynamic array indexing (prevents register spill).
-      q = t5_div3(v); U dq0 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
-      q = t5_div3(v); U dq1 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
-      q = t5_div3(v); U dq2 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
-      q = t5_div3(v); U dq3 = s * (U(v-(q<<1u)-q) - 1.0f); v = q;
-      U dq4 = s * (U(v) - 1.0f);
+      const U dq0 = s * (U(p & 0x003u)        - 1.0f);
+      const U dq1 = s * (U((p >>  2u) & 0x3u) - 1.0f);
+      const U dq2 = s * (U((p >>  4u) & 0x3u) - 1.0f);
+      const U dq3 = s * (U((p >>  6u) & 0x3u) - 1.0f);
+      const U dq4 = s * (U((p >>  8u) & 0x3u) - 1.0f);
 #pragma unroll
       for (int vi = 0; vi < vecs_per_tg; vi++) {
         result[vi] += U(xv[vi][base + 0]) * dq0
@@ -1537,16 +1564,15 @@ METAL_FUNC void qmv_wide_t5_impl(
                     + U(xv[vi][base + 4]) * dq4;
       }
     }
-    // Last partial byte via magic divmod-3 (I-K).
+    // Last partial byte via T5_TO_B4 LUT.
     if constexpr (rem_trits > 0) {
-      uint v = uint(wg[full_bytes]);  // promote to uint for magic multiply-shift
-      uint q;
+      const uint p = T5_TO_B4[wg[full_bytes]];
       const int base = k0 + full_bytes * 5;
       U dq0 = U(0), dq1 = U(0), dq2 = U(0), dq3 = U(0);
-      if constexpr (rem_trits >= 1) { q = t5_div3(v); dq0 = s*(U(v-(q<<1u)-q)-1.0f); v = q; }
-      if constexpr (rem_trits >= 2) { q = t5_div3(v); dq1 = s*(U(v-(q<<1u)-q)-1.0f); v = q; }
-      if constexpr (rem_trits >= 3) { q = t5_div3(v); dq2 = s*(U(v-(q<<1u)-q)-1.0f); v = q; }
-      if constexpr (rem_trits >= 4) { dq3 = s * (U(v) - 1.0f); }
+      if constexpr (rem_trits >= 1) { dq0 = s * (U(p & 0x003u) - 1.0f); }
+      if constexpr (rem_trits >= 2) { dq1 = s * (U((p >> 2u) & 0x3u) - 1.0f); }
+      if constexpr (rem_trits >= 3) { dq2 = s * (U((p >> 4u) & 0x3u) - 1.0f); }
+      if constexpr (rem_trits >= 4) { dq3 = s * (U((p >> 6u) & 0x3u) - 1.0f); }
 #pragma unroll
       for (int vi = 0; vi < vecs_per_tg; vi++) {
         if constexpr (rem_trits >= 1) result[vi] += U(xv[vi][base + 0]) * dq0;
