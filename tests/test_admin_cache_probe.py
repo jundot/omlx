@@ -11,6 +11,7 @@ from fastapi import HTTPException
 import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — triggers set_admin_getters
 from omlx.cache.paged_cache import compute_block_hash
+from omlx.model_settings import ModelSettings, merge_chat_template_kwargs
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -448,3 +449,97 @@ class TestCacheProbeResponseShape:
         assert "blocks_ram" not in result
         assert "ram_hit_tokens" not in result
         assert "prefix_index_hits" not in result
+
+
+class TestCacheProbeChatTemplateKwargs:
+    """The probe must render the prompt the scheduler would actually prefill.
+
+    Regression: the probe rendered with the caller's kwargs alone and never
+    consulted the model's own settings. For any model with enable_thinking
+    set, it hashed a prompt no real turn produces — and because the block
+    walk stops at the first miss, *every* block came back cold and the cache
+    looked empty even while it was being written.
+    """
+
+    @staticmethod
+    def _rendered_kwargs(settings, request_kwargs=None, lookup_raises=False):
+        """Run probe_cache and return the kwargs handed to the template."""
+        request = admin_routes.CacheProbeRequest(
+            model_id=MODEL_ID,
+            messages=[{"role": "user", "content": "hello"}],
+            chat_template_kwargs=request_kwargs,
+        )
+        entry = _make_engine_entry(_make_tokenizer([1, 2, 3, 4]), _make_scheduler())
+        seen = {}
+
+        def render(messages, tools, **kwargs):
+            seen["ct"] = kwargs.get("chat_template_kwargs")
+            return "rendered prompt"
+
+        entry.engine._apply_chat_template = render
+
+        manager = MagicMock(spec=[])
+        if lookup_raises:
+            manager.get_settings_for_request = MagicMock(
+                side_effect=RuntimeError("settings store unavailable")
+            )
+        else:
+            manager.get_settings_for_request = MagicMock(return_value=settings)
+
+        with (
+            patch.object(
+                admin_routes, "_get_engine_pool", return_value=_pool_with({MODEL_ID: entry})
+            ),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+        ):
+            asyncio.run(admin_routes.probe_cache(request, is_admin=True))
+        return seen["ct"]
+
+    def test_model_thinking_toggle_reaches_the_template(self):
+        """The bug: this toggle was dropped, so the probe hashed the wrong prompt."""
+        settings = ModelSettings()
+        settings.enable_thinking = False
+        assert self._rendered_kwargs(settings) == {"enable_thinking": False}
+
+    def test_persisted_template_kwargs_reach_the_template(self):
+        settings = ModelSettings()
+        settings.chat_template_kwargs = {"custom": "value"}
+        assert self._rendered_kwargs(settings) == {"custom": "value"}
+
+    def test_preserve_thinking_toggle_reaches_the_template(self):
+        settings = ModelSettings()
+        settings.preserve_thinking = True
+        assert self._rendered_kwargs(settings) == {"preserve_thinking": True}
+
+    def test_request_kwargs_override_model_settings(self):
+        settings = ModelSettings()
+        settings.enable_thinking = False
+        rendered = self._rendered_kwargs(settings, {"enable_thinking": True})
+        assert rendered == {"enable_thinking": True}
+
+    def test_forced_keys_win_over_request_kwargs(self):
+        settings = ModelSettings()
+        settings.enable_thinking = False
+        settings.forced_ct_kwargs = ["enable_thinking"]
+        rendered = self._rendered_kwargs(settings, {"enable_thinking": True})
+        assert rendered == {"enable_thinking": False}
+
+    def test_settings_lookup_failure_falls_back_to_request_kwargs(self):
+        """A settings failure must degrade, not break probing outright."""
+        rendered = self._rendered_kwargs(
+            None, {"enable_thinking": True}, lookup_raises=True
+        )
+        assert rendered == {"enable_thinking": True}
+
+    def test_no_settings_and_no_kwargs_renders_none(self):
+        assert self._rendered_kwargs(None) is None
+
+    def test_probe_and_chat_path_resolve_identical_kwargs(self):
+        """Anti-drift: both paths must agree, since disagreement is the bug."""
+        settings = ModelSettings()
+        settings.enable_thinking = False
+        settings.chat_template_kwargs = {"custom": "value"}
+        request_kwargs = {"custom": "override"}
+        assert self._rendered_kwargs(settings, request_kwargs) == (
+            merge_chat_template_kwargs(settings, request_kwargs)
+        )

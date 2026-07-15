@@ -1194,3 +1194,48 @@ class ModelSettingsManager:
             del self._templates[name]
             self._save_templates()
             return True
+
+
+def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
+    """Chat-template keys a request is not allowed to override."""
+    if settings is None:
+        return set()
+    return set(settings.forced_ct_kwargs or [])
+
+
+def merge_chat_template_kwargs(
+    settings: "ModelSettings | None",
+    request_ct_kwargs: "dict[str, Any] | None" = None,
+) -> "dict[str, Any]":
+    """Resolve the chat_template_kwargs a prompt should be rendered with.
+
+    Precedence, lowest to highest:
+      1. ``settings.chat_template_kwargs``
+      2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
+      3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+
+    Anything that renders a prompt for a model must go through here. The
+    chat completions path and the admin cache probe previously each spelled
+    this out; the probe's copy omitted the model settings entirely, so it
+    hashed a prompt the scheduler never prefills — every block of every
+    probe came back cold for any model with a thinking toggle set.
+    """
+    merged: dict[str, Any] = {}
+    forced_keys = forced_ct_keys(settings)
+
+    if settings is not None:
+        if settings.chat_template_kwargs:
+            merged.update(settings.chat_template_kwargs)
+        # Dedicated toggles take precedence over chat_template_kwargs.
+        if settings.enable_thinking is not None:
+            merged["enable_thinking"] = settings.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if settings.preserve_thinking is not None:
+            merged["preserve_thinking"] = settings.preserve_thinking
+
+    if request_ct_kwargs:
+        for key, value in request_ct_kwargs.items():
+            if key not in forced_keys:
+                merged[key] = value
+
+    return merged
