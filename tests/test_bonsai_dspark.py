@@ -124,15 +124,16 @@ class TestKeyRemapping:
 
 class TestQ4_1Dequant:
     def _make_q4_1_block(self, delta: float, d_min: float, nibbles: list[int]) -> bytes:
-        """Build one 20-byte Q4_1 block."""
+        """Build one 20-byte Q4_1 block (GGUF layout: delta, min, nibbles)."""
         assert len(nibbles) == 32
+        delta_bytes = np.array([delta], dtype=np.float16).tobytes()
+        dmin_bytes = np.array([d_min], dtype=np.float16).tobytes()
         # Pack 32 nibbles as 16 bytes (lo nibble first)
         packed = bytearray(16)
         for i in range(16):
             packed[i] = (nibbles[2 * i] & 0x0F) | ((nibbles[2 * i + 1] & 0x0F) << 4)
-        delta_bytes = np.array([delta], dtype=np.float16).tobytes()
-        dmin_bytes = np.array([d_min], dtype=np.float16).tobytes()
-        return bytes(packed) + delta_bytes + dmin_bytes
+        # Correct GGUF layout: [delta: 2B][min: 2B][nibbles: 16B]
+        return delta_bytes + dmin_bytes + bytes(packed)
 
     def test_single_block_zero(self):
         block = self._make_q4_1_block(1.0, 0.0, [0] * 32)
@@ -273,7 +274,7 @@ class TestBonsaiDSparkDrafter:
             block_size=4,
             mask_token_id=1,
             target_layer_ids=[0, 1],
-            markov_rank=8,
+            markov_rank=32,
             enable_confidence_head=True,
         )
 
@@ -414,7 +415,7 @@ class TestBonsaiTarget:
 class TestSpeculativeGenerate:
     """Smoke-test the generate loop with minimal fake implementations."""
 
-    def _make_target_and_drafter(self, vocab=32, hidden=16, n_tap=2):
+    def _make_target_and_drafter(self, vocab=64, hidden=32, n_tap=2):
         """Build tiny fake target + drafter for a round-trip test."""
         import mlx.nn as nn
 
@@ -458,7 +459,7 @@ class TestSpeculativeGenerate:
             block_size=3,
             mask_token_id=2,
             target_layer_ids=list(range(n_tap)),
-            markov_rank=4,
+            markov_rank=32,
             enable_confidence_head=False,
             log_snr_dim=8,
         )
@@ -497,10 +498,10 @@ class TestSpeculativeGenerate:
             def __call__(self, inputs, cache=None, **kwargs):
                 capture = kwargs.get("capture_layer_ids")
                 B, L = inputs.shape
-                eye_row = mx.equal(mx.arange(32), mx.array(3)).astype(mx.float32) * 10.0
-                logits = mx.broadcast_to(eye_row.reshape(1, 1, 32), (B, L, 32))
+                eye_row = mx.equal(mx.arange(64), mx.array(3)).astype(mx.float32) * 10.0
+                logits = mx.broadcast_to(eye_row.reshape(1, 1, 64), (B, L, 64))
                 if capture is not None:
-                    hs = [mx.zeros((B, L, 16)) for _ in capture]
+                    hs = [mx.zeros((B, L, 32)) for _ in capture]
                     return SimpleNamespace(logits=logits, hidden_states=hs)
                 return SimpleNamespace(logits=logits)
 

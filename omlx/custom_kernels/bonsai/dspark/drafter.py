@@ -109,6 +109,12 @@ class _CrossAttention(nn.Module):
         k = mx.concatenate([cache.k, k_blk], axis=2)
         v = mx.concatenate([cache.v, v_blk], axis=2)
 
+        # GQA: repeat KV heads to match Q heads
+        if self.n_heads != self.n_kv:
+            repeats = self.n_heads // self.n_kv
+            k = mx.repeat(k, repeats, axis=1)
+            v = mx.repeat(v, repeats, axis=1)
+
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, q_len, -1))
 
@@ -134,7 +140,8 @@ class _VanillaMarkov(nn.Module):
     def __init__(self, vocab: int, rank: int):
         super().__init__()
         self.markov_w1 = nn.Embedding(vocab, rank)
-        self.markov_w2 = nn.Linear(rank, vocab, bias=False)
+        # markov_w2 is vocab-scale; keep quantized same as lm_head
+        self.markov_w2 = nn.QuantizedLinear(rank, vocab, bias=False, group_size=32, bits=4)
 
     def prev_embeddings(self, token_ids: mx.array) -> mx.array:
         return self.markov_w1(token_ids)
@@ -216,10 +223,12 @@ class BonsaiDSparkDrafter(nn.Module):
         self.layers = [_DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
 
-        # Output head
-        self.lm_head = nn.Linear(h, v, bias=False)
+        # Output head — stored as QuantizedLinear (MLX Q4 group_size=32 bits=4)
+        # to avoid loading a ~5 GB fp32 weight matrix.  The safetensors file
+        # written by convert_gguf stores the packed uint32 + scales + biases.
+        self.lm_head = nn.QuantizedLinear(h, v, bias=False, group_size=32, bits=4)
 
-        # Markov head
+        # Markov head — markov_w2 is also vocab-scale; keep quantized
         self.markov_head = _VanillaMarkov(v, config.markov_rank)
 
         # Confidence head
