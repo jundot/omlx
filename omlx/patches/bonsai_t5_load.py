@@ -147,9 +147,12 @@ def _t5_quantized_matmul(
             **kwargs
         )
 
-    # t5 uint8 weight — route through fast Metal kernels for all M when available.
-    # dispatch_qmv_wide_t5 tiles M into ceil(M/5) groups (vecs_per_tg ≤ 5) in one
-    # kernel launch, so it handles prefill (large M) just as well as decode.
+    # t5 uint8 weight routing:
+    #   Decode (M ≤ 16): fast Metal qmv kernels — weight bytes read once.
+    #   Prefill (M > 16): qmv_wide re-reads weights ceil(M/5) times across
+    #     threadgroup tiles; for M=512 that's 103× DRAM traffic.  Dequantize
+    #     to float16 once and use MLX matmul (weights read exactly twice,
+    #     independent of M).
     from omlx.custom_kernels.bonsai.fast import (
         bonsai_t5_qmv,
         bonsai_t5_qmv_wide,
@@ -157,13 +160,14 @@ def _t5_quantized_matmul(
     )
     M = x.shape[-2] if x.ndim >= 2 else 1
 
-    if has_native():
+    if has_native() and M <= 16:
         sc = scales.astype(x.dtype)
         if M >= 2:
             return bonsai_t5_qmv_wide(x, w, sc)
         return bonsai_t5_qmv(x, w, sc)
 
-    # Fallback (native extension unavailable): dequantize to float and use mx.matmul.
+    # Prefill path (M > 16) or fallback (no native ext): dequantize → matmul.
+    # t5 symmetric: dequant = scale × (trit − 1), no bias term needed.
     N = w.shape[0]
     n_groups = scales.shape[-1]
     bpg = w.shape[-1] // n_groups
@@ -177,8 +181,7 @@ def _t5_quantized_matmul(
         v = v // 3
     trits = mx.stack(trit_parts, axis=-1).reshape(N, n_groups, bpg * 5)[:, :, :gs]
     sc2 = scales.astype(x.dtype).reshape(N, n_groups, 1)
-    bi = biases.astype(x.dtype).reshape(N, n_groups, 1)
-    weight_fp = (trits.astype(x.dtype) * sc2 + bi).reshape(N, K)
+    weight_fp = ((trits.astype(x.dtype) - 1.0) * sc2).reshape(N, K)
     if transpose:
         return x @ weight_fp.T
     return x @ weight_fp

@@ -51,6 +51,12 @@ _patch_active = False
 # Above this threshold the model is prefilling — use stock mlx qmm_t instead.
 _MAX_DECODE_M = 5
 
+# t5 prefill threshold: qmv_wide re-reads weights ceil(M/5) times, one per
+# threadgroup tile in the M dimension.  Above this M, dequantize to float16
+# once and use MLX's optimised matmul instead (reads weights exactly twice:
+# once for dequant, once for matmul — independent of M).
+_T5_PREFILL_THRESHOLD = 16
+
 
 def _get_cached_scales_biases(
     self: nn.QuantizedLinear, dtype: Any
@@ -168,9 +174,13 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     M = x.shape[-2] if x.ndim >= 2 else 1
 
     # t5 format: uint8 base-3 ternary weights — route before bits check.
-    # bonsai_t5_qmv_wide tiles M into groups of ≤5 in one kernel dispatch,
-    # so it handles arbitrarily large M without float weight materialisation.
+    # Decode (M ≤ _T5_PREFILL_THRESHOLD): qmv kernels stream weights once.
+    # Prefill (M > threshold): qmv_wide re-reads weights ceil(M/5) times per
+    # threadgroup — for M=512 that's 103× DRAM traffic.  Dequantize once to
+    # float16 and hand off to MLX's optimised matmul instead.
     if mode == "affine" and bits == 2 and _is_t5_format(self):
+        if M > _T5_PREFILL_THRESHOLD:
+            return _t5_dequant_matmul(self, x)
         w = self.weight
         scales = self.scales.astype(x.dtype)
         if M >= 2:
