@@ -14,9 +14,9 @@ Patch 1 – Module.load_weights
 Patch 2 – mx.quantized_matmul
   mlx_vlm (Qwen3.5 and similar) calls mx.quantized_matmul DIRECTLY, bypassing
   QuantizedLinear.__call__ and our bonsai_qmv inference patch.  This wrapper
-  intercepts all calls: when the weight is uint8 (t5 format) it dequantizes
-  in-place and falls back to a regular mx.matmul; otherwise it delegates to
-  the original C function unchanged.
+  intercepts all calls: for uint8 t5 weights it routes decode (M<=5) through
+  the fast bonsai_t5_qmv / _wide Metal kernels and prefill (M>5) through a
+  dequantize + mx.matmul path.  Non-t5 calls (uint32) pass through unchanged.
 
 Apply once via apply_bonsai_t5_load_patch() before mlx_vlm / mlx_lm load().
 """
@@ -121,9 +121,10 @@ def _t5_quantized_matmul(
 ):
     """mx.quantized_matmul replacement that handles t5 uint8 weights.
 
-    When *w* is uint8 (t5 base-3 packed), dequantizes in-place using the
-    existing scales/biases and falls back to mx.matmul.  For all other dtypes
-    the original C function is called unchanged.
+    When *w* is uint8 (t5 base-3 packed):
+      - Decode (M <= 5): route to the native bonsai_t5_qmv / _wide Metal kernel.
+      - Prefill (M > 5): dequantize to float and use mx.matmul.
+    For all other weight dtypes the original C function is called unchanged.
     """
     if w.dtype != mx.uint8:
         return _original_quantized_matmul(
@@ -131,26 +132,38 @@ def _t5_quantized_matmul(
             **kwargs
         )
 
-    # t5 decode path
+    from omlx.custom_kernels.bonsai.fast import (
+        bonsai_t5_qmv,
+        bonsai_t5_qmv_wide,
+        has_native,
+        _use_qmv_wide,
+    )
+    _MAX_DECODE_M = 5
+    M = x.shape[-2] if x.ndim >= 2 else 1
+
+    if M <= _MAX_DECODE_M and has_native():
+        sc = scales.astype(x.dtype)
+        if _use_qmv_wide(2, M):
+            return bonsai_t5_qmv_wide(x, w, sc)
+        return bonsai_t5_qmv(x, w, sc)
+
+    # Prefill: dequantize to float then matmul
     N = w.shape[0]
     n_groups = scales.shape[-1]
     bpg = w.shape[-1] // n_groups
-    gs = 64 if bpg == 13 else 128   # bytes per group → group_size
+    gs = 64 if bpg == 13 else 128
     K = n_groups * gs
 
-    # Decode base-3: extract 5 trits per byte via repeated mod-3
     v = w.reshape(N, n_groups, bpg).astype(mx.uint32)
     trit_parts = []
     for _ in range(5):
         trit_parts.append(v % 3)
         v = v // 3
-    trits = mx.stack(trit_parts, axis=-1).reshape(N, n_groups, bpg * 5)
-    trits = trits[:, :, :gs]  # (N, n_groups, gs) — trim padding trits
+    trits = mx.stack(trit_parts, axis=-1).reshape(N, n_groups, bpg * 5)[:, :, :gs]
 
-    # Dequantize using stored scales and biases (exact: quant*scale + bias)
-    sc = scales.astype(x.dtype).reshape(N, n_groups, 1)
+    sc2 = scales.astype(x.dtype).reshape(N, n_groups, 1)
     bi = biases.astype(x.dtype).reshape(N, n_groups, 1)
-    weight_fp = (trits.astype(x.dtype) * sc + bi).reshape(N, K)
+    weight_fp = (trits.astype(x.dtype) * sc2 + bi).reshape(N, K)
 
     if transpose:
         return x @ weight_fp.T
