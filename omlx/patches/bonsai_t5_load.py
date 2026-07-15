@@ -184,6 +184,49 @@ def _t5_quantized_matmul(
     return x @ weight_fp
 
 
+def free_t5_biases(model: nn.Module) -> int:
+    """Replace bias tensors in t5-format layers with tiny placeholders.
+
+    t5 ternary symmetric (I-D) never uses biases at inference time — the
+    dequant is ``scale * (q - 1)`` with no additive offset.  The repacked
+    safetensors file carries the original 2-bit biases purely for format
+    compatibility; after loading they just waste ~420 MB of GPU memory.
+
+    This function walks every QuantizedLinear whose weight dtype is uint8
+    (t5 packing) and replaces its ``biases`` parameter with a zero scalar
+    so the large bias tensor can be garbage-collected.
+
+    Call once immediately after model.load_weights() / mlx_vlm.load().
+
+    Returns bytes freed (approximate).
+    """
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    params = dict(tree_flatten(model.parameters()))
+    _tiny = mx.zeros((1,), dtype=mx.float16)
+    updates: list[tuple[str, mx.array]] = []
+    freed = 0
+
+    for k, v in params.items():
+        if not k.endswith(".biases"):
+            continue
+        w = params.get(k.replace(".biases", ".weight"))
+        if w is not None and isinstance(w, mx.array) and w.dtype == mx.uint8:
+            freed += int(v.size) * v.itemsize
+            updates.append((k, _tiny))
+
+    if updates:
+        model.update(tree_unflatten(updates))
+        mx.eval(model.parameters())
+        logger.info(
+            "bonsai_t5_load: freed %d unused bias tensors (~%.0f MB) from t5 layers.",
+            len(updates),
+            freed / 1e6,
+        )
+
+    return freed
+
+
 def apply_bonsai_t5_load_patch() -> bool:
     """Monkey-patch Module.load_weights and mx.quantized_matmul for t5 weights.
 

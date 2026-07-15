@@ -1285,7 +1285,15 @@ METAL_FUNC void qmv_wide_impl(
 // Realization 2.3 (I-K): Granlund-Montgomery magic divmod-3, exact for v ∈ [0,255].
 // ⌊v/3⌋ = (v·171) >> 9  — no integer divide instruction, pure multiply + shift.
 // Then v mod 3 = v − 3q = v − (q<<1) − q.
-METAL_FUNC uint t5_div3(uint v) { return (v * 171u) >> 9u; }
+METAL_FUNC uint t5_div3(uint v)  { return (v * 171u) >> 9u; }
+
+// Parallel trit extraction helpers (I-L): all operate on the ORIGINAL byte v,
+// so ALL four calls can be issued simultaneously with no serial data dependency.
+// Exact for v ∈ [0, 242] (max valid t5 byte = 3^5 − 1 = 242).
+METAL_FUNC uint t5_div9(uint v)  { return (v * 228u) >> 11u; }  // ⌊v/9⌋
+METAL_FUNC uint t5_div27(uint v) { return (v * 76u)  >> 11u; }  // ⌊v/27⌋
+// ⌊v/81⌋ ∈ {0,1,2}: two independent comparisons, no multiply needed.
+METAL_FUNC uint t5_div81(uint v) { return uint(v >= 81u) + uint(v >= 162u); }
 
 // ---------------------------------------------------------------------------
 // t5: base-3 ternary packing (Identity I-D)
@@ -1338,40 +1346,114 @@ METAL_FUNC void qmv_fast_t5_impl(
 
   const device T* x_batch = x + tid.x * in_vec_size;
 
+  // Interleaved 4-row decode: all results_per_simdgroup row chains run in
+  // lockstep so the GPU can issue t5_div3 for all rows before any single
+  // chain's result is ready, hiding the ~4-cycle multiply-shift latency.
+  // Fast path handles the common case (all rows in bounds); the boundary
+  // fallback covers the last partial threadgroup (rare for aligned N).
+  const int ng_bpg = n_groups * bytes_per_group;
   for (int g = simd_lid; g < n_groups; g += SIMD_SIZE) {
     const device T* xg = x_batch + g * group_size;
 
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const int cur_row = out_row + row;
-      if (cur_row >= out_vec_size) continue;
+    if (out_row + results_per_simdgroup - 1 < out_vec_size) {
+      // ---- Fast path: all 4 rows in bounds ----
+      const device uint8_t* wg0 = w + (out_row+0)*ng_bpg + g*bytes_per_group;
+      const device uint8_t* wg1 = w + (out_row+1)*ng_bpg + g*bytes_per_group;
+      const device uint8_t* wg2 = w + (out_row+2)*ng_bpg + g*bytes_per_group;
+      const device uint8_t* wg3 = w + (out_row+3)*ng_bpg + g*bytes_per_group;
+      const U s0=U(scales[(out_row+0)*n_groups+g]), s1=U(scales[(out_row+1)*n_groups+g]);
+      const U s2=U(scales[(out_row+2)*n_groups+g]), s3=U(scales[(out_row+3)*n_groups+g]);
+      U a0=0,a1=0,a2=0,a3=0;
 
-      const device uint8_t* wg =
-          w + cur_row * (n_groups * bytes_per_group) + g * bytes_per_group;
-      const U s = U(scales[cur_row * n_groups + g]);
-      U accum = 0;
-
-      // Decode full_bytes bytes: 5 trits per byte via magic divmod-3 (I-K).
       for (int b = 0; b < full_bytes; b++) {
-        uint v = uint(wg[b]);           // promote to uint for magic multiply-shift
-        uint q;
+        const uint v0=uint(wg0[b]),v1=uint(wg1[b]),v2=uint(wg2[b]),v3=uint(wg3[b]);
         const int base = b * 5;
-        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+0]); v = q;
-        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+1]); v = q;
-        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+2]); v = q;
-        q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+3]); v = q;
-        accum += (U(v) - 1.0f) * U(xg[base+4]); // last trit: v already = trit value
+        // Parallel decode (I-L): all d_i computed from the original byte value —
+        // no serial v=q reassignment.  All 16 multiplies can be issued at once.
+        const uint d1_0=t5_div3(v0),  d1_1=t5_div3(v1),  d1_2=t5_div3(v2),  d1_3=t5_div3(v3);
+        const uint d2_0=t5_div9(v0),  d2_1=t5_div9(v1),  d2_2=t5_div9(v2),  d2_3=t5_div9(v3);
+        const uint d3_0=t5_div27(v0), d3_1=t5_div27(v1), d3_2=t5_div27(v2), d3_3=t5_div27(v3);
+        const uint t4_0=t5_div81(v0), t4_1=t5_div81(v1), t4_2=t5_div81(v2), t4_3=t5_div81(v3);
+        // Trit 0: v % 3
+        U xa=U(xg[base+0]);
+        a0+=(U(v0-(d1_0<<1u)-d1_0)-1.0f)*xa; a1+=(U(v1-(d1_1<<1u)-d1_1)-1.0f)*xa;
+        a2+=(U(v2-(d1_2<<1u)-d1_2)-1.0f)*xa; a3+=(U(v3-(d1_3<<1u)-d1_3)-1.0f)*xa;
+        // Trit 1: (v/3) % 3 = d1 % 3
+        U xb=U(xg[base+1]);
+        a0+=(U(d1_0-(d2_0<<1u)-d2_0)-1.0f)*xb; a1+=(U(d1_1-(d2_1<<1u)-d2_1)-1.0f)*xb;
+        a2+=(U(d1_2-(d2_2<<1u)-d2_2)-1.0f)*xb; a3+=(U(d1_3-(d2_3<<1u)-d2_3)-1.0f)*xb;
+        // Trit 2: (v/9) % 3 = d2 % 3
+        U xc=U(xg[base+2]);
+        a0+=(U(d2_0-(d3_0<<1u)-d3_0)-1.0f)*xc; a1+=(U(d2_1-(d3_1<<1u)-d3_1)-1.0f)*xc;
+        a2+=(U(d2_2-(d3_2<<1u)-d3_2)-1.0f)*xc; a3+=(U(d2_3-(d3_3<<1u)-d3_3)-1.0f)*xc;
+        // Trit 3: (v/27) % 3 = d3 % 3
+        U xd=U(xg[base+3]);
+        a0+=(U(d3_0-(t4_0<<1u)-t4_0)-1.0f)*xd; a1+=(U(d3_1-(t4_1<<1u)-t4_1)-1.0f)*xd;
+        a2+=(U(d3_2-(t4_2<<1u)-t4_2)-1.0f)*xd; a3+=(U(d3_3-(t4_3<<1u)-t4_3)-1.0f)*xd;
+        // Trit 4: v/81 (direct)
+        U xe=U(xg[base+4]);
+        a0+=(U(t4_0)-1.0f)*xe; a1+=(U(t4_1)-1.0f)*xe;
+        a2+=(U(t4_2)-1.0f)*xe; a3+=(U(t4_3)-1.0f)*xe;
       }
-      // Last partial byte: rem_trits active trits (3 for gs=128, 4 for gs=64).
       if constexpr (rem_trits > 0) {
-        uint v = uint(wg[full_bytes]);  // promote to uint for magic multiply-shift
-        uint q;
+        const uint v0=uint(wg0[full_bytes]),v1=uint(wg1[full_bytes]);
+        const uint v2=uint(wg2[full_bytes]),v3=uint(wg3[full_bytes]);
         const int base = full_bytes * 5;
-        if constexpr (rem_trits >= 1) { q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+0]); v = q; }
-        if constexpr (rem_trits >= 2) { q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+1]); v = q; }
-        if constexpr (rem_trits >= 3) { q = t5_div3(v); accum += (U(v-(q<<1u)-q) - 1.0f) * U(xg[base+2]); v = q; }
-        if constexpr (rem_trits >= 4) { accum += (U(v) - 1.0f) * U(xg[base+3]); }
+        // Compute only the divisors needed for the active rem_trits.
+        const uint d1_0=t5_div3(v0),  d1_1=t5_div3(v1),  d1_2=t5_div3(v2),  d1_3=t5_div3(v3);
+        if constexpr (rem_trits >= 1) {
+          U xa=U(xg[base+0]);
+          a0+=(U(v0-(d1_0<<1u)-d1_0)-1.0f)*xa; a1+=(U(v1-(d1_1<<1u)-d1_1)-1.0f)*xa;
+          a2+=(U(v2-(d1_2<<1u)-d1_2)-1.0f)*xa; a3+=(U(v3-(d1_3<<1u)-d1_3)-1.0f)*xa;
+        }
+        if constexpr (rem_trits >= 2) {
+          const uint d2_0=t5_div9(v0),d2_1=t5_div9(v1),d2_2=t5_div9(v2),d2_3=t5_div9(v3);
+          U xb=U(xg[base+1]);
+          a0+=(U(d1_0-(d2_0<<1u)-d2_0)-1.0f)*xb; a1+=(U(d1_1-(d2_1<<1u)-d2_1)-1.0f)*xb;
+          a2+=(U(d1_2-(d2_2<<1u)-d2_2)-1.0f)*xb; a3+=(U(d1_3-(d2_3<<1u)-d2_3)-1.0f)*xb;
+          if constexpr (rem_trits >= 3) {
+            const uint d3_0=t5_div27(v0),d3_1=t5_div27(v1),d3_2=t5_div27(v2),d3_3=t5_div27(v3);
+            U xc=U(xg[base+2]);
+            a0+=(U(d2_0-(d3_0<<1u)-d3_0)-1.0f)*xc; a1+=(U(d2_1-(d3_1<<1u)-d3_1)-1.0f)*xc;
+            a2+=(U(d2_2-(d3_2<<1u)-d3_2)-1.0f)*xc; a3+=(U(d2_3-(d3_3<<1u)-d3_3)-1.0f)*xc;
+            if constexpr (rem_trits >= 4) {
+              const uint t4_0=t5_div81(v0),t4_1=t5_div81(v1),t4_2=t5_div81(v2),t4_3=t5_div81(v3);
+              U xd=U(xg[base+3]);
+              a0+=(U(d3_0-(t4_0<<1u)-t4_0)-1.0f)*xd; a1+=(U(d3_1-(t4_1<<1u)-t4_1)-1.0f)*xd;
+              a2+=(U(d3_2-(t4_2<<1u)-t4_2)-1.0f)*xd; a3+=(U(d3_3-(t4_3<<1u)-t4_3)-1.0f)*xd;
+            }
+          }
+        }
       }
-      result[row] += s * accum;
+      result[0]+=s0*a0; result[1]+=s1*a1; result[2]+=s2*a2; result[3]+=s3*a3;
+
+    } else {
+      // ---- Boundary fallback: partial last threadgroup ----
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const int cur_row = out_row + row;
+        if (cur_row >= out_vec_size) continue;
+        const device uint8_t* wg = w + cur_row*ng_bpg + g*bytes_per_group;
+        const U s = U(scales[cur_row * n_groups + g]);
+        U accum = 0;
+        for (int b = 0; b < full_bytes; b++) {
+          uint v = uint(wg[b]); uint q;
+          const int base = b * 5;
+          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+0]); v=q;
+          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+1]); v=q;
+          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+2]); v=q;
+          q=t5_div3(v); accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+3]); v=q;
+          accum+=(U(v)-1.0f)*U(xg[base+4]);
+        }
+        if constexpr (rem_trits > 0) {
+          uint v=uint(wg[full_bytes]); uint q;
+          const int base=full_bytes*5;
+          if constexpr (rem_trits>=1){q=t5_div3(v);accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+0]);v=q;}
+          if constexpr (rem_trits>=2){q=t5_div3(v);accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+1]);v=q;}
+          if constexpr (rem_trits>=3){q=t5_div3(v);accum+=(U(v-(q<<1u)-q)-1.0f)*U(xg[base+2]);v=q;}
+          if constexpr (rem_trits>=4){accum+=(U(v)-1.0f)*U(xg[base+3]);}
+        }
+        result[row] += s * accum;
+      }
     }
   }
 

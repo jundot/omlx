@@ -1403,6 +1403,22 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
 
+        # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
+        # The repacked safetensors carries 2-bit biases for format compat;
+        # the t5 symmetric kernel (scale*(q-1)) never reads them.
+        try:
+            from ..patches.bonsai_t5_load import free_t5_biases
+
+            freed = await loop.run_in_executor(
+                get_mlx_executor(), free_t5_biases, self._vlm_model
+            )
+            if freed > 0:
+                logger.info(
+                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
+                )
+        except Exception:
+            logger.debug("t5 bias free skipped", exc_info=True)
+
         # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
