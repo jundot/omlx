@@ -1388,10 +1388,38 @@ class EnginePool:
             # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
             pass
 
-            # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
+            # Check if DSpark is enabled (Bonsai speculative decoding)
             engine = None
             if model_settings is not None:
+                dspark_enabled = getattr(model_settings, "dspark_enabled", False)
+                dspark_draft = getattr(model_settings, "dspark_draft_model", None)
+                if dspark_enabled and dspark_draft:
+                    try:
+                        from .engine.dspark import DSParkEngine
+
+                        engine = DSParkEngine(
+                            model_name=entry.model_path,
+                            draft_model_path=dspark_draft,
+                            model_settings=model_settings,
+                        )
+                        logger.info(
+                            "DSPark enabled for %s, draft=%s", model_id, dspark_draft
+                        )
+                    except ImportError as e:
+                        logger.warning(
+                            "DSPark enabled for %s but dependencies missing: %s. "
+                            "Falling back to default engine.",
+                            model_id, e,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "DSPark init failed for %s: %s. Falling back to default engine.",
+                            model_id, e,
+                        )
+
+            # Check if DFlash is enabled -- takes priority over engine type
+            # since DFlash has its own model loading pipeline
+            if engine is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if (
