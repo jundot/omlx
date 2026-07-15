@@ -123,6 +123,43 @@ def _is_t5_format(self: nn.QuantizedLinear) -> bool:
     return result
 
 
+def _t5_dequant_matmul(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
+    """Prefill path for t5 weights: decode trits → dequantize → matmul.
+
+    mlx's quantized_matmul kernel requires uint32 weights; for t5 (uint8) we
+    dequantize to float and fall back to a regular matmul.  Called only when
+    M > _MAX_DECODE_M (batch prefill); latency is dominated by the matmul,
+    not the decode.
+    """
+    w = self.weight      # uint8, (N, n_groups * bpg)
+    scales = self.scales  # (N, n_groups)
+    N = w.shape[0]
+    n_groups = scales.shape[-1]
+    bpg = w.shape[1] // n_groups
+    group_size = 64 if bpg == 13 else 128
+    K = n_groups * group_size
+
+    # Decode base-3: extract 5 trits per byte via repeated mod-3
+    v = w.reshape(N, n_groups, bpg).astype(mx.uint32)
+    trit_parts = []
+    for _ in range(5):
+        trit_parts.append(v % 3)
+        v = v // 3
+    # (N, n_groups, bpg, 5) → (N, n_groups, bpg*5) → trim padding
+    trits = mx.stack(trit_parts, axis=-1).reshape(N, n_groups, bpg * 5)
+    trits = trits[:, :, :group_size]  # (N, n_groups, group_size)
+
+    # Dequantize: (trit - 1) * scale → {-scale, 0, +scale}
+    dq = (trits.astype(x.dtype) - 1.0) * scales[..., None].astype(x.dtype)
+    weight_fp = dq.reshape(N, K)  # (N, K)
+
+    out = x @ weight_fp.T
+    linear_bias = getattr(self, "bias", None)
+    if linear_bias is not None:
+        out = out + linear_bias
+    return out
+
+
 def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
     """Replacement for QuantizedLinear.__call__ for 1-bit and 2-bit layers."""
     bits: int = getattr(self, "bits", 4)
@@ -133,7 +170,7 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     # t5 format: uint8 base-3 ternary weights — route before bits check.
     if mode == "affine" and bits == 2 and _is_t5_format(self):
         if M > _MAX_DECODE_M:
-            return _original_quantized_linear_call(self, x)
+            return _t5_dequant_matmul(self, x)
         w = self.weight
         scales = self.scales.astype(x.dtype)
         if _use_qmv_wide(2, M):

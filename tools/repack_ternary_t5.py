@@ -52,11 +52,28 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# Actual bits-per-weight for base-3 ternary packing
+_T5_BPW = math.log2(3)  # ≈ 1.585
+
+
+def _suggest_output_name(src: Path) -> Path:
+    """Derive output path by replacing the bit-count in the source name.
+
+    e.g. 'Ternary-Bonsai-27B-mlx-2bit' → 'Ternary-Bonsai-27B-mlx-1.585bit'
+    Falls back to appending '-1.585bit' if no bit descriptor is found.
+    """
+    bpw_str = f"{_T5_BPW:.3f}bit"
+    new_name = re.sub(r"\d+(?:\.\d+)?-?bit", bpw_str, src.name, count=1, flags=re.IGNORECASE)
+    if new_name == src.name:
+        new_name = src.name + f"-{bpw_str}"
+    return src.parent / new_name
 
 
 # ---------------------------------------------------------------------------
@@ -79,42 +96,24 @@ def pack_t5(quants: np.ndarray, group_size: int) -> np.ndarray:
     assert K % group_size == 0, f"K={K} not divisible by group_size={group_size}"
     n_groups = K // group_size
     bytes_per_group = math.ceil(group_size / 5)  # 26 for gs=128, 13 for gs=64
-    full_bytes = group_size // 5
-    rem_trits  = group_size % 5
 
-    out = np.zeros((N, n_groups * bytes_per_group), dtype=np.uint8)
+    # Reshape to (N, n_groups, group_size)
+    q = quants.reshape(N, n_groups, group_size)
 
-    for g in range(n_groups):
-        g_start = g * group_size
-        g_end   = g_start + group_size
-        grp = quants[:, g_start:g_end]  # (N, group_size)
+    # Pad each group to bytes_per_group*5 trits with q=1 (trit=0, zero contribution)
+    pad_len = bytes_per_group * 5 - group_size
+    if pad_len > 0:
+        q = np.concatenate([q, np.ones((N, n_groups, pad_len), dtype=np.uint8)], axis=2)
+    # q: (N, n_groups, bytes_per_group*5)
 
-        byte_off = g * bytes_per_group
-
-        # Pack full_bytes bytes (5 trits each)
-        for b in range(full_bytes):
-            t = grp[:, b*5:(b+1)*5]     # (N, 5)
-            v = (t[:, 0].astype(np.uint32)
-                 + t[:, 1] * 3
-                 + t[:, 2] * 9
-                 + t[:, 3] * 27
-                 + t[:, 4] * 81).astype(np.uint8)
-            out[:, byte_off + b] = v
-
-        # Last partial byte (rem_trits active trits, padded with q=1)
-        if rem_trits > 0:
-            t = grp[:, full_bytes*5:full_bytes*5 + rem_trits]  # (N, rem_trits)
-            # Pad to length 5 with q=1 (trit=0)
-            pad = np.ones((N, 5 - rem_trits), dtype=np.uint8)
-            t_padded = np.concatenate([t, pad], axis=1)  # (N, 5)
-            v = (t_padded[:, 0].astype(np.uint32)
-                 + t_padded[:, 1] * 3
-                 + t_padded[:, 2] * 9
-                 + t_padded[:, 3] * 27
-                 + t_padded[:, 4] * 81).astype(np.uint8)
-            out[:, byte_off + full_bytes] = v
-
-    return out
+    # Expose groups of 5 trits, then base-3 encode — fully vectorized, no Python loops
+    q = q.reshape(N, n_groups, bytes_per_group, 5)
+    v = (q[:, :, :, 0].astype(np.uint32)
+         + q[:, :, :, 1] * 3
+         + q[:, :, :, 2] * 9
+         + q[:, :, :, 3] * 27
+         + q[:, :, :, 4] * 81).astype(np.uint8)
+    return v.reshape(N, n_groups * bytes_per_group)
 
 
 def unpack_t5(t5w: np.ndarray, group_size: int, K: int) -> np.ndarray:
@@ -133,28 +132,16 @@ def unpack_t5(t5w: np.ndarray, group_size: int, K: int) -> np.ndarray:
     N = t5w.shape[0]
     n_groups = K // group_size
     bytes_per_group = math.ceil(group_size / 5)
-    full_bytes = group_size // 5
-    rem_trits  = group_size % 5
 
-    out = np.zeros((N, K), dtype=np.uint8)
+    # Decode 5 trits from every byte simultaneously — 5-iteration loop, fully vectorized
+    v = t5w.reshape(N, n_groups, bytes_per_group).astype(np.uint32)
+    trits = np.empty((N, n_groups, bytes_per_group, 5), dtype=np.uint8)
+    for j in range(5):
+        trits[:, :, :, j] = (v % 3).astype(np.uint8)
+        v //= 3
 
-    for g in range(n_groups):
-        g_start = g * group_size
-        byte_off = g * bytes_per_group
-
-        for b in range(full_bytes):
-            v = t5w[:, byte_off + b].astype(np.uint32)
-            for j in range(5):
-                out[:, g_start + b*5 + j] = (v % 3).astype(np.uint8)
-                v //= 3
-
-        if rem_trits > 0:
-            v = t5w[:, byte_off + full_bytes].astype(np.uint32)
-            for j in range(rem_trits):
-                out[:, g_start + full_bytes*5 + j] = (v % 3).astype(np.uint8)
-                v //= 3
-
-    return out
+    # Flatten bytes×trits axis, drop padding, reshape to (N, K)
+    return trits.reshape(N, n_groups, bytes_per_group * 5)[:, :, :group_size].reshape(N, K)
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +161,9 @@ def unpack_mlx_2bit(w_uint32: np.ndarray, K: int) -> np.ndarray:
     (N, K) uint8 quants in {0,1,2,3}  (ternary uses only {0,1,2})
     """
     N = w_uint32.shape[0]
-    out = np.zeros((N, K), dtype=np.uint8)
-    for slot in range(16):
-        shift = slot * 2
-        out[:, slot::16] = ((w_uint32 >> shift) & 0x3).astype(np.uint8)
-    return out
+    shifts = np.arange(16, dtype=np.uint32) * 2  # (16,)
+    # (N, K//16, 16) → reshape to (N, K): slot-major ordering matches slot::16 stride
+    return ((w_uint32[:, :, None] >> shifts) & 0x3).astype(np.uint8).reshape(N, K)
 
 
 def dequantize_group(quants: np.ndarray, scale: float, bias: float) -> np.ndarray:
@@ -231,11 +216,10 @@ def repack_shard(
     Rules:
     - Keys ending in '.weight' with dtype uint32 and ndim==2 are weight tensors.
     - Their corresponding '.scales' and '.biases' must exist.
-    - After repack: weight dtype becomes uint8 with t5 encoding; '.biases' key is removed.
+    - After repack: weight dtype becomes uint8 with t5 encoding; '.biases' key is kept.
     - '.scales' is unchanged (same values, same dtype).
     """
     out: dict[str, np.ndarray] = {}
-    bias_keys_to_drop: set[str] = set()
 
     for key, arr in tensors.items():
         if not key.endswith(".weight"):
@@ -287,11 +271,7 @@ def repack_shard(
 
         out[key] = t5w
         out[scales_key] = scales   # keep scales unchanged
-        bias_keys_to_drop.add(biases_key)
-
-    # Drop bias keys for repacked layers (don't re-add them)
-    for k in bias_keys_to_drop:
-        out.pop(k, None)
+        # biases are kept: mlx-lm strict load requires them; t5 decode path ignores them
 
     return out
 
@@ -307,7 +287,7 @@ def repack_model(src: Path, dst: Path, group_size: int, verbose: bool = True) ->
     if src == dst:
         print(
             f"Error: --output must differ from --model.\n"
-            f"  Suggested name: {src.parent / (src.name + '-t5')}",
+            f"  Suggested name: {_suggest_output_name(src)}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -393,20 +373,17 @@ def verify_models(
 
             N, K_packed = arr.shape
             K = K_packed * 16
-            q_src = unpack_mlx_2bit(arr, K)
             n_groups = K // group_size
+            q_src = unpack_mlx_2bit(arr, K)
 
             q_t5w = t5_tensors[key]
             q_t5  = unpack_t5(q_t5w, group_size, K)
 
-            dq_src = np.zeros((N, K), dtype=np.float32)
-            dq_t5  = np.zeros((N, K), dtype=np.float32)
-            for g in range(n_groups):
-                gs, ge = g * group_size, (g+1) * group_size
-                s = scales[:, g:g+1]
-                b = biases[:, g:g+1]
-                dq_src[:, gs:ge] = s * q_src[:, gs:ge] + b
-                dq_t5[:, gs:ge]  = s * q_t5[:, gs:ge]  + b
+            # Vectorized dequant: broadcast scales/biases over group_size axis
+            s = scales.reshape(N, n_groups, 1)
+            b = biases.reshape(N, n_groups, 1)
+            dq_src = (s * q_src.reshape(N, n_groups, group_size) + b).reshape(N, K)
+            dq_t5  = (s * q_t5.reshape(N,  n_groups, group_size) + b).reshape(N, K)
 
             if not np.allclose(dq_src, dq_t5, atol=atol):
                 max_diff = np.abs(dq_src - dq_t5).max()
