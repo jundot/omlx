@@ -45,6 +45,16 @@ except ImportError:
     _NATIVE = False
 
 # ---------------------------------------------------------------------------
+# t5 tensor factory (base-3 ternary, I-D)
+# ---------------------------------------------------------------------------
+
+try:
+    from tools.repack_ternary_t5 import pack_t5 as _pack_t5
+    _HAS_T5_REPACK = True
+except ImportError:
+    _HAS_T5_REPACK = False
+
+# ---------------------------------------------------------------------------
 # Projection shapes for Qwen3.6-27B (Bonsai-27B base)
 # ---------------------------------------------------------------------------
 
@@ -91,19 +101,43 @@ def make_2bit_tensors(M: int, N: int, K: int, group_size: int, dtype: mx.Dtype):
     return x, w, scales, biases
 
 
+def make_t5_tensors(M: int, N: int, K: int, group_size: int, dtype: mx.Dtype):
+    """t5 base-3 ternary packing: ceil(group_size/5) uint8 bytes per group."""
+    import numpy as np
+    x      = mx.random.normal((M, K)).astype(dtype)
+    n_g    = K // group_size
+    scales = mx.ones((N, n_g), dtype=dtype)
+    if _HAS_T5_REPACK:
+        rng    = np.random.default_rng(0)
+        quants = rng.integers(0, 3, size=(N, K), dtype=np.uint8)
+        w_np   = _pack_t5(quants, group_size)
+        w      = mx.array(w_np)
+    else:
+        bpg = (group_size + 4) // 5
+        w   = mx.zeros((N, n_g * bpg), dtype=mx.uint8)
+    return x, w, scales
+
+
 # ---------------------------------------------------------------------------
 # Bandwidth calculation
 # ---------------------------------------------------------------------------
 
 def bytes_streamed(
     M: int, N: int, K: int, group_size: int, bits: int,
-    dtype: mx.Dtype, symmetric: bool = False,
+    dtype: mx.Dtype, symmetric: bool = False, is_t5: bool = False,
 ) -> int:
+    import math
     T = DTYPE_BYTES[dtype]
     n_g = K // group_size
-    w_bytes     = N * K * bits // 8
+    if is_t5:
+        # t5: ceil(group_size/5) bytes per group, no biases (always symmetric)
+        bpg = math.ceil(group_size / 5)
+        w_bytes    = N * n_g * bpg
+        bias_bytes = 0
+    else:
+        w_bytes    = N * K * bits // 8
+        bias_bytes = 0 if symmetric else N * n_g * T
     scale_bytes = N * n_g * T
-    bias_bytes  = 0 if symmetric else N * n_g * T
     x_bytes     = M * K * T
     y_bytes     = M * N * T
     return w_bytes + scale_bytes + bias_bytes + x_bytes + y_bytes
@@ -137,6 +171,7 @@ class Variant:
     bits: int
     requires_native: bool = True
     symmetric: bool = False
+    is_t5: bool = False  # base-3 ternary format (I-D)
 
 
 def get_variants(bits: int) -> list[Variant]:
@@ -155,6 +190,8 @@ def get_variants(bits: int) -> list[Variant]:
             Variant("q2_fast_sym",   2, requires_native=True,  symmetric=True),
             Variant("q2_wide",       2, requires_native=True,  symmetric=False),
             Variant("q2_wide_sym",   2, requires_native=True,  symmetric=True),
+            Variant("t5_fast",       2, requires_native=True,  symmetric=True,  is_t5=True),
+            Variant("t5_wide",       2, requires_native=True,  symmetric=True,  is_t5=True),
             Variant("mlx_fallback",  2, requires_native=False, symmetric=False),
         ]
     return variants
@@ -165,6 +202,18 @@ def call_variant(v: Variant, x, w, scales, biases, M: int) -> mx.array | None:
         return None
     if bf is None:
         return None
+
+    # t5 variants: no biases, different weight format
+    if v.is_t5:
+        wide = "wide" in v.name and M >= 3 and bf._use_qmv_wide(2, M)
+        fn_name = "bonsai_t5_qmv_wide" if wide else "bonsai_t5_qmv"
+        if not bf.has_symbol(fn_name):
+            return None
+        fn = getattr(bf, fn_name)
+        try:
+            return fn(x, w, scales)
+        except Exception:
+            return None
 
     wide = M >= 3 and bf._use_qmv_wide(v.bits, M)
 
@@ -261,13 +310,27 @@ def run_bench(
                     x, w, scales, biases = make_fn(M, N, K, gs, dtype)
                     mx.eval(x, w, scales, biases)
 
+                    # t5 tensors (shared across t5 variants for this shape)
+                    t5_tensors = None
+
                     for v in get_variants(bits):
                         # Skip wide variants for M < 3 (not instantiated for M=1,2
                         # in the wide path; fast is used instead)
                         if "wide" in v.name and M < 2:
                             continue
 
-                        out = call_variant(v, x, w, scales, biases, M)
+                        # t5 variants need their own weight tensor
+                        if v.is_t5:
+                            if not _HAS_T5_REPACK and bf is None:
+                                continue
+                            if t5_tensors is None:
+                                t5x, t5w, t5sc = make_t5_tensors(M, N, K, gs, dtype)
+                                mx.eval(t5x, t5w, t5sc)
+                                t5_tensors = (t5x, t5w, t5sc)
+                            t5x, t5w, t5sc = t5_tensors
+                            out = call_variant(v, t5x, t5w, t5sc, None, M)
+                        else:
+                            out = call_variant(v, x, w, scales, biases, M)
                         if out is None:
                             continue
 
@@ -278,10 +341,15 @@ def run_bench(
                             rows.append(Row(name, N, K, M, bits, gs, v.name, 0, 0, f"ERROR: {e}"))
                             continue
 
-                        bw = bytes_streamed(M, N, K, gs, bits, dtype, v.symmetric)
+                        bw = bytes_streamed(M, N, K, gs, bits, dtype, v.symmetric, v.is_t5)
 
-                        def fn(v=v, x=x, w=w, scales=scales, biases=biases, M=M):
-                            return call_variant(v, x, w, scales, biases, M)
+                        if v.is_t5:
+                            _t5x, _t5w, _t5sc = t5_tensors  # type: ignore[misc]
+                            def fn(v=v, _x=_t5x, _w=_t5w, _sc=_t5sc, M=M):
+                                return call_variant(v, _x, _w, _sc, None, M)
+                        else:
+                            def fn(v=v, x=x, w=w, scales=scales, biases=biases, M=M):
+                                return call_variant(v, x, w, scales, biases, M)
 
                         try:
                             t = time_fn(fn, warmup, iters)

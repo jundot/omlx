@@ -107,6 +107,25 @@ array bonsai_q2_affine_qmv_wide_sym(
     const array& biases,
     StreamOrDevice s = {});
 
+// ---------------------------------------------------------------------------
+// t5: base-3 ternary qmv (Identity I-D, ~1.585 bpw)
+// ---------------------------------------------------------------------------
+// x      : [..., K]                float16 or bfloat16
+// w      : [..., N, n_groups*bpg]  uint8 t5 bytes (bpg=26 for gs=128, 13 for gs=64)
+// scales : [..., N, n_groups]      float16 or bfloat16 (no biases — always symmetric)
+// Returns [..., N].
+array bonsai_t5_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
+array bonsai_t5_qmv_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,

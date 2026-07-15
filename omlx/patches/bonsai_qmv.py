@@ -36,6 +36,8 @@ from omlx.custom_kernels.bonsai.fast import (
     bonsai_q1_affine_qmv_wide_sym,
     bonsai_q2_affine_qmv_wide_sym,
     bonsai_qmv_wide,
+    bonsai_t5_qmv,
+    bonsai_t5_qmv_wide,
     has_native,
     _use_qmv_wide,
 )
@@ -89,16 +91,64 @@ def _is_symmetric(self: nn.QuantizedLinear, bits: int) -> bool:
     return result
 
 
+def _is_t5_format(self: nn.QuantizedLinear) -> bool:
+    """Return True if the weight tensor is in t5 (base-3 ternary) format.
+
+    t5 weights are stored as uint8 with bytes_per_group ∈ {13, 26}:
+      13 bytes/group → group_size=64  (13×5=65; 1 padding trit)
+      26 bytes/group → group_size=128 (26×5=130; 2 padding trits)
+
+    Evaluated once on the first call; result cached as _bonsai_t5_cache.
+    """
+    cache_attr = "_bonsai_t5_cache"
+    cached = getattr(self, cache_attr, None)
+    if cached is not None:
+        return cached
+    w = self.weight
+    if w.dtype != mx.uint8:
+        object.__setattr__(self, cache_attr, False)
+        return False
+    sc = getattr(self, "scales", None)
+    if sc is None or sc.shape[-1] == 0:
+        object.__setattr__(self, cache_attr, False)
+        return False
+    n_groups = sc.shape[-1]
+    w_cols   = w.shape[-1]
+    if n_groups <= 0 or w_cols % n_groups != 0:
+        object.__setattr__(self, cache_attr, False)
+        return False
+    bpg = w_cols // n_groups  # bytes per group
+    result = bpg in (13, 26)
+    object.__setattr__(self, cache_attr, result)
+    return result
+
+
 def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
     """Replacement for QuantizedLinear.__call__ for 1-bit and 2-bit layers."""
     bits: int = getattr(self, "bits", 4)
     mode: str = getattr(self, "mode", "affine")
 
+    M = x.shape[-2] if x.ndim >= 2 else 1
+
+    # t5 format: uint8 base-3 ternary weights — route before bits check.
+    if mode == "affine" and bits == 2 and _is_t5_format(self):
+        if M > _MAX_DECODE_M:
+            return _original_quantized_linear_call(self, x)
+        w = self.weight
+        scales = self.scales.astype(x.dtype)
+        if _use_qmv_wide(2, M):
+            out = bonsai_t5_qmv_wide(x, w, scales)
+        else:
+            out = bonsai_t5_qmv(x, w, scales)
+        linear_bias = getattr(self, "bias", None)
+        if linear_bias is not None:
+            out = out + linear_bias
+        return out
+
     # Only intercept 1-bit / 2-bit affine layers in decode regime.
     if mode != "affine" or bits not in (1, 2):
         return _original_quantized_linear_call(self, x)
 
-    M = x.shape[-2] if x.ndim >= 2 else 1
     if M > _MAX_DECODE_M:
         return _original_quantized_linear_call(self, x)
 

@@ -642,3 +642,151 @@ def test_bonsai_local_build_probe_is_healthy():
     if not bonsai_fast.is_native_available():
         pytest.skip("bonsai native build unavailable")
     assert bonsai_fast._ext.abi_probe(mx.zeros((3,))) == 3
+
+
+# ---------------------------------------------------------------------------
+# t5 (base-3 ternary packing, Identity I-D) tests
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+def _make_t5_layer(N: int = 64, K: int = 256, group_size: int = 128,
+                   quants: np.ndarray | None = None) -> nn.QuantizedLinear:
+    """QuantizedLinear with t5-format weights (uint8, base-3)."""
+    from tools.repack_ternary_t5 import pack_t5
+
+    if quants is None:
+        rng = np.random.default_rng(42)
+        quants = rng.integers(0, 3, size=(N, K), dtype=np.uint8)
+
+    t5w = pack_t5(quants, group_size)
+    n_groups = K // group_size
+    scales = mx.ones((N, n_groups), dtype=mx.float16)
+
+    layer = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+    object.__setattr__(layer, "weight", mx.array(t5w))
+    object.__setattr__(layer, "scales", scales)
+    object.__setattr__(layer, "biases", -scales)  # symmetric: bias = -scale
+    object.__setattr__(layer, "bits", 2)
+    object.__setattr__(layer, "group_size", group_size)
+    object.__setattr__(layer, "mode", "affine")
+    return layer
+
+
+class TestT5Repack:
+    """Tests for tools/repack_ternary_t5.py."""
+
+    def test_pack_unpack_roundtrip_gs128(self):
+        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        rng = np.random.default_rng(0)
+        q = rng.integers(0, 3, size=(8, 128), dtype=np.uint8)
+        t5w = pack_t5(q, group_size=128)
+        assert t5w.shape == (8, 26), f"expected (8,26) got {t5w.shape}"
+        q_rt = unpack_t5(t5w, group_size=128, K=128)
+        np.testing.assert_array_equal(q, q_rt)
+
+    def test_pack_unpack_roundtrip_gs64(self):
+        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        rng = np.random.default_rng(1)
+        q = rng.integers(0, 3, size=(8, 64), dtype=np.uint8)
+        t5w = pack_t5(q, group_size=64)
+        assert t5w.shape == (8, 13), f"expected (8,13) got {t5w.shape}"
+        q_rt = unpack_t5(t5w, group_size=64, K=64)
+        np.testing.assert_array_equal(q, q_rt)
+
+    def test_pack_unpack_larger_K(self):
+        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        rng = np.random.default_rng(2)
+        K, gs = 7168, 128
+        q = rng.integers(0, 3, size=(4, K), dtype=np.uint8)
+        t5w = pack_t5(q, group_size=gs)
+        n_groups = K // gs
+        assert t5w.shape == (4, n_groups * 26)
+        q_rt = unpack_t5(t5w, group_size=gs, K=K)
+        np.testing.assert_array_equal(q, q_rt)
+
+    def test_padding_trit_is_neutral(self):
+        """Padding trits (q=1) must contribute zero to the dot product."""
+        from tools.repack_ternary_t5 import pack_t5
+        # Single group of 128, last 2 positions zero-padded with q=1
+        q = np.ones((1, 128), dtype=np.uint8)  # all t=0 (q=1 → dq=0 for scale*(q-1))
+        t5w = pack_t5(q, group_size=128)
+        # Decode last byte and check it encodes 3 active trits + 2 padding (all q=1)
+        # byte v = 1 + 1*3 + 1*9 + 1*27 + 1*81 = 121
+        assert t5w[0, 25] == 121  # 1+3+9+27+81
+
+    def test_dequant_matches_2bit_reference(self):
+        """t5 and 2-bit dequantize to the same float values."""
+        from tools.repack_ternary_t5 import pack_t5, unpack_t5, unpack_mlx_2bit
+        rng = np.random.default_rng(3)
+        N, K, gs = 16, 256, 128
+        # Generate ternary quants ∈ {0,1,2}
+        q = rng.integers(0, 3, size=(N, K), dtype=np.uint8)
+
+        # 2-bit MLX pack: 16 values per uint32
+        w2bit = np.zeros((N, K // 16), dtype=np.uint32)
+        for i in range(16):
+            w2bit |= (q[:, i::16].astype(np.uint32) << (i * 2))
+
+        # Build matching scales and biases
+        n_groups = K // gs
+        scales = rng.uniform(0.5, 1.5, size=(N, n_groups)).astype(np.float32)
+        biases = -scales  # ternary symmetric
+
+        # Dequantize from 2-bit
+        q2 = unpack_mlx_2bit(w2bit, K)
+        dq2 = sum(
+            (scales[:, g:g+1] * q2[:, g*gs:(g+1)*gs] + biases[:, g:g+1])
+            for g in range(n_groups)
+        )
+
+        # Dequantize from t5
+        t5w = pack_t5(q, group_size=gs)
+        qt5 = unpack_t5(t5w, group_size=gs, K=K)
+        dqt5 = sum(
+            (scales[:, g:g+1] * qt5[:, g*gs:(g+1)*gs] + biases[:, g:g+1])
+            for g in range(n_groups)
+        )
+
+        np.testing.assert_allclose(dq2, dqt5, atol=1e-6)
+
+
+class TestT5FormatDetection:
+    """Tests for _is_t5_format detection in bonsai_qmv patch."""
+
+    def test_detects_t5_gs128(self):
+        from omlx.patches.bonsai_qmv import _is_t5_format
+        layer = _make_t5_layer(N=64, K=256, group_size=128)
+        assert _is_t5_format(layer) is True
+
+    def test_detects_t5_gs64(self):
+        from omlx.patches.bonsai_qmv import _is_t5_format
+        layer = _make_t5_layer(N=64, K=256, group_size=64)
+        assert _is_t5_format(layer) is True
+
+    def test_rejects_uint32_weight(self):
+        from omlx.patches.bonsai_qmv import _is_t5_format
+        layer = _make_sym_layer(bits=2, N=64, K=256, group_size=128)
+        # weight is uint32 (2-bit MLX format), not t5
+        assert _is_t5_format(layer) is False
+
+    def test_rejects_wrong_bytes_per_group(self):
+        from omlx.patches.bonsai_qmv import _is_t5_format
+        import mlx.nn as nn_inner
+        # uint8 weight but bytes_per_group=32 (not 13 or 26)
+        layer = nn_inner.QuantizedLinear.__new__(nn_inner.QuantizedLinear)
+        object.__setattr__(layer, "weight", mx.zeros((64, 64), dtype=mx.uint8))
+        object.__setattr__(layer, "scales", mx.ones((64, 2), dtype=mx.float16))
+        object.__setattr__(layer, "bits", 2)
+        object.__setattr__(layer, "mode", "affine")
+        assert _is_t5_format(layer) is False
+
+    def test_detection_cached(self):
+        from omlx.patches.bonsai_qmv import _is_t5_format
+        layer = _make_t5_layer(N=16, K=128, group_size=128)
+        first = _is_t5_format(layer)
+        # Change weight — cache should still return first result
+        object.__setattr__(layer, "weight", mx.zeros((16, 3), dtype=mx.uint8))
+        second = _is_t5_format(layer)
+        assert first == second

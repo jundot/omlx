@@ -123,6 +123,125 @@ int derive_group_size(const array& w, const array& scales, int bits) {
     return static_cast<int>(K / n_groups);
 }
 
+// t5 weight tensor: (N, n_groups * bytes_per_group) uint8.
+// bytes_per_group = ceil(group_size / 5): 26 for gs=128, 13 for gs=64.
+int derive_t5_group_size(const array& w, const array& scales) {
+    int64_t n_groups = scales.shape(-1);
+    if (n_groups <= 0)
+        throw std::invalid_argument("t5: scales has 0 groups");
+    int64_t bpg = w.shape(-1) / n_groups;
+    if (bpg == 26) return 128;
+    if (bpg == 13) return 64;
+    std::ostringstream msg;
+    msg << "t5: unrecognised bytes_per_group=" << bpg
+        << " (expected 26 for gs=128 or 13 for gs=64)";
+    throw std::invalid_argument(msg.str());
+}
+
+// ---------------------------------------------------------------------------
+// t5 kernel name helpers
+// ---------------------------------------------------------------------------
+
+// affine_qmv_fast_t5_<type>_gs_<gs>_batch_<0|1>
+std::string qmv_fast_t5_kname(
+    const std::string& type, int group_size, bool batched) {
+    return "affine_qmv_fast_t5_" + type
+        + "_gs_" + std::to_string(group_size)
+        + (batched ? "_batch_1" : "_batch_0");
+}
+
+// affine_qmv_wide_t5_<type>_gs_<gs>_nv_<nv>_kl_<kl>_batch_<0|1>
+std::string qmv_wide_t5_kname(
+    const std::string& type, int group_size,
+    int vecs_per_tg, int k_lanes, bool batched) {
+    return "affine_qmv_wide_t5_" + type
+        + "_gs_" + std::to_string(group_size)
+        + "_nv_" + std::to_string(vecs_per_tg)
+        + "_kl_" + std::to_string(k_lanes)
+        + (batched ? "_batch_1" : "_batch_0");
+}
+
+// ---------------------------------------------------------------------------
+// t5 dispatch functions
+// ---------------------------------------------------------------------------
+
+// Buffer layout for t5 kernels: w(0), scales(1), x(2), y(3), K(4), N(5)
+// (no biases — t5 is always symmetric)
+void dispatch_qmv_fast_t5(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int M, int N, int K,
+    int group_size,
+    metal::Device& d,
+    const Stream& s) {
+
+    int B = static_cast<int>(out.size()) / M / N;
+    bool batched = B > 1;
+    std::string kname = qmv_fast_t5_kname(type_str(x.dtype()), group_size, batched);
+
+    auto kernel = get_bonsai_kernel(d, kname);
+    auto& enc = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+
+    int c = 0;
+    enc.set_input_array(w,      c++);
+    enc.set_input_array(scales, c++);
+    enc.set_input_array(x,      c++);
+    enc.set_output_array(out,   c++);
+    enc.set_bytes(K, c++);
+    enc.set_bytes(N, c++);
+
+    int bn = 16, bk = 32;
+    MTL::Size group_dims(bk, 4, 1);
+    MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+    enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void dispatch_qmv_wide_t5(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int M, int N, int K,
+    int group_size,
+    metal::Device& d,
+    const Stream& s) {
+
+    int B = static_cast<int>(out.size()) / M / N;
+    bool batched = B > 1;
+
+    int n_tiles = (M + 4) / 5;
+    int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+    int k_lanes = 8;
+    int num_simdgroups = 4;
+    int rows_per_tg = (32 / k_lanes) * num_simdgroups;
+
+    std::string kname = qmv_wide_t5_kname(
+        type_str(x.dtype()), group_size, vecs_per_tg, k_lanes, batched);
+
+    auto kernel = get_bonsai_kernel(d, kname);
+    auto& enc = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+
+    int c = 0;
+    enc.set_input_array(w,      c++);
+    enc.set_input_array(scales, c++);
+    enc.set_input_array(x,      c++);
+    enc.set_output_array(out,   c++);
+    enc.set_bytes(K, c++);
+    enc.set_bytes(N, c++);
+    enc.set_bytes(M, c++);
+
+    MTL::Size group_dims(32, num_simdgroups, 1);
+    MTL::Size grid_dims(
+        (M + vecs_per_tg - 1) / vecs_per_tg,
+        (N + rows_per_tg - 1) / rows_per_tg,
+        B);
+    enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 // ---------------------------------------------------------------------------
 // qmv_fast dispatch (called from eval_gpu)
 // ---------------------------------------------------------------------------
@@ -334,6 +453,54 @@ class BonsaiSpecDecodePrimitive : public Primitive {
     DEFINE_NAME(BonsaiSpecDecodePrimitive)
 };
 
+// BonsaiT5QmvPrimitive: t5 base-3 ternary decode (Identity I-D).
+//   inputs[0] = x      (row-contiguous activations)
+//   inputs[1] = w      (uint8 t5 weight bytes, (N, n_groups*bytes_per_group))
+//   inputs[2] = scales ((N, n_groups) scale per group; no biases)
+class BonsaiT5QmvPrimitive : public Primitive {
+ public:
+    explicit BonsaiT5QmvPrimitive(Stream s, bool wide)
+        : Primitive(s), wide_(wide) {}
+
+ private:
+    bool wide_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error("BonsaiT5QmvPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        const auto& x      = inputs[0];
+        const auto& w      = inputs[1];
+        const auto& scales = inputs[2];
+
+        int group_size = derive_t5_group_size(w, scales);
+        int N          = static_cast<int>(w.shape(-2));
+        int n_groups   = static_cast<int>(scales.shape(-1));
+        int K          = n_groups * group_size;
+        int M          = static_cast<int>(x.size()) / K;
+
+        if (wide_) {
+            dispatch_qmv_wide_t5(x, w, scales, out,
+                                 M, N, K, group_size, d, s);
+        } else {
+            dispatch_qmv_fast_t5(x, w, scales, out,
+                                 M, N, K, group_size, d, s);
+        }
+    }
+
+    DEFINE_NAME(BonsaiT5QmvPrimitive)
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -488,6 +655,38 @@ array bonsai_q2_affine_qmv_wide_sym(
     return array(out_shape, x_c.dtype(),
         std::make_shared<BonsaiQmvPrimitive>(s, 2, /*wide=*/true, /*symmetric=*/true),
         {x_c, w, sc, bi});
+}
+
+array bonsai_t5_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiT5QmvPrimitive>(s, /*wide=*/false),
+        {x_c, w, sc});
+}
+
+array bonsai_t5_qmv_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc  = ensure_dtype(scales, x_c.dtype(), s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = x_c.shape();
+    out_shape.back() = N;
+    return array(out_shape, x_c.dtype(),
+        std::make_shared<BonsaiT5QmvPrimitive>(s, /*wide=*/true),
+        {x_c, w, sc});
 }
 
 std::pair<array, array> bonsai_spec_decode_verify(

@@ -374,6 +374,49 @@ def bonsai_q2_affine_qmv_wide_sym(
 
 
 # ---------------------------------------------------------------------------
+# t5: base-3 ternary packing (Identity I-D, ~1.585 bpw)
+# ---------------------------------------------------------------------------
+# Weight tensor: uint8, shape (N, n_groups * bytes_per_group)
+#   bytes_per_group = 26 for group_size=128, 13 for group_size=64
+# No bias tensor (always symmetric: dequant = scale * (q - 1), q ∈ {0,1,2})
+# ---------------------------------------------------------------------------
+
+
+def bonsai_t5_qmv(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 base-3 ternary decode (M=1, ~1.585 bpw, I-D).
+
+    Parameters
+    ----------
+    x      : [..., K]                   activations (float16 or bfloat16)
+    w      : [..., N, n_groups*bpg]     uint8 t5 weight bytes
+    scales : [..., N, n_groups]         scale per group (float16 or bfloat16)
+    """
+    if _ext is not None and has_symbol("bonsai_t5_qmv"):
+        return _ext.bonsai_t5_qmv(x, w, scales, stream=stream)
+    raise RuntimeError(
+        "bonsai_t5_qmv: native extension unavailable. "
+        "Rebuild the bonsai extension to use t5-format weights."
+    )
+
+
+def bonsai_t5_qmv_wide(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 base-3 ternary wide decode (M=2..5, I-D + I-C)."""
+    if _ext is not None and has_symbol("bonsai_t5_qmv_wide"):
+        return _ext.bonsai_t5_qmv_wide(x, w, scales, stream=stream)
+    return bonsai_t5_qmv(x, w, scales, stream=stream)
+
+
+# ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------
 

@@ -1281,6 +1281,206 @@ METAL_FUNC void qmv_wide_impl(
   }
 }
 
+// ---------------------------------------------------------------------------
+// t5: base-3 ternary packing (Identity I-D)
+//
+// Format: ceil(group_size/5) bytes per group, 5 trits per byte.
+//   byte v = t0 + t1*3 + t2*9 + t3*27 + t4*81,  t_k ∈ {0,1,2}
+// Last byte of each group has (group_size % 5) active trits; remainder
+// is padded with q=1 (trit = 0, zero contribution to the dot product).
+//
+// group_size=128: 26 bytes/group (130 trits encoded; 2 padding=q1)
+// group_size=64:  13 bytes/group (65 trits encoded; 1 padding=q1)
+//
+// Always symmetric: dequant = scale * (q - 1), no bias tensor needed.
+// This saves the bias DRAM load AND the 2-bit overhead vs t5:
+//   2-bit gs=128: 32 bytes weight + 2 bias = 34 bytes/group
+//   t5   gs=128: 26 bytes weight only       = 26 bytes/group  (-23.5%)
+// ---------------------------------------------------------------------------
+
+// qmv_fast_t5: single-batch decode (M=1).
+//
+// Thread geometry: same as qmv_fast_impl (4 simdgroups × 4 rows, 32 threads).
+// Each thread strides over groups at step SIMD_SIZE=32.  For n_groups=56
+// (K=7168, gs=128) threads 0-23 get 2 groups, threads 24-31 get 1 group.
+// No pre-scaling trick (incompatible with base-3); direct divmod per byte.
+template <typename T, int group_size, bool batched = false>
+METAL_FUNC void qmv_fast_t5_impl(
+    const device uint8_t* w,     // (N, n_groups * bytes_per_group) t5 bytes
+    const device T* scales,      // (N, n_groups) scale per group
+    const device T* x,           // (M, K) activations
+    device T* y,                 // (M, N) output
+    const constant int& in_vec_size,   // K
+    const constant int& out_vec_size,  // N
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+
+  // ceil(group_size / 5) bytes encode the group, last byte partially used.
+  constexpr int bytes_per_group = (group_size + 4) / 5;
+  constexpr int full_bytes = group_size / 5;      // bytes with all 5 trits active
+  constexpr int rem_trits  = group_size % 5;      // active trits in last byte (3 or 4)
+  constexpr int num_simdgroups = 4;
+  constexpr int results_per_simdgroup = 4;
+
+  typedef float U;
+  thread U result[results_per_simdgroup] = {0};
+
+  const int n_groups = in_vec_size / group_size;
+  const int out_row  = tid.y * (num_simdgroups * results_per_simdgroup) +
+                       simd_gid * results_per_simdgroup;
+
+  const device T* x_batch = x + tid.x * in_vec_size;
+
+  for (int g = simd_lid; g < n_groups; g += SIMD_SIZE) {
+    const device T* xg = x_batch + g * group_size;
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const int cur_row = out_row + row;
+      if (cur_row >= out_vec_size) continue;
+
+      const device uint8_t* wg =
+          w + cur_row * (n_groups * bytes_per_group) + g * bytes_per_group;
+      const U s = U(scales[cur_row * n_groups + g]);
+      U accum = 0;
+
+      // Decode full_bytes bytes: each byte encodes exactly 5 trits.
+      // Sequential divmod-by-3; compiler emits multiply-shift (no hw div).
+      for (int b = 0; b < full_bytes; b++) {
+        uint8_t v = wg[b];
+        const int base = b * 5;
+        accum += (U(v % 3) - 1.0f) * U(xg[base + 0]); v /= 3;
+        accum += (U(v % 3) - 1.0f) * U(xg[base + 1]); v /= 3;
+        accum += (U(v % 3) - 1.0f) * U(xg[base + 2]); v /= 3;
+        accum += (U(v % 3) - 1.0f) * U(xg[base + 3]); v /= 3;
+        accum += (U(v)     - 1.0f) * U(xg[base + 4]); // last trit: no div needed
+      }
+      // Last partial byte: rem_trits active trits (3 for gs=128, 4 for gs=64).
+      if constexpr (rem_trits > 0) {
+        uint8_t v = wg[full_bytes];
+        const int base = full_bytes * 5;
+        if constexpr (rem_trits >= 1) { accum += (U(v % 3) - 1.0f) * U(xg[base + 0]); v /= 3; }
+        if constexpr (rem_trits >= 2) { accum += (U(v % 3) - 1.0f) * U(xg[base + 1]); v /= 3; }
+        if constexpr (rem_trits >= 3) { accum += (U(v % 3) - 1.0f) * U(xg[base + 2]); v /= 3; }
+        if constexpr (rem_trits >= 4) { accum += (U(v)     - 1.0f) * U(xg[base + 3]); }
+      }
+      result[row] += s * accum;
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0 && out_row + row < out_vec_size) {
+      y[tid.x * out_vec_size + out_row + row] = T(result[row]);
+    }
+  }
+}
+
+// qmv_wide_t5: small-batch decode (M = vecs_per_tg = 2..5).
+//
+// Amortises the weight stream across all M vectors (Identity I-C):
+// decode each t5 byte once, multiply with all M activations.
+// k_lanes threads stride over groups, results_per_simdgroup=SIMD_SIZE/k_lanes.
+template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool batched = false>
+METAL_FUNC void qmv_wide_t5_impl(
+    const device uint8_t* w,
+    const device T* scales,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+
+  constexpr int bytes_per_group = (group_size + 4) / 5;
+  constexpr int full_bytes = group_size / 5;
+  constexpr int rem_trits  = group_size % 5;
+  constexpr int num_simdgroups = 4;
+  constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
+
+  typedef float U;
+  const short k_lane = simd_lid % k_lanes;
+  const short sg_row = simd_lid / k_lanes;
+
+  const int out_row = tid.y * (results_per_simdgroup * num_simdgroups) +
+                      results_per_simdgroup * simd_gid + sg_row;
+  const int vec0 = tid.x * vecs_per_tg;
+  const int n_groups = in_vec_size / group_size;
+
+  const int row = min(out_row, out_vec_size - 1);
+  const device uint8_t* wrow = w + row * (n_groups * bytes_per_group);
+  const device T* srow = scales + row * n_groups;
+
+  const device T* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) {
+    xv[v] = x + min(vec0 + v, M - 1) * in_vec_size;
+  }
+
+  U result[vecs_per_tg] = {0};
+
+  for (int g = k_lane; g < n_groups; g += k_lanes) {
+    const device uint8_t* wg = wrow + g * bytes_per_group;
+    const U s = U(srow[g]);
+    const int k0 = g * group_size;
+
+    // Full bytes: decode 5 dequantized values and multiply with all M vecs.
+    for (int b = 0; b < full_bytes; b++) {
+      uint8_t v = wg[b];
+      const int base = k0 + b * 5;
+      // Named variables avoid dynamic array indexing (prevents register spill).
+      U dq0 = s * (U(v % 3) - 1.0f); v /= 3;
+      U dq1 = s * (U(v % 3) - 1.0f); v /= 3;
+      U dq2 = s * (U(v % 3) - 1.0f); v /= 3;
+      U dq3 = s * (U(v % 3) - 1.0f); v /= 3;
+      U dq4 = s * (U(v)     - 1.0f);
+#pragma unroll
+      for (int vi = 0; vi < vecs_per_tg; vi++) {
+        result[vi] += U(xv[vi][base + 0]) * dq0
+                    + U(xv[vi][base + 1]) * dq1
+                    + U(xv[vi][base + 2]) * dq2
+                    + U(xv[vi][base + 3]) * dq3
+                    + U(xv[vi][base + 4]) * dq4;
+      }
+    }
+    // Last partial byte.
+    if constexpr (rem_trits > 0) {
+      uint8_t v = wg[full_bytes];
+      const int base = k0 + full_bytes * 5;
+      U dq0 = U(0), dq1 = U(0), dq2 = U(0), dq3 = U(0);
+      if constexpr (rem_trits >= 1) { dq0 = s * (U(v % 3) - 1.0f); v /= 3; }
+      if constexpr (rem_trits >= 2) { dq1 = s * (U(v % 3) - 1.0f); v /= 3; }
+      if constexpr (rem_trits >= 3) { dq2 = s * (U(v % 3) - 1.0f); v /= 3; }
+      if constexpr (rem_trits >= 4) { dq3 = s * (U(v)     - 1.0f); }
+#pragma unroll
+      for (int vi = 0; vi < vecs_per_tg; vi++) {
+        if constexpr (rem_trits >= 1) result[vi] += U(xv[vi][base + 0]) * dq0;
+        if constexpr (rem_trits >= 2) result[vi] += U(xv[vi][base + 1]) * dq1;
+        if constexpr (rem_trits >= 3) result[vi] += U(xv[vi][base + 2]) * dq2;
+        if constexpr (rem_trits >= 4) result[vi] += U(xv[vi][base + 3]) * dq3;
+      }
+    }
+  }
+
+  // k_lane shuffle reduction (same ladder as qmv_wide_impl).
+  for (int v = 0; v < vecs_per_tg; v++) {
+    if constexpr (k_lanes >= 32) result[v] += simd_shuffle_down(result[v], 16);
+    if constexpr (k_lanes >= 16) result[v] += simd_shuffle_down(result[v], 8);
+    if constexpr (k_lanes >= 8)  result[v] += simd_shuffle_down(result[v], 4);
+    if constexpr (k_lanes >= 4)  result[v] += simd_shuffle_down(result[v], 2);
+    if constexpr (k_lanes >= 2)  result[v] += simd_shuffle_down(result[v], 1);
+  }
+
+  if (k_lane == 0 && out_row < out_vec_size) {
+    for (int v = 0; v < vecs_per_tg; v++) {
+      if (vec0 + v < M) {
+        y[(vec0 + v) * out_vec_size + out_row] = T(result[v]);
+      }
+    }
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,

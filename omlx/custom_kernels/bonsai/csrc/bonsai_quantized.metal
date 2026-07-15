@@ -142,4 +142,84 @@ bonsai_qmv_wide_sym_types(128, 1)
 bonsai_qmv_wide_sym_types(32, 2)
 bonsai_qmv_wide_sym_types(64, 2)
 bonsai_qmv_wide_sym_types(128, 2)
+
+// ---- t5: base-3 ternary packing (Identity I-D) ----------------------------
+// ~1.585 bpw vs 2.0 bpw; always symmetric (no bias tensor).
+// Only gs=64 and gs=128 (the two Bonsai group sizes).
+
+template <typename T, int group_size, bool batched>
+[[kernel]] void affine_qmv_fast_t5(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    device T* y [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+{
+    qmv_fast_t5_impl<T, group_size, batched>(
+        w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int vecs_per_tg, int k_lanes, bool batched>
+[[kernel]] void affine_qmv_wide_t5(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    device T* y [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& M [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+{
+    qmv_wide_t5_impl<T, group_size, vecs_per_tg, k_lanes, batched>(
+        w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+}
+
+#define bonsai_instantiate_qmv_fast_t5(type, gs, batched)                  \
+  instantiate_kernel(                                                        \
+      "affine_qmv_fast_t5_" #type "_gs_" #gs "_batch_" #batched,           \
+      affine_qmv_fast_t5, type, gs, batched)
+
+#define bonsai_instantiate_qmv_wide_t5(type, gs, nv, kl, batch)            \
+  instantiate_kernel(                                                        \
+      "affine_qmv_wide_t5_" #type "_gs_" #gs "_nv_" #nv "_kl_" #kl        \
+          "_batch_" #batch,                                                  \
+      affine_qmv_wide_t5, type, gs, nv, kl, batch)
+
+#define bonsai_qmv_fast_t5_bits(type, gs)                                   \
+  bonsai_instantiate_qmv_fast_t5(type, gs, 0)                               \
+  bonsai_instantiate_qmv_fast_t5(type, gs, 1)
+
+#define bonsai_qmv_fast_t5_types(gs)                                        \
+  bonsai_qmv_fast_t5_bits(float, gs)                                        \
+  bonsai_qmv_fast_t5_bits(float16_t, gs)                                    \
+  bonsai_qmv_fast_t5_bits(bfloat16_t, gs)
+
+#define bonsai_qmv_wide_t5_gs(type, gs)                                     \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 2, 8, 0)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 2, 8, 1)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 3, 8, 0)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 3, 8, 1)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 4, 8, 0)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 4, 8, 1)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 5, 8, 0)                        \
+  bonsai_instantiate_qmv_wide_t5(type, gs, 5, 8, 1)
+
+#define bonsai_qmv_wide_t5_types(gs)                                        \
+  bonsai_qmv_wide_t5_gs(float, gs)                                          \
+  bonsai_qmv_wide_t5_gs(float16_t, gs)                                      \
+  bonsai_qmv_wide_t5_gs(bfloat16_t, gs)
+
+// qmv_fast_t5: gs=64 and gs=128
+bonsai_qmv_fast_t5_types(64)
+bonsai_qmv_fast_t5_types(128)
+
+// qmv_wide_t5: gs=64 and gs=128
+bonsai_qmv_wide_t5_types(64)
+bonsai_qmv_wide_t5_types(128)
 // clang-format on
