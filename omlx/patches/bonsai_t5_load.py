@@ -15,10 +15,12 @@ Patch 1 – Module.load_weights
 Patch 2 – mx.quantized_matmul
   mlx_vlm (Qwen3.5 and similar) calls mx.quantized_matmul DIRECTLY, bypassing
   QuantizedLinear.__call__ and our bonsai_qmv inference patch.  This wrapper
-  intercepts all calls: for uint8 t5 weights it routes decode (M<=5) through
-  the fast bonsai_t5_qmv / _wide Metal kernels (which use magic divmod-3,
-  Realization 2.3 / I-K, so no hw integer divide) and prefill (M>5) through
-  a dequantize + mx.matmul path.  Non-t5 calls (uint32) pass through unchanged.
+  intercepts all calls: for uint8 t5 weights it routes all M through the fast
+  bonsai_t5_qmv (M=1) / bonsai_t5_qmv_wide (M≥2) Metal kernels.  The wide
+  kernel tiles M into groups of ≤5 in one dispatch — no float weight
+  materialisation at any batch size.  Non-t5 calls (uint32) pass through
+  unchanged.  A dequant+matmul fallback fires only when the native extension
+  is unavailable.
 
 Apply once via apply_bonsai_t5_load_patch() before mlx_vlm / mlx_lm load().
 """
@@ -131,8 +133,11 @@ def _t5_quantized_matmul(
     """mx.quantized_matmul replacement that handles t5 uint8 weights.
 
     When *w* is uint8 (t5 base-3 packed):
-      - Decode (M <= 5): route to the native bonsai_t5_qmv / _wide Metal kernel.
-      - Prefill (M > 5): dequantize to float and use mx.matmul.
+      - M=1: route to qmv_fast Metal kernel (single-vector decode).
+      - M≥2: route to qmv_wide Metal kernel (arbitrary M via tiling; reads each
+        weight byte once across all M vectors — no float weight materialisation).
+      The dequant+matmul fallback below is only reached when the native extension
+      is unavailable.
     For all other weight dtypes the original C function is called unchanged.
     """
     # Normal path: uint32 weights → native MLX kernel (the common case).
@@ -142,23 +147,23 @@ def _t5_quantized_matmul(
             **kwargs
         )
 
-    # t5 uint8 weight — route through fast Metal kernels for decode, dequant+matmul for prefill.
+    # t5 uint8 weight — route through fast Metal kernels for all M when available.
+    # dispatch_qmv_wide_t5 tiles M into ceil(M/5) groups (vecs_per_tg ≤ 5) in one
+    # kernel launch, so it handles prefill (large M) just as well as decode.
     from omlx.custom_kernels.bonsai.fast import (
         bonsai_t5_qmv,
         bonsai_t5_qmv_wide,
         has_native,
-        _use_qmv_wide,
     )
-    _MAX_DECODE_M = 5
     M = x.shape[-2] if x.ndim >= 2 else 1
 
-    if M <= _MAX_DECODE_M and has_native():
+    if has_native():
         sc = scales.astype(x.dtype)
-        if _use_qmv_wide(2, M):
+        if M >= 2:
             return bonsai_t5_qmv_wide(x, w, sc)
         return bonsai_t5_qmv(x, w, sc)
 
-    # Prefill path: dequantize to float and use mx.matmul.
+    # Fallback (native extension unavailable): dequantize to float and use mx.matmul.
     N = w.shape[0]
     n_groups = scales.shape[-1]
     bpg = w.shape[-1] // n_groups
