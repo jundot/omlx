@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 
 constant bool align_M [[function_constant(200)]];
@@ -1569,6 +1570,176 @@ METAL_FUNC void qmv_wide_t5_impl(
         y[(vec0 + v) * out_vec_size + out_row] = T(result[v]);
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// qmm_t5_impl: simdgroup MMA GEMM for t5 ternary weights (Identity I-M).
+//
+// Computes out[M, N] = x[M, K] @ t5_decode(w[N, K]).T  (float32 accumulate).
+//
+// Architecture (adapted from MetalTile mt_qmm_mma_int2):
+//   BM=BN=32, BK=group_size (one complete t5 group per K-block iteration)
+//   128 threads = 4 SG × 32 lanes; 2×2 SG tile layout (sm=sg/2, sn=sg%2)
+//   xs[BM][BK+4] and ws[BN][BK+4] threadgroup tiles
+//   BK/8 simdgroup_multiply_accumulate calls per K-block
+//
+// Thread (lane_in_tg = sg_id*32 + lane):
+//   X loading :  row = lane_in_tg/4, k_sub = lane_in_tg%4 → loads BK/4 x-elems
+//   W dequant :  row = lane_in_tg/4, sub  = lane_in_tg%4 → decodes BK/4 trits
+//                (sub 0..3 each decode a contiguous BK/4 K-positions from t5 bytes)
+//
+// Grid: (ceil(N/32), ceil(M/32), B)  Threadgroup: (32, 4, 1)
+// ---------------------------------------------------------------------------
+template <typename T, int group_size>
+METAL_FUNC void qmm_t5_impl(
+    const device uint8_t* w,    // (N, n_groups * bpg) t5 bytes
+    const device T* scales,     // (N, n_groups)
+    const device T* x,          // (M, K)
+    device T* out,              // (M, N)
+    const constant int& M_c,
+    const constant int& N_c,
+    const constant int& K_c,
+    threadgroup T* xs,          // BM*(group_size+4) — declared by caller
+    threadgroup T* ws,          // BN*(group_size+4) — declared by caller
+    uint2 tgid,                  // (n_tile, m_tile)
+    uint  lane,                  // thread_index_in_simdgroup  (0..31)
+    uint  sg_id)                 // simdgroup_index_in_threadgroup (0..3)
+{
+  constexpr int bpg    = (group_size + 4) / 5;   // bytes per group
+  constexpr int xs_ld  = group_size + 4;          // padded stride for xs
+  constexpr int ws_ld  = group_size + 4;          // padded stride for ws
+  constexpr int BM = 32, BN = 32;
+  (void)BM; (void)BN;
+
+  // Float32 accumulators: 2×2 SG tile → 4 frags per SG (each covers 8×8 out elements)
+  simdgroup_matrix<float, 8, 8> c00, c01, c10, c11;
+  c00.thread_elements()[0] = 0.f;  c00.thread_elements()[1] = 0.f;
+  c01.thread_elements()[0] = 0.f;  c01.thread_elements()[1] = 0.f;
+  c10.thread_elements()[0] = 0.f;  c10.thread_elements()[1] = 0.f;
+  c11.thread_elements()[0] = 0.f;  c11.thread_elements()[1] = 0.f;
+
+  const uint sm = sg_id >> 1u;       // SG M-index (0..1)
+  const uint sn = sg_id & 1u;        // SG N-index (0..1)
+  const uint lane_in_tg = sg_id * 32u + lane;
+
+  // Fragment indices within an 8×8 sub-tile (same derivation as mt_qmm_mma_int2)
+  const uint qid = lane >> 2u;
+  const uint fm  = (qid & 4u) + ((lane >> 1u) & 3u);    // frag M offset in [0,7]
+  const uint fn0 = ((qid & 2u) << 1u) + ((lane & 1u) << 1u);  // frag N offset
+  const uint fn1 = fn0 + 1u;
+
+  const uint m_base = tgid.y * (uint)BM;
+  const uint n_base = tgid.x * (uint)BN;
+
+  const int M = M_c, N = N_c, K = K_c;
+  const int n_groups = K / group_size;
+
+  // Per-block tile-loading assignment
+  const uint tl_row     = lane_in_tg >> 2u;    // tile row 0..31 (both X and W)
+  const uint tl_sub     = lane_in_tg & 3u;     // K-quarter 0..3
+  const uint k_sub_size = (uint)(group_size >> 2);  // BK/4 per sub (32 for gs=128)
+
+  // Precomputed threadgroup-memory read indices for MMA (invariant per K-block)
+  const uint xs_m0 = (sm * 16u + fm) * xs_ld;
+  const uint xs_m1 = (sm * 16u + 8u + fm) * xs_ld;
+  const uint ws_n00 = (sn * 16u       + fn0) * ws_ld;
+  const uint ws_n01 = (sn * 16u       + fn1) * ws_ld;
+  const uint ws_n10 = (sn * 16u + 8u  + fn0) * ws_ld;
+  const uint ws_n11 = (sn * 16u + 8u  + fn1) * ws_ld;
+
+  for (int g = 0; g < n_groups; g++) {
+    // ---- Load X tile into xs ----
+    {
+      const uint m_row = m_base + tl_row;
+      const bool m_ok  = m_row < (uint)M;
+      const uint k_off = (uint)(g * group_size) + tl_sub * k_sub_size;
+      const device T* xp = x + min(m_row, (uint)(M - 1)) * K + k_off;
+      const uint xs_dst  = tl_row * xs_ld + tl_sub * k_sub_size;
+      for (uint i = 0; i < k_sub_size; i++) {
+        xs[xs_dst + i] = m_ok ? xp[i] : T(0);
+      }
+    }
+
+    // ---- Dequant W tile into ws ----
+    {
+      const uint n_row  = n_base + tl_row;
+      const bool n_ok   = n_row < (uint)N;
+      const float sc    = n_ok ? float(scales[n_row * n_groups + g]) : 0.f;
+      const uint w_base = n_row * (uint)(n_groups * bpg) + (uint)(g * bpg);
+      const uint ks     = tl_sub * k_sub_size;   // K-start within group (0,32,64,96)
+      const uint ke     = ks + k_sub_size;        // K-end within group
+      const uint b_lo   = ks / 5u;               // first byte index (inclusive)
+      const uint b_hi   = (ke - 1u) / 5u;        // last byte index  (inclusive)
+
+      for (uint b = b_lo; b <= b_hi; b++) {
+        // Read t5 byte; pad with 1 (neutral trit=1→dq=0) if out of bounds
+        const uint bval = (n_ok && b < (uint)bpg) ? (uint)w[w_base + b] : 1u;
+        const uint d1 = t5_div3(bval);
+        const uint d2 = t5_div9(bval);
+        const uint d3 = t5_div27(bval);
+        const uint d4 = t5_div81(bval);
+        const uint t0 = bval - (d1 << 1u) - d1;
+        const uint t1 = d1   - (d2 << 1u) - d2;
+        const uint t2 = d2   - (d3 << 1u) - d3;
+        const uint t3 = d3   - (d4 << 1u) - d4;
+        const uint t4 = d4;
+        const uint bk = b * 5u;  // K-index of trit 0 of this byte
+        // Write only the trits whose K-position falls in [ks, ke)
+        if (bk     >= ks && bk     < ke) ws[tl_row * ws_ld + bk    ] = T(sc * (float(t0) - 1.f));
+        if (bk+1u  >= ks && bk+1u  < ke) ws[tl_row * ws_ld + bk+1u ] = T(sc * (float(t1) - 1.f));
+        if (bk+2u  >= ks && bk+2u  < ke) ws[tl_row * ws_ld + bk+2u ] = T(sc * (float(t2) - 1.f));
+        if (bk+3u  >= ks && bk+3u  < ke) ws[tl_row * ws_ld + bk+3u ] = T(sc * (float(t3) - 1.f));
+        if (bk+4u  >= ks && bk+4u  < ke) ws[tl_row * ws_ld + bk+4u ] = T(sc * (float(t4) - 1.f));
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- BK/8 simdgroup MMA steps ----
+    {
+      simdgroup_matrix<T, 8, 8> a0, a1, b0, b1;
+      for (uint ki = 0; ki < (uint)(group_size >> 3); ki++) {
+        const uint ko = ki * 8u;
+        a0.thread_elements()[0] = xs[xs_m0 + fn0 + ko];
+        a0.thread_elements()[1] = xs[xs_m0 + fn1 + ko];
+        a1.thread_elements()[0] = xs[xs_m1 + fn0 + ko];
+        a1.thread_elements()[1] = xs[xs_m1 + fn1 + ko];
+        b0.thread_elements()[0] = ws[ws_n00 + fm + ko];
+        b0.thread_elements()[1] = ws[ws_n01 + fm + ko];
+        b1.thread_elements()[0] = ws[ws_n10 + fm + ko];
+        b1.thread_elements()[1] = ws[ws_n11 + fm + ko];
+        simdgroup_barrier(mem_flags::mem_none);
+        simdgroup_multiply_accumulate(c00, a0, b0, c00);
+        simdgroup_multiply_accumulate(c01, a0, b1, c01);
+        simdgroup_multiply_accumulate(c10, a1, b0, c10);
+        simdgroup_multiply_accumulate(c11, a1, b1, c11);
+        simdgroup_barrier(mem_flags::mem_none);
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ---- Write output ----
+  const uint om0  = m_base + sm * 16u + fm;
+  const uint om1  = m_base + sm * 16u + 8u + fm;
+  const uint on0  = n_base + sn * 16u + fn0;
+  const uint on1  = n_base + sn * 16u + fn1;
+  const uint on80 = n_base + sn * 16u + 8u + fn0;
+  const uint on81 = n_base + sn * 16u + 8u + fn1;
+
+  if (om0 < (uint)M) {
+    if (on0  < (uint)N) out[om0 * N + on0 ] = T(c00.thread_elements()[0]);
+    if (on1  < (uint)N) out[om0 * N + on1 ] = T(c00.thread_elements()[1]);
+    if (on80 < (uint)N) out[om0 * N + on80] = T(c01.thread_elements()[0]);
+    if (on81 < (uint)N) out[om0 * N + on81] = T(c01.thread_elements()[1]);
+  }
+  if (om1 < (uint)M) {
+    if (on0  < (uint)N) out[om1 * N + on0 ] = T(c10.thread_elements()[0]);
+    if (on1  < (uint)N) out[om1 * N + on1 ] = T(c10.thread_elements()[1]);
+    if (on80 < (uint)N) out[om1 * N + on80] = T(c11.thread_elements()[0]);
+    if (on81 < (uint)N) out[om1 * N + on81] = T(c11.thread_elements()[1]);
   }
 }
 

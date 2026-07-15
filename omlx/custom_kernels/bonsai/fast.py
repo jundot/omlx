@@ -416,6 +416,32 @@ def bonsai_t5_qmv_wide(
     return bonsai_t5_qmv(x, w, scales, stream=stream)
 
 
+def bonsai_t5_qmm(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    stream=None,
+) -> mx.array:
+    """t5 MMA GEMM for prefill (Identity I-M).
+
+    Fused dequant + simdgroup matmul. Reads each t5 weight byte exactly once
+    per matmul, without materialising an intermediate float weight matrix.
+
+    Parameters
+    ----------
+    x      : [M, K]                  activations (float16 or bfloat16)
+    w      : [N, n_groups*bpg]       uint8 t5 weight bytes
+    scales : [N, n_groups]           scale per group
+    Returns [M, N].
+    """
+    if _ext is not None and has_symbol("bonsai_t5_qmm"):
+        return _ext.bonsai_t5_qmm(x, w, scales, stream=stream)
+    raise RuntimeError(
+        "bonsai_t5_qmm: native extension unavailable. "
+        "Rebuild the bonsai extension."
+    )
+
+
 # ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------

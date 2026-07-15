@@ -126,6 +126,19 @@ array bonsai_t5_qmv_wide(
     const array& scales,
     StreamOrDevice s = {});
 
+// ---------------------------------------------------------------------------
+// t5 MMA GEMM (Identity I-M): fused dequant + simdgroup matmul for prefill
+// ---------------------------------------------------------------------------
+// x      : [M, K]                   float16 or bfloat16
+// w      : [N, n_groups * bpg]      uint8 t5 bytes
+// scales : [N, n_groups]            float16 or bfloat16
+// Returns [M, N].
+array bonsai_t5_qmm(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,

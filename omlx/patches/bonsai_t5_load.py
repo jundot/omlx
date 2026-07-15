@@ -166,14 +166,25 @@ def _t5_quantized_matmul(
             return bonsai_t5_qmv_wide(x, w, sc)
         return bonsai_t5_qmv(x, w, sc)
 
-    # Prefill path (M > 16) or fallback (no native ext): dequantize → matmul.
-    # t5 symmetric: dequant = scale × (trit − 1), no bias term needed.
+    # Prefill path (M > 16): use fused t5 MMA GEMM (Identity I-M).
+    # This reads each weight byte exactly once without materialising float weights.
+    from omlx.custom_kernels.bonsai.fast import bonsai_t5_qmm, has_native
+    if has_native():
+        x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+        # bonsai_t5_qmm expects transpose=True semantics (w stores rows, so out[m,n]=x@w[n].T)
+        out_flat = bonsai_t5_qmm(x_flat, w, scales.astype(x.dtype))
+        out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
+        if not transpose:
+            # This case shouldn't occur in practice (all callers use transpose=True)
+            return out.mT
+        return out
+
+    # Fallback (no native ext): dequantize → matmul.
     N = w.shape[0]
     n_groups = scales.shape[-1]
     bpg = w.shape[-1] // n_groups
     gs = 64 if bpg == 13 else 128
     K = n_groups * gs
-
     v = w.reshape(N, n_groups, bpg).astype(mx.uint32)
     trit_parts = []
     for _ in range(5):

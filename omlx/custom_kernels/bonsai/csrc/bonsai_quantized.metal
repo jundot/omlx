@@ -222,4 +222,40 @@ bonsai_qmv_fast_t5_types(128)
 // qmv_wide_t5: gs=64 and gs=128
 bonsai_qmv_wide_t5_types(64)
 bonsai_qmv_wide_t5_types(128)
+
+// ---- t5 MMA GEMM (Identity I-M): fused dequant + simdgroup matmul for prefill ----
+// w(0)=uint8 t5 bytes, scales(1), x(2), out(3), M(4), N(5), K(6)
+// Grid: (ceil(N/32), ceil(M/32), B)  TG: (32, 4, 1)
+
+template <typename T, int group_size>
+[[kernel]] void affine_qmm_t5(
+    const device uint8_t* w  [[buffer(0)]],
+    const device T* scales   [[buffer(1)]],
+    const device T* x        [[buffer(2)]],
+    device T* out            [[buffer(3)]],
+    const constant int& M    [[buffer(4)]],
+    const constant int& N    [[buffer(5)]],
+    const constant int& K    [[buffer(6)]],
+    uint2 tgid               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_index_in_simdgroup]],
+    uint  sg_id              [[simdgroup_index_in_threadgroup]])
+{
+    // Threadgroup tiles declared here (Metal requires [[kernel]] scope for threadgroup vars)
+    threadgroup T xs[32 * (group_size + 4)];
+    threadgroup T ws[32 * (group_size + 4)];
+    qmm_t5_impl<T, group_size>(w, scales, x, out, M, N, K, xs, ws, tgid, lane, sg_id);
+}
+
+#define bonsai_instantiate_qmm_t5(type, gs) \
+  instantiate_kernel(                        \
+      "affine_qmm_t5_" #type "_gs_" #gs,    \
+      affine_qmm_t5, type, gs)
+
+#define bonsai_qmm_t5_types(gs)                \
+  bonsai_instantiate_qmm_t5(float, gs)         \
+  bonsai_instantiate_qmm_t5(float16_t, gs)     \
+  bonsai_instantiate_qmm_t5(bfloat16_t, gs)
+
+bonsai_qmm_t5_types(64)
+bonsai_qmm_t5_types(128)
 // clang-format on
