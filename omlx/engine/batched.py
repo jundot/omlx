@@ -12,14 +12,14 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens, detect_and_strip_partial
-from ..utils.tokenizer import get_tokenizer_config
-from .base import (
-    BaseEngine,
-    GenerationOutput,
-    _clear_teardown_references,
-    _warn_scheduler_unreachable_once,
+from ..api.utils import (
+    clean_special_tokens,
+    detect_and_strip_partial,
+    is_mistral_common_tokenizer,
+    strip_thinking_from_messages,
 )
+from ..utils.tokenizer import get_tokenizer_config
+from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +222,9 @@ class BatchedEngine(BaseEngine):
             Preprocessed messages
         """
         if self.model_type == "gpt_oss" and HAS_HARMONY_ADAPTER:
-            return preprocess_harmony_messages(messages)
+            messages = preprocess_harmony_messages(messages)
+        if is_mistral_common_tokenizer(self._tokenizer):
+            messages = strip_thinking_from_messages(messages)
         return messages
 
     async def start(self) -> None:
@@ -232,10 +234,11 @@ class BatchedEngine(BaseEngine):
 
         import asyncio
 
+        from mlx_lm import load
+
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
-            lm_load_compat,
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
         )
@@ -267,7 +270,7 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
-            return lm_load_compat(
+            return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
@@ -277,6 +280,11 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
         )
+
+        # MistralCommon (tekken) tokenizers expose no jinja chat_template, so
+        # mlx_lm's load() can't infer a tool parser and has_tool_calling stays
+        # False -> the server never parses [TOOL_CALLS]. Attach it explicitly.
+        self._ensure_mistral_tool_parser()
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
@@ -475,7 +483,7 @@ class BatchedEngine(BaseEngine):
                                 specprefill_draft,
                                 trust_remote_code=self._trust_remote_code,
                             )
-                            draft_model, _ = lm_load_compat(
+                            draft_model, _ = load(
                                 specprefill_draft,
                                 tokenizer_config=draft_tokenizer_config,
                                 trust_remote_code=self._trust_remote_code,
@@ -518,16 +526,9 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
-        _clear_teardown_references(
-            self,
-            none_attrs=(
-                "_engine",
-                "_model",
-                "_tokenizer",
-                "_grammar_compiler",
-            ),
-            false_attrs=("_grammar_compiler_init_attempted",),
-        )
+        self._engine = None
+        self._model = None
+        self._tokenizer = None
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
@@ -593,6 +594,101 @@ class BatchedEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def _is_mistral_common(self) -> bool:
+        """True if the loaded tokenizer is backed by mistral-common (tekken)."""
+        return is_mistral_common_tokenizer(self._tokenizer)
+
+    def _ensure_mistral_tool_parser(self) -> None:
+        """Attach mlx_lm's mistral tool parser for MistralCommon tokenizers.
+
+        MistralCommon exposes no jinja ``chat_template``, so mlx_lm's ``load()``
+        cannot infer a tool parser and ``has_tool_calling`` stays ``False``. The
+        model still emits ``[TOOL_CALLS]``; without a parser the server returns it
+        as raw text instead of structured ``tool_calls``.
+        """
+        tokenizer = self._tokenizer
+        if tokenizer is None or not self._is_mistral_common():
+            return
+        if getattr(tokenizer, "has_tool_calling", False):
+            return
+        try:
+            from mlx_lm.tool_parsers import mistral as mistral_parser
+        except ImportError:
+            logger.warning(
+                "mlx_lm.tool_parsers.mistral not found; tool calling "
+                "disabled for MistralCommon tokenizer"
+            )
+            return
+        tokenizer._tool_call_start = mistral_parser.tool_call_start
+        tokenizer._tool_call_end = mistral_parser.tool_call_end
+        tokenizer._tool_parser = mistral_parser.parse_tool_call
+        logger.info("LLM tool calling enabled: parser=mistral (MistralCommon)")
+
+    def _mistral_prompt_ids(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        is_partial: bool | None,
+    ) -> list[int] | None:
+        """Tokenize directly to ids for MistralCommon tokenizers.
+
+        ``apply_chat_template(..., tokenize=False)`` renders control tokens
+        (``[INST]``, ``[AVAILABLE_TOOLS]``, ``[TOOL_CALLS]``, ...) as literal text;
+        re-encoding that string turns them into ASCII brackets, so the model sees an
+        out-of-distribution prompt and emits EOS immediately. Tokenizing directly to
+        ids preserves the control tokens.
+        """
+        if not self._is_mistral_common():
+            return None
+        kw = {"tokenize": True, "add_generation_prompt": not bool(is_partial)}
+        if is_partial:
+            kw["continue_final_message"] = True
+        if tools:
+            kw["tools"] = tools
+        if chat_template_kwargs:
+            kw.update(chat_template_kwargs)
+        try:
+            ids = self._tokenizer.apply_chat_template(messages, **kw)
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    kw.pop(key, None)
+            kw.pop("enable_thinking", None)
+            kw.pop("preserve_thinking", None)
+            ids = self._tokenizer.apply_chat_template(messages, **kw)
+        except Exception as e:
+            logger.warning(
+                f"MistralCommon direct tokenize failed ({e}); "
+                "falling back to string prompt"
+            )
+            return None
+        return list(ids)
+
+    def _render_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> str | list[int]:
+        ids = self._mistral_prompt_ids(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        if ids is not None:
+            return ids
+        return self._apply_chat_template(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    def _prompt_token_count(self, prompt: str | list[int]) -> int:
+        if isinstance(prompt, list):
+            return len(prompt)
+        return len(self._tokenizer.encode(prompt))
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -614,13 +710,13 @@ class BatchedEngine(BaseEngine):
         """
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
-        prompt = self._apply_chat_template(
+        prompt = self._render_chat_prompt(
             messages,
             template_tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer.encode(prompt))
+        return self._prompt_token_count(prompt)
 
     async def generate(
         self,
@@ -670,9 +766,9 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
-            thinking_budget=kwargs.get("thinking_budget", None),
-            compiled_grammar=kwargs.get("compiled_grammar", None),
-            seed=kwargs.get("seed", None),
+            thinking_budget=kwargs.get("thinking_budget"),
+            compiled_grammar=kwargs.get("compiled_grammar"),
+            seed=kwargs.get("seed"),
         )
 
         output = await self._engine.generate(
@@ -739,9 +835,9 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
-            thinking_budget=kwargs.get("thinking_budget", None),
-            compiled_grammar=kwargs.get("compiled_grammar", None),
-            seed=kwargs.get("seed", None),
+            thinking_budget=kwargs.get("thinking_budget"),
+            compiled_grammar=kwargs.get("compiled_grammar"),
+            seed=kwargs.get("seed"),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -789,8 +885,6 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
-                    generated_at=getattr(output, "generated_at", None),
-                    generated_until=getattr(output, "generated_until", None),
                 )
         except GeneratorExit:
             # Client disconnected
@@ -852,7 +946,7 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = self._render_chat_prompt(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
@@ -898,22 +992,14 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
-        prompt = self._apply_chat_template(
+        prompt = self._render_chat_prompt(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
-        # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
-        # malformed input) are normally surfaced by the real chat path's
-        # add_request → tokenize call as a 500 — there's no path-specific
-        # 400 handler today. Don't introduce a NEW failure mode here: if
-        # tokenization fails during preflight, log it and skip the memory
-        # check. The actual chat path will hit the same error and raise it
-        # through the existing handler chain so the response shape stays
-        # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = self._prompt_token_count(prompt)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -1003,16 +1089,13 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = self._render_chat_prompt(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
 
-        # SpecPrefill: compute system prompt token count for protection.
-        # Can't template system-only messages (most templates require user),
-        # so compute by subtracting non-system from full prompt tokens.
         specprefill_model_enabled = (
             getattr(self._model_settings, "specprefill_enabled", False)
             if self._model_settings
@@ -1024,11 +1107,14 @@ class BatchedEngine(BaseEngine):
             ]
             if len(non_system) < len(messages) and non_system:
                 try:
-                    non_system_prompt = self._apply_chat_template(
-                        non_system, template_tools, chat_template_kwargs=ct_kwargs
+                    non_system_prompt = self._render_chat_prompt(
+                        non_system,
+                        template_tools,
+                        chat_template_kwargs=ct_kwargs,
+                        is_partial=partial,
                     )
-                    full_tokens = len(self._tokenizer.encode(prompt))
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                    full_tokens = self._prompt_token_count(prompt)
+                    non_system_tokens = self._prompt_token_count(non_system_prompt)
                     system_end = full_tokens - non_system_tokens
                     if system_end > 0:
                         kwargs["specprefill_system_end"] = system_end

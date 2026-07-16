@@ -4717,14 +4717,6 @@ class Scheduler:
         except Exception:
             pass
 
-        # Tier 3: direct token lookup
-        try:
-            tid = self.tokenizer.convert_tokens_to_ids("</think>")
-            if tid != getattr(self.tokenizer, "unk_token_id", None):
-                return [tid]
-        except (AttributeError, KeyError, TypeError):
-            pass
-
         return None
 
     def _resolve_think_close_pattern(
@@ -4825,6 +4817,11 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
+        from .api.utils import is_mistral_common_tokenizer
+
+        if is_mistral_common_tokenizer(self.tokenizer):
+            return False
+
         think_start_ids = None
         think_start_id = self._get_think_token_id("think_start_id")
         if think_start_id is not None:
@@ -4833,17 +4830,16 @@ class Scheduler:
             think_start_text = (
                 self._get_output_parser_thinking_start_text() or "<think>"
             )
-            try:
-                token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
-                if isinstance(token_id, int) and token_id != getattr(
-                    self.tokenizer, "unk_token_id", None
-                ):
-                    think_start_ids = [token_id]
-            except (AttributeError, KeyError, TypeError):
-                think_start_ids = None
-
+            think_start_ids = self._encode_thinking_marker(think_start_text)
             if think_start_ids is None:
-                think_start_ids = self._encode_thinking_marker(think_start_text)
+                try:
+                    token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
+                    if isinstance(token_id, int) and token_id != getattr(
+                        self.tokenizer, "unk_token_id", None
+                    ):
+                        think_start_ids = [token_id]
+                except (AttributeError, KeyError, TypeError):
+                    think_start_ids = None
 
         if not think_start_ids or not request.prompt_token_ids:
             return False

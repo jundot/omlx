@@ -21,7 +21,6 @@ import bisect
 import json
 import logging
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -29,6 +28,7 @@ import regex
 from jsonschema import ValidationError, validate
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
+from .shared_models import generate_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             arguments = parsed.get("arguments", {})
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=name,
@@ -184,7 +184,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     arguments[key] = val
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -214,7 +214,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     arguments[k] = v
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -269,7 +269,7 @@ def _parse_namespaced_tool_calls(
                     arguments[key] = val
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -316,7 +316,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             if name:
                 tool_calls.append(
                     ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        id=generate_tool_call_id(),
                         type="function",
                         function=FunctionCall(
                             name=name,
@@ -359,7 +359,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
 
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -401,7 +401,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
             arguments = {"raw": args_str}
         tool_calls.append(
             ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
+                id=generate_tool_call_id(),
                 type="function",
                 function=FunctionCall(
                     name=name,
@@ -421,7 +421,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         name = match.group(1)
         tool_calls.append(
             ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
+                id=generate_tool_call_id(),
                 type="function",
                 function=FunctionCall(
                     name=name,
@@ -466,6 +466,7 @@ class _Gemma4ArgsTooComplexError(ValueError):
     happily parse oversized/deeply-nested input and defeat them.  Subclasses
     ValueError so the public parse chain still treats it as a clean drop.
     """
+
 
 # A tool-call head: the name plus its opening ``{``.  Only the head is matched
 # by regex; the argument span is found by _scan_gemma4_args_span, not by a
@@ -535,8 +536,11 @@ def _squote_close_positions(s: str) -> list:
 
 
 def _scan_gemma4_args_span(
-    text: str, open_idx: int, squote_closes: list,
-    open_ch: str = "{", close_ch: str = "}",
+    text: str,
+    open_idx: int,
+    squote_closes: list,
+    open_ch: str = "{",
+    close_ch: str = "}",
 ) -> int:
     """Return the end index (exclusive) of the balanced ``open_ch...close_ch``
     span starting at ``open_idx``, or -1 if no balanced span exists within
@@ -685,20 +689,18 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
     def _read_marked_string(i: int):
         """Read a <|"|>- or single-quoted string at i, or return None."""
         if args_str.startswith(_GEMMA4_STR_DELIM, i):
-            close = args_str.find(
-                _GEMMA4_STR_DELIM, i + len(_GEMMA4_STR_DELIM)
-            )
+            close = args_str.find(_GEMMA4_STR_DELIM, i + len(_GEMMA4_STR_DELIM))
             if close == -1:
                 raise ValueError("unterminated Gemma 4 string")
             return (
-                args_str[i + len(_GEMMA4_STR_DELIM): close],
+                args_str[i + len(_GEMMA4_STR_DELIM) : close],
                 close + len(_GEMMA4_STR_DELIM),
             )
         if args_str[i] == "'":
             k = bisect.bisect_right(squote_closes, i)
             if k < len(squote_closes):
                 close = squote_closes[k]
-                return args_str[i + 1: close], close + 1
+                return args_str[i + 1 : close], close + 1
             # No anchored close ahead: not a string, treat as bare content.
         return None
 
@@ -710,7 +712,7 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 j += 2
                 continue
             if args_str[j] == '"':
-                return args_str[i: j + 1], j + 1
+                return args_str[i : j + 1], j + 1
             j += 1
         raise ValueError("unterminated double-quoted string")
 
@@ -782,9 +784,7 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 # clean parse failure on the existing drop path, never as a
                 # RecursionError (uncaught by the parse chain's excepts).
                 if len(stack) >= _GEMMA4_MAX_DEPTH:
-                    raise _Gemma4ArgsTooComplexError(
-                        "Gemma 4 args nested too deeply"
-                    )
+                    raise _Gemma4ArgsTooComplexError("Gemma 4 args nested too deeply")
                 out.append(ch)
                 stack.append(ch)
                 i += 1
@@ -920,9 +920,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     # Keep the pre-step-5 text: if step 5 fails, its partial quoting has
     # corrupted multi-line bare values and step 6 must start clean.
     pre_quote_text = text
-    text = regex.sub(
-        r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
-    )
+    text = regex.sub(r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -994,10 +992,7 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     # already-consumed paren span (the inner ``{...}`` of ``call:f(a={...})``)
     # is string/structure content, not a sibling call, and must be skipped.
     heads = [(m.start(), m, "{", "}") for m in _GEMMA4_CALL_HEAD.finditer(text)]
-    heads += [
-        (m.start(), m, "(", ")")
-        for m in _GEMMA4_CALL_HEAD_PAREN.finditer(text)
-    ]
+    heads += [(m.start(), m, "(", ")") for m in _GEMMA4_CALL_HEAD_PAREN.finditer(text)]
     heads.sort(key=lambda h: h[0])
 
     results = []
@@ -1008,9 +1003,7 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
         if start < consumed_until:
             continue
         open_idx = m.end() - 1
-        end = _scan_gemma4_args_span(
-            text, open_idx, squote_closes, open_ch, close_ch
-        )
+        end = _scan_gemma4_args_span(text, open_idx, squote_closes, open_ch, close_ch)
         if end == -1:
             continue
         args_str = text[open_idx:end]
@@ -1028,9 +1021,7 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     return results[0] if len(results) == 1 else results
 
 
-def _remap_tool_call_names(
-    tool_calls: List[ToolCall], tools: Optional[List]
-) -> None:
+def _remap_tool_call_names(tool_calls: List[ToolCall], tools: Optional[List]) -> None:
     """Remap namespace-prefixed emitted tool names onto registered tools.
 
     Gemma 4 emits names like ``google:mcp:text_generation:create-pdf-file``
@@ -1063,8 +1054,7 @@ def _remap_tool_call_names(
         if len(candidates) == 1:
             target = next(iter(candidates))
             logger.info(
-                "Remapped namespaced tool call name %r to registered "
-                "tool %r",
+                "Remapped namespaced tool call name %r to registered tool %r",
                 name[:200],
                 target,
             )
@@ -1152,7 +1142,7 @@ def _parse_tool_calls_impl(
                         arguments = p.get("arguments", {})
                         tool_calls.append(
                             ToolCall(
-                                id=f"call_{uuid.uuid4().hex[:8]}",
+                                id=generate_tool_call_id(),
                                 type="function",
                                 function=FunctionCall(
                                     name=name,
@@ -1173,18 +1163,14 @@ def _parse_tool_calls_impl(
                     gemma4_handled = False
                     if tool_call_start == "<|tool_call>":
                         try:
-                            parsed = _parse_gemma4_tool_call_fallback(
-                                match.strip()
-                            )
-                            items = (
-                                parsed if isinstance(parsed, list) else [parsed]
-                            )
+                            parsed = _parse_gemma4_tool_call_fallback(match.strip())
+                            items = parsed if isinstance(parsed, list) else [parsed]
                             for p in items:
                                 name = p.get("name", "")
                                 arguments = p.get("arguments", {})
                                 tool_calls.append(
                                     ToolCall(
-                                        id=f"call_{uuid.uuid4().hex[:8]}",
+                                        id=generate_tool_call_id(),
                                         type="function",
                                         function=FunctionCall(
                                             name=name,
@@ -1386,7 +1372,9 @@ def extract_tool_calls_with_thinking(
                     tool_calls_from_thinking = False
             else:
                 valid_names = _extract_tool_names(tools)
-                tool_calls = [tc for tc in tool_calls if tc.function.name in valid_names]
+                tool_calls = [
+                    tc for tc in tool_calls if tc.function.name in valid_names
+                ]
                 if not tool_calls:
                     tool_calls = None
                     tool_calls_from_thinking = False
@@ -1912,7 +1900,7 @@ def restore_gemma4_param_names(arguments: dict) -> dict:
     restored = {}
     for k, v in arguments.items():
         if k.startswith(_GEMMA4_RENAME_PREFIX):
-            original = k[len(_GEMMA4_RENAME_PREFIX):]
+            original = k[len(_GEMMA4_RENAME_PREFIX) :]
             if original in _GEMMA4_COLLIDING_PARAMS:
                 restored[original] = v
                 continue

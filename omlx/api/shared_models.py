@@ -43,6 +43,22 @@ def generate_id(prefix: IDPrefix, length: int = 8) -> str:
     return f"{prefix.value}-{uuid.uuid4().hex[:length]}"
 
 
+def generate_tool_call_id() -> str:
+    """Generate a tool-call id valid across every supported tokenizer.
+
+    Mistral / tekken (``MistralCommonBackend``) validates ``tool_call_id``
+    against ``[a-zA-Z0-9]`` with a length of *exactly* 9, and rejects the id
+    when the assistant turn is replayed otherwise (HTTP 500 on multi-turn tool
+    loops). ``"call"`` + 5 hex characters is exactly 9 alphanumeric characters:
+    accepted by Mistral and still an opaque, recognizable id for OpenAI /
+    Anthropic clients, which treat the id as opaque.
+
+    Returns:
+        A 9-character alphanumeric id, e.g. ``"call1a2b3"``.
+    """
+    return f"call{uuid.uuid4().hex[:5]}"
+
+
 def get_unix_timestamp() -> int:
     """Get current Unix timestamp.
 
@@ -67,7 +83,9 @@ class BaseUsage(BaseModel):
 
     def model_post_init(self, __context) -> None:
         """Calculate total_tokens and sync Anthropic-style aliases."""
-        if self.total_tokens == 0 and (self.prompt_tokens > 0 or self.completion_tokens > 0):
+        if self.total_tokens == 0 and (
+            self.prompt_tokens > 0 or self.completion_tokens > 0
+        ):
             object.__setattr__(
                 self,
                 "total_tokens",

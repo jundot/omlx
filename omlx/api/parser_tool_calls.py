@@ -2,11 +2,11 @@
 """Helpers for converting parser-emitted tool calls to OpenAI models."""
 
 import logging
-import uuid
 
 from pydantic import ValidationError
 
 from .openai_models import FunctionCall, ToolCall
+from .shared_models import generate_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +27,9 @@ def convert_parser_tool_calls(tool_calls: list[dict] | None) -> list[ToolCall]:
         try:
             converted.append(
                 ToolCall(
-                    id=tool_call.get("id")
-                    or tool_call.get("call_id")
-                    or f"call_{uuid.uuid4().hex[:8]}",
+                id=tool_call.get("id")
+                or tool_call.get("call_id")
+                or generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=name,

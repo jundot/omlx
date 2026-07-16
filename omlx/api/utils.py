@@ -14,6 +14,56 @@ from .openai_models import Message
 _NATIVE_REASONING_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
 
 
+def is_mistral_common_tokenizer(tokenizer: Any | None) -> bool:
+    """Return whether ``tokenizer`` is backed by mistral-common (tekken)."""
+    if tokenizer is None:
+        return False
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    return type(inner).__name__ == "MistralCommonBackend"
+
+
+def strip_thinking_from_messages(messages: list[dict]) -> list[dict]:
+    """Drop ``<think>`` blocks from message text for strict tokenizers."""
+    from .thinking import extract_thinking
+
+    stripped: list[dict] = []
+    for message in messages:
+        msg = dict(message)
+        content = msg.get("content")
+        if isinstance(content, str) and content:
+            _, regular = extract_thinking(content)
+            msg["content"] = regular
+        elif isinstance(content, list):
+            parts: list[Any] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "thinking":
+                    continue
+                if isinstance(item, dict) and item.get("type") == "text":
+                    item = dict(item)
+                    _, regular = extract_thinking(item.get("text", ""))
+                    item["text"] = regular
+                    parts.append(item)
+                else:
+                    parts.append(item)
+            msg["content"] = parts
+        msg.pop("reasoning_content", None)
+        stripped.append(msg)
+    return stripped
+
+
+def filter_chat_template_kwargs_for_tokenizer(
+    tokenizer: Any | None,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Drop template kwargs that MistralCommon tokenizers reject or mis-handle."""
+    if not chat_template_kwargs or not is_mistral_common_tokenizer(tokenizer):
+        return chat_template_kwargs
+    filtered = dict(chat_template_kwargs)
+    filtered.pop("enable_thinking", None)
+    filtered.pop("preserve_thinking", None)
+    return filtered
+
+
 def uses_native_reasoning_content(
     model_name: str | None = None,
     *,
@@ -363,6 +413,8 @@ def chat_template_preserves_mid_system(
     user turn instead of raising, dropping it, or moving it to the front.
     """
     if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return False
+    if is_mistral_common_tokenizer(tokenizer):
         return False
     if placement not in {"tail", "between"}:
         return False
@@ -807,6 +859,7 @@ def _apply_reasoning_reconstruction(
     content: Any,
     reasoning: str | None,
     native: bool,
+    tokenizer: Any | None = None,
 ) -> tuple[Any, str | None]:
     """Reconstruct reasoning on a historical assistant message.
 
@@ -838,6 +891,11 @@ def _apply_reasoning_reconstruction(
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
+    if is_mistral_common_tokenizer(tokenizer):
+        from .thinking import extract_thinking
+
+        _, content_only = extract_thinking(text)
+        return content_only, None
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
@@ -885,7 +943,7 @@ def extract_text_content(
         # <think>...</think> in content.
         reasoning = getattr(msg, "reasoning_content", None)
         content, reasoning_out = _apply_reasoning_reconstruction(
-            role, content, reasoning, native_reasoning_content
+            role, content, reasoning, native_reasoning_content, tokenizer
         )
 
         # Normalize "developer" role to "system" (OpenAI API compatibility)
@@ -1063,7 +1121,7 @@ def extract_multimodal_content(
         # Reconstruct reasoning (see extract_text_content).
         reasoning = getattr(msg, "reasoning_content", None)
         content, reasoning_out = _apply_reasoning_reconstruction(
-            role, content, reasoning, native_reasoning_content
+            role, content, reasoning, native_reasoning_content, tokenizer
         )
 
         if role == "developer":

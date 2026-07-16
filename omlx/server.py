@@ -154,6 +154,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
+from .api.shared_models import generate_tool_call_id
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
@@ -170,7 +171,9 @@ from .api.utils import (
     detect_and_strip_partial,
     extract_multimodal_content,
     extract_text_content,
+    filter_chat_template_kwargs_for_tokenizer,
     has_nonleading_system_message,
+    is_mistral_common_tokenizer,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
@@ -186,7 +189,6 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
-    ModelUnavailableError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
@@ -962,8 +964,6 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
-    except ModelUnavailableError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ModelBusyError as e:
@@ -2687,22 +2687,8 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 
     try:
         await _server_state.engine_pool.get_engine(model_id)
-    except ModelNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ModelTooLargeError as e:
-        raise HTTPException(status_code=507, detail=str(e)) from e
-    except InsufficientMemoryError as e:
-        raise HTTPException(status_code=507, detail=str(e)) from e
-    except ModelUnavailableError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except ModelLoadingError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except ModelBusyError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except EnginePoolError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
@@ -3340,6 +3326,9 @@ async def create_chat_completion(
         if tools_for_template and "gemma" in (resolved_model or "").lower():
             tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
         await _ensure_tokenizer_for_system_probe(engine, messages)
+        merged_ct_kwargs = filter_chat_template_kwargs_for_tokenizer(
+            engine.tokenizer, merged_ct_kwargs or None
+        ) or {}
         messages = prepare_system_messages_for_template(
             messages,
             engine.tokenizer,
@@ -3421,7 +3410,11 @@ async def create_chat_completion(
         # budget is active (from request or model settings).  Some chat
         # templates (e.g. Gemma 4) explicitly suppress thinking unless this
         # kwarg is True.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and "enable_thinking" not in merged_ct_kwargs
+            and not is_mistral_common_tokenizer(engine.tokenizer)
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -4236,71 +4229,6 @@ async def stream_completion(
     yield "data: [DONE]\n\n"
 
 
-def _copy_chat_template_messages(messages: list) -> list:
-    return [
-        dict(message) if isinstance(message, dict) else message for message in messages
-    ]
-
-
-def _render_chat_prompt_for_thinking_detection(
-    engine: BaseEngine,
-    messages: list,
-    kwargs: dict,
-) -> tuple[str, list[int] | None]:
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is None:
-        return "", None
-
-    template_messages = _copy_chat_template_messages(messages)
-    tools = kwargs.get("tools")
-    chat_template_kwargs = kwargs.get("chat_template_kwargs")
-    is_partial = kwargs.get("is_partial")
-    engine_renderer = getattr(engine, "_apply_chat_template", None)
-
-    if is_partial is not None:
-        for message in template_messages:
-            if isinstance(message, dict):
-                message.pop("partial", None)
-
-    if callable(engine_renderer):
-        prompt = engine_renderer(
-            template_messages,
-            tools,
-            chat_template_kwargs=chat_template_kwargs,
-            is_partial=is_partial,
-        )
-    else:
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": not bool(is_partial),
-        }
-        if is_partial:
-            template_kwargs["continue_final_message"] = True
-        if tools:
-            template_kwargs["tools"] = tools
-        if chat_template_kwargs:
-            template_kwargs.update(chat_template_kwargs)
-
-        try:
-            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
-        except TypeError:
-            if chat_template_kwargs:
-                for key in chat_template_kwargs:
-                    template_kwargs.pop(key, None)
-            template_kwargs.pop("tools", None)
-            template_kwargs.pop("enable_thinking", None)
-            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
-
-    if isinstance(prompt, str):
-        return prompt, None
-    if isinstance(prompt, list):
-        try:
-            return "", [int(token_id) for token_id in prompt]
-        except (TypeError, ValueError):
-            return str(prompt), None
-    return str(prompt), None
-
-
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4321,19 +4249,7 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    start_in_thinking = False
-    try:
-        tokenizer = getattr(engine, "tokenizer", None)
-        if tokenizer is not None:
-            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                engine, messages, kwargs
-            )
-            start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
-            )
-    except Exception as exc:
-        logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking_parser = ThinkingParser()
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4723,22 +4639,8 @@ async def stream_anthropic_messages(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
 
-    # Track content blocks with thinking separation. Some templates open the
-    # thinking block in the prompt itself, so the generated text starts with
-    # reasoning body and only later emits </think>.
-    start_in_thinking = False
-    try:
-        tokenizer = getattr(engine, "tokenizer", None)
-        if tokenizer is not None:
-            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                engine, messages, kwargs
-            )
-            start_in_thinking, _ = prompt_opens_thinking(
-                tokenizer, prompt, prompt_token_ids=prompt_token_ids
-            )
-    except Exception as exc:
-        logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    # Track content blocks with thinking separation
+    thinking_parser = ThinkingParser()
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -5234,7 +5136,11 @@ async def create_anthropic_message(
         # Auto-set enable_thinking in chat template kwargs when a thinking
         # budget is active but enable_thinking was not already set (e.g. via
         # the Anthropic thinking.type field above or model settings).
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and "enable_thinking" not in merged_ct_kwargs
+            and not is_mistral_common_tokenizer(engine.tokenizer)
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -5289,6 +5195,9 @@ async def create_anthropic_message(
         chat_kwargs["is_partial"] = is_partial
 
         await _ensure_tokenizer_for_system_probe(engine, messages)
+        merged_ct_kwargs = filter_chat_template_kwargs_for_tokenizer(
+            engine.tokenizer, merged_ct_kwargs or None
+        ) or {}
         messages = prepare_system_messages_for_template(
             messages,
             engine.tokenizer,
@@ -5703,6 +5612,9 @@ async def create_response(
         if tools_for_template and "gemma" in (resolved_model or "").lower():
             tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
         await _ensure_tokenizer_for_system_probe(engine, messages)
+        merged_ct_kwargs = filter_chat_template_kwargs_for_tokenizer(
+            engine.tokenizer, merged_ct_kwargs or None
+        ) or {}
         messages = prepare_system_messages_for_template(
             messages,
             engine.tokenizer,
@@ -5775,7 +5687,11 @@ async def create_response(
             chat_kwargs["thinking_budget"] = thinking_budget
 
         # Auto-set enable_thinking when thinking budget is active.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and "enable_thinking" not in merged_ct_kwargs
+            and not is_mistral_common_tokenizer(engine.tokenizer)
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -5870,9 +5786,6 @@ async def create_response(
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
-                cleaned_thinking = sanitize_tool_call_markup(
-                    thinking_content, engine.tokenizer
-                )
             else:
                 extraction = extract_tool_calls_with_thinking(
                     thinking_content,
@@ -5882,7 +5795,6 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
             if tool_calls and "gemma" in (resolved_model or "").lower():
@@ -5908,8 +5820,8 @@ async def create_response(
 
             # Build output items
             output_items: list[OutputItem] = []
-            reasoning_text = (cleaned_thinking or "").strip()
-            if reasoning_text:
+            reasoning_text = (thinking_content or "").strip()
+            if native_reasoning and reasoning_text:
                 output_items.append(build_reasoning_output_item(reasoning_text))
             output_items.append(
                 build_message_output_item(cleaned_text.strip() if cleaned_text else "")
@@ -5923,7 +5835,7 @@ async def create_response(
                         arguments = tc.function.arguments
                     elif isinstance(tc, dict):
                         call_id = tc.get(
-                            "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                            "call_id", tc.get("id", generate_tool_call_id())
                         )
                         name = tc.get("name", "")
                         arguments = tc.get("arguments", "{}")
@@ -6016,7 +5928,6 @@ async def stream_responses_api(
     message_opened = False
     next_output_index = 0
     reasoning_output_index: Optional[int] = None  # captured when reasoning opens
-    msg_output_index: Optional[int] = None  # captured when message opens
 
     # Build initial response object (in_progress, empty output)
     initial_response = ResponseObject(
@@ -6057,12 +5968,11 @@ async def stream_responses_api(
 
     # --- helper closures for lazy item emission ----------------------
     def _open_reasoning():
-        nonlocal seq, reasoning_opened, reasoning_output_index, next_output_index
+        nonlocal seq, reasoning_opened, reasoning_output_index
         if reasoning_opened:
             return []
         reasoning_opened = True
         reasoning_output_index = next_output_index
-        next_output_index += 1
         events = []
         seq += 1
         events.append(
@@ -6098,11 +6008,11 @@ async def stream_responses_api(
         return events
 
     def _close_reasoning():
-        nonlocal seq, reasoning_closed
+        nonlocal seq, reasoning_closed, next_output_index
         if reasoning_closed or not reasoning_opened:
             return []
         reasoning_closed = True
-        reasoning_text = accumulated_reasoning
+        next_output_index += 1
         events = []
         seq += 1
         events.append(
@@ -6113,7 +6023,7 @@ async def stream_responses_api(
                     "item_id": reasoning_id,
                     "output_index": reasoning_output_index,
                     "summary_index": 0,
-                    "text": reasoning_text,
+                    "text": accumulated_reasoning,
                     "sequence_number": seq,
                 },
             )
@@ -6127,7 +6037,7 @@ async def stream_responses_api(
                     "item_id": reasoning_id,
                     "output_index": reasoning_output_index,
                     "summary_index": 0,
-                    "part": {"type": "summary_text", "text": reasoning_text},
+                    "part": {"type": "summary_text", "text": accumulated_reasoning},
                     "sequence_number": seq,
                 },
             )
@@ -6143,7 +6053,9 @@ async def stream_responses_api(
                         "type": "reasoning",
                         "id": reasoning_id,
                         "status": "completed",
-                        "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        "summary": [
+                            {"type": "summary_text", "text": accumulated_reasoning}
+                        ],
                     },
                     "sequence_number": seq,
                 },
@@ -6152,12 +6064,11 @@ async def stream_responses_api(
         return events
 
     def _open_message():
-        nonlocal seq, message_opened, next_output_index, msg_output_index
+        nonlocal seq, message_opened, next_output_index
         if message_opened:
             return []
         message_opened = True
         msg_output_index = next_output_index
-        next_output_index += 1
         events = []
         seq += 1
         events.append(
@@ -6193,46 +6104,24 @@ async def stream_responses_api(
         )
         return events
 
-    def _emit_reasoning_delta(delta: str):
-        nonlocal seq, accumulated_reasoning
-        if not delta:
-            return []
-        accumulated_reasoning += delta
-        events = []
-        events.extend(_open_reasoning())
-        seq += 1
-        events.append(
-            format_sse_event(
-                "response.reasoning_summary_text.delta",
-                {
-                    "type": "response.reasoning_summary_text.delta",
-                    "item_id": reasoning_id,
-                    "output_index": reasoning_output_index,
-                    "summary_index": 0,
-                    "delta": delta,
-                    "sequence_number": seq,
-                },
-            )
-        )
-        return events
-
     # -----------------------------------------------------------------
 
-    # Open message/reasoning items lazily so non-native <think> blocks can still
-    # become a leading Responses reasoning item.
+    # If not native reasoning, open message immediately (legacy behavior)
+    if not native_reasoning:
+        for ev in _open_message():
+            yield ev
 
     # Stream tokens
     tool_filter = None
-    thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
-        if _content_filter.active:
-            tool_filter = _content_filter
-            thinking_filter = _thinking_filter
+        _f = ToolCallStreamFilter(engine.tokenizer)
+        if _f.active:
+            tool_filter = _f
         else:
             stream_content = False
+
+    msg_output_index = None  # will be set when message opens
 
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -6245,18 +6134,31 @@ async def stream_responses_api(
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
-                if thinking_delta:
-                    if thinking_filter:
-                        thinking_delta = thinking_filter.feed(thinking_delta)
-                    for ev in _emit_reasoning_delta(thinking_delta):
+                if thinking_delta and native_reasoning:
+                    accumulated_reasoning += thinking_delta
+                    for ev in _open_reasoning():
                         yield ev
+                    seq += 1
+                    yield format_sse_event(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "item_id": reasoning_id,
+                            "output_index": reasoning_output_index,
+                            "summary_index": 0,
+                            "delta": thinking_delta,
+                            "sequence_number": seq,
+                        },
+                    )
 
                 if content_delta:
-                    if reasoning_opened and not reasoning_closed:
+                    if native_reasoning and reasoning_opened and not reasoning_closed:
                         for ev in _close_reasoning():
                             yield ev
                     for ev in _open_message():
                         yield ev
+                    if msg_output_index is None:
+                        msg_output_index = next_output_index
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
@@ -6285,24 +6187,23 @@ async def stream_responses_api(
         )
         return
 
+    # Close reasoning if still open
+    if native_reasoning and reasoning_opened and not reasoning_closed:
+        for ev in _close_reasoning():
+            yield ev
+
+    # Ensure message item is opened (even if no content was streamed)
+    for ev in _open_message():
+        yield ev
+    if msg_output_index is None:
+        msg_output_index = next_output_index
+
     # Flush remaining content from parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
-        if thinking_delta:
-            if thinking_filter:
-                thinking_delta = thinking_filter.feed(thinking_delta)
-            for ev in _emit_reasoning_delta(thinking_delta):
-                yield ev
-        if thinking_filter:
-            remaining_thinking = thinking_filter.finish()
-            for ev in _emit_reasoning_delta(remaining_thinking):
-                yield ev
+        if thinking_delta and native_reasoning:
+            accumulated_reasoning += thinking_delta
         if content_delta:
-            if reasoning_opened and not reasoning_closed:
-                for ev in _close_reasoning():
-                    yield ev
-            for ev in _open_message():
-                yield ev
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
@@ -6321,11 +6222,6 @@ async def stream_responses_api(
         if tool_filter:
             remaining = tool_filter.finish()
             if remaining:
-                if reasoning_opened and not reasoning_closed:
-                    for ev in _close_reasoning():
-                        yield ev
-                for ev in _open_message():
-                    yield ev
                 seq += 1
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -6355,16 +6251,7 @@ async def stream_responses_api(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
-        if not stream_content:
-            cleaned_thinking = (extraction.cleaned_thinking or "").strip()
-            for ev in _emit_reasoning_delta(cleaned_thinking):
-                yield ev
-            if reasoning_opened and not reasoning_closed:
-                for ev in _close_reasoning():
-                    yield ev
         if not stream_content and cleaned_text:
-            for ev in _open_message():
-                yield ev
             seq += 1
             yield format_sse_event(
                 "response.output_text.delta",
@@ -6403,14 +6290,6 @@ async def stream_responses_api(
             final_text = json.dumps(parsed_json)
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
-
-    if reasoning_opened and not reasoning_closed:
-        for ev in _close_reasoning():
-            yield ev
-
-    # Ensure message item is opened (even if no content was streamed).
-    for ev in _open_message():
-        yield ev
 
     # response.output_text.done
     seq += 1
@@ -6462,14 +6341,13 @@ async def stream_responses_api(
 
     # Build output items for final response
     output_items = []
-    reasoning_text = accumulated_reasoning
-    if reasoning_text:
+    if native_reasoning and accumulated_reasoning:
         output_items.append(
             {
                 "type": "reasoning",
                 "id": reasoning_id,
                 "status": "completed",
-                "summary": [{"type": "summary_text", "text": reasoning_text}],
+                "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
             }
         )
     output_items.append(
@@ -6484,16 +6362,14 @@ async def stream_responses_api(
 
     # Emit function call items if present
     if tool_calls:
-        output_index = next_output_index
+        output_index = next_output_index + 1
         for tc in tool_calls:
             if hasattr(tc, "function"):
                 call_id = tc.id
                 name = tc.function.name
                 arguments = tc.function.arguments
             elif isinstance(tc, dict):
-                call_id = tc.get(
-                    "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                )
+                call_id = tc.get("call_id", tc.get("id", generate_tool_call_id()))
                 name = tc.get("name", "")
                 arguments = tc.get("arguments", "{}")
             else:
@@ -6569,7 +6445,6 @@ async def stream_responses_api(
 
             output_items.append(completed_fc)
             output_index += 1
-            next_output_index = output_index
 
     # Record metrics
     usage_data = None
@@ -6590,7 +6465,9 @@ async def stream_responses_api(
             model_id=resolved_model or request.model,
         )
         reasoning_token_count = (
-            len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+            len(engine.tokenizer.encode(accumulated_reasoning))
+            if accumulated_reasoning
+            else 0
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
