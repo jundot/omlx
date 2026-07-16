@@ -358,6 +358,143 @@ def _decode_shape(shape_str: str) -> tuple:
     return tuple(int(d) for d in shape_str.split(","))
 
 
+def _store_nstate_elements_flat(
+    arrays: dict[str, Any],
+    cache_list_meta: dict[str, str],
+    prefix: str,
+    elements,
+) -> None:
+    """Write N elements as ``{prefix}_state_{k}`` keys with a
+    ``{prefix}_state_count`` count marker. Zero-dim shapes are
+    preserved via ``{prefix}_state_{k}_zero_dim``. Composite
+    elements (a bare tuple/list or a nested ``__nstate__``
+    marker) recurse under a ``{elem_key}`` sub-prefix and record
+    a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
+    tensor is deliberately omitted so an older reader hits its
+    ``Missing {elem_key} in arrays`` path and skips the block.
+
+    Module-level on purpose — same recursive-closure cycle bug as
+    ``_load_nstate_flat`` (see that docstring).
+    """
+    cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
+    for k, elem in enumerate(elements):
+        elem_key = f"{prefix}_state_{k}"
+        if elem is None:
+            # None placeholder — store an empty marker tensor
+            # and a sentinel zero_dim entry so the loader can
+            # restore None instead of materializing zeros.
+            arrays[elem_key] = mx.zeros((1,))
+            cache_list_meta[f"{elem_key}_none"] = "1"
+        elif _has_zero_dim(elem):
+            arrays[elem_key] = mx.zeros((1,))
+            cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(elem.shape)
+        elif (
+            isinstance(elem, tuple)
+            and len(elem) >= 2
+            and isinstance(elem[0], str)
+            and elem[0] == "__nstate__"
+        ):
+            # Nested ``('__nstate__', class_name, [sub...])``
+            # marker — recurse, no flat tensor written.
+            cache_list_meta[f"{elem_key}_nested"] = "nstate"
+            sub_class = elem[1] if len(elem) >= 2 else None
+            sub_elements = elem[2] if len(elem) >= 3 else []
+            if sub_class:
+                cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
+            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, sub_elements)
+        elif isinstance(elem, (tuple, list)):
+            # Bare tuple/list of sub-elements — recurse, no flat
+            # tensor written.
+            cache_list_meta[f"{elem_key}_nested"] = "tuple"
+            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, list(elem))
+        else:
+            if not isinstance(elem, mx.array):
+                raise TypeError(
+                    f"unsupported non-array nstate element "
+                    f"{elem_key}: {type(elem).__name__}"
+                )
+            arrays[elem_key] = elem
+
+
+def _load_nstate_flat(
+    arrays: dict[str, Any],
+    file_metadata: dict[str, str],
+    prefix: str,
+    fallback_class: str | None,
+) -> tuple | None:
+    """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
+    polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
+    on success or None on missing tensors.
+
+    Module-level on purpose: the previous nested-closure version formed a
+    self-referential cycle (recursive closure) that captured ``arrays`` —
+    hundreds of MB of KV tensors — and only gen-2 gc could free it.
+    """
+    count_key = f"{prefix}_state_count"
+    class_name = None
+    if file_metadata:
+        class_name = file_metadata.get(f"{prefix}_state_class_name")
+    if class_name is None:
+        class_name = fallback_class
+
+    elements: list[Any] = []
+    if file_metadata and count_key in file_metadata:
+        # V3 path
+        try:
+            count = int(file_metadata[count_key])
+        except (ValueError, TypeError):
+            return None
+        for k in range(count):
+            elem_key = f"{prefix}_state_{k}"
+            none_marker = f"{elem_key}_none"
+            zd_marker = f"{elem_key}_zero_dim"
+            nested_marker = f"{elem_key}_nested"
+            if file_metadata and none_marker in file_metadata:
+                elements.append(None)
+                continue
+            if file_metadata and nested_marker in file_metadata:
+                # Composite element — recurse, then restore the same
+                # shape it had on save (bare tuple vs __nstate__).
+                sub = _load_nstate_flat(arrays, file_metadata, elem_key, None)
+                if sub is None:
+                    return None
+                if file_metadata[nested_marker] == "tuple":
+                    elements.append(tuple(sub[2]))
+                elif file_metadata[nested_marker] == "nstate":
+                    # Explicit marker on write — preserve the full
+                    # ('__nstate__', class_name, elements) as-is;
+                    # never unwrap (would drop the marker/class_name).
+                    elements.append(sub)
+                else:
+                    # Corrupt/unknown nested marker — fail closed.
+                    return None
+                continue
+            if elem_key not in arrays:
+                logger.error(f"Missing {elem_key} in arrays")
+                return None
+            if file_metadata and zd_marker in file_metadata:
+                elements.append(mx.zeros(_decode_shape(file_metadata[zd_marker])))
+            else:
+                elements.append(arrays[elem_key])
+    else:
+        # V2 polyfill: legacy ``{prefix}_keys`` / ``{prefix}_values``.
+        keys_key = f"{prefix}_keys"
+        values_key = f"{prefix}_values"
+        if keys_key not in arrays or values_key not in arrays:
+            return None
+        k_zd = f"{prefix}_keys_zero_dim"
+        v_zd = f"{prefix}_values_zero_dim"
+        if file_metadata and k_zd in file_metadata:
+            elements.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
+        else:
+            elements.append(arrays[keys_key])
+        if file_metadata and v_zd in file_metadata:
+            elements.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
+        else:
+            elements.append(arrays[values_key])
+    return ("__nstate__", class_name, elements)
+
+
 # --- Safetensors dtype mapping for background-thread-safe serialization ---
 # These mappings enable writing safetensors files without any mx/Metal API,
 # bypassing the bfloat16 limitation that blocked PR #16 v2 (numpy doesn't
@@ -1900,55 +2037,10 @@ class PagedSSDCacheManager(CacheManager):
                 {}
             )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
 
+            # Shim; module-level to avoid a recursive-closure refcount
+            # cycle pinning `arrays` — see _store_nstate_elements_flat.
             def _store_nstate_elements(prefix: str, elements):
-                """Write N elements as ``{prefix}_state_{k}`` keys with a
-                ``{prefix}_state_count`` count marker. Zero-dim shapes are
-                preserved via ``{prefix}_state_{k}_zero_dim``. Composite
-                elements (a bare tuple/list or a nested ``__nstate__``
-                marker) recurse under a ``{elem_key}`` sub-prefix and record
-                a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
-                tensor is deliberately omitted so an older reader hits its
-                ``Missing {elem_key} in arrays`` path and skips the block."""
-                cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
-                for k, elem in enumerate(elements):
-                    elem_key = f"{prefix}_state_{k}"
-                    if elem is None:
-                        # None placeholder — store an empty marker tensor
-                        # and a sentinel zero_dim entry so the loader can
-                        # restore None instead of materializing zeros.
-                        arrays[elem_key] = mx.zeros((1,))
-                        cache_list_meta[f"{elem_key}_none"] = "1"
-                    elif _has_zero_dim(elem):
-                        arrays[elem_key] = mx.zeros((1,))
-                        cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(
-                            elem.shape
-                        )
-                    elif (
-                        isinstance(elem, tuple)
-                        and len(elem) >= 2
-                        and isinstance(elem[0], str)
-                        and elem[0] == "__nstate__"
-                    ):
-                        # Nested ``('__nstate__', class_name, [sub...])``
-                        # marker — recurse, no flat tensor written.
-                        cache_list_meta[f"{elem_key}_nested"] = "nstate"
-                        sub_class = elem[1] if len(elem) >= 2 else None
-                        sub_elements = elem[2] if len(elem) >= 3 else []
-                        if sub_class:
-                            cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
-                        _store_nstate_elements(elem_key, sub_elements)
-                    elif isinstance(elem, (tuple, list)):
-                        # Bare tuple/list of sub-elements — recurse, no flat
-                        # tensor written.
-                        cache_list_meta[f"{elem_key}_nested"] = "tuple"
-                        _store_nstate_elements(elem_key, list(elem))
-                    else:
-                        if not isinstance(elem, mx.array):
-                            raise TypeError(
-                                f"unsupported non-array nstate element "
-                                f"{elem_key}: {type(elem).__name__}"
-                            )
-                        arrays[elem_key] = elem
+                _store_nstate_elements_flat(arrays, cache_list_meta, prefix, elements)
 
             for i, layer_data in enumerate(cache_data):
                 if (
@@ -2278,75 +2370,10 @@ class PagedSSDCacheManager(CacheManager):
                 return (elements[0], elements[1])
             return marker
 
+        # Shim; module-level to avoid a recursive-closure refcount
+        # cycle pinning `arrays` — see _load_nstate_flat.
         def _load_nstate(prefix: str, fallback_class: str | None) -> tuple | None:
-            """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
-            polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
-            on success or None on missing tensors."""
-            count_key = f"{prefix}_state_count"
-            class_name = None
-            if file_metadata:
-                class_name = file_metadata.get(f"{prefix}_state_class_name")
-            if class_name is None:
-                class_name = fallback_class
-
-            elements: list[Any] = []
-            if file_metadata and count_key in file_metadata:
-                # V3 path
-                try:
-                    count = int(file_metadata[count_key])
-                except (ValueError, TypeError):
-                    return None
-                for k in range(count):
-                    elem_key = f"{prefix}_state_{k}"
-                    none_marker = f"{elem_key}_none"
-                    zd_marker = f"{elem_key}_zero_dim"
-                    nested_marker = f"{elem_key}_nested"
-                    if file_metadata and none_marker in file_metadata:
-                        elements.append(None)
-                        continue
-                    if file_metadata and nested_marker in file_metadata:
-                        # Composite element — recurse, then restore the same
-                        # shape it had on save (bare tuple vs __nstate__).
-                        sub = _load_nstate(elem_key, fallback_class=None)
-                        if sub is None:
-                            return None
-                        if file_metadata[nested_marker] == "tuple":
-                            elements.append(tuple(sub[2]))
-                        elif file_metadata[nested_marker] == "nstate":
-                            # Explicit marker on write — preserve the full
-                            # ('__nstate__', class_name, elements) as-is;
-                            # never unwrap (would drop the marker/class_name).
-                            elements.append(sub)
-                        else:
-                            # Corrupt/unknown nested marker — fail closed.
-                            return None
-                        continue
-                    if elem_key not in arrays:
-                        logger.error(f"Missing {elem_key} in arrays")
-                        return None
-                    if file_metadata and zd_marker in file_metadata:
-                        elements.append(
-                            mx.zeros(_decode_shape(file_metadata[zd_marker]))
-                        )
-                    else:
-                        elements.append(arrays[elem_key])
-            else:
-                # V2 polyfill: legacy ``{prefix}_keys`` / ``{prefix}_values``.
-                keys_key = f"{prefix}_keys"
-                values_key = f"{prefix}_values"
-                if keys_key not in arrays or values_key not in arrays:
-                    return None
-                k_zd = f"{prefix}_keys_zero_dim"
-                v_zd = f"{prefix}_values_zero_dim"
-                if file_metadata and k_zd in file_metadata:
-                    elements.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
-                else:
-                    elements.append(arrays[keys_key])
-                if file_metadata and v_zd in file_metadata:
-                    elements.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
-                else:
-                    elements.append(arrays[values_key])
-            return ("__nstate__", class_name, elements)
+            return _load_nstate_flat(arrays, file_metadata, prefix, fallback_class)
 
         for i in range(num_layers):
             cache_type = (
