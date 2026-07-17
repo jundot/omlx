@@ -1379,6 +1379,12 @@ def _trunk_norm_module(model: Any):
 
     Walks both wrapper conventions: mlx-lm's outer ``Model.language_model``
     and oMLX's ``VLMModelAdapter._language_model`` (mlx-vlm path).
+
+    Models whose ``return_hidden`` output is already post-norm mark
+    ``_omlx_mtp_head_hidden_normed`` (instance or inner language model) and
+    get an identity here — applying the trunk norm again would double-norm
+    the head inputs, and the ``inner.model.norm`` walk does not fit every
+    backbone layout (e.g. ``backbone.norm_f``).
     """
     inner = model
     for attr in ("language_model", "_language_model"):
@@ -1386,6 +1392,10 @@ def _trunk_norm_module(model: Any):
         if candidate is not None:
             inner = candidate
             break
+    if getattr(model, "_omlx_mtp_head_hidden_normed", False) or getattr(
+        inner, "_omlx_mtp_head_hidden_normed", False
+    ):
+        return lambda x: x
     return inner.model.norm
 
 
