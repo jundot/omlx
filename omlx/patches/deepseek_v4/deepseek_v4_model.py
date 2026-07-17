@@ -588,7 +588,38 @@ class Compressor(nn.Module):
             )
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
-            new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+
+            # Overlap (ratio==4) pools each window from its own lane-B plus the
+            # previous window's lane-A. _overlap_compress_kv gets lane-A via
+            # `kv_a[:, :-1]` (window-axis shift), which collapses to zero-
+            # padding when only one window is in view (every decode step, and
+            # the first window of any prefill/verify chunk). Prepend the last
+            # completed window carried in the cache so the shift sees a real
+            # predecessor; drop the prepend's own (zero lane-A) pooled output.
+            # Mirrors native DS4's rolling state_kv double buffer
+            # (ds4.c compressor_decode_one). rope runs on the current windows
+            # only with pool_base, so positions stay aligned.
+            prev_kv = getattr(pool_cache, "prev_win_kv", None) if self.overlap else None
+            prev_gate = (
+                getattr(pool_cache, "prev_win_gate", None)
+                if self.overlap
+                else None
+            )
+            if self.overlap and prev_kv is not None and prev_kv.shape[1] > 0:
+                kv = mx.concatenate([prev_kv, kv], axis=1)
+                gate = mx.concatenate([prev_gate, gate], axis=1)
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+                new_pooled = new_pooled[:, 1:]
+            else:
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+
+            if self.overlap and pool_cache is not None:
+                # Carry the last window (now in `kv` after any prepend) for
+                # the next step's lane-A. Index -1 of the post-prepend kv is
+                # the current chunk's last window.
+                pool_cache.prev_win_kv = kv[:, -1:]
+                pool_cache.prev_win_gate = gate[:, -1:]
+
             new_pooled = self.norm(new_pooled)
             new_pooled = self.rope(
                 new_pooled[:, None],

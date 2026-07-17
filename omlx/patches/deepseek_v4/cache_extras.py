@@ -35,6 +35,17 @@ class PoolingCache(_BaseCache):
         self.pooled = None
         self._undo = None
 
+        # Previous completed window's raw (pre-compression) KV/gate. Only
+        # used by overlap (ratio==4) compressors: decode hands a single
+        # window to _overlap_compress_kv, whose `kv_a[:, :-1]` lane-A shift
+        # collapses to zero-padding and drops the cross-window overlap that
+        # native DS4 keeps via a rolling double buffer (ds4.c
+        # compressor_decode_one). Carrying the last window here lets the
+        # Compressor prepend it so decode preserves the overlap. Simple
+        # (ratio==128) layers leave these None.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
+
     @property
     def offset(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
@@ -62,6 +73,8 @@ class PoolingCache(_BaseCache):
                 self.pooled,
                 kv,
                 gate,
+                self.prev_win_kv,
+                self.prev_win_gate,
             )
         else:
             self._undo = None
@@ -163,6 +176,13 @@ class PoolingCache(_BaseCache):
             self.accumulate_windows(buf_kv, buf_gate, 0)
         self.pooled = pooled
         self._undo = None
+        # prev_win is runtime-only and not part of the persisted 3-tuple, so
+        # a state restore (SSD eviction/recovery) cannot rebuild it. The next
+        # window completed after restore pools with a zero lane-A once, then
+        # prev_win repopulates — a single-window overlap loss, not the
+        # persistent per-window loss the original decode bug caused.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
 
     @property
     def meta_state(self):
@@ -197,11 +217,15 @@ class PoolingCache(_BaseCache):
             return n
         if not self._can_undo(n):
             return 0
-        buf_kv, buf_gate, rem_prev, pooled_prev, kv, gate = self._undo
+        buf_kv, buf_gate, rem_prev, pooled_prev, kv, gate, prev_kv, prev_gate = (
+            self._undo
+        )
         self._undo = None
         k = kv.shape[1] - n
         self.pooled = pooled_prev
         self.remainder = rem_prev
+        self.prev_win_kv = prev_kv
+        self.prev_win_gate = prev_gate
         if buf_kv is not None:
             self.buf_kv[:, :rem_prev] = buf_kv
             self.buf_gate[:, :rem_prev] = buf_gate
@@ -254,6 +278,12 @@ class BatchPoolingCache(_BaseCache):
         self._processed = [0] * batch_size
         self._undo = None
 
+        # Previous completed window's raw KV/gate per batch row, for overlap
+        # (ratio==4) compressors — see PoolingCache.prev_win_kv docstring.
+        # None until a row completes its first window.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
+
     @property
     def offset(self):
         return mx.array(self._pool_lengths, dtype=mx.int32)
@@ -291,6 +321,8 @@ class BatchPoolingCache(_BaseCache):
                 list(self._processed),
                 kv,
                 gate,
+                self.prev_win_kv,
+                self.prev_win_gate,
             )
         else:
             self._undo = None
@@ -445,6 +477,8 @@ class BatchPoolingCache(_BaseCache):
     def state(self, v):
         self.buf_kv, self.buf_gate, self.pooled = v
         self._undo = None
+        self.prev_win_kv = None
+        self.prev_win_gate = None
 
     @property
     def meta_state(self):
@@ -480,7 +514,9 @@ class BatchPoolingCache(_BaseCache):
             return n
         if not self._can_undo(n):
             return 0
-        buf_kv, buf_gate, remainder, pool_lengths, processed, kv, gate = self._undo
+        buf_kv, buf_gate, remainder, pool_lengths, processed, kv, gate, prev_kv, prev_gate = (
+            self._undo
+        )
         self._undo = None
         k = kv.shape[1] - n
         # The undo path only triggers when some row completed a window,
@@ -492,6 +528,8 @@ class BatchPoolingCache(_BaseCache):
         self.remainder = list(remainder)
         self._pool_lengths = list(pool_lengths)
         self._processed = list(processed)
+        self.prev_win_kv = prev_kv
+        self.prev_win_gate = prev_gate
         if k > 0:
             # Replay the confirmed prefix; _can_undo guarantees it stays in
             # the buffer, so no window is recompressed.
@@ -530,6 +568,9 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = [self._pool_lengths[i] for i in idx_list]
         self._lengths = [self._lengths[i] for i in idx_list]
         self._processed = [self._processed[i] for i in idx_list]
+        # prev_win is runtime-only; reset after filter to avoid stale indices
+        self.prev_win_kv = None
+        self.prev_win_gate = None
 
     def extend(self, other):
         # Merge the remainder buffers
