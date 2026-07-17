@@ -644,6 +644,9 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = self._pool_lengths + other._pool_lengths
         self._lengths = self._lengths + other._lengths
         self._processed = self._processed + other._processed
+        # Batch dimension changed; reset runtime-only prev_win state.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
 
     def extract(self, idx):
         cache = PoolingCache(self.ratio)
