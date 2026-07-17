@@ -101,6 +101,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
         cache_rollback,
         deepseek_v4_model,
         glm_moe_dsa_model,
+        nemotron_h_chain,
+        nemotron_h_model,
         qwen35_model,
     )
 
@@ -114,6 +116,10 @@ def apply_mlx_lm_mtp_patch() -> bool:
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
     if not glm_moe_dsa_model.apply():
         logger.debug("GLM-5.2 MTP patch did not apply (likely missing base patch)")
+    if not nemotron_h_model.apply():
+        logger.debug("nemotron_h MTP patch did not apply (likely import error)")
+    elif not nemotron_h_chain.apply():
+        logger.debug("nemotron_h MTP chain patch did not apply")
     if not batch_generator.apply():
         logger.warning(
             "BatchGenerator MTP dispatch patch failed; MTP path will be inactive"
