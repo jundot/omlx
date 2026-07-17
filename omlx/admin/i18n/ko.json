@@ -747,6 +747,7 @@
   "chat.untitled_title": "제목 없음",
   "chat.admin_settings": "관리자 설정",
   "chat.clear_all_history": "전체 기록 삭제",
+  "chat.no_chats_to_export": "내보낼 채팅이 없습니다.",
   "chat.change_api_key": "API 키 변경",
   "chat.select_model": "모델 선택",
   "chat.no_models": "사용 가능한 모델 없음",

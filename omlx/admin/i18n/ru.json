@@ -747,6 +747,7 @@
   "chat.untitled_title": "Без названия",
   "chat.admin_settings": "Настройки админки",
   "chat.clear_all_history": "Очистить всю историю",
+  "chat.no_chats_to_export": "Нет чатов для экспорта.",
   "chat.change_api_key": "Изменить API-ключ",
   "chat.select_model": "Выберите модель",
   "chat.no_models": "Нет доступных моделей",

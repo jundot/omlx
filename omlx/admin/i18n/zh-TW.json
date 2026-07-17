@@ -747,6 +747,7 @@
   "chat.untitled_title": "未命名",
   "chat.admin_settings": "管理後台",
   "chat.clear_all_history": "清除所有歷史記錄",
+  "chat.no_chats_to_export": "沒有聊天記錄可匯出。",
   "chat.change_api_key": "更換 API 金鑰",
   "chat.select_model": "選擇模型",
   "chat.no_models": "暫無可用模型",

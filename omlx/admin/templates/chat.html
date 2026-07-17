@@ -1149,6 +1149,11 @@
                     </select>
                 </div>
             </div>
+            <button @click="downloadChats()"
+                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+                <i data-lucide="download" class="w-3 h-3"></i>
+                Download Chats
+            </button>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
                 class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
@@ -2044,6 +2049,7 @@
     }
 
     const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
+    const MAX_CHAT_HISTORY_SIZE = 100;
 
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
@@ -3813,6 +3819,33 @@
         });
     },
 
+    async downloadChats() {
+        const history = localStorage.getItem('omlx_chat_history');
+        if (!history) {
+            alert(window.t('chat.no_chats_to_export'));
+            return;
+        }
+        try {
+            const chats = JSON.parse(history);
+            if (!chats.length) {
+                alert(window.t('chat.no_chats_to_export'));
+                return;
+            }
+            const json = JSON.stringify(chats, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'omlx-chats.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('Failed to download chats:', e);
+        }
+    },
+
     async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
         localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
@@ -4562,8 +4595,8 @@
             this.chatHistory.unshift(chatData);
         }
 
-        // Keep only last 50 chats
-        this.chatHistory = this.chatHistory.slice(0, 50);
+        // Keep only last MAX_CHAT_HISTORY_SIZE chats
+        this.chatHistory = this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE);
         this.saveChatHistory();
     },
 

@@ -748,6 +748,7 @@
   "chat.admin_settings": "Admin Settings",
   "chat.clear_all_history": "Clear All History",
   "chat.change_api_key": "Change API Key",
+  "chat.no_chats_to_export": "No chats to export.",
   "chat.select_model": "Select Model",
   "chat.no_models": "No models available",
   "chat.welcome_heading": "Chat with oMLX",

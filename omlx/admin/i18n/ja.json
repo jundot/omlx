@@ -747,6 +747,7 @@
   "chat.untitled_title": "無題",
   "chat.admin_settings": "管理設定",
   "chat.clear_all_history": "全履歴を削除",
+  "chat.no_chats_to_export": "エクスポートするチャットはありません。",
   "chat.change_api_key": "APIキーを変更",
   "chat.select_model": "モデルを選択",
   "chat.no_models": "利用可能なモデルなし",

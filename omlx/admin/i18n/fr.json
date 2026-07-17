@@ -747,6 +747,7 @@
   "chat.untitled_title": "Sans titre",
   "chat.admin_settings": "Paramètres d'administration",
   "chat.clear_all_history": "Effacer tout l'historique",
+  "chat.no_chats_to_export": "Aucune discussion à exporter.",
   "chat.change_api_key": "Modifier la clé API",
   "chat.select_model": "Sélectionner un modèle",
   "chat.no_models": "Aucun modèle disponible",
