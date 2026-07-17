@@ -75,6 +75,13 @@ NATIVE_SYMBOLS = (
 # so only pass them when the rebuilt binding is present.
 _EXT_HAS_NAX = _ext is not None and hasattr(_ext, "is_nax_available")
 
+# Extensions built before the chunked-dispatch fix (issue #2225) reject the
+# dispatch_budget kwarg, so only forward it when the rebuilt binding is
+# present; those older builds keep the single-dispatch behavior.
+_EXT_HAS_FA256_DISPATCH_BUDGET = _ext is not None and hasattr(
+    _ext, "FA256_HAS_DISPATCH_BUDGET"
+)
+
 _NAX_ARCH_RE = re.compile(r"applegpu_g(\d+)([a-z])")
 _NAX_KERNEL_NEEDLE = b"affine_qmm_t_nax"
 
@@ -245,6 +252,10 @@ def _native_stream_kwargs(stream) -> dict[str, object]:
     return {"stream": stream}
 
 
+def fa256_supports_dispatch_budget() -> bool:
+    return _EXT_HAS_FA256_DISPATCH_BUDGET
+
+
 def qwen35_fa256_attention(
     q: mx.array,
     k: mx.array,
@@ -253,10 +264,14 @@ def qwen35_fa256_attention(
     causal: bool = True,
     q_block: int = 32,
     k_block: int = 8,
+    dispatch_budget: int = 0,
     *,
     stream=None,
 ) -> mx.array:
     if _ext is not None and hasattr(_ext, "qwen35_fa256_attention"):
+        budget_kwargs: dict[str, int] = {}
+        if _EXT_HAS_FA256_DISPATCH_BUDGET:
+            budget_kwargs["dispatch_budget"] = int(dispatch_budget)
         return _ext.qwen35_fa256_attention(
             q,
             k,
@@ -265,6 +280,7 @@ def qwen35_fa256_attention(
             causal=causal,
             q_block=q_block,
             k_block=k_block,
+            **budget_kwargs,
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_fa256_attention native kernel is unavailable")

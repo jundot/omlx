@@ -60,11 +60,12 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
     if x.shape[-2] * int(getattr(self, "top_k", 0)) < 64:
         return False
     switch_mlp = getattr(self, "switch_mlp", None)
-    return (
-        switch_mlp is not None
-        and hasattr(switch_mlp, "up_proj")
-        and hasattr(switch_mlp, "gate_proj")
-        and hasattr(switch_mlp, "down_proj")
+    if switch_mlp is None or not hasattr(switch_mlp, "down_proj"):
+        return False
+    # Either the stock split projections or the omlx gate+up fused layout
+    # (qwen35_moe_gate_up patch, issue #2238).
+    return hasattr(switch_mlp, "gate_up_proj") or (
+        hasattr(switch_mlp, "up_proj") and hasattr(switch_mlp, "gate_proj")
     )
 
 
@@ -81,8 +82,13 @@ def _native_switch_weighted_sum(
     if switch_mlp.training:
         idx = mx.stop_gradient(idx)
 
-    x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
-    x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+    gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    if gate_up is not None:
+        x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
+        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+    else:
+        x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
+        x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
     x_sorted = switch_mlp.down_proj(
         switch_mlp.activation(x_up, x_gate),
         idx,

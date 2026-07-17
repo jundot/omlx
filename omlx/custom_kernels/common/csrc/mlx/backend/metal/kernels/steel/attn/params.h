@@ -164,5 +164,16 @@ struct DeepseekV4SparseAttentionParams {
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
 };
 
+struct AttnChunkReduceParams {
+  int C; ///< Number of key chunks
+  int H; ///< Heads
+  int qL; ///< Query sequence length
+  int D; ///< Head dim
+
+  int64_t o_chunk_stride; ///< Elements per chunk in the partial O slab
+  int64_t lse_chunk_stride; ///< Elements per chunk in the logsumexp slab
+  int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
+};
+
 } // namespace steel
 } // namespace mlx

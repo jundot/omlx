@@ -383,6 +383,23 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.values = _filter_state(self.values, batch_indices)
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        # Shift left to drop shared padding, mirroring BatchKVCache.filter().
+        # The turboquant_skip_last layer is a stock BatchKVCache that compacts
+        # here, and the model feeds every attention layer ONE mask built from
+        # the first (TQ) layer's _phys_end. Skipping the same compaction
+        # leaves that mask min_left_pad columns wider than the dense layer's
+        # keys and crashes the next decode step (#2237).
+        min_left_pad = int(self.left_padding.min().item())
+        if min_left_pad > 0:
+            if self.keys is not None:
+                self.keys = _slice_state_range(
+                    self.keys, min_left_pad, self._phys_end
+                )
+                self.values = _slice_state_range(
+                    self.values, min_left_pad, self._phys_end
+                )
+            self._phys_end -= min_left_pad
+            self.left_padding = self.left_padding - min_left_pad
         self._cached_state = None
         self._cached_state_offset = -1
 

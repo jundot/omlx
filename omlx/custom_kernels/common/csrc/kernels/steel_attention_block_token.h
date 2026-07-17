@@ -17,6 +17,13 @@ constant bool has_sinks [[function_constant(302)]];
 constant bool has_block_mask [[function_constant(303)]];
 constant bool has_block_token_mask [[function_constant(304)]];
 constant bool has_block_indices [[function_constant(305)]];
+// Chunked-dispatch partial outputs (issue #2225). Defaulted so pipelines
+// built by callers that predate the constant (glm_moe_dsa) keep compiling.
+constant bool output_partials [[function_constant(306)]];
+constant bool output_partials_defined =
+    is_function_constant_defined(output_partials);
+constant bool use_output_partials =
+    output_partials_defined && output_partials;
 
 struct MaxOp {
   template <typename T>
@@ -85,6 +92,8 @@ template <
     const device uint* block_token_mask [[buffer(11), function_constant(has_block_token_mask)]],
     const constant AttnBlockIndexParams* block_index_params [[buffer(12), function_constant(has_block_indices)]],
     const device uint* block_indices [[buffer(13), function_constant(has_block_indices)]],
+    device T* O_part [[buffer(14), function_constant(use_output_partials)]],
+    device float* lse_part [[buffer(15), function_constant(use_output_partials)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -107,7 +116,10 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  // In chunked-dispatch mode the (normalized) partial output goes to the
+  // per-chunk slab instead of O; a reduce pass folds the chunks afterwards.
+  device T* Odst = use_output_partials ? O_part : O;
+  Odst += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
 
@@ -521,12 +533,31 @@ template <
     }
   }
 
+  // Emit per-row logsumexp for the chunk-reduce pass. Values stay in the
+  // kernel's scaled log2 domain (scores were multiplied by scale * M_LOG2E);
+  // the reduce only needs differences so the domain cancels. Rows whose KV
+  // loop never ran (causally dead threadgroups in later chunks) get -INF so
+  // the reduce skips their 0/0 partials.
+  if (use_output_partials && sn == 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const int row_pos = tid.x * BQ + tm + sm + (i * kFragSize);
+      if (row_pos < params->qL) {
+        const ulong lse_idx =
+            (tidl.z * params->H + tidl.y) * ulong(params->qL) + row_pos;
+        lse_part[lse_idx] = sum_score[i] <= 0
+            ? -INFINITY
+            : float(max_score[i]) + fast::log2(float(sum_score[i]));
+      }
+    }
+  }
+
   // Normalize output
   Otile.template row_bin_op<DivOp>(sum_score);
   threadgroup_barrier(mem_flags::mem_none);
 
   // Store results
-  O += (tm + sm) * params->O_strides[2] + sn;
+  Odst += (tm + sm) * params->O_strides[2] + sn;
 
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
     auto dst_tile_dims = short2(BD - sn, params->qL_rem - (tm + sm));
@@ -534,8 +565,63 @@ template <
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
       return;
 
-    Otile.template store_safe<T, 1, 1>(O, params->O_strides[2], dst_tile_dims);
+    Otile.template store_safe<T, 1, 1>(
+        Odst, params->O_strides[2], dst_tile_dims);
   } else {
-    Otile.template store<T, 1, 1>(O, params->O_strides[2]);
+    Otile.template store<T, 1, 1>(Odst, params->O_strides[2]);
   }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Chunk reduce kernel (issue #2225)
+///////////////////////////////////////////////////////////////////////////////
+
+// Folds the per-chunk normalized partial outputs into the final output with
+// logsumexp-weighted averaging (the standard flash-attention chunk
+// combination). One thread covers 4 consecutive head-dim elements of one
+// (batch, head, row); lse values are in the attention kernel's log2 domain.
+template <typename T>
+[[kernel]] void attention_chunk_reduce(
+    const device T* O_part [[buffer(0)]],
+    const device float* lse_part [[buffer(1)]],
+    device T* O [[buffer(2)]],
+    const constant AttnChunkReduceParams* params [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  const int d4 = gid.x;
+  const int row = gid.y;
+  const int bh = gid.z;
+  if (row >= params->qL || (4 * d4) >= params->D) {
+    return;
+  }
+  const int b = bh / params->H;
+  const int h = bh % params->H;
+
+  const ulong row_off = ulong(bh) * ulong(params->qL) + row;
+  const ulong o_off = row_off * ulong(params->D) + 4 * d4;
+
+  float m = -INFINITY;
+  for (int c = 0; c < params->C; ++c) {
+    m = metal::max(m, lse_part[c * params->lse_chunk_stride + row_off]);
+  }
+
+  float4 acc = 0;
+  float den = 0;
+  for (int c = 0; c < params->C; ++c) {
+    const float lse = lse_part[c * params->lse_chunk_stride + row_off];
+    if (lse == -INFINITY) {
+      continue; // dead chunk: partial is 0/0, weight is exactly 0
+    }
+    const float w = metal::exp2(lse - m);
+    const device T* op = O_part + c * params->o_chunk_stride + o_off;
+    acc += w * float4(op[0], op[1], op[2], op[3]);
+    den += w;
+  }
+  const float4 out = den > 0 ? acc / den : float4(0);
+
+  device T* dst = O + b * params->O_strides[0] + h * params->O_strides[1] +
+      row * params->O_strides[2] + 4 * d4;
+  dst[0] = static_cast<T>(out.x);
+  dst[1] = static_cast<T>(out.y);
+  dst[2] = static_cast<T>(out.z);
+  dst[3] = static_cast<T>(out.w);
 }

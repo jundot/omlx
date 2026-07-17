@@ -292,6 +292,27 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
+        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # gate and up projections so decode runs 2 gather_qmm launches per
+        # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
+        # executor because it rewrites weights in place.
+        if (
+            getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_gate_up import (
+                    apply_qwen35_moe_gate_up_fusion,
+                )
+
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    apply_qwen35_moe_gate_up_fusion,
+                    self._model,
+                )
+            except Exception:
+                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)

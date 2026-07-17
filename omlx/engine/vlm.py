@@ -1403,6 +1403,28 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
 
+        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # gate and up projections so decode runs 2 gather_qmm launches per
+        # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
+        # mlx-vlm target-verify helper for a fused-aware version. Runs on
+        # the MLX executor because it rewrites weights in place.
+        if (
+            getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_gate_up import (
+                    apply_qwen35_moe_gate_up_fusion,
+                )
+
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    apply_qwen35_moe_gate_up_fusion,
+                    self._vlm_model,
+                )
+            except Exception:
+                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
+
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:

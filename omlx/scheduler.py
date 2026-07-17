@@ -4253,15 +4253,19 @@ class Scheduler:
             mx.random.seed(request.sampling_params.seed)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
-        uids = self.batch_generator.insert(
-            [state.last_token],
-            max_tokens=[request.sampling_params.max_tokens],
-            caches=[state.cache] if state.cache else None,
-            all_tokens=[_batch_generator_all_tokens(request)],
-            samplers=[state.sampler],
-            logits_processors=[per_row_lps],
-            state_machines=[state.sm],
-        )
+        # insert() merges the prompt cache into the batch KV caches with lazy
+        # ops; keep them on the engine stream so the next decode step's eval
+        # graph stays single-stream (#2235, see _remove_uid_from_active_batch).
+        with mx.stream(self._stream):
+            uids = self.batch_generator.insert(
+                [state.last_token],
+                max_tokens=[request.sampling_params.max_tokens],
+                caches=[state.cache] if state.cache else None,
+                all_tokens=[_batch_generator_all_tokens(request)],
+                samplers=[state.sampler],
+                logits_processors=[per_row_lps],
+                state_machines=[state.sm],
+            )
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
@@ -7069,7 +7073,13 @@ class Scheduler:
         if self.batch_generator is None:
             return
 
-        self.batch_generator.remove([uid])
+        # remove() filters the batch KV caches with lazy views; keep those
+        # views on the engine stream. A worker-default-stream view inside the
+        # next decode step's eval graph adds a cross-stream fence that can
+        # wait forever on macOS 26 and wedge the engine (#2235, same class as
+        # the prefill chunk fix for #2183/#2197).
+        with mx.stream(self._stream):
+            self.batch_generator.remove([uid])
 
     def _check_pending_aborts_for_uids(self, uids: list[int]) -> list[int]:
         """Return UIDs that have pending aborts.
@@ -8470,15 +8480,20 @@ class Scheduler:
             # See vllm-mlx-patched commit 8d4052b for the same root cause
             # in a sibling project, and #934 for the user-visible symptom.
             per_row_lps = list(logits_processors) if logits_processors else []
-            uids = self.batch_generator.insert(
-                [tokens_to_process],
-                max_tokens=[request.sampling_params.max_tokens],
-                caches=[cache_to_use] if cache_to_use else None,
-                all_tokens=[_batch_generator_all_tokens(request)],
-                samplers=[sampler],
-                logits_processors=[per_row_lps],
-                state_machines=[sm],
-            )
+            # insert() merges the prompt cache into the batch KV caches with
+            # lazy ops; keep them on the engine stream so the next decode
+            # step's eval graph stays single-stream (#2235, see
+            # _remove_uid_from_active_batch).
+            with mx.stream(self._stream):
+                uids = self.batch_generator.insert(
+                    [tokens_to_process],
+                    max_tokens=[request.sampling_params.max_tokens],
+                    caches=[cache_to_use] if cache_to_use else None,
+                    all_tokens=[_batch_generator_all_tokens(request)],
+                    samplers=[sampler],
+                    logits_processors=[per_row_lps],
+                    state_machines=[sm],
+                )
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]

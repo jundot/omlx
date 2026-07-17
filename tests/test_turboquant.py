@@ -2,7 +2,7 @@
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
     _build_codec,
@@ -1166,7 +1166,7 @@ def test_batch_tq_append_position_survives_min_lp_row_departure():
     batch, rows = _make_ragged_batch()
     _, k2, v2 = rows[1]
 
-    batch.filter(mx.array([1]))  # the lp=0 row departs; survivor lp=16
+    batch.filter(mx.array([1]))  # the lp=0 row departs; padding compacts away
 
     ref_k = [k2[0]]
     for _ in range(3):
@@ -1189,15 +1189,83 @@ def test_batch_tq_append_position_survives_min_lp_row_departure():
 
 
 def test_batch_tq_make_mask_width_after_min_lp_row_departure():
-    """make_mask must span the written physical columns, not offset.max():
-    after the lp=0 row departs the two diverge and a shrunken mask blinds
-    the survivors to their own tail context."""
+    """After the lp=0 row departs, filter() compacts the shared padding away
+    (mirroring BatchKVCache), leaving the single survivor at lp=0 with the
+    written end equal to its own length, so a decode step needs no mask.
+    Survivors with residual padding are covered by
+    test_batch_tq_filter_compacts_left_padding_like_batch_kv."""
     batch, _ = _make_ragged_batch()
     batch.filter(mx.array([1]))
-    m = batch.make_mask(1, return_array=True)
-    assert m.shape[-1] == 48 + 1, (
-        f"mask spans {m.shape[-1]} columns, expected 49 (48 written + 1 new)"
+    assert batch._phys_end == 32, (
+        f"written end {batch._phys_end}, expected 32 after dropping the "
+        "departed row's 16 shared padding columns"
     )
+    assert batch.left_padding.tolist() == [0]
+    m = batch.make_mask(1, return_array=True)
+    assert m is None, f"expected no mask for the unpadded survivor, got {m}"
+
+
+def test_batch_tq_filter_compacts_left_padding_like_batch_kv():
+    """Issue #2237: BatchKVCache.filter() shifts its buffer left by
+    min(left_padding) once the zero-left-padding row departs; the TQ batch
+    cache must mirror that compaction. The model builds ONE decode mask from
+    the first (TQ) layer and feeds it to every attention layer, including the
+    turboquant_skip_last dense BatchKVCache layer, so diverging physical
+    widths crash the next step with a broadcast error."""
+    mx.random.seed(7)
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=8.0)
+    dense = BatchKVCache([0, 1, 2])
+    for t in (8, 1, 1, 1):
+        k = mx.random.normal((3, 2, t, 32)).astype(mx.float16)
+        v = mx.random.normal((3, 2, t, 32)).astype(mx.float16)
+        tq.update_and_fetch(k, v)
+        dense.update_and_fetch(k, v)
+
+    # The zero-left-padding row departs; survivors keep lp > 0.
+    keep = mx.array([1, 2])
+    tq.filter(keep)
+    dense.filter(keep)
+    assert tq.left_padding.tolist() == dense.left_padding.tolist(), (
+        f"left_padding diverges after filter: TQ={tq.left_padding.tolist()} "
+        f"BK={dense.left_padding.tolist()}"
+    )
+    assert tq._phys_end == dense._idx, (
+        f"physical end diverges after filter: TQ={tq._phys_end} "
+        f"BK={dense._idx}"
+    )
+
+    # Next decode step: shared mask width vs dense layer keys width.
+    k = mx.random.normal((2, 2, 1, 32)).astype(mx.float16)
+    v = mx.random.normal((2, 2, 1, 32)).astype(mx.float16)
+    mask = tq.make_mask(1)
+    dk, _ = dense.update_and_fetch(k, v)
+    tq.update_and_fetch(k, v)
+    assert mask.shape[-1] == dk.shape[2], (
+        f"decode mask spans {mask.shape[-1]} columns but the dense skip-last "
+        f"layer has {dk.shape[2]}, broadcast crash in SDPA (#2237)"
+    )
+
+    # Compaction must shift content, not corrupt it: compare each row's
+    # valid region against the exact dense copy of the same stream.
+    dqk, _ = tq.dequantize()
+    for i in range(2):
+        lp_i = int(dense.left_padding[i].item())
+        err = (
+            mx.abs(
+                dqk[i, :, lp_i:, :].astype(mx.float32)
+                - dk[i, :, lp_i:, :].astype(mx.float32)
+            )
+            .max()
+            .item()
+        )
+        assert err < 0.2, f"row {i} content shifted by compaction (err {err:.3f})"
+
+    # Second departure leaves a single survivor whose padding compacts to 0;
+    # both caches must stay in lockstep there too.
+    tq.filter(mx.array([1]))
+    dense.filter(mx.array([1]))
+    assert tq.left_padding.tolist() == dense.left_padding.tolist()
+    assert tq._phys_end == dense._idx
 
 
 def test_batch_tq_append_growth_keeps_content_and_geometry():
