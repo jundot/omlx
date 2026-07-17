@@ -57,7 +57,7 @@ dependencies = [
     # Keep <5.13 until the broader dependency set gets a dedicated resolver
     # smoke test with transformers 5.13+. The mlx-lm pin above includes the
     # known NewlineTokenizer registration fix.
-    "transformers>=5.7.0,<5.13",
+    "transformers>=5.7.0,<5.15",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
