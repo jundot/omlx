@@ -608,3 +608,58 @@ class TestEngineCorePropagation:
         req = core.scheduler.add_request.call_args[0][0]
         assert not hasattr(req, "_specprefill_threshold")
         assert not hasattr(req, "_specprefill_keep_pct")
+
+
+class TestRoPEReWrap:
+    """Regression tests for #766 — re-wrapping a leftover _OffsetAdjustedRoPE.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called, e.g. an aborted request or a multi-turn partial cache hit), the
+    next sparse_prefill used to capture that wrapper as `original` and re-wrap it
+    in _PositionMappedRoPE, whose __init__ dereferenced `original_rope.dims` and
+    raised `'_OffsetAdjustedRoPE' object has no attribute 'dims'`.
+    """
+
+    class _GenuineRoPE:
+        dims = 128
+        base = 10000.0
+        scale = 1.0
+
+        def __call__(self, x, offset=0):
+            return x
+
+    def test_offset_adjusted_delegates_attrs(self):
+        from omlx.patches.specprefill import _OffsetAdjustedRoPE
+
+        wrapped = _OffsetAdjustedRoPE(self._GenuineRoPE(), adjustment=5)
+        # unknown attrs delegate to the wrapped rope
+        assert wrapped.dims == 128
+        assert wrapped.base == 10000.0
+
+    def test_unwrap_peels_to_genuine(self):
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+            _unwrap_rope,
+        )
+
+        genuine = self._GenuineRoPE()
+        positions = mx.arange(16)
+        assert _unwrap_rope(genuine) is genuine
+        assert _unwrap_rope(_OffsetAdjustedRoPE(genuine, 5)) is genuine
+        assert (
+            _unwrap_rope(_PositionMappedRoPE(_OffsetAdjustedRoPE(genuine, 5), positions))
+            is genuine
+        )
+
+    def test_rewrap_leftover_does_not_crash(self):
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+        )
+
+        genuine = self._GenuineRoPE()
+        leftover = _OffsetAdjustedRoPE(genuine, adjustment=5)
+        # Previously raised AttributeError on original_rope.dims (#766)
+        pm = _PositionMappedRoPE(leftover, mx.arange(16))
+        assert pm._dims == 128

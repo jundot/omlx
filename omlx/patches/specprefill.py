@@ -706,7 +706,7 @@ class _PositionMappedRoPE:
             self._dims = _get_dims(original_rope)
             self._pre_scale = _get_pre_scale(original_rope)
         else:
-            self._dims = original_rope.dims
+            self._dims = _get_dims(original_rope)
             self._base = original_rope.base
             self._scale = original_rope.scale
 
@@ -735,6 +735,24 @@ class _OffsetAdjustedRoPE:
 
     def __call__(self, x, offset=0):
         return self._original(x, offset=offset + self._adjustment)
+
+    def __getattr__(self, name):
+        # Delegate unknown attrs (e.g. .dims, .base, ._freqs) to the wrapped
+        # rope so this wrapper is transparent if it is ever re-wrapped. See #766.
+        return getattr(object.__getattribute__(self, "_original"), name)
+
+
+def _unwrap_rope(rope):
+    """Peel any sparse-prefill RoPE wrappers down to the genuine module.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called between multi-turn requests), re-wrapping it would nest wrappers
+    and, before this fix, crash in _PositionMappedRoPE. Always start from the
+    genuine rope. See #766.
+    """
+    while isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
+        rope = rope._original
+    return rope
 
 
 def _get_dims(rope_module):
@@ -835,9 +853,13 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            original_ropes[layer_idx] = attn.rope
+            # Start from the genuine rope: a prior sparse_prefill may have left
+            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
+            # (multi-turn + partial cache hit). See #766.
+            genuine = _unwrap_rope(attn.rope)
+            original_ropes[layer_idx] = genuine
             attn.rope = _PositionMappedRoPE(
-                attn.rope, selected_positions, cache_start=cache_start
+                genuine, selected_positions, cache_start=cache_start
             )
 
     try:
