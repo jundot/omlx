@@ -605,7 +605,7 @@ class Compressor(nn.Module):
                 if self.overlap
                 else None
             )
-            if self.overlap and prev_kv is not None and prev_kv.shape[1] > 0:
+            if self.overlap and prev_kv is not None and prev_kv.shape[1] > 0 and prev_kv.shape[0] == kv.shape[0]:
                 kv = mx.concatenate([prev_kv, kv], axis=1)
                 gate = mx.concatenate([prev_gate, gate], axis=1)
                 new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
