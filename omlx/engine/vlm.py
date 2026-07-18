@@ -1777,10 +1777,15 @@ class VLMBatchedEngine(BaseEngine):
         mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
         and loads the correct per-model parser.  Falls back to mlx_lm if the
         mlx_vlm.tool_parsers package is not present.
+
+        For models whose parser isn't in mlx_vlm/mlx_lm (e.g. DeepSeek V4 DSML),
+        fall back to omlx's bundled tool parser modules.
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
+
+        tool_module = None
 
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
@@ -1790,13 +1795,13 @@ class VLMBatchedEngine(BaseEngine):
             )
 
             tool_parser_type = _infer_tool_parser(chat_template)
-            if tool_parser_type is None:
-                return
-            try:
-                tool_module = load_tool_module(tool_parser_type)
-            except ImportError:
-                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
-                return
+            if tool_parser_type is not None:
+                try:
+                    tool_module = load_tool_module(tool_parser_type)
+                except ImportError:
+                    logger.warning(
+                        f"VLM tool parser module not found: {tool_parser_type}"
+                    )
         except ImportError:
             # Fallback: mlx_lm only (no Gemma4 support)
             try:
@@ -1805,18 +1810,35 @@ class VLMBatchedEngine(BaseEngine):
                 from mlx_lm.tokenizer_utils import (
                     _infer_tool_parser as _mlx_lm_infer,
                 )
+
+                tool_parser_type = _mlx_lm_infer(chat_template)
+                if tool_parser_type is not None:
+                    try:
+                        tool_module = importlib.import_module(
+                            f"mlx_lm.tool_parsers.{tool_parser_type}"
+                        )
+                    except ImportError:
+                        logger.warning(
+                            f"VLM tool parser module not found: {tool_parser_type}"
+                        )
             except ImportError:
-                return
-            tool_parser_type = _mlx_lm_infer(chat_template)
-            if tool_parser_type is None:
-                return
-            try:
-                tool_module = importlib.import_module(
-                    f"mlx_lm.tool_parsers.{tool_parser_type}"
-                )
-            except ImportError:
-                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
-                return
+                pass
+
+        # Fallback: omlx bundled parsers for models not yet upstream.
+        if tool_module is None and isinstance(chat_template, str):
+            if "<｜DSML｜tool_calls>" in chat_template:
+                try:
+                    from ..patches.deepseek_v4 import tool_parser_v4
+
+                    tool_module = tool_parser_v4
+                    tool_parser_type = "deepseek_v4"
+                except ImportError:
+                    logger.warning(
+                        "DeepSeek V4 tool parser not found in omlx patches"
+                    )
+
+        if tool_module is None:
+            return
 
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end

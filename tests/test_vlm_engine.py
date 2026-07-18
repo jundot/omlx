@@ -681,6 +681,21 @@ class TestInjectToolCalling:
         assert tokenizer.has_tool_calling is True
         assert isinstance(tokenizer.tool_call_start, str)
 
+    def test_injects_deepseek_v4_dsml_fallback(self):
+        """Chat template with DSML markers → omlx bundled parser."""
+        engine = _make_engine()
+        tokenizer = MockVLMTokenizer(
+            chat_template="some template with <｜DSML｜tool_calls> markers",
+            vocab={"<｜DSML｜tool_calls>": 100, "</｜DSML｜tool_calls>": 101},
+        )
+
+        engine._inject_tool_calling(tokenizer)
+
+        assert tokenizer.has_tool_calling is True
+        assert tokenizer.tool_call_start == "<｜DSML｜tool_calls>"
+        assert tokenizer.tool_call_end == "</｜DSML｜tool_calls>"
+        assert callable(tokenizer.tool_parser)
+
 
 # ---------------------------------------------------------------------------
 # TestApplyChatTemplate
