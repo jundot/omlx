@@ -587,6 +587,56 @@ class TestModelSettingsManager:
         restored = ModelSettings.from_dict(d)
         assert restored.forced_ct_kwargs == ["enable_thinking", "reasoning_effort"]
 
+    def test_merge_chat_template_request_kwargs_request_overrides_model(self):
+        """Request kwargs override model chat-template defaults."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            }
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False},
+        )
+
+        assert merged == {"enable_thinking": False, "custom_flag": "model"}
+
+    def test_merge_chat_template_request_kwargs_dedicated_overrides_raw(self):
+        """Dedicated model fields override model raw chat-template kwargs."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={"enable_thinking": False},
+            enable_thinking=True,
+        )
+
+        assert merge_chat_template_request_kwargs(settings) == {
+            "enable_thinking": True
+        }
+
+    def test_merge_chat_template_request_kwargs_respects_forced_keys(self):
+        """Forced keys block request-level chat-template overrides."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            },
+            forced_ct_kwargs=["enable_thinking"],
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False, "custom_flag": "request"},
+        )
+
+        assert merged == {"enable_thinking": True, "custom_flag": "request"}
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading

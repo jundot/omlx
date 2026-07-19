@@ -470,6 +470,36 @@ class TestResponsesEndpoint:
         assert data["output"][1]["content"][0]["text"] == "Hello!"
         assert data["usage"]["output_tokens_details"]["reasoning_tokens"] == 3
 
+    def test_responses_forwards_request_chat_template_kwargs(
+        self, client, mock_llm_engine
+    ):
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="pong",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.chat = chat
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Say pong",
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        ct_kwargs = recorded_chat_kwargs[0].get("chat_template_kwargs") or {}
+        assert ct_kwargs["enable_thinking"] is False
+
     def test_response_stream_includes_reasoning_item_for_think_blocks(
         self, client, mock_llm_engine
     ):

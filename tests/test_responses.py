@@ -1055,6 +1055,14 @@ class TestResponsesRequest:
         assert req.prompt_cache_key == "test-key"
         assert req.reasoning["effort"] == "high"
 
+    def test_chat_template_kwargs(self):
+        req = ResponsesRequest(
+            model="test",
+            input="Hi",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        assert req.chat_template_kwargs == {"enable_thinking": False}
+
     def test_extra_fields_allowed(self):
         """Unknown fields should not cause validation errors."""
         req = ResponsesRequest(
