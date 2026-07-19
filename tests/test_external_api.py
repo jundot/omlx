@@ -57,14 +57,16 @@ def _usage_chunk(prompt=10, completion=5, cached=None):
     return {"choices": [], "usage": usage}
 
 
-def _completion_response(text="A", prompt=10, completion=5, extra_message=None):
+def _completion_response(
+    text="A", prompt=10, completion=5, extra_message=None, finish_reason="stop"
+):
     message = {"role": "assistant", "content": text}
     if extra_message:
         message.update(extra_message)
     return httpx.Response(
         200,
         json={
-            "choices": [{"message": message, "finish_reason": "stop"}],
+            "choices": [{"message": message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
         },
     )
@@ -326,6 +328,81 @@ class TestChatCompletion:
         assert result.text == "B"
         assert result.prompt_tokens == 42
         assert result.completion_tokens == 7
+        assert result.finish_reason == "stop"
+        assert result.status == "ok"
+
+    async def test_empty_content_preserves_reasoning_diagnostics(self):
+        def handler(request):
+            return _completion_response(
+                text=None,
+                extra_message={"reasoning_content": "private reasoning"},
+            )
+
+        client = _client(handler)
+        try:
+            result = await client.chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=None,
+            )
+        finally:
+            await client.aclose()
+
+        assert result.text == ""
+        assert result.status == "empty_content"
+        assert result.reasoning_fields_present == ("reasoning_content",)
+        assert result.reasoning_fields_nonempty == ("reasoning_content",)
+
+    async def test_length_finish_reason_is_truncated(self):
+        def handler(request):
+            return _completion_response(text="partial", finish_reason="length")
+
+        client = _client(handler)
+        try:
+            result = await client.chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=None,
+            )
+        finally:
+            await client.aclose()
+
+        assert result.status == "truncated"
+        assert result.finish_reason == "length"
+
+    async def test_non_text_content_is_invalid_response(self):
+        def handler(request):
+            return _completion_response(text=[{"type": "text", "text": "A"}])
+
+        client = _client(handler)
+        try:
+            with pytest.raises(ExternalEndpointError) as exc_info:
+                await client.chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=8,
+                    temperature=None,
+                )
+        finally:
+            await client.aclose()
+
+        assert exc_info.value.status == "invalid_response"
+
+    async def test_non_json_response_is_invalid_response(self):
+        def handler(request):
+            return httpx.Response(200, text="not json")
+
+        client = _client(handler)
+        try:
+            with pytest.raises(ExternalEndpointError) as exc_info:
+                await client.chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=8,
+                    temperature=None,
+                )
+        finally:
+            await client.aclose()
+
+        assert exc_info.value.status == "invalid_response"
 
     async def test_unexpected_shape_raises(self):
         def handler(request):
@@ -333,7 +410,9 @@ class TestChatCompletion:
 
         client = _client(handler)
         try:
-            with pytest.raises(ExternalEndpointError, match="unexpected response"):
+            with pytest.raises(
+                ExternalEndpointError, match="unexpected response"
+            ) as exc_info:
                 await client.chat_completion(
                     messages=[{"role": "user", "content": "hi"}],
                     max_tokens=8,
@@ -341,6 +420,28 @@ class TestChatCompletion:
                 )
         finally:
             await client.aclose()
+        assert exc_info.value.status == "invalid_response"
+
+    async def test_http_error_status_and_secret_redaction(self):
+        def handler(request):
+            return httpx.Response(
+                500,
+                json={"error": {"message": f"provider echoed {API_KEY}"}},
+            )
+
+        client = _client(handler)
+        try:
+            with pytest.raises(ExternalEndpointError) as exc_info:
+                await client.chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=8,
+                    temperature=None,
+                )
+        finally:
+            await client.aclose()
+
+        assert exc_info.value.status == "http_error"
+        assert API_KEY not in str(exc_info.value)
 
     async def test_no_auth_header_without_key(self):
         captured = {}
@@ -436,6 +537,7 @@ class TestExternalChatAdapter:
 
         adapter, _ = self._adapter(handler)
         assert adapter.model_type is None
+        assert adapter.is_external_api is True
 
     async def test_preflight_raises_on_auth_error(self):
         def handler(request):
@@ -457,3 +559,49 @@ class TestExternalChatAdapter:
             await adapter.preflight()
         finally:
             await client.aclose()
+
+    @pytest.mark.parametrize(
+        ("text", "extra_message", "finish_reason", "expected_status"),
+        [
+            (None, None, "stop", "empty_content"),
+            (None, {"reasoning_content": "thinking"}, "stop", "empty_content"),
+            ("partial", None, "length", "truncated"),
+            ("not the sentinel", None, "stop", "parse_error"),
+            ("NOT OK", None, "stop", "parse_error"),
+        ],
+    )
+    async def test_preflight_rejects_incompatible_final_answer(
+        self, text, extra_message, finish_reason, expected_status
+    ):
+        def handler(request):
+            return _completion_response(
+                text=text,
+                extra_message=extra_message,
+                finish_reason=finish_reason,
+            )
+
+        adapter, client = self._adapter(handler)
+        try:
+            with pytest.raises(ExternalEndpointError) as exc_info:
+                await adapter.preflight()
+        finally:
+            await client.aclose()
+
+        assert exc_info.value.status == expected_status
+
+    async def test_question_error_is_returned_as_diagnostic_output(self):
+        def handler(request):
+            return httpx.Response(429, json={"error": {"message": "rate limited"}})
+
+        adapter, client = self._adapter(handler)
+        try:
+            output = await adapter.chat(
+                messages=[{"role": "user", "content": "q"}],
+                max_tokens=8,
+            )
+        finally:
+            await client.aclose()
+
+        assert output.text == ""
+        assert output.external_status == "http_error"
+        assert "429" in output.error_message

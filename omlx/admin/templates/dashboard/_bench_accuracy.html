@@ -316,9 +316,58 @@
                                         </div>
                                     </div>
                                     <div class="text-right">
+                                        <div x-show="r.external" class="text-[10px] uppercase tracking-wide text-neutral-400 mb-0.5">{{ t('acc_bench.results.total_accuracy') }}</div>
                                         <span class="text-2xl font-bold tabular-nums"
                                               :class="r.accuracy >= 0.7 ? 'text-green-600' : r.accuracy >= 0.4 ? 'text-amber-600' : 'text-red-600'"
                                               x-text="(r.accuracy * 100).toFixed(1) + '%'"></span>
+                                    </div>
+                                </div>
+
+                                <div x-show="r.external && r.reliability_warning" x-cloak
+                                     class="mt-4 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800">
+                                    <i data-lucide="triangle-alert" class="w-4 h-4 flex-shrink-0 mt-0.5"></i>
+                                    <span class="text-xs font-medium">{{ t('acc_bench.results.reliability_warning') }}</span>
+                                </div>
+                                <div x-show="r.external" x-cloak class="mt-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_responses') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.valid_response_count + ' / ' + r.total"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_response_rate') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="(r.valid_response_rate * 100).toFixed(1) + '%'"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_answer_accuracy') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="(r.valid_answer_accuracy * 100).toFixed(1) + '%'"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.empty_content') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.empty_content_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.truncated') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.truncated_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.timeout') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.timeout_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.http_errors') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.http_error_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.invalid_responses') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.invalid_response_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.parse_errors') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.parse_error_count"></div>
+                                    </div>
+                                    <div x-show="r.connection_error_count > 0" class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.connection_errors') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.connection_error_count"></div>
                                     </div>
                                 </div>
 

@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -548,7 +549,30 @@ async def run_accuracy_benchmark(
                 run.error_message = str(e)
                 return
 
-            # Build result
+            question_results = []
+            for qr in result.question_results:
+                question_data = {
+                    "id": qr.question_id,
+                    "correct": qr.correct,
+                    "expected": qr.expected,
+                    "predicted": qr.predicted,
+                    "question": qr.question_text,
+                    "raw_response": qr.raw_response,
+                    "category": qr.category,
+                    "time_s": round(qr.time_seconds, 3),
+                }
+                if request.external is not None:
+                    question_data.update({
+                        "status": qr.status,
+                        "finish_reason": qr.finish_reason,
+                        "reasoning_fields_present": qr.reasoning_fields_present,
+                        "reasoning_fields_nonempty": qr.reasoning_fields_nonempty,
+                        "prompt_tokens": qr.prompt_tokens,
+                        "completion_tokens": qr.completion_tokens,
+                        "error_message": qr.error_message,
+                    })
+                question_results.append(question_data)
+
             result_data = {
                 "model_id": request.model_id,
                 "external": request.external is not None,
@@ -558,20 +582,47 @@ async def run_accuracy_benchmark(
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),
-                "question_results": [
-                    {
-                        "id": qr.question_id,
-                        "correct": qr.correct,
-                        "expected": qr.expected,
-                        "predicted": qr.predicted,
-                        "question": qr.question_text,
-                        "raw_response": qr.raw_response,
-                        "category": qr.category,
-                        "time_s": round(qr.time_seconds, 3),
-                    }
-                    for qr in result.question_results
-                ],
+                "question_results": question_results,
             }
+            if request.external is not None:
+                status_counts = Counter(
+                    qr.status or "invalid_response" for qr in result.question_results
+                )
+                valid_responses = status_counts["correct"] + status_counts["wrong"]
+                total_questions = result.total_questions
+                result_data.update({
+                    "valid_response_count": valid_responses,
+                    "empty_content_count": status_counts["empty_content"],
+                    "truncated_count": status_counts["truncated"],
+                    "timeout_count": status_counts["timeout"],
+                    "http_error_count": status_counts["http_error"],
+                    "connection_error_count": status_counts["connection_error"],
+                    "invalid_response_count": status_counts["invalid_response"],
+                    "parse_error_count": status_counts["parse_error"],
+                    "wrong_count": status_counts["wrong"],
+                    "valid_response_rate": round(
+                        valid_responses / total_questions
+                        if total_questions > 0 else 0.0,
+                        4,
+                    ),
+                    "valid_answer_accuracy": round(
+                        result.correct_count / valid_responses
+                        if valid_responses > 0 else 0.0,
+                        4,
+                    ),
+                    "reliability_warning": any(
+                        status_counts[name] > 0
+                        for name in (
+                            "empty_content",
+                            "truncated",
+                            "timeout",
+                            "http_error",
+                            "connection_error",
+                            "invalid_response",
+                            "parse_error",
+                        )
+                    ),
+                })
             if result.category_scores:
                 result_data["category_scores"] = {
                     k: round(v, 4) for k, v in result.category_scores.items()

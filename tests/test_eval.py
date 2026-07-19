@@ -452,3 +452,123 @@ class TestEvalSingleSampling:
     async def test_max_tokens_always_benchmark_controlled(self):
         kwargs = await self._captured_chat_kwargs({"max_tokens": 5})
         assert kwargs["max_tokens"] != 5
+
+
+class TestExternalEvalDiagnostics:
+    @staticmethod
+    def _item():
+        return {
+            "question": "Which option is correct?",
+            "choices": ["one", "two", "three", "four"],
+            "answer": "A",
+            "subject": "test",
+        }
+
+    async def _run(self, output):
+        from unittest.mock import AsyncMock
+
+        from omlx.eval.cmmlu import CMMLUBenchmark
+
+        engine = MagicMock(is_external_api=True, model_type=None)
+        engine.chat = AsyncMock(return_value=output)
+        result = await CMMLUBenchmark().run(engine, [self._item()], batch_size=1)
+        return result, engine
+
+    @pytest.mark.parametrize(
+        ("text", "external_status", "expected_status", "correct"),
+        [
+            ("A", "ok", "correct", True),
+            ("B", "ok", "wrong", False),
+            ("no option", "ok", "parse_error", False),
+            ("", "timeout", "timeout", False),
+        ],
+    )
+    async def test_external_outcomes_are_classified(
+        self, text, external_status, expected_status, correct
+    ):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            text=text,
+            external_status=external_status,
+            finish_reason="stop",
+            reasoning_fields_present=(),
+            reasoning_fields_nonempty=(),
+            prompt_tokens=11,
+            completion_tokens=2,
+            error_message="timed out" if external_status == "timeout" else "",
+        )
+        result, _ = await self._run(output)
+        question = result.question_results[0]
+
+        assert question.status == expected_status
+        assert question.correct is correct
+        assert question.prompt_tokens == 11
+        assert question.completion_tokens == 2
+
+    async def test_external_output_does_not_trigger_local_thinking_retry(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            text="<think>hidden</think>A",
+            external_status="ok",
+            finish_reason="stop",
+            reasoning_fields_present=(),
+            reasoning_fields_nonempty=(),
+            prompt_tokens=11,
+            completion_tokens=2,
+            error_message="",
+        )
+        result, engine = await self._run(output)
+
+        assert result.thinking_used is False
+        assert engine.chat.await_count == 1
+
+    def test_missing_extracted_answer_is_parse_error(self):
+        from omlx.eval.cmmlu import CMMLUBenchmark
+
+        benchmark = CMMLUBenchmark()
+        benchmark.extract_answer = MagicMock(return_value=None)
+
+        predicted, correct, status = benchmark._classify_response(
+            "unparseable", self._item(), {"status": "ok"}
+        )
+
+        assert predicted == ""
+        assert correct is False
+        assert status == "parse_error"
+
+
+@pytest.mark.parametrize(
+    "benchmark_name",
+    ["humaneval", "livecodebench", "mbpp"],
+)
+async def test_code_benchmark_custom_runners_accept_diagnostic_result(
+    benchmark_name, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from omlx.eval.humaneval import HumanEvalBenchmark
+    from omlx.eval.livecodebench import LiveCodeBenchBenchmark
+    from omlx.eval.mbpp import MBPPBenchmark
+
+    benchmark_classes = {
+        "humaneval": HumanEvalBenchmark,
+        "livecodebench": LiveCodeBenchBenchmark,
+        "mbpp": MBPPBenchmark,
+    }
+    benchmark = benchmark_classes[benchmark_name]()
+    monkeypatch.setattr(
+        benchmark,
+        "format_prompt",
+        lambda item: [{"role": "user", "content": "write code"}],
+    )
+    monkeypatch.setattr(benchmark, "extract_answer", lambda response, item: "code")
+    monkeypatch.setattr(benchmark, "check_answer", lambda predicted, item: True)
+    engine = MagicMock(is_external_api=False, model_type=None)
+    engine.chat = AsyncMock(return_value=MagicMock(text="code"))
+
+    result = await benchmark.run(engine, [{"id": "one"}], batch_size=1)
+
+    assert result.correct_count == 1
+    assert result.question_results[0].status is None

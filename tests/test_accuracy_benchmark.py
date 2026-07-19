@@ -497,6 +497,77 @@ class TestExternalAccuracyRun:
         assert error_events
         mock_client.aclose.assert_awaited()
 
+    @pytest.mark.asyncio
+    async def test_external_result_separates_failures_from_wrong_answers(self):
+        questions = [
+            SimpleNamespace(
+                question_id=str(index),
+                correct=status == "correct",
+                expected="A",
+                predicted="A" if status == "correct" else "",
+                question_text="question",
+                raw_response="answer",
+                category="test",
+                time_seconds=0.1,
+                status=status,
+                finish_reason="stop",
+                reasoning_fields_present=[],
+                reasoning_fields_nonempty=[],
+                prompt_tokens=10,
+                completion_tokens=1,
+                error_message="timed out" if status == "timeout" else "",
+            )
+            for index, status in enumerate(
+                ["correct", "wrong", "parse_error", "timeout"]
+            )
+        ]
+        mock_result = MagicMock(
+            benchmark_name="mmlu",
+            accuracy=0.25,
+            total_questions=4,
+            correct_count=1,
+            time_seconds=0.4,
+            category_scores=None,
+            thinking_used=False,
+            question_results=questions,
+        )
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=mock_result)
+        mock_adapter = MagicMock()
+        mock_adapter.preflight = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.aclose = AsyncMock()
+        run = create_run(self._external_request())
+
+        with (
+            patch.dict(
+                "omlx.eval.BENCHMARKS",
+                {"mmlu": MagicMock(return_value=mock_evaluator)},
+                clear=True,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalAPIClient",
+                return_value=mock_client,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalChatAdapter",
+                return_value=mock_adapter,
+            ),
+        ):
+            await run_accuracy_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["valid_response_count"] == 2
+        assert result["valid_response_rate"] == 0.5
+        assert result["valid_answer_accuracy"] == 0.5
+        assert result["wrong_count"] == 1
+        assert result["parse_error_count"] == 1
+        assert result["timeout_count"] == 1
+        assert result["reliability_warning"] is True
+        assert result["question_results"][3]["status"] == "timeout"
+        reset_accumulated_results()
+
 
 class _StubResult:
     """Minimal stand-in for an eval BenchmarkResult."""

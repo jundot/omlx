@@ -239,9 +239,19 @@ class HumanEvalBenchmark(BaseBenchmark):
             gen_results = await asyncio.gather(*gen_tasks)
             gen_elapsed = time.time() - batch_time
 
-            for idx, item, response_text, prompt_text, _raw in sorted(gen_results, key=lambda x: x[0]):
-                code = self.extract_answer(response_text, item)
-                is_correct = self.check_answer(code, item)
+            for (
+                idx,
+                item,
+                response_text,
+                prompt_text,
+                _raw,
+                diagnostics,
+            ) in sorted(gen_results, key=lambda x: x[0]):
+                code, is_correct, question_status = self._classify_response(
+                    response_text, item, diagnostics
+                )
+                result_diagnostics = self._diagnostic_result_fields(diagnostics)
+                result_diagnostics["status"] = question_status
 
                 if is_correct:
                     correct += 1
@@ -256,6 +266,7 @@ class HumanEvalBenchmark(BaseBenchmark):
                         question_text=prompt_text,
                         raw_response=response_text,
                         category=self.get_category(item),
+                        **result_diagnostics,
                     )
                 )
 
