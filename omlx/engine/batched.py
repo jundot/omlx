@@ -622,6 +622,66 @@ class BatchedEngine(BaseEngine):
         )
         return len(self._tokenizer.encode(prompt))
 
+    @staticmethod
+    def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pop SpecPrefill per-request overrides out of ``kwargs``.
+
+        The engine's ``add_request`` accepts these as dedicated arguments, so
+        they must be forwarded explicitly rather than left in ``**kwargs``.
+        Shared by ``generate`` and ``stream_generate`` so both request paths
+        honour SpecPrefill overrides identically.
+        """
+        specprefill_kwargs: dict[str, Any] = {}
+        for key in (
+            "specprefill",
+            "specprefill_keep_pct",
+            "specprefill_threshold",
+            "specprefill_system_end",
+        ):
+            if kwargs.get(key) is not None:
+                specprefill_kwargs[key] = kwargs.pop(key)
+        return specprefill_kwargs
+
+    def _inject_specprefill_system_end(
+        self,
+        messages: list[dict[str, Any]],
+        prompt: str,
+        template_tools: Any,
+        ct_kwargs: dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Compute the system-prompt token boundary and add it to ``kwargs``.
+
+        SpecPrefill protects the system-prompt region from token dropping. The
+        boundary is derived by subtracting the non-system prompt token count
+        from the full prompt token count (system-only messages usually can't be
+        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
+        non-streaming path protects the system prompt identically. No-op unless
+        the model has SpecPrefill enabled and the request has a system prompt.
+        """
+        specprefill_model_enabled = (
+            getattr(self._model_settings, "specprefill_enabled", False)
+            if self._model_settings
+            else False
+        )
+        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+            return
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) < len(messages) and non_system:
+            try:
+                non_system_prompt = self._apply_chat_template(
+                    non_system, template_tools, chat_template_kwargs=ct_kwargs
+                )
+                full_tokens = len(self._tokenizer.encode(prompt))
+                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                system_end = full_tokens - non_system_tokens
+                if system_end > 0:
+                    kwargs["specprefill_system_end"] = system_end
+            except Exception as e:
+                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+
     async def generate(
         self,
         prompt: str,
@@ -675,9 +735,14 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        # SpecPrefill: forward per-request overrides to the engine, mirroring
+        # stream_generate so the non-streaming path is not silently ignored.
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            **specprefill_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -746,21 +811,7 @@ class BatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: pass per-request overrides to engine
-        specprefill_kwargs = {}
-        if kwargs.get("specprefill") is not None:
-            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
-        if kwargs.get("specprefill_keep_pct") is not None:
-            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop(
-                "specprefill_keep_pct"
-            )
-        if kwargs.get("specprefill_threshold") is not None:
-            specprefill_kwargs["specprefill_threshold"] = kwargs.pop(
-                "specprefill_threshold"
-            )
-        if kwargs.get("specprefill_system_end") is not None:
-            specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
-                "specprefill_system_end"
-            )
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -858,6 +909,11 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+        )
+
+        # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
+        self._inject_specprefill_system_end(
+            messages, prompt, template_tools, ct_kwargs, kwargs
         )
 
         return await self.generate(
@@ -1011,30 +1067,10 @@ class BatchedEngine(BaseEngine):
             is_partial=partial,
         )
 
-        # SpecPrefill: compute system prompt token count for protection.
-        # Can't template system-only messages (most templates require user),
-        # so compute by subtracting non-system from full prompt tokens.
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
+        # SpecPrefill: protect the system-prompt region from token dropping.
+        self._inject_specprefill_system_end(
+            messages, prompt, template_tools, ct_kwargs, kwargs
         )
-        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
-            non_system = [
-                m for m in messages if m.get("role") not in ("system", "developer")
-            ]
-            if len(non_system) < len(messages) and non_system:
-                try:
-                    non_system_prompt = self._apply_chat_template(
-                        non_system, template_tools, chat_template_kwargs=ct_kwargs
-                    )
-                    full_tokens = len(self._tokenizer.encode(prompt))
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                    system_end = full_tokens - non_system_tokens
-                    if system_end > 0:
-                        kwargs["specprefill_system_end"] = system_end
-                except Exception as e:
-                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,
