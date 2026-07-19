@@ -3956,6 +3956,29 @@ class TestMeasureSensitivityVlmMtp:
         assert mock_load.call_args.kwargs["trust_remote_code"] is True
 
 
+class TestCollectImatrixTextLoad:
+    def test_uses_compat_loader_without_trust_remote_code(self, monkeypatch):
+        """oQe calibration works with current mlx-lm, which removed this kwarg."""
+        from omlx import oq as oq_mod
+        import omlx.utils.model_loading as real_ml
+
+        mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
+        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", False)
+        monkeypatch.setattr(real_ml, "_has_mtp_heads", MagicMock(return_value=False))
+        monkeypatch.setattr(
+            real_ml, "_checkpoint_has_mtp_weights", MagicMock(return_value=False)
+        )
+        monkeypatch.setattr(real_ml, "maybe_apply_pre_load_patches", MagicMock())
+        monkeypatch.setattr(
+            oq_mod, "_collect_imatrix_from_model", MagicMock(return_value=({}, {}))
+        )
+
+        oq_mod._collect_imatrix("/fake/text", {}, trust_remote_code=True)
+
+        assert "trust_remote_code" not in mock_load.call_args.kwargs
+
+
 class TestMeasureSensitivityQuantizedVlm:
     def test_quantized_vlm_proxy_uses_vlm_loader(self, monkeypatch):
         from omlx import oq as oq_mod
