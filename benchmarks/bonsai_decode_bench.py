@@ -368,8 +368,108 @@ def run_bench(
 
 
 # ---------------------------------------------------------------------------
-# Output formatting
+# Dispatch overhead measurement
 # ---------------------------------------------------------------------------
+
+def measure_dispatch_overhead(
+    dtype: mx.Dtype, warmup: int, iters: int,
+) -> None:
+    """Measure Python overhead of the patched QuantizedLinear.__call__.
+
+    A Qwen3.6-27B decode step makes ~448 calls (64 blocks × 7 projections).
+    This test creates a single representative quantized layer and measures:
+    (a) patched call time, (b) raw C++ kernel time, (c) Python no-op overhead.
+    """
+    import math
+    from omlx.patches.bonsai_qmv import _is_symmetric, _is_t5_format
+
+    T = DTYPE_BYTES[dtype]
+
+    # Representative shape: o_proj (7168×8192) with group_size=128, bits=2
+    N, K, gs = 7168, 8192, 128
+    M = 1
+
+    # Create a QuantizedLinear with our construct patch active
+    from omlx.patches.bonsai_qmv import apply_bonsai_construct_patch
+    apply_bonsai_construct_patch()
+
+    from mlx.nn import QuantizedLinear
+    layer = QuantizedLinear(K, N, bias=False, group_size=gs, bits=2)
+    import numpy as np
+    import mlx.core as mx
+    layer.weight = mx.array(np.random.randint(0, 4, (N, K // 16), dtype=np.uint32))
+    layer.scales = mx.array(np.random.randn(N, K // gs).astype(np.float16).__abs__())
+    layer.biases = mx.array(-np.array(layer.scales, copy=True))
+
+    x = mx.array(np.random.randn(M, K).astype(np.float16))
+
+    # (a) Full patched call
+    def patched_call():
+        return layer(x)
+
+    mx.eval(patched_call())  # warmup compile
+    mx.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        mx.eval(patched_call())
+    mx.synchronize()
+    t_patched = (time.perf_counter() - t0) / iters
+
+    # (b) Raw C++ kernel (bypassing the patch)
+    from omlx.custom_kernels.bonsai.fast import bonsai_q2_affine_qmv_sym
+    sym = _is_symmetric(layer, 2)
+
+    w, sc, bi = layer.weight, layer.scales, layer.biases
+    if sym:
+        def raw_call():
+            return bonsai_q2_affine_qmv_sym(x, w, sc, bi)
+    else:
+        def raw_call():
+            return bonsai_q2_affine_qmv(x, w, sc, bi)
+
+    mx.eval(raw_call())
+    mx.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        mx.eval(raw_call())
+    mx.synchronize()
+    t_raw = (time.perf_counter() - t0) / iters
+
+    # (c) No-op Python overhead: just the branch/getattr logic, no kernel
+    sym_cache = getattr(layer, "_bonsai_sym_cache", None)
+    bits = layer.bits
+
+    def noop_dispatch():
+        nonlocal sym_cache
+        m = bits
+        if m != 2: return
+        s = getattr(layer, "_bonsai_sym_cache", None)
+        if s is None:
+            s = _is_symmetric(layer, bits)
+        _is_t5_format(layer)  # forces the uint8 check
+        # No kernel call — just the Python overhead
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        noop_dispatch()
+    t_noop = (time.perf_counter() - t0) / iters
+
+    # (d) Estimate per-token overhead for 448 calls
+    per_call_overhead = t_patched - t_raw
+    per_token_448 = per_call_overhead * 448 * 1e6
+
+    print(f"\n--- Dispatch Overhead (warmup={warmup}, iters={iters}, dtype={dtype}) ---")
+    print(f"  (a) Patched __call__ : {t_patched*1e6:8.1f} µs")
+    print(f"  (b) Raw C++ kernel   : {t_raw*1e6:8.1f} µs")
+    print(f"  (c) No-op dispatch   : {t_noop*1e6:8.1f} µs")
+    print(f"  overhead per call    : {per_call_overhead*1e6:8.1f} µs")
+    print(f"  overhead × 448 calls : {per_token_448:8.0f} µs = {per_token_448/1000:.1f} ms/tok")
+    print()
+    if per_token_448 > 2000:
+        print("  → CONFIRMED: dispatch overhead is dominant bottleneck.")
+        print("    Load-time specialization (#1 fix) would eliminate this per-call cost.")
+    else:
+        print("  → Dispatch overhead is minor; bandwidth/compute is the bottleneck.")
 
 def print_markdown(rows: list[Row]) -> None:
     print(f"\n{'layer':<12} {'N':>6} {'K':>6} {'M':>2} {'bits':>4} {'gs':>4} "
@@ -445,6 +545,8 @@ def parse_args():
                    help="print wide-vs-fast speedup summary after table")
     p.add_argument("--layer",  default=None,
                    help="restrict to a specific layer name (e.g. gate_proj)")
+    p.add_argument("--dispatch-overhead", action="store_true",
+                   help="measure Python dispatch overhead per call (confirms #1 bottleneck)")
     return p.parse_args()
 
 
@@ -469,6 +571,10 @@ def main():
         print(f"GPU arch: {arch}")
     print(f"dtype: {args.dtype}  warmup: {args.warmup}  iters: {args.iters}")
     print(f"M: {M_values}  bits: {bits_values}  group_size: {gs_values}")
+
+    if args.dispatch_overhead:
+        measure_dispatch_overhead(dtype, args.warmup, args.iters)
+        return
 
     rows = run_bench(M_values, bits_values, gs_values, dtype, args.warmup, args.iters, shapes)
 

@@ -116,7 +116,8 @@ std::string qmv_wide_kname(
 // MLX packs quantized weights as uint32 (32/bits values per element).
 // Exception: Bonsai 1-bit uses uint8 packing (8 values per byte).
 int derive_group_size(const array& w, const array& scales, int bits) {
-    int64_t pack = (bits == 1) ? 8 : (32 / bits);
+    // Bonsai 1-bit: 32 values per uint32 (vs stock MLX's 8 per uint8).
+    int64_t pack = (bits == 1) ? 32 : (32 / bits);
     int64_t K = static_cast<int64_t>(w.shape(-1)) * pack;
     int64_t n_groups = scales.shape(-1);
     if (n_groups <= 0) return 64;
@@ -372,7 +373,8 @@ class BonsaiQmvPrimitive : public Primitive {
         const auto& scales = inputs[2];
         const auto& biases = inputs[3];
 
-        int64_t pack = (bits_ == 1) ? 8 : (32 / bits_);
+        // Bonsai 1-bit: 32 values per uint32 (vs stock MLX's 8 values per uint8).
+        int64_t pack = (bits_ == 1) ? 32 : (32 / bits_);
         int64_t K = static_cast<int64_t>(w.shape(-1)) * pack;
         int N = static_cast<int>(w.shape(-2));
         int M = static_cast<int>(x.size()) / static_cast<int>(K);

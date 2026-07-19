@@ -889,21 +889,17 @@ class TestAttnScaleFold:
         )
 
     def test_fold_into_q_proj_scales_no_q_norm(self):
-        """Without q_norm, scale folds into q_proj.scales."""
+        """Without q_norm, _fold_one returns False (fallback removed per review)."""
         from omlx.patches.attn_scale_fold import _fold_one
         head_dim = 128
         mod = _make_attn_module_no_q_norm(head_dim=head_dim)
-        original_scale = float(mod.scale)
-        original_scales = np.array(mod.q_proj.scales.tolist())
 
         folded = _fold_one(mod, "self_attn")
 
-        assert folded is True
-        assert mod.scale == 1.0
-        new_scales = np.array(mod.q_proj.scales.tolist())
-        np.testing.assert_allclose(
-            new_scales, original_scales * original_scale, rtol=1e-3
-        )
+        # Fallback to q_proj.scales was removed — the gate in
+        # apply_post_load_transforms only fires when q_norm exists.
+        assert folded is False
+        assert mod.scale == head_dim ** -0.5  # unchanged
 
     def test_already_folded_is_noop(self):
         """Calling fold twice leaves module unchanged on second call."""

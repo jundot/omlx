@@ -1,15 +1,16 @@
 """Identity I-I: Row-constant fold — pre-multiply attention scale at load time.
 
-For any attention module with a `scale` attribute (head_dim**-0.5), the runtime
-`queries *= scale` multiply is eliminated by folding the constant into:
-  - q_norm.weight (architectures with per-head QK normalization, e.g. Qwen3.x)
-  - q_proj.scales (quantized, architectures without q_norm)
+For attention modules with both a `scale` attribute (head_dim**-0.5) and a
+`q_norm` sub-module (e.g. Qwen3.x per-head QK normalization), the runtime
+`queries *= scale` multiply is eliminated by folding the constant into
+q_norm.weight.
 
 After folding, module.scale is set to 1.0.  The attention forward already
 passes `scale=self.scale` to SDPA, so no other code changes are needed — the
 kernel receives scale=1.0 and the per-token elementwise multiply is gone.
 
-Applied once at model load time via apply_attn_scale_fold(model).
+Only called when the model has at least one q_norm attention module (gated in
+model_loading.py).  Applied once at model load time via apply_attn_scale_fold(model).
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def _fold_one(module: nn.Module, name: str) -> bool:
-    """Fold module.scale into q_norm.weight or q_proj.scales.
+    """Fold module.scale into q_norm.weight.
 
     Returns True if the fold was applied.
     """
@@ -32,7 +33,7 @@ def _fold_one(module: nn.Module, name: str) -> bool:
 
     scale = float(scale)
 
-    # Preferred: fold into q_norm.weight (Qwen3.x and similar architectures).
+    # Fold into q_norm.weight (Qwen3.x and similar architectures).
     # q_norm is applied after q_proj, so multiplying its learnable weight by
     # scale bakes in the constant without touching the quantized weights.
     q_norm = getattr(module, "q_norm", None)
@@ -46,20 +47,6 @@ def _fold_one(module: nn.Module, name: str) -> bool:
                 "I-I scale fold: %s — scale=%.6f → q_norm.weight", name, scale
             )
             return True
-
-    # Fallback: no q_norm — fold directly into q_proj quantized scales.
-    # Valid when scale is applied directly to the output of the projection
-    # (D_α Ŵ with all α_i = scale).
-    q_proj = getattr(module, "q_proj", None)
-    if isinstance(q_proj, nn.QuantizedLinear):
-        # Use object.__setattr__ to bypass Module bookkeeping on frozen layers.
-        object.__setattr__(q_proj, "scales", q_proj.scales * scale)
-        mx.eval(q_proj.scales)
-        module.scale = 1.0
-        logger.debug(
-            "I-I scale fold: %s — scale=%.6f → q_proj.scales", name, scale
-        )
-        return True
 
     return False
 

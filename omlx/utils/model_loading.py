@@ -231,6 +231,24 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # Bonsai 1-bit/2-bit construction patch: stock mlx-lm calls
+    # nn.quantize(model, bits=1) before our inference patches hook in,
+    # and mx.quantize(bits=1) is rejected at the C++ level.  Monkey-patch
+    # QuantizedLinear.__init__ to create uint32-packed weights directly
+    # in the 1-bit shape (K//32 values per uint32) instead of calling
+    # mx.quantize for bits=1.
+    if quant_bits in (1, 2):
+        try:
+            from ..patches.bonsai_qmv import apply_bonsai_construct_patch
+        except Exception as e:
+            logger.debug("bonsai construct patch import failed: %s", e)
+        else:
+            if apply_bonsai_construct_patch():
+                logger.info(
+                    "Bonsai 1-bit/2-bit construct patch applied for %s",
+                    model_name,
+                )
+
     model_type = config.get("model_type")
     if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -668,16 +686,47 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
-    # Identity I-I: row-constant fold — always applied when possible.
-    # Folds the attention softmax scale (head_dim**-0.5) into q_norm.weight
-    # (or q_proj.scales for models without q_norm), eliminating a per-token
-    # elementwise multiply and kernel dispatch. Safe for all model types;
-    # skips silently if no foldable modules are found.
+    # Identity I-I: row-constant fold — only applied when the model uses
+    # q_norm (per-head QK normalization).  The fallback path that wrote
+    # into q_proj.scales is removed: it broke non-Qwen architectures
+    # (Gemma RMSNorm with 1.0+weight, etc.) and bypassed Module dict
+    # bookkeeping via object.__setattr__.
     try:
         from ..patches.attn_scale_fold import apply_attn_scale_fold
-        apply_attn_scale_fold(model)
+
+        # Only fold if at least one attention module has q_norm
+        has_q_norm = any(
+            getattr(m, "q_norm", None) is not None and
+            getattr(m, "scale", None) not in (None, 1.0)
+            for _name, m in model.named_modules()
+        )
+        if has_q_norm:
+            apply_attn_scale_fold(model)
+        else:
+            logger.debug("attn_scale_fold skipped: no q_norm attention modules found")
     except Exception as e:
         logger.debug("attn_scale_fold skipped: %s", e)
+
+    # Load-time specialization: replace patched QuantizedLinear.__call__ with
+    # pre-bound closures.  Eliminates per-call Python dispatch overhead
+    # (~134 µs/call × 448 calls = 60 ms/tok on Qwen3.6-27B at decode).
+    try:
+        from ..patches.bonsai_qmv import specialize_quantized_linears
+        n = specialize_quantized_linears(model)
+        if n:
+            logger.info("Specialized %d QuantizedLinear layers", n)
+    except Exception as e:
+        logger.debug("QuantizedLinear specialization skipped: %s", e)
+
+    # QKV / gate-up weight fusion: concatenate per-block projection weights
+    # row-wise so one kernel call replaces three (Q,K,V) or two (gate,up).
+    try:
+        from ..patches.bonsai_qmv import fuse_attention_and_mlp_projections
+        fused = fuse_attention_and_mlp_projections(model)
+        if fused:
+            logger.info("Fused %d projection blocks", fused)
+    except Exception as e:
+        logger.debug("Projection fusion skipped: %s", e)
 
     if model_settings is None:
         return model
