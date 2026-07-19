@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,19 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=3600.0, write=120.0, pool=30.
 
 _ERROR_DETAIL_MAX_CHARS = 300
 
+# Provider-specific request JSON must not override fields owned by the
+# benchmark or authentication layer.
+PROTECTED_EXTRA_BODY_FIELDS = frozenset({
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "temperature",
+    "api_key",
+    "authorization",
+})
+
 
 class ExternalEndpointConfig(BaseModel):
     """Connection settings for an external OpenAI-compatible endpoint.
@@ -37,6 +50,7 @@ class ExternalEndpointConfig(BaseModel):
     base_url: str
     api_key: SecretStr = SecretStr("")
     model: str
+    extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("base_url")
     @classmethod
@@ -53,6 +67,25 @@ class ExternalEndpointConfig(BaseModel):
         if not v:
             raise ValueError("model must not be empty")
         return v
+
+    @field_validator("extra_body", mode="before")
+    @classmethod
+    def validate_extra_body(cls, v: Any) -> dict[str, Any]:
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError("extra_body must be a JSON object")
+        blocked = sorted(
+            str(key)
+            for key in v
+            if str(key).lower() in PROTECTED_EXTRA_BODY_FIELDS
+        )
+        if blocked:
+            raise ValueError(
+                "extra_body cannot override protected field(s): "
+                + ", ".join(blocked)
+            )
+        return dict(v)
 
 
 class ExternalEndpointError(Exception):
@@ -104,9 +137,9 @@ def _extract_error_detail(body: str) -> str:
 class ExternalAPIClient:
     """Async client for an external OpenAI-compatible /chat/completions API.
 
-    Only a whitelist of request fields is ever sent (model, messages,
-    max_tokens, stream, stream_options, temperature) because providers
-    commonly reject unknown parameters with HTTP 400.
+    Provider-specific fields may be supplied through config.extra_body. The
+    config validator prevents them from overriding benchmark-owned or
+    authentication-related fields.
     """
 
     def __init__(
@@ -149,6 +182,7 @@ class ExternalAPIClient:
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
+        body.update(self._config.extra_body)
         return body
 
     def _map_transport_error(self, exc: httpx.HTTPError) -> ExternalEndpointError:

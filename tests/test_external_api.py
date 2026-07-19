@@ -103,6 +103,38 @@ class TestExternalEndpointConfig:
         cfg = _config(api_key="")
         assert cfg.api_key.get_secret_value() == ""
 
+    def test_extra_body_defaults_to_empty_object(self):
+        cfg = _config()
+        assert cfg.extra_body == {}
+
+    def test_extra_body_accepts_provider_specific_fields(self):
+        extra = {"thinking": {"type": "disabled"}, "seed": 42}
+        cfg = _config(extra_body=extra)
+        assert cfg.extra_body == extra
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "model",
+            "messages",
+            "stream",
+            "stream_options",
+            "max_tokens",
+            "temperature",
+            "api_key",
+            "authorization",
+            "Authorization",
+        ],
+    )
+    def test_extra_body_rejects_protected_fields(self, field):
+        with pytest.raises(ValueError, match="protected field"):
+            _config(extra_body={field: "override"})
+
+    @pytest.mark.parametrize("value", [[], "value", 1, True])
+    def test_extra_body_requires_object(self, value):
+        with pytest.raises(ValueError, match="JSON object"):
+            _config(extra_body=value)
+
 
 # =============================================================================
 # Streaming chat completion
@@ -359,6 +391,29 @@ class TestChatCompletion:
         finally:
             await client.aclose()
         assert captured["auth"] is None
+
+    async def test_merges_provider_specific_extra_body(self):
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return _completion_response()
+
+        client = _client(
+            handler,
+            extra_body={"thinking": {"type": "disabled"}, "seed": 42},
+        )
+        try:
+            await client.chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=0.0,
+            )
+        finally:
+            await client.aclose()
+
+        assert captured["body"]["thinking"] == {"type": "disabled"}
+        assert captured["body"]["seed"] == 42
 
 
 # =============================================================================
