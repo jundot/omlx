@@ -11,6 +11,522 @@
         }
       }
     },
+    "appearance.row.alltime_activity" : {
+      "comment" : "Appearance row label for the ALL menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All Time Activity"
+          }
+        }
+      }
+    },
+    "appearance.row.alltime_activity.sub" : {
+      "comment" : "Appearance row sublabel for the ALL menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average speeds across all sessions (ALL)."
+          }
+        }
+      }
+    },
+    "appearance.row.average_activity" : {
+      "comment" : "Appearance row label for the AVG menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average Session Activity"
+          }
+        }
+      }
+    },
+    "appearance.row.average_activity.sub" : {
+      "comment" : "Appearance row sublabel for the AVG menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average speeds since the server started (AVG)."
+          }
+        }
+      }
+    },
+    "appearance.row.cpu_item" : {
+      "comment" : "Appearance row label for the CPU usage bar menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CPU"
+          }
+        }
+      }
+    },
+    "appearance.row.cpu_item.sub" : {
+      "comment" : "Appearance row sublabel for the CPU usage bar menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CPU usage as a vertical bar."
+          }
+        }
+      }
+    },
+    "appearance.row.gpu_item" : {
+      "comment" : "Appearance row label for the GPU usage bar menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU"
+          }
+        }
+      }
+    },
+    "appearance.row.gpu_item.sub" : {
+      "comment" : "Appearance row sublabel for the GPU usage bar menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU usage as a vertical bar."
+          }
+        }
+      }
+    },
+    "appearance.row.live_activity" : {
+      "comment" : "Appearance row label for the LIV menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Live Activity"
+          }
+        }
+      }
+    },
+    "appearance.row.live_activity.sub" : {
+      "comment" : "Appearance row sublabel for the LIV menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Current speeds across running requests (LIV)."
+          }
+        }
+      }
+    },
+    "appearance.row.memory_item" : {
+      "comment" : "Appearance row label for the memory usage bar menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Memory"
+          }
+        }
+      }
+    },
+    "appearance.row.memory_item.sub" : {
+      "comment" : "Appearance row sublabel for the memory usage bar menubar item toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Memory usage as a vertical bar (MEM)."
+          }
+        }
+      }
+    },
+    "appearance.row.refresh_interval" : {
+      "comment" : "Appearance row label for the menubar refresh cadence picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Refresh Interval"
+          }
+        }
+      }
+    },
+    "appearance.row.refresh_interval.sub" : {
+      "comment" : "Appearance row sublabel for the menubar refresh cadence picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How often menu bar items and their graphs update."
+          }
+        }
+      }
+    },
+    "appearance.row.show_dock_icon" : {
+      "comment" : "Appearance row label for the permanent Dock icon toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show Dock Icon"
+          }
+        }
+      }
+    },
+    "appearance.row.show_dock_icon.sub" : {
+      "comment" : "Appearance row sublabel for the permanent Dock icon toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep the Dock icon visible even when no window is open."
+          }
+        }
+      }
+    },
+    "appearance.section.general" : {
+      "comment" : "Appearance screen section header for the basic options",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "General"
+          }
+        }
+      }
+    },
+    "appearance.section.menubar_items" : {
+      "comment" : "Appearance screen section header for the metric item toggles",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Menu Bar Items"
+          }
+        }
+      }
+    },
+    "appearance.section.menubar_items.sub" : {
+      "comment" : "Appearance screen section subtitle explaining the metric items",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Each item shows prompt-processing and token-generation speed in the menu bar. Click one for details and a live graph."
+          }
+        }
+      }
+    },
+    "menubar.item.system_stats" : {
+      "comment" : "Menubar parent item opening the CPU/GPU/Memory submenu",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "System Stats"
+          }
+        }
+      }
+    },
+    "menubar.metric.activity" : {
+      "comment" : "Header above the throughput graphs in a menubar metric popover",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Activity"
+          }
+        }
+      }
+    },
+    "menubar.metric.dashboard" : {
+      "comment" : "Button in a menubar metric popover that opens the web dashboard",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dashboard"
+          }
+        }
+      }
+    },
+    "menubar.metric.live_unavailable" : {
+      "comment" : "Note in the LIV popover when live stats need admin authentication",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Set an API key to enable live activity"
+          }
+        }
+      }
+    },
+    "menubar.metric.server_off" : {
+      "comment" : "Note in a menubar metric popover while the server is not running",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server is off"
+          }
+        }
+      }
+    },
+    "menubar.metric.settings" : {
+      "comment" : "Button in a menubar metric popover that opens the Appearance settings pane",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings"
+          }
+        }
+      }
+    },
+    "menubar.metric.title.alltime" : {
+      "comment" : "Popover title for the all-time-average menubar item",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All Time"
+          }
+        }
+      }
+    },
+    "menubar.metric.title.average" : {
+      "comment" : "Popover title for the session-average menubar item",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average Session"
+          }
+        }
+      }
+    },
+    "menubar.metric.title.live" : {
+      "comment" : "Popover title for the live-throughput menubar item",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Live Activity"
+          }
+        }
+      }
+    },
+    "menubar.system.active" : {
+      "comment" : "Memory panel legend row for active memory",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Active"
+          }
+        }
+      }
+    },
+    "menubar.system.compressed" : {
+      "comment" : "Memory panel legend row for compressed memory",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Compressed"
+          }
+        }
+      }
+    },
+    "menubar.system.cpu_caption" : {
+      "comment" : "CPU panel caption under the usage bars",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E (amber) / P (blue) usage"
+          }
+        }
+      }
+    },
+    "menubar.system.e_cores" : {
+      "comment" : "CPU panel row label for efficiency-core usage",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E-cores"
+          }
+        }
+      }
+    },
+    "menubar.system.free" : {
+      "comment" : "Memory panel legend row for free memory",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Free"
+          }
+        }
+      }
+    },
+    "menubar.system.gpu_caption" : {
+      "comment" : "GPU panel caption under the usage bars",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU (green) / GPU mem (cyan)"
+          }
+        }
+      }
+    },
+    "menubar.system.gpu_memory" : {
+      "comment" : "GPU panel row label for accelerator in-use memory",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU memory"
+          }
+        }
+      }
+    },
+    "menubar.system.in_use" : {
+      "comment" : "GPU memory value; placeholder is a byte size like 2.60 GB",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ in use"
+          }
+        }
+      }
+    },
+    "menubar.system.load_avg" : {
+      "comment" : "CPU panel row label for the 1/5/15-minute load averages",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Load avg"
+          }
+        }
+      }
+    },
+    "menubar.system.memory_title" : {
+      "comment" : "Title of the Memory panel in the System Stats submenu",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Memory"
+          }
+        }
+      }
+    },
+    "menubar.system.p_cores" : {
+      "comment" : "CPU panel row label for performance-core usage",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "P-cores"
+          }
+        }
+      }
+    },
+    "menubar.system.thermal" : {
+      "comment" : "CPU panel row label for the system thermal state",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thermal"
+          }
+        }
+      }
+    },
+    "menubar.system.uptime" : {
+      "comment" : "CPU panel row label for system uptime",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uptime"
+          }
+        }
+      }
+    },
+    "menubar.system.wired" : {
+      "comment" : "Memory panel legend row for wired memory",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wired"
+          }
+        }
+      }
+    },
+    "sidebar.appearance" : {
+      "comment" : "Sidebar row label / navigation title for the Appearance section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Appearance"
+          }
+        }
+      }
+    },
     "—" : {
       "localizations" : {
         "ru" : {
@@ -4874,24 +5390,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Настройки…"
-          }
-        }
-      }
-    },
-    "menubar.item.show_live_activity_in_menu_bar" : {
-      "comment" : "Menubar item that toggles current request activity text beside the oMLX icon",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Show Live Activity in Menu Bar"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Показывать активность в строке меню"
           }
         }
       }

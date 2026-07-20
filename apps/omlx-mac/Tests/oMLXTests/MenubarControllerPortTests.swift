@@ -251,130 +251,6 @@ final class MenubarControllerPortTests: XCTestCase {
         XCTAssertEqual(activity.detail, "Laguna XS.2 · 321 tok/s · 47s left")
     }
 
-    func testMenuBarButtonTitleRequiresTheLiveActivityPreference() throws {
-        let data = try XCTUnwrap(
-            """
-            {
-              "active_models": {
-                "models": [
-                  {
-                    "id": "Laguna XS.2",
-                    "generating": [
-                      {
-                        "request_id": "generation-1",
-                        "generated_tokens": 128,
-                        "tokens_per_second": 42.1,
-                        "elapsed_seconds": 3.0
-                      }
-                    ]
-                  }
-                ]
-              }
-            }
-            """.data(using: .utf8)
-        )
-        let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
-        let activity = try XCTUnwrap(stats.liveActivity)
-
-        XCTAssertEqual(
-            MenubarController.menuBarButtonTitle(
-                serverState: .running(pid: 123),
-                liveActivity: activity,
-                isLiveActivityEnabled: false
-            ),
-            ""
-        )
-        XCTAssertEqual(
-            MenubarController.menuBarButtonTitle(
-                serverState: .stopped,
-                liveActivity: activity,
-                isLiveActivityEnabled: true
-            ),
-            ""
-        )
-        XCTAssertEqual(
-            MenubarController.menuBarButtonTitle(
-                serverState: .running(pid: 123),
-                liveActivity: activity,
-                isLiveActivityEnabled: true
-            ),
-            "GEN 42.1 tok/s"
-        )
-    }
-
-    func testLiveActivityUsesOneStatusItemWithBirdPinnedToItsRightEdge() {
-        let idlePresentation = MenubarController.menuBarStatusItemPresentation(
-            activityTitle: "",
-            activityTextWidth: 0,
-            statusBarThickness: 24
-        )
-        let activePresentation = MenubarController.menuBarStatusItemPresentation(
-            activityTitle: "PP 55% · 6k/11k",
-            activityTextWidth: 100,
-            statusBarThickness: 24
-        )
-
-        XCTAssertEqual(idlePresentation.itemLength, NSStatusItem.squareLength)
-        XCTAssertEqual(activePresentation.itemLength, 133)
-        XCTAssertEqual(idlePresentation.iconCenterTrailingOffset, 12)
-        XCTAssertEqual(activePresentation.iconCenterTrailingOffset, 12)
-        XCTAssertFalse(idlePresentation.reservesActivityLabelSpace)
-        XCTAssertTrue(activePresentation.reservesActivityLabelSpace)
-        XCTAssertEqual(activePresentation.activityTitle, "PP 55% · 6k/11k")
-        XCTAssertNil(idlePresentation.accessibilityValue)
-        XCTAssertEqual(activePresentation.accessibilityValue, "PP 55% · 6k/11k")
-    }
-
-    func testMenuBarToolTipRequiresVisibleLiveActivity() throws {
-        let data = try XCTUnwrap(
-            """
-            {
-              "active_models": {
-                "models": [
-                  {
-                    "id": "Laguna XS.2",
-                    "generating": [
-                      {
-                        "generated_tokens": 128,
-                        "tokens_per_second": 42.1,
-                        "elapsed_seconds": 3.0
-                      }
-                    ]
-                  }
-                ]
-              }
-            }
-            """.data(using: .utf8)
-        )
-        let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
-        let activity = try XCTUnwrap(stats.liveActivity)
-
-        XCTAssertEqual(
-            MenubarController.menuBarButtonToolTip(
-                serverState: .running(pid: 123),
-                liveActivity: activity,
-                isLiveActivityEnabled: true
-            ),
-            "Laguna XS.2 · 128 tok · 3s"
-        )
-        XCTAssertEqual(
-            MenubarController.menuBarButtonToolTip(
-                serverState: .running(pid: 123),
-                liveActivity: activity,
-                isLiveActivityEnabled: false
-            ),
-            "oMLX"
-        )
-        XCTAssertEqual(
-            MenubarController.menuBarButtonToolTip(
-                serverState: .stopped,
-                liveActivity: activity,
-                isLiveActivityEnabled: true
-            ),
-            "oMLX"
-        )
-    }
-
     func testLiveActivityShowsGenerationWhenNoPrefillIsActive() throws {
         let data = try XCTUnwrap(
             """
@@ -461,7 +337,7 @@ final class MenubarControllerPortTests: XCTestCase {
             apiKey: "test-key",
             sessionConfiguration: sessionConfiguration
         )
-        poller.setLiveActivityPollingEnabled(true)
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
 
         await poller.refreshOnce()
 
@@ -471,7 +347,11 @@ final class MenubarControllerPortTests: XCTestCase {
         XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 1)
     }
 
-    func testPollingOnlyAcceleratesAfterLiveActivityOptIn() {
+    func testPollingFollowsRefreshIntervalOnlyWhileAMetricItemIsEnabled() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: MenubarMetricPrefs.refreshIntervalKey)
+        defer { defaults.removeObject(forKey: MenubarMetricPrefs.refreshIntervalKey) }
+
         let poller = MenubarStatsPoller(
             baseURL: URL(string: "http://omlx.test")!,
             apiKey: "test-key"
@@ -479,10 +359,23 @@ final class MenubarControllerPortTests: XCTestCase {
 
         XCTAssertEqual(poller.currentPollingInterval, 2.0)
 
-        poller.setLiveActivityPollingEnabled(true)
-        XCTAssertEqual(poller.currentPollingInterval, 1.0)
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+        XCTAssertEqual(poller.currentPollingInterval, 1.0, "absent pref defaults to 1 s")
 
-        poller.setLiveActivityPollingEnabled(false)
+        defaults.set(0.5, forKey: MenubarMetricPrefs.refreshIntervalKey)
+        XCTAssertEqual(poller.currentPollingInterval, 0.5)
+
+        defaults.set(42.0, forKey: MenubarMetricPrefs.refreshIntervalKey)
+        XCTAssertEqual(poller.currentPollingInterval, 1.0, "out-of-set values clamp to 1 s")
+
+        poller.setEnabledMetrics(EnabledMetrics(live: false, average: true, alltime: false))
+        defaults.set(3.0, forKey: MenubarMetricPrefs.refreshIntervalKey)
+        XCTAssertEqual(
+            poller.currentPollingInterval, 3.0,
+            "any enabled metric item drives the configured cadence, not just live"
+        )
+
+        poller.setEnabledMetrics(EnabledMetrics(live: false, average: false, alltime: false))
         XCTAssertEqual(poller.currentPollingInterval, 2.0)
     }
 
@@ -494,7 +387,7 @@ final class MenubarControllerPortTests: XCTestCase {
             apiKey: nil,
             sessionConfiguration: sessionConfiguration
         )
-        poller.setLiveActivityPollingEnabled(true)
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
 
         await poller.refreshOnce()
 
@@ -510,7 +403,7 @@ final class MenubarControllerPortTests: XCTestCase {
             apiKey: "test-key",
             sessionConfiguration: sessionConfiguration
         )
-        poller.setLiveActivityPollingEnabled(true)
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
         let observer = NotificationCenter.default.addObserver(
             forName: MenubarStatsPoller.didUpdateNotification,
             object: poller,
@@ -534,7 +427,7 @@ final class MenubarControllerPortTests: XCTestCase {
             sessionConfiguration: sessionConfiguration
         )
 
-        poller.setLiveActivityPollingEnabled(false)
+        poller.setEnabledMetrics(EnabledMetrics(live: false, average: false, alltime: false))
         await poller.refreshOnce()
 
         XCTAssertEqual(poller.sessionStats?.totalPromptTokens, 99)
@@ -550,7 +443,7 @@ final class MenubarControllerPortTests: XCTestCase {
             apiKey: "test-key",
             sessionConfiguration: sessionConfiguration
         )
-        poller.setLiveActivityPollingEnabled(true)
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
 
         await poller.refreshOnce()
         XCTAssertNotNil(poller.liveStats?.liveActivity)
@@ -569,7 +462,7 @@ final class MenubarControllerPortTests: XCTestCase {
             apiKey: "test-key",
             sessionConfiguration: sessionConfiguration
         )
-        poller.setLiveActivityPollingEnabled(true)
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
 
         await poller.refreshOnce()
         XCTAssertNotNil(poller.liveStats?.liveActivity)
@@ -578,6 +471,36 @@ final class MenubarControllerPortTests: XCTestCase {
         await poller.refreshOnce()
 
         XCTAssertNil(poller.liveStats)
+    }
+
+    func testRefreshOncePostsExactlyOneNotificationWhenServerGoesAway() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+        let observer = NotificationCenter.default.addObserver(
+            forName: MenubarStatsPoller.didUpdateNotification,
+            object: poller,
+            queue: nil
+        ) { _ in
+            MenubarStatsURLProtocol.recordUpdateNotification()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 1)
+
+        // First failing tick after a success: one "server went away" repaint…
+        MenubarStatsURLProtocol.setPublicStatusResponseStatusCode(500)
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 2)
+
+        // …then silence while the server stays down (no per-tick spam).
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 2)
     }
 
     // MARK: - displayPort

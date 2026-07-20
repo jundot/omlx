@@ -224,16 +224,21 @@ final class MenubarStatsPoller {
     private let baseURL: URL
     private let apiKey: String?
     private let idleInterval: TimeInterval
-    private let liveActivityInterval: TimeInterval
     private let session: URLSession
     private var task: Task<Void, Never>?
-    /// Number of ticks between all-time fetches. Current request activity
-    /// needs steady refresh; all-time stats only show in the "All-Time"
-    /// submenu, so polling them at the same rate burns server CPU for no UX
-    /// benefit. At the one-second live interval this fetches every 30 seconds.
-    private let alltimeRefreshInterval: TimeInterval = 30
+    /// Seconds between all-time fetches. All-time averages only change when a
+    /// request completes and the endpoint is heavyweight (it also builds
+    /// active_models/engines/runtime_cache), so it is never polled at the
+    /// user-facing refresh interval: 5 s keeps an enabled ALL menubar item
+    /// feeling live, 30 s is plenty for the Serving Stats submenu.
+    private var alltimeRefreshInterval: TimeInterval {
+        enabledMetrics.alltime ? 5 : 30
+    }
     private var tickCount = 0
-    private var isLiveActivityPollingEnabled = false
+    private(set) var enabledMetrics = EnabledMetrics(
+        live: false, average: false, alltime: false
+    )
+    private(set) var lastTickWasSuccess = false
 
     private(set) var sessionStats: Stats?
     private(set) var liveStats: Stats?
@@ -244,13 +249,11 @@ final class MenubarStatsPoller {
         baseURL: URL,
         apiKey: String?,
         interval: TimeInterval = 2.0,
-        liveActivityInterval: TimeInterval = 1.0,
         sessionConfiguration: URLSessionConfiguration? = nil
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.idleInterval = interval
-        self.liveActivityInterval = liveActivityInterval
 
         let cfg = sessionConfiguration ?? URLSessionConfiguration.default
         // `HTTPCookieStorage()` returns a detached instance that never
@@ -284,19 +287,30 @@ final class MenubarStatsPoller {
         task = nil
     }
 
-    func setLiveActivityPollingEnabled(_ isEnabled: Bool) {
-        guard isLiveActivityPollingEnabled != isEnabled else {
+    func setEnabledMetrics(_ metrics: EnabledMetrics) {
+        guard enabledMetrics != metrics else {
             return
         }
 
-        isLiveActivityPollingEnabled = isEnabled
-        if !isEnabled {
+        let liveTurnedOff = enabledMetrics.live && !metrics.live
+        let alltimeTurnedOn = !enabledMetrics.alltime && metrics.alltime
+        enabledMetrics = metrics
+        if liveTurnedOff {
             clearLiveStats()
+        }
+        if alltimeTurnedOn {
+            // Force an all-time fetch on the next tick so a freshly enabled
+            // ALL item doesn't sit on "–" for up to a full cadence period.
+            tickCount = 0
         }
     }
 
+    /// Any enabled menubar metric item polls at the user-configured refresh
+    /// interval (read live from UserDefaults so setting changes apply on the
+    /// next loop pass); otherwise the idle 2 s cadence keeps the Serving
+    /// Stats submenu fresh at minimal cost.
     var currentPollingInterval: TimeInterval {
-        isLiveActivityPollingEnabled ? liveActivityInterval : idleInterval
+        enabledMetrics.any ? MenubarMetricPrefs.refreshInterval : idleInterval
     }
 
     deinit {
@@ -317,14 +331,14 @@ final class MenubarStatsPoller {
             let s = try await fetchPublicStatus()
             self.sessionStats = s
             self.lastStatusSuccessAt = Date()
-            if isLiveActivityPollingEnabled {
+            if enabledMetrics.live {
                 do {
                     let live = try await fetchAdminActivity()
-                    if isLiveActivityPollingEnabled {
+                    if enabledMetrics.live {
                         self.liveStats = live
                     }
                 } catch {
-                    if isLiveActivityPollingEnabled {
+                    if enabledMetrics.live {
                         clearLiveStats(shouldPostUpdate: false)
                     }
                 }
@@ -333,13 +347,23 @@ final class MenubarStatsPoller {
                let alltime = try? await fetchAdminStats(scope: "alltime") {
                 self.alltimeStats = alltime
             }
+            lastTickWasSuccess = true
             NotificationCenter.default.post(
                 name: Self.didUpdateNotification, object: self
             )
         } catch {
             // Suppress: server may be transitioning, paused, or 401-pending.
             // Next tick retries; we log only the once-per-tick failure mode.
-            clearLiveStats()
+            let wasSuccess = lastTickWasSuccess
+            lastTickWasSuccess = false
+            clearLiveStats(shouldPostUpdate: false)
+            if wasSuccess {
+                // Exactly one "server went away" repaint for the menubar
+                // metric items, instead of silence or per-tick spam.
+                NotificationCenter.default.post(
+                    name: Self.didUpdateNotification, object: self
+                )
+            }
         }
     }
 

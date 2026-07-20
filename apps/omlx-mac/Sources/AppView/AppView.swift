@@ -98,6 +98,7 @@ struct AppView: View {
     private func screen(for section: AppSection) -> some View {
         switch section {
         case .server:       ServerScreen()
+        case .appearance:   AppearanceScreen()
         case .network:      NetworkScreen()
         case .performance:  PerformanceScreen()
         case .status:       StatusScreen()
@@ -441,6 +442,7 @@ private struct SettingsSidebar: View {
         List(selection: $selection) {
             Section {
                 SidebarRow(section: .status)
+                SidebarRow(section: .appearance)
                 SidebarRow(section: .server)
                 SidebarRow(section: .network)
                 SidebarRow(section: .performance)

@@ -55,6 +55,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the user can click it to bring the window back.
     private var dropDockIconOnNextClose: Bool = false
 
+    /// Appearance → "Show Dock Icon". While true, every `.accessory` drop is
+    /// suppressed so the Dock icon stays up with no window open.
+    private var dockIconAlwaysVisible: Bool {
+        MenubarMetricPrefs.showDockIcon
+    }
+
+    /// Last value of the pref that was acted on, so the chatty
+    /// UserDefaults notification only triggers policy work on real flips.
+    private var lastAppliedDockIconPref: Bool?
+
     func requestQuit() {
         explicitQuitRequested = true
         NSApp.terminate(nil)
@@ -73,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // If close() was vetoed and only orderOut hid the window,
         // willCloseNotification didn't fire — drop policy explicitly.
         let stillVisible = NSApp.windows.contains { $0.styleMask.contains(.titled) && $0.isVisible }
-        if !stillVisible {
+        if !stillVisible, !dockIconAlwaysVisible {
             NSApp.setActivationPolicy(.accessory)
         }
         dropDockIconOnNextClose = false
@@ -127,6 +137,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installWindowObservers()
+        // Seed without applying: launch flow (accessory flip / welcome)
+        // owns the initial policy; only later real flips act.
+        lastAppliedDockIconPref = dockIconAlwaysVisible
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(defaultsDidChange(_:)),
+            name: UserDefaults.didChangeNotification,
+            object: UserDefaults.standard
+        )
         services.updates.setTerminateForUpdate { [weak self] in
             if let self {
                 self.requestQuit()
@@ -225,8 +244,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.presentAppView()
             },
             openAppView: { [weak self] in self?.presentAppView() },
+            openAppearanceSettings: { [weak self] in
+                guard let self else { return }
+                self.services.requestedSection = .appearance
+                self.presentAppView()
+            },
             requestQuit:  { [weak self] in self?.requestQuit() }
         )
+    }
+
+    /// UserDefaults writes can come from any thread; hop before touching
+    /// the activation policy.
+    @objc nonisolated private func defaultsDidChange(_ note: Notification) {
+        Task { @MainActor in
+            self.applyDockIconPreference()
+        }
+    }
+
+    /// Applies a "Show Dock Icon" flip immediately: ON shows the icon right
+    /// away; OFF returns to menubar-only unless a window is currently open
+    /// (then the regular auto rule takes over on its next close).
+    private func applyDockIconPreference() {
+        let pref = dockIconAlwaysVisible
+        guard pref != lastAppliedDockIconPref else { return }
+        lastAppliedDockIconPref = pref
+
+        if pref {
+            if NSApp.activationPolicy() != .regular {
+                NSApp.setActivationPolicy(.regular)
+            }
+            return
+        }
+        let anyVisible = NSApp.windows.contains { $0.isVisible && isAppOwnedWindow($0) }
+        if !anyVisible, NSApp.activationPolicy() != .accessory {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     private func bootstrapServer(config: AppConfig) {
@@ -272,7 +324,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Defer the policy flip so the status item has time to register
         // with WindowServer before we hide the Dock icon (mirrors
         // switchToAccessoryPolicy_ in app.py:324-327).
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard self?.dockIconAlwaysVisible != true else { return }
             NSApp.setActivationPolicy(.accessory)
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -332,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Dock Quit / Welcome wizard finish). Red-button close keeps the
             // Dock icon up so clicking it can re-open the window via
             // applicationShouldHandleReopen.
-            if !stillVisible, shouldDropDockIcon {
+            if !stillVisible, shouldDropDockIcon, !self.dockIconAlwaysVisible {
                 NSApp.setActivationPolicy(.accessory)
             }
         }
