@@ -6790,9 +6790,33 @@ model and sampling defaults are managed via the admin page.
     if args.mcp_config:
         os.environ["OMLX_MCP_CONFIG"] = args.mcp_config
 
+    # Load settings and hand them to init_server the way the omlx CLI
+    # does. The admin page resolves settings through
+    # _server_state.global_settings, so booting without them leaves
+    # _get_global_settings() returning None and the initial API-key
+    # setup form crashing with a 500 (#2282). Passing api_key keeps the
+    # two entry points enforcing the same auth. Scheduler/cache wiring
+    # stays CLI-only on purpose; this entry point remains minimal.
+    from .settings import init_settings
+
+    settings = init_settings()
+    settings.ensure_directories()
+
+    # Match the cli.py launcher: keep freed GPU buffers in the pool so
+    # allocator::free() never releases a buffer the GPU may still be
+    # using (kernel panics on M4 otherwise; see cli.py and issue #300).
+    # EnginePool eviction also assumes this cache limit is in place.
+    import mlx.core as mx
+
+    total_mem = mx.device_info().get("memory_size", 0)
+    if total_mem > 0:
+        mx.set_cache_limit(total_mem)
+
     # Initialize server
     init_server(
         model_dirs=args.model_dir,
+        api_key=settings.auth.api_key,
+        global_settings=settings,
     )
 
     # Start server
@@ -6802,4 +6826,15 @@ model and sampling defaults are managed via the admin page.
 
 
 if __name__ == "__main__":
+    # ``python -m omlx.server`` executes this file as the ``__main__``
+    # module, but the admin routes import it back as ``omlx.server`` at
+    # request time. Without this alias that import executes the module a
+    # SECOND time, and the fresh copy's module-level set_admin_getters()
+    # call repoints the admin state getters at a server state that
+    # init_server() never touched, so the settings main() wires in are
+    # invisible to /admin (#2282). Alias the canonical name to this
+    # instance so every later import resolves to the running server.
+    import sys
+
+    sys.modules.setdefault("omlx.server", sys.modules[__name__])
     main()
