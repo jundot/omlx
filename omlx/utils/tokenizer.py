@@ -399,6 +399,24 @@ def _is_laguna_model(model_name: str) -> bool:
     return config is not None and config.get("model_type") == "laguna"
 
 
+def _is_mistral_common_model(model_name: str) -> bool:
+    """True for local model dirs transformers would route to MistralCommonBackend.
+
+    transformers keys that routing on ``tekken.json`` (its
+    ``_has_tekken_tokenizer_file`` check), so mirror the same trigger here.
+    The ``tokenizer.json`` requirement guards the fallback target: audio-only
+    mistral exports (Voxtral) ship ``tekken.json`` without an HF-native
+    ``tokenizer.json``, and for those there is no TokenizersBackend to select.
+    """
+    try:
+        model_path = Path(model_name)
+        return (model_path / "tekken.json").is_file() and (
+            model_path / "tokenizer.json"
+        ).is_file()
+    except OSError:
+        return False
+
+
 def get_tokenizer_config(
     model_name: str,
     trust_remote_code: bool = False,
@@ -437,6 +455,25 @@ def get_tokenizer_config(
         logger.debug(
             "Laguna detected: enabling the Mistral tokenizer regex fix and "
             "the laguna tool parser"
+        )
+
+    if _is_mistral_common_model(model_name):
+        # MistralCommonBackend renders chat templates whose output cannot be
+        # re-encoded faithfully: encoding the rendered string turns control
+        # tokens ([INST], [AVAILABLE_TOOLS], [TOOL_CALLS], ...) into literal
+        # text tokens, corrupting every prompt built through the
+        # render-then-encode pipeline (empty replies / prompt echo / dead tool
+        # calling on Devstral 2 and Mistral Small). Passing fix_mistral_regex
+        # makes AutoTokenizer select the HF-native TokenizersBackend instead —
+        # honoring the backend the repo itself declares — and enables the
+        # Tekken pre-tokenizer regex fix where transformers' own config
+        # detection applies. AutoTokenizer's routing
+        # gate for this kwarg shipped in transformers 5.12.1 (the pyproject
+        # floor); older 5.x swallows it and keeps the broken backend.
+        config.setdefault("fix_mistral_regex", True)
+        logger.debug(
+            "mistral-common model detected: forcing HF-native tokenizer "
+            "backend via fix_mistral_regex"
         )
 
     return config

@@ -500,3 +500,58 @@ class TestApplyQwen3Fix:
         assert result["use_fast"] is True
         assert result["padding_side"] == "left"
         assert result["eos_token"] == "<|im_end|>"
+
+
+class TestMistralCommonTokenizerConfig:
+    """get_tokenizer_config forces the HF-native backend for mistral-common repos.
+
+    transformers routes repos that ship tekken.json (Devstral 2 / Mistral
+    Small Tekken exports) to MistralCommonBackend, whose rendered chat
+    template cannot be re-encoded faithfully — control tokens become literal
+    text and every prompt built via render-then-encode is corrupted. Passing
+    fix_mistral_regex selects TokenizersBackend instead (gate shipped in
+    transformers 5.12.1, the pyproject floor).
+    """
+
+    def _make_mistral_repo(self, tmp_path):
+        _write_json(tmp_path / "tekken.json", {"version": "v13"})
+        _write_json(tmp_path / "tokenizer.json", {"version": "1.0"})
+        return tmp_path
+
+    def test_mistral_common_repo_gets_fix_mistral_regex(self, tmp_path):
+        repo = self._make_mistral_repo(tmp_path)
+        config = get_tokenizer_config(str(repo))
+        assert config["fix_mistral_regex"] is True
+
+    def test_symlinked_repo_detected(self, tmp_path):
+        """Served model dirs are frequently symlinks; is_file() must follow."""
+        real = tmp_path / "real"
+        real.mkdir()
+        self._make_mistral_repo(real)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        config = get_tokenizer_config(str(link))
+        assert config["fix_mistral_regex"] is True
+
+    def test_plain_repo_without_tekken_json_untouched(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"version": "1.0"})
+        config = get_tokenizer_config(str(tmp_path))
+        assert "fix_mistral_regex" not in config
+
+    def test_audio_only_export_without_tokenizer_json_untouched(self, tmp_path):
+        """Voxtral-shaped exports ship tekken.json with no HF-native
+        tokenizer.json; there is no TokenizersBackend to select — do not
+        inject the kwarg."""
+        _write_json(tmp_path / "tekken.json", {"version": "v13"})
+        config = get_tokenizer_config(str(tmp_path))
+        assert "fix_mistral_regex" not in config
+
+    def test_hf_repo_id_untouched(self):
+        """Remote repo ids are not local paths; detection stays conservative."""
+        config = get_tokenizer_config("mlx-community/Devstral-Small-2-24B-4bit")
+        assert "fix_mistral_regex" not in config
+
+    def test_other_family_fixes_unaffected(self, tmp_path):
+        repo = self._make_mistral_repo(tmp_path)
+        config = get_tokenizer_config(str(repo))
+        assert "eos_token" not in config
