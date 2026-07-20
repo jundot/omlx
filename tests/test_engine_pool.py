@@ -1408,6 +1408,98 @@ class TestEnginePoolEviction:
                 await pool.get_engine("model-b")
 
 
+class TestGuardOffBestEffortAdmission:
+    """#2290: model-swap eviction must survive disabling the memory guard.
+
+    With the guard off `_get_final_ceiling` reads 0; the pool falls back
+    to `_get_admission_ceiling` (enforcer static ceiling) for LRU
+    eviction, but never refuses a load under it.
+    """
+
+    @pytest.fixture
+    def guard_off_pool(self, small_mock_model_dir, monkeypatch):
+        pool = _make_pool(ceiling=None)  # guard off: final ceiling reads 0
+        pool._get_admission_ceiling = lambda: 2500
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_swap_evicts_lru_with_guard_off(self, guard_off_pool):
+        """Loading a second model evicts the LRU one despite guard off."""
+        pool = guard_off_pool
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+        mock_engine_a.has_active_requests.return_value = False
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests.return_value = False
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return mock_engine_a if "model-a" in name else mock_engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        mock_engine_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_nothing_evictable_admits_over_ceiling(
+        self, guard_off_pool, caplog
+    ):
+        """Guard off + nothing to evict: warn and load anyway, never raise."""
+        pool = guard_off_pool
+        pool._entries["model-a"].is_pinned = True
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+                await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        assert any("memory guard disabled" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_admission_callback_admits_unconditionally(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """Standalone pools (no enforcer wired) keep admitting everything."""
+        pool = _make_pool(ceiling=None)
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+
 class TestEnginePoolPrefillEviction:
     """Tests for request-time idle LRU eviction before prefill throttling."""
 
@@ -2394,6 +2486,35 @@ class TestEnginePoolInUseLease:
         assert entry.in_use == 0
         # Unknown model id is a harmless no-op.
         await pool.release_engine("nope")
+
+    @pytest.mark.asyncio
+    async def test_release_engine_survives_caller_cancellation_while_lock_waits(self):
+        """A cancelled caller must not strand a lease behind the pool lock."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        pool._entries = {"leased": entry}
+
+        await pool._lock.acquire()
+        caller = asyncio.create_task(pool.release_engine("leased"))
+        try:
+            await asyncio.sleep(0)
+            assert len(pool._lease_release_tasks) == 1
+
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+            assert entry.in_use == 1
+            assert len(pool._lease_release_tasks) == 1
+        finally:
+            pool._lock.release()
+
+        await pool._drain_lease_release_tasks()
+
+        assert entry.in_use == 0
+        assert pool._lease_release_tasks == set()
+        assert pool._find_lru_victim() == "leased"
 
     @pytest.mark.asyncio
     async def test_release_engine_unloads_pending_after_lease_drains(self):

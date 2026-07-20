@@ -109,5 +109,11 @@ nanobind_add_module(
 target_link_libraries(_ext PRIVATE omlx_minimax_m3_kernel_ops)
 
 if(BUILD_SHARED_LIBS)
-  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path)
+  # @loader_path resolves the sibling kernel_ops dylib. The second entry
+  # resolves the mlx wheel's libmlx.dylib from the installed site-packages
+  # layout (omlx/custom_kernels/<pkg> -> site-packages -> mlx/lib); without
+  # it the only libmlx rpath is the link-time absolute path into the build
+  # env, which is dead after install (issue #2233).
+  target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path
+                      -Wl,-rpath,@loader_path/../../../mlx/lib)
 endif()

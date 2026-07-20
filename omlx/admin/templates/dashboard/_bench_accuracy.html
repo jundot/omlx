@@ -132,6 +132,16 @@
                                                        placeholder="gpt-4o-mini"
                                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                             </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('acc_bench.config.external_extra_body') }}</label>
+                                                <textarea x-model="accExternalExtraBody"
+                                                          @input="accError = ''"
+                                                          rows="4"
+                                                          spellcheck="false"
+                                                          placeholder='{"thinking":{"type":"disabled"}}'
+                                                          class="w-full max-w-md px-3 py-2 text-sm font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50 resize-y"></textarea>
+                                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.external_extra_body_hint') }}</p>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>

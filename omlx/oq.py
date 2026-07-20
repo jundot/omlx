@@ -4706,6 +4706,10 @@ def quantize_oq_streaming(
 
 _SENS_NUM_SAMPLES = 128
 _SENS_SEQ_LENGTH = 256
+# Calibration subsampling uses a fixed key so repeated quants of the same
+# source select the same samples (#2293). Keyed draws leave the global RNG
+# stream untouched.
+_CALIB_SAMPLE_SEED = 0
 _OQE_CALIB_DATASET = "oqe_code_multilingual"
 _OQE_IMATRIX_FORMAT = "omlx-oqe-imatrix-cache"
 _OQE_MAX_SAMPLE_MULTIPLIER = 8
@@ -4878,7 +4882,9 @@ def _load_builtin_calibration(
     tokens = tokens[:usable].reshape(-1, seq_length)
 
     if num_samples > 0 and tokens.shape[0] > num_samples:
-        indices = mx.random.permutation(tokens.shape[0])[:num_samples]
+        indices = mx.random.permutation(
+            tokens.shape[0], key=mx.random.key(_CALIB_SAMPLE_SEED)
+        )[:num_samples]
         tokens = tokens[indices]
 
     logger.info(f"Calibration: {tokens.shape[0]} samples x {seq_length} tokens")
@@ -4974,7 +4980,9 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
 
     n_available = tokens.shape[0]
     if num_samples > 0 and n_available > num_samples:
-        indices = mx.random.permutation(n_available)[:num_samples]
+        indices = mx.random.permutation(
+            n_available, key=mx.random.key(_CALIB_SAMPLE_SEED)
+        )[:num_samples]
         tokens = tokens[indices]
 
     logger.info(

@@ -537,6 +537,8 @@
             accSamplingProfile: 'deterministic',
             accAdvancedOptionsOpen: false,
             accExternalEnabled: false,
+            // Provider-specific JSON is intentionally session-only.
+            accExternalExtraBody: '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -2827,6 +2829,43 @@
                 };
             },
 
+            parseAccuracyExtraBody() {
+                const raw = this.accExternalExtraBody.trim();
+                if (!raw) return {};
+
+                let value;
+                try {
+                    value = JSON.parse(raw);
+                } catch (_) {
+                    throw new Error(window.t('js.error.external_extra_body_invalid_json'));
+                }
+                if (value === null || Array.isArray(value) || typeof value !== 'object') {
+                    throw new Error(window.t('js.error.external_extra_body_object_required'));
+                }
+
+                const protectedFields = new Set([
+                    'model', 'messages', 'stream', 'stream_options',
+                    'max_tokens', 'temperature', 'api_key', 'authorization',
+                ]);
+                const blocked = Object.keys(value).filter(
+                    key => protectedFields.has(key.toLowerCase())
+                );
+                if (blocked.length > 0) {
+                    throw new Error(
+                        window.t('js.error.external_extra_body_protected')
+                            .replace('{fields}', blocked.sort().join(', '))
+                    );
+                }
+                return value;
+            },
+
+            accuracyExternalRequestBody() {
+                const body = this.externalRequestBody();
+                const extraBody = this.parseAccuracyExtraBody();
+                if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                return body;
+            },
+
             // Benchmark functions
             async startBenchmark() {
                 if (this.benchExternalEnabled) {
@@ -3305,9 +3344,16 @@
             },
 
             async addToAccQueue() {
+                let externalRequest = null;
                 if (this.accExternalEnabled) {
                     if (!this.externalConfigValid()) {
                         this.accError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                    try {
+                        externalRequest = this.accuracyExternalRequestBody();
+                    } catch (err) {
+                        this.accError = err.message;
                         return;
                     }
                 } else if (!this.accModelId) {
@@ -3332,7 +3378,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
-                            external: this.accExternalEnabled ? this.externalRequestBody() : null,
+                            external: externalRequest,
                         }),
                     });
                     if (!resp.ok) {

@@ -660,6 +660,29 @@ class ProcessMemoryEnforcer:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
 
+    def get_admission_ceiling(self) -> int:
+        """Best-effort pre-load ceiling that survives disabling the guard.
+
+        ``get_final_ceiling()`` returns 0 when the prefill memory guard is
+        off, which used to disable engine-pool pre-load eviction entirely:
+        loading a second model would overcommit physical memory and thrash
+        the machine instead of evicting the LRU model (#2290). This
+        accessor keeps load-time eviction working independently of the
+        guard toggle by falling back to the static ceiling (total RAM
+        minus the tier reserve) when the guard is disabled.
+
+        The Metal cap and the dynamic (vm_stat) ceiling are deliberately
+        excluded from the fallback: with the guard off nothing is wired,
+        allocations beyond Apple's recommended working set stay pageable,
+        and workloads legitimately run above that cap. The engine pool
+        treats this fallback as best-effort — it evicts idle LRU models to
+        fit under it but never refuses a load, preserving the unguarded
+        "no hard limits" semantics.
+        """
+        if self._prefill_memory_guard:
+            return self._get_hard_limit_bytes()
+        return self._get_static_ceiling()
+
     def _get_abort_limit_bytes(self) -> int:
         """Stable physical cap used to ABORT an in-flight prefill.
 

@@ -139,6 +139,21 @@ class Omlx < Formula
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
 
+  # Both fixups below must run in post_install rather than install because
+  # Homebrew's post-install "Cleaning" step rewrites Mach-O install names
+  # and deletes every dist-info/RECORD file in the keg as part of its
+  # relocation pass. Anything patched inside `def install` is either wiped
+  # or invalidated before the user sees it.
+  def post_install
+    return if build.without?("grammar") && build.without?("custom-kernel")
+
+    python = libexec/"bin/python"
+    site = Utils.safe_popen_read(python, "-c",
+                                 "import site; print(site.getsitepackages()[0])").chomp
+    patch_xgrammar(python, site) if build.with?("grammar")
+    fix_custom_kernel_rpaths(python, site) if build.with?("custom-kernel")
+  end
+
   # Patch the macOS arm64 xgrammar wheel so its native binding loads.
   # The 0.1.32+ wheel ships libxgrammar_bindings.dylib with
   # @rpath/libtvm_ffi.dylib but no LC_RPATH pointing at where tvm_ffi
@@ -148,21 +163,9 @@ class Omlx < Formula
   # `import xgrammar`, which crashes /admin/api/grammar/parsers and
   # hides the Reasoning Parser dropdown. Tracking upstream:
   # jundot/omlx#1005.
-  #
-  # Runs in post_install rather than install because Homebrew's
-  # post-install "Cleaning" step deletes every dist-info/RECORD file
-  # in the keg as part of its relocation pass (RECORD hashes become
-  # invalid once brew rewrites Mach-O install names). Anything we
-  # write to RECORD inside `def install` is wiped before the user
-  # sees it.
-  def post_install
-    return if build.without?("grammar")
-
+  def patch_xgrammar(python, site)
     ohai "Patching xgrammar macOS arm64 wheel"
-    py = libexec/"bin/python"
-    site = Utils.safe_popen_read(py, "-c",
-                                 "import site; print(site.getsitepackages()[0])").chomp
-    tvmlib = Utils.safe_popen_read(py, "-c",
+    tvmlib = Utils.safe_popen_read(python, "-c",
       "import os, tvm_ffi; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'lib'))").chomp
     dylib = "#{site}/xgrammar/libxgrammar_bindings.dylib"
     dist_dirs = Dir["#{site}/xgrammar-*.dist-info"]
@@ -200,12 +203,60 @@ class Omlx < Formula
     # Verify the patch took. Failing here is much less confusing than
     # the user discovering it later via a 500 from the admin route.
     ohai "  verifying import xgrammar..."
-    system py, "-c", "import xgrammar; print('xgrammar import OK')"
+    system python, "-c", "import xgrammar; print('xgrammar import OK')"
+  end
+
+  # The custom kernel extensions reference @rpath/libmlx.dylib but their
+  # only link-time libmlx rpath points into pip's isolated build env, which
+  # is dead after install. The import check in `def install` still passes
+  # because dyld resolves the dependency against the already-loaded libmlx
+  # by install name; the post-install "Cleaning" pass then rewrites
+  # libmlx's LC_ID_DYLIB to an absolute Cellar path, which breaks that
+  # match, so the kernels silently fail to dlopen at runtime and prefill
+  # falls back to the slow path (issue #2233). Stamp the real mlx lib dir
+  # as an rpath after the clean pass and re-verify from the final state.
+  def fix_custom_kernel_rpaths(python, site)
+    ohai "Adding mlx rpath to custom kernel binaries"
+    mlx_lib = Utils.safe_popen_read(python, "-c",
+      "import os, mlx.core; print(os.path.join(os.path.dirname(mlx.core.__file__), 'lib'))").chomp
+    odie "mlx lib dir not found at #{mlx_lib}" unless File.directory?(mlx_lib)
+    binaries = Dir["#{site}/omlx/custom_kernels/*/{_ext*.so,lib*_kernel_ops.dylib}"]
+    odie "no custom kernel binaries under #{site}/omlx/custom_kernels" if binaries.empty?
+
+    binaries.each do |lib|
+      if Utils.safe_popen_read("/usr/bin/otool", "-l", lib).include?(mlx_lib)
+        ohai "  #{File.basename(lib)}: mlx rpath already present"
+        next
+      end
+      ohai "  adding rpath to #{File.basename(lib)}"
+      system "/usr/bin/install_name_tool", "-add_rpath", mlx_lib, lib
+      system "/usr/bin/codesign", "--force", "--sign", "-", lib
+    end
+
+    ohai "  verifying custom kernel imports..."
+    system python, "-c", <<~PYTHON
+      from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+      from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+      from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
+      assert glm_fast.is_native_available(), glm_fast.import_error()
+      assert minimax_fast.is_native_available(), minimax_fast.import_error()
+      assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
+    PYTHON
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
+    if build.with?("custom-kernel")
+      system libexec/"bin/python", "-c", <<~PYTHON
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+        from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
+        assert glm_fast.is_native_available(), glm_fast.import_error()
+        assert minimax_fast.is_native_available(), minimax_fast.import_error()
+        assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
+      PYTHON
+    end
   end
 end

@@ -4,6 +4,24 @@ import XCTest
 @MainActor
 final class ModelSettingsScreenVMTests: XCTestCase {
 
+    func testModelTypeOptionsMatchServerValues() {
+        let values = ModelSettingsScreenVM.modelTypeOptions.map(\.0)
+
+        XCTAssertEqual(
+            values,
+            [
+                "",
+                "llm",
+                "vlm",
+                "embedding",
+                "reranker",
+                "audio_stt",
+                "audio_tts",
+                "audio_sts",
+            ]
+        )
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"

@@ -407,6 +407,11 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._process_memory_enforcer = enforcer
         # Engine pool consults the enforcer for the pre-load ceiling.
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        # Best-effort fallback so model-swap eviction keeps working when
+        # the memory guard is disabled (#2290).
+        _server_state.engine_pool._get_admission_ceiling = (
+            enforcer.get_admission_ceiling
+        )
         enforcer.start()
 
     # Startup: Preload pinned models in the background so uvicorn binds the
@@ -771,6 +776,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         request.method,
         request.url.path,
         exc,
+        exc_info=exc,
     )
     if _is_api_route(request):
         content = _openai_error_body("Internal server error", 500)

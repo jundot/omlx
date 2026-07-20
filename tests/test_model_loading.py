@@ -584,3 +584,59 @@ class TestExpandPerLayerQuantKeys:
         swapped = "language_model.model.layers.0.linear_attn.in_proj_qkv"
         assert swapped in cfg["quantization"]
         assert cfg["quantization"][swapped]["bits"] == 8
+
+
+class TestMaterializeLazyState:
+    def test_covers_arrays_in_plain_helper_objects(self):
+        """Lazy arrays hidden in non-Module helpers must be materialized.
+
+        Mirrors mlx-vlm's PixtralRotaryEmbedding: a plain class attribute on
+        a module holding a lazy array built on the loader thread. Without
+        the plain-object scan, evaluating that array from another thread
+        raises "There is no Stream(gpu, N) in current thread" (issue #2263
+        follow-up; same class as #1304).
+        """
+        import threading
+
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        from omlx.utils.model_loading import materialize_lazy_state
+
+        class _PlainRotary:
+            def __init__(self):
+                freqs = 1.0 / (10000.0 ** (mx.arange(0, 8, 2) / 8.0))
+                self.inv_freq = mx.concatenate([freqs, freqs], axis=-1)
+
+        class _Vision(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rotary = _PlainRotary()
+                self.rotary_list = [_PlainRotary()]
+                self._hidden = mx.arange(4) * 2.0
+
+        errors = []
+
+        def _build_and_materialize(box):
+            model = _Vision()
+            materialize_lazy_state(model)
+            box.append(model)
+
+        def _eval_elsewhere(model):
+            try:
+                mx.eval(model.rotary.inv_freq)
+                mx.eval(model.rotary_list[0].inv_freq)
+                mx.eval(model._hidden)
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        box: list = []
+        t0 = threading.Thread(target=_build_and_materialize, args=(box,))
+        t0.start()
+        t0.join()
+
+        t1 = threading.Thread(target=_eval_elsewhere, args=(box[0],))
+        t1.start()
+        t1.join()
+
+        assert not errors, f"cross-thread eval failed: {errors}"

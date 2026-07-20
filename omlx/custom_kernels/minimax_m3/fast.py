@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -23,6 +24,16 @@ try:
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
     _IMPORT_ERROR = _detach_import_error(exc)
+    # Default installs ship no extension; warn only when a built _ext fails
+    # to load (e.g. unresolved @rpath/libmlx.dylib, issue #2233) so the
+    # silent-slow-path fallback leaves a trace in the server log.
+    if any(Path(__file__).parent.glob("_ext*.so")):
+        logger.warning(
+            "%s: native extension is present but failed to load; falling "
+            "back to the slow path: %s",
+            __name__,
+            _IMPORT_ERROR,
+        )
 else:
     _IMPORT_ERROR = None
 

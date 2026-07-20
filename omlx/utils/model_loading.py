@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 logger = logging.getLogger(__name__)
@@ -604,6 +605,40 @@ def materialize_lazy_state(model: Any) -> None:
     makes every leaf array safe to read from any thread afterwards.
     """
     arrays = [v for _, v in tree_flatten(model) if isinstance(v, mx.array)]
+
+    # tree_flatten only descends Module/list/dict containers and skips
+    # underscore-prefixed attributes. Lazy arrays held by plain helper
+    # objects hung off modules (e.g. mlx-vlm's PixtralRotaryEmbedding, a
+    # non-Module class whose inv_freq is built at construction time) stay
+    # invisible to it and keep their loader-thread stream binding. Scan one
+    # attribute level below every module for such containers as well.
+    def _scan_plain_object(obj: Any) -> None:
+        for attr in vars(obj).values():
+            if isinstance(attr, mx.array):
+                arrays.append(attr)
+
+    modules = model.modules() if hasattr(model, "modules") else []
+    for module in modules:
+        # nn.Module splits attribute storage: arrays and containers live in
+        # the Module's dict payload (where tree_flatten skips underscore
+        # keys), while plain helper objects land in the instance __dict__.
+        values = list(vars(module).values())
+        if isinstance(module, dict):
+            values.extend(dict.values(module))
+        for value in values:
+            if isinstance(value, mx.array):
+                arrays.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if not isinstance(item, (nn.Module, mx.array)) and hasattr(
+                        item, "__dict__"
+                    ):
+                        _scan_plain_object(item)
+            elif not isinstance(value, (nn.Module, dict)) and hasattr(
+                value, "__dict__"
+            ):
+                _scan_plain_object(value)
+
     if arrays:
         mx.eval(arrays)
 

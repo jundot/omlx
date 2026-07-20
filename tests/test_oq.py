@@ -46,6 +46,7 @@ from omlx.oq import (
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
+    _load_builtin_calibration,
     _measure_sensitivity,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
@@ -1827,6 +1828,28 @@ class TestOQECalibrationData:
         assert multilingual_share >= 0.25
         assert shares["tool_calling"] <= 0.18
         assert max(shares.values()) <= 0.18
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestCalibrationSampleDeterminism:
+    """Calibration subsampling must not depend on the global RNG (#2293)."""
+
+    class _ByteTokenizer:
+        def encode(self, text):
+            return list(text.encode("utf-8")[:64])
+
+    def test_builtin_calibration_subset_is_deterministic(self):
+        tokenizer = self._ByteTokenizer()
+        mx.random.seed(111)
+        first = _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples=4, seq_length=64
+        )
+        mx.random.seed(222)
+        second = _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples=4, seq_length=64
+        )
+        assert first.shape == (4, 64)
+        assert mx.array_equal(first, second).item()
 
 
 # =============================================================================

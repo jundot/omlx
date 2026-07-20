@@ -1204,6 +1204,39 @@ class TestAbortLimitCalculation:
         assert enforcer.memory_guard_tier == "balanced"
 
 
+class TestAdmissionCeiling:
+    """#2290: the pre-load admission ceiling survives disabling the guard."""
+
+    def test_guard_on_matches_final_ceiling(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        assert enforcer.get_admission_ceiling() == enforcer.get_final_ceiling()
+        assert enforcer.get_admission_ceiling() == 10 * 1024**3
+
+    def test_guard_off_falls_back_to_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_final_ceiling() == 0
+            assert enforcer.get_admission_ceiling() == 122 * 1024**3
+
+    def test_guard_off_ignores_metal_cap(self, mock_engine_pool):
+        """Guard off leaves allocations pageable; the Metal cap must not
+        shrink the best-effort admission ceiling."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        enforcer._get_effective_metal_cap_bytes = lambda: 96 * 1024**3
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_admission_ceiling() == 122 * 1024**3
+
+
 class TestMetalWiredLimit:
     """enforcer.start() applies MLX wired limits only for explicit sysctl caps."""
 
