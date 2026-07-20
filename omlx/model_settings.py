@@ -186,6 +186,13 @@ class ModelSettings:
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
+    # DSpark (Bonsai 1-bit / 2-bit speculative decoding via cross-attention drafter).
+    # Mutually exclusive with dflash_enabled and mtp_enabled.
+    dspark_enabled: bool = False
+    dspark_draft_model: Optional[str] = None  # Path to converted drafter dir or raw .gguf
+    dspark_max_draft_tokens: Optional[int] = 2   # Draft cap per round (Apple Silicon optimum)
+    dspark_log_snr: Optional[float] = None   # Log-SNR inference scalar (None = config default)
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
@@ -237,6 +244,11 @@ class ModelSettings:
             raise ValueError(
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
+            )
+        if self.dspark_enabled and (self.dflash_enabled or self.mtp_enabled):
+            raise ValueError(
+                "dspark_enabled is mutually exclusive with dflash_enabled and mtp_enabled; "
+                "choose one speculative-decoding path per model"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path

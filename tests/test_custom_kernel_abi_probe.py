@@ -9,11 +9,12 @@ disable the native symbols instead of letting each routed call raise.
 
 import pytest
 
+from omlx.custom_kernels.bonsai import fast as bonsai_fast
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
 from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
 
-ALL_FAST = (qwen35_fast, glm_fast, minimax_fast)
+ALL_FAST = (qwen35_fast, glm_fast, minimax_fast, bonsai_fast)
 
 
 class _MismatchedExt:
