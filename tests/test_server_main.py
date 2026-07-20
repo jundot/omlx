@@ -54,6 +54,20 @@ def module_entry(monkeypatch, tmp_path):
     ):
         server.main()
 
+    # Other suites patch admin_routes._get_global_settings and can leak
+    # a mock into this process; re-run the canonical wiring so the
+    # in-process tests see main()'s state exactly as a fresh interpreter
+    # would (the subprocess test below covers the fresh process for
+    # real, wiring included).
+    from omlx.admin.routes import set_admin_getters
+
+    set_admin_getters(
+        server.get_server_state,
+        server.get_engine_pool,
+        lambda: server._server_state.settings_manager,
+        lambda: server._server_state.global_settings,
+    )
+
     yield server, uvicorn_run
     reset_settings()
 
