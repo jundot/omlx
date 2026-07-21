@@ -33,6 +33,9 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
 from omlx.custom_kernels.bonsai.fast import (
+    _dequant_1bit,
+    bonsai_q1_affine_qmv,
+    bonsai_qmv_wide,
     bonsai_t5_qmv,
     bonsai_t5_qmv_wide,
     bonsai_t5_qmm,
@@ -141,7 +144,7 @@ def _t5_quantized_matmul(
     group_size: int = 64,
     **kwargs,
 ):
-    """mx.quantized_matmul replacement that handles t5 uint8 weights.
+    """mx.quantized_matmul replacement that handles t5 uint8 and 1-bit weights.
 
     When *w* is uint8 (t5 base-3 packed):
       - M=1: route to qmv_fast Metal kernel (single-vector decode).
@@ -149,8 +152,25 @@ def _t5_quantized_matmul(
         weight byte once across all M vectors — no float weight materialisation).
       The dequant+matmul fallback below is only reached when the native extension
       is unavailable.
+    When *bits* is 1: stock mlx accepts the op but its metallib ships no b_1
+    kernels, so dispatch dies with "Unable to load kernel".  This path exists
+    because mlx-vlm model code (fused projections, as_linear) calls
+    mx.quantized_matmul directly, bypassing the patched QuantizedLinear.
     For all other weight dtypes the original C function is called unchanged.
     """
+    # 1-bit affine: route around the missing stock kernels.
+    if bits == 1 and w.dtype == mx.uint32 and transpose:
+        M = x.shape[-2] if x.ndim >= 2 else 1
+        if has_native() and M == 1:
+            return bonsai_q1_affine_qmv(
+                x, w, scales.astype(x.dtype), biases.astype(x.dtype)
+            )
+        if has_native() and 2 <= M <= 5:
+            return bonsai_qmv_wide(x, w, scales, biases, bits=1)
+        # Prefill / no native ext: dequantize to x.dtype and matmul.
+        w_fp = _dequant_1bit(w, scales, biases, x.dtype, group_size)
+        return x @ w_fp.T
+
     # Normal path: uint32 weights → native MLX kernel (the common case).
     if w.dtype != mx.uint8:
         return _original_quantized_matmul(

@@ -29,6 +29,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.custom_kernels.bonsai.fast import (
+    _dequant_1bit,
     bonsai_q1_affine_qmv,
     bonsai_q2_affine_qmv,
     bonsai_q1_affine_qmv_sym,
@@ -212,25 +213,9 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     # in its metallib.  For bits=1 prefill, dequantize to float16 explicitly.
     if M > _MAX_DECODE_M:
         if bits == 1:
-            w = self.weight  # (N, K//32) uint32
-            scales = self.scales.astype(x.dtype)
-            biases = getattr(self, "biases", None)
-            if biases is not None:
-                biases = biases.astype(x.dtype)
-            N, K32 = w.shape
-            K_full = K32 * 32
-            n_groups = scales.shape[-1]
-            gs = K_full // n_groups
-            # Unpack 1-bit to float16: (N, K_full)
-            shifts = mx.arange(32, dtype=mx.uint32)
-            w_flat = ((w[:, :, None] >> shifts) & 0x1).astype(x.dtype).reshape(N, K_full)
-            # Expand scales from (N, n_groups) to (N, K_full)
-            scales_exp = mx.repeat(scales, gs, axis=-1)
-            w_fp = w_flat * scales_exp
-            if biases is not None:
-                biases_exp = mx.repeat(biases, gs, axis=-1)
-                w_fp = w_fp + biases_exp
-            w_fp = w_fp.reshape(N, K_full)
+            w_fp = _dequant_1bit(
+                self.weight, self.scales, getattr(self, "biases", None), x.dtype
+            )
             out = x @ w_fp.T
             linear_bias = getattr(self, "bias", None)
             if linear_bias is not None:

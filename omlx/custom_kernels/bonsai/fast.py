@@ -178,6 +178,24 @@ def bonsai_q2_affine_qmv(
     )
 
 
+def _dequant_1bit(w, scales, biases, dtype, group_size=None):
+    """Dequantize 1-bit affine weights (N, K//32 uint32) to (N, K) dtype.
+
+    Stock mlx ships no affine_dequantize for bits=1, so prefill and direct
+    quantized_matmul callers materialize the weight explicitly.
+    """
+    N, K32 = w.shape
+    K = K32 * 32
+    n_groups = scales.shape[-1]
+    gs = K // n_groups
+    shifts = mx.arange(32, dtype=mx.uint32)
+    w_flat = ((w[:, :, None] >> shifts) & 0x1).astype(dtype).reshape(N, K)
+    w_fp = w_flat * mx.repeat(scales.astype(dtype), gs, axis=-1)
+    if biases is not None:
+        w_fp = w_fp + mx.repeat(biases.astype(dtype), gs, axis=-1)
+    return w_fp
+
+
 def bonsai_q1_affine_qmv(
     x: mx.array,
     w: mx.array,
