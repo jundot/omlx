@@ -608,7 +608,7 @@
   "logs.showing_lines": "Exibindo {lines} de {total} linhas",
   "logs.placeholder": "Nenhum log disponível. Inicie o servidor para gerar logs.",
   "logs.last_updated": "Última atualização: {time}",
-  "logs.level_label": "Nível mín. de exibição",
+  "logs.level_label": "Nível de exibição",
   "logs.level_tooltip": "Filtra apenas o que é exibido aqui — não afeta o nível de gravação do arquivo de log",
   "bench.section_label": "Benchmark",
   "bench.heading": "Benchmark de Desempenho",

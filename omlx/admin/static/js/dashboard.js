@@ -289,7 +289,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
-            logMinLevel: 'TRACE',
+            logLevelFilter: 'ALL',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -3759,25 +3759,22 @@
 
             // Log viewer functions
             filteredLogContent() {
-                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
-                const minIdx = LEVELS.indexOf(this.logMinLevel);
-                if (minIdx <= 0) return this.logContent;
+                if (this.logLevelFilter === 'ALL') return this.logContent;
                 const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
-                let visible = true;
+                // Show only lines of the selected level. Continuation lines (stack
+                // traces, etc.) inherit the visibility of the entry they belong to.
+                let visible = false;
                 return this.logContent.split('\n').filter(line => {
                     const m = line.match(levelRe);
-                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    if (m) visible = m[1] === this.logLevelFilter;
                     return visible;
                 }).join('\n');
             },
 
             levelButtonClass(lvl) {
-                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
-                const idx = LEVELS.indexOf(lvl);
-                const minIdx = LEVELS.indexOf(this.logMinLevel);
-                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
-                if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-200 text-neutral-700';
+                return this.logLevelFilter === lvl
+                    ? 'bg-neutral-900 text-white'
+                    : 'bg-neutral-200 text-neutral-700';
             },
 
             async loadLogs() {

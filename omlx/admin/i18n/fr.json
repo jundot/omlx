@@ -608,7 +608,7 @@
   "logs.showing_lines": "Affichage de {lines} des {total} lignes",
   "logs.placeholder": "Aucun log disponible. Démarrez le serveur pour générer des logs.",
   "logs.last_updated": "Dernière mise à jour : {time}",
-  "logs.level_label": "Niveau min. affiché",
+  "logs.level_label": "Niveau affiché",
   "logs.level_tooltip": "Filtre l'affichage uniquement — n'affecte pas le niveau d'enregistrement du fichier journal",
   "bench.section_label": "Benchmark",
   "bench.heading": "Benchmark de performance",
