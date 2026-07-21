@@ -9,6 +9,7 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import math
 import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
@@ -395,6 +396,11 @@ class ThinkingBudgetProcessor:
     exceeded, forces the close-think token(s) one at a time, then becomes
     a no-op for the rest of generation.
 
+    Includes a soft budget zone over the last 30% of the token budget:
+    instead of a single hard cut, a plausible close-think token is
+    progressively boosted, encouraging a natural stopping point before the
+    hard force at 100%.
+
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
 
@@ -402,7 +408,19 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        soft_budget: Enable the progressive soft zone (default True).
     """
+
+    # Fraction of the budget where the soft zone begins (0.7 = last 30%).
+    # Tuned on local validation: 0.7 stays closer to the requested budget while
+    # still avoiding abrupt hard-wall cuts; see the PR for the sweep.
+    _SOFT_ZONE_START_FRAC = 0.7
+    # Sigmoid ramp shape for the soft zone. The close-token logit is pulled
+    # toward just below the current top logit near the hard wall, so the
+    # soft path nudges without becoming a deterministic force before 100%.
+    _SOFT_SIGMOID_CENTER = 0.8
+    _SOFT_SIGMOID_SHARPNESS = 10.0
+    _SOFT_TARGET_MARGIN = 0.25
 
     def __init__(
         self,
@@ -412,6 +430,7 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        soft_budget: bool = True,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -423,6 +442,16 @@ class ThinkingBudgetProcessor:
         self._budget = budget
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._soft_budget = soft_budget
+        self._soft_start = int(budget * self._SOFT_ZONE_START_FRAC) if budget > 0 else 0
+        # Invariant after construction; floored at 1 so tiny budgets cannot
+        # divide by zero in the progress computation.
+        self._soft_span = max(1, budget - self._soft_start - 1)
+        self._soft_ramp_start = self._soft_sigmoid(0.0)
+        self._soft_ramp_span = max(
+            self._soft_sigmoid(1.0) - self._soft_ramp_start,
+            1e-6,
+        )
 
         # State
         self._thinking_tokens: int = 0
@@ -471,8 +500,72 @@ class ThinkingBudgetProcessor:
                     return self._force_next_token(logits, mx)
                 self._waiting_utf8 = True
                 self._recent_tokens = []
+            elif self._soft_budget and self._thinking_tokens > self._soft_start:
+                return self._apply_soft_bias(logits, mx)
 
         return logits
+
+    def _apply_soft_bias(self, logits, mx):
+        """Progressively boost the close-think logit through the soft zone.
+
+        At each step, pull the next valid close-think token toward just below
+        the current top logit with a normalized sigmoid ramp. The absolute
+        boost scales with the gap, but only becomes strong late in the soft
+        zone and never overtakes the model's preferred token.
+
+        The whole path stays in lazy MLX array ops — no ``.item()``/eval,
+        so the decode loop never syncs on this bias (``progress`` comes
+        from Python-side counters). Only the *next valid* token of the
+        close marker is boosted; for multi-token markers, boosting later
+        ids could make the model sample them out of order and leak a
+        marker fragment into the thinking text.
+        """
+        progress = (self._thinking_tokens - self._soft_start) / self._soft_span
+        ramp = self._normalized_soft_ramp(progress)
+        next_id = self._next_close_token_id()
+        top_logit = mx.max(logits, axis=-1, keepdims=True)
+        end_logit = logits[..., next_id : next_id + 1]
+        target_logit = top_logit - self._SOFT_TARGET_MARGIN
+        boosted_logit = end_logit + ramp * (target_logit - end_logit)
+        logits[..., next_id : next_id + 1] = mx.maximum(end_logit, boosted_logit)
+        return logits
+
+    @classmethod
+    def _soft_sigmoid(cls, progress: float) -> float:
+        return 1.0 / (
+            1.0
+            + math.exp(
+                -cls._SOFT_SIGMOID_SHARPNESS
+                * (progress - cls._SOFT_SIGMOID_CENTER)
+            )
+        )
+
+    def _normalized_soft_ramp(self, progress: float) -> float:
+        """Map soft-zone progress [0, 1] to a late-rising sigmoid [0, 1]."""
+        progress = min(max(progress, 0.0), 1.0)
+        value = self._soft_sigmoid(progress)
+        return min(
+            max((value - self._soft_ramp_start) / self._soft_ramp_span, 0.0),
+            1.0,
+        )
+
+    def _next_close_token_id(self) -> int:
+        """The only close-marker token that is valid to sample next.
+
+        For a multi-token close marker, the model must emit the ids in
+        order; if the tail of recently generated tokens already matches a
+        proper prefix of the marker, the next id of the sequence is the
+        one to encourage. Otherwise (and always for single-token markers)
+        it is the first id.
+        """
+        ids = self._think_end_ids
+        if len(ids) == 1:
+            return ids[0]
+        recent = self._recent_tokens
+        for k in range(min(len(recent), len(ids) - 1), 0, -1):
+            if recent[-k:] == ids[:k]:
+                return ids[k]
+        return ids[0]
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""

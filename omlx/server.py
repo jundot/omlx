@@ -3210,6 +3210,10 @@ async def create_chat_completion(
             request.chat_template_kwargs,
         )
 
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+            merged_ct_kwargs["enable_thinking"] = True
+
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
         # get reasoning as a separate field; others fall back to <think> inlined
@@ -3316,6 +3320,15 @@ async def create_chat_completion(
             json_instruction = build_json_system_prompt(response_format)
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
+        messages = _inject_thinking_budget_instruction(
+            messages,
+            thinking_budget,
+            final_json=(
+                _response_format_requests_grammar(response_format)
+                or structured_outputs is not None
+                or guided_grammar is not None
+            ),
+        )
 
         # Merge MCP tools with user-provided tools unless the request explicitly
         # disables tool use.
@@ -3421,16 +3434,8 @@ async def create_chat_completion(
             chat_kwargs["seed"] = request.seed
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking in chat template kwargs when a thinking
-        # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-        # kwarg is True.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
@@ -3702,6 +3707,23 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+def _inject_thinking_budget_instruction(
+    messages: list,
+    budget: int | None,
+    *,
+    final_json: bool = False,
+) -> list:
+    """Guide reasoning length with a cache-friendly tail system note."""
+    if budget is None or budget <= 0:
+        return list(messages)
+    final_kind = "final JSON answer" if final_json else "final answer"
+    instruction = (
+        f"Think step by step and use fewer than {budget} reasoning tokens "
+        f"before the {final_kind}."
+    )
+    return [*messages, {"role": "system", "content": instruction}]
 
 
 def _normalize_structured_outputs(
@@ -5129,6 +5151,10 @@ async def create_anthropic_message(
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
 
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+            merged_ct_kwargs["enable_thinking"] = True
+
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
             f"has_tokenizer={engine.tokenizer is not None}"
@@ -5194,6 +5220,11 @@ async def create_anthropic_message(
             )
             merge_system_fallback_roles = True
 
+        messages = _inject_thinking_budget_instruction(
+            messages,
+            thinking_budget,
+        )
+
         # Detect and strip partial mode at the API boundary — exactly once.
         is_partial = detect_and_strip_partial(messages)
 
@@ -5232,15 +5263,8 @@ async def create_anthropic_message(
         }
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking in chat template kwargs when a thinking
-        # budget is active but enable_thinking was not already set (e.g. via
-        # the Anthropic thinking.type field above or model settings).
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
@@ -5648,6 +5672,10 @@ async def create_response(
             request.chat_template_kwargs,
         )
 
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+            merged_ct_kwargs["enable_thinking"] = True
+
         # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
         # are NOT called here because convert_responses_input_to_messages() already
         # returns plain dicts in {"role": str, "content": str} format.
@@ -5690,6 +5718,11 @@ async def create_response(
                         messages = _inject_json_instruction(messages, json_instruction)
             else:
                 compiled_grammar = None
+        messages = _inject_thinking_budget_instruction(
+            messages,
+            thinking_budget,
+            final_json=response_format is not None,
+        )
 
         # Merge MCP tools
         effective_tools = (
@@ -5778,13 +5811,8 @@ async def create_response(
             chat_kwargs["seed"] = request.seed
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking when thinking budget is active.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
