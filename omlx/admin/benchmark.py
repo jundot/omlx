@@ -11,6 +11,7 @@ import logging
 import re
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -179,41 +180,62 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
 
 
 
+# Natural-language corpus for benchmark prompts (public-domain text of
+# Project Gutenberg eBook #2701, boilerplate stripped). Prompts must not be
+# built from repeated filler: speculative decoders (Lightning MTP, DFlash)
+# reach ~99% draft acceptance on repetitive text versus ~55-80% on natural
+# text, which inflates benchmark tg by roughly 2x over anything real
+# requests can achieve on those models.
+_BENCH_CORPUS_PATH = Path(__file__).parent / "bench_corpus.txt"
+
+# Approximate characters per token for natural English prose in common BPE
+# vocabularies; used only by the tokenizer-less external path, which reports
+# the endpoint's actual usage.prompt_tokens anyway.
+_CORPUS_CHARS_PER_TOKEN = 4
+
+
+def _load_bench_corpus() -> str:
+    return _BENCH_CORPUS_PATH.read_text(encoding="utf-8")
+
+
+# One bench run requests prompts for many lengths plus warmup and batch
+# tests; the corpus tokenization is identical every time, so cache it for
+# the tokenizer currently in use (weakref: never outlives the engine).
+_corpus_token_cache: Optional[tuple[Any, list[int]]] = None
+
+
+def _corpus_tokens(tokenizer: Any) -> list[int]:
+    global _corpus_token_cache
+    if _corpus_token_cache is not None:
+        ref, cached = _corpus_token_cache
+        if ref() is tokenizer:
+            return cached
+    tokens = tokenizer.encode(_load_bench_corpus())
+    if not tokens:
+        raise RuntimeError(
+            f"Benchmark corpus at {_BENCH_CORPUS_PATH} tokenized to 0 tokens"
+        )
+    _corpus_token_cache = (weakref.ref(tokenizer), tokens)
+    return tokens
+
+
 def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
-    """Generate a prompt with exactly target_tokens tokens.
+    """Generate a natural-text prompt with exactly target_tokens tokens.
 
     Uses a unique UUID prefix to prevent SSD cache hits from previous sessions.
     """
     unique_prefix = f"BENCH-{uuid.uuid4().hex} "
-    filler = (
-        "The quick brown fox jumps over the lazy dog. "
-        "In the realm of artificial intelligence, large language models "
-        "have demonstrated remarkable capabilities across diverse tasks. "
-    )
+    prefix_tokens = tokenizer.encode(unique_prefix)
+    corpus_tokens = _corpus_tokens(tokenizer)
 
-    # Build a large enough text
-    text = unique_prefix + filler * (target_tokens // 10 + 1)
-    tokens = tokenizer.encode(text)
-
-    if len(tokens) < target_tokens:
-        # Need more tokens, repeat more
-        text = unique_prefix + filler * (target_tokens // 5 + 1)
-        tokens = tokenizer.encode(text)
+    # Wrap around only for targets beyond the corpus length (~280k tokens).
+    needed = max(0, target_tokens - len(prefix_tokens))
+    while len(corpus_tokens) < needed:
+        corpus_tokens = corpus_tokens + corpus_tokens
 
     # Truncate to exact target length
-    tokens = tokens[:target_tokens]
+    tokens = (prefix_tokens + corpus_tokens)[:target_tokens]
     return tokenizer.decode(tokens)
-
-
-# The external path has no tokenizer, so prompt lengths are approximated by
-# repeating this filler (~30 tokens per repetition in common BPE vocabs).
-# Results report the endpoint's actual usage.prompt_tokens.
-_EXTERNAL_FILLER = (
-    "The quick brown fox jumps over the lazy dog. "
-    "In the realm of artificial intelligence, large language models "
-    "have demonstrated remarkable capabilities across diverse tasks. "
-)
-_EXTERNAL_FILLER_TOKENS = 30
 
 
 def _generate_external_prompt(target_tokens: int) -> str:
@@ -222,8 +244,13 @@ def _generate_external_prompt(target_tokens: int) -> str:
     Uses a unique UUID prefix so remote prefix caches cannot skew results.
     """
     unique_prefix = f"BENCH-{uuid.uuid4().hex} "
-    repeats = max(1, target_tokens // _EXTERNAL_FILLER_TOKENS)
-    return unique_prefix + _EXTERNAL_FILLER * repeats
+    corpus = _load_bench_corpus()
+    if not corpus:
+        raise RuntimeError(f"Benchmark corpus at {_BENCH_CORPUS_PATH} is empty")
+    target_chars = target_tokens * _CORPUS_CHARS_PER_TOKEN
+    while len(corpus) < target_chars:
+        corpus = corpus + corpus
+    return unique_prefix + corpus[:target_chars]
 
 
 def _compute_single_metrics(

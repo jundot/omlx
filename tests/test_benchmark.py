@@ -148,6 +148,81 @@ class TestGeneratePrompt:
         # the UUID prefix ensures cache isolation
 
 
+class _WordTokenizer:
+    """Word-level round-trip tokenizer for content-sensitive prompt tests."""
+
+    def __init__(self):
+        self.vocab = {}
+        self.words = []
+
+    def encode(self, text):
+        ids = []
+        for word in text.split(" "):
+            if word not in self.vocab:
+                self.vocab[word] = len(self.words)
+                self.words.append(word)
+            ids.append(self.vocab[word])
+        return ids
+
+    def decode(self, ids):
+        return " ".join(self.words[i] for i in ids)
+
+
+class TestPromptRealism:
+    def test_corpus_file_ships_and_is_natural_text(self):
+        from omlx.admin.benchmark import _load_bench_corpus
+
+        corpus = _load_bench_corpus()
+        assert len(corpus) > 500_000
+        assert "quick brown fox jumps" not in corpus
+
+    def test_prompt_is_not_repetitive(self):
+        """Speculative decoders (MTP/DFlash) hit ~99% draft acceptance on
+        repeated filler, inflating benchmark tg ~2x over real prompts; the
+        prompt must be natural, non-looping text."""
+        tokenizer = _WordTokenizer()
+        ids = tokenizer.encode(_generate_prompt(tokenizer, 2048))
+        window = 16
+        windows = {tuple(ids[i : i + window]) for i in range(len(ids) - window)}
+        distinct_ratio = len(windows) / (len(ids) - window)
+        assert distinct_ratio > 0.5
+
+    def test_prompt_deterministic_apart_from_uuid_prefix(self):
+        tokenizer = _WordTokenizer()
+        first = _generate_prompt(tokenizer, 512).split(" ", 1)
+        second = _generate_prompt(tokenizer, 512).split(" ", 1)
+        assert first[0] != second[0]
+        assert first[1] == second[1]
+
+    def test_corpus_tokenized_once_per_tokenizer(self):
+        from omlx.admin.benchmark import _load_bench_corpus
+
+        tokenizer = _WordTokenizer()
+        corpus_len = len(_load_bench_corpus())
+        encoded_lengths = []
+        original_encode = tokenizer.encode
+
+        def counting_encode(text):
+            encoded_lengths.append(len(text))
+            return original_encode(text)
+
+        tokenizer.encode = counting_encode
+        _generate_prompt(tokenizer, 256)
+        _generate_prompt(tokenizer, 512)
+        assert sum(1 for n in encoded_lengths if n == corpus_len) == 1
+
+    def test_external_prompt_is_not_repetitive(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        words = _generate_external_prompt(1024).split(" ")
+        window = 12
+        windows = {
+            tuple(words[i : i + window]) for i in range(len(words) - window)
+        }
+        distinct_ratio = len(windows) / (len(words) - window)
+        assert distinct_ratio > 0.5
+
+
 # =============================================================================
 # Metrics computation tests
 # =============================================================================
