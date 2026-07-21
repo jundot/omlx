@@ -162,8 +162,17 @@ template <typename T, int group_size>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]])
 {
-    qmv_fast_t5_impl<T, group_size>(
-        w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    // Load the T5_TO_B4 LUT into threadgroup memory once per threadgroup
+    // (128 threads: 32 lanes x 4 simdgroups cover all 256 entries in 2 steps).
+    threadgroup uint t5_lut[256];
+    for (uint i = simd_lid + simd_gid * 32; i < 256; i += 128) {
+        t5_lut[i] = T5_TO_B4[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    qmv_fast_t5_impl<T, group_size, /*USE_SIGMA=*/false>(
+        w, scales, x, y, in_vec_size, out_vec_size, nullptr, t5_lut,
+        tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int vecs_per_tg, int k_lanes>
@@ -179,8 +188,17 @@ template <typename T, int group_size, int vecs_per_tg, int k_lanes>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]])
 {
+    // Same cooperative T5_TO_B4 preload as affine_qmv_fast_t5
+    // (128 threads: 32 lanes x 4 simdgroups).
+    threadgroup uint t5_lut[256];
+    for (uint i = simd_lid + simd_gid * 32; i < 256; i += 128) {
+        t5_lut[i] = T5_TO_B4[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     qmv_wide_t5_impl<T, group_size, vecs_per_tg, k_lanes>(
-        w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
+        w, scales, x, y, in_vec_size, out_vec_size, M, t5_lut,
+        tid, simd_gid, simd_lid);
 }
 
 #define bonsai_instantiate_qmv_fast_t5(type, gs)                            \
