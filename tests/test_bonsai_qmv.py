@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 import omlx.custom_kernels.bonsai.fast as bonsai_fast
@@ -378,8 +379,9 @@ def test_spec_decode_verify_mid_mismatch(monkeypatch):
 def test_spec_decode_verify_routes_to_ext_when_available(monkeypatch):
     called = {}
 
-    def fake_verify(draft_tokens, target_logits, stream=None):
+    def fake_verify(draft_tokens, target, stream=None):
         called["fired"] = True
+        called["target"] = target
         B = draft_tokens.shape[0]
         K = draft_tokens.shape[1]
         return mx.zeros((B,), mx.int32), mx.zeros((B, K + 1), mx.int32)
@@ -391,6 +393,41 @@ def test_spec_decode_verify_routes_to_ext_when_available(monkeypatch):
     target_logits = mx.zeros((1, 3, 8), dtype=mx.float32)
     bonsai_fast.spec_decode_verify(draft, target_logits)
     assert called.get("fired") is True
+    # The native op takes argmaxed int32 token ids, not raw logits.
+    assert called["target"].dtype == mx.int32
+    assert called["target"].shape == (1, 3)
+
+
+@pytest.mark.skipif(
+    not bonsai_fast.has_symbol("bonsai_spec_decode_verify"),
+    reason="requires compiled bonsai extension",
+)
+def test_spec_decode_verify_native_matches_fallback():
+    """Native kernel and pure-mlx fallback agree on n_accepted and the
+    committed prefix (positions past n_accepted are unspecified padding)."""
+    rng = np.random.default_rng(11)
+    for _trial in range(10):
+        B = int(rng.integers(1, 5))
+        K = int(rng.integers(1, 8))
+        V = 32
+        draft = mx.array(rng.integers(0, V, (B, K)), dtype=mx.int32)
+        logits = mx.array(rng.standard_normal((B, K + 1, V)).astype(np.float32))
+
+        n_nat, c_nat = bonsai_fast.spec_decode_verify(draft, logits)
+        mx.eval(n_nat, c_nat)
+
+        orig_ext = bonsai_fast._ext
+        try:
+            bonsai_fast._ext = None
+            n_fb, c_fb = bonsai_fast.spec_decode_verify(draft, logits)
+            mx.eval(n_fb, c_fb)
+        finally:
+            bonsai_fast._ext = orig_ext
+
+        assert mx.array_equal(n_nat, n_fb).item()
+        for b in range(B):
+            n = int(n_nat[b].item())
+            assert c_nat[b, : n + 1].tolist() == c_fb[b, : n + 1].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +683,6 @@ def test_bonsai_local_build_probe_is_healthy():
 # ---------------------------------------------------------------------------
 # t5 (base-3 ternary packing, Identity I-D) tests
 # ---------------------------------------------------------------------------
-
-import numpy as np
 
 
 def _make_t5_layer(N: int = 64, K: int = 256, group_size: int = 128,

@@ -1,7 +1,7 @@
 """Bonsai t5 profiler — diagnose 1.585-bit vs 2-bit decode throughput.
 
 Usage:
-    python tools/bonsai_bench.py [--model-dir /path/to/model] [--reps 50]
+    python tools/bonsai_bench.py [--reps 50]
 
 Reports per-kernel DRAM bandwidth, time per layer, and estimated tok/s for
 all Bonsai-27B projection shapes.  Prints a diagnosis of where time is spent.
@@ -62,8 +62,7 @@ FULL_LAYERS = {"attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj",
 
 def _make_t5_weight(N: int, K: int, gs: int = GS) -> tuple[mx.array, mx.array]:
     """Random uint8 t5 weight + float16 scales."""
-    bpg = (gs // 5) * 5 // 5  # bytes per group: gs=128 → bpg=26
-    bpg = 26 if gs == 128 else 13
+    bpg = 26 if gs == 128 else 13  # bytes per group (ceil(gs/5))
     n_groups = K // gs
     w = mx.array(np.random.randint(0, 243, (N, n_groups * bpg), dtype=np.uint8))
     sc = mx.array(np.random.randn(N, n_groups).astype(np.float16))

@@ -61,7 +61,7 @@ jobs:
           /tmp/wheel-smoke/bin/python - <<'PY'
           import importlib
           failed = []
-          for pkg in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+          for pkg in ("bonsai", "glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
               fast = importlib.import_module(f"omlx.custom_kernels.{pkg}.fast")
               ok = bool(fast.is_native_available())
               print(f"{pkg}: native_available={ok} import_error={fast.import_error()}")

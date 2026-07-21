@@ -87,7 +87,14 @@ _nax_available_cache: bool | None = None
 
 
 def is_nax_available() -> bool:
-    """True when the GPU is M5-class or later (gen >= 18, NAX tensor unit)."""
+    """True when the GPU is M5-class or later (gen >= 18, NAX tensor unit).
+
+    Hardware capability probe only (informational).  This is NOT the
+    routing predicate for stock NAX dispatch — that lives in
+    omlx.custom_kernels.nax and additionally checks the OMLX_NAX env
+    override, the installed metallib, and the macOS version.  Bonsai
+    kernel routing uses _arch_gen(), not this.
+    """
     global _nax_available_cache
     if _nax_available_cache is not None:
         return _nax_available_cache
@@ -484,14 +491,15 @@ def spec_decode_verify(
     """
     s = stream
 
-    if _ext is not None and has_symbol("bonsai_spec_decode_verify"):
-        return _ext.bonsai_spec_decode_verify(draft_tokens, target_logits, stream=s)
-
-    # Pure-mlx fallback — exactly the oracle from the Bonsai MLX fork
-    # (mlx/fast.cpp::spec_decode_verify fallback lambda).
     dft = draft_tokens.astype(mx.int32, stream=s) if draft_tokens.dtype != mx.int32 else draft_tokens
     tgt = mx.argmax(target_logits, axis=-1, stream=s)  # [B, K+1]
     tgt = tgt.astype(mx.int32, stream=s) if tgt.dtype != mx.int32 else tgt
+
+    if _ext is not None and has_symbol("bonsai_spec_decode_verify"):
+        return _ext.bonsai_spec_decode_verify(dft, tgt, stream=s)
+
+    # Pure-mlx fallback — exactly the oracle from the Bonsai MLX fork
+    # (mlx/fast.cpp::spec_decode_verify fallback lambda).
 
     B, K = dft.shape[0], dft.shape[1]
 

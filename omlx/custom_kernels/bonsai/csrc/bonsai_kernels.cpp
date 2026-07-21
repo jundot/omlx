@@ -396,7 +396,7 @@ class BonsaiQmvPrimitive : public Primitive {
 
 // BonsaiSpecDecodePrimitive: wraps spec_decode_verify kernel.
 //   inputs[0] = draft  [B, K] int32
-//   inputs[1] = target [B, K+1, V] float
+//   inputs[1] = target [B, K+1] int32 (argmax token ids; caller argmaxes logits)
 //   outputs[0] = n_accepted [B] int32
 //   outputs[1] = committed  [B, K+1] int32
 class BonsaiSpecDecodePrimitive : public Primitive {
@@ -784,10 +784,25 @@ std::pair<array, array> bonsai_spec_decode_verify(
     int B = draft.shape(0);
     int K = draft.shape(1);
 
+    if (draft.dtype() != mlx::core::int32 || target.dtype() != mlx::core::int32) {
+        throw std::invalid_argument(
+            "[bonsai_spec_decode_verify] draft and target must be int32 token ids "
+            "(argmax target logits before calling).");
+    }
+    if (target.ndim() != 2 || target.shape(0) != B || target.shape(1) != K + 1) {
+        throw std::invalid_argument(
+            "[bonsai_spec_decode_verify] target must have shape [B, K+1].");
+    }
+
+    // Sibling outputs must be created through make_arrays so eval_gpu
+    // receives both in one outputs vector.
     auto primitive = std::make_shared<BonsaiSpecDecodePrimitive>(s);
-    array n_accepted({B},      mlx::core::int32, primitive, {draft, target});
-    array committed ({B, K+1}, mlx::core::int32, primitive, {draft, target});
-    return {n_accepted, committed};
+    auto outs = array::make_arrays(
+        {{B}, {B, K + 1}},
+        {mlx::core::int32, mlx::core::int32},
+        primitive,
+        {draft, target});
+    return {outs[0], outs[1]};
 }
 
 bool is_nax_available() {

@@ -139,39 +139,19 @@ def _t5_dequant_matmul(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
     """Prefill path for t5 weights: fused t5 MMA GEMM (Identity I-M).
 
     Routes through bonsai_t5_qmm which decodes each t5 weight byte exactly
-    once without materialising a float weight matrix.  Falls back to the
-    Python dequant chain only when the native extension is unavailable.
+    once without materialising a float weight matrix.
     """
+    # The qmv patch is only installed when the native extension is present
+    # (apply_bonsai_qmv_patch gates on has_native), so this path can assume
+    # the fused kernel.  The no-native t5 dequant chain lives in
+    # bonsai_t5_load._t5_quantized_matmul, the only reachable copy.
     w = self.weight
     scales = self.scales
 
-    # Native fused kernel (preferred): reads weights once, no float materialisation.
-    if has_native():
-        # x may have leading batch dims; flatten to (M, K) for the kernel.
-        x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-        out_flat = bonsai_t5_qmm(x_flat, w, scales)
-        out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
-        linear_bias = getattr(self, "bias", None)
-        if linear_bias is not None:
-            out = out + linear_bias
-        return out
-
-    # Fallback: Python MLX dequant chain (no native ext).
-    N = w.shape[0]
-    n_groups = scales.shape[-1]
-    bpg = w.shape[1] // n_groups
-    group_size = 64 if bpg == 13 else 128
-    K = n_groups * group_size
-    v = w.reshape(N, n_groups, bpg).astype(mx.uint32)
-    trit_parts = []
-    for _ in range(5):
-        trit_parts.append(v % 3)
-        v = v // 3
-    trits = mx.stack(trit_parts, axis=-1).reshape(N, n_groups, bpg * 5)
-    trits = trits[:, :, :group_size]
-    dq = (trits.astype(x.dtype) - 1.0) * scales[..., None].astype(x.dtype)
-    weight_fp = dq.reshape(N, K)
-    out = x @ weight_fp.T
+    # x may have leading batch dims; flatten to (M, K) for the kernel.
+    x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+    out_flat = bonsai_t5_qmm(x_flat, w, scales)
+    out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
     linear_bias = getattr(self, "bias", None)
     if linear_bias is not None:
         out = out + linear_bias

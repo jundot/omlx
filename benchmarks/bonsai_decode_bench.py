@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import mlx.core as mx
@@ -214,8 +214,6 @@ def call_variant(v: Variant, x, w, scales, biases, M: int) -> mx.array | None:
             return fn(x, w, scales)
         except Exception:
             return None
-
-    wide = M >= 3 and bf._use_qmv_wide(v.bits, M)
 
     if v.name.startswith("q1_fast"):
         fn = bf.bonsai_q1_affine_qmv_sym if v.symmetric else bf.bonsai_q1_affine_qmv
