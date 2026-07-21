@@ -18,16 +18,19 @@ the qwen35_model chain contract to the Nemotron-H hybrid trunk:
   bit-identical to the original forward for those positions (same stock
   ssm path, same single-chunk math).
 - Stamps ``_omlx_mtp_chain`` / ``_omlx_mtp_depth`` (from ``get_mtp_depth()``,
-  i.e. the ``mtp_num_draft_tokens`` model setting, default 3) on MTP-bearing
+  i.e. the ``mtp_num_draft_tokens`` model setting; nemotron_h defaults to a
+  fixed depth-1 cycle — the stock head is depth-1 trained) on MTP-bearing
   instances, plus ``_omlx_mtp_head_hidden_normed`` — nemotron's
-  ``return_hidden`` hidden is already post-``norm_f``, so the chain's trunk
-  norm hook must be an identity for this model (qwen returns pre-norm).
+  ``return_hidden`` hidden is already post-``norm_f``, so
+  ``_trunk_norm_module`` returns identity for this model (qwen returns
+  pre-norm).
 
 Greedy speculative decoding is lossless: outputs are identical to the
 depth-1/no-MTP greedy stream; only throughput changes.
 """
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +60,6 @@ def apply() -> bool:
     _patch_mtp_forward(nh)
     _patch_partial_rollback(nh)
     _patch_init_markers(nh)
-    _patch_trunk_norm()
     logger.info(
         "nemotron_h MTP chain patch applied "
         "(depth-k drafting, sequential fused verify, replay-free rollback)"
@@ -79,8 +81,17 @@ def apply() -> bool:
 # The per-position capture is armed around the window call; if anything
 # about the call shape is unexpected (mask set, no state, capture missed a
 # layer) the code falls back to the raw-input stash + replay path.
+# Thread-local: two models decoding concurrently in one process must not
+# interleave arm/read across threads.
 # --------------------------------------------------------------------------- #
-_capture = {"armed": False, "ssm": None, "conv": None}
+class _Capture(threading.local):
+    def __init__(self):
+        self.armed = False
+        self.ssm = None
+        self.conv = None
+
+
+_capture = _Capture()
 
 
 def _patch_mixer(nh):
@@ -93,18 +104,18 @@ def _patch_mixer(nh):
         S = hidden_states.shape[1]
         if cache is not None and 0 < n_confirmed < S:
             conv0, ssm0 = cache[0], cache[1]  # zero-copy pre-forward refs
-            _capture["armed"] = mask is None
-            _capture["ssm"] = None
-            _capture["conv"] = None
+            _capture.armed = mask is None
+            _capture.ssm = None
+            _capture.conv = None
             try:
                 out = base_call(self, hidden_states, mask, cache)
             finally:
-                armed = _capture["armed"]
-                ssm_states = _capture["ssm"]
-                conv_tails = _capture["conv"]
-                _capture["armed"] = False
-                _capture["ssm"] = None
-                _capture["conv"] = None
+                armed = _capture.armed
+                ssm_states = _capture.ssm
+                conv_tails = _capture.conv
+                _capture.armed = False
+                _capture.ssm = None
+                _capture.conv = None
             if (
                 armed
                 and ssm_states is not None
@@ -165,7 +176,7 @@ def _patch_ssm_sequential():
     ):
         S = hidden_states.shape[1]
         if (
-            _capture["armed"]
+            _capture.armed
             and 1 < S < 32
             and state is not None
             and mask is None
@@ -189,7 +200,7 @@ def _patch_ssm_sequential():
                 )
                 ys.append(y)
                 states.append(s)
-            _capture["ssm"] = states
+            _capture.ssm = states
             return mx.concatenate(ys, axis=1), s
         return inner(
             hidden_states, A_log, B, C, D, dt, dt_bias, state,
@@ -218,7 +229,7 @@ def _patch_conv_capture(nh):
 
     def _conv(self, conv_input, cache=None, mask=None):
         if (
-            _capture["armed"]
+            _capture.armed
             and cache is not None
             and mask is None
             and getattr(cache, "lengths", None) is None
@@ -236,7 +247,7 @@ def _patch_conv_capture(nh):
             for i in range(S):
                 seq = mx.concatenate([prev, conv_input[:, : i + 1]], axis=1)
                 tails.append(seq[:, -n_keep:, :])
-            _capture["conv"] = tails
+            _capture.conv = tails
         return orig_conv(self, conv_input, cache, mask)
 
     setattr(_conv, _MARKER, True)
@@ -375,28 +386,3 @@ def _patch_init_markers(nh):
 
     Model.__init__ = __init__
     Model._omlx_nh_chain_init = True
-
-
-# --------------------------------------------------------------------------- #
-# batch_generator._trunk_norm_module: identity for already-normed hidden
-# --------------------------------------------------------------------------- #
-def _patch_trunk_norm():
-    from . import batch_generator as bg
-
-    if getattr(bg._trunk_norm_module, _MARKER, False):
-        return
-    orig = bg._trunk_norm_module
-
-    def _trunk_norm_module(model):
-        if getattr(model, "_omlx_mtp_head_hidden_normed", False):
-            return lambda x: x
-        for attr in ("language_model", "_language_model"):
-            inner = getattr(model, attr, None)
-            if inner is not None and getattr(
-                inner, "_omlx_mtp_head_hidden_normed", False
-            ):
-                return lambda x: x
-        return orig(model)
-
-    setattr(_trunk_norm_module, _MARKER, True)
-    bg._trunk_norm_module = _trunk_norm_module

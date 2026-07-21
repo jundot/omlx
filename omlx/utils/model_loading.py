@@ -305,7 +305,15 @@ def maybe_apply_pre_load_patches(
             # (M >= 3), whose numerics can diverge from the unrouted path at
             # bf16 tail-ULP level.
             depth = getattr(model_settings, "mtp_num_draft_tokens", None)
-            set_mtp_depth(int(depth) if depth else 3)
+            if depth:
+                set_mtp_depth(int(depth))
+            elif model_type.startswith("nemotron_h"):
+                # The stock nemotron_h head is depth-1 trained; the adaptive
+                # controller's exploration costs ~10% throughput vs fixed
+                # depth 1 on it.
+                set_mtp_depth(1)
+            else:
+                set_mtp_depth(3)
             if mtp_enabled:
                 logger.info(
                     "Native MTP patch applied for %s (model_type=%s, active)",
@@ -557,8 +565,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15) and GLM-5.2 (glm_moe_dsa). The model also has to declare
-    MTP heads in the config; otherwise the patch is a no-op.
+    fork PR 15), GLM-5.2 (glm_moe_dsa) and Nemotron-H hybrids (nemotron_h).
+    The model also has to declare MTP heads in the config; otherwise the
+    patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -568,6 +577,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
     )
 

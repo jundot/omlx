@@ -54,6 +54,16 @@ def _apply_patches():
     set_mtp_active(False)
 
 
+class TestLoaderGate:
+    def test_nemotron_h_is_mtp_compatible(self):
+        # The stock loader must route nemotron_h through the MTP patch;
+        # without this gate the whole feature is inert on a stock server.
+        from omlx.utils.model_loading import _is_mtp_compatible
+
+        assert _is_mtp_compatible({"num_nextn_predict_layers": 1}, "nemotron_h")
+        assert not _is_mtp_compatible({}, "nemotron_h")
+
+
 class TestApply:
     def test_idempotent(self):
         mixer_call = nh.NemotronHMamba2Mixer.__call__
