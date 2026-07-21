@@ -83,6 +83,31 @@ _EXT_HAS_FA256_DISPATCH_BUDGET = _ext is not None and hasattr(
     _ext, "FA256_HAS_DISPATCH_BUDGET"
 )
 
+# Extensions built before the Bonsai group_size=128 support reject the
+# group_size kwarg on the qmm bindings, so only forward it when the rebuilt
+# binding is present.  The q2 binding ships in the same rebuild, so its
+# presence marks the new ABI.  Older builds only carry gs=64 kernels; callers
+# must keep gs!=64 layers on stock mlx (see qmm_supports_group_size).
+_EXT_HAS_QMM_GROUP_SIZE = _ext is not None and hasattr(
+    _ext, "qwen35_q2_affine_qmm_t"
+)
+
+
+def _qmm_group_size_kwargs(group_size: int) -> dict:
+    if _EXT_HAS_QMM_GROUP_SIZE:
+        return {"group_size": group_size}
+    return {}
+
+
+def qmm_supports_group_size(group_size: int) -> bool:
+    """True if the compiled extension can run qmm at this group size.
+
+    gs=64 always works (the pre-group_size builds are gs=64-only).  Other
+    group sizes require the rebuilt binding; routing a gs=128 layer through
+    an old build would silently run the gs=64 kernel on gs=128 data.
+    """
+    return group_size == 64 or _EXT_HAS_QMM_GROUP_SIZE
+
 _NAX_ARCH_RE = re.compile(r"applegpu_g(\d+)([a-z])")
 _NAX_KERNEL_NEEDLE = b"affine_qmm_t_nax"
 
@@ -305,7 +330,7 @@ def qwen35_q2_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
-            group_size=group_size,
+            **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q2_affine_qmm_t native kernel is unavailable")
@@ -329,7 +354,7 @@ def qwen35_q4_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
-            group_size=group_size,
+            **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q4_affine_qmm_t native kernel is unavailable")
@@ -353,7 +378,7 @@ def qwen35_q5_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
-            group_size=group_size,
+            **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q5_affine_qmm_t native kernel is unavailable")
@@ -377,7 +402,7 @@ def qwen35_q6_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
-            group_size=group_size,
+            **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q6_affine_qmm_t native kernel is unavailable")
@@ -401,7 +426,7 @@ def qwen35_q8_affine_qmm_t(
             biases,
             variant,
             **_qmm_nax_kwargs(),
-            group_size=group_size,
+            **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("qwen35_q8_affine_qmm_t native kernel is unavailable")

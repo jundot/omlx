@@ -39,6 +39,14 @@ def _native_qmm_for_bits(bits: int) -> Callable[..., mx.array] | None:
     return getattr(fast, name)
 
 
+def _qmm_supports_group_size(group_size: int) -> bool:
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return False
+    return fast.qmm_supports_group_size(group_size)
+
+
 def _has_native_qmm() -> bool:
     return _native_qmm_for_bits(4) is not None
 
@@ -58,6 +66,8 @@ def _is_supported_affine_linear_shape(
         return False
     group_size = getattr(linear, "group_size", None)
     if group_size not in (64, 128):
+        return False
+    if not _qmm_supports_group_size(int(group_size)):
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":

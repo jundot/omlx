@@ -28,7 +28,7 @@ Usage
     python tools/repack_ternary_t5.py \\
         --model /path/to/Bonsai-27B-mlx-2bit \\
         --output /path/to/Bonsai-27B-mlx-t5 \\
-        [--group-size 128]  # default: 128
+        [--group-size 128]  # default: auto-detect from config.json
 
     # The tool refuses to overwrite the source model directory.
     # Always specify a different --output path (e.g. append "-t5" to the name).
@@ -51,6 +51,7 @@ This checks that dequantized values are bit-identical (up to fp order).
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import shutil
@@ -250,6 +251,20 @@ def repack_shard(
         # Unpack 2-bit → (N, K) quants
         N, K_packed = arr.shape
         K = K_packed * 16  # 16 values per uint32
+
+        # The requested group_size must match the checkpoint's real grouping,
+        # otherwise the t5 bytes get laid out on wrong boundaries and the
+        # model loads cleanly but decodes shifted trits (silent corruption).
+        real_gs = K // scales.shape[-1]
+        if real_gs != group_size:
+            print(
+                f"Error: {key} is quantized at group_size={real_gs} but the "
+                f"repack was requested at group_size={group_size}.  Re-run "
+                f"with --group-size {real_gs} (or omit it to auto-detect).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         quants = unpack_mlx_2bit(arr, K)
 
         # Verify quants are in {0,1,2} (ternary)
@@ -274,6 +289,19 @@ def repack_shard(
         # biases are kept: mlx-lm strict load requires them; t5 decode path ignores them
 
     return out
+
+
+def _config_group_size(model_dir: Path) -> int | None:
+    """Read quantization.group_size from the model's config.json."""
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError):
+        return None
+    quant = config.get("quantization")
+    if isinstance(quant, dict) and isinstance(quant.get("group_size"), int):
+        return quant["group_size"]
+    return None
 
 
 def repack_model(src: Path, dst: Path, group_size: int, verbose: bool = True) -> None:
@@ -406,8 +434,8 @@ def parse_args() -> argparse.Namespace:
                    help="Source 2-bit MLX model directory")
     p.add_argument("--output",     type=Path, default=None,
                    help="Output t5 model directory (required unless --verify)")
-    p.add_argument("--group-size", type=int, default=128,
-                   help="Group size (default: 128)")
+    p.add_argument("--group-size", type=int, default=None,
+                   help="Group size (default: auto-detect from config.json)")
     p.add_argument("--verbose",    action="store_true", default=True,
                    help="Print per-tensor progress (default: on)")
     p.add_argument("--quiet",      action="store_true",
@@ -424,6 +452,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     verbose = args.verbose and not args.quiet
+
+    if args.group_size is None:
+        args.group_size = _config_group_size(args.model)
+        if args.group_size is None:
+            print(
+                "Could not read quantization.group_size from config.json; "
+                "pass --group-size explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if verbose:
+            print(f"group_size={args.group_size} (from config.json)")
 
     if args.verify:
         t5_path = args.t5_model or args.output
