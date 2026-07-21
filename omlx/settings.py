@@ -553,7 +553,7 @@ class ModelScopeSettings:
 
 @dataclass
 class Aria2Settings:
-    """Shared aria2 transfer settings for every model source."""
+    """Optional aria2 transfer settings for ModelScope downloads."""
 
     proxy: str = ""
     connections_per_file: int = 8

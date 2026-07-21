@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -135,16 +137,77 @@ def test_configured_runner_reads_global_transfer_settings() -> None:
     assert runner.concurrent_files == 2
 
 
+def test_configured_runner_is_optional_when_aria2_is_missing() -> None:
+    with patch("omlx.admin.aria2_downloader.find_aria2c", return_value=None):
+        assert configured_aria2_runner() is None
+
+
 @pytest.mark.asyncio
 async def test_download_removes_protected_manifest_after_success(
     tmp_path: Path,
 ) -> None:
-    runner = Aria2Runner(executable="/usr/bin/true")
+    executable = tmp_path / "fake-aria2"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "manifest = Path(sys.argv[1].split('=', 1)[1])\n"
+        "directory = None\n"
+        "for line in manifest.read_text().splitlines():\n"
+        "    if line.startswith('  dir='):\n"
+        "        directory = Path(line[6:])\n"
+        "    elif line.startswith('  out='):\n"
+        "        directory.mkdir(parents=True, exist_ok=True)\n"
+        "        (directory / line[6:]).write_bytes(b'payload')\n"
+    )
+    executable.chmod(0o755)
+    runner = Aria2Runner(executable=str(executable))
     files = [Aria2File(url="https://example.test/model", relative_path="model.bin")]
 
     await runner.download(files, tmp_path, bypass_proxies=True)
 
+    assert (tmp_path / "model.bin").read_bytes() == b"payload"
     assert list(tmp_path.glob(".omlx-aria2-*.txt")) == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_download_keeps_partial_file_hidden(tmp_path: Path) -> None:
+    executable = tmp_path / "slow-aria2"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        "import sys, time\n"
+        "manifest = Path(sys.argv[1].split('=', 1)[1])\n"
+        "directory = None\n"
+        "for line in manifest.read_text().splitlines():\n"
+        "    if line.startswith('  dir='):\n"
+        "        directory = Path(line[6:])\n"
+        "    elif line.startswith('  out='):\n"
+        "        directory.mkdir(parents=True, exist_ok=True)\n"
+        "        (directory / line[6:]).write_bytes(b'partial')\n"
+        "time.sleep(30)\n"
+    )
+    executable.chmod(0o755)
+    runner = Aria2Runner(executable=str(executable))
+    files = [Aria2File(url="https://example.test/model", relative_path="model.bin")]
+
+    task = asyncio.create_task(
+        runner.download(files, tmp_path, bypass_proxies=False)
+    )
+    hidden = tmp_path / "._____temp" / "model.bin"
+    final = tmp_path / "model.bin"
+    try:
+        for _ in range(200):
+            if hidden.exists() or final.exists():
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert hidden.read_bytes() == b"partial"
+    assert not final.exists()
 
 
 @pytest.mark.asyncio

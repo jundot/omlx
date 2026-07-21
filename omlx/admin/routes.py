@@ -38,6 +38,7 @@ from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
+from .aria2_downloader import Aria2Installer, get_aria2_status
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -47,11 +48,6 @@ from .auth import (
     validate_api_key,
     verify_api_key,
     verify_session,
-)
-from .aria2_downloader import (
-    Aria2Installer,
-    Aria2UnavailableError,
-    get_aria2_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,7 +263,7 @@ class GlobalSettingsRequest(BaseModel):
     # ModelScope settings
     ms_endpoint: str | None = None
 
-    # aria2 transfer settings shared by Hugging Face and ModelScope
+    # Optional aria2 transfer settings for ModelScope
     aria2_proxy: str | None = None
     aria2_connections_per_file: int | None = Field(default=None, ge=1, le=16)
     aria2_concurrent_files: int | None = Field(default=None, ge=1, le=16)
@@ -5244,7 +5240,7 @@ async def probe_cache(
 
 @router.get("/api/aria2/status")
 async def aria2_status(is_admin: bool = Depends(require_admin)):
-    """Return whether the required aria2 executable is available."""
+    """Return whether the optional aria2 executable is available."""
 
     return await get_aria2_status()
 
@@ -5270,8 +5266,6 @@ async def start_hf_download(
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Aria2UnavailableError as e:
-        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.get("/api/hf/tasks")

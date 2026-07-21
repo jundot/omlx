@@ -15,7 +15,6 @@ class Omlx < Formula
   depends_on arch: :arm64
   depends_on :macos
   depends_on "python@3.11"
-  depends_on "aria2"
 
   # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries
   # (llvm/llvm-project#203678). Skip Homebrew's post-install clean pass over

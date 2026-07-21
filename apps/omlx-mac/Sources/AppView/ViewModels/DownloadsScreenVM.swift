@@ -67,7 +67,7 @@ final class DownloadsScreenVM {
     var aria2ConcurrentFiles = 4
 
     var aria2ProxyDisabled: Bool {
-        source == .hf ? mirrorIsCustom : msMirrorIsCustom
+        msMirrorIsCustom
     }
 
     private(set) var msSearchResults: [MSModelInfo] = []

@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """ModelScope model downloader for oMLX admin panel.
 
-Builds manifests with the ModelScope SDK and transfers every payload file
-through aria2 with directory-size-based progress polling.
+Uses aria2 when available and falls back to the ModelScope SDK.
 """
 
 import asyncio
 import logging
 import os
+import shutil
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 from urllib.parse import urlencode
 
 import requests
 
 from .aria2_downloader import Aria2File, Aria2Runner, configured_aria2_runner
-
 from .hf_downloader import (
     DownloadStatus,
     DownloadTask,
@@ -30,10 +30,12 @@ logger = logging.getLogger(__name__)
 # Check if modelscope SDK is available
 MS_SDK_AVAILABLE = False
 try:
+    from modelscope import snapshot_download as ms_snapshot_download
     from modelscope.hub.api import HubApi as MSHubApi
 
     MS_SDK_AVAILABLE = True
 except ImportError:
+    ms_snapshot_download = None  # type: ignore[assignment]
     MSHubApi = None  # type: ignore[assignment, misc]
 
 # Timeout for ModelScope API calls (seconds).
@@ -106,7 +108,8 @@ def _to_aria2_files(
         filename = entry.get("Name") or entry.get("Path") or ""
         if not filename:
             continue
-        query = urlencode({"Revision": "master", "FilePath": filename})
+        revision = entry.get("Revision") or entry.get("revision") or "master"
+        query = urlencode({"Revision": revision, "FilePath": filename})
         files.append(
             Aria2File(
                 url=f"{endpoint.rstrip('/')}/api/v1/models/{model_id}/repo?{query}",
@@ -116,6 +119,29 @@ def _to_aria2_files(
             )
         )
     return files
+
+
+def _fetch_ms_file_manifest(
+    model_id: str,
+    *,
+    endpoint: str,
+    token: str,
+) -> list[dict]:
+    """Fetch file metadata including immutable per-file revisions."""
+
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = requests.get(
+        f"{endpoint.rstrip('/')}/api/v1/models/{model_id}/repo/files",
+        params={"Revision": "master", "Recursive": "True"},
+        headers=headers,
+        timeout=_MS_API_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("Data", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        return data.get("Files") or data.get("files") or []
+    return data if isinstance(data, list) else []
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +376,7 @@ def _parse_ms_model_entry(entry: dict) -> dict:
         model_id = name
     else:
         model_id = path
-    
+
     downloads = entry.get("Downloads") or 0
     likes = entry.get("Likes") or entry.get("Stars") or 0
     # StorageSize is the total size in bytes
@@ -407,8 +433,8 @@ async def _fetch_ms_models_rest(
 class MSDownloader:
     """Manages ModelScope model downloads with progress tracking.
 
-    Uses ModelScope for manifests, aria2 for payload transfers, and target-
-    directory polling for progress.
+    Uses aria2 for payload transfers when installed, otherwise ModelScope's
+    native downloader, with target-directory polling for progress.
 
     Args:
         model_dir: Directory where downloaded models are stored.
@@ -861,7 +887,7 @@ class MSDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh task; aria2 resumes from existing files and .aria2 state.
+        # Start a fresh task; either backend handles its own resume behavior.
         new_task = await self.start_download(model_id, ms_token)
         new_task.retry_count = old_retry_count + 1
         return new_task
@@ -901,8 +927,8 @@ class MSDownloader:
         """Execute a download task.
 
         Waits for the download semaphore (only one download runs at a time),
-        then fetches a file manifest and runs aria2 while polling the target
-        directory for progress updates.
+        then uses aria2 when available or the ModelScope SDK otherwise while
+        polling the target directory for progress updates.
         """
         task = self._tasks[task_id]
 
@@ -920,36 +946,72 @@ class MSDownloader:
                 # when sharing a model directory.
                 target_dir = self._model_dir / task.repo_id
 
-                api = _get_ms_api()
-                if api is None:
-                    raise RuntimeError("ModelScope SDK not available")
-                file_list = await asyncio.wait_for(
-                    asyncio.to_thread(api.get_model_files, task.repo_id),
-                    timeout=_MS_API_TIMEOUT,
-                )
                 endpoint = _get_ms_endpoint()
-                files = _to_aria2_files(
-                    task.repo_id,
-                    file_list or [],
-                    endpoint=endpoint,
-                    token=ms_token,
-                )
-                task.total_size = sum(item.size for item in files)
+                files: list[Aria2File] = []
+                if aria2:
+                    file_list = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _fetch_ms_file_manifest,
+                            task.repo_id,
+                            endpoint=endpoint,
+                            token=ms_token,
+                        ),
+                        timeout=_MS_API_TIMEOUT,
+                    )
+                    files = _to_aria2_files(
+                        task.repo_id,
+                        file_list,
+                        endpoint=endpoint,
+                        token=ms_token,
+                    )
+                    task.total_size = sum(item.size for item in files)
+                else:
+                    try:
+                        api = _get_ms_api()
+                        if api:
+                            file_list = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    api.get_model_files,
+                                    task.repo_id,
+                                ),
+                                timeout=_MS_API_TIMEOUT,
+                            )
+                            task.total_size = _extract_model_size_from_files(
+                                file_list or []
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not fetch file info for {task.repo_id}: {e}. "
+                            "Progress estimation will be unavailable."
+                        )
 
                 # Start progress polling
                 self._progress_tasks[task_id] = asyncio.create_task(
                     self._poll_progress(task_id, target_dir)
                 )
 
-                await (aria2 or Aria2Runner()).download(
-                    files,
-                    target_dir,
-                    bypass_proxies=endpoint != _DEFAULT_MS_ENDPOINT,
-                )
+                if aria2:
+                    await aria2.download(
+                        files,
+                        target_dir,
+                        bypass_proxies=endpoint != _DEFAULT_MS_ENDPOINT,
+                    )
+                else:
+                    if ms_snapshot_download is None:
+                        raise RuntimeError("ModelScope SDK not available")
+                    dl_kwargs = {
+                        "model_id": task.repo_id,
+                        "local_dir": str(target_dir),
+                    }
+                    if ms_token:
+                        dl_kwargs["token"] = ms_token
+                    await asyncio.to_thread(ms_snapshot_download, **dl_kwargs)
 
-                # Check if cancelled while downloading. aria2 keeps its
-                # partial files so a retry can resume instead of starting over.
+                # Aria2 partials remain hidden for resume. Preserve the SDK's
+                # existing cleanup behavior when its blocking call finishes.
                 if task_id in self._cancelled:
+                    if not aria2 and target_dir.exists():
+                        shutil.rmtree(target_dir)
                     return
 
                 # Success
@@ -1031,7 +1093,7 @@ class MSDownloader:
                 task.downloaded_size = current_size
 
                 if task.total_size > 0:
-                    # Cap at 99% until aria2 confirms completion.
+                    # Cap at 99% until the active backend confirms completion.
                     task.progress = min(
                         (current_size / task.total_size) * 100, 99.0
                     )
@@ -1059,7 +1121,8 @@ class MSDownloader:
                         f"MS Download stalled for {task.repo_id} "
                         f"(task_id={task_id})"
                     )
-                    # Cancelling the task terminates its aria2 child process.
+                    # Cancelling terminates aria2 immediately; the SDK thread
+                    # retains its existing cooperative cancellation behavior.
                     active_task = self._active_tasks.get(task_id)
                     if active_task and not active_task.done():
                         active_task.cancel()
@@ -1088,7 +1151,7 @@ class MSDownloader:
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:
-        """Calculate total size of all files in a directory."""
+        """Calculate bytes physically present, not sparse logical lengths."""
         if not path.exists():
             return 0
         total = 0
@@ -1096,7 +1159,13 @@ class MSDownloader:
             for f in path.rglob("*"):
                 if f.is_file():
                     try:
-                        total += f.stat().st_size
+                        stat = f.stat()
+                        blocks = getattr(stat, "st_blocks", None)
+                        total += (
+                            stat.st_size
+                            if blocks is None
+                            else min(stat.st_size, blocks * 512)
+                        )
                     except OSError:
                         pass
         except OSError:

@@ -234,12 +234,12 @@
                             </button>
                         </div>
 
-                        <!-- aria2 dependency and transfer settings -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <!-- Optional ModelScope aria2 acceleration -->
+                        <div x-show="downloaderSource === 'ms'" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
                             <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div>
                                     <div class="text-xs font-bold uppercase tracking-wider text-neutral-600">aria2</div>
-                                    <div class="text-xs text-neutral-500 mt-1" x-text="aria2Status.installed ? (aria2Status.version || 'Ready') : 'Required for model downloads'"></div>
+                                    <div class="text-xs text-neutral-500 mt-1" x-text="aria2Status.installed ? (aria2Status.version || 'Ready') : 'Optional ModelScope acceleration'"></div>
                                 </div>
                                 <button x-show="!aria2Status.installed" @click="installAria2()" :disabled="aria2Installing"
                                         class="px-4 py-2 bg-neutral-900 text-white text-xs font-semibold rounded-full disabled:opacity-50">

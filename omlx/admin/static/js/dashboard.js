@@ -370,9 +370,7 @@
             aria2Saving: false,
             aria2Error: '',
             get aria2MirrorActive() {
-                const endpoint = this.downloaderSource === 'hf'
-                    ? this.globalSettings.huggingface.endpoint
-                    : this.globalSettings.modelscope.endpoint;
+                const endpoint = this.globalSettings.modelscope.endpoint;
                 return Boolean((endpoint || '').trim());
             },
             msAvailable: false,

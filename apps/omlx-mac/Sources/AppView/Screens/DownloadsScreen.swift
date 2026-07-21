@@ -39,18 +39,20 @@ struct DownloadsScreen: View {
                 msAvailable: vm.msAvailable
             )
 
-            Aria2SettingsSection(
-                installed: vm.aria2Installed,
-                version: vm.aria2Version,
-                installing: vm.aria2Installing,
-                saving: vm.aria2Saving,
-                proxyDisabled: vm.aria2ProxyDisabled,
-                proxy: $vm.aria2Proxy,
-                connectionsPerFile: $vm.aria2ConnectionsPerFile,
-                concurrentFiles: $vm.aria2ConcurrentFiles,
-                onInstall: { vm.installAria2(client: services.client) },
-                onSave: { vm.saveAria2Settings(client: services.client) }
-            )
+            if vm.source == .ms {
+                Aria2SettingsSection(
+                    installed: vm.aria2Installed,
+                    version: vm.aria2Version,
+                    installing: vm.aria2Installing,
+                    saving: vm.aria2Saving,
+                    proxyDisabled: vm.aria2ProxyDisabled,
+                    proxy: $vm.aria2Proxy,
+                    connectionsPerFile: $vm.aria2ConnectionsPerFile,
+                    concurrentFiles: $vm.aria2ConcurrentFiles,
+                    onInstall: { vm.installAria2(client: services.client) },
+                    onSave: { vm.saveAria2Settings(client: services.client) }
+                )
+            }
 
             if vm.source == .hf {
                 AddFromHFSection(
@@ -165,7 +167,7 @@ private struct Aria2SettingsSection: View {
                     Image(systemName: installed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .foregroundStyle(installed ? .green : .orange)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(installed ? (version ?? "aria2 ready") : "aria2 is required for model downloads")
+                        Text(installed ? (version ?? "aria2 ready") : "Optional ModelScope acceleration")
                             .font(.omlxText(12, weight: .medium))
                         if !installed {
                             Text("One-click installation uses Homebrew. Install Homebrew first if it is unavailable.")

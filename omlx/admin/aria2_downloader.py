@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared aria2 process support for Hugging Face and ModelScope downloads."""
+"""Optional aria2 process support for ModelScope downloads."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import tempfile
@@ -23,7 +24,7 @@ _PROXY_KEYS = {
 
 
 class Aria2UnavailableError(RuntimeError):
-    """Raised when a model download is requested without aria2 installed."""
+    """Raised when an aria2 runner is requested without aria2 installed."""
 
 
 class Aria2DownloadError(RuntimeError):
@@ -62,20 +63,23 @@ def find_brew() -> str | None:
     return _find_executable("brew", _BREW_PATHS)
 
 
-def configured_aria2_runner() -> Aria2Runner:
-    """Build a runner from global settings, with defaults before init."""
+def configured_aria2_runner() -> Aria2Runner | None:
+    """Build a configured runner, or return None when aria2 is unavailable."""
 
     try:
         from ..settings import get_settings
 
         settings = get_settings().aria2
     except (RuntimeError, AttributeError):
-        return Aria2Runner()
-    return Aria2Runner(
-        proxy=settings.proxy,
-        connections_per_file=settings.connections_per_file,
-        concurrent_files=settings.concurrent_files,
-    )
+        settings = None
+    try:
+        return Aria2Runner(
+            proxy=settings.proxy if settings else "",
+            connections_per_file=settings.connections_per_file if settings else 8,
+            concurrent_files=settings.concurrent_files if settings else 4,
+        )
+    except Aria2UnavailableError:
+        return None
 
 
 async def get_aria2_status() -> dict[str, object]:
@@ -117,10 +121,7 @@ class Aria2Runner:
     ):
         self.executable = executable or find_aria2c()
         if not self.executable:
-            raise Aria2UnavailableError(
-                "aria2 is required for model downloads. Install it from the "
-                "Downloads screen or run: brew install aria2"
-            )
+            raise Aria2UnavailableError("aria2 is not installed")
         self.proxy = proxy.strip()
         self.connections_per_file = max(1, min(16, int(connections_per_file)))
         self.concurrent_files = max(1, min(16, int(concurrent_files)))
@@ -218,9 +219,10 @@ class Aria2Runner:
         *,
         bypass_proxies: bool,
     ) -> None:
-        """Run one aria2 process and always remove its protected manifest."""
+        """Download into hidden staging and publish files only after success."""
 
-        manifest = self.write_manifest(files, target_dir)
+        staging_dir = target_dir / "._____temp"
+        manifest = self.write_manifest(files, staging_dir)
         command = self.build_command(manifest, bypass_proxies=bypass_proxies)
         environment = self.build_environment(os.environ, bypass_proxies=bypass_proxies)
         process: asyncio.subprocess.Process | None = None
@@ -256,6 +258,15 @@ class Aria2Runner:
             raise Aria2DownloadError(
                 message.strip() or f"aria2 exited with status {process.returncode}."
             )
+
+        for item in files:
+            relative = PurePosixPath(item.relative_path)
+            staged = staging_dir.joinpath(*relative.parts)
+            destination = target_dir.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged, destination)
+        with contextlib.suppress(OSError):
+            staging_dir.rmdir()
 
 
 class Aria2Installer:

@@ -19,6 +19,9 @@ def test_dashboard_saves_both_concurrency_controls() -> None:
 
 
 def test_download_page_explains_controls_and_disables_proxy_for_mirror() -> None:
+    assert 'x-show="downloaderSource === \'ms\'"' in TEMPLATE
+    assert "Optional ModelScope acceleration" in TEMPLATE
+    assert "Required for model downloads" not in TEMPLATE
     assert "Splits one large file into parallel ranges" in TEMPLATE
     assert "Controls how many files download at once" in TEMPLATE
     assert ':disabled="aria2MirrorActive"' in TEMPLATE

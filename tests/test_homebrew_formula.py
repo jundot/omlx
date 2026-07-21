@@ -48,8 +48,8 @@ def formula_update_workflow() -> str:
 
 
 class TestFormulaReleaseUpdate:
-    def test_aria2_is_a_runtime_dependency(self, formula):
-        assert 'depends_on "aria2"' in formula
+    def test_aria2_is_not_a_runtime_dependency(self, formula):
+        assert 'depends_on "aria2"' not in formula
 
     def test_source_sha_update_is_scoped_to_top_level(self, formula_update_workflow):
         """Release bumps must not replace checksums inside resource blocks."""
