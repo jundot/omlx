@@ -263,6 +263,10 @@
                                         <div class="mt-2 ml-5 space-y-1.5">
                                             <template x-for="pp in m.prefilling" :key="pp.request_id">
                                                 <div class="flex items-center gap-2">
+                                                    <span x-show="requestAttributionLabel(pp)"
+                                                          class="text-[10px] font-medium text-neutral-700 max-w-64 truncate"
+                                                          :title="requestAttributionTitle(pp)"
+                                                          x-text="requestAttributionLabel(pp)"></span>
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="pp.request_id.substring(0, 8)"></span>
                                                     <div class="flex-1 h-1.5 bg-neutral-100 rounded-full overflow-hidden max-w-[120px]">
                                                         <div class="h-full bg-blue-400 rounded-full transition-all duration-300"
@@ -284,6 +288,10 @@
                                         <div class="mt-1.5 ml-5 space-y-1.5">
                                             <template x-for="gen in m.generating" :key="gen.request_id">
                                                 <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+                                                    <span x-show="requestAttributionLabel(gen)"
+                                                          class="text-[10px] font-medium text-neutral-700 max-w-64 truncate"
+                                                          :title="requestAttributionTitle(gen)"
+                                                          x-text="requestAttributionLabel(gen)"></span>
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
                                                     <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
                                                         <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
@@ -348,6 +356,10 @@
                                         <div class="mt-1.5 ml-5 space-y-1.5">
                                             <template x-for="wait in m.waiting" :key="wait.request_id">
                                                 <div class="flex items-center gap-2">
+                                                    <span x-show="requestAttributionLabel(wait)"
+                                                          class="text-[10px] font-medium text-neutral-700 max-w-64 truncate"
+                                                          :title="requestAttributionTitle(wait)"
+                                                          x-text="requestAttributionLabel(wait)"></span>
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
                                                     <span class="w-2 h-2 rounded-full bg-amber-300"></span>
                                                     <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>

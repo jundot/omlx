@@ -4535,6 +4535,17 @@ def _build_active_models_data() -> dict:
     total_active = 0
     total_waiting = 0
 
+    def request_attribution(req) -> dict:
+        """Return display-only attribution attached to a scheduler request."""
+        if req is None:
+            return {}
+        return dict(getattr(req, "metadata", {}) or {})
+
+    def request_attribution_fields(req) -> dict:
+        """Return an optional response fragment without changing legacy rows."""
+        attribution = request_attribution(req)
+        return {"attribution": attribution} if attribution else {}
+
     for model_info in status.get("models", []):
         if not model_info.get("loaded") and not model_info.get("is_loading"):
             continue
@@ -4587,6 +4598,7 @@ def _build_active_models_data() -> dict:
                         "queue_position": idx,
                         "elapsed_seconds": max(0.0, now - req.arrival_time),
                         "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                        **request_attribution_fields(req),
                     }
                     for idx, req in enumerate(waiting_queue, start=1)
                 ]
@@ -4599,6 +4611,10 @@ def _build_active_models_data() -> dict:
                 activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
+        for progress in prefilling:
+            attribution = request_attribution(running_by_id.get(progress["request_id"]))
+            if attribution:
+                progress["attribution"] = attribution
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
             active_request_ids = set(running_by_id) | prefilling_ids
@@ -4631,6 +4647,7 @@ def _build_active_models_data() -> dict:
                     "last_activity_age_seconds": last_activity_age,
                     "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                    **request_attribution_fields(req),
                 }
             )
 

@@ -2755,6 +2755,23 @@
                 return 'last token ' + this.formatDurationShort(seconds) + ' ago';
             },
 
+            requestAttributionLabel(request) {
+                const a = request?.attribution || {};
+                return [a.source, a.channel, a.agent, a.session_name]
+                    .filter(Boolean)
+                    .join(' · ');
+            },
+
+            requestAttributionTitle(request) {
+                const a = request?.attribution || {};
+                const ids = [];
+                if (a.session_id) ids.push('session: ' + a.session_id);
+                if (a.conversation_id) ids.push('conversation: ' + a.conversation_id);
+                if (a.external_request_id) ids.push('external request: ' + a.external_request_id);
+                ids.push('oMLX request: ' + request.request_id);
+                return ids.join('\n');
+            },
+
             formatActivityMetadata(activity) {
                 const parts = [];
                 if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
