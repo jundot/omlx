@@ -199,6 +199,10 @@ def maybe_apply_pre_load_patches(
 
     set_mtp_active(False)
 
+    from ..patches.qwen35_yarn_rope import set_yarn_params
+
+    set_yarn_params(None)
+
     _patch_mlx_lm_load_config()
 
     config_path = Path(model_name) / "config.json"
@@ -463,6 +467,62 @@ def maybe_apply_pre_load_patches(
                     "qwen3_6 nested-visual sanitize wrap applied for %s",
                     model_name,
                 )
+
+    # YaRN RoPE frequency correction for Qwen3.5/3.6 MRoPE VLMs.
+    # Auto-detects from text_config.rope_parameters.type == "yarn" in
+    # config.json, or force-enabled via model_settings.yarn_enabled.
+    if for_vlm and model_type and model_type.startswith("qwen3_5"):
+        text_cfg = config.get("text_config") or {}
+        rope_params = text_cfg.get("rope_parameters") or {}
+        rope_type = rope_params.get("type") or rope_params.get("rope_type")
+
+        yarn_active = rope_type == "yarn"
+        forced = False
+        if model_settings is not None and getattr(model_settings, "yarn_enabled", None) is True:
+            yarn_active = True
+            forced = True
+
+        if yarn_active:
+            factor = float(
+                getattr(model_settings, "yarn_factor", None)
+                or rope_params.get("factor")
+                or 2.0
+            )
+            orig_max_pos = int(
+                rope_params.get("original_max_position_embeddings")
+                or text_cfg.get("max_position_embeddings", 32768)
+            )
+            yarn_params = {
+                "factor": factor,
+                "orig_max_pos": orig_max_pos,
+                "beta_fast": float(rope_params.get("beta_fast", 32.0)),
+                "beta_slow": float(rope_params.get("beta_slow", 1.0)),
+                "mscale": float(rope_params.get("mscale", 1.0)),
+                "mscale_all_dim": float(rope_params.get("mscale_all_dim", 0.0)),
+            }
+            from ..patches.qwen35_yarn_rope import (
+                apply_qwen35_yarn_rope_patch,
+                set_yarn_params,
+            )
+
+            set_yarn_params(yarn_params)
+            if apply_qwen35_yarn_rope_patch():
+                logger.info(
+                    "YaRN RoPE patch active for %s (factor=%.2f, orig_max_pos=%d%s)",
+                    model_name,
+                    factor,
+                    orig_max_pos,
+                    " [forced by settings]" if forced else "",
+                )
+
+
+def _is_yarn_compatible(
+    config: dict, model_type: str | None, *, is_vlm: bool = False
+) -> bool:
+    """True iff the model supports YaRN RoPE via the oMLX patch."""
+    if not is_vlm or not model_type:
+        return False
+    return model_type.startswith("qwen3_5")
 
 
 def _has_mtp_heads(config: dict) -> bool:

@@ -148,6 +148,9 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    # YaRN RoPE context extension (Qwen3.5/3.6 VLMs only)
+    yarn_enabled: bool | None = None
+    yarn_factor: float | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -607,6 +610,42 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
+
+
+def _yarn_compat_for_model(model_info: dict) -> tuple[bool, int | None]:
+    """Return ``(compatible, native_context_length)`` for YaRN RoPE.
+
+    ``native_context_length`` is the original ``max_position_embeddings``
+    from the model config (before any YaRN scaling).  Returned alongside
+    the compat flag so the admin UI can auto-suggest a scaled context
+    window when the user toggles YaRN on.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from ..utils.model_loading import _is_yarn_compatible
+
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, None
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        return False, None
+    try:
+        cfg = _json.loads(cfg_path.read_text())
+    except Exception:
+        return False, None
+    compatible = _is_yarn_compatible(
+        cfg, cfg.get("model_type"), is_vlm=model_info.get("model_type") == "vlm"
+    )
+    native_ctx = None
+    if compatible:
+        text_cfg = cfg.get("text_config") or {}
+        native_ctx = (
+            text_cfg.get("max_position_embeddings")
+            or cfg.get("max_position_embeddings")
+        )
+    return compatible, native_ctx
 
 
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -1900,6 +1939,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        yarn_compat_ok, yarn_native_ctx = _yarn_compat_for_model(model_info)
 
         model_data = {
             "id": model_id,
@@ -1949,6 +1989,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatibility_reason": mtp_compat_reason,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "yarn_compatible": yarn_compat_ok,
+            "yarn_native_context_length": yarn_native_ctx,
         }
 
         # Add settings if available
@@ -1994,6 +2036,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "mtp_compatibility_reason": "",
                 "is_paroquant": False,
                 "paroquant_reason": "",
+                "yarn_compatible": False,
+                "yarn_native_context_length": None,
                 "virtual": True,
             }
         )
@@ -2375,6 +2419,17 @@ async def update_model_settings(
         # Anything else (including empty string) → revert to dflash default.
         current_settings.dflash_verify_mode = (
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
+        )
+
+    # YaRN RoPE context extension
+    if "yarn_enabled" in sent:
+        current_settings.yarn_enabled = (
+            True if request.yarn_enabled else None
+        )
+    if "yarn_factor" in sent:
+        value = request.yarn_factor
+        current_settings.yarn_factor = (
+            float(value) if value and value > 1.0 else None
         )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)

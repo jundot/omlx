@@ -142,6 +142,12 @@ class ModelSettings:
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
+    # YaRN RoPE context extension (Qwen3.5/3.6 VLMs only)
+    # None = auto-detect from rope_parameters.type in config.json
+    # True = force YaRN even when config does not declare it
+    yarn_enabled: Optional[bool] = None
+    yarn_factor: Optional[float] = None  # Override scaling factor (None = use config or 2.0)
+
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8

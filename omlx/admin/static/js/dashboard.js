@@ -1482,6 +1482,10 @@
                     ttl_seconds: s.ttl_seconds ?? null,
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
+                    yarn_enabled: s.yarn_enabled === true,
+                    yarn_factor: s.yarn_factor || null,
+                    yarn_compatible: model?.yarn_compatible === true,
+                    yarn_native_context_length: model?.yarn_native_context_length || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     specprefill_enabled: s.specprefill_enabled || false,
@@ -1999,6 +2003,9 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
+                                yarn_enabled: this.modelSettings.yarn_enabled ? true : null,
+                                yarn_factor: this.modelSettings.yarn_enabled && this.modelSettings.yarn_factor
+                                    ? parseFloat(this.modelSettings.yarn_factor) : null,
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
@@ -2083,6 +2090,9 @@
                                     guided_grammar_enabled: false,
                                     guided_grammar: null,
                                     max_tool_result_tokens: 0,
+                                    yarn_enabled: false,
+                                    yarn_factor: null,
+                                    yarn_native_context_length: null,
                                     turboquant_kv_enabled: false,
                                     turboquant_kv_bits: 4,
                                     specprefill_enabled: false,
