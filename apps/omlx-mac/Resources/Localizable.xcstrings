@@ -8680,56 +8680,14 @@
         }
       }
     },
-    "quant.about.body1" : {
-      "comment" : "First body paragraph of the About oQ card",
+    "quant.about.subtitle" : {
+      "comment" : "Subtitle of the collapsible About oQ Quantization card",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Quantization should not be exclusive to any particular inference server. oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format. No custom loader required."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Квантование не должно быть привязано к конкретному inference-серверу. oQ создает стандартные модели mlx-lm, которые работают везде — в oMLX, mlx-lm, LM Studio и любом приложении с поддержкой формата MLX safetensors. Пользовательский загрузчик не нужен."
-          }
-        }
-      }
-    },
-    "quant.about.body2" : {
-      "comment" : "Second body paragraph of the About oQ card",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16) and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they matter most. Every model gets a unique bit allocation tuned to its architecture."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "oQ оценивает чувствительность каждого слоя к квантованию на калибровочных данных (относительная MSE относительно float16) и строит план смешанной точности с ограничением по объёму, распределяя биты там, где данные показывают наибольшую важность. Для каждой модели подбирается уникальное распределение битов с учётом её архитектуры."
-          }
-        }
-      }
-    },
-    "quant.about.headline" : {
-      "comment" : "Headline inside the About oQ card",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "oMLX Universal Dynamic Quantization"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Универсальное динамическое квантование oMLX"
+            "value" : "Compare standard oQ with oQe imatrix and how enhanced quantization works."
           }
         }
       }
@@ -8748,6 +8706,426 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "О квантовании oQ"
+          }
+        }
+      }
+    },
+    "quant.about.intro_title" : {
+      "comment" : "Large heading inside the expanded About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ: oMLX Universal Dynamic Quantization"
+          }
+        }
+      }
+    },
+    "quant.about.quote.exclusive" : {
+      "comment" : "Quoted line inside the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantization should not be exclusive to any particular inference server."
+          }
+        }
+      }
+    },
+    "quant.about.quote.works_everywhere" : {
+      "comment" : "Quoted line inside the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format."
+          }
+        }
+      }
+    },
+    "quant.about.quote.no_loader" : {
+      "comment" : "Quoted line inside the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No custom loader required."
+          }
+        }
+      }
+    },
+    "quant.about.mixed_precision.title" : {
+      "comment" : "Section heading in the expanded About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ and oQe: MLX-native mixed precision"
+          }
+        }
+      }
+    },
+    "quant.about.mixed_precision.body" : {
+      "comment" : "Section body in the expanded About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted affine quantization."
+          }
+        }
+      }
+    },
+    "quant.about.standard.heading" : {
+      "comment" : "Heading for the standard-oQ feature list in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "What standard oQ does"
+          }
+        }
+      }
+    },
+    "quant.about.standard.layer_sensitivity.title" : {
+      "comment" : "Standard-oQ feature title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Layer sensitivity"
+          }
+        }
+      }
+    },
+    "quant.about.standard.layer_sensitivity.body" : {
+      "comment" : "Standard-oQ feature body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "is measured with calibration prompts by comparing quantized-layer output error against the float baseline."
+          }
+        }
+      }
+    },
+    "quant.about.standard.mixed_precision.title" : {
+      "comment" : "Standard-oQ feature title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mixed precision"
+          }
+        }
+      }
+    },
+    "quant.about.standard.mixed_precision.body" : {
+      "comment" : "Standard-oQ feature body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "allocates higher bits to sensitive layers and protected tensors while keeping the target bits-per-weight budget under a hard cap."
+          }
+        }
+      }
+    },
+    "quant.about.standard.architecture.title" : {
+      "comment" : "Standard-oQ feature title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Architecture rules"
+          }
+        }
+      }
+    },
+    "quant.about.standard.architecture.body" : {
+      "comment" : "Standard-oQ feature body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "keep MoE routers in fp16, protect shared experts and output-critical tensors, leave vision/audio encoders unquantized, and preserve SSM state tensors."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.heading" : {
+      "comment" : "Heading for the oQe addition section in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "What oQe adds"
+          }
+        }
+      }
+    },
+    "quant.about.oqe.intro" : {
+      "comment" : "oQe section body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step. This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from representative prompts, then use that information so quantization spends less error on the input channels that matter most."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.how.heading" : {
+      "comment" : "Heading for the imatrix steps in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How oQe imatrix works"
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.collect.title" : {
+      "comment" : "oQe imatrix step title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Collect activation energy."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.collect.body" : {
+      "comment" : "oQe imatrix step body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe runs calibration samples through the model and records average input activation squared, E[x^2], for each quantized Linear input channel."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.experts.title" : {
+      "comment" : "oQe imatrix step title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Track experts separately."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.experts.body" : {
+      "comment" : "oQe imatrix step body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "For MoE SwitchLinear layers, oQe records one importance vector per expert using the router-selected expert indices, so inactive or rarely active experts are visible in the coverage report."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.adapt.title" : {
+      "comment" : "oQe imatrix step title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adapt sample count."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.adapt.body" : {
+      "comment" : "oQe imatrix step body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Calibration starts from the requested sample count and can continue up to the adaptive maximum when MoE expert coverage is not sufficient."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.weight.title" : {
+      "comment" : "oQe imatrix step title in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weight the quantization error."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.step.weight.body" : {
+      "comment" : "oQe imatrix step body in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "During affine quantization, oQe chooses scale/bias candidates by minimizing sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE."
+          }
+        }
+      }
+    },
+    "quant.about.oqe.fallback" : {
+      "comment" : "Footnote under the imatrix steps in the About oQ card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "If a tensor has no matching imatrix entry, the default behavior is to fall back to standard oQ for that tensor. Enable strict coverage to fail instead."
+          }
+        }
+      }
+    },
+    "quant.about.table.header.path" : {
+      "comment" : "Header cell in the oQ/oQe comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Path"
+          }
+        }
+      }
+    },
+    "quant.about.table.header.bits" : {
+      "comment" : "Header cell in the oQ/oQe comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bit allocation"
+          }
+        }
+      }
+    },
+    "quant.about.table.header.affine" : {
+      "comment" : "Header cell in the oQ/oQe comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Affine quantization"
+          }
+        }
+      }
+    },
+    "quant.about.table.header.use" : {
+      "comment" : "Header cell in the oQ/oQe comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Best use"
+          }
+        }
+      }
+    },
+    "quant.about.table.oq.bits" : {
+      "comment" : "oQ row cell in the comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Layer-sensitivity mixed precision"
+          }
+        }
+      }
+    },
+    "quant.about.table.oq.affine" : {
+      "comment" : "oQ row cell in the comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard min/max affine per group"
+          }
+        }
+      }
+    },
+    "quant.about.table.oq.use" : {
+      "comment" : "oQ row cell in the comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fast, deterministic conversion with strong baseline quality"
+          }
+        }
+      }
+    },
+    "quant.about.table.oqe.bits" : {
+      "comment" : "oQe row cell in the comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Same oQ plan"
+          }
+        }
+      }
+    },
+    "quant.about.table.oqe.affine" : {
+      "comment" : "oQe row cell in the comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "imatrix-weighted clipping/search per group"
+          }
+        }
+      }
+    },
+    "quant.about.table.oqe.use" : {
+      "comment" : "oQe row cell in the comparison table",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Better low-bit retention, especially for MoE and activation-skewed layers"
           }
         }
       }
@@ -8928,6 +9306,138 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Запуск…"
+          }
+        }
+      }
+    },
+    "quant.enhanced.cache_path.label" : {
+      "comment" : "Label for the optional oQe imatrix cache path input",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Imatrix cache path"
+          }
+        }
+      }
+    },
+    "quant.enhanced.cache_path.placeholder" : {
+      "comment" : "Placeholder for an automatically selected oQe imatrix cache path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatic"
+          }
+        }
+      }
+    },
+    "quant.enhanced.cache_path.sub" : {
+      "comment" : "Sublabel for the optional oQe imatrix cache path input",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leave empty to use an automatic cache location."
+          }
+        }
+      }
+    },
+    "quant.enhanced.enable.label" : {
+      "comment" : "Toggle label that enables enhanced oQe quantization",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enable oQe"
+          }
+        }
+      }
+    },
+    "quant.enhanced.enable.sub" : {
+      "comment" : "Toggle sublabel explaining what enabling oQe does",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Collect activation importance and use it to reduce affine quantization error."
+          }
+        }
+      }
+    },
+    "quant.enhanced.reuse.label" : {
+      "comment" : "Toggle label for reusing a compatible oQe imatrix cache",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reuse imatrix cache"
+          }
+        }
+      }
+    },
+    "quant.enhanced.reuse.sub" : {
+      "comment" : "Toggle sublabel for the oQe imatrix cache reuse option",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use a compatible cached imatrix when available; otherwise collect a new one."
+          }
+        }
+      }
+    },
+    "quant.enhanced.strict.label" : {
+      "comment" : "Toggle label for requiring imatrix entries for every quantized tensor",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Strict imatrix coverage"
+          }
+        }
+      }
+    },
+    "quant.enhanced.strict.sub" : {
+      "comment" : "Toggle sublabel for strict oQe imatrix coverage",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fail when a quantized tensor has no matching imatrix entry instead of falling back to standard oQ."
+          }
+        }
+      }
+    },
+    "quant.enhanced.subtitle" : {
+      "comment" : "Section subtitle explaining oQe imatrix calibration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use imatrix calibration to weight affine quantization by activation importance."
+          }
+        }
+      }
+    },
+    "quant.enhanced.title" : {
+      "comment" : "Section title for the optional oQe imatrix-calibration controls",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enhanced quantization (oQe)"
           }
         }
       }

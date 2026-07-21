@@ -13,6 +13,10 @@
 //                            (live from /api/oq/estimate, debounced at
 //                            300 ms to match the JS dashboard).
 //
+//   Enhanced quantization — oQe imatrix calibration controls: enable it,
+//                            reuse or select the cache path, and require
+//                            complete imatrix coverage.
+//
 //   Advanced settings     — collapsible block with text-only toggle (VLM
 //                            only), preserve-MTP toggle (only when the
 //                            source model exposes MTP heads), and the
@@ -64,6 +68,7 @@ struct QuantizationScreen: View {
                 selectedModelPath: $vm.selectedModelPath,
                 sensitivityModelPath: $vm.sensitivityModelPath,
                 oqLevel: $vm.oqLevel,
+                enhanced: vm.enhanced,
                 isStarting: vm.isStarting,
                 modelsLoaded: vm.modelsLoaded,
                 onStart: { vm.startQuantization(client: services.client) }
@@ -77,6 +82,14 @@ struct QuantizationScreen: View {
                 )
             }
 
+            EnhancedQuantizationSection(
+                enabled: $vm.enhanced,
+                reuseCache: $vm.imatrixReuseCache,
+                cachePath: $vm.imatrixCachePath,
+                strictCoverage: $vm.imatrixStrict
+            )
+            .padding(.bottom, 12)
+
             AdvancedSection(
                 isOpen: $vm.advancedOpen,
                 selectedIsVLM: vm.selectedIsVLM,
@@ -85,6 +98,7 @@ struct QuantizationScreen: View {
                 preserveMtp: $vm.preserveMtp,
                 dtype: $vm.dtype
             )
+            .padding(.bottom, 12)
 
             MessageBanner(error: vm.lastError, success: vm.lastSuccess)
 
@@ -135,6 +149,7 @@ private struct SourceModelSection: View {
     @Binding var selectedModelPath: String
     @Binding var sensitivityModelPath: String
     @Binding var oqLevel: Double
+    let enhanced: Bool
     let isStarting: Bool
     let modelsLoaded: Bool
     let onStart: () -> Void
@@ -195,7 +210,7 @@ private struct SourceModelSection: View {
                 Popup(
                     selection: $oqLevel,
                     width: 120,
-                    options: Self.levelOptions
+                    options: levelOptions
                 )
             }
 
@@ -249,19 +264,16 @@ private struct SourceModelSection: View {
         return opts
     }
 
-    // Mirrors the HTML <option>s.
-    static let levelOptions: [PopupOption<Double>] = [
-        PopupOption(value: 2,   label: "oQ2"),
-        PopupOption(value: 2.5, label: "oQ2.5"),
-        PopupOption(value: 2.7, label: "oQ2.7"),
-        PopupOption(value: 2.8, label: "oQ2.8"),
-        PopupOption(value: 3,   label: "oQ3"),
-        PopupOption(value: 3.5, label: "oQ3.5"),
-        PopupOption(value: 4,   label: "oQ4"),
-        PopupOption(value: 5,   label: "oQ5"),
-        PopupOption(value: 6,   label: "oQ6"),
-        PopupOption(value: 8,   label: "oQ8"),
-    ]
+    // Mirrors the HTML <option>s. oQe keeps the same bit levels, but makes
+    // the output variant explicit in the picker, as the web UI does.
+    private var levelOptions: [PopupOption<Double>] {
+        Self.levelValues.map { level in
+            let number = level.rounded() == level ? String(Int(level)) : String(level)
+            return PopupOption(value: level, label: "oQ\(number)\(enhanced ? "e" : "")")
+        }
+    }
+
+    private static let levelValues: [Double] = [2, 2.5, 2.7, 2.8, 3, 3.5, 4, 5, 6, 8]
 }
 
 // MARK: - Estimate strip
@@ -397,6 +409,86 @@ private struct AdvancedSection: View {
                             ("float16",  "float16"),
                         ])
                     }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Enhanced quantization (oQe)
+
+/// Controls the optional imatrix calibration pass used by oQe. The server
+/// generates a cache path when this field is left blank, so an empty value is
+/// intentionally sent rather than replaced with a client-specific path.
+private struct EnhancedQuantizationSection: View {
+    @Binding var enabled: Bool
+    @Binding var reuseCache: Bool
+    @Binding var cachePath: String
+    @Binding var strictCoverage: Bool
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "quant.enhanced.title",
+                   defaultValue: "Enhanced quantization (oQe)",
+                   comment: "Section title for the optional oQe imatrix-calibration controls"),
+            subtitle: String(localized: "quant.enhanced.subtitle",
+                             defaultValue: "Use imatrix calibration to weight affine quantization by activation importance.",
+                             comment: "Section subtitle explaining oQe imatrix calibration")
+        )
+
+        ListGroup {
+            Row(
+                label: String(localized: "quant.enhanced.enable.label",
+                              defaultValue: "Enable oQe",
+                              comment: "Toggle label that enables enhanced oQe quantization"),
+                sublabel: String(localized: "quant.enhanced.enable.sub",
+                                 defaultValue: "Collect activation importance and use it to reduce affine quantization error.",
+                                 comment: "Toggle sublabel explaining what enabling oQe does"),
+                isLast: !enabled
+            ) {
+                Toggle("", isOn: $enabled).labelsHidden().toggleStyle(.switch)
+            }
+
+            if enabled {
+                Row(
+                    label: String(localized: "quant.enhanced.reuse.label",
+                                  defaultValue: "Reuse imatrix cache",
+                                  comment: "Toggle label for reusing a compatible oQe imatrix cache"),
+                    sublabel: String(localized: "quant.enhanced.reuse.sub",
+                                     defaultValue: "Use a compatible cached imatrix when available; otherwise collect a new one.",
+                                     comment: "Toggle sublabel for the oQe imatrix cache reuse option")
+                ) {
+                    Toggle("", isOn: $reuseCache).labelsHidden().toggleStyle(.switch)
+                }
+
+                Row(
+                    label: String(localized: "quant.enhanced.cache_path.label",
+                                  defaultValue: "Imatrix cache path",
+                                  comment: "Label for the optional oQe imatrix cache path input"),
+                    sublabel: String(localized: "quant.enhanced.cache_path.sub",
+                                     defaultValue: "Leave empty to use an automatic cache location.",
+                                     comment: "Sublabel for the optional oQe imatrix cache path input")
+                ) {
+                    TextInput(
+                        text: $cachePath,
+                        placeholder: String(localized: "quant.enhanced.cache_path.placeholder",
+                                            defaultValue: "Automatic",
+                                            comment: "Placeholder for an automatically selected oQe imatrix cache path"),
+                        mono: true,
+                        width: 320
+                    )
+                }
+
+                Row(
+                    label: String(localized: "quant.enhanced.strict.label",
+                                  defaultValue: "Strict imatrix coverage",
+                                  comment: "Toggle label for requiring imatrix entries for every quantized tensor"),
+                    sublabel: String(localized: "quant.enhanced.strict.sub",
+                                     defaultValue: "Fail when a quantized tensor has no matching imatrix entry instead of falling back to standard oQ.",
+                                     comment: "Toggle sublabel for strict oQe imatrix coverage"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: $strictCoverage).labelsHidden().toggleStyle(.switch)
                 }
             }
         }
@@ -1143,37 +1235,266 @@ private struct UploadModalView: View {
 // MARK: - About
 
 private struct AboutSection: View {
+    @State private var isOpen = false
+
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader(String(localized: "quant.about.title",
-                              defaultValue: "About oQ Quantization",
-                              comment: "Section heading for the static About card on the Quantization screen"))
-
-        ListGroup {
-            FreeRow(isLast: true) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(String(localized: "quant.about.headline",
-                                defaultValue: "oMLX Universal Dynamic Quantization",
-                                comment: "Headline inside the About oQ card"))
-                        .font(.omlxText(13, weight: .semibold))
-                        .foregroundStyle(theme.text)
-                    Text(String(localized: "quant.about.body1",
-                                defaultValue: "Quantization should not be exclusive to any particular inference server. oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format. No custom loader required.",
-                                comment: "First body paragraph of the About oQ card"))
-                        .font(.omlxText(11.5))
-                        .foregroundStyle(theme.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(String(localized: "quant.about.body2",
-                                defaultValue: "oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16) and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they matter most. Every model gets a unique bit allocation tuned to its architecture.",
-                                comment: "Second body paragraph of the About oQ card"))
-                        .font(.omlxText(11.5))
-                        .foregroundStyle(theme.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) { isOpen.toggle() }
+            } label: {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(String(localized: "quant.about.title",
+                                    defaultValue: "About oQ Quantization",
+                                    comment: "Title of the collapsible About oQ Quantization card"))
+                            .font(.omlxText(13, weight: .semibold))
+                            .foregroundStyle(theme.text)
+                        Text(String(localized: "quant.about.subtitle",
+                                    defaultValue: "Compare standard oQ with oQe imatrix and how enhanced quantization works.",
+                                    comment: "Subtitle of the collapsible About oQ Quantization card"))
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    Spacer(minLength: 12)
+                    Image(systemName: isOpen ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(theme.textTertiary)
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isOpen {
+                Rectangle().fill(theme.rowSep).frame(height: 0.5)
+                aboutContent
+                    .padding(14)
             }
         }
+        .background(theme.groupBg)
+        .overlay {
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
+                .stroke(theme.rowSep, lineWidth: 0.5)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
+        .padding(.horizontal, 14)
         .padding(.bottom, 18)
+    }
+
+    private var aboutContent: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(
+                    String(localized: "quant.about.intro_title",
+                        defaultValue: "oQ: oMLX Universal Dynamic Quantization",
+                        comment: "Large heading inside the expanded About oQ card")
+                )
+                .font(.omlxText(16, weight: .bold))
+                .foregroundStyle(theme.text)
+                HStack(alignment: .top, spacing: 14) {
+                    Rectangle().fill(theme.rowSep).frame(width: 2)
+                    VStack(alignment: .leading, spacing: 6) {
+                        quote(
+                            String(localized: "quant.about.quote.exclusive",
+                                defaultValue: "Quantization should not be exclusive to any particular inference server.",
+                                comment: "Quoted line inside the About oQ card")
+                        )
+                        quote(
+                            String(localized: "quant.about.quote.works_everywhere",
+                                defaultValue: "oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format.",
+                                comment: "Quoted line inside the About oQ card")
+                        )
+                        quote(
+                            String(localized: "quant.about.quote.no_loader",
+                                defaultValue: "No custom loader required.",
+                                comment: "Quoted line inside the About oQ card")
+                        )
+                    }
+                }
+            }
+
+            section(
+                title: String(localized: "quant.about.mixed_precision.title",
+                    defaultValue: "oQ and oQe: MLX-native mixed precision",
+                    comment: "Section heading in the expanded About oQ card"),
+                body: String(localized: "quant.about.mixed_precision.body",
+                    defaultValue: "The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted affine quantization.",
+                    comment: "Section body in the expanded About oQ card")
+            )
+
+            VStack(alignment: .leading, spacing: 12) {
+                heading(
+                    String(localized: "quant.about.standard.heading",
+                        defaultValue: "What standard oQ does",
+                        comment: "Heading for the standard-oQ feature list in the About oQ card")
+                )
+                feature(
+                    icon: "waveform.path.ecg",
+                    title: String(localized: "quant.about.standard.layer_sensitivity.title",
+                        defaultValue: "Layer sensitivity",
+                        comment: "Standard-oQ feature title in the About oQ card"),
+                    body: String(localized: "quant.about.standard.layer_sensitivity.body",
+                        defaultValue: "is measured with calibration prompts by comparing quantized-layer output error against the float baseline.",
+                        comment: "Standard-oQ feature body in the About oQ card")
+                )
+                feature(
+                    icon: "slider.horizontal.3",
+                    title: String(localized: "quant.about.standard.mixed_precision.title",
+                        defaultValue: "Mixed precision",
+                        comment: "Standard-oQ feature title in the About oQ card"),
+                    body: String(localized: "quant.about.standard.mixed_precision.body",
+                        defaultValue: "allocates higher bits to sensitive layers and protected tensors while keeping the target bits-per-weight budget under a hard cap.",
+                        comment: "Standard-oQ feature body in the About oQ card")
+                )
+                feature(
+                    icon: "point.bottomleft.forward.to.point.topright.scurvepath",
+                    title: String(localized: "quant.about.standard.architecture.title",
+                        defaultValue: "Architecture rules",
+                        comment: "Standard-oQ feature title in the About oQ card"),
+                    body: String(localized: "quant.about.standard.architecture.body",
+                        defaultValue: "keep MoE routers in fp16, protect shared experts and output-critical tensors, leave vision/audio encoders unquantized, and preserve SSM state tensors.",
+                        comment: "Standard-oQ feature body in the About oQ card")
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                section(
+                    title: String(localized: "quant.about.oqe.heading",
+                        defaultValue: "What oQe adds",
+                        comment: "Heading for the oQe addition section in the About oQ card"),
+                    body: String(localized: "quant.about.oqe.intro",
+                        defaultValue: "oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step. This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from representative prompts, then use that information so quantization spends less error on the input channels that matter most.",
+                        comment: "oQe section body in the About oQ card")
+                )
+                comparisonTable
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                heading(
+                    String(localized: "quant.about.oqe.how.heading",
+                        defaultValue: "How oQe imatrix works",
+                        comment: "Heading for the imatrix steps in the About oQ card")
+                )
+                step(1,
+                     title: String(localized: "quant.about.oqe.step.collect.title",
+                         defaultValue: "Collect activation energy.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.collect.body",
+                         defaultValue: "oQe runs calibration samples through the model and records average input activation squared, E[x^2], for each quantized Linear input channel.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                step(2,
+                     title: String(localized: "quant.about.oqe.step.experts.title",
+                         defaultValue: "Track experts separately.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.experts.body",
+                         defaultValue: "For MoE SwitchLinear layers, oQe records one importance vector per expert using the router-selected expert indices, so inactive or rarely active experts are visible in the coverage report.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                step(3,
+                     title: String(localized: "quant.about.oqe.step.adapt.title",
+                         defaultValue: "Adapt sample count.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.adapt.body",
+                         defaultValue: "Calibration starts from the requested sample count and can continue up to the adaptive maximum when MoE expert coverage is not sufficient.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                step(4,
+                     title: String(localized: "quant.about.oqe.step.weight.title",
+                         defaultValue: "Weight the quantization error.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.weight.body",
+                         defaultValue: "During affine quantization, oQe chooses scale/bias candidates by minimizing sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                Text(
+                    String(localized: "quant.about.oqe.fallback",
+                        defaultValue: "If a tensor has no matching imatrix entry, the default behavior is to fall back to standard oQ for that tensor. Enable strict coverage to fail instead.",
+                        comment: "Footnote under the imatrix steps in the About oQ card")
+                )
+                .font(.omlxText(10.5))
+                .foregroundStyle(theme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var comparisonTable: some View {
+        let columns = Array(repeating: GridItem(.flexible(minimum: 72), alignment: .leading), count: 4)
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+            tableCell(String(localized: "quant.about.table.header.path", defaultValue: "Path", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell(String(localized: "quant.about.table.header.bits", defaultValue: "Bit allocation", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell(String(localized: "quant.about.table.header.affine", defaultValue: "Affine quantization", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell(String(localized: "quant.about.table.header.use", defaultValue: "Best use", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell("oQ", header: true)
+            tableCell(String(localized: "quant.about.table.oq.bits", defaultValue: "Layer-sensitivity mixed precision", comment: "oQ row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oq.affine", defaultValue: "Standard min/max affine per group", comment: "oQ row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oq.use", defaultValue: "Fast, deterministic conversion with strong baseline quality", comment: "oQ row cell in the comparison table"))
+            tableCell("oQe", header: true)
+            tableCell(String(localized: "quant.about.table.oqe.bits", defaultValue: "Same oQ plan", comment: "oQe row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oqe.affine", defaultValue: "imatrix-weighted clipping/search per group", comment: "oQe row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oqe.use", defaultValue: "Better low-bit retention, especially for MoE and activation-skewed layers", comment: "oQe row cell in the comparison table"))
+        }
+        .padding(.top, 2)
+    }
+
+    private func section(title: String, body: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            heading(title)
+            Text(body)
+                .font(.omlxText(11.5))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func heading(_ value: String) -> some View {
+        Text(value)
+            .font(.omlxText(13, weight: .semibold))
+            .foregroundStyle(theme.text)
+    }
+
+    private func quote(_ value: String) -> some View {
+        Text(value)
+            .font(.omlxText(11.5, weight: .semibold))
+            .italic()
+            .foregroundStyle(theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func feature(icon: String, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13))
+                .foregroundStyle(theme.textTertiary)
+                .frame(width: 16)
+            inlineText(title: title, body: body)
+        }
+    }
+
+    private func step(_ number: Int, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.omlxText(10, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+                .frame(width: 20, height: 20)
+                .background(theme.rowSep)
+                .clipShape(Circle())
+            inlineText(title: title, body: body)
+        }
+    }
+
+    private func inlineText(title: String, body: String) -> some View {
+        (Text(title).fontWeight(.semibold) + Text(" \(body)"))
+            .font(.omlxText(11.5))
+            .foregroundStyle(theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func tableCell(_ value: String, header: Bool = false) -> some View {
+        Text(value)
+            .font(.omlxText(10.5, weight: header ? .semibold : .regular))
+            .foregroundStyle(header ? theme.text : theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
