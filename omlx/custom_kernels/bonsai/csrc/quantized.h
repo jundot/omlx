@@ -1342,159 +1342,140 @@ constant constexpr uint T5_TO_B4[256] = {
     0x2A8, 0x2A9, 0x2AA, 0x000, 0x000, 0x000, 0x000, 0x000,
     0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000,
 };
-
 // ---------------------------------------------------------------------------
-// t5: base-3 ternary packing (Identity I-D)
+// qmv_fast_t5_impl — optimized (O1-O5)
 //
-// Format: ceil(group_size/5) bytes per group, 5 trits per byte.
-//   byte v = t0 + t1*3 + t2*9 + t3*27 + t4*81,  t_k ∈ {0,1,2}
-// Last byte of each group has (group_size % 5) active trits; remainder
-// is padded with q=1 (trit = 0, zero contribution to the dot product).
-//
-// group_size=128: 26 bytes/group (130 trits encoded; 2 padding=q1)
-// group_size=64:  13 bytes/group (65 trits encoded; 1 padding=q1)
-//
-// Always symmetric: dequant = scale * (q - 1), no bias tensor needed.
-// This saves the bias DRAM load AND the 2-bit overhead vs t5:
-//   2-bit gs=128: 32 bytes weight + 2 bias = 34 bytes/group
-//   t5   gs=128: 26 bytes weight only       = 26 bytes/group  (-23.5%)
+// [O1] packed_uchar4 weight loads (alignment 1, 7 loads vs 26 per row-group)
+// [O2] packed_half4 activation loads (2 loads vs 5 per 5-trit byte)
+// [O3] 20-trit chunk structure (4 bytes x 5 trits, fully unrolled)
+// [O4] USE_SIGMA: skip x_sum + pre-scale muls (sigma precomputed elsewhere)
+// [O5] row clamping instead of duplicated boundary loop
 // ---------------------------------------------------------------------------
-
-// qmv_fast_t5: single-batch decode (M=1).
-//
-// Thread geometry: same as qmv_fast_impl (4 simdgroups × 4 rows, 32 threads).
-// Each thread strides over groups at step SIMD_SIZE=32.
-//
-// Decode via T5_TO_B4 LUT + 2-bit pre-scaling trick (I-L):
-//   p = T5_TO_B4[byte]  — one constant-cache load replaces 4 divmod chains
-//   x_pre[k] = x[k] × 4^{−k}
-//   x_pre[k] × (p & (3<<2k))  =  x[k] × tₖ   (no integer division)
-//   result = s × (Σ x[k]tₖ − Σ x[k])           (−1 offset via x_sum)
-// x_sum is shared across all 4 rows, computed once per group.
-template <typename T, int group_size>
+template <typename T, int group_size, bool USE_SIGMA = false>
 METAL_FUNC void qmv_fast_t5_impl(
-    const device uint8_t* w,     // (N, n_groups * bytes_per_group) t5 bytes
-    const device T* scales,      // (N, n_groups) scale per group
-    const device T* x,           // (M, K) activations
-    device T* y,                 // (M, N) output
-    const constant int& in_vec_size,   // K
-    const constant int& out_vec_size,  // N
+    const device uint8_t* w,
+    const device T* scales,
+    const device T* x,            // pre-scaled by 4^{-(j%5)} when USE_SIGMA
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const device float* sigma,    // [n_groups] group sums; used iff USE_SIGMA
+    threadgroup const uint* lut,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
 
   constexpr int bytes_per_group = (group_size + 4) / 5;
-  constexpr int full_bytes = group_size / 5;
-  constexpr int rem_trits  = group_size % 5;
+  constexpr int full_bytes = group_size / 5;         // 25 for gs=128
+  constexpr int chunk_bytes = full_bytes & ~3;       // 24: packed_uchar4 part
+  constexpr int tail_full   = full_bytes - chunk_bytes; // 1 full byte in tail
+  constexpr int rem_trits   = group_size % 5;        // 3 for gs=128
   constexpr int num_simdgroups = 4;
   constexpr int results_per_simdgroup = 4;
 
   typedef float U;
-  thread U result[results_per_simdgroup] = {0};
+  constexpr U PS0 = 1.0f, PS1 = 0.25f, PS2 = 0.0625f,
+              PS3 = 0.015625f, PS4 = 0.00390625f;
 
+  thread U result[results_per_simdgroup] = {0};
   const int n_groups = in_vec_size / group_size;
   const int out_row  = tid.y * (num_simdgroups * results_per_simdgroup) +
                        simd_gid * results_per_simdgroup;
+  const int ng_bpg   = n_groups * bytes_per_group;
+
+  int rows[results_per_simdgroup];
+  bool row_ok[results_per_simdgroup];
+  for (int r = 0; r < results_per_simdgroup; r++) {
+    row_ok[r] = (out_row + r) < out_vec_size;
+    rows[r]   = row_ok[r] ? (out_row + r) : 0;
+  }
 
   const device T* x_batch = x + tid.x * in_vec_size;
-  const int ng_bpg = n_groups * bytes_per_group;
 
   for (int g = simd_lid; g < n_groups; g += SIMD_SIZE) {
     const device T* xg = x_batch + g * group_size;
+    const device uint8_t* wg0 = w + rows[0]*ng_bpg + g*bytes_per_group;
+    const device uint8_t* wg1 = w + rows[1]*ng_bpg + g*bytes_per_group;
+    const device uint8_t* wg2 = w + rows[2]*ng_bpg + g*bytes_per_group;
+    const device uint8_t* wg3 = w + rows[3]*ng_bpg + g*bytes_per_group;
+    const U s0 = U(scales[rows[0]*n_groups + g]);
+    const U s1 = U(scales[rows[1]*n_groups + g]);
+    const U s2 = U(scales[rows[2]*n_groups + g]);
+    const U s3 = U(scales[rows[3]*n_groups + g]);
 
-    if (out_row + results_per_simdgroup - 1 < out_vec_size) {
-      // ---- Fast path: all 4 rows in bounds ----
-      const device uint8_t* wg0 = w + (out_row+0)*ng_bpg + g*bytes_per_group;
-      const device uint8_t* wg1 = w + (out_row+1)*ng_bpg + g*bytes_per_group;
-      const device uint8_t* wg2 = w + (out_row+2)*ng_bpg + g*bytes_per_group;
-      const device uint8_t* wg3 = w + (out_row+3)*ng_bpg + g*bytes_per_group;
-      const U s0=U(scales[(out_row+0)*n_groups+g]), s1=U(scales[(out_row+1)*n_groups+g]);
-      const U s2=U(scales[(out_row+2)*n_groups+g]), s3=U(scales[(out_row+3)*n_groups+g]);
-      U a0=0, a1=0, a2=0, a3=0, x_sum=0;
+    U a0 = 0, a1 = 0, a2 = 0, a3 = 0, x_sum = 0;
 
-      for (int b = 0; b < full_bytes; b++) {
-        // One LUT load per row replaces 4 divmod chains (no integer division).
-        const uint p0=T5_TO_B4[wg0[b]], p1=T5_TO_B4[wg1[b]];
-        const uint p2=T5_TO_B4[wg2[b]], p3=T5_TO_B4[wg3[b]];
-        const int base = b * 5;
-        // Load x values; pre-scale by 4^{−k} so (mask × x_pre) = trit_k × x[k].
-        const U xv0=U(xg[base+0]), xv1=U(xg[base+1]), xv2=U(xg[base+2]);
-        const U xv3=U(xg[base+3]), xv4=U(xg[base+4]);
-        x_sum += xv0 + xv1 + xv2 + xv3 + xv4;
-        const U xp1=xv1*U(0.25f), xp2=xv2*U(0.0625f);
-        const U xp3=xv3*U(0.015625f), xp4=xv4*U(0.00390625f);
-        a0 += xv0*U(p0&0x003u)+xp1*U(p0&0x00Cu)+xp2*U(p0&0x030u)+xp3*U(p0&0x0C0u)+xp4*U(p0&0x300u);
-        a1 += xv0*U(p1&0x003u)+xp1*U(p1&0x00Cu)+xp2*U(p1&0x030u)+xp3*U(p1&0x0C0u)+xp4*U(p1&0x300u);
-        a2 += xv0*U(p2&0x003u)+xp1*U(p2&0x00Cu)+xp2*U(p2&0x030u)+xp3*U(p2&0x0C0u)+xp4*U(p2&0x300u);
-        a3 += xv0*U(p3&0x003u)+xp1*U(p3&0x00Cu)+xp2*U(p3&0x030u)+xp3*U(p3&0x0C0u)+xp4*U(p3&0x300u);
+#pragma clang loop unroll(full)
+    for (int c = 0; c < chunk_bytes / 4; c++) {
+      const packed_uchar4 q0 = *((const device packed_uchar4*)(wg0 + c*4));
+      const packed_uchar4 q1 = *((const device packed_uchar4*)(wg1 + c*4));
+      const packed_uchar4 q2 = *((const device packed_uchar4*)(wg2 + c*4));
+      const packed_uchar4 q3 = *((const device packed_uchar4*)(wg3 + c*4));
+#pragma clang loop unroll(full)
+      for (int bb = 0; bb < 4; bb++) {
+        const uint p0 = lut[q0[bb]], p1 = lut[q1[bb]];
+        const uint p2 = lut[q2[bb]], p3 = lut[q3[bb]];
+        const int base = (c*4 + bb) * 5;
+        const packed_half4 xv4 = *((const device packed_half4*)(xg + base));
+        const U xv0 = U(xv4[0]), xv1 = U(xv4[1]), xv2 = U(xv4[2]), xv3 = U(xv4[3]);
+        const U xv4s = U(xg[base + 4]);
+        U xp1, xp2, xp3, xp4;
+        if constexpr (USE_SIGMA) { xp1=xv1; xp2=xv2; xp3=xv3; xp4=xv4s; }
+        else { x_sum += xv0+xv1+xv2+xv3+xv4s; xp1=xv1*PS1; xp2=xv2*PS2; xp3=xv3*PS3; xp4=xv4s*PS4; }
+        a0+=xv0*U(p0&0x003u)+xp1*U(p0&0x00Cu)+xp2*U(p0&0x030u)+xp3*U(p0&0x0C0u)+xp4*U(p0&0x300u);
+        a1+=xv0*U(p1&0x003u)+xp1*U(p1&0x00Cu)+xp2*U(p1&0x030u)+xp3*U(p1&0x0C0u)+xp4*U(p1&0x300u);
+        a2+=xv0*U(p2&0x003u)+xp1*U(p2&0x00Cu)+xp2*U(p2&0x030u)+xp3*U(p2&0x0C0u)+xp4*U(p2&0x300u);
+        a3+=xv0*U(p3&0x003u)+xp1*U(p3&0x00Cu)+xp2*U(p3&0x030u)+xp3*U(p3&0x0C0u)+xp4*U(p3&0x300u);
+      }
+    }
+    if constexpr (tail_full > 0 || rem_trits > 0) {
+      ushort t0, t1, t2, t3;
+      if constexpr (tail_full > 0) {
+        t0 = *((const device ushort*)(wg0 + chunk_bytes));
+        t1 = *((const device ushort*)(wg1 + chunk_bytes));
+        t2 = *((const device ushort*)(wg2 + chunk_bytes));
+        t3 = *((const device ushort*)(wg3 + chunk_bytes));
+      } else {
+        t0 = ushort(wg0[chunk_bytes]) << 8; t1 = ushort(wg1[chunk_bytes]) << 8;
+        t2 = ushort(wg2[chunk_bytes]) << 8; t3 = ushort(wg3[chunk_bytes]) << 8;
+      }
+      if constexpr (tail_full > 0) {
+        const uint p0=lut[t0&0xFF], p1=lut[t1&0xFF], p2=lut[t2&0xFF], p3=lut[t3&0xFF];
+        const int base = chunk_bytes * 5;
+        const packed_half4 xv4 = *((const device packed_half4*)(xg + base));
+        const U xv0=U(xv4[0]), xv1=U(xv4[1]), xv2=U(xv4[2]), xv3=U(xv4[3]), xv4s=U(xg[base+4]);
+        U xp1,xp2,xp3,xp4;
+        if constexpr (USE_SIGMA) { xp1=xv1;xp2=xv2;xp3=xv3;xp4=xv4s; }
+        else { x_sum+=xv0+xv1+xv2+xv3+xv4s; xp1=xv1*PS1;xp2=xv2*PS2;xp3=xv3*PS3;xp4=xv4s*PS4; }
+        a0+=xv0*U(p0&0x003u)+xp1*U(p0&0x00Cu)+xp2*U(p0&0x030u)+xp3*U(p0&0x0C0u)+xp4*U(p0&0x300u);
+        a1+=xv0*U(p1&0x003u)+xp1*U(p1&0x00Cu)+xp2*U(p1&0x030u)+xp3*U(p1&0x0C0u)+xp4*U(p1&0x300u);
+        a2+=xv0*U(p2&0x003u)+xp1*U(p2&0x00Cu)+xp2*U(p2&0x030u)+xp3*U(p2&0x0C0u)+xp4*U(p2&0x300u);
+        a3+=xv0*U(p3&0x003u)+xp1*U(p3&0x00Cu)+xp2*U(p3&0x030u)+xp3*U(p3&0x0C0u)+xp4*U(p3&0x300u);
       }
       if constexpr (rem_trits > 0) {
-        const uint p0=T5_TO_B4[wg0[full_bytes]], p1=T5_TO_B4[wg1[full_bytes]];
-        const uint p2=T5_TO_B4[wg2[full_bytes]], p3=T5_TO_B4[wg3[full_bytes]];
+        const uint p0=lut[t0>>8], p1=lut[t1>>8], p2=lut[t2>>8], p3=lut[t3>>8];
         const int base = full_bytes * 5;
-        if constexpr (rem_trits >= 1) {
-          const U xv=U(xg[base+0]); x_sum+=xv;
-          a0+=xv*U(p0&0x003u); a1+=xv*U(p1&0x003u);
-          a2+=xv*U(p2&0x003u); a3+=xv*U(p3&0x003u);
+#pragma clang loop unroll(full)
+        for (int k = 0; k < rem_trits; k++) {
+          const U xv=U(xg[base+k]); U xp;
+          if constexpr (USE_SIGMA) { xp=xv; }
+          else { x_sum+=xv; xp=xv*(k==0?PS0:k==1?PS1:k==2?PS2:k==3?PS3:PS4); }
+          const uint m=0x3u<<(2*k);
+          a0+=xp*U(p0&m); a1+=xp*U(p1&m); a2+=xp*U(p2&m); a3+=xp*U(p3&m);
         }
-        if constexpr (rem_trits >= 2) {
-          const U xp=U(xg[base+1])*U(0.25f); x_sum+=U(xg[base+1]);
-          a0+=xp*U(p0&0x00Cu); a1+=xp*U(p1&0x00Cu);
-          a2+=xp*U(p2&0x00Cu); a3+=xp*U(p3&0x00Cu);
-        }
-        if constexpr (rem_trits >= 3) {
-          const U xp=U(xg[base+2])*U(0.0625f); x_sum+=U(xg[base+2]);
-          a0+=xp*U(p0&0x030u); a1+=xp*U(p1&0x030u);
-          a2+=xp*U(p2&0x030u); a3+=xp*U(p3&0x030u);
-        }
-        if constexpr (rem_trits >= 4) {
-          const U xp=U(xg[base+3])*U(0.015625f); x_sum+=U(xg[base+3]);
-          a0+=xp*U(p0&0x0C0u); a1+=xp*U(p1&0x0C0u);
-          a2+=xp*U(p2&0x0C0u); a3+=xp*U(p3&0x0C0u);
-        }
-      }
-      // Apply scale and −1 offset: s × Σ(tₖ−1)xₖ = s × (accum − x_sum).
-      result[0]+=s0*(a0-x_sum); result[1]+=s1*(a1-x_sum);
-      result[2]+=s2*(a2-x_sum); result[3]+=s3*(a3-x_sum);
-
-    } else {
-      // ---- Boundary fallback: partial last threadgroup ----
-      for (int row = 0; row < results_per_simdgroup; row++) {
-        const int cur_row = out_row + row;
-        if (cur_row >= out_vec_size) continue;
-        const device uint8_t* wg = w + cur_row*ng_bpg + g*bytes_per_group;
-        const U s = U(scales[cur_row * n_groups + g]);
-        U accum = 0, xsum = 0;
-        for (int b = 0; b < full_bytes; b++) {
-          const uint p = T5_TO_B4[wg[b]];
-          const int base = b * 5;
-          const U xv0=U(xg[base+0]),xv1=U(xg[base+1]),xv2=U(xg[base+2]);
-          const U xv3=U(xg[base+3]),xv4=U(xg[base+4]);
-          xsum += xv0+xv1+xv2+xv3+xv4;
-          accum += xv0*U(p&0x003u) + xv1*U(0.25f)*U(p&0x00Cu)
-                 + xv2*U(0.0625f)*U(p&0x030u) + xv3*U(0.015625f)*U(p&0x0C0u)
-                 + xv4*U(0.00390625f)*U(p&0x300u);
-        }
-        if constexpr (rem_trits > 0) {
-          const uint p = T5_TO_B4[wg[full_bytes]];
-          const int base = full_bytes * 5;
-          if constexpr (rem_trits>=1){const U xv=U(xg[base+0]);xsum+=xv;accum+=xv*U(p&0x003u);}
-          if constexpr (rem_trits>=2){const U xv=U(xg[base+1]);xsum+=xv;accum+=xv*U(0.25f)*U(p&0x00Cu);}
-          if constexpr (rem_trits>=3){const U xv=U(xg[base+2]);xsum+=xv;accum+=xv*U(0.0625f)*U(p&0x030u);}
-          if constexpr (rem_trits>=4){const U xv=U(xg[base+3]);xsum+=xv;accum+=xv*U(0.015625f)*U(p&0x0C0u);}
-        }
-        result[row] += s * (accum - xsum);
       }
     }
+    const U xs = USE_SIGMA ? U(sigma[g]) : x_sum;
+    result[0] += s0*(a0-xs); result[1] += s1*(a1-xs);
+    result[2] += s2*(a2-xs); result[3] += s3*(a3-xs);
   }
-
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0 && out_row + row < out_vec_size) {
+    if (simd_lid == 0 && row_ok[row])
       y[tid.x * out_vec_size + out_row + row] = T(result[row]);
-    }
   }
 }
+
 
 // qmv_wide_t5: small-batch decode (M = vecs_per_tg = 2..5).
 //
@@ -1510,6 +1491,7 @@ METAL_FUNC void qmv_wide_t5_impl(
     const constant int& in_vec_size,
     const constant int& out_vec_size,
     const constant int& M,
+    threadgroup const uint* lut,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
