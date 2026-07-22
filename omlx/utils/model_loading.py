@@ -80,6 +80,17 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 variant = _VLM_TEXT_PREFIX + key
             if variant not in quant and variant not in extras:
                 extras[variant] = val
+            # Laguna router overrides: published checkpoints key the
+            # per-layer quantization spec by ``mlp.gate``, but the model's
+            # actual module-tree path is ``mlp.gate.proj`` (the router is
+            # ``LagunaTopKRouter.proj``, not ``gate`` itself).  Without the
+            # matching key, ``nn.quantize`` falls back to the global bits
+            # and builds the router at the wrong width, causing a shape
+            # mismatch during strict weight loading.
+            if key.endswith(".mlp.gate"):
+                proj_variant = key + ".proj"
+                if proj_variant not in quant and proj_variant not in extras:
+                    extras[proj_variant] = val
         if extras:
             quant.update(extras)
     return cfg

@@ -389,6 +389,144 @@ def test_laguna_sanitize_remaps_gate_and_stacks_experts():
     assert stacked_gate.shape == (2, 128, 64)
 
 
+def test_sanitize_remaps_quant_router_sidecars():
+    """``_remap_router_weights`` remaps ``gate.scales`` and ``gate.biases`` too.
+
+    Quantized checkpoints produced by oQ / mlx-vlm carry quantization
+    sidecars alongside ``gate.weight``.  Remapping only ``.weight`` leaves
+    ``gate.scales`` and ``gate.biases`` orphaned, triggering
+    ``ValueError: Received N parameters not in model``.
+    """
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    weights = {
+        "model.embed_tokens.weight": mx.zeros((1024, 64)),
+        "lm_head.weight": mx.zeros((1024, 64)),
+        "model.norm.weight": mx.ones((64,)),
+        # Router weight + quant sidecars keyed under ``gate`` (not ``gate.proj``)
+        "model.layers.0.mlp.gate.weight": mx.zeros((2, 64)),
+        "model.layers.0.mlp.gate.scales": mx.zeros((2, 64)),
+        "model.layers.0.mlp.gate.biases": mx.zeros((2, 64)),
+        # Expert weights (pre-stacked layout)
+        "model.layers.0.mlp.experts.0.gate_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.0.up_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.1.up_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.0.down_proj.weight": mx.zeros((64, 128)),
+        "model.layers.0.mlp.experts.1.down_proj.weight": mx.zeros((64, 128)),
+    }
+
+    out = model.sanitize(weights)
+
+    # All three router tensors are remapped from gate.<suffix> to
+    # gate.proj.<suffix>
+    assert "model.layers.0.mlp.gate.proj.weight" in out
+    assert "model.layers.0.mlp.gate.proj.scales" in out
+    assert "model.layers.0.mlp.gate.proj.biases" in out
+
+    # No orphaned keys remain under the old ``gate.`` prefix
+    assert not any(
+        k.startswith("model.layers.0.mlp.gate.") and ".proj." not in k
+        for k in out
+        if "e_score_correction_bias" not in k
+    )
+
+
+def test_sanitize_remaps_bare_score_correction_bias():
+    """Bare ``mlp.e_score_correction_bias`` maps to ``gate.e_score_correction_bias``.
+
+    The published pipenetwork/Laguna-S-2.1 MLX conversions store the
+    router correction bias at ``mlp.e_score_correction_bias`` (without the
+    ``experts.`` prefix the legacy sanitizer branch checked for).
+    """
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    weights = {
+        "model.embed_tokens.weight": mx.zeros((1024, 64)),
+        "lm_head.weight": mx.zeros((1024, 64)),
+        "model.norm.weight": mx.ones((64,)),
+        "model.layers.0.mlp.gate.weight": mx.zeros((2, 64)),
+        "model.layers.0.mlp.e_score_correction_bias": mx.zeros((2,)),
+        "model.layers.0.mlp.experts.0.gate_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.0.up_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.1.up_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.0.down_proj.weight": mx.zeros((64, 128)),
+        "model.layers.0.mlp.experts.1.down_proj.weight": mx.zeros((64, 128)),
+    }
+
+    out = model.sanitize(weights)
+
+    assert "model.layers.0.mlp.gate.e_score_correction_bias" in out
+    assert "model.layers.0.mlp.e_score_correction_bias" not in out
+
+
+def test_sanitize_remaps_experts_prefixed_score_correction_bias():
+    """Legacy ``experts.e_score_correction_bias`` still maps correctly."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    weights = {
+        "model.embed_tokens.weight": mx.zeros((1024, 64)),
+        "lm_head.weight": mx.zeros((1024, 64)),
+        "model.norm.weight": mx.ones((64,)),
+        "model.layers.0.mlp.gate.weight": mx.zeros((2, 64)),
+        "model.layers.0.mlp.experts.e_score_correction_bias": mx.zeros((2,)),
+        "model.layers.0.mlp.experts.0.gate_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.0.up_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.1.up_proj.weight": mx.zeros((128, 64)),
+        "model.layers.0.mlp.experts.0.down_proj.weight": mx.zeros((64, 128)),
+        "model.layers.0.mlp.experts.1.down_proj.weight": mx.zeros((64, 128)),
+    }
+
+    out = model.sanitize(weights)
+
+    assert "model.layers.0.mlp.gate.e_score_correction_bias" in out
+    assert "model.layers.0.mlp.experts.e_score_correction_bias" not in out
+
+
 def test_sanitize_dequantizes_fp8_block_weights():
     """FP8 e4m3 weight + f32 block scales convert to 8-bit affine triples."""
     from omlx.patches.laguna import apply_laguna_patch
