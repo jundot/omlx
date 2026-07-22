@@ -200,19 +200,37 @@ class InvalidProfileNameError(ValueError):
     """Raised when a profile or template name fails validation."""
 
 
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+# Used for API-exposed names (model IDs, api_name) — must be lowercase slugs.
+_API_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+# Used for internal profile/template names — allows uppercase so users can
+# create names like "Gemma-4-OCR-32k" without hitting a 400 error.
+_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")
 
 
 def validate_profile_name(name: str) -> None:
-    """Raise InvalidProfileNameError if ``name`` is not a valid slug.
+    """Raise InvalidProfileNameError if ``name`` is not a valid profile identifier.
 
-    Valid: lowercase letters/digits, underscores, dashes. Must start with
-    a letter or digit. 1-32 characters.
+    Valid: letters (upper or lower), digits, underscores, dashes. Must start
+    with a letter or digit. 1-32 characters.
     """
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise InvalidProfileNameError(
             f"Invalid profile/template name: {name!r}. "
-            f"Must match ^[a-z0-9][a-z0-9_-]{{0,31}}$"
+            f"Must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,31}}$"
+        )
+
+
+def validate_profile_api_name(name: str) -> None:
+    """Raise InvalidProfileNameError if ``name`` is not a valid API slug.
+
+    API names are used in model IDs and URL paths, so they must be lowercase.
+    Valid: lowercase letters, digits, underscores, dashes. 1-32 characters.
+    """
+    if not isinstance(name, str) or not _API_NAME_RE.match(name):
+        raise InvalidProfileNameError(
+            f"Invalid profile API name: {name!r}. "
+            f"Must match ^[a-z0-9][a-z0-9_-]{{0,31}}$ (lowercase only)"
         )
 
 

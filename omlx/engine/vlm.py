@@ -934,6 +934,91 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
         _minimax_m3_vl._sanitize_moe_weights = original_sanitize_moe_weights
 
 
+
+@contextlib.contextmanager
+def _force_qwen35_moe_mtp_sanitize_on_load(model_dir: Path):
+    """Force mlx-vlm's sanitize path for Qwen3.5 MoE VLM models with a
+    separate mtp.safetensors (OptiQ layout).
+
+    MLX-format checkpoints skip sanitize upstream, but the sidecar
+    mtp.safetensors contains bare mtp.* keys that must be remapped to
+    language_model.mtp.* by the MTP sanitize patch.  Without this,
+    load_weights(strict=True) fails with "Received N parameters not in model"
+    and the VLM silently falls back to text-only LLM (issue #1944).
+
+    Hides the safetensors format=mlx metadata during load so that the
+    upstream sanitize path runs before load_weights.
+    """
+    model_type = _read_config_model_type(model_dir)
+    if model_type not in ("qwen3_5", "qwen3_5_moe"):
+        yield
+        return
+
+    # Only activate for the OptiQ layout: index exists but contains no mtp.*
+    # keys, and a sidecar mtp.safetensors is present alongside it.
+    index_path = model_dir / "model.safetensors.index.json"
+    mtp_path = model_dir / "mtp.safetensors"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text())
+            weight_map = data.get("weight_map") or {}
+            if any("mtp." in k for k in weight_map):
+                # Index already references mtp weights; no patch needed.
+                yield
+                return
+        except Exception:
+            yield
+            return
+    if not mtp_path.exists():
+        yield
+        return
+
+    import safetensors
+
+    original_safe_open = safetensors.safe_open
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    safetensors.safe_open = _patched_safe_open
+    try:
+        logger.info(
+            "Forcing sanitize path for %s (OptiQ separate mtp.safetensors detected)",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+
 @contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
@@ -1472,6 +1557,7 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
+                _force_qwen35_moe_mtp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
