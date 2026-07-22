@@ -2120,3 +2120,117 @@ class TestCountImageTokensReal:
 
         messages = [{"role": "user", "content": "just text"}]
         assert _count_image_tokens_real(messages, _QWEN_PROC) == 0
+
+
+class TestVLMEngineFrequencyPenalty:
+    """VLM SamplingParams must carry frequency_penalty (mirrors BatchedEngine).
+
+    Both VLM SamplingParams constructions previously omitted
+    frequency_penalty entirely, so it landed in **kwargs and was silently
+    dropped instead of reaching the scheduler.
+    """
+
+    @staticmethod
+    def _fake_output():
+        return SimpleNamespace(
+            output_text="hi",
+            prompt_tokens=5,
+            completion_tokens=2,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_forwards_frequency_penalty(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", frequency_penalty=0.7)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.7
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_defaults_frequency_penalty_to_zero(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt")
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_generate_forwards_frequency_penalty(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = MagicMock()
+        engine._engine.add_request = AsyncMock(return_value="req-1")
+        engine._engine.abort_request = AsyncMock(return_value=True)
+
+        async def _one_output_stream(_request_id):
+            yield SimpleNamespace(
+                output_text="ok",
+                new_text="ok",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+                cached_tokens=0,
+            )
+
+        engine._engine.stream_outputs = _one_output_stream
+
+        async for _ in engine.stream_generate("hello", frequency_penalty=0.9):
+            pass
+
+        call_kwargs = engine._engine.add_request.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.9
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_chat_forwards_frequency_penalty_to_generate(self):
+        """chat() forwards **kwargs into generate(), so the server's
+        frequency_penalty kwarg must survive the chat -> generate chain."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        engine = _make_loaded_engine(model_type="test-vlm")
+        mlx_executor = ThreadPoolExecutor(max_workers=1)
+        engine._engine = SimpleNamespace(
+            _mlx_executor=mlx_executor,
+            generate=AsyncMock(return_value=self._fake_output()),
+        )
+
+        def _mock_process(messages, tools, kwargs):
+            return "<prompt>", None, {}, None, 0, []
+
+        try:
+            with patch.object(
+                engine, "_process_chat_messages", side_effect=_mock_process
+            ):
+                await engine.chat(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    frequency_penalty=0.42,
+                )
+        finally:
+            mlx_executor.shutdown(wait=False)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.42
