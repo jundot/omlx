@@ -368,6 +368,11 @@ def _is_vision_tensor(name: str) -> bool:
         for p in (
             "visual.",
             "vision_",
+            # DeepSeek-OCR / Unlimited-OCR SAM encoder. Kept full precision like
+            # the rest of the vision tower: its neck/net_2/net_3 are nn.Conv2d,
+            # which mlx cannot quantize at all, so quantizing them yields
+            # unloadable .scales/.biases the model has no slot for.
+            "sam_model",
             "patch_embed",
             "pos_embed",
             "image_newline",
@@ -2605,9 +2610,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
         or None if the model class can't be loaded.
     """
     architectures = config.get("architectures", [])
+    # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
+    # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
+    # like baidu/Unlimited-OCR (UnlimitedOCRForCausalLM) and DeepSeek-OCR
+    # (DeepseekOCR2ForCausalLM) carry a vision_config but a ForCausalLM arch, so
+    # the arch-only heuristic dropped them to the mlx-lm sanitize path (which
+    # can't resolve their model_type) and shipped unsanitized vision weights.
     is_vlm = (
-        any("ForConditionalGeneration" in a for a in architectures) and not text_only
-    )
+        any("ForConditionalGeneration" in a for a in architectures)
+        or _has_vision_subconfig(config)
+    ) and not text_only
 
     if is_vlm:
         try:
@@ -2703,7 +2715,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 _lm_proxy = type("_LMProxy", (), {})()
                 _lm_proxy.args = text_config
                 proxy.language_model = _lm_proxy
-                w = model_module.Model.sanitize(proxy, weights)
+                # Model.sanitize is an instance method (self, weights) for most
+                # VLMs, but a @staticmethod (weights) for the DeepSeek-OCR family
+                # (deepseekocr / unlimited_ocr). Dispatch on the arg count so the
+                # proxy is only passed when sanitize actually takes a self.
+                _san = model_module.Model.sanitize
+                _san_argc = getattr(getattr(_san, "__code__", None), "co_argcount", 2)
+                if _san_argc >= 2:
+                    w = _san(proxy, weights)
+                else:
+                    w = _san(weights)
 
                 w = sanitize_weights(model_module.VisionModel, w, vision_config)
                 w = sanitize_weights(model_module.LanguageModel, w, text_config)
