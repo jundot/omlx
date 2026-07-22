@@ -3005,3 +3005,143 @@ class TestToolCallStreamFilterGemma4StrayClose:
         result = f.feed('<|tool_call>call()<tool_call|> extra<tool_call|>')
         result += f.finish()
         assert result == " extra"
+
+
+class TestParseToolCallsLlama3JsonContent:
+    """Tests for the Llama-3-style {"name", "parameters"} JSON content fallback.
+
+    Llama-4-Scout-Instruct's official chat template instructs the model to
+    respond with ``{"name": "<func>", "parameters": {...}}`` instead of using
+    a marker tag, so this format must be promoted to ``tool_calls`` when the
+    function name matches a provided tool.
+    """
+
+    _WEATHER_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+
+    def test_llama3_json_content_extracts_tool_call(self):
+        """Plain-content {"name","parameters":{...}} is promoted to tool_calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"location": "Paris"}
+        assert cleaned == ""
+
+    def test_llama3_json_arguments_synonym(self):
+        """``arguments`` should be accepted as a synonym for ``parameters``."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "arguments": {"location": "Tokyo"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {"location": "Tokyo"}
+
+    def test_llama3_json_content_strips_match_from_cleaned_text(self):
+        """Surrounding prose should survive; only the JSON block is removed."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = (
+            'Sure, calling now: '
+            '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+            ' done.'
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert "get_weather" not in cleaned
+        assert "Sure, calling now:" in cleaned
+        assert "done." in cleaned
+
+    def test_llama3_json_content_rejects_unknown_function(self):
+        """Function names outside the tools list must NOT be promoted."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "rm_rf", "parameters": {"path": "/"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_llama3_json_content_no_tools_no_promotion(self):
+        """Without a tools list, JSON content must not be classified as a call."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=None)
+
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_llama3_json_content_invalid_json_skipped(self):
+        """Malformed parameter JSON must not raise; falls through cleanly."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = '{"name": "get_weather", "parameters": {malformed}}'
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=self._WEATHER_TOOLS)
+
+        # raw_decode rejects the malformed inner object — no tool_calls,
+        # no exception.
+        assert tool_calls is None
+
+    def test_llama3_json_content_handles_deeply_nested_parameters(self):
+        """Parameters with nested objects >1 level deep must still match.
+
+        The earlier brace-balance regex only handled one level of nesting;
+        real tool schemas (e.g. filter expressions with nested predicates)
+        routinely exceed that. Switching to ``json.JSONDecoder.raw_decode``
+        accepts any valid JSON depth.
+        """
+        nested_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_events",
+                    "description": "Search events with nested filters",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"filter": {"type": "object"}},
+                        "required": ["filter"],
+                    },
+                },
+            }
+        ]
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+
+        text = (
+            '{"name": "search_events", "parameters": '
+            '{"filter": {"date": {"gte": "2026-01-01", "lt": "2027-01-01"}}}}'
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools=nested_tools)
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "search_events"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "filter": {"date": {"gte": "2026-01-01", "lt": "2027-01-01"}}
+        }
+        assert cleaned == ""

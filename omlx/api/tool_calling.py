@@ -1267,6 +1267,56 @@ def _parse_tool_calls_impl(
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
 
+    # Fallback: Llama-3-style JSON tool calls emitted as plain content.
+    # Some chat templates (notably Llama-4-Scout-Instruct's) instruct the
+    # model to respond with `{"name": "<func>", "parameters": {...}}`
+    # instead of a marker tag, and the `parameters` value can be nested
+    # arbitrarily deep. Use `JSONDecoder.raw_decode` to scan candidate `{`
+    # positions so we accept any valid JSON depth (the earlier regex only
+    # handled one level of nested braces). Promote only when the function
+    # name matches a provided tool, to avoid mis-parsing arbitrary
+    # user-content JSON as a tool call.
+    if tools and "{" in cleaned_text and '"name"' in cleaned_text:
+        valid_names = _extract_tool_names(tools)
+        decoder = json.JSONDecoder()
+        idx = 0
+        while True:
+            start = cleaned_text.find("{", idx)
+            if start == -1:
+                break
+            try:
+                obj, end = decoder.raw_decode(cleaned_text, start)
+            except (json.JSONDecodeError, ValueError):
+                idx = start + 1
+                continue
+            if not isinstance(obj, dict):
+                idx = end
+                continue
+            name = obj.get("name")
+            args = obj.get("parameters", obj.get("arguments"))
+            if not isinstance(name, str) or not isinstance(args, dict):
+                idx = end
+                continue
+            if name not in valid_names:
+                logger.debug(
+                    "Llama-3 JSON fallback: skipping object with name=%r "
+                    "(not in tools list %r)",
+                    name,
+                    sorted(valid_names),
+                )
+                idx = end
+                continue
+            tc = ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name,
+                    arguments=_serialize_tool_call_arguments(args),
+                ),
+            )
+            cleaned = (cleaned_text[:start] + cleaned_text[end:]).strip()
+            return cleaned, [tc]
+
     # All parsing attempts exhausted. Strip known tool-call markers so raw
     # control markup never leaks into the API response.  Models whose markers
     # overlap with the generic ``<tool_call>`` tag already returned above via
