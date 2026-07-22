@@ -57,6 +57,7 @@ VLM_MODEL_TYPES = {
     "florence2",
     "deepseekocr",
     "deepseekocr_2",
+    "unlimited_ocr",
     "dots_ocr",
     "glm_ocr",
     "minimax_m3_vl",
@@ -147,6 +148,7 @@ VLM_ARCHITECTURES = {
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
+    "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
 }
 
 # Known embedding model types from mlx-embeddings

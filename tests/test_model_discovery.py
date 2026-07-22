@@ -327,6 +327,18 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_unlimited_ocr_as_vlm(self, tmp_path):
+        """baidu/Unlimited-OCR is served by mlx-vlm (dashed model_type)."""
+        config = {
+            "model_type": "unlimited-ocr",
+            "architectures": ["UnlimitedOCRForCausalLM"],
+            "vision_config": {"model_type": "vision"},
+            "language_config": {"model_type": "deepseek_v2"},
+            "projector_config": {"model_type": "mlp_projector"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_minimax_m3_vl_as_vlm(self, tmp_path):
         """MiniMax M3 VL is served by mlx-vlm."""
         config = {

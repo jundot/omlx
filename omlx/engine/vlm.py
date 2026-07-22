@@ -62,7 +62,16 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 # OCR model types that require special handling.
-OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
+# unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
+# unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
+# match VLMBatchedEngine.model_type (== vlm_model.config.model_type).
+OCR_MODEL_TYPES = {
+    "deepseekocr",
+    "deepseekocr_2",
+    "unlimited-ocr",
+    "dots_ocr",
+    "glm_ocr",
+}
 
 # OCR model types and their default markdown conversion prompts.
 # When an OCR model receives a generic user prompt with an image,
@@ -70,6 +79,9 @@ OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
 OCR_MODEL_PROMPTS: Dict[str, str] = {
     "deepseekocr": "Convert the document to markdown.",
     "deepseekocr_2": "Convert the document to markdown.",
+    # baidu/Unlimited-OCR upstream-documented single-page baseline. Multi-page
+    # / PDF workflows use "Multi page parsing." (pass it explicitly).
+    "unlimited-ocr": "document parsing.",
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
@@ -106,6 +118,10 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_tokens": 8192,
     },
     "deepseekocr_2": {
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "unlimited-ocr": {
         "temperature": 0.0,
         "max_tokens": 8192,
     },
