@@ -1,0 +1,16 @@
+{
+  "change": "add-forge-mcp-features",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "07e9d83826984d722bcdc6e3cc3a782de49396e27337b37630d6915c7037a3eb",
+  "files": [
+    { "path": "openspec/changes/add-forge-mcp-features/proposal.md", "sha256": "8da1ac401518daf6b19822217895cd39084cecf82f86720ca9474cace1fbfaad" },
+    { "path": "openspec/changes/add-forge-mcp-features/design.md", "sha256": "109585ccb53e324bad2a28f0a7b30df543305908e1ff1a429b09108f566de26a" },
+    { "path": "openspec/changes/add-forge-mcp-features/tasks.md", "sha256": "ac16598fc64237de023b1b14ca101e7ff1d30dae52b59fd34ae24d040543e328" },
+    { "path": "openspec/changes/add-forge-mcp-features/specs/mcp-prerequisite-enforcement/spec.md", "sha256": "e73a7f04734f4678bbebb8f7ca604b13d52fea71f5e343b0c9a2862b75b7e498" },
+    { "path": "openspec/changes/add-forge-mcp-features/specs/synthetic-respond-tool/spec.md", "sha256": "629fda6d031cd92143e78084e0ef9145b3b6f55d7989f8dd8f9d9b373f522f4c" },
+    { "path": "openspec/changes/add-forge-mcp-features/specs/tool-call-validation/spec.md", "sha256": "d56dc89c5e720456aa20c13b5482fcb3bbc866ac19c457081175dc7289c6471f" }
+  ]
+}

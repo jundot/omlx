@@ -1,0 +1,2792 @@
+{
+  "/Users/czha168/workspaces/omlx/.graphify_detect.json": {
+    "mtime": 1780874980.3106463,
+    "ast_hash": "c598526696f565d48f7442991af067f8",
+    "semantic_hash": "c598526696f565d48f7442991af067f8"
+  },
+  "/Users/czha168/workspaces/omlx/mcp.example.json": {
+    "mtime": 1780874841.8615983,
+    "ast_hash": "f5b90b1d4cfd67f9d2299cbd83cc5890",
+    "semantic_hash": "f5b90b1d4cfd67f9d2299cbd83cc5890"
+  },
+  "/Users/czha168/workspaces/omlx/packaging/build.py": {
+    "mtime": 1780874841.988909,
+    "ast_hash": "cb6d3f908d19fb34eecd9fe923006357",
+    "semantic_hash": "cb6d3f908d19fb34eecd9fe923006357"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_store_cache_gate.py": {
+    "mtime": 1780874842.0027483,
+    "ast_hash": "c30423c13fbf3b4957cf36b409c25309",
+    "semantic_hash": "c30423c13fbf3b4957cf36b409c25309"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_model_discovery.py": {
+    "mtime": 1780874841.996728,
+    "ast_hash": "6f0cbe964f5b17bcbb7abb7347c26d24",
+    "semantic_hash": "6f0cbe964f5b17bcbb7abb7347c26d24"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_openai_adapter.py": {
+    "mtime": 1780874841.9972374,
+    "ast_hash": "3eb46170c2dedd92d91d96b7fa27ea19",
+    "semantic_hash": "3eb46170c2dedd92d91d96b7fa27ea19"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_paged_ssd_cache.py": {
+    "mtime": 1780874898.787333,
+    "ast_hash": "1a8cb53cb8dace7263d249f1639482c5",
+    "semantic_hash": "1a8cb53cb8dace7263d249f1639482c5"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_hybrid_cache.py": {
+    "mtime": 1780874841.9951608,
+    "ast_hash": "edbf3994b3ce71b3ed538a46f7e420a0",
+    "semantic_hash": "edbf3994b3ce71b3ed538a46f7e420a0"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_utils_hardware.py": {
+    "mtime": 1780874842.0038383,
+    "ast_hash": "35781978b9cd52084605eaeb7e28ad88",
+    "semantic_hash": "35781978b9cd52084605eaeb7e28ad88"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_utils_tokenizer.py": {
+    "mtime": 1780874842.0039175,
+    "ast_hash": "0b0f4c90e737601b8ff2b15dab782081",
+    "semantic_hash": "0b0f4c90e737601b8ff2b15dab782081"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_cache_ntuple_state.py": {
+    "mtime": 1780874841.992466,
+    "ast_hash": "dacd54243fe17af64121815230b70f5a",
+    "semantic_hash": "dacd54243fe17af64121815230b70f5a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_benchmark_sse_replay.py": {
+    "mtime": 1780874841.9922478,
+    "ast_hash": "306708150b95d7fce828f1e00f22124f",
+    "semantic_hash": "306708150b95d7fce828f1e00f22124f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/e2e_vision_cache.py": {
+    "mtime": 1780874841.989424,
+    "ast_hash": "3c7c19a0a1e9c9fccd666be3ecb2f030",
+    "semantic_hash": "3c7c19a0a1e9c9fccd666be3ecb2f030"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_stream_usage.py": {
+    "mtime": 1780874842.0028055,
+    "ast_hash": "8e2e1fc5cdd99d04b71691b8a969ef19",
+    "semantic_hash": "8e2e1fc5cdd99d04b71691b8a969ef19"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_deepseek_v4_patch.py": {
+    "mtime": 1780874841.9932394,
+    "ast_hash": "00fa2e123f888c0e7670ff572e4b3825",
+    "semantic_hash": "00fa2e123f888c0e7670ff572e4b3825"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_ms_downloader.py": {
+    "mtime": 1780874841.997128,
+    "ast_hash": "4d1a2a7ee31e25ff1a80cc2fce20777c",
+    "semantic_hash": "4d1a2a7ee31e25ff1a80cc2fce20777c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vision_feature_cache.py": {
+    "mtime": 1780874842.0040514,
+    "ast_hash": "bfced0e7d52dbba1b753b13c61e69f0d",
+    "semantic_hash": "bfced0e7d52dbba1b753b13c61e69f0d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/conftest.py": {
+    "mtime": 1780874841.9893649,
+    "ast_hash": "01ad9e15e7bc65e2e6e428b25a3ee12f",
+    "semantic_hash": "01ad9e15e7bc65e2e6e428b25a3ee12f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_config.py": {
+    "mtime": 1780874841.9958994,
+    "ast_hash": "c3d43206042276cb8a2e189cfb80a320",
+    "semantic_hash": "c3d43206042276cb8a2e189cfb80a320"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_oq_manager.py": {
+    "mtime": 1780874841.997791,
+    "ast_hash": "17bf2adcc544561c1481c68178378971",
+    "semantic_hash": "17bf2adcc544561c1481c68178378971"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_process_memory_enforcer.py": {
+    "mtime": 1780874842.0006537,
+    "ast_hash": "1466ed660502263b508c9b02064f5bae",
+    "semantic_hash": "1466ed660502263b508c9b02064f5bae"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_prefix_cache.py": {
+    "mtime": 1780874842.0004401,
+    "ast_hash": "8e672a7c0449de9c4bef09fe2794dab5",
+    "semantic_hash": "8e672a7c0449de9c4bef09fe2794dab5"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_shared_models.py": {
+    "mtime": 1780874842.0022194,
+    "ast_hash": "f489be7953597a7c55e6ca9e6710466e",
+    "semantic_hash": "f489be7953597a7c55e6ca9e6710466e"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_chat_tool_call.py": {
+    "mtime": 1780874841.9928064,
+    "ast_hash": "db87a9c6208f1899bb7fc8bf86627de1",
+    "semantic_hash": "db87a9c6208f1899bb7fc8bf86627de1"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mbpp_extract_code.py": {
+    "mtime": 1780874841.9957223,
+    "ast_hash": "b17e8535bea4a4cbe3a88ec001aea042",
+    "semantic_hash": "b17e8535bea4a4cbe3a88ec001aea042"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_restart.py": {
+    "mtime": 1780874841.9908552,
+    "ast_hash": "02869605ad3020e4128d5b3d19177152",
+    "semantic_hash": "02869605ad3020e4128d5b3d19177152"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_reload.py": {
+    "mtime": 1780874841.9908075,
+    "ast_hash": "40fbafaba01f87b9d6e90892df58d968",
+    "semantic_hash": "40fbafaba01f87b9d6e90892df58d968"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_utils_formatting.py": {
+    "mtime": 1780874842.0037835,
+    "ast_hash": "d6a18d689bd0cc31ff6c52318f804cea",
+    "semantic_hash": "d6a18d689bd0cc31ff6c52318f804cea"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_tool_calling.py": {
+    "mtime": 1780874842.0033224,
+    "ast_hash": "eeda83a39ceb834938b91d60c6741ee2",
+    "semantic_hash": "eeda83a39ceb834938b91d60c6741ee2"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_singleton_cache_passthrough.py": {
+    "mtime": 1780874842.0022798,
+    "ast_hash": "9f1a55808a424c81e78af1c1ee6d62ec",
+    "semantic_hash": "9f1a55808a424c81e78af1c1ee6d62ec"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_gemma4_rendering.py": {
+    "mtime": 1780874841.9943452,
+    "ast_hash": "6b03cdfc63d384bb3f5b7556f24b3c9f",
+    "semantic_hash": "6b03cdfc63d384bb3f5b7556f24b3c9f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_dflash_lifecycle.py": {
+    "mtime": 1780874841.9934006,
+    "ast_hash": "40cf9ece772650b552fda53519048cd3",
+    "semantic_hash": "40cf9ece772650b552fda53519048cd3"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_model_registry.py": {
+    "mtime": 1780874841.996854,
+    "ast_hash": "7dd3e6dc8a3015b9175215eef69dd354",
+    "semantic_hash": "7dd3e6dc8a3015b9175215eef69dd354"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_api_key.py": {
+    "mtime": 1780874841.9904742,
+    "ast_hash": "0a0e326caadb6ec881eb4835a9faff2a",
+    "semantic_hash": "0a0e326caadb6ec881eb4835a9faff2a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mlx_lm_mtp_patch.py": {
+    "mtime": 1780874841.9966273,
+    "ast_hash": "16eae3559ba957b1caa9b85f3f2fff8c",
+    "semantic_hash": "16eae3559ba957b1caa9b85f3f2fff8c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_memory_monitor.py": {
+    "mtime": 1780874841.9963725,
+    "ast_hash": "4ce8e0eaa09d763627df91b767b9cc76",
+    "semantic_hash": "4ce8e0eaa09d763627df91b767b9cc76"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_integrations.py": {
+    "mtime": 1780874841.9955149,
+    "ast_hash": "dd2cdd8e20a7e5ee4237d1b2340370bb",
+    "semantic_hash": "dd2cdd8e20a7e5ee4237d1b2340370bb"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_stt.py": {
+    "mtime": 1780874841.9918308,
+    "ast_hash": "c8b04cf483569afe0b2b9436aba8a437",
+    "semantic_hash": "c8b04cf483569afe0b2b9436aba8a437"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_chat_image_upload.py": {
+    "mtime": 1780874841.9927397,
+    "ast_hash": "21db557ef6752c1f955da0e89336ef30",
+    "semantic_hash": "21db557ef6752c1f955da0e89336ef30"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vlm_specprefill.py": {
+    "mtime": 1780874842.004445,
+    "ast_hash": "20866e0c0c83070e7a3484f54ea82c91",
+    "semantic_hash": "20866e0c0c83070e7a3484f54ea82c91"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_engine_core.py": {
+    "mtime": 1780874898.7870905,
+    "ast_hash": "6550db0801583ff1223938c671f35bfa",
+    "semantic_hash": "6550db0801583ff1223938c671f35bfa"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_optimizations.py": {
+    "mtime": 1780874841.9974878,
+    "ast_hash": "adfe984a66c9d5052dd30052ea71a8fc",
+    "semantic_hash": "adfe984a66c9d5052dd30052ea71a8fc"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_prefix_cache_v4_block_storage.py": {
+    "mtime": 1780874842.000501,
+    "ast_hash": "3771c4f928330ed95884efc0c8cbc0c9",
+    "semantic_hash": "3771c4f928330ed95884efc0c8cbc0c9"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vlm_audio_fallback.py": {
+    "mtime": 1780874842.0041225,
+    "ast_hash": "0c25b45064718a860321f45fbdcfd3fb",
+    "semantic_hash": "0c25b45064718a860321f45fbdcfd3fb"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_request.py": {
+    "mtime": 1780874842.0007966,
+    "ast_hash": "f13021c4445cec0460be2b95adee7266",
+    "semantic_hash": "f13021c4445cec0460be2b95adee7266"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_scheduler_logits_processors.py": {
+    "mtime": 1780874842.0015514,
+    "ast_hash": "92569e0ff53cc7fa69ceca0ca6ab930d",
+    "semantic_hash": "92569e0ff53cc7fa69ceca0ca6ab930d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_api.py": {
+    "mtime": 1780874841.9915261,
+    "ast_hash": "e2350c4f2bb769ba545e328d9a772513",
+    "semantic_hash": "e2350c4f2bb769ba545e328d9a772513"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_anthropic_models.py": {
+    "mtime": 1780874841.9911995,
+    "ast_hash": "f5faa4e0f6444b29e327326bb56e907f",
+    "semantic_hash": "f5faa4e0f6444b29e327326bb56e907f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_install_detection.py": {
+    "mtime": 1780874841.9953716,
+    "ast_hash": "8491f2cf9aa1b9f4b929213247b733b1",
+    "semantic_hash": "8491f2cf9aa1b9f4b929213247b733b1"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_image_utils.py": {
+    "mtime": 1780874841.995241,
+    "ast_hash": "f6e31ae6061d5a29ee12489187e2e917",
+    "semantic_hash": "f6e31ae6061d5a29ee12489187e2e917"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_turboquant_batch_memory.py": {
+    "mtime": 1780874842.003673,
+    "ast_hash": "0223efb615d96d690a7b621c7a4e7f47",
+    "semantic_hash": "0223efb615d96d690a7b621c7a4e7f47"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_tools.py": {
+    "mtime": 1780874841.9962063,
+    "ast_hash": "6a6781440c9596b65121623c8d6b3db0",
+    "semantic_hash": "6a6781440c9596b65121623c8d6b3db0"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_api_utils.py": {
+    "mtime": 1780874841.9913967,
+    "ast_hash": "570ea00927634c825a630b18d0e5ac94",
+    "semantic_hash": "570ea00927634c825a630b18d0e5ac94"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_server_aliases.py": {
+    "mtime": 1780874841.990911,
+    "ast_hash": "121ae4adde51e62af6cf66cbe30b6c1d",
+    "semantic_hash": "121ae4adde51e62af6cf66cbe30b6c1d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_proc_memory.py": {
+    "mtime": 1780874842.0005496,
+    "ast_hash": "b55f5ab7254585d50d6c7927d66d065d",
+    "semantic_hash": "b55f5ab7254585d50d6c7927d66d065d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_turboquant_ssd.py": {
+    "mtime": 1780874842.003735,
+    "ast_hash": "d71ea289a2b0182188846f0412dcaa71",
+    "semantic_hash": "d71ea289a2b0182188846f0412dcaa71"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_v4_multi_session.py": {
+    "mtime": 1780874842.0039763,
+    "ast_hash": "2df2453b50b450940b3f8b549adc7793",
+    "semantic_hash": "2df2453b50b450940b3f8b549adc7793"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_grammar.py": {
+    "mtime": 1780874841.9944375,
+    "ast_hash": "3941d8ad0d59ba8312ad1fa5e4cf0880",
+    "semantic_hash": "3941d8ad0d59ba8312ad1fa5e4cf0880"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_output_parser.py": {
+    "mtime": 1780874841.9995959,
+    "ast_hash": "1276ae78a258c93ffe55871869112c76",
+    "semantic_hash": "1276ae78a258c93ffe55871869112c76"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_rerank_models.py": {
+    "mtime": 1780874842.000863,
+    "ast_hash": "c2035ae327ad8d6512f37e39dfb7366d",
+    "semantic_hash": "c2035ae327ad8d6512f37e39dfb7366d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_dflash_engine.py": {
+    "mtime": 1780874841.99334,
+    "ast_hash": "b909513de3a3cf0e053531c6d2c7579a",
+    "semantic_hash": "b909513de3a3cf0e053531c6d2c7579a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_specprefill.py": {
+    "mtime": 1780874842.0023625,
+    "ast_hash": "608de17b092ae8aa0113ce079f4943aa",
+    "semantic_hash": "608de17b092ae8aa0113ce079f4943aa"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_engine_keepalive.py": {
+    "mtime": 1780874841.9938931,
+    "ast_hash": "0d9122466c1efa22466db6b5149e117b",
+    "semantic_hash": "0d9122466c1efa22466db6b5149e117b"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_client.py": {
+    "mtime": 1780874841.9958055,
+    "ast_hash": "59bbca7f5a8d86d0cbc946aa579c8434",
+    "semantic_hash": "59bbca7f5a8d86d0cbc946aa579c8434"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_context_scaling.py": {
+    "mtime": 1780874841.993078,
+    "ast_hash": "64510e02d74cf4aad72c3192e54a0d7f",
+    "semantic_hash": "64510e02d74cf4aad72c3192e54a0d7f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_exceptions.py": {
+    "mtime": 1780874841.9942265,
+    "ast_hash": "54bad9766fcacda40433fec18479d5ca",
+    "semantic_hash": "54bad9766fcacda40433fec18479d5ca"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_gemma4_messages.py": {
+    "mtime": 1780874841.994293,
+    "ast_hash": "df9a7e6663468d32725222861b9a7855",
+    "semantic_hash": "df9a7e6663468d32725222861b9a7855"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_executor.py": {
+    "mtime": 1780874841.995979,
+    "ast_hash": "750d3a23a687b5f816b894ec4743b5e7",
+    "semantic_hash": "750d3a23a687b5f816b894ec4743b5e7"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_prefill_progress.py": {
+    "mtime": 1780874842.0002143,
+    "ast_hash": "6f9c91297f18c605ebafa6beca105ef6",
+    "semantic_hash": "6f9c91297f18c605ebafa6beca105ef6"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_dflash_multimodal_fallback.py": {
+    "mtime": 1780874841.993477,
+    "ast_hash": "5bd63b7cc265fb0b04e5acdf3a00f600",
+    "semantic_hash": "5bd63b7cc265fb0b04e5acdf3a00f600"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_hf_downloader.py": {
+    "mtime": 1780874841.9948823,
+    "ast_hash": "8fb1d3d9bbb76c276141a570ffd889bc",
+    "semantic_hash": "8fb1d3d9bbb76c276141a570ffd889bc"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_status_endpoint.py": {
+    "mtime": 1780874842.002633,
+    "ast_hash": "5c76a5bfd5df33fc03325cce8a655dce",
+    "semantic_hash": "5c76a5bfd5df33fc03325cce8a655dce"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_scheduler.py": {
+    "mtime": 1780874842.0013473,
+    "ast_hash": "7233d9dc76edaef2bcb0988b70fc6f29",
+    "semantic_hash": "7233d9dc76edaef2bcb0988b70fc6f29"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_torch_stub.py": {
+    "mtime": 1780874842.0034375,
+    "ast_hash": "4e5bff34cb319410f2e31431e34f718c",
+    "semantic_hash": "4e5bff34cb319410f2e31431e34f718c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_grammar_live.py": {
+    "mtime": 1780874841.994506,
+    "ast_hash": "4a47cf37a9387b0dcfc9c983971c9759",
+    "semantic_hash": "4a47cf37a9387b0dcfc9c983971c9759"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_types.py": {
+    "mtime": 1780874841.9962716,
+    "ast_hash": "399b173a01fea68cf3e1a30b06020237",
+    "semantic_hash": "399b173a01fea68cf3e1a30b06020237"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_anthropic_adapter.py": {
+    "mtime": 1780874841.9911366,
+    "ast_hash": "1667cab67c87e5a111e24f2a2ad557a1",
+    "semantic_hash": "1667cab67c87e5a111e24f2a2ad557a1"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_scheduler_chunked_prefill.py": {
+    "mtime": 1780874842.0014877,
+    "ast_hash": "01ec0e9815a536b8fbc7cbd565baab97",
+    "semantic_hash": "01ec0e9815a536b8fbc7cbd565baab97"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_openai_models.py": {
+    "mtime": 1780874841.9974277,
+    "ast_hash": "e07724873771987c9f0d5f7a4698bad6",
+    "semantic_hash": "e07724873771987c9f0d5f7a4698bad6"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vlm_engine.py": {
+    "mtime": 1780874842.0042155,
+    "ast_hash": "711c6b419df912069ecebabb1e037c95",
+    "semantic_hash": "711c6b419df912069ecebabb1e037c95"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_accuracy_benchmark.py": {
+    "mtime": 1780874841.9903274,
+    "ast_hash": "143c6d34d504e912ffe6cd164c67aa7f",
+    "semantic_hash": "143c6d34d504e912ffe6cd164c67aa7f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vlm_model_adapter.py": {
+    "mtime": 1780874842.0043032,
+    "ast_hash": "50debb60542e78a656456d3efad1f9fd",
+    "semantic_hash": "50debb60542e78a656456d3efad1f9fd"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_discovery.py": {
+    "mtime": 1780874841.9915879,
+    "ast_hash": "75e78ef89cd91361f52850ed8b466667",
+    "semantic_hash": "75e78ef89cd91361f52850ed8b466667"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_app_bundle_cli_wrapper.py": {
+    "mtime": 1780874841.9914687,
+    "ast_hash": "aa7976bf85459e4ec2709521c69bee6c",
+    "semantic_hash": "aa7976bf85459e4ec2709521c69bee6c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_embedding.py": {
+    "mtime": 1780874841.9937258,
+    "ast_hash": "667c4f9beebe82697f7e873e2123ed3b",
+    "semantic_hash": "667c4f9beebe82697f7e873e2123ed3b"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_structured_output.py": {
+    "mtime": 1780874842.0028687,
+    "ast_hash": "d4c2c6464ce8ab575b4fd4da084f4912",
+    "semantic_hash": "d4c2c6464ce8ab575b4fd4da084f4912"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_prefill_transient_tracker.py": {
+    "mtime": 1780874842.0003297,
+    "ast_hash": "e58704c7cc365d7bdfa5b7cc202eba03",
+    "semantic_hash": "e58704c7cc365d7bdfa5b7cc202eba03"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_engine_pool.py": {
+    "mtime": 1780874841.9940393,
+    "ast_hash": "aa17ae9febc06e6c135fb732b537e9e3",
+    "semantic_hash": "aa17ae9febc06e6c135fb732b537e9e3"
+  },
+  "/Users/czha168/workspaces/omlx/tests/bench_grammar_bitmask.py": {
+    "mtime": 1780874841.9892614,
+    "ast_hash": "b7740b5aa1f86800d84110c84288a743",
+    "semantic_hash": "b7740b5aa1f86800d84110c84288a743"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_active_models_visibility.py": {
+    "mtime": 1780874841.9904068,
+    "ast_hash": "07f7cea0a7d5855d7970230847b85a22",
+    "semantic_hash": "07f7cea0a7d5855d7970230847b85a22"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vlm_mtp.py": {
+    "mtime": 1780874842.004391,
+    "ast_hash": "7c6783119e2ec0730f808fc0b1eae1a8",
+    "semantic_hash": "7c6783119e2ec0730f808fc0b1eae1a8"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_cache_type_handlers.py": {
+    "mtime": 1780874841.9926777,
+    "ast_hash": "fd33393dcaca754fd191a4e562034721",
+    "semantic_hash": "fd33393dcaca754fd191a4e562034721"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_process_title.py": {
+    "mtime": 1780874842.0007102,
+    "ast_hash": "1b827b034011d5d29c3c55c6bc387466",
+    "semantic_hash": "1b827b034011d5d29c3c55c6bc387466"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_oq.py": {
+    "mtime": 1780874841.9977312,
+    "ast_hash": "842ce148e1b4adefd021be08dbb50c83",
+    "semantic_hash": "842ce148e1b4adefd021be08dbb50c83"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_benchmark.py": {
+    "mtime": 1780874841.9921637,
+    "ast_hash": "0d737ba1705a00a160ad7b2163d90b57",
+    "semantic_hash": "0d737ba1705a00a160ad7b2163d90b57"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_server.py": {
+    "mtime": 1780874842.001635,
+    "ast_hash": "a06e5c543c17395bf1e7a8f1e8df4935",
+    "semantic_hash": "a06e5c543c17395bf1e7a8f1e8df4935"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_reranker_vl.py": {
+    "mtime": 1780874842.0009952,
+    "ast_hash": "2372085ef1a898565dfb6f325f8f02fa",
+    "semantic_hash": "2372085ef1a898565dfb6f325f8f02fa"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_memory_monitor_vlm_config.py": {
+    "mtime": 1780874841.9964495,
+    "ast_hash": "8e01f04716a8d0bfe6976952860330c8",
+    "semantic_hash": "8e01f04716a8d0bfe6976952860330c8"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_cache_factory.py": {
+    "mtime": 1780874841.992391,
+    "ast_hash": "45a41df0f3e35e0f4eb6bfb24b96c24f",
+    "semantic_hash": "45a41df0f3e35e0f4eb6bfb24b96c24f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_batched_engine.py": {
+    "mtime": 1780874841.9920819,
+    "ast_hash": "107137db82c00e8b2fb54e6ce5352628",
+    "semantic_hash": "107137db82c00e8b2fb54e6ce5352628"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_tts.py": {
+    "mtime": 1780874841.9919202,
+    "ast_hash": "98f0e5f2211c740aec366f1ad456e8a4",
+    "semantic_hash": "98f0e5f2211c740aec366f1ad456e8a4"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_server_queue_full_handler.py": {
+    "mtime": 1780874842.00199,
+    "ast_hash": "9d0d7efcc95916f43588c93ffb71484e",
+    "semantic_hash": "9d0d7efcc95916f43588c93ffb71484e"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_cache_observability.py": {
+    "mtime": 1780874841.992524,
+    "ast_hash": "68bce11eb93308f1405a11ae82510c86",
+    "semantic_hash": "68bce11eb93308f1405a11ae82510c86"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_per_engine_threads.py": {
+    "mtime": 1780874842.0000427,
+    "ast_hash": "246a810ae310f9618bc6fdc82b3635fb",
+    "semantic_hash": "246a810ae310f9618bc6fdc82b3635fb"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_thinking_budget.py": {
+    "mtime": 1780874842.0030675,
+    "ast_hash": "4fae4fc2f16975f85caf73d690932743",
+    "semantic_hash": "4fae4fc2f16975f85caf73d690932743"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_harmony.py": {
+    "mtime": 1780874841.9946496,
+    "ast_hash": "34b054167eb1b886dd5f18fcabc71ecb",
+    "semantic_hash": "34b054167eb1b886dd5f18fcabc71ecb"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_cache_probe.py": {
+    "mtime": 1780874841.990629,
+    "ast_hash": "e29fe00ed30d5c36a14dffb68670a0d6",
+    "semantic_hash": "e29fe00ed30d5c36a14dffb68670a0d6"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_manager.py": {
+    "mtime": 1780874841.996053,
+    "ast_hash": "27f8ec0d09bd785439f057862d7141fb",
+    "semantic_hash": "27f8ec0d09bd785439f057862d7141fb"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_prefill_progress_activity.py": {
+    "mtime": 1780874842.0002768,
+    "ast_hash": "b79ab4f189f248688207774a7ec17a34",
+    "semantic_hash": "b79ab4f189f248688207774a7ec17a34"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_responses.py": {
+    "mtime": 1780874842.0010917,
+    "ast_hash": "25f5727502a1365c1bd5092c51a2632d",
+    "semantic_hash": "25f5727502a1365c1bd5092c51a2632d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_config.py": {
+    "mtime": 1780874841.9930115,
+    "ast_hash": "a2e042dcbeb9bb7e23c8538d79fd1b08",
+    "semantic_hash": "a2e042dcbeb9bb7e23c8538d79fd1b08"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_vlm_torch_free_image_processor.py": {
+    "mtime": 1780874842.0045395,
+    "ast_hash": "0636bbdf1ed1b14371b4cac13fdf1fcd",
+    "semantic_hash": "0636bbdf1ed1b14371b4cac13fdf1fcd"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_sse_formatter.py": {
+    "mtime": 1780874842.0024877,
+    "ast_hash": "b66d364899c2391ed13102fbc1e265e4",
+    "semantic_hash": "b66d364899c2391ed13102fbc1e265e4"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_profiles_api.py": {
+    "mtime": 1780874841.9907396,
+    "ast_hash": "465dd7da2ce523fea2121a3ef1e2453b",
+    "semantic_hash": "465dd7da2ce523fea2121a3ef1e2453b"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_model_loading.py": {
+    "mtime": 1780874841.996795,
+    "ast_hash": "14bd1ae6aed3e19c70893ad83ce94d01",
+    "semantic_hash": "14bd1ae6aed3e19c70893ad83ce94d01"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_scheduler_admission.py": {
+    "mtime": 1780874842.0014005,
+    "ast_hash": "b6cb7b7477601fd5fedc4fc9c65187b1",
+    "semantic_hash": "b6cb7b7477601fd5fedc4fc9c65187b1"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_step3p7_patch.py": {
+    "mtime": 1780874842.00269,
+    "ast_hash": "4f9f05bfd67b1a494010a80c80777987",
+    "semantic_hash": "4f9f05bfd67b1a494010a80c80777987"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_server_metrics.py": {
+    "mtime": 1780874842.0017152,
+    "ast_hash": "1b68ea4fba38f768c119fa26ecc9ec97",
+    "semantic_hash": "1b68ea4fba38f768c119fa26ecc9ec97"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_turboquant.py": {
+    "mtime": 1780874842.0035949,
+    "ast_hash": "95ca68b6c0116be2d0e0f5aaf777abe9",
+    "semantic_hash": "95ca68b6c0116be2d0e0f5aaf777abe9"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_thinking.py": {
+    "mtime": 1780874842.0029619,
+    "ast_hash": "c864f232d89442b9e4f40db4988b14ec",
+    "semantic_hash": "c864f232d89442b9e4f40db4988b14ec"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_rotating_cache_contract.py": {
+    "mtime": 1780874842.001155,
+    "ast_hash": "338b967ea664bd37a0f9dcf736360b45",
+    "semantic_hash": "338b967ea664bd37a0f9dcf736360b45"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_hardware_benchmark.py": {
+    "mtime": 1780874841.9945679,
+    "ast_hash": "16df55c6b2ec16902f261ccffce56296",
+    "semantic_hash": "16df55c6b2ec16902f261ccffce56296"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_prefill_oom_graceful.py": {
+    "mtime": 1780874842.0001483,
+    "ast_hash": "2b36221ded2cde6f2ce2046ebf74f30e",
+    "semantic_hash": "2b36221ded2cde6f2ce2046ebf74f30e"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_models_base.py": {
+    "mtime": 1780874841.9970396,
+    "ast_hash": "66b54b7026b5119a8022e99078208bc1",
+    "semantic_hash": "66b54b7026b5119a8022e99078208bc1"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_compile_cache.py": {
+    "mtime": 1780874841.9929338,
+    "ast_hash": "9a16e9b7e79b17a7913aba0d86b5b98f",
+    "semantic_hash": "9a16e9b7e79b17a7913aba0d86b5b98f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_model_settings.py": {
+    "mtime": 1780874841.9969134,
+    "ast_hash": "c5d7ea22959447d4d7d5796442f1f0b7",
+    "semantic_hash": "c5d7ea22959447d4d7d5796442f1f0b7"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_utils.py": {
+    "mtime": 1780874841.9919815,
+    "ast_hash": "23644cc3d57a93fc3ed563a012d38709",
+    "semantic_hash": "23644cc3d57a93fc3ed563a012d38709"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mcp_routes.py": {
+    "mtime": 1780874841.9961262,
+    "ast_hash": "03ddf9f61f84a2a53b2cc3e932fda14c",
+    "semantic_hash": "03ddf9f61f84a2a53b2cc3e932fda14c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_sts.py": {
+    "mtime": 1780874841.991756,
+    "ast_hash": "2a548778b44b354841e3cb76336f300a",
+    "semantic_hash": "2a548778b44b354841e3cb76336f300a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_hot_cache.py": {
+    "mtime": 1780874841.995055,
+    "ast_hash": "bdcbedae09db9d186adde099f9397567",
+    "semantic_hash": "bdcbedae09db9d186adde099f9397567"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_context_window.py": {
+    "mtime": 1780874841.993153,
+    "ast_hash": "ead7eadbf9acb237ec67f4f589aca761",
+    "semantic_hash": "ead7eadbf9acb237ec67f4f589aca761"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_audio_memory.py": {
+    "mtime": 1780874841.9916797,
+    "ast_hash": "7f9bf4f5bfd15766afe30d8c49d5808a",
+    "semantic_hash": "7f9bf4f5bfd15766afe30d8c49d5808a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_cli.py": {
+    "mtime": 1780874841.9928832,
+    "ast_hash": "e42e4fcce37f1b8da423f4f87a9b4b37",
+    "semantic_hash": "e42e4fcce37f1b8da423f4f87a9b4b37"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_hf_uploader.py": {
+    "mtime": 1780874841.9949613,
+    "ast_hash": "23628c4b4d92cbd4825b91305cf5d24a",
+    "semantic_hash": "23628c4b4d92cbd4825b91305cf5d24a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_paged_cache.py": {
+    "mtime": 1780874841.999699,
+    "ast_hash": "58f05285b8d4a7b925b8b8717cccf72c",
+    "semantic_hash": "58f05285b8d4a7b925b8b8717cccf72c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_index_cache.py": {
+    "mtime": 1780874841.9953098,
+    "ast_hash": "966230d467f794188cf441b1eb065c4b",
+    "semantic_hash": "966230d467f794188cf441b1eb065c4b"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_sampling.py": {
+    "mtime": 1780874842.0012043,
+    "ast_hash": "264ea3dfec0a8ae4dd25cd94b83c8b73",
+    "semantic_hash": "264ea3dfec0a8ae4dd25cd94b83c8b73"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_disconnect_guard.py": {
+    "mtime": 1780874841.993529,
+    "ast_hash": "c23763748d998cda63ac86a96091e828",
+    "semantic_hash": "c23763748d998cda63ac86a96091e828"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_mlx_embeddings_compat.py": {
+    "mtime": 1780874841.9965184,
+    "ast_hash": "8ea6414f5bb5d5cd1b4ee50b67329097",
+    "semantic_hash": "8ea6414f5bb5d5cd1b4ee50b67329097"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_cache_stats.py": {
+    "mtime": 1780874841.9925952,
+    "ast_hash": "8ca5b61bb788f677ec0c88c3c06a434e",
+    "semantic_hash": "8ca5b61bb788f677ec0c88c3c06a434e"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_non_streaming_activity.py": {
+    "mtime": 1780874841.9971797,
+    "ast_hash": "b27c98e4ca06106a5268bea636a2d0b1",
+    "semantic_hash": "b27c98e4ca06106a5268bea636a2d0b1"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_boundary_snapshot_store.py": {
+    "mtime": 1780874841.9923294,
+    "ast_hash": "db89d60eeb895b8c13722cb61b89e4d5",
+    "semantic_hash": "db89d60eeb895b8c13722cb61b89e4d5"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_output_collector.py": {
+    "mtime": 1780874841.9978547,
+    "ast_hash": "6f020e5073104e48e10d8f614df22dd3",
+    "semantic_hash": "6f020e5073104e48e10d8f614df22dd3"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_markitdown_integration.py": {
+    "mtime": 1780874841.9956546,
+    "ast_hash": "a333bbdb172151ad3d920322211dead8",
+    "semantic_hash": "a333bbdb172151ad3d920322211dead8"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_api_auth.py": {
+    "mtime": 1780874841.9912813,
+    "ast_hash": "ac4ab2a0654e21a342b57aced68db84c",
+    "semantic_hash": "ac4ab2a0654e21a342b57aced68db84c"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_thinking_toggle.py": {
+    "mtime": 1780874842.0031905,
+    "ast_hash": "d358909481a5e5cac80417c3aa6c09a5",
+    "semantic_hash": "d358909481a5e5cac80417c3aa6c09a5"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_update_check.py": {
+    "mtime": 1780874841.9909775,
+    "ast_hash": "24bb5c6b50bc347f66d8b4b9fcca8245",
+    "semantic_hash": "24bb5c6b50bc347f66d8b4b9fcca8245"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_admin_auth.py": {
+    "mtime": 1780874841.9905462,
+    "ast_hash": "9dce6484621479518512d07781f49de9",
+    "semantic_hash": "9dce6484621479518512d07781f49de9"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_model_settings_profiles.py": {
+    "mtime": 1780874841.9969852,
+    "ast_hash": "5fbdb8e5fb2f6e81dc3517c5e9fa78a6",
+    "semantic_hash": "5fbdb8e5fb2f6e81dc3517c5e9fa78a6"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_harmony_parser.py": {
+    "mtime": 1780874841.9947178,
+    "ast_hash": "3e30b4f83ad7d10094eb1c2da8e2d304",
+    "semantic_hash": "3e30b4f83ad7d10094eb1c2da8e2d304"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_eval.py": {
+    "mtime": 1780874841.9941573,
+    "ast_hash": "af27695262bfa6e8113c8a7ea9b0a56d",
+    "semantic_hash": "af27695262bfa6e8113c8a7ea9b0a56d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_truncate_tool_result.py": {
+    "mtime": 1780874842.003511,
+    "ast_hash": "489daaea7c971549ed0b6d1b173a56da",
+    "semantic_hash": "489daaea7c971549ed0b6d1b173a56da"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_logging_config.py": {
+    "mtime": 1780874841.9955726,
+    "ast_hash": "2deecd7f06fb6f0c4275ec756506900b",
+    "semantic_hash": "2deecd7f06fb6f0c4275ec756506900b"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_settings.py": {
+    "mtime": 1780874842.0020974,
+    "ast_hash": "7adb6df51bad5260f92872340d8a8b8f",
+    "semantic_hash": "7adb6df51bad5260f92872340d8a8b8f"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_reranker_causal_lm.py": {
+    "mtime": 1780874842.0009305,
+    "ast_hash": "9e04824f2cbc7a52c8718f505fe008e8",
+    "semantic_hash": "9e04824f2cbc7a52c8718f505fe008e8"
+  },
+  "/Users/czha168/workspaces/omlx/tests/test_sse_keepalive.py": {
+    "mtime": 1780874842.0025663,
+    "ast_hash": "d150bcf3ce8f55f6584b43a86312ab8d",
+    "semantic_hash": "d150bcf3ce8f55f6584b43a86312ab8d"
+  },
+  "/Users/czha168/workspaces/omlx/tests/mocks.py": {
+    "mtime": 1780874841.9902632,
+    "ast_hash": "c1d303817bb82738e31ddd81f2609368",
+    "semantic_hash": "c1d303817bb82738e31ddd81f2609368"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_vlm_mrope_integration.py": {
+    "mtime": 1780874841.9901943,
+    "ast_hash": "7e86ae2feec629cae65d75187a64ef16",
+    "semantic_hash": "7e86ae2feec629cae65d75187a64ef16"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_e2e_streaming.py": {
+    "mtime": 1780874841.9898791,
+    "ast_hash": "060f12d8fd1023c576704254f4e6d3f6",
+    "semantic_hash": "060f12d8fd1023c576704254f4e6d3f6"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/__init__.py": {
+    "mtime": 1780874841.9896476,
+    "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_audio_tts_streaming_integration.py": {
+    "mtime": 1780874841.9897122,
+    "ast_hash": "d6322a08819919eb1ecb2a5102858ac9",
+    "semantic_hash": "d6322a08819919eb1ecb2a5102858ac9"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_full_integration.py": {
+    "mtime": 1780874841.9899602,
+    "ast_hash": "43a1e6e386a25b1ebff8c2eba3f5a1d2",
+    "semantic_hash": "43a1e6e386a25b1ebff8c2eba3f5a1d2"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_real_model_inference.py": {
+    "mtime": 1780874841.9900374,
+    "ast_hash": "6c0cb2b5072f34e88b79df096e8e960a",
+    "semantic_hash": "6c0cb2b5072f34e88b79df096e8e960a"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_server_endpoints.py": {
+    "mtime": 1780874841.9901218,
+    "ast_hash": "72b9eccc622a0c897f534f6ab3cd6a48",
+    "semantic_hash": "72b9eccc622a0c897f534f6ab3cd6a48"
+  },
+  "/Users/czha168/workspaces/omlx/tests/integration/test_boundary_cache_consistency.py": {
+    "mtime": 1780874841.9897768,
+    "ast_hash": "e39b8edb0d47e59193e333aac1e0921b",
+    "semantic_hash": "e39b8edb0d47e59193e333aac1e0921b"
+  },
+  "/Users/czha168/workspaces/omlx/tests/fixtures/generate_test_audio.py": {
+    "mtime": 1780874841.9894981,
+    "ast_hash": "875af1d012836ecef14ff02b055d9c8d",
+    "semantic_hash": "875af1d012836ecef14ff02b055d9c8d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/oq_calibration_data.json": {
+    "mtime": 1780874841.98349,
+    "ast_hash": "d36cc6f11e2f5ad2d497594f80498ee0",
+    "semantic_hash": "d36cc6f11e2f5ad2d497594f80498ee0"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/model_settings.py": {
+    "mtime": 1780874841.9808638,
+    "ast_hash": "feaa947a589503b14abea92406fbbe0d",
+    "semantic_hash": "feaa947a589503b14abea92406fbbe0d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/server.py": {
+    "mtime": 1780874841.9871435,
+    "ast_hash": "68209ee55ae2a5068f14386735c601d6",
+    "semantic_hash": "68209ee55ae2a5068f14386735c601d6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/output_collector.py": {
+    "mtime": 1780874841.9838467,
+    "ast_hash": "ebf4ff45abdd6a25ed88a28e1fd21c6c",
+    "semantic_hash": "ebf4ff45abdd6a25ed88a28e1fd21c6c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/config.py": {
+    "mtime": 1780874841.8921547,
+    "ast_hash": "4971988b022ff2e8a9f08a5766293c01",
+    "semantic_hash": "4971988b022ff2e8a9f08a5766293c01"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/logging_config.py": {
+    "mtime": 1780874841.9799964,
+    "ast_hash": "0008cbf058b0594dd3c014165843251a",
+    "semantic_hash": "0008cbf058b0594dd3c014165843251a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/_version.py": {
+    "mtime": 1780874841.8618193,
+    "ast_hash": "66e34b646ed170f9bf3b0f17380e214b",
+    "semantic_hash": "66e34b646ed170f9bf3b0f17380e214b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/prefill_transient_tracker.py": {
+    "mtime": 1780874841.986301,
+    "ast_hash": "023041d7501977b88d1bc1c5cb992d86",
+    "semantic_hash": "023041d7501977b88d1bc1c5cb992d86"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/model_profiles.py": {
+    "mtime": 1780874841.9806948,
+    "ast_hash": "a580824d5023da7ee0724a16bb187f93",
+    "semantic_hash": "a580824d5023da7ee0724a16bb187f93"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/turboquant_kv.py": {
+    "mtime": 1780874841.9877675,
+    "ast_hash": "496e5e6567d32758637e1ee06557cec0",
+    "semantic_hash": "496e5e6567d32758637e1ee06557cec0"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/request.py": {
+    "mtime": 1780874841.9865658,
+    "ast_hash": "543a44b0c0100991257fe74ea05a531e",
+    "semantic_hash": "543a44b0c0100991257fe74ea05a531e"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/__init__.py": {
+    "mtime": 1780874841.861687,
+    "ast_hash": "45a0bacf5fafd9cecd4177da4873994b",
+    "semantic_hash": "45a0bacf5fafd9cecd4177da4873994b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/server_metrics.py": {
+    "mtime": 1780874841.987456,
+    "ast_hash": "775eb338b65494698d1e7344bb472227",
+    "semantic_hash": "775eb338b65494698d1e7344bb472227"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/process_memory_enforcer.py": {
+    "mtime": 1780874841.9864433,
+    "ast_hash": "fee1e46cfd68cf2eeb30df2913035145",
+    "semantic_hash": "fee1e46cfd68cf2eeb30df2913035145"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/optimizations.py": {
+    "mtime": 1780874841.9815004,
+    "ast_hash": "0dfd95416da4be3b4c1bcb088b0b88c6",
+    "semantic_hash": "0dfd95416da4be3b4c1bcb088b0b88c6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine_core.py": {
+    "mtime": 1780874898.7866225,
+    "ast_hash": "e98f3b42d6bad726b2f2466c4e17732a",
+    "semantic_hash": "e98f3b42d6bad726b2f2466c4e17732a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cli.py": {
+    "mtime": 1780874841.892072,
+    "ast_hash": "a1922a20ce75efe5538c3398028e9c91",
+    "semantic_hash": "a1922a20ce75efe5538c3398028e9c91"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/prefill_progress.py": {
+    "mtime": 1780874841.9862554,
+    "ast_hash": "1587436ebc555478415d0934d0fa4e67",
+    "semantic_hash": "1587436ebc555478415d0934d0fa4e67"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/process_title.py": {
+    "mtime": 1780874841.9865015,
+    "ast_hash": "8017040ba816ea8eb13a8b6a25788aef",
+    "semantic_hash": "8017040ba816ea8eb13a8b6a25788aef"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/model_discovery.py": {
+    "mtime": 1780874841.9806235,
+    "ast_hash": "25ce631c749f17ee133bb50e9227b49f",
+    "semantic_hash": "25ce631c749f17ee133bb50e9227b49f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/settings.py": {
+    "mtime": 1780874841.9875455,
+    "ast_hash": "a59f1de9fa7cc869b7d77f7fa93eed58",
+    "semantic_hash": "a59f1de9fa7cc869b7d77f7fa93eed58"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/oq.py": {
+    "mtime": 1780874841.9817822,
+    "ast_hash": "a7b44cf2a296016c43586ec33d6fdafc",
+    "semantic_hash": "a7b44cf2a296016c43586ec33d6fdafc"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/exceptions.py": {
+    "mtime": 1780874841.9793112,
+    "ast_hash": "5d16de0d9eba926e82e18e2a60abcf5b",
+    "semantic_hash": "5d16de0d9eba926e82e18e2a60abcf5b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/scheduler.py": {
+    "mtime": 1780874841.9869182,
+    "ast_hash": "68dd1577686f652d2cc737a1fbbb11c1",
+    "semantic_hash": "68dd1577686f652d2cc737a1fbbb11c1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/_torch_stub.py": {
+    "mtime": 1780874841.8617725,
+    "ast_hash": "10fd6c54700c1292c4430593ffe6149b",
+    "semantic_hash": "10fd6c54700c1292c4430593ffe6149b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine_pool.py": {
+    "mtime": 1780874841.89347,
+    "ast_hash": "eb9cf524d15d6b9643c4c5c965f8a6d3",
+    "semantic_hash": "eb9cf524d15d6b9643c4c5c965f8a6d3"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/model_registry.py": {
+    "mtime": 1780874841.9807484,
+    "ast_hash": "87b80872201d8608050d35f7f775ec3f",
+    "semantic_hash": "87b80872201d8608050d35f7f775ec3f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/memory_monitor.py": {
+    "mtime": 1780874841.9805312,
+    "ast_hash": "4d68ed4f5c6cd451a856fb7658975dbb",
+    "semantic_hash": "4d68ed4f5c6cd451a856fb7658975dbb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/recovery.py": {
+    "mtime": 1780874841.89157,
+    "ast_hash": "ead347335db2370259b972253cb6f743",
+    "semantic_hash": "ead347335db2370259b972253cb6f743"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/_rotating_subclass.py": {
+    "mtime": 1780874841.8907087,
+    "ast_hash": "71f5a4917cbd6874964f26f142444d53",
+    "semantic_hash": "71f5a4917cbd6874964f26f142444d53"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/interface.py": {
+    "mtime": 1780874841.8909736,
+    "ast_hash": "5fd32d54a9929f1d24f8196ef88cbd2e",
+    "semantic_hash": "5fd32d54a9929f1d24f8196ef88cbd2e"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/type_handlers.py": {
+    "mtime": 1780874841.8917544,
+    "ast_hash": "de6e4cd71d377981286d96f6623930bb",
+    "semantic_hash": "de6e4cd71d377981286d96f6623930bb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/__init__.py": {
+    "mtime": 1780874841.8906636,
+    "ast_hash": "ec0704efc9d12d6c8e997672acfab1b8",
+    "semantic_hash": "ec0704efc9d12d6c8e997672acfab1b8"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/observability.py": {
+    "mtime": 1780874841.8910222,
+    "ast_hash": "121bbdfd85b06a5104535847998aaa5f",
+    "semantic_hash": "121bbdfd85b06a5104535847998aaa5f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/factory.py": {
+    "mtime": 1780874841.8908772,
+    "ast_hash": "bc50f8408a00528de47719645d87088c",
+    "semantic_hash": "bc50f8408a00528de47719645d87088c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/type_registry.py": {
+    "mtime": 1780874841.8918312,
+    "ast_hash": "87f5995763878efd3d64421091dfd087",
+    "semantic_hash": "87f5995763878efd3d64421091dfd087"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/boundary_snapshot_store.py": {
+    "mtime": 1780874841.8908207,
+    "ast_hash": "b9923b966960ffa011b6dfe511124d2d",
+    "semantic_hash": "b9923b966960ffa011b6dfe511124d2d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/paged_ssd_cache.py": {
+    "mtime": 1780874898.7862177,
+    "ast_hash": "28d78b836388a551818fc0dcdf745376",
+    "semantic_hash": "28d78b836388a551818fc0dcdf745376"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/paged_cache.py": {
+    "mtime": 1780874841.891132,
+    "ast_hash": "17a5733c489a0feb662f98c129845438",
+    "semantic_hash": "17a5733c489a0feb662f98c129845438"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/stats.py": {
+    "mtime": 1780874841.891629,
+    "ast_hash": "59fe5aa3a3133111519831a851dbd6be",
+    "semantic_hash": "59fe5aa3a3133111519831a851dbd6be"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/vision_feature_cache.py": {
+    "mtime": 1780874841.8919094,
+    "ast_hash": "fc579e4bf3cf97b7264ec9e61f7709cb",
+    "semantic_hash": "fc579e4bf3cf97b7264ec9e61f7709cb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/prefix_cache.py": {
+    "mtime": 1780874841.8914719,
+    "ast_hash": "8f0717b731dc226c1a01942cd0d99a0f",
+    "semantic_hash": "8f0717b731dc226c1a01942cd0d99a0f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/cache/hybrid_cache.py": {
+    "mtime": 1780874841.8909304,
+    "ast_hash": "57c748f1150e02b902c81394523e4e96",
+    "semantic_hash": "57c748f1150e02b902c81394523e4e96"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_audio_compat.py": {
+    "mtime": 1780874841.9848497,
+    "ast_hash": "d4def206b5690bbaba9d731ec2d84618",
+    "semantic_hash": "d4def206b5690bbaba9d731ec2d84618"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/specprefill.py": {
+    "mtime": 1780874841.9860003,
+    "ast_hash": "d414cb771a8c9c7ffbd98b71acaca1f0",
+    "semantic_hash": "d414cb771a8c9c7ffbd98b71acaca1f0"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/__init__.py": {
+    "mtime": 1780874841.9839218,
+    "ast_hash": "917cc2656856300b0163ddaa51573acc",
+    "semantic_hash": "917cc2656856300b0163ddaa51573acc"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/index_cache.py": {
+    "mtime": 1780874841.9848042,
+    "ast_hash": "9254353525348461c76bbf3124626db3",
+    "semantic_hash": "9254353525348461c76bbf3124626db3"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/qwen3_6_nested_visual.py": {
+    "mtime": 1780874841.9859107,
+    "ast_hash": "f31a19c08654d072f959cd6281bd6197",
+    "semantic_hash": "f31a19c08654d072f959cd6281bd6197"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/turboquant_attention.py": {
+    "mtime": 1780874841.9861925,
+    "ast_hash": "8887241251cefe86acd964af8a4cfe91",
+    "semantic_hash": "8887241251cefe86acd964af8a4cfe91"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/dflash_lifecycle.py": {
+    "mtime": 1780874841.9847395,
+    "ast_hash": "d0db486262ed2087991d441b5cb64aa7",
+    "semantic_hash": "d0db486262ed2087991d441b5cb64aa7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_runtime.py": {
+    "mtime": 1780874841.985714,
+    "ast_hash": "716e909277a09607b0971f72ff43f19a",
+    "semantic_hash": "716e909277a09607b0971f72ff43f19a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_model.py": {
+    "mtime": 1780874841.985602,
+    "ast_hash": "633c81ae89e37e80b367af906781b827",
+    "semantic_hash": "633c81ae89e37e80b367af906781b827"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_vlm_mtp/__init__.py": {
+    "mtime": 1780874841.9855003,
+    "ast_hash": "a6a6f8727eef5cf199733b4c7db32651",
+    "semantic_hash": "a6a6f8727eef5cf199733b4c7db32651"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_vlm_mtp/qwen35_vlm_model.py": {
+    "mtime": 1780874841.9857883,
+    "ast_hash": "60f9450d24da3b6a66e62ce9c06ff421",
+    "semantic_hash": "60f9450d24da3b6a66e62ce9c06ff421"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_vlm_mtp/qwen35_vlm_runtime.py": {
+    "mtime": 1780874841.9858496,
+    "ast_hash": "10120598557103af2ae8088e7d50e52b",
+    "semantic_hash": "10120598557103af2ae8088e7d50e52b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/deepseek_v4_model.py": {
+    "mtime": 1780874841.9843757,
+    "ast_hash": "4c2d7f3847ab1fc242daf569649d8b08",
+    "semantic_hash": "4c2d7f3847ab1fc242daf569649d8b08"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/chat_template_v4.py": {
+    "mtime": 1780874841.984291,
+    "ast_hash": "290c1f4a96b8a47ea250f3dcb7fec5df",
+    "semantic_hash": "290c1f4a96b8a47ea250f3dcb7fec5df"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/tool_parser_v4.py": {
+    "mtime": 1780874841.984614,
+    "ast_hash": "fb425cdae572c039bed0494f632cf9a5",
+    "semantic_hash": "fb425cdae572c039bed0494f632cf9a5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/__init__.py": {
+    "mtime": 1780874841.9840715,
+    "ast_hash": "27ba92c64927392d7af454287b698471",
+    "semantic_hash": "27ba92c64927392d7af454287b698471"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/generate_patch.py": {
+    "mtime": 1780874841.984432,
+    "ast_hash": "4146feb8b724a28571d8dd73ba7579d9",
+    "semantic_hash": "4146feb8b724a28571d8dd73ba7579d9"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/cache_extras.py": {
+    "mtime": 1780874841.9841468,
+    "ast_hash": "946cbec1cb00fe4db30a51cf8bd42a95",
+    "semantic_hash": "946cbec1cb00fe4db30a51cf8bd42a95"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/utils_patch.py": {
+    "mtime": 1780874841.9846783,
+    "ast_hash": "c44223128b3cd927812a0e12dc89cd70",
+    "semantic_hash": "c44223128b3cd927812a0e12dc89cd70"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/hyper_connection.py": {
+    "mtime": 1780874841.9844944,
+    "ast_hash": "3a2064a6d517b7134af741d537c0f11a",
+    "semantic_hash": "3a2064a6d517b7134af741d537c0f11a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/tokenizer_patch.py": {
+    "mtime": 1780874841.9845552,
+    "ast_hash": "fcacd6d0f9e798994b589d71d36f5501",
+    "semantic_hash": "fcacd6d0f9e798994b589d71d36f5501"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/cache_handlers.py": {
+    "mtime": 1780874841.984209,
+    "ast_hash": "57223826737f7c52477ad7c04513cebf",
+    "semantic_hash": "57223826737f7c52477ad7c04513cebf"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/step3p7/step3p7_model.py": {
+    "mtime": 1780874841.986134,
+    "ast_hash": "baca2040ddb89a4dca73b3422488a9bb",
+    "semantic_hash": "baca2040ddb89a4dca73b3422488a9bb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/step3p7/__init__.py": {
+    "mtime": 1780874841.9860866,
+    "ast_hash": "b0807427658548be189e4dc8c8cb96a8",
+    "semantic_hash": "b0807427658548be189e4dc8c8cb96a8"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_lm_mtp/deepseek_v4_model.py": {
+    "mtime": 1780874841.9852703,
+    "ast_hash": "a00a07424457e21fa2b4b0c44ee64c55",
+    "semantic_hash": "a00a07424457e21fa2b4b0c44ee64c55"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_lm_mtp/__init__.py": {
+    "mtime": 1780874841.984954,
+    "ast_hash": "57ba74aee1cdb3eb9af11318f4540a0e",
+    "semantic_hash": "57ba74aee1cdb3eb9af11318f4540a0e"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_lm_mtp/qwen35_model.py": {
+    "mtime": 1780874841.9854052,
+    "ast_hash": "44b3d40fb4ea7da9085c38607c933f31",
+    "semantic_hash": "44b3d40fb4ea7da9085c38607c933f31"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_lm_mtp/cache_rollback.py": {
+    "mtime": 1780874841.9851856,
+    "ast_hash": "80bc6632b8540bbaabcc007c87f8dfd8",
+    "semantic_hash": "80bc6632b8540bbaabcc007c87f8dfd8"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/mlx_lm_mtp/batch_generator.py": {
+    "mtime": 1780874841.9851263,
+    "ast_hash": "f09a486c7f29328acdd6a294fb865c5d",
+    "semantic_hash": "f09a486c7f29328acdd6a294fb865c5d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/auth.py": {
+    "mtime": 1780874841.8624253,
+    "ast_hash": "fe6f8c3ea65a7d745382de379d0f77fb",
+    "semantic_hash": "fe6f8c3ea65a7d745382de379d0f77fb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/ms_downloader.py": {
+    "mtime": 1780874841.8639712,
+    "ast_hash": "0497392ae5ebb92af2d886500401a8b2",
+    "semantic_hash": "0497392ae5ebb92af2d886500401a8b2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/tailwind.config.js": {
+    "mtime": 1780874841.8866584,
+    "ast_hash": "b8c4ee08b4767d3bb5c6e2dffaa3ede9",
+    "semantic_hash": "b8c4ee08b4767d3bb5c6e2dffaa3ede9"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/benchmark.py": {
+    "mtime": 1780874841.8625412,
+    "ast_hash": "ceea6ce4c85e77b8d327c96583bb9a61",
+    "semantic_hash": "ceea6ce4c85e77b8d327c96583bb9a61"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/hf_downloader.py": {
+    "mtime": 1780874841.8627279,
+    "ast_hash": "673c570512694f0428be78ad82f1e29b",
+    "semantic_hash": "673c570512694f0428be78ad82f1e29b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/accuracy_benchmark.py": {
+    "mtime": 1780874841.8623476,
+    "ast_hash": "60f4d0fc75642ecb92d265abf97a7080",
+    "semantic_hash": "60f4d0fc75642ecb92d265abf97a7080"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/build_css.py": {
+    "mtime": 1780874841.8626041,
+    "ast_hash": "a6b1e0149330e62eb3a70bc2b27687ea",
+    "semantic_hash": "a6b1e0149330e62eb3a70bc2b27687ea"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/__init__.py": {
+    "mtime": 1780874841.8622684,
+    "ast_hash": "97ecf9e409ae9eaa993da33f9ea6c0ce",
+    "semantic_hash": "97ecf9e409ae9eaa993da33f9ea6c0ce"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/vendor_deps.py": {
+    "mtime": 1780874841.8885868,
+    "ast_hash": "0e44f27b25e0a6a47843d1cf0a6ce7e0",
+    "semantic_hash": "0e44f27b25e0a6a47843d1cf0a6ce7e0"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/hf_uploader.py": {
+    "mtime": 1780874841.8628285,
+    "ast_hash": "241e161e851c11e1737b9cc1c2e71227",
+    "semantic_hash": "241e161e851c11e1737b9cc1c2e71227"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/oq_manager.py": {
+    "mtime": 1780874841.864064,
+    "ast_hash": "538c4b659b3fd538d6aae384fa37fac7",
+    "semantic_hash": "538c4b659b3fd538d6aae384fa37fac7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/routes.py": {
+    "mtime": 1780874898.7856948,
+    "ast_hash": "c1afc4bcf2e4c11219d4c5c1138465c7",
+    "semantic_hash": "c1afc4bcf2e4c11219d4c5c1138465c7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/omlx_preset.json": {
+    "mtime": 1780874841.8866134,
+    "ast_hash": "0d3bed71ea8a05231c00b0fa3eff66d5",
+    "semantic_hash": "0d3bed71ea8a05231c00b0fa3eff66d5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/purify.min.js": {
+    "mtime": 1780874841.8862944,
+    "ast_hash": "549c43ecd1cb8a901f5729c257abb068",
+    "semantic_hash": "549c43ecd1cb8a901f5729c257abb068"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/hljs-json.min.js": {
+    "mtime": 1780874841.8846426,
+    "ast_hash": "eeb73fa94a2bd520e532e44cf2b79200",
+    "semantic_hash": "eeb73fa94a2bd520e532e44cf2b79200"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/alpine.min.js": {
+    "mtime": 1780874841.8839226,
+    "ast_hash": "8ff95ecd7ce47a261b8ea81f5a2f9198",
+    "semantic_hash": "8ff95ecd7ce47a261b8ea81f5a2f9198"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/hljs-javascript.min.js": {
+    "mtime": 1780874841.8845985,
+    "ast_hash": "9b1f59a11916b6d695ea93abfe9ac591",
+    "semantic_hash": "9b1f59a11916b6d695ea93abfe9ac591"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/marked-highlight.umd.js": {
+    "mtime": 1780874841.8860874,
+    "ast_hash": "dee6831a241c1798f673e2f20dcd9637",
+    "semantic_hash": "dee6831a241c1798f673e2f20dcd9637"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/katex.min.js": {
+    "mtime": 1780874841.8850703,
+    "ast_hash": "80102fec0059ad07966087b6df6e12f2",
+    "semantic_hash": "80102fec0059ad07966087b6df6e12f2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/highlight.min.js": {
+    "mtime": 1780874841.8844812,
+    "ast_hash": "1ba1ea897d65b202b5450f6e55d043ef",
+    "semantic_hash": "1ba1ea897d65b202b5450f6e55d043ef"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/hljs-bash.min.js": {
+    "mtime": 1780874841.88454,
+    "ast_hash": "42db2f41b1ccb73c252655f25c333392",
+    "semantic_hash": "42db2f41b1ccb73c252655f25c333392"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/dashboard.js": {
+    "mtime": 1780874841.884284,
+    "ast_hash": "b0fcbaebac8f429de8befd8eee140946",
+    "semantic_hash": "b0fcbaebac8f429de8befd8eee140946"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/katex-auto-render.min.js": {
+    "mtime": 1780874841.8847353,
+    "ast_hash": "ee714a6885cbddd97bf29ba915b037af",
+    "semantic_hash": "ee714a6885cbddd97bf29ba915b037af"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/lucide.min.js": {
+    "mtime": 1780874841.8858614,
+    "ast_hash": "6e37a1cce626d59d778fa9ed52fc5805",
+    "semantic_hash": "6e37a1cce626d59d778fa9ed52fc5805"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/hljs-python.min.js": {
+    "mtime": 1780874841.88469,
+    "ast_hash": "e90a11c08180e2919b01caa1483bf572",
+    "semantic_hash": "e90a11c08180e2919b01caa1483bf572"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/js/marked.umd.js": {
+    "mtime": 1780874841.8862097,
+    "ast_hash": "182ec00649740c3070b2080dd9690142",
+    "semantic_hash": "182ec00649740c3070b2080dd9690142"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/zh.json": {
+    "mtime": 1780874841.8638887,
+    "ast_hash": "639ff2f5d8969f291627c4b145dde7dd",
+    "semantic_hash": "639ff2f5d8969f291627c4b145dde7dd"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/ja.json": {
+    "mtime": 1780874841.8633902,
+    "ast_hash": "71e18305e1baf06dce19240cdfc3dfea",
+    "semantic_hash": "71e18305e1baf06dce19240cdfc3dfea"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/ru.json": {
+    "mtime": 1780874841.8636327,
+    "ast_hash": "0dcc4da2e288885129458e9fd3ebeb49",
+    "semantic_hash": "0dcc4da2e288885129458e9fd3ebeb49"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/en.json": {
+    "mtime": 1780874841.8630776,
+    "ast_hash": "a0d7c032da474da2367c21228b4c7fd7",
+    "semantic_hash": "a0d7c032da474da2367c21228b4c7fd7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/fr.json": {
+    "mtime": 1780874841.8632731,
+    "ast_hash": "31540d63862754c75a788c41e2526e3b",
+    "semantic_hash": "31540d63862754c75a788c41e2526e3b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/ko.json": {
+    "mtime": 1780874841.8635557,
+    "ast_hash": "0f8fe4c61d139c9dffb51b44c6424e28",
+    "semantic_hash": "0f8fe4c61d139c9dffb51b44c6424e28"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/zh-TW.json": {
+    "mtime": 1780874841.863758,
+    "ast_hash": "a39bfe4d648032109976896c993da3c6",
+    "semantic_hash": "a39bfe4d648032109976896c993da3c6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/i18n/es.json": {
+    "mtime": 1780874841.863198,
+    "ast_hash": "c5f77883212a3aefe10c9dbd6d33aa16",
+    "semantic_hash": "c5f77883212a3aefe10c9dbd6d33aa16"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/proc_memory.py": {
+    "mtime": 1780874841.9883993,
+    "ast_hash": "7a404c4a78f6ed1ce6a6801e6c2381f7",
+    "semantic_hash": "7a404c4a78f6ed1ce6a6801e6c2381f7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/release_check.py": {
+    "mtime": 1780874841.9884439,
+    "ast_hash": "260964bc828f7eccab936a19737379d3",
+    "semantic_hash": "260964bc828f7eccab936a19737379d3"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/generation_config.py": {
+    "mtime": 1780874841.9879777,
+    "ast_hash": "9a71bc736c107d4ab417ff9c39f17be1",
+    "semantic_hash": "9a71bc736c107d4ab417ff9c39f17be1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/__init__.py": {
+    "mtime": 1780874841.9878414,
+    "ast_hash": "3116af937c2919d5f248fd10267216a2",
+    "semantic_hash": "3116af937c2919d5f248fd10267216a2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/formatting.py": {
+    "mtime": 1780874841.9879298,
+    "ast_hash": "d8207fd5a4272e45af5d86a828376c48",
+    "semantic_hash": "d8207fd5a4272e45af5d86a828376c48"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/model_loading.py": {
+    "mtime": 1780874841.9882693,
+    "ast_hash": "a81e60462693eaa874b145395623cba5",
+    "semantic_hash": "a81e60462693eaa874b145395623cba5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/tokenizer.py": {
+    "mtime": 1780874841.9886072,
+    "ast_hash": "c29014a4b2d2826f4c395b2ef627c18e",
+    "semantic_hash": "c29014a4b2d2826f4c395b2ef627c18e"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/sampling.py": {
+    "mtime": 1780874841.988526,
+    "ast_hash": "0185cbbde5e38b95fa986facdcc547d6",
+    "semantic_hash": "0185cbbde5e38b95fa986facdcc547d6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/network.py": {
+    "mtime": 1780874841.9883313,
+    "ast_hash": "cf3d93f5abda7c0bc9ee81914fee283d",
+    "semantic_hash": "cf3d93f5abda7c0bc9ee81914fee283d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/hardware.py": {
+    "mtime": 1780874841.988055,
+    "ast_hash": "4776f76f22e9cea85cd6a5798beb7a8d",
+    "semantic_hash": "4776f76f22e9cea85cd6a5798beb7a8d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/install.py": {
+    "mtime": 1780874841.9881673,
+    "ast_hash": "c91bd6a7e2854f2de810804fd2e768f6",
+    "semantic_hash": "c91bd6a7e2854f2de810804fd2e768f6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/image.py": {
+    "mtime": 1780874841.9881175,
+    "ast_hash": "5041837a9d6f1297b1b3bad62e73462a",
+    "semantic_hash": "5041837a9d6f1297b1b3bad62e73462a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/utils/compile_cache.py": {
+    "mtime": 1780874841.987889,
+    "ast_hash": "314dae1718b45b5958c7c5cd2d968da6",
+    "semantic_hash": "314dae1718b45b5958c7c5cd2d968da6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/config.py": {
+    "mtime": 1780874841.9802246,
+    "ast_hash": "5bbbe13c13424865a4566e559f76aee2",
+    "semantic_hash": "5bbbe13c13424865a4566e559f76aee2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/client.py": {
+    "mtime": 1780874841.9801717,
+    "ast_hash": "a6df7b4bb583ee19c075d93363fbe22c",
+    "semantic_hash": "a6df7b4bb583ee19c075d93363fbe22c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/tools.py": {
+    "mtime": 1780874841.9803832,
+    "ast_hash": "b7a4de6ff066fd0431ed00d4dd238163",
+    "semantic_hash": "b7a4de6ff066fd0431ed00d4dd238163"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/__init__.py": {
+    "mtime": 1780874841.9800844,
+    "ast_hash": "cc37729653b9300ff46db8381e55ec8f",
+    "semantic_hash": "cc37729653b9300ff46db8381e55ec8f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/types.py": {
+    "mtime": 1780874841.9804373,
+    "ast_hash": "1feb5396f549ac39f4284705bc7eede8",
+    "semantic_hash": "1feb5396f549ac39f4284705bc7eede8"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/manager.py": {
+    "mtime": 1780874841.980332,
+    "ast_hash": "94696bda090baef6b2c72f8d3f6fc557",
+    "semantic_hash": "94696bda090baef6b2c72f8d3f6fc557"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/mcp/executor.py": {
+    "mtime": 1780874841.9802759,
+    "ast_hash": "553c1cac079973cf2b7d8935b87e8939",
+    "semantic_hash": "553c1cac079973cf2b7d8935b87e8939"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/reranker.py": {
+    "mtime": 1780874841.9812987,
+    "ast_hash": "434b66d86bff5ec893bc67a4465f84cb",
+    "semantic_hash": "434b66d86bff5ec893bc67a4465f84cb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/mlx_embeddings_compat.py": {
+    "mtime": 1780874841.9811924,
+    "ast_hash": "5440c68b095f3f7ec765048c4a6da490",
+    "semantic_hash": "5440c68b095f3f7ec765048c4a6da490"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/embedding.py": {
+    "mtime": 1780874841.9810739,
+    "ast_hash": "419e4de2d8bb825ac19533818ca5da71",
+    "semantic_hash": "419e4de2d8bb825ac19533818ca5da71"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/__init__.py": {
+    "mtime": 1780874841.9809535,
+    "ast_hash": "e9c060c26dda737de11e86e7e9b14cd1",
+    "semantic_hash": "e9c060c26dda737de11e86e7e9b14cd1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/llm.py": {
+    "mtime": 1780874841.9811463,
+    "ast_hash": "410fe0e17e27883d773076418eb4b8a1",
+    "semantic_hash": "410fe0e17e27883d773076418eb4b8a1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/base_model.py": {
+    "mtime": 1780874841.9810052,
+    "ast_hash": "673161763b478d1874dff79d55c3d628",
+    "semantic_hash": "673161763b478d1874dff79d55c3d628"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/vlm.py": {
+    "mtime": 1780874841.9813902,
+    "ast_hash": "c5082388f96510a027fe9f432f387287",
+    "semantic_hash": "c5082388f96510a027fe9f432f387287"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/models/xlm_roberta.py": {
+    "mtime": 1780874841.981449,
+    "ast_hash": "1b678cf28eac793626a21abc44219bfd",
+    "semantic_hash": "1b678cf28eac793626a21abc44219bfd"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/adapter/gemma4.py": {
+    "mtime": 1780874841.8619897,
+    "ast_hash": "25763eaddc1d35b767f16078d2de7635",
+    "semantic_hash": "25763eaddc1d35b767f16078d2de7635"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/adapter/__init__.py": {
+    "mtime": 1780874841.8619006,
+    "ast_hash": "d047afa1f28ca99b8cf600cf845d03e5",
+    "semantic_hash": "d047afa1f28ca99b8cf600cf845d03e5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/adapter/output_parser.py": {
+    "mtime": 1780874841.8621645,
+    "ast_hash": "d10dd91eff805fc4c616b1c619f57985",
+    "semantic_hash": "d10dd91eff805fc4c616b1c619f57985"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/adapter/harmony.py": {
+    "mtime": 1780874841.8620806,
+    "ast_hash": "fea116cd6809982f70f72687354157b4",
+    "semantic_hash": "fea116cd6809982f70f72687354157b4"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/codex.py": {
+    "mtime": 1780874841.9796185,
+    "ast_hash": "e40ac53f8365e99396d75c4a38bafab8",
+    "semantic_hash": "e40ac53f8365e99396d75c4a38bafab8"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/claude.py": {
+    "mtime": 1780874841.9795544,
+    "ast_hash": "47a368d2dd51a20ddcc55996c19126d4",
+    "semantic_hash": "47a368d2dd51a20ddcc55996c19126d4"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/copilot.py": {
+    "mtime": 1780874841.9796712,
+    "ast_hash": "12e29a696264bc9d5014562b872f70d9",
+    "semantic_hash": "12e29a696264bc9d5014562b872f70d9"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/__init__.py": {
+    "mtime": 1780874841.9794047,
+    "ast_hash": "faffe030fe9d4bbd07b5619758541b67",
+    "semantic_hash": "faffe030fe9d4bbd07b5619758541b67"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/hermes.py": {
+    "mtime": 1780874841.9797359,
+    "ast_hash": "ec08abfea7ac498f3516b7b6ee99f9f8",
+    "semantic_hash": "ec08abfea7ac498f3516b7b6ee99f9f8"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/pi.py": {
+    "mtime": 1780874841.9799194,
+    "ast_hash": "621a0db07b715ef513681538d86c172b",
+    "semantic_hash": "621a0db07b715ef513681538d86c172b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/opencode.py": {
+    "mtime": 1780874841.9798667,
+    "ast_hash": "9f4a945c22c363414bcf63ea5086a7eb",
+    "semantic_hash": "9f4a945c22c363414bcf63ea5086a7eb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/base.py": {
+    "mtime": 1780874841.9794989,
+    "ast_hash": "193a6f1451c2e60490c17c392a9e9850",
+    "semantic_hash": "193a6f1451c2e60490c17c392a9e9850"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/integrations/openclaw.py": {
+    "mtime": 1780874841.9798083,
+    "ast_hash": "5065f0533dee4af3e1d8950f2a1bcb35",
+    "semantic_hash": "5065f0533dee4af3e1d8950f2a1bcb35"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/audio_models.py": {
+    "mtime": 1780874841.889183,
+    "ast_hash": "fbcc6615784e576d6e717e4c052523a6",
+    "semantic_hash": "fbcc6615784e576d6e717e4c052523a6"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/mcp_routes.py": {
+    "mtime": 1780874841.889604,
+    "ast_hash": "e301b0399f74702368be7461840876eb",
+    "semantic_hash": "e301b0399f74702368be7461840876eb"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/shared_models.py": {
+    "mtime": 1780874841.8902676,
+    "ast_hash": "842582fd0a3dee45d3cf0128f2c4af9c",
+    "semantic_hash": "842582fd0a3dee45d3cf0128f2c4af9c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/embedding_utils.py": {
+    "mtime": 1780874841.8893616,
+    "ast_hash": "8e3ba23966023bd14698435567757e26",
+    "semantic_hash": "8e3ba23966023bd14698435567757e26"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/embedding_models.py": {
+    "mtime": 1780874841.8893118,
+    "ast_hash": "432d763b9f2459ea1a63b106effe03ed",
+    "semantic_hash": "432d763b9f2459ea1a63b106effe03ed"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/__init__.py": {
+    "mtime": 1780874841.8886673,
+    "ast_hash": "41ca86c19a878c2fbc38a0a21aee52dc",
+    "semantic_hash": "41ca86c19a878c2fbc38a0a21aee52dc"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/rerank_models.py": {
+    "mtime": 1780874841.8897655,
+    "ast_hash": "478c5227f43806ceef836dd48f83f65d",
+    "semantic_hash": "478c5227f43806ceef836dd48f83f65d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/responses_models.py": {
+    "mtime": 1780874841.88983,
+    "ast_hash": "14314698ea76c11a4f869b11ff3bfdb2",
+    "semantic_hash": "14314698ea76c11a4f869b11ff3bfdb2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/grammar.py": {
+    "mtime": 1780874841.8894162,
+    "ast_hash": "54b815e8951585725c7f581be7615909",
+    "semantic_hash": "54b815e8951585725c7f581be7615909"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/anthropic_models.py": {
+    "mtime": 1780874841.8890116,
+    "ast_hash": "467a9f2ec816dd78778589a3ca9d77dd",
+    "semantic_hash": "467a9f2ec816dd78778589a3ca9d77dd"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/markitdown.py": {
+    "mtime": 1780874841.8894877,
+    "ast_hash": "a81846737cdd7512b58d925213d38009",
+    "semantic_hash": "a81846737cdd7512b58d925213d38009"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/thinking.py": {
+    "mtime": 1780874841.890376,
+    "ast_hash": "630b09081dea8e58780ff42394e510a3",
+    "semantic_hash": "630b09081dea8e58780ff42394e510a3"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/utils.py": {
+    "mtime": 1780874841.8905666,
+    "ast_hash": "411baf7a3703389cbea5d85f894e674d",
+    "semantic_hash": "411baf7a3703389cbea5d85f894e674d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/openai_models.py": {
+    "mtime": 1780874841.889701,
+    "ast_hash": "64528bc8e2f86bbe14206ed88c105292",
+    "semantic_hash": "64528bc8e2f86bbe14206ed88c105292"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/audio_routes.py": {
+    "mtime": 1780874841.8892608,
+    "ast_hash": "dfbdc1462523c2a940d8faebd7777b94",
+    "semantic_hash": "dfbdc1462523c2a940d8faebd7777b94"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/anthropic_utils.py": {
+    "mtime": 1780874841.889129,
+    "ast_hash": "84897793812fbee1bf9e4e64381d20ce",
+    "semantic_hash": "84897793812fbee1bf9e4e64381d20ce"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/tool_calling.py": {
+    "mtime": 1780874841.8904884,
+    "ast_hash": "cfda2e9aaee3d7f8f16b71bbb250f021",
+    "semantic_hash": "cfda2e9aaee3d7f8f16b71bbb250f021"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/markitdown_pdf_fallback.py": {
+    "mtime": 1780874841.8895524,
+    "ast_hash": "dce0cf198e91c27385b5124b60fdccea",
+    "semantic_hash": "dce0cf198e91c27385b5124b60fdccea"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/responses_utils.py": {
+    "mtime": 1780874841.8899379,
+    "ast_hash": "79e328eb98ecf19d80e0e485b112a40d",
+    "semantic_hash": "79e328eb98ecf19d80e0e485b112a40d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/adapters/__init__.py": {
+    "mtime": 1780874841.8887398,
+    "ast_hash": "d96c8619763bae01f397247e37dfb5b9",
+    "semantic_hash": "d96c8619763bae01f397247e37dfb5b9"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/adapters/sse_formatter.py": {
+    "mtime": 1780874841.8889377,
+    "ast_hash": "113415bcca07e518ae88cda10de5f721",
+    "semantic_hash": "113415bcca07e518ae88cda10de5f721"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/adapters/openai.py": {
+    "mtime": 1780874841.8888958,
+    "ast_hash": "12a1e3438f38e9fc14567ecc9d72c008",
+    "semantic_hash": "12a1e3438f38e9fc14567ecc9d72c008"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/adapters/anthropic.py": {
+    "mtime": 1780874841.888792,
+    "ast_hash": "e9540f2752214a8d3068d9ef2ba0b83b",
+    "semantic_hash": "e9540f2752214a8d3068d9ef2ba0b83b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/api/adapters/base.py": {
+    "mtime": 1780874841.8888412,
+    "ast_hash": "f668ed4354700b310731eac4f6e8a8ef",
+    "semantic_hash": "f668ed4354700b310731eac4f6e8a8ef"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/speculative/__init__.py": {
+    "mtime": 1780874841.987629,
+    "ast_hash": "dc3f3aacbc27b1216d4d219bf55a7f98",
+    "semantic_hash": "dc3f3aacbc27b1216d4d219bf55a7f98"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/speculative/vlm_mtp.py": {
+    "mtime": 1780874841.987704,
+    "ast_hash": "309c171e21b22c1cf81565987731097a",
+    "semantic_hash": "309c171e21b22c1cf81565987731097a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/mbpp.py": {
+    "mtime": 1780874841.978838,
+    "ast_hash": "d431b98ec8cb6170f63e3d13faa75d1f",
+    "semantic_hash": "d431b98ec8cb6170f63e3d13faa75d1f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/jmmlu.py": {
+    "mtime": 1780874841.9785554,
+    "ast_hash": "b275edbb91cb5f0e4367e231fc564691",
+    "semantic_hash": "b275edbb91cb5f0e4367e231fc564691"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/mmlu.py": {
+    "mtime": 1780874841.9789162,
+    "ast_hash": "c69c1a6a584114bb78c9ed07df399c0c",
+    "semantic_hash": "c69c1a6a584114bb78c9ed07df399c0c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/gsm8k.py": {
+    "mtime": 1780874841.9783423,
+    "ast_hash": "36e1e2ed43a7f86d5858d64c14a05707",
+    "semantic_hash": "36e1e2ed43a7f86d5858d64c14a05707"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/winogrande.py": {
+    "mtime": 1780874841.9791946,
+    "ast_hash": "499ef49162607fa9d7dad783c2406879",
+    "semantic_hash": "499ef49162607fa9d7dad783c2406879"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/mathqa.py": {
+    "mtime": 1780874841.9787593,
+    "ast_hash": "32f741d40135cc66b911ccbfe64f6db2",
+    "semantic_hash": "32f741d40135cc66b911ccbfe64f6db2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/bbq.py": {
+    "mtime": 1780874841.8937442,
+    "ast_hash": "bfb58b18e6cef568844d963e03895a59",
+    "semantic_hash": "bfb58b18e6cef568844d963e03895a59"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/datasets.py": {
+    "mtime": 1780874841.978224,
+    "ast_hash": "6051f5da6d42dea17f072e74a6b94cbd",
+    "semantic_hash": "6051f5da6d42dea17f072e74a6b94cbd"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/__init__.py": {
+    "mtime": 1780874841.8935564,
+    "ast_hash": "1cc82ce08400f3319f37d16083361d06",
+    "semantic_hash": "1cc82ce08400f3319f37d16083361d06"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/safetybench.py": {
+    "mtime": 1780874841.9790895,
+    "ast_hash": "c562a08c3f0167765ae5b0fb83713d59",
+    "semantic_hash": "c562a08c3f0167765ae5b0fb83713d59"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/livecodebench.py": {
+    "mtime": 1780874841.978694,
+    "ast_hash": "769ac9f7752e5ac49529176a2f64c96c",
+    "semantic_hash": "769ac9f7752e5ac49529176a2f64c96c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/kmmlu.py": {
+    "mtime": 1780874841.9786086,
+    "ast_hash": "9b1f877510da46fb7a3c89b1314948a2",
+    "semantic_hash": "9b1f877510da46fb7a3c89b1314948a2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/truthfulqa.py": {
+    "mtime": 1780874841.9791408,
+    "ast_hash": "04a48a543c3cf08f986366c0e28b2dd7",
+    "semantic_hash": "04a48a543c3cf08f986366c0e28b2dd7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/hellaswag.py": {
+    "mtime": 1780874841.9784114,
+    "ast_hash": "88f675dd64c15b04acb0b56a3228e01e",
+    "semantic_hash": "88f675dd64c15b04acb0b56a3228e01e"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/mmlu_pro.py": {
+    "mtime": 1780874841.9790337,
+    "ast_hash": "28814418e7362431b3f44ea2897194e5",
+    "semantic_hash": "28814418e7362431b3f44ea2897194e5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/arc.py": {
+    "mtime": 1780874841.893621,
+    "ast_hash": "937bbaaf0d68b54aadd72098199b42b1",
+    "semantic_hash": "937bbaaf0d68b54aadd72098199b42b1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/cmmlu.py": {
+    "mtime": 1780874841.8938003,
+    "ast_hash": "beccfc12094d4469ea4f3e174d0f1440",
+    "semantic_hash": "beccfc12094d4469ea4f3e174d0f1440"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/base.py": {
+    "mtime": 1780874841.8936899,
+    "ast_hash": "ed74291deaac19fc1db8626a413fa4fd",
+    "semantic_hash": "ed74291deaac19fc1db8626a413fa4fd"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/eval/humaneval.py": {
+    "mtime": 1780874841.9784982,
+    "ast_hash": "b43ce7cb26f0d5fddecc42d4f51050da",
+    "semantic_hash": "b43ce7cb26f0d5fddecc42d4f51050da"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/sts.py": {
+    "mtime": 1780874841.8928652,
+    "ast_hash": "82c2d447a599c05bbc8f439fde9b3257",
+    "semantic_hash": "82c2d447a599c05bbc8f439fde9b3257"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/reranker.py": {
+    "mtime": 1780874841.8927724,
+    "ast_hash": "114133ee9c018631d8bf476587636b2a",
+    "semantic_hash": "114133ee9c018631d8bf476587636b2a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/embedding.py": {
+    "mtime": 1780874841.8927066,
+    "ast_hash": "0f6289d2c0789278dcd8642f9707ea9c",
+    "semantic_hash": "0f6289d2c0789278dcd8642f9707ea9c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/tts.py": {
+    "mtime": 1780874841.8930454,
+    "ast_hash": "330fc4357ff20c5e26c5b8c18ced55d2",
+    "semantic_hash": "330fc4357ff20c5e26c5b8c18ced55d2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/__init__.py": {
+    "mtime": 1780874841.8922436,
+    "ast_hash": "ed03364c565844d217e88a5cf233a4a4",
+    "semantic_hash": "ed03364c565844d217e88a5cf233a4a4"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/vlm.py": {
+    "mtime": 1780874841.8931844,
+    "ast_hash": "614a6ce4b4c9454c05c7abd8c770f16d",
+    "semantic_hash": "614a6ce4b4c9454c05c7abd8c770f16d"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/audio_utils.py": {
+    "mtime": 1780874841.8922973,
+    "ast_hash": "8c84fa005c6ed68761e91aee6083e80e",
+    "semantic_hash": "8c84fa005c6ed68761e91aee6083e80e"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/dflash.py": {
+    "mtime": 1780874841.8926437,
+    "ast_hash": "d69bc9722ca7fa74ea89f5008c28ab1c",
+    "semantic_hash": "d69bc9722ca7fa74ea89f5008c28ab1c"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/batched.py": {
+    "mtime": 1780874841.8925123,
+    "ast_hash": "ce99e944bf0e858de55b1fe04943ecfc",
+    "semantic_hash": "ce99e944bf0e858de55b1fe04943ecfc"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/base.py": {
+    "mtime": 1780874841.8923962,
+    "ast_hash": "b4ce1a1ce0b70bb8b17c52242ab78348",
+    "semantic_hash": "b4ce1a1ce0b70bb8b17c52242ab78348"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/engine/stt.py": {
+    "mtime": 1780874841.8929422,
+    "ast_hash": "75c287ea5d0439987a3a0fb667722189",
+    "semantic_hash": "75c287ea5d0439987a3a0fb667722189"
+  },
+  "/Users/czha168/workspaces/omlx/Formula/omlx.rb": {
+    "mtime": 1780874841.807528,
+    "ast_hash": "d609af9cc9fb2e53207b0e25915c97d6",
+    "semantic_hash": "d609af9cc9fb2e53207b0e25915c97d6"
+  },
+  "/Users/czha168/workspaces/omlx/scripts/normalize_i18n.py": {
+    "mtime": 1780874841.9891422,
+    "ast_hash": "0c6fee3f529a1bd9955d6d04d2c73a2e",
+    "semantic_hash": "0c6fee3f529a1bd9955d6d04d2c73a2e"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/Contents.json": {
+    "mtime": 1780874841.8086603,
+    "ast_hash": "9deb2ada1cc834bbebf8bbad9c8978a1",
+    "semantic_hash": "9deb2ada1cc834bbebf8bbad9c8978a1"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/MenubarOutline.imageset/Contents.json": {
+    "mtime": 1780874841.8088806,
+    "ast_hash": "50cd06832f893720365301fc5f441c6a",
+    "semantic_hash": "50cd06832f893720365301fc5f441c6a"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/MenubarFilled.imageset/Contents.json": {
+    "mtime": 1780874841.808739,
+    "ast_hash": "19354616e7509f8554520d4929770914",
+    "semantic_hash": "19354616e7509f8554520d4929770914"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/AppLogo.imageset/Contents.json": {
+    "mtime": 1780874841.8084958,
+    "ast_hash": "20a48e8a46535f14a1769bb599a6bdf3",
+    "semantic_hash": "20a48e8a46535f14a1769bb599a6bdf3"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/AppIcon.icon/icon.json": {
+    "mtime": 1780874841.8083768,
+    "ast_hash": "f153e5463f8812ea26ffcdfb85b6276c",
+    "semantic_hash": "f153e5463f8812ea26ffcdfb85b6276c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ProfileDTODecodeTests.swift": {
+    "mtime": 1780874841.817818,
+    "ast_hash": "cb52e23dcb9551f4ca9dc45febea0d9b",
+    "semantic_hash": "cb52e23dcb9551f4ca9dc45febea0d9b"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ServerProcessIntegrationTests.swift": {
+    "mtime": 1780874841.818031,
+    "ast_hash": "facfaeb5bb95f8ed914fba71c0709a6d",
+    "semantic_hash": "facfaeb5bb95f8ed914fba71c0709a6d"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/SamplingValidatorTests.swift": {
+    "mtime": 1780874841.8179739,
+    "ast_hash": "5963b1a316b97f5c5c7f0576c04263d7",
+    "semantic_hash": "5963b1a316b97f5c5c7f0576c04263d7"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/DTOFixtureTests.swift": {
+    "mtime": 1780874841.8170578,
+    "ast_hash": "5adc5e75e234facee4e64f03ef4a05dd",
+    "semantic_hash": "5adc5e75e234facee4e64f03ef4a05dd"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/DflashByteSizeTests.swift": {
+    "mtime": 1780874841.8171084,
+    "ast_hash": "3bd4defdad97c389985a3b6ccbb1aeae",
+    "semantic_hash": "3bd4defdad97c389985a3b6ccbb1aeae"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ReleasesCheckerTests.swift": {
+    "mtime": 1780874841.8179235,
+    "ast_hash": "a32a354fcc9c2499b90eb675ff918d30",
+    "semantic_hash": "a32a354fcc9c2499b90eb675ff918d30"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/GlobalSettingsSamplingTests.swift": {
+    "mtime": 1780874841.8175187,
+    "ast_hash": "630084a72e099675204ec940f10b5622",
+    "semantic_hash": "630084a72e099675204ec940f10b5622"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/WelcomeViewModelTests.swift": {
+    "mtime": 1780874841.8182952,
+    "ast_hash": "5062a508b1c5a167c6cb07caba2ac20c",
+    "semantic_hash": "5062a508b1c5a167c6cb07caba2ac20c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ProfileScopeTests.swift": {
+    "mtime": 1780874841.8178687,
+    "ast_hash": "c5365ebcf39ef9764353e6f9c7e3a0be",
+    "semantic_hash": "c5365ebcf39ef9764353e6f9c7e3a0be"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/LocalizationSmokeTests.swift": {
+    "mtime": 1780874841.8175836,
+    "ast_hash": "3a58a20e7e42fdf1f15ed6a5e75d58fd",
+    "semantic_hash": "3a58a20e7e42fdf1f15ed6a5e75d58fd"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ShellEnvWriterTests.swift": {
+    "mtime": 1780874841.818141,
+    "ast_hash": "b9239c57df0da1dc05e48fae5e310813",
+    "semantic_hash": "b9239c57df0da1dc05e48fae5e310813"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/MenubarControllerPortTests.swift": {
+    "mtime": 1780874841.8176496,
+    "ast_hash": "7a3cecfeea2d145a410a04259df13f8e",
+    "semantic_hash": "7a3cecfeea2d145a410a04259df13f8e"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/SystemMetricsTests.swift": {
+    "mtime": 1780874841.8181899,
+    "ast_hash": "839591e7c81a17c6f87426f17b305ed0",
+    "semantic_hash": "839591e7c81a17c6f87426f17b305ed0"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ChatTemplateKwargsCodecTests.swift": {
+    "mtime": 1780874841.8169975,
+    "ast_hash": "1a4d2f525018b20dc2a417842f91ec37",
+    "semantic_hash": "1a4d2f525018b20dc2a417842f91ec37"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ModelsScreenSortingTests.swift": {
+    "mtime": 1780874841.8177617,
+    "ast_hash": "bb137a0b291866f9a641134b465f5315",
+    "semantic_hash": "bb137a0b291866f9a641134b465f5315"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/APIKeyGeneratorTests.swift": {
+    "mtime": 1780874841.8168087,
+    "ast_hash": "0a410d57bf0e5f8ee55a6e2b32ffd641",
+    "semantic_hash": "0a410d57bf0e5f8ee55a6e2b32ffd641"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/AppConfigTests.swift": {
+    "mtime": 1780874841.8168797,
+    "ast_hash": "ac9b07f04ab5eed707ba1e4cd4ee7df4",
+    "semantic_hash": "ac9b07f04ab5eed707ba1e4cd4ee7df4"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ModelCardDTODecodeTests.swift": {
+    "mtime": 1780874841.8177102,
+    "ast_hash": "cbfa1284389e1255d4506e089290d1be",
+    "semantic_hash": "cbfa1284389e1255d4506e089290d1be"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ServerScreenVMStorageDiffTests.swift": {
+    "mtime": 1780874841.8180904,
+    "ast_hash": "b2a1705ac5ca5df0a28ac66bf015917a",
+    "semantic_hash": "b2a1705ac5ca5df0a28ac66bf015917a"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/AppServicesPathTests.swift": {
+    "mtime": 1780874841.8169417,
+    "ast_hash": "3b431e5f200c103bf93529610615347a",
+    "semantic_hash": "3b431e5f200c103bf93529610615347a"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/ThemeTests.swift": {
+    "mtime": 1780874841.8182356,
+    "ast_hash": "c1d6b0e4204f412bc2f4c1b7df020f46",
+    "semantic_hash": "c1d6b0e4204f412bc2f4c1b7df020f46"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/Fixtures/model-profiles.json": {
+    "mtime": 1780874841.817249,
+    "ast_hash": "2ce867ba17404ca8f747fa04a369026c",
+    "semantic_hash": "2ce867ba17404ca8f747fa04a369026c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/Fixtures/models.json": {
+    "mtime": 1780874841.8172987,
+    "ast_hash": "52dfa7b0c68d13705879df18450a540a",
+    "semantic_hash": "52dfa7b0c68d13705879df18450a540a"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/Fixtures/stats-session.json": {
+    "mtime": 1780874841.8174508,
+    "ast_hash": "dd1d844e9d6d81a6f84968c9c7663ed6",
+    "semantic_hash": "dd1d844e9d6d81a6f84968c9c7663ed6"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/Fixtures/global-settings.json": {
+    "mtime": 1780874841.8171897,
+    "ast_hash": "3cefa9b33ecea34ac0b6a9f252d21f44",
+    "semantic_hash": "3cefa9b33ecea34ac0b6a9f252d21f44"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/Fixtures/profile-templates.json": {
+    "mtime": 1780874841.8173482,
+    "ast_hash": "5ab6a69ed6e9f858c74f27f5dc07483d",
+    "semantic_hash": "5ab6a69ed6e9f858c74f27f5dc07483d"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Tests/oMLXTests/Fixtures/server-info.json": {
+    "mtime": 1780874841.817401,
+    "ast_hash": "90f01999a484f8cb6d43a6fbaca5bb07",
+    "semantic_hash": "90f01999a484f8cb6d43a6fbaca5bb07"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Scripts/dev_server.py": {
+    "mtime": 1780874841.8105319,
+    "ast_hash": "32beaec014def697956d555b1d804cfe",
+    "semantic_hash": "32beaec014def697956d555b1d804cfe"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Scripts/build.sh": {
+    "mtime": 1780874841.8104665,
+    "ast_hash": "3f443a04e6d2dade490db82f7d26a697",
+    "semantic_hash": "3f443a04e6d2dade490db82f7d26a697"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/Endpoints.swift": {
+    "mtime": 1780874841.8150022,
+    "ast_hash": "79c2dae86f7ebf533db3757f4879f346",
+    "semantic_hash": "79c2dae86f7ebf533db3757f4879f346"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/OMLXClient.swift": {
+    "mtime": 1780874841.8150933,
+    "ast_hash": "7b3c84f05dec9aff9055cc4d9e515a92",
+    "semantic_hash": "7b3c84f05dec9aff9055cc4d9e515a92"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/OQDTO.swift": {
+    "mtime": 1780874841.8146396,
+    "ast_hash": "e08b80f3200e59cdd510bfad262bfc20",
+    "semantic_hash": "e08b80f3200e59cdd510bfad262bfc20"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/ProfileDTO.swift": {
+    "mtime": 1780874841.8147604,
+    "ast_hash": "514f77a7bcfbd3221eebab1125c0eb56",
+    "semantic_hash": "514f77a7bcfbd3221eebab1125c0eb56"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/LogsDTO.swift": {
+    "mtime": 1780874841.814423,
+    "ast_hash": "749c3cb20e5060cd5b526b085492b1ff",
+    "semantic_hash": "749c3cb20e5060cd5b526b085492b1ff"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/SubKeyDTO.swift": {
+    "mtime": 1780874841.814936,
+    "ast_hash": "f7ceb96ed1d85a01f04e0a5b3c4884fe",
+    "semantic_hash": "f7ceb96ed1d85a01f04e0a5b3c4884fe"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/ModelsDTO.swift": {
+    "mtime": 1780874841.81459,
+    "ast_hash": "bf84815055d4a1618d6112bb46db7af8",
+    "semantic_hash": "bf84815055d4a1618d6112bb46db7af8"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/GlobalSettingsDTO.swift": {
+    "mtime": 1780874841.8142612,
+    "ast_hash": "943b430693c3bbb122c220ca38c05e18",
+    "semantic_hash": "943b430693c3bbb122c220ca38c05e18"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/MSTaskDTO.swift": {
+    "mtime": 1780874841.814478,
+    "ast_hash": "0ae9b807a241b7b97bbfd7f37cbc308b",
+    "semantic_hash": "0ae9b807a241b7b97bbfd7f37cbc308b"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/HFUploadDTO.swift": {
+    "mtime": 1780874841.8143713,
+    "ast_hash": "2e9d25e670d4eca46cc6b8f0aeb4d469",
+    "semantic_hash": "2e9d25e670d4eca46cc6b8f0aeb4d469"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/StatsDTO.swift": {
+    "mtime": 1780874841.814876,
+    "ast_hash": "6945038a0a0a0482f0083139f032f2b5",
+    "semantic_hash": "6945038a0a0a0482f0083139f032f2b5"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/ServerInfoDTO.swift": {
+    "mtime": 1780874841.81482,
+    "ast_hash": "d9a28c19eac1310ed0eb7aff20a08e59",
+    "semantic_hash": "d9a28c19eac1310ed0eb7aff20a08e59"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/PresetBundleDTO.swift": {
+    "mtime": 1780874841.8146913,
+    "ast_hash": "eeafbbc1e6caee5ebd4dcec023e53ee9",
+    "semantic_hash": "eeafbbc1e6caee5ebd4dcec023e53ee9"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/ModelCardDTO.swift": {
+    "mtime": 1780874841.8145287,
+    "ast_hash": "9601962c0f3bae67e8f028c6759a938a",
+    "semantic_hash": "9601962c0f3bae67e8f028c6759a938a"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/BenchDTO.swift": {
+    "mtime": 1780874841.8141892,
+    "ast_hash": "3649789a902957777013545c0d097aa7",
+    "semantic_hash": "3649789a902957777013545c0d097aa7"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Net/DTO/HFTaskDTO.swift": {
+    "mtime": 1780874841.8143165,
+    "ast_hash": "b975e22a3180e4a391a93e957b606c7d",
+    "semantic_hash": "b975e22a3180e4a391a93e957b606c7d"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/App/oMLXApp.swift": {
+    "mtime": 1780874841.8107758,
+    "ast_hash": "149bd8b3974419917c3048ea1b45f77c",
+    "semantic_hash": "149bd8b3974419917c3048ea1b45f77c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/App/AppDelegate.swift": {
+    "mtime": 1780874841.8107002,
+    "ast_hash": "2f3b7d96ae2acc059d3494afdbf1f7b2",
+    "semantic_hash": "2f3b7d96ae2acc059d3494afdbf1f7b2"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Menubar/MenubarController.swift": {
+    "mtime": 1780874841.813923,
+    "ast_hash": "299147cf9c9fdfc8aade8939242add3f",
+    "semantic_hash": "299147cf9c9fdfc8aade8939242add3f"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Menubar/MenubarStatsPoller.swift": {
+    "mtime": 1780874841.8139908,
+    "ast_hash": "610b98cbdc141d1752d3b62a8e84434b",
+    "semantic_hash": "610b98cbdc141d1752d3b62a8e84434b"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Menubar/MenubarVisibilityWatcher.swift": {
+    "mtime": 1780874841.8140593,
+    "ast_hash": "192f4a0c0cf8749465a29ed4bbdcf959",
+    "semantic_hash": "192f4a0c0cf8749465a29ed4bbdcf959"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Config/APIKeyGenerator.swift": {
+    "mtime": 1780874841.8136091,
+    "ast_hash": "8181361932f7bd7bbbc8f13f2a5e0c94",
+    "semantic_hash": "8181361932f7bd7bbbc8f13f2a5e0c94"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Config/ShellEnvWriter.swift": {
+    "mtime": 1780874841.8137867,
+    "ast_hash": "8167930ae2b950dade8acea68ce6e73c",
+    "semantic_hash": "8167930ae2b950dade8acea68ce6e73c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Config/AppConfig.swift": {
+    "mtime": 1780874841.8137114,
+    "ast_hash": "c70015c6d4dd88d860ecb8f47e513331",
+    "semantic_hash": "c70015c6d4dd88d860ecb8f47e513331"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Server/AppControlServer.swift": {
+    "mtime": 1780874841.8152092,
+    "ast_hash": "1b75c476b8f308b3d98e21c021fd9f84",
+    "semantic_hash": "1b75c476b8f308b3d98e21c021fd9f84"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Server/PythonRuntime.swift": {
+    "mtime": 1780874841.8153703,
+    "ast_hash": "2e5198455aad53e5a3dd1f30a1ca1986",
+    "semantic_hash": "2e5198455aad53e5a3dd1f30a1ca1986"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Server/PortConflictResolver.swift": {
+    "mtime": 1780874841.8152874,
+    "ast_hash": "1cc312110a940a2ae980610b8e48bb7e",
+    "semantic_hash": "1cc312110a940a2ae980610b8e48bb7e"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Server/ServerProcess.swift": {
+    "mtime": 1780874841.8154573,
+    "ast_hash": "41bee53220d08f7e2e4e8106017f5d05",
+    "semantic_hash": "41bee53220d08f7e2e4e8106017f5d05"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Server/SignalHandlers.swift": {
+    "mtime": 1780874841.815526,
+    "ast_hash": "a66cfd4fe9653e7d93babaf76706580c",
+    "semantic_hash": "a66cfd4fe9653e7d93babaf76706580c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Updater/AppUpdater.swift": {
+    "mtime": 1780874841.8163793,
+    "ast_hash": "0c736a10ed236d94af063f51a8404b39",
+    "semantic_hash": "0c736a10ed236d94af063f51a8404b39"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Updater/UpdateController.swift": {
+    "mtime": 1780874841.816537,
+    "ast_hash": "d27171e7174df6ab1d1d72b6edfea993",
+    "semantic_hash": "d27171e7174df6ab1d1d72b6edfea993"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Updater/ReleasesChecker.swift": {
+    "mtime": 1780874841.8164523,
+    "ast_hash": "2f7e565a7db3bf372d6e32847cf5f432",
+    "semantic_hash": "2f7e565a7db3bf372d6e32847cf5f432"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Welcome/WelcomeWindow.swift": {
+    "mtime": 1780874841.8166895,
+    "ast_hash": "71070d5652146159fdacb9cafefb0c75",
+    "semantic_hash": "71070d5652146159fdacb9cafefb0c75"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Glass.swift": {
+    "mtime": 1780874841.81616,
+    "ast_hash": "e999fdb5bf661bb82e2990f0f25bfb30",
+    "semantic_hash": "e999fdb5bf661bb82e2990f0f25bfb30"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Squircle.swift": {
+    "mtime": 1780874841.8162148,
+    "ast_hash": "f87a6e5b2094bf908d9745006e8388a0",
+    "semantic_hash": "f87a6e5b2094bf908d9745006e8388a0"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Theme.swift": {
+    "mtime": 1780874841.8162804,
+    "ast_hash": "e8a83d0a3addfe448076390ca9840751",
+    "semantic_hash": "e8a83d0a3addfe448076390ca9840751"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/StatusPill.swift": {
+    "mtime": 1780874841.8160553,
+    "ast_hash": "a9a1a7fe08ef1dfa7b3f1207a4264efc",
+    "semantic_hash": "a9a1a7fe08ef1dfa7b3f1207a4264efc"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/ScreenScaffold.swift": {
+    "mtime": 1780874841.8159144,
+    "ast_hash": "d7f6dbf3dc34e1db73a4aca7cfa73a81",
+    "semantic_hash": "d7f6dbf3dc34e1db73a4aca7cfa73a81"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/Segmented.swift": {
+    "mtime": 1780874841.816009,
+    "ast_hash": "8aaedd015147f2d3eb667ba405ad5587",
+    "semantic_hash": "8aaedd015147f2d3eb667ba405ad5587"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/TextInput.swift": {
+    "mtime": 1780874841.8161027,
+    "ast_hash": "eb2d27072c194b9d49b8d97aa1554b19",
+    "semantic_hash": "eb2d27072c194b9d49b8d97aa1554b19"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/ListGroup.swift": {
+    "mtime": 1780874841.8157651,
+    "ast_hash": "de8a68f8777267f83bbf40b428efa84b",
+    "semantic_hash": "de8a68f8777267f83bbf40b428efa84b"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/Row.swift": {
+    "mtime": 1780874841.8158677,
+    "ast_hash": "843f8faf50b31e3dd540defbbe6f84b9",
+    "semantic_hash": "843f8faf50b31e3dd540defbbe6f84b9"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/CodeChip.swift": {
+    "mtime": 1780874841.8157046,
+    "ast_hash": "9faff068e9f99b2b07fefa94929e3a46",
+    "semantic_hash": "9faff068e9f99b2b07fefa94929e3a46"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/Button.swift": {
+    "mtime": 1780874841.8156528,
+    "ast_hash": "1b88da8be160e578c56d3ef4d8f10bb6",
+    "semantic_hash": "1b88da8be160e578c56d3ef4d8f10bb6"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/Popup.swift": {
+    "mtime": 1780874841.8158162,
+    "ast_hash": "5c85020dc132317bdb498608010a71fb",
+    "semantic_hash": "5c85020dc132317bdb498608010a71fb"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/Theme/Components/SectionHeader.swift": {
+    "mtime": 1780874841.8159592,
+    "ast_hash": "0ad25450668c25b5675f25ee83b10845",
+    "semantic_hash": "0ad25450668c25b5675f25ee83b10845"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/AppView.swift": {
+    "mtime": 1780874841.8110912,
+    "ast_hash": "ea9b2b64300d29c101d5a0fc8b0cabaa",
+    "semantic_hash": "ea9b2b64300d29c101d5a0fc8b0cabaa"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/AppServices.swift": {
+    "mtime": 1780874841.8109694,
+    "ast_hash": "b1877741b80541fd0091b474c5c6866e",
+    "semantic_hash": "b1877741b80541fd0091b474c5c6866e"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/AppSection.swift": {
+    "mtime": 1780874841.8108888,
+    "ast_hash": "f17031372fe7ddc06dd92ab087a446eb",
+    "semantic_hash": "f17031372fe7ddc06dd92ab087a446eb"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/PresetBundleStore.swift": {
+    "mtime": 1780874841.8111534,
+    "ast_hash": "bcd0d0ba06ea446773ef569d23361213",
+    "semantic_hash": "bcd0d0ba06ea446773ef569d23361213"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ProfileViews.swift": {
+    "mtime": 1780874841.8127778,
+    "ast_hash": "e1dfcfb759aeb6104447f97c637ca93b",
+    "semantic_hash": "e1dfcfb759aeb6104447f97c637ca93b"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/NetworkScreen.swift": {
+    "mtime": 1780874841.8125567,
+    "ast_hash": "73e4ab0fa1906772434ee1a660d5432c",
+    "semantic_hash": "73e4ab0fa1906772434ee1a660d5432c"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/AboutScreen.swift": {
+    "mtime": 1780874841.811251,
+    "ast_hash": "67caa9ca0c3bd25f15e5af8aa0a3e8c4",
+    "semantic_hash": "67caa9ca0c3bd25f15e5af8aa0a3e8c4"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ThroughputBenchScreen.swift": {
+    "mtime": 1780874841.8135016,
+    "ast_hash": "411dab72a68e24f0152be024ba7d86e3",
+    "semantic_hash": "411dab72a68e24f0152be024ba7d86e3"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ModelSettingsScreen.swift": {
+    "mtime": 1780874841.8123593,
+    "ast_hash": "5cae3c953f97f28706f619e4aad2cb7b",
+    "semantic_hash": "5cae3c953f97f28706f619e4aad2cb7b"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/SecurityScreen.swift": {
+    "mtime": 1780874841.8130758,
+    "ast_hash": "9651b3fa659257eaeabebc3e890b6806",
+    "semantic_hash": "9651b3fa659257eaeabebc3e890b6806"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ServerScreen.swift": {
+    "mtime": 1780874841.81323,
+    "ast_hash": "98ae28137fb589517673e91836deae18",
+    "semantic_hash": "98ae28137fb589517673e91836deae18"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ProfileWorkingState.swift": {
+    "mtime": 1780874841.8128667,
+    "ast_hash": "6a93c360741367d2c206a960e527a987",
+    "semantic_hash": "6a93c360741367d2c206a960e527a987"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/QuantizationScreen.swift": {
+    "mtime": 1780874841.8129926,
+    "ast_hash": "fa88d35c2edd713b6ad7e9a937a9f1a5",
+    "semantic_hash": "fa88d35c2edd713b6ad7e9a937a9f1a5"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/DownloadsScreen.swift": {
+    "mtime": 1780874841.8116887,
+    "ast_hash": "0c47770ecd6f73170c00757355d721e8",
+    "semantic_hash": "0c47770ecd6f73170c00757355d721e8"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ModelsScreen.swift": {
+    "mtime": 1780874841.81248,
+    "ast_hash": "e882400dfce1f915b9fbb0aad7f6cd0d",
+    "semantic_hash": "e882400dfce1f915b9fbb0aad7f6cd0d"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/LogsScreen.swift": {
+    "mtime": 1780874841.81206,
+    "ast_hash": "f3ae3eb628f6737ca9068f2e82a5fe55",
+    "semantic_hash": "f3ae3eb628f6737ca9068f2e82a5fe55"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ChatTemplateKwargs.swift": {
+    "mtime": 1780874841.811533,
+    "ast_hash": "29ab017157daf81b3782b4a56a8bd745",
+    "semantic_hash": "29ab017157daf81b3782b4a56a8bd745"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/PerformanceScreen.swift": {
+    "mtime": 1780874841.8126547,
+    "ast_hash": "4755fe9e4f14ec25e9f064f9beebe6f4",
+    "semantic_hash": "4755fe9e4f14ec25e9f064f9beebe6f4"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/SystemMetrics.swift": {
+    "mtime": 1780874841.8134196,
+    "ast_hash": "09a634ca743ea5dbcfc88d3af07c436f",
+    "semantic_hash": "09a634ca743ea5dbcfc88d3af07c436f"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/IntegrationsScreen.swift": {
+    "mtime": 1780874841.8119729,
+    "ast_hash": "3bc13895229f6e0f631c98045269f83f",
+    "semantic_hash": "3bc13895229f6e0f631c98045269f83f"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/AccuracyBenchScreen.swift": {
+    "mtime": 1780874841.8114078,
+    "ast_hash": "d49d344273f8e7e69931e5bcf284396f",
+    "semantic_hash": "d49d344273f8e7e69931e5bcf284396f"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/DflashByteSize.swift": {
+    "mtime": 1780874841.8115852,
+    "ast_hash": "2822d614aa84b3bdc6721c0e26473de1",
+    "semantic_hash": "2822d614aa84b3bdc6721c0e26473de1"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/StatusScreen.swift": {
+    "mtime": 1780874841.8133388,
+    "ast_hash": "1ddf93e8aab034c7ab82ecfa17309021",
+    "semantic_hash": "1ddf93e8aab034c7ab82ecfa17309021"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Sources/AppView/Screens/ModelCardSheet.swift": {
+    "mtime": 1780874841.812151,
+    "ast_hash": "172dc30e851697a8322351898a926d45",
+    "semantic_hash": "172dc30e851697a8322351898a926d45"
+  },
+  "/Users/czha168/workspaces/omlx/README.zh.md": {
+    "mtime": 1780874841.8080215,
+    "ast_hash": "d6fad78963142a0a16215ad52a078fda",
+    "semantic_hash": "d6fad78963142a0a16215ad52a078fda"
+  },
+  "/Users/czha168/workspaces/omlx/README.fr.md": {
+    "mtime": 1780874841.8076727,
+    "ast_hash": "af55d0ab40688f27a433f54fadb078c0",
+    "semantic_hash": "af55d0ab40688f27a433f54fadb078c0"
+  },
+  "/Users/czha168/workspaces/omlx/README.md": {
+    "mtime": 1780874841.8079498,
+    "ast_hash": "de3c1ba60d7e7cd19132b4042aeaef3d",
+    "semantic_hash": "de3c1ba60d7e7cd19132b4042aeaef3d"
+  },
+  "/Users/czha168/workspaces/omlx/README.ja.md": {
+    "mtime": 1780874841.8077621,
+    "ast_hash": "ca12f756cc81e799abc8331dc025c84d",
+    "semantic_hash": "ca12f756cc81e799abc8331dc025c84d"
+  },
+  "/Users/czha168/workspaces/omlx/README.ko.md": {
+    "mtime": 1780874841.8078454,
+    "ast_hash": "f9fa6d2b3009331f99054b94e4ba7d4f",
+    "semantic_hash": "f9fa6d2b3009331f99054b94e4ba7d4f"
+  },
+  "/Users/czha168/workspaces/omlx/packaging/README.md": {
+    "mtime": 1780874841.9887724,
+    "ast_hash": "898da2cf91d2aa99673a64ecb8156df7",
+    "semantic_hash": "898da2cf91d2aa99673a64ecb8156df7"
+  },
+  "/Users/czha168/workspaces/omlx/docs/oQ_Quantization.md": {
+    "mtime": 1780874841.8615434,
+    "ast_hash": "dbd924d8e73fbab5120dc9060ff7c6b7",
+    "semantic_hash": "dbd924d8e73fbab5120dc9060ff7c6b7"
+  },
+  "/Users/czha168/workspaces/omlx/docs/CONTRIBUTING.md": {
+    "mtime": 1780874841.8186812,
+    "ast_hash": "7f094ad75f219277ed4432ff55979ddd",
+    "semantic_hash": "7f094ad75f219277ed4432ff55979ddd"
+  },
+  "/Users/czha168/workspaces/omlx/docs/experimental/dflash_mlx_integration.md": {
+    "mtime": 1780874841.8187923,
+    "ast_hash": "e205fb57a0d7638b3d700bacb38585e3",
+    "semantic_hash": "e205fb57a0d7638b3d700bacb38585e3"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/patches/deepseek_v4/README.md": {
+    "mtime": 1780874841.9840095,
+    "ast_hash": "1e3f7dfad2c5976bf9d558af60c1f3a4",
+    "semantic_hash": "1e3f7dfad2c5976bf9d558af60c1f3a4"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/base.html": {
+    "mtime": 1780874841.8867433,
+    "ast_hash": "3901c1487ec744d5fcb0a702f0b0c58f",
+    "semantic_hash": "3901c1487ec744d5fcb0a702f0b0c58f"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/login.html": {
+    "mtime": 1780874841.8885107,
+    "ast_hash": "4be3d0855d400eee04e496249505c7cf",
+    "semantic_hash": "4be3d0855d400eee04e496249505c7cf"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard.html": {
+    "mtime": 1780874841.8874133,
+    "ast_hash": "32aecbe94527ca30efad7f8751aba3e5",
+    "semantic_hash": "32aecbe94527ca30efad7f8751aba3e5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/chat.html": {
+    "mtime": 1780874841.8869894,
+    "ast_hash": "7dc8f860e88c8afb868abaac35729d8b",
+    "semantic_hash": "7dc8f860e88c8afb868abaac35729d8b"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_status.html": {
+    "mtime": 1780874841.8884392,
+    "ast_hash": "f44c1471b49967a508fc9f5f0a196a03",
+    "semantic_hash": "f44c1471b49967a508fc9f5f0a196a03"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_navbar.html": {
+    "mtime": 1780874841.8882003,
+    "ast_hash": "d54896d0bc5c4d89847436b255a42517",
+    "semantic_hash": "d54896d0bc5c4d89847436b255a42517"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_logs.html": {
+    "mtime": 1780874841.8878706,
+    "ast_hash": "74200448b296e9ba60c684a9dd01f038",
+    "semantic_hash": "74200448b296e9ba60c684a9dd01f038"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_bench_accuracy.html": {
+    "mtime": 1780874841.887612,
+    "ast_hash": "eb80cbdfd5404efece61588187d461af",
+    "semantic_hash": "eb80cbdfd5404efece61588187d461af"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_bench.html": {
+    "mtime": 1780874841.8875432,
+    "ast_hash": "a0a0b3146c758bcb1b721de31db9e0db",
+    "semantic_hash": "a0a0b3146c758bcb1b721de31db9e0db"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_modal_model_settings.html": {
+    "mtime": 1780874841.8880029,
+    "ast_hash": "c41f5e0efdbad7515395eae1a41dde00",
+    "semantic_hash": "c41f5e0efdbad7515395eae1a41dde00"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_settings.html": {
+    "mtime": 1780874841.8883176,
+    "ast_hash": "f99a2c42cd73d1563aa314999d396816",
+    "semantic_hash": "f99a2c42cd73d1563aa314999d396816"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/templates/dashboard/_models.html": {
+    "mtime": 1780874841.8881285,
+    "ast_hash": "61660c4ac4ffc5e997d4e90405882f96",
+    "semantic_hash": "61660c4ac4ffc5e997d4e90405882f96"
+  },
+  "/Users/czha168/workspaces/omlx/.github/dependabot.yml": {
+    "mtime": 1780874841.807248,
+    "ast_hash": "93422de963ae4939d6bac35b8fd8928d",
+    "semantic_hash": "93422de963ae4939d6bac35b8fd8928d"
+  },
+  "/Users/czha168/workspaces/omlx/.github/workflows/update-formula.yml": {
+    "mtime": 1780874841.807374,
+    "ast_hash": "8be47708214ec7e836a24cd58f6e66ff",
+    "semantic_hash": "8be47708214ec7e836a24cd58f6e66ff"
+  },
+  "/Users/czha168/workspaces/omlx/.github/workflows/ci.yml": {
+    "mtime": 1780874841.8073246,
+    "ast_hash": "de14948149f8f9fbce4a3a4905aa0398",
+    "semantic_hash": "de14948149f8f9fbce4a3a4905aa0398"
+  },
+  "/Users/czha168/workspaces/omlx/.github/ISSUE_TEMPLATE/feature_request.md": {
+    "mtime": 1780874841.8072042,
+    "ast_hash": "174545e1d9daff8020525fdd1e020411",
+    "semantic_hash": "174545e1d9daff8020525fdd1e020411"
+  },
+  "/Users/czha168/workspaces/omlx/.github/ISSUE_TEMPLATE/bug_report.md": {
+    "mtime": 1780874841.8071501,
+    "ast_hash": "ffa1c796809106497ddefe49e6944a25",
+    "semantic_hash": "ffa1c796809106497ddefe49e6944a25"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_thinking_budget1.png": {
+    "mtime": 1780874841.8603556,
+    "ast_hash": "283321c060d8943ca66c1e2ffa8c2b14",
+    "semantic_hash": "283321c060d8943ca66c1e2ffa8c2b14"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_thinking_budget2.png": {
+    "mtime": 1780874841.8606017,
+    "ast_hash": "68e8ac3f2f67f278f457b288bffc5d2c",
+    "semantic_hash": "68e8ac3f2f67f278f457b288bffc5d2c"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_ai_benchmarks.png": {
+    "mtime": 1780874841.849252,
+    "ast_hash": "8e2d9b7ff332c21b6ef7a714c5400777",
+    "semantic_hash": "8e2d9b7ff332c21b6ef7a714c5400777"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/benchmark_omlx.png": {
+    "mtime": 1780874841.841095,
+    "ast_hash": "79294026d766f9806511879bf8e502d7",
+    "semantic_hash": "79294026d766f9806511879bf8e502d7"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_integrations.png": {
+    "mtime": 1780874841.8590784,
+    "ast_hash": "d71df9aba784a13ae2579b1c276dfb65",
+    "semantic_hash": "d71df9aba784a13ae2579b1c276dfb65"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_applications.png": {
+    "mtime": 1780874841.8515332,
+    "ast_hash": "e7232cc50830a2f91c3ba388c2af4d96",
+    "semantic_hash": "e7232cc50830a2f91c3ba388c2af4d96"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_hot_cold_cache.png": {
+    "mtime": 1780874841.858468,
+    "ast_hash": "37d004016cb0a3469ee90b8d931d3ca9",
+    "semantic_hash": "37d004016cb0a3469ee90b8d931d3ca9"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/benchmark_omlx_squared.png": {
+    "mtime": 1780874841.8422587,
+    "ast_hash": "c94470ef42878c6a4c42cf1dcb770981",
+    "semantic_hash": "c94470ef42878c6a4c42cf1dcb770981"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.46.44.png": {
+    "mtime": 1780874841.8324163,
+    "ast_hash": "0783ecb307f27e97101e19f39c3c59c8",
+    "semantic_hash": "0783ecb307f27e97101e19f39c3c59c8"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/downloader_omlx.png": {
+    "mtime": 1780874841.8457165,
+    "ast_hash": "3059296a163bdfd4e2ed466a71318702",
+    "semantic_hash": "3059296a163bdfd4e2ed466a71318702"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_ChatTemplateKwargs.png": {
+    "mtime": 1780874841.8478608,
+    "ast_hash": "a0b53939cbab55ca8fe996ab710d3a3a",
+    "semantic_hash": "a0b53939cbab55ca8fe996ab710d3a3a"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx.ai_perf_explorer.png": {
+    "mtime": 1780874841.8463283,
+    "ast_hash": "3bac031ed8bd31d0eea1599e4a11c3b4",
+    "semantic_hash": "3bac031ed8bd31d0eea1599e4a11c3b4"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_dashboard_activemodels.png": {
+    "mtime": 1780874841.857967,
+    "ast_hash": "1ca5f2a0e53fb6986c3b9d88c68100c9",
+    "semantic_hash": "1ca5f2a0e53fb6986c3b9d88c68100c9"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_model_preset.png": {
+    "mtime": 1780874841.859958,
+    "ast_hash": "e63179402a72820be5fdf05d2a437037",
+    "semantic_hash": "e63179402a72820be5fdf05d2a437037"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_benchmark.png": {
+    "mtime": 1780874841.8531547,
+    "ast_hash": "fb8ba158d7431c9aa4eaf8aff13ec6bb",
+    "semantic_hash": "fb8ba158d7431c9aa4eaf8aff13ec6bb"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_vlm_chat.png": {
+    "mtime": 1780874841.8611906,
+    "ast_hash": "3c502682a28f0141aca8bfa091574294",
+    "semantic_hash": "3c502682a28f0141aca8bfa091574294"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/0.4.0rc2_dark.png": {
+    "mtime": 1780874841.8199465,
+    "ast_hash": "7c8bddd39d1a24ec4780a808cafb1f58",
+    "semantic_hash": "7c8bddd39d1a24ec4780a808cafb1f58"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/0.4.0rc2_light.png": {
+    "mtime": 1780874841.8213413,
+    "ast_hash": "8cdc3f20ec44757edde5b99c24c90f35",
+    "semantic_hash": "8cdc3f20ec44757edde5b99c24c90f35"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_ai_landing.png": {
+    "mtime": 1780874841.8508956,
+    "ast_hash": "a97819f5e740621603c3a47d633378da",
+    "semantic_hash": "a97819f5e740621603c3a47d633378da"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/icon-rounded-dark.svg": {
+    "mtime": 1780874841.8458161,
+    "ast_hash": "f8cb0529840165eb0a16ad3b2160b765",
+    "semantic_hash": "f8cb0529840165eb0a16ad3b2160b765"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_turboquant.png": {
+    "mtime": 1780874841.8608387,
+    "ast_hash": "5289d578cfc7fec80cb266d2db416bc1",
+    "semantic_hash": "5289d578cfc7fec80cb266d2db416bc1"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_additional_api_key.png": {
+    "mtime": 1780874841.848307,
+    "ast_hash": "59dc0f6d0285ec6db8677e95c1a9fac4",
+    "semantic_hash": "59dc0f6d0285ec6db8677e95c1a9fac4"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.46.15.png": {
+    "mtime": 1780874841.831637,
+    "ast_hash": "263166ea7e73fc7d84286782d396e9a8",
+    "semantic_hash": "263166ea7e73fc7d84286782d396e9a8"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-06-02 at 01.59.34.png": {
+    "mtime": 1780874841.8371966,
+    "ast_hash": "998868c759ce99b87f1305a8812a4a1c",
+    "semantic_hash": "998868c759ce99b87f1305a8812a4a1c"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/ScreenShot_2026-03-14_104350_610.png": {
+    "mtime": 1780874841.822989,
+    "ast_hash": "5a0c50116e8e4c97d685ead0369a4bb9",
+    "semantic_hash": "5a0c50116e8e4c97d685ead0369a4bb9"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.35.01.png": {
+    "mtime": 1780874841.827044,
+    "ast_hash": "a84b85487e1d4783b9b53e11843a4dc7",
+    "semantic_hash": "a84b85487e1d4783b9b53e11843a4dc7"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_0.4.0.png": {
+    "mtime": 1780874841.847307,
+    "ast_hash": "a4ea13f0e3299ed1767753755a6942ec",
+    "semantic_hash": "a4ea13f0e3299ed1767753755a6942ec"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-06-02 at 01.55.37.png": {
+    "mtime": 1780874841.8360357,
+    "ast_hash": "cd3de85e73360b7223d4fdb8c6bdf38d",
+    "semantic_hash": "cd3de85e73360b7223d4fdb8c6bdf38d"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_audio.png": {
+    "mtime": 1780874841.8519654,
+    "ast_hash": "09f6b896febe2471bc43db266c9389ab",
+    "semantic_hash": "09f6b896febe2471bc43db266c9389ab"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/icon-rounded-light.svg": {
+    "mtime": 1780874841.8458693,
+    "ast_hash": "1dbf79ebbf4363323796b6f9bf97b2be",
+    "semantic_hash": "1dbf79ebbf4363323796b6f9bf97b2be"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.34.30.png": {
+    "mtime": 1780874841.8255246,
+    "ast_hash": "d882fda447f8ed0ea5d69c3b1dd4041d",
+    "semantic_hash": "d882fda447f8ed0ea5d69c3b1dd4041d"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_dashboard.png": {
+    "mtime": 1780874841.8559158,
+    "ast_hash": "c88b4a81edebe29578282af652e78768",
+    "semantic_hash": "c88b4a81edebe29578282af652e78768"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.36.32.png": {
+    "mtime": 1780874841.8286097,
+    "ast_hash": "3295440e814fde3b31cec5fe5c78d24b",
+    "semantic_hash": "3295440e814fde3b31cec5fe5c78d24b"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/omlx_memguard.png": {
+    "mtime": 1780874841.8595984,
+    "ast_hash": "2fe9b50c73b7cae1363de2809cd046d7",
+    "semantic_hash": "2fe9b50c73b7cae1363de2809cd046d7"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.45.34.png": {
+    "mtime": 1780874841.830789,
+    "ast_hash": "be0707d541592d570696562009e3579a",
+    "semantic_hash": "be0707d541592d570696562009e3579a"
+  },
+  "/Users/czha168/workspaces/omlx/docs/images/Screenshot 2026-02-10 at 00.51.54.png": {
+    "mtime": 1780874841.834472,
+    "ast_hash": "ef379ae9da314d6d59046ba7654f22f1",
+    "semantic_hash": "ef379ae9da314d6d59046ba7654f22f1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/navbar-logo-light.svg": {
+    "mtime": 1780874841.8865683,
+    "ast_hash": "500250e003341ac9aa4dae5dd020aad4",
+    "semantic_hash": "500250e003341ac9aa4dae5dd020aad4"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/navbar-logo-dark.svg": {
+    "mtime": 1780874841.8865244,
+    "ast_hash": "a547d3bfb91e07449877b964d580d3d1",
+    "semantic_hash": "a547d3bfb91e07449877b964d580d3d1"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/logo-dark.svg": {
+    "mtime": 1780874841.8863463,
+    "ast_hash": "a401827dca1ec313971d89d537dee290",
+    "semantic_hash": "a401827dca1ec313971d89d537dee290"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/logo-light.svg": {
+    "mtime": 1780874841.8863902,
+    "ast_hash": "eec69d2930b47e402e7e6f03602a372a",
+    "semantic_hash": "eec69d2930b47e402e7e6f03602a372a"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/menubar-filled.svg": {
+    "mtime": 1780874841.8864355,
+    "ast_hash": "e227a616748322b800e7425dc6aa5179",
+    "semantic_hash": "e227a616748322b800e7425dc6aa5179"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/menubar-outline.svg": {
+    "mtime": 1780874841.8864844,
+    "ast_hash": "84c448d485db78bae30b6f3d79c6ada4",
+    "semantic_hash": "84c448d485db78bae30b6f3d79c6ada4"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/favicon.svg": {
+    "mtime": 1780874841.86852,
+    "ast_hash": "181081ea0c5ff687c8c110a0e1729818",
+    "semantic_hash": "181081ea0c5ff687c8c110a0e1729818"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/openclaw.png": {
+    "mtime": 1780874841.8837073,
+    "ast_hash": "f569825061f97560c19c1260210414d3",
+    "semantic_hash": "f569825061f97560c19c1260210414d3"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/pi.svg": {
+    "mtime": 1780874841.8837953,
+    "ast_hash": "85dfe91dc41f9fb29b2efe0fe7360dd2",
+    "semantic_hash": "85dfe91dc41f9fb29b2efe0fe7360dd2"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/copilot.svg": {
+    "mtime": 1780874841.883577,
+    "ast_hash": "60979ca396f8ab0c47bb12025d887185",
+    "semantic_hash": "60979ca396f8ab0c47bb12025d887185"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/claude.png": {
+    "mtime": 1780874841.883467,
+    "ast_hash": "3d517229c118a7c4c20738fb4efd03d7",
+    "semantic_hash": "3d517229c118a7c4c20738fb4efd03d7"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/hermes.svg": {
+    "mtime": 1780874841.8836596,
+    "ast_hash": "c8533d1c7cb887723068eea3af42ae68",
+    "semantic_hash": "c8533d1c7cb887723068eea3af42ae68"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/opencode.png": {
+    "mtime": 1780874841.8837528,
+    "ast_hash": "f513c8be4edecc2c9a4b58bd2e1e8fe5",
+    "semantic_hash": "f513c8be4edecc2c9a4b58bd2e1e8fe5"
+  },
+  "/Users/czha168/workspaces/omlx/omlx/admin/static/img/integrations/codex.png": {
+    "mtime": 1780874841.883528,
+    "ast_hash": "1960bbf4c53fe3e7f4aa56c70ee5cf58",
+    "semantic_hash": "1960bbf4c53fe3e7f4aa56c70ee5cf58"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/MenubarOutline.imageset/menubar-outline.svg": {
+    "mtime": 1780874841.8089342,
+    "ast_hash": "84c448d485db78bae30b6f3d79c6ada4",
+    "semantic_hash": "84c448d485db78bae30b6f3d79c6ada4"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/MenubarFilled.imageset/menubar-filled.svg": {
+    "mtime": 1780874841.8088043,
+    "ast_hash": "e227a616748322b800e7425dc6aa5179",
+    "semantic_hash": "e227a616748322b800e7425dc6aa5179"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/AppLogo.imageset/icon-rounded-dark.svg": {
+    "mtime": 1780874841.808554,
+    "ast_hash": "f8cb0529840165eb0a16ad3b2160b765",
+    "semantic_hash": "f8cb0529840165eb0a16ad3b2160b765"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/Assets.xcassets/AppLogo.imageset/icon-rounded-light.svg": {
+    "mtime": 1780874841.808601,
+    "ast_hash": "1dbf79ebbf4363323796b6f9bf97b2be",
+    "semantic_hash": "1dbf79ebbf4363323796b6f9bf97b2be"
+  },
+  "/Users/czha168/workspaces/omlx/apps/omlx-mac/Resources/AppIcon.icon/Assets/omlx_glyph_1024.png": {
+    "mtime": 1780874841.8083208,
+    "ast_hash": "649b74af90b9820468bd84bab7f1bbc8",
+    "semantic_hash": "649b74af90b9820468bd84bab7f1bbc8"
+  },
+  "/Users/czha168/workspaces/omlx/tests/fixtures/test_audio.wav": {
+    "mtime": 1780874841.989598,
+    "ast_hash": "132c581d81c34ca1100bff4d92516499",
+    "semantic_hash": "132c581d81c34ca1100bff4d92516499"
+  }
+}

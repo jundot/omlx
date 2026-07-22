@@ -1,0 +1,2 @@
+build_command: "python -m pytest tests/test_guardrail_types.py -q"
+verify_command: "python -m pytest tests/test_guardrail_types.py tests/test_guardrail_nudges.py tests/test_guardrail_validator.py tests/test_rescue_parsers.py tests/test_tool_choice_enforcement.py tests/test_strict_args_wrapper.py tests/test_guardrail_settings.py tests/test_server_guardrail_wiring.py tests/test_guardrail_e2e.py -v --tb=short"

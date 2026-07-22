@@ -283,6 +283,16 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
 
+    # Forge Guardrails settings
+    forge_guardrails_validation_enabled: bool | None = None
+    forge_guardrails_strict_tool_args: bool | None = None
+    forge_guardrails_include_validation_metadata: bool | None = None
+    forge_guardrails_max_retries: int | None = Field(default=None, ge=0, le=20)
+    forge_guardrails_max_tool_errors: int | None = Field(default=None, ge=0, le=20)
+    forge_guardrails_compaction_strategy: str | None = None
+    forge_guardrails_inject_respond_tool: bool | None = None
+    forge_guardrails_enforce_mcp_prerequisites: bool | None = None
+
     # Other integrations settings
     integrations_copilot_model: str | None = None
     integrations_codex_model: str | None = None
@@ -3775,6 +3785,63 @@ async def update_global_settings(
             f"haiku={global_settings.claude_code.haiku_model}"
         )
 
+    # Apply Forge Guardrails settings (Live - immediately applied)
+    forge_guardrails_changed = False
+    if request.forge_guardrails_validation_enabled is not None:
+        global_settings.forge_guardrails.validation_enabled = (
+            request.forge_guardrails_validation_enabled
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_strict_tool_args is not None:
+        global_settings.forge_guardrails.strict_tool_args = (
+            request.forge_guardrails_strict_tool_args
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_include_validation_metadata is not None:
+        global_settings.forge_guardrails.include_validation_metadata = (
+            request.forge_guardrails_include_validation_metadata
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_max_retries is not None:
+        global_settings.forge_guardrails.max_retries = (
+            request.forge_guardrails_max_retries
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_max_tool_errors is not None:
+        global_settings.forge_guardrails.max_tool_errors = (
+            request.forge_guardrails_max_tool_errors
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_compaction_strategy is not None:
+        global_settings.forge_guardrails.compaction_strategy = (
+            request.forge_guardrails_compaction_strategy
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_inject_respond_tool is not None:
+        global_settings.forge_guardrails.inject_respond_tool = (
+            request.forge_guardrails_inject_respond_tool
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_enforce_mcp_prerequisites is not None:
+        global_settings.forge_guardrails.enforce_mcp_prerequisites = (
+            request.forge_guardrails_enforce_mcp_prerequisites
+        )
+        forge_guardrails_changed = True
+
+    if forge_guardrails_changed:
+        runtime_applied.append("forge_guardrails")
+        logger.info(
+            f"Forge Guardrails settings updated: "
+            f"validation_enabled={global_settings.forge_guardrails.validation_enabled}, "
+            f"strict_tool_args={global_settings.forge_guardrails.strict_tool_args}, "
+            f"include_validation_metadata={global_settings.forge_guardrails.include_validation_metadata}, "
+            f"max_retries={global_settings.forge_guardrails.max_retries}, "
+            f"max_tool_errors={global_settings.forge_guardrails.max_tool_errors}, "
+            f"compaction_strategy={global_settings.forge_guardrails.compaction_strategy}, "
+            f"inject_respond_tool={global_settings.forge_guardrails.inject_respond_tool}, "
+            f"enforce_mcp_prerequisites={global_settings.forge_guardrails.enforce_mcp_prerequisites}"
+        )
+
     # Apply integrations settings (Live - immediately applied)
     integrations_changed = False
     if "integrations_copilot_model" in request.model_fields_set:
@@ -4460,6 +4527,32 @@ async def get_server_stats(
             global_settings.claude_code.target_context_size
             if global_settings
             else 200000
+        ),
+        "forge_guardrails_validation_enabled": (
+            global_settings.forge_guardrails.validation_enabled
+            if global_settings
+            else False
+        ),
+        "forge_guardrails_strict_tool_args": (
+            global_settings.forge_guardrails.strict_tool_args
+            if global_settings
+            else False
+        ),
+        "forge_guardrails_include_validation_metadata": (
+            global_settings.forge_guardrails.include_validation_metadata
+            if global_settings
+            else False
+        ),
+        "forge_guardrails_max_retries": (
+            global_settings.forge_guardrails.max_retries if global_settings else 3
+        ),
+        "forge_guardrails_max_tool_errors": (
+            global_settings.forge_guardrails.max_tool_errors if global_settings else 2
+        ),
+        "forge_guardrails_compaction_strategy": (
+            global_settings.forge_guardrails.compaction_strategy
+            if global_settings
+            else "none"
         ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
@@ -6482,3 +6575,21 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
+
+
+@router.get("/api/compression/stats")
+async def get_compression_stats(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
+    from ..server import _compression_stats
+
+    stats = dict(_compression_stats)
+    if stats["compressed_requests"] > 0:
+        stats["avg_compression_ratio"] = (
+            stats["total_tokens_saved"] / stats["total_tokens_before"]
+            if stats["total_tokens_before"] > 0
+            else 0.0
+        )
+    else:
+        stats["avg_compression_ratio"] = 0.0
+    return JSONResponse(content=stats)

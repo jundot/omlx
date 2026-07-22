@@ -91,7 +91,7 @@ def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
     return value
 
 
-def _serialize_tool_call_arguments(arguments: Any) -> str:
+def _serialize_tool_call_arguments(arguments: Any, strict: bool = False) -> str:
     """Serialize parser output to a JSON-object arguments string.
 
     Chat templates for models with native tool calling (Qwen 3.5/3.6 XML,
@@ -99,6 +99,9 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     in history. Anything that does not represent a JSON object must be
     coerced to "{}" here so we never hand the client a non-JSON value that
     the next turn's template would crash on.
+
+    When strict=True (guardrails enabled), preserve the original value
+    instead of coercing — validation will flag it separately.
     """
     if isinstance(arguments, dict):
         return json.dumps(arguments, ensure_ascii=False)
@@ -111,6 +114,10 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
             parsed = None
         if isinstance(parsed, dict):
             return json.dumps(parsed, ensure_ascii=False)
+
+    if strict:
+        return str(arguments) if arguments is not None else "null"
+
     logger.warning(
         "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
         "coercing to empty object to keep downstream template safe.",
@@ -128,9 +135,12 @@ class ToolCallExtraction:
     tool_calls: Optional[List[ToolCall]]
     cleaned_thinking: str
     tool_calls_from_thinking: bool = False
+    validation_result: Any = None
 
 
-def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+def _parse_xml_tool_calls(
+    text: str, strict: bool = False
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for XML-based tool call formats.
 
@@ -159,7 +169,9 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     type="function",
                     function=FunctionCall(
                         name=name,
-                        arguments=_serialize_tool_call_arguments(arguments),
+                        arguments=_serialize_tool_call_arguments(
+                            arguments, strict=strict
+                        ),
                     ),
                 )
             )
@@ -232,7 +244,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
 
 
 def _parse_namespaced_tool_calls(
-    text: str, namespace: str
+    text: str, namespace: str, strict: bool = False
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse namespaced tool call tags like <minimax:tool_call>...</minimax:tool_call>.
@@ -320,7 +332,9 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                         type="function",
                         function=FunctionCall(
                             name=name,
-                            arguments=_serialize_tool_call_arguments(arguments),
+                            arguments=_serialize_tool_call_arguments(
+                                arguments, strict=strict
+                            ),
                         ),
                     )
                 )
@@ -1075,6 +1089,7 @@ def parse_tool_calls(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    strict: bool = False,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse tool calls from model output.
@@ -1099,16 +1114,144 @@ def parse_tool_calls(
         - cleaned_text: Text with tool call tags and thinking tags removed
         - tool_calls: List of ToolCall objects, or None if no tool calls found
     """
-    cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
+    cleaned_text, tool_calls = _parse_tool_calls_impl(
+        text, tokenizer, tools, strict=strict
+    )
     if tool_calls:
         _remap_tool_call_names(tool_calls, tools)
     return cleaned_text, tool_calls
+
+
+def _extract_balanced_json(text: str, start: int) -> Optional[str]:
+    if start >= len(text) or text[start] != "{":
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        i += 1
+
+    return None
+
+
+def _parse_rehearsal_tool_calls(
+    text: str,
+) -> Optional[List[ToolCall]]:
+    """Rescue parser for rehearsal-syntax tool calls (reasoning models).
+
+    Extracts patterns like ``search[ARGS]{"query": "hello"}`` that some
+    reasoning models emit inside thinking tokens. Last-resort fallback
+    invoked only when all primary parsers return nothing.
+    """
+    pattern = re.compile(r"(\w+)\[ARGS\](\{.*?\})", re.DOTALL)
+    matches = pattern.findall(text)
+    if not matches:
+        return None
+
+    tool_calls: list[ToolCall] = []
+    for name, brace_content in matches:
+        try:
+            parsed = json.loads(brace_content, strict=False)
+            if isinstance(parsed, dict):
+                tc = ToolCall(
+                    id=f"rehearsal_{len(tool_calls)}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=json.dumps(parsed, ensure_ascii=False),
+                    ),
+                )
+                tool_calls.append(tc)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return tool_calls if tool_calls else None
+
+
+def _parse_mistral_bracket_tool_calls(
+    text: str,
+) -> Optional[List[ToolCall]]:
+    """Rescue parser for Mistral ``[TOOL_CALLS]`` using brace-balance scan.
+
+    Handles nested JSON objects, literal braces inside string values, and
+    escaped quotes — cases the regex-based parser cannot handle.
+    """
+    marker = "[TOOL_CALLS]"
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+
+    body = text[idx + len(marker):]
+    tool_calls: list[ToolCall] = []
+    pos = 0
+
+    while pos < len(body):
+        while pos < len(body) and body[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(body):
+            break
+
+        name_start = pos
+        while pos < len(body) and (body[pos].isalnum() or body[pos] in "_-"):
+            pos += 1
+        name = body[name_start:pos]
+        if not name:
+            break
+
+        while pos < len(body) and body[pos] in " \t":
+            pos += 1
+        if pos >= len(body) or body[pos] != "{":
+            break
+
+        obj_str = _extract_balanced_json(body, pos)
+        if obj_str is None:
+            break
+
+        try:
+            parsed = json.loads(obj_str)
+            if isinstance(parsed, dict):
+                tc = ToolCall(
+                    id=f"mistral_{len(tool_calls)}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=json.dumps(parsed, ensure_ascii=False),
+                    ),
+                )
+                tool_calls.append(tc)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        pos += len(obj_str)
+
+    return tool_calls if tool_calls else None
 
 
 def _parse_tool_calls_impl(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    strict: bool = False,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
     cleaned_text = text
@@ -1156,7 +1299,9 @@ def _parse_tool_calls_impl(
                                 type="function",
                                 function=FunctionCall(
                                     name=name,
-                                    arguments=_serialize_tool_call_arguments(arguments),
+                                    arguments=_serialize_tool_call_arguments(
+                                        arguments, strict=strict
+                                    ),
                                 ),
                             )
                         )
@@ -1187,10 +1332,10 @@ def _parse_tool_calls_impl(
                                         id=f"call_{uuid.uuid4().hex[:8]}",
                                         type="function",
                                         function=FunctionCall(
-                                            name=name,
-                                            arguments=_serialize_tool_call_arguments(
-                                                arguments
-                                            ),
+                                        name=name,
+                                        arguments=_serialize_tool_call_arguments(
+                                            arguments, strict=strict
+                                        ),
                                         ),
                                     )
                                 )
@@ -1212,7 +1357,7 @@ def _parse_tool_calls_impl(
                     # drop when the native parser raises (e.g. ast.literal_eval
                     # SyntaxError on non-Python-literal parameter values).
                     fb_wrapped = f"<tool_call>{match}</tool_call>"
-                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped, strict=strict)
                     if fb_calls:
                         tool_calls.extend(fb_calls)
                         logger.warning(
@@ -1249,13 +1394,13 @@ def _parse_tool_calls_impl(
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
-        return _parse_xml_tool_calls(cleaned_text)
+        return _parse_xml_tool_calls(cleaned_text, strict=strict)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
     ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
-        return _parse_namespaced_tool_calls(cleaned_text, ns)
+        return _parse_namespaced_tool_calls(cleaned_text, ns, strict=strict)
 
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
@@ -1266,6 +1411,13 @@ def _parse_tool_calls_impl(
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
+
+    # --- Rescue parsers (last resort) ---
+    tool_calls = _parse_rehearsal_tool_calls(cleaned_text)
+    if tool_calls is None:
+        tool_calls = _parse_mistral_bracket_tool_calls(cleaned_text)
+    if tool_calls is not None:
+        return cleaned_text, tool_calls
 
     # All parsing attempts exhausted. Strip known tool-call markers so raw
     # control markup never leaks into the API response.  Models whose markers
@@ -1341,6 +1493,7 @@ def extract_tool_calls_with_thinking(
     regular_content: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    strict: bool = False,
 ) -> ToolCallExtraction:
     """Extract tool calls while keeping a sanitized reasoning transcript.
 
@@ -1357,12 +1510,16 @@ def extract_tool_calls_with_thinking(
       Calls whose name matches a provided tool are promoted regardless
       of whether regular text was also produced.
     """
-    cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+    cleaned_text, tool_calls = parse_tool_calls(
+        regular_content, tokenizer, tools, strict=strict
+    )
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
     tool_calls_from_thinking = False
 
     if not tool_calls and thinking_content:
-        _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
+        _, tool_calls = parse_tool_calls(
+            thinking_content, tokenizer, tools, strict=strict
+        )
         tool_calls_from_thinking = bool(tool_calls)
 
         # Guard: validate thinking-embedded tool calls.
@@ -1396,6 +1553,51 @@ def extract_tool_calls_with_thinking(
         tool_calls=tool_calls,
         cleaned_thinking=cleaned_thinking,
         tool_calls_from_thinking=tool_calls_from_thinking,
+    )
+
+
+def extract_and_validate_tool_calls(
+    thinking_content: str,
+    regular_content: str,
+    tokenizer: Any,
+    tools: Optional[List] = None,
+    tool_choice: Any = None,
+    strict_tool_args: bool = False,
+    validation_enabled: bool = False,
+) -> ToolCallExtraction:
+    """Wrapper: extract tool calls, then validate if enabled.
+
+    When validation_enabled is False (default), this is a pure passthrough
+    to extract_tool_calls_with_thinking() — zero behavioral change.
+
+    When validation_enabled is True and tools are provided, runs
+    GuardrailValidator on the extraction and attaches the result.
+    """
+    extraction = extract_tool_calls_with_thinking(
+        thinking_content, regular_content, tokenizer, tools,
+        strict=strict_tool_args,
+    )
+
+    validation_result = None
+    if validation_enabled and tools:
+        try:
+            from omlx.api.guardrails.validator import GuardrailValidator
+
+            validator = GuardrailValidator(tools)
+            validation_result = validator.validate(
+                extraction, tool_choice=tool_choice, has_tools=bool(tools)
+            )
+        except Exception:
+            logger.exception(
+                "Guardrail validation failed; returning extraction without validation"
+            )
+
+    return ToolCallExtraction(
+        cleaned_text=extraction.cleaned_text,
+        tool_calls=extraction.tool_calls,
+        cleaned_thinking=extraction.cleaned_thinking,
+        tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+        validation_result=validation_result,
     )
 
 

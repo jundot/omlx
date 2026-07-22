@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -155,11 +155,18 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.guardrail_wiring import (
+    apply_guardrails,
+    guardrail_validation_payload,
+)
+from .api.respond import inject_respond_tool, strip_respond_calls
+from .mcp.prerequisites import PrerequisiteChecker
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
+    extract_and_validate_tool_calls,
     extract_tool_calls_with_thinking,
     parse_json_output,
     restore_gemma4_param_names,
@@ -199,6 +206,86 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
+
+# Compression statistics (module-level for admin API access).
+# Per-worker: under multi-worker uvicorn each worker has its own dict.
+_compression_stats: dict[str, Any] = {
+    "total_requests": 0,
+    "compressed_requests": 0,
+    "total_tokens_before": 0,
+    "total_tokens_after": 0,
+    "total_tokens_saved": 0,
+    "last_compression_ratio": 0.0,
+    "last_compression_time": None,
+}
+
+try:
+    from headroom import CompressConfig
+    from headroom import compress as _hr_compress
+
+    _HEADROOM_AVAILABLE = True
+except ImportError:
+    _HEADROOM_AVAILABLE = False
+    _hr_compress = None  # type: ignore[assignment]
+    CompressConfig = None  # type: ignore[assignment]
+
+
+def _apply_compression(messages: list) -> list:
+    """Apply headroom context compression to *messages* if enabled.
+
+    Returns the (possibly compressed) message list.  Updates
+    ``_compression_stats`` in place.  Never raises.
+    """
+    if not _HEADROOM_AVAILABLE:
+        return messages
+
+    try:
+        _gs = _server_state.global_settings
+        if _gs is None or not _gs.compression.enabled:
+            return messages
+
+        # Quick pre-check: estimate tokens via ~4 chars/token heuristic so
+        # we don't invoke headroom for trivially short prompts.  This must
+        # be a *token* estimate — comparing raw char count against
+        # min_tokens_to_compress would trigger ~4× too eagerly.
+        total_chars = sum(
+            len(m.get("content", "")) if isinstance(m, dict) else 0
+            for m in messages
+        )
+        estimated_tokens = total_chars // 4
+        _compression_stats["total_requests"] += 1
+
+        if estimated_tokens < _gs.compression.min_tokens_to_compress:
+            return messages
+
+        result = _hr_compress(
+            messages,
+            config=CompressConfig(
+                min_tokens_to_compress=_gs.compression.min_tokens_to_compress,
+            ),
+        )
+        if result.tokens_saved > 0:
+            logger.info(
+                "Context compression: %d -> %d tokens (%.1f%% reduction, %d transforms)",
+                result.tokens_before,
+                result.tokens_after,
+                result.compression_ratio * 100,
+                len(result.transforms_applied),
+            )
+            _compression_stats["compressed_requests"] += 1
+            _compression_stats["total_tokens_before"] += result.tokens_before
+            _compression_stats["total_tokens_after"] += result.tokens_after
+            _compression_stats["total_tokens_saved"] += result.tokens_saved
+            _compression_stats["last_compression_ratio"] = result.compression_ratio
+            _compression_stats["last_compression_time"] = time.time()
+            return result.messages
+
+        return messages
+    except Exception as e:
+        # Defense-in-depth: headroom has its own internal try/except, but
+        # guard against unexpected ABI/runtime failures.
+        logger.warning("Context compression failed, using original messages: %s", e)
+        return messages
 
 
 # =============================================================================
@@ -287,6 +374,40 @@ def get_engine_pool() -> EnginePool:
 def get_mcp_manager():
     """Get the MCP manager instance (may be None)."""
     return _server_state.mcp_manager
+
+
+def _build_prereq_checker():
+    _fg = _server_state.global_settings.forge_guardrails
+    if (
+        _fg.enforce_mcp_prerequisites
+        and _server_state.mcp_manager is not None
+        and getattr(_server_state.mcp_manager.config, "tools_prerequisites", {})
+    ):
+        return PrerequisiteChecker(
+            _server_state.mcp_manager.config.tools_prerequisites
+        )
+    return None
+
+
+def _prior_messages_for_request(request) -> list[dict] | None:
+    msgs = getattr(request, "messages", None)
+    if msgs is None:
+        return None
+    out: list[dict] = []
+    for m in msgs:
+        d = m.model_dump() if hasattr(m, "model_dump") else m
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def _maybe_inject_respond_tool(tools):
+    if not tools:
+        return tools
+    _fg = _server_state.global_settings.forge_guardrails
+    if not _fg.inject_respond_tool:
+        return tools
+    return inject_respond_tool(tools)
 
 
 async def verify_api_key(
@@ -3193,6 +3314,7 @@ async def create_chat_completion(
         )
 
     lease = _LLMEngineLease()
+
     try:
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
@@ -3280,6 +3402,8 @@ async def create_chat_completion(
         # as an explicit parameter so the engine never has to re-derive it.
         is_partial = detect_and_strip_partial(messages)
 
+        messages = _apply_compression(messages)
+
         # Compile grammar for structured output (logit-level enforcement).
         # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
         response_format = request.response_format
@@ -3344,6 +3468,7 @@ async def create_chat_completion(
             effective_tools = _server_state.mcp_manager.get_merged_tools(
                 user_tools_dicts
             )
+        effective_tools = _maybe_inject_respond_tool(effective_tools)
 
         # Validate context window before sending to model
         tools_for_template = (
@@ -3588,16 +3713,54 @@ async def create_chat_completion(
             )
 
             # Protocol parsers can return structured tool_calls directly.
+            extraction = None
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
             else:
-                extraction = extract_tool_calls_with_thinking(
+                _fg = _server_state.global_settings.forge_guardrails
+                extraction = extract_and_validate_tool_calls(
                     thinking_content,
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    tool_choice=request.tool_choice,
+                    strict_tool_args=_fg.strict_tool_args,
+                    validation_enabled=_fg.validation_enabled,
                 )
+                _prereq = _build_prereq_checker()
+                extraction = apply_guardrails(
+                    extraction,
+                    request.tool_choice,
+                    tools_for_template,
+                    validation_enabled=_fg.validation_enabled,
+                    prerequisite_checker=_prereq,
+                    prior_messages=(
+                        _prior_messages_for_request(request)
+                        if _prereq is not None
+                        else None
+                    ),
+                )
+                if extraction.tool_calls:
+                    _real_calls, _resp_text = strip_respond_calls(
+                        extraction.tool_calls
+                    )
+                    if _resp_text is not None:
+                        extraction = ToolCallExtraction(
+                            cleaned_text=_resp_text,
+                            tool_calls=[],
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
+                    elif len(_real_calls) != len(extraction.tool_calls or []):
+                        extraction = ToolCallExtraction(
+                            cleaned_text=extraction.cleaned_text,
+                            tool_calls=_real_calls,
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
@@ -3625,7 +3788,7 @@ async def create_chat_completion(
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-            return ChatCompletionResponse(
+            _result = ChatCompletionResponse(
                 model=request.model,
                 choices=[
                     ChatCompletionChoice(
@@ -3655,9 +3818,16 @@ async def create_chat_completion(
                 ),
             ).model_dump_json(exclude_none=True)
 
-        json_headers = (
-            {"Warning": response_format_warning} if response_format_warning else None
-        )
+            _fg_meta = _server_state.global_settings.forge_guardrails
+            if _fg_meta.include_validation_metadata and extraction is not None:
+                _payload = guardrail_validation_payload(
+                    extraction, include_validation_metadata=True
+                )
+                if _payload:
+                    _resp = json.loads(_result)
+                    _resp.update(_payload)
+                    _result = json.dumps(_resp, ensure_ascii=False)
+            return _result
         return StreamingResponse(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_chat_completion()),
@@ -4511,21 +4681,58 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    extraction = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
-        # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        extraction = extract_tool_calls_with_thinking(
+        _fg = _server_state.global_settings.forge_guardrails
+        extraction = extract_and_validate_tool_calls(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            tool_choice=request.tool_choice,
+            strict_tool_args=_fg.strict_tool_args,
+            validation_enabled=_fg.validation_enabled,
         )
+        _prereq = _build_prereq_checker()
+        extraction = apply_guardrails(
+            extraction,
+            request.tool_choice,
+            kwargs.get("tools"),
+            validation_enabled=_fg.validation_enabled,
+            prerequisite_checker=_prereq,
+            prior_messages=(
+                _prior_messages_for_request(request)
+                if _prereq is not None
+                else None
+            ),
+        )
+        if extraction.tool_calls:
+            _real_calls, _resp_text = strip_respond_calls(
+                extraction.tool_calls
+            )
+            if _resp_text is not None:
+                extraction = ToolCallExtraction(
+                    cleaned_text=_resp_text,
+                    tool_calls=[],
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
+            elif len(_real_calls) != len(extraction.tool_calls or []):
+                extraction = ToolCallExtraction(
+                    cleaned_text=extraction.cleaned_text,
+                    tool_calls=_real_calls,
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
@@ -4703,6 +4910,12 @@ async def stream_chat_completion(
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    _fg_meta = _server_state.global_settings.forge_guardrails
+    if _fg_meta.include_validation_metadata and extraction is not None:
+        _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+        if _payload:
+            yield f"data: {json.dumps(_payload, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -4959,19 +5172,56 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    extraction = None
     if last_output and last_output.tool_calls:
-        # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        extraction = extract_tool_calls_with_thinking(
+        _fg = _server_state.global_settings.forge_guardrails
+        extraction = extract_and_validate_tool_calls(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            tool_choice=request.tool_choice,
+            strict_tool_args=_fg.strict_tool_args,
+            validation_enabled=_fg.validation_enabled,
         )
+        _prereq = _build_prereq_checker()
+        extraction = apply_guardrails(
+            extraction,
+            request.tool_choice,
+            kwargs.get("tools"),
+            validation_enabled=_fg.validation_enabled,
+            prerequisite_checker=_prereq,
+            prior_messages=(
+                _prior_messages_for_request(request)
+                if _prereq is not None
+                else None
+            ),
+        )
+        if extraction.tool_calls:
+            _real_calls, _resp_text = strip_respond_calls(
+                extraction.tool_calls
+            )
+            if _resp_text is not None:
+                extraction = ToolCallExtraction(
+                    cleaned_text=_resp_text,
+                    tool_calls=[],
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
+            elif len(_real_calls) != len(extraction.tool_calls or []):
+                extraction = ToolCallExtraction(
+                    cleaned_text=extraction.cleaned_text,
+                    tool_calls=_real_calls,
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
         tool_calls = extraction.tool_calls
 
     # 4. Close open blocks
@@ -5065,6 +5315,12 @@ async def stream_anthropic_messages(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+
+    _fg_meta = _server_state.global_settings.forge_guardrails
+    if _fg_meta.include_validation_metadata and extraction is not None:
+        _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+        if _payload:
+            yield format_sse_event("x_omlx_validation", _payload)
 
     # 7. Send message_stop
     yield create_message_stop_event()
@@ -5402,16 +5658,54 @@ async def create_anthropic_message(
             )
 
             # Protocol parsers can return structured tool_calls directly.
+            extraction = None
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
             else:
-                extraction = extract_tool_calls_with_thinking(
+                _fg = _server_state.global_settings.forge_guardrails
+                extraction = extract_and_validate_tool_calls(
                     thinking_content,
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=internal_tools,
+                    tool_choice=request.tool_choice,
+                    strict_tool_args=_fg.strict_tool_args,
+                    validation_enabled=_fg.validation_enabled,
                 )
+                _prereq = _build_prereq_checker()
+                extraction = apply_guardrails(
+                    extraction,
+                    request.tool_choice,
+                    internal_tools,
+                    validation_enabled=_fg.validation_enabled,
+                    prerequisite_checker=_prereq,
+                    prior_messages=(
+                        _prior_messages_for_request(request)
+                        if _prereq is not None
+                        else None
+                    ),
+                )
+                if extraction.tool_calls:
+                    _real_calls, _resp_text = strip_respond_calls(
+                        extraction.tool_calls
+                    )
+                    if _resp_text is not None:
+                        extraction = ToolCallExtraction(
+                            cleaned_text=_resp_text,
+                            tool_calls=[],
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
+                    elif len(_real_calls) != len(extraction.tool_calls or []):
+                        extraction = ToolCallExtraction(
+                            cleaned_text=extraction.cleaned_text,
+                            tool_calls=_real_calls,
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
@@ -5445,7 +5739,15 @@ async def create_anthropic_message(
                 request_uses_cache_control=request_has_cache_control(request),
             )
 
-            return response.model_dump_json()
+            _result = response.model_dump_json()
+            _fg_meta = _server_state.global_settings.forge_guardrails
+            if _fg_meta.include_validation_metadata and extraction is not None:
+                _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+                if _payload:
+                    _resp = json.loads(_result)
+                    _resp.update(_payload)
+                    _result = json.dumps(_resp, ensure_ascii=False)
+            return _result
 
         return StreamingResponse(
             _release_after_stream(
@@ -5499,6 +5801,7 @@ async def count_anthropic_tokens(
 
         # Convert tools if present
         internal_tools = convert_anthropic_tools_to_internal(request.tools)
+        internal_tools = _maybe_inject_respond_tool(internal_tools)
 
         # Apply chat template to get prompt
         tokenizer = engine.tokenizer
@@ -5710,6 +6013,7 @@ async def create_response(
         )
         if _server_state.mcp_manager and effective_tools:
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+        effective_tools = _maybe_inject_respond_tool(effective_tools)
 
         # Convert tools for chat template
         tools_for_template = (
@@ -5890,6 +6194,7 @@ async def create_response(
             thinking_content, regular_content = extract_thinking(raw_text)
 
             # Parse tool calls
+            extraction = None
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
@@ -5897,12 +6202,49 @@ async def create_response(
                     thinking_content, engine.tokenizer
                 )
             else:
-                extraction = extract_tool_calls_with_thinking(
+                _fg = _server_state.global_settings.forge_guardrails
+                extraction = extract_and_validate_tool_calls(
                     thinking_content,
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    tool_choice=request.tool_choice,
+                    strict_tool_args=_fg.strict_tool_args,
+                    validation_enabled=_fg.validation_enabled,
                 )
+                _prereq = _build_prereq_checker()
+                extraction = apply_guardrails(
+                    extraction,
+                    request.tool_choice,
+                    tools_for_template,
+                    validation_enabled=_fg.validation_enabled,
+                    prerequisite_checker=_prereq,
+                    prior_messages=(
+                        _prior_messages_for_request(request)
+                        if _prereq is not None
+                        else None
+                    ),
+                )
+                if extraction.tool_calls:
+                    _real_calls, _resp_text = strip_respond_calls(
+                        extraction.tool_calls
+                    )
+                    if _resp_text is not None:
+                        extraction = ToolCallExtraction(
+                            cleaned_text=_resp_text,
+                            tool_calls=[],
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
+                    elif len(_real_calls) != len(extraction.tool_calls or []):
+                        extraction = ToolCallExtraction(
+                            cleaned_text=extraction.cleaned_text,
+                            tool_calls=_real_calls,
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
@@ -5990,7 +6332,15 @@ async def create_response(
                     input_messages=current_input_messages,
                 )
 
-            return response_obj.model_dump_json()
+            _result = response_obj.model_dump_json()
+            _fg_meta = _server_state.global_settings.forge_guardrails
+            if _fg_meta.include_validation_metadata and extraction is not None:
+                _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+                if _payload:
+                    _resp = json.loads(_result)
+                    _resp.update(_payload)
+                    _result = json.dumps(_resp, ensure_ascii=False)
+            return _result
 
         return StreamingResponse(
             _release_after_stream(
@@ -6364,18 +6714,56 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    extraction = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        extraction = extract_tool_calls_with_thinking(
+        _fg = _server_state.global_settings.forge_guardrails
+        extraction = extract_and_validate_tool_calls(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            tool_choice=request.tool_choice,
+            strict_tool_args=_fg.strict_tool_args,
+            validation_enabled=_fg.validation_enabled,
         )
+        _prereq = _build_prereq_checker()
+        extraction = apply_guardrails(
+            extraction,
+            request.tool_choice,
+            kwargs.get("tools"),
+            validation_enabled=_fg.validation_enabled,
+            prerequisite_checker=_prereq,
+            prior_messages=(
+                _prior_messages_for_request(request)
+                if _prereq is not None
+                else None
+            ),
+        )
+        if extraction.tool_calls:
+            _real_calls, _resp_text = strip_respond_calls(
+                extraction.tool_calls
+            )
+            if _resp_text is not None:
+                extraction = ToolCallExtraction(
+                    cleaned_text=_resp_text,
+                    tool_calls=[],
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
+            elif len(_real_calls) != len(extraction.tool_calls or []):
+                extraction = ToolCallExtraction(
+                    cleaned_text=extraction.cleaned_text,
+                    tool_calls=_real_calls,
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         if not stream_content:
@@ -6622,6 +7010,12 @@ async def stream_responses_api(
             "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
+
+    _fg_meta = _server_state.global_settings.forge_guardrails
+    if _fg_meta.include_validation_metadata and extraction is not None:
+        _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+        if _payload:
+            yield format_sse_event("response.x_omlx_validation", _payload)
 
     # 13. response.completed — MUST always be sent
     final_response = {

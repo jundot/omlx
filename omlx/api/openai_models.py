@@ -309,6 +309,37 @@ class ChatCompletionRequest(BaseModel):
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
 
+    _valid_tool_choice_strings = {"auto", "none", "required"}
+
+    @field_validator("tool_choice", mode="after")
+    @classmethod
+    def _validate_tool_choice(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            if v not in cls._valid_tool_choice_strings:
+                raise ValueError(
+                    f"tool_choice must be one of {cls._valid_tool_choice_strings} "
+                    f"or a dict like {{'type':'function','function':{{'name':'...'}}}}. "
+                    f"Got: '{v}'"
+                )
+            return v
+        if isinstance(v, dict):
+            if v.get("type") != "function":
+                raise ValueError(
+                    "tool_choice dict must have type='function'. "
+                    f"Got type='{v.get('type')}'"
+                )
+            func = v.get("function")
+            if not isinstance(func, dict) or "name" not in func:
+                raise ValueError(
+                    "tool_choice dict must have function.name field"
+                )
+            return v
+        raise ValueError(
+            f"tool_choice must be a string or dict, got {type(v).__name__}"
+        )
+
     @field_validator("stop", mode="before")
     @classmethod
     def coerce_stop(cls, v):

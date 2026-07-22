@@ -776,6 +776,74 @@ class IntegrationSettings:
 
 
 @dataclass
+class CompressionSettings:
+    """Context compression settings for reducing prompt token count."""
+
+    enabled: bool = True
+    # Minimum total message tokens before compression is attempted.
+    # Prompts shorter than this are passed through unchanged.
+    min_tokens_to_compress: int = 250
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "min_tokens_to_compress": self.min_tokens_to_compress,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CompressionSettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", True),
+            min_tokens_to_compress=data.get("min_tokens_to_compress", 250),
+        )
+
+
+@dataclass
+class ForgeGuardrailsSettings:
+    """Guardrail validation settings (opt-in by default).
+
+    Follows the CompressionSettings pattern. All flags default to False
+    for full backward compatibility.
+    """
+
+    validation_enabled: bool = False
+    strict_tool_args: bool = False
+    include_validation_metadata: bool = False
+    max_retries: int = 3
+    max_tool_errors: int = 2
+    compaction_strategy: str = "none"
+    inject_respond_tool: bool = False
+    enforce_mcp_prerequisites: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "validation_enabled": self.validation_enabled,
+            "strict_tool_args": self.strict_tool_args,
+            "include_validation_metadata": self.include_validation_metadata,
+            "max_retries": self.max_retries,
+            "max_tool_errors": self.max_tool_errors,
+            "compaction_strategy": self.compaction_strategy,
+            "inject_respond_tool": self.inject_respond_tool,
+            "enforce_mcp_prerequisites": self.enforce_mcp_prerequisites,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ForgeGuardrailsSettings":
+        return cls(
+            validation_enabled=data.get("validation_enabled", False),
+            strict_tool_args=data.get("strict_tool_args", False),
+            include_validation_metadata=data.get("include_validation_metadata", False),
+            max_retries=data.get("max_retries", 3),
+            max_tool_errors=data.get("max_tool_errors", 2),
+            compaction_strategy=data.get("compaction_strategy", "none"),
+            inject_respond_tool=data.get("inject_respond_tool", False),
+            enforce_mcp_prerequisites=data.get("enforce_mcp_prerequisites", False),
+        )
+
+
+@dataclass
 class GlobalSettings:
     """
     Global settings for oMLX.
@@ -803,6 +871,10 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
+    compression: CompressionSettings = field(default_factory=CompressionSettings)
+    forge_guardrails: ForgeGuardrailsSettings = field(
+        default_factory=ForgeGuardrailsSettings
+    )
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
@@ -899,6 +971,12 @@ class GlobalSettings:
                 self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
+            if "compression" in data:
+                self.compression = CompressionSettings.from_dict(data["compression"])
+            if "forge_guardrails" in data:
+                self.forge_guardrails = ForgeGuardrailsSettings.from_dict(
+                    data["forge_guardrails"]
+                )
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
@@ -1025,6 +1103,18 @@ class GlobalSettings:
                 markitdown_pdf_processing_engine.strip() or "markitdown"
             )
 
+        # Compression settings — if both env vars are set, DISABLED takes
+        # precedence (fail-safe: when in doubt, don't compress).
+        if compression_enabled := os.getenv("OMLX_COMPRESSION_ENABLED"):
+            self.compression.enabled = compression_enabled.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if compression_disabled := os.getenv("OMLX_COMPRESSION_DISABLED"):
+            if compression_disabled.lower() in ("true", "1", "yes"):
+                self.compression.enabled = False
+
     def _apply_cli_overrides(self, args: Any) -> None:
         """
         Apply CLI argument overrides.
@@ -1107,6 +1197,10 @@ class GlobalSettings:
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
 
+        # Compression settings
+        if hasattr(args, "disable_compression") and args.disable_compression:
+            self.compression.enabled = False
+
     def get_hf_cache_dir(self) -> Path:
         """Return the standard HuggingFace Hub cache directory."""
         if hf_hub_cache := os.getenv("HF_HUB_CACHE"):
@@ -1168,6 +1262,8 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "compression": self.compression.to_dict(),
+            "forge_guardrails": self.forge_guardrails.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
@@ -1366,6 +1462,13 @@ class GlobalSettings:
         if not str(self.integrations.markitdown_pdf_processing_engine or "").strip():
             errors.append("markitdown_pdf_processing_engine must not be empty")
 
+        # Compression validation
+        if self.compression.min_tokens_to_compress < 0:
+            errors.append(
+                f"Invalid min_tokens_to_compress: "
+                f"{self.compression.min_tokens_to_compress} (must be >= 0)"
+            )
+
         # HuggingFace validation
         if self.huggingface.endpoint:
             endpoint = self.huggingface.endpoint.strip()
@@ -1432,6 +1535,52 @@ class GlobalSettings:
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GlobalSettings":
+        """Create a GlobalSettings instance from a dictionary."""
+        settings = cls()
+        if "server" in data:
+            settings.server = ServerSettings.from_dict(data["server"])
+        if "model" in data:
+            settings.model = ModelSettings.from_dict(data["model"])
+        if "memory" in data:
+            settings.memory = MemorySettings.from_dict(data["memory"])
+        if "scheduler" in data:
+            settings.scheduler = SchedulerSettings.from_dict(data["scheduler"])
+        if "cache" in data:
+            settings.cache = CacheSettings.from_dict(data["cache"])
+        if "auth" in data:
+            settings.auth = AuthSettings.from_dict(data["auth"])
+        if "mcp" in data:
+            settings.mcp = MCPSettings.from_dict(data["mcp"])
+        if "huggingface" in data:
+            settings.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
+        if "modelscope" in data:
+            settings.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
+        if "network" in data:
+            settings.network = NetworkSettings.from_dict(data["network"])
+        if "sampling" in data:
+            settings.sampling = SamplingSettings.from_dict(data["sampling"])
+        if "logging" in data:
+            settings.logging = LoggingSettings.from_dict(data["logging"])
+        if "claude_code" in data:
+            settings.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
+        if "integrations" in data:
+            settings.integrations = IntegrationSettings.from_dict(data["integrations"])
+        if "ui" in data:
+            settings.ui = UISettings.from_dict(data["ui"])
+        if "compression" in data:
+            settings.compression = CompressionSettings.from_dict(data["compression"])
+        if "forge_guardrails" in data:
+            settings.forge_guardrails = ForgeGuardrailsSettings.from_dict(
+                data["forge_guardrails"]
+            )
+        if "idle_timeout" in data:
+            settings.idle_timeout = ModelIdleTimeoutSettings.from_dict(
+                data["idle_timeout"]
+            )
+        return settings
+
     def to_dict(self) -> dict[str, Any]:
         """Convert all settings to a dictionary."""
         return {
@@ -1452,6 +1601,8 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "compression": self.compression.to_dict(),
+            "forge_guardrails": self.forge_guardrails.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
