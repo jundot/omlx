@@ -20,6 +20,12 @@
             "state" : "translated",
             "value" : "All Models"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все модели"
+          }
         }
       }
     },
@@ -31,6 +37,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Favorites Only"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Только избранные"
           }
         }
       }
@@ -44,6 +56,12 @@
             "state" : "translated",
             "value" : "All Time Activity"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Активность за всё время"
+          }
         }
       }
     },
@@ -55,6 +73,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Average speeds across all sessions (ALL)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Средняя скорость по всем сессиям (ALL)."
           }
         }
       }
@@ -68,6 +92,12 @@
             "state" : "translated",
             "value" : "Average Session Activity"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Средняя активность сессии"
+          }
         }
       }
     },
@@ -80,6 +110,12 @@
             "state" : "translated",
             "value" : "Average speeds since the server started (AVG)."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Средняя скорость с момента запуска сервера (AVG)."
+          }
         }
       }
     },
@@ -88,6 +124,12 @@
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CPU"
+          }
+        },
+        "ru" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "CPU"
@@ -104,6 +146,12 @@
             "state" : "translated",
             "value" : "CPU usage as a vertical bar."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка CPU в виде вертикального индикатора."
+          }
         }
       }
     },
@@ -112,6 +160,12 @@
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU"
+          }
+        },
+        "ru" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "GPU"
@@ -128,6 +182,12 @@
             "state" : "translated",
             "value" : "GPU usage as a vertical bar."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка GPU в виде вертикального индикатора."
+          }
         }
       }
     },
@@ -139,6 +199,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Live Activity"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Текущая активность"
           }
         }
       }
@@ -152,6 +218,12 @@
             "state" : "translated",
             "value" : "Current speeds across running requests (LIV)."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Текущая скорость по выполняющимся запросам (LIV)."
+          }
         }
       }
     },
@@ -163,6 +235,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Memory"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Память"
           }
         }
       }
@@ -176,6 +254,12 @@
             "state" : "translated",
             "value" : "Memory usage as a vertical bar (MEM)."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использование памяти в виде вертикального индикатора (MEM)."
+          }
         }
       }
     },
@@ -187,6 +271,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Refresh Interval"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Интервал обновления"
           }
         }
       }
@@ -200,6 +290,12 @@
             "state" : "translated",
             "value" : "How often menu bar items and their graphs update."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Как часто обновляются элементы строки меню и их графики."
+          }
         }
       }
     },
@@ -211,6 +307,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Show Dock Icon"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Показывать значок в Dock"
           }
         }
       }
@@ -224,6 +326,12 @@
             "state" : "translated",
             "value" : "Keep the Dock icon visible even when no window is open."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставлять значок в Dock видимым, даже когда ни одно окно не открыто."
+          }
         }
       }
     },
@@ -235,6 +343,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Visible Models"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Видимые модели"
           }
         }
       }
@@ -248,6 +362,12 @@
             "state" : "translated",
             "value" : "Which models the menu bar Models menu lists. Loaded models always show."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Какие модели показывает меню «Модели» в строке меню. Загруженные модели показываются всегда."
+          }
         }
       }
     },
@@ -259,6 +379,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "General"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общее"
           }
         }
       }
@@ -272,6 +398,12 @@
             "state" : "translated",
             "value" : "Menu Bar Items"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Элементы строки меню"
+          }
         }
       }
     },
@@ -283,6 +415,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Each item shows prompt-processing and token-generation speed in the menu bar. Click one for details and a live graph."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Каждый элемент показывает скорость обработки промптов и генерации токенов в строке меню. Нажмите элемент, чтобы посмотреть подробности и график в реальном времени."
           }
         }
       }
@@ -296,6 +434,12 @@
             "state" : "translated",
             "value" : "Menu Bar Model Library"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Библиотека моделей в строке меню"
+          }
         }
       }
     },
@@ -307,6 +451,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "System Stats"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Статистика системы"
           }
         }
       }
@@ -320,6 +470,12 @@
             "state" : "translated",
             "value" : "Activity"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Активность"
+          }
         }
       }
     },
@@ -331,6 +487,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Dashboard"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Веб-панель"
           }
         }
       }
@@ -344,6 +506,12 @@
             "state" : "translated",
             "value" : "Set an API key to enable live activity"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Задайте API-ключ, чтобы включить текущую активность"
+          }
         }
       }
     },
@@ -355,6 +523,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Server is off"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сервер выключен"
           }
         }
       }
@@ -368,6 +542,12 @@
             "state" : "translated",
             "value" : "Settings"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Настройки"
+          }
         }
       }
     },
@@ -379,6 +559,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "All Time"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "За всё время"
           }
         }
       }
@@ -392,6 +578,12 @@
             "state" : "translated",
             "value" : "Average Session"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Среднее за сессию"
+          }
         }
       }
     },
@@ -403,6 +595,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Live Activity"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Текущая активность"
           }
         }
       }
@@ -416,6 +614,12 @@
             "state" : "translated",
             "value" : "No favorite models yet"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Избранных моделей пока нет"
+          }
         }
       }
     },
@@ -427,6 +631,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Active"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Активная"
           }
         }
       }
@@ -440,6 +650,12 @@
             "state" : "translated",
             "value" : "Compressed"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сжатая"
+          }
         }
       }
     },
@@ -451,6 +667,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "E (amber) / P (blue) usage"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка E (янтарный) / P (синий)"
           }
         }
       }
@@ -464,6 +686,12 @@
             "state" : "translated",
             "value" : "E-cores"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E-ядра"
+          }
         }
       }
     },
@@ -475,6 +703,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Free"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Свободная"
           }
         }
       }
@@ -488,6 +722,12 @@
             "state" : "translated",
             "value" : "GPU (green) / GPU mem (cyan)"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU (зелёный) / память GPU (голубой)"
+          }
         }
       }
     },
@@ -499,6 +739,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "GPU memory"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Память GPU"
           }
         }
       }
@@ -512,6 +758,12 @@
             "state" : "translated",
             "value" : "%@ in use"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ используется"
+          }
         }
       }
     },
@@ -523,6 +775,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Load avg"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Средняя нагрузка"
           }
         }
       }
@@ -536,6 +794,12 @@
             "state" : "translated",
             "value" : "Memory"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Память"
+          }
         }
       }
     },
@@ -547,6 +811,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "P-cores"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "P-ядра"
           }
         }
       }
@@ -560,6 +830,12 @@
             "state" : "translated",
             "value" : "Thermal"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Температурное состояние"
+          }
         }
       }
     },
@@ -571,6 +847,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Uptime"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Время работы"
           }
         }
       }
@@ -584,6 +866,12 @@
             "state" : "translated",
             "value" : "Wired"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Закреплённая"
+          }
         }
       }
     },
@@ -595,6 +883,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Appearance"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Внешний вид"
           }
         }
       }
@@ -8689,6 +8983,12 @@
             "state" : "translated",
             "value" : "Compare standard oQ with oQe imatrix and how enhanced quantization works."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сравните стандартный oQ с oQe imatrix и посмотрите, как работает улучшенное квантование."
+          }
         }
       }
     },
@@ -8719,6 +9019,12 @@
             "state" : "translated",
             "value" : "oQ: oMLX Universal Dynamic Quantization"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ: универсальное динамическое квантование oMLX"
+          }
         }
       }
     },
@@ -8730,6 +9036,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Quantization should not be exclusive to any particular inference server."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Квантование не должно быть привязано к какому-либо одному серверу инференса."
           }
         }
       }
@@ -8743,6 +9055,12 @@
             "state" : "translated",
             "value" : "oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ создаёт стандартные модели mlx-lm, которые работают везде — в oMLX, mlx-lm, LM Studio и любом приложении с поддержкой формата MLX safetensors."
+          }
         }
       }
     },
@@ -8754,6 +9072,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "No custom loader required."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Специальный загрузчик не требуется."
           }
         }
       }
@@ -8767,6 +9091,12 @@
             "state" : "translated",
             "value" : "oQ and oQe: MLX-native mixed precision"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ и oQe: смешанная точность нативно для MLX"
+          }
         }
       }
     },
@@ -8778,6 +9108,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted affine quantization."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Квантователь потоково читает тензоры из safetensors, измеряет чувствительность слоёв и записывает чекпойнт смешанной точности в рамках заданного байтового бюджета. Стандартный oQ фокусируется на чувствительности отдельных слоёв и правилах защиты с учётом архитектуры модели. oQe сохраняет тот же план oQ и добавляет аффинное квантование, взвешенное через imatrix."
           }
         }
       }
@@ -8791,6 +9127,12 @@
             "state" : "translated",
             "value" : "What standard oQ does"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Что делает стандартный oQ"
+          }
         }
       }
     },
@@ -8802,6 +9144,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Layer sensitivity"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чувствительность слоёв"
           }
         }
       }
@@ -8815,6 +9163,12 @@
             "state" : "translated",
             "value" : "is measured with calibration prompts by comparing quantized-layer output error against the float baseline."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "измеряется на калибровочных промптах: ошибка вывода квантованного слоя сравнивается с float-базой."
+          }
         }
       }
     },
@@ -8826,6 +9180,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Mixed precision"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Смешанная точность"
           }
         }
       }
@@ -8839,6 +9199,12 @@
             "state" : "translated",
             "value" : "allocates higher bits to sensitive layers and protected tensors while keeping the target bits-per-weight budget under a hard cap."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "выделяет больше битов чувствительным слоям и защищённым тензорам, удерживая целевой бюджет битов на вес ниже жёсткого предела."
+          }
         }
       }
     },
@@ -8850,6 +9216,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Architecture rules"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Архитектурные правила"
           }
         }
       }
@@ -8863,6 +9235,12 @@
             "state" : "translated",
             "value" : "keep MoE routers in fp16, protect shared experts and output-critical tensors, leave vision/audio encoders unquantized, and preserve SSM state tensors."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "сохраняют MoE-роутеры в fp16, защищают общих экспертов и критичные для выхода тензоры, оставляют vision/audio-энкодеры неквантованными и сохраняют тензоры состояния SSM."
+          }
         }
       }
     },
@@ -8874,6 +9252,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "What oQe adds"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Что добавляет oQe"
           }
         }
       }
@@ -8887,6 +9271,12 @@
             "state" : "translated",
             "value" : "oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step. This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from representative prompts, then use that information so quantization spends less error on the input channels that matter most."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe использует тот же планировщик чувствительности oQ и добавляет этап калибровки матрицы важности. Идея прямо заимствована из imatrix в llama.cpp: собрать энергию активаций на репрезентативных промптах, а затем учитывать полученную матрицу, чтобы ошибка квантования меньше приходилась на самые важные входные каналы."
+          }
         }
       }
     },
@@ -8898,6 +9288,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "How oQe imatrix works"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Как работает oQe imatrix"
           }
         }
       }
@@ -8911,6 +9307,12 @@
             "state" : "translated",
             "value" : "Collect activation energy."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Собрать энергию активаций."
+          }
         }
       }
     },
@@ -8922,6 +9324,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "oQe runs calibration samples through the model and records average input activation squared, E[x^2], for each quantized Linear input channel."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe пропускает калибровочные примеры через модель и для каждого входного канала квантуемого Linear записывает средний квадрат входной активации, E[x^2]."
           }
         }
       }
@@ -8935,6 +9343,12 @@
             "state" : "translated",
             "value" : "Track experts separately."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отслеживать экспертов отдельно."
+          }
         }
       }
     },
@@ -8946,6 +9360,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "For MoE SwitchLinear layers, oQe records one importance vector per expert using the router-selected expert indices, so inactive or rarely active experts are visible in the coverage report."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Для слоёв MoE SwitchLinear oQe записывает отдельный вектор важности для каждого эксперта, используя выбранные роутером индексы экспертов. Поэтому неактивные или редко активные эксперты видны в отчёте о покрытии."
           }
         }
       }
@@ -8959,6 +9379,12 @@
             "state" : "translated",
             "value" : "Adapt sample count."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Адаптировать число примеров."
+          }
         }
       }
     },
@@ -8970,6 +9396,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Calibration starts from the requested sample count and can continue up to the adaptive maximum when MoE expert coverage is not sufficient."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Калибровка начинается с заданного числа примеров и может продолжаться до адаптивного максимума, если покрытие MoE-экспертов недостаточно."
           }
         }
       }
@@ -8983,6 +9415,12 @@
             "state" : "translated",
             "value" : "Weight the quantization error."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Взвесить ошибку квантования."
+          }
         }
       }
     },
@@ -8994,6 +9432,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "During affine quantization, oQe chooses scale/bias candidates by minimizing sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Во время аффинного квантования oQe выбирает кандидаты масштаба/смещения, минимизируя sum(importance * (weight - dequantized_weight)^2), а не обычную невзвешенную MSE."
           }
         }
       }
@@ -9007,6 +9451,12 @@
             "state" : "translated",
             "value" : "If a tensor has no matching imatrix entry, the default behavior is to fall back to standard oQ for that tensor. Enable strict coverage to fail instead."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если для тензора нет подходящей записи imatrix, по умолчанию для этого тензора используется стандартный oQ. Включите строгое покрытие, чтобы вместо этого завершать работу с ошибкой."
+          }
         }
       }
     },
@@ -9018,6 +9468,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Path"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вариант"
           }
         }
       }
@@ -9031,6 +9487,12 @@
             "state" : "translated",
             "value" : "Bit allocation"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Распределение битов"
+          }
         }
       }
     },
@@ -9042,6 +9504,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Affine quantization"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аффинное квантование"
           }
         }
       }
@@ -9055,6 +9523,12 @@
             "state" : "translated",
             "value" : "Best use"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лучше подходит для"
+          }
         }
       }
     },
@@ -9066,6 +9540,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Layer-sensitivity mixed precision"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Смешанная точность по чувствительности слоёв"
           }
         }
       }
@@ -9079,6 +9559,12 @@
             "state" : "translated",
             "value" : "Standard min/max affine per group"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Стандартное аффинное min/max по группам"
+          }
         }
       }
     },
@@ -9090,6 +9576,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Fast, deterministic conversion with strong baseline quality"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Быстрое детерминированное преобразование с хорошим базовым качеством"
           }
         }
       }
@@ -9103,6 +9595,12 @@
             "state" : "translated",
             "value" : "Same oQ plan"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тот же план oQ"
+          }
         }
       }
     },
@@ -9115,6 +9613,12 @@
             "state" : "translated",
             "value" : "imatrix-weighted clipping/search per group"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Клиппинг/поиск по группам с весами imatrix"
+          }
         }
       }
     },
@@ -9126,6 +9630,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Better low-bit retention, especially for MoE and activation-skewed layers"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лучшее сохранение качества при малой битности, особенно для MoE и слоёв с неравномерными активациями"
           }
         }
       }
@@ -9319,6 +9829,12 @@
             "state" : "translated",
             "value" : "Imatrix cache path"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Путь к кэшу imatrix"
+          }
         }
       }
     },
@@ -9330,6 +9846,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Automatic"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Автоматически"
           }
         }
       }
@@ -9343,6 +9865,12 @@
             "state" : "translated",
             "value" : "Leave empty to use an automatic cache location."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставьте пустым, чтобы использовать автоматическое расположение кэша."
+          }
         }
       }
     },
@@ -9354,6 +9882,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enable oQe"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Включить oQe"
           }
         }
       }
@@ -9367,6 +9901,12 @@
             "state" : "translated",
             "value" : "Collect activation importance and use it to reduce affine quantization error."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Собирать важность активаций и использовать её, чтобы снизить ошибку аффинного квантования."
+          }
         }
       }
     },
@@ -9378,6 +9918,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Reuse imatrix cache"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторно использовать кэш imatrix"
           }
         }
       }
@@ -9391,6 +9937,12 @@
             "state" : "translated",
             "value" : "Use a compatible cached imatrix when available; otherwise collect a new one."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использовать совместимую imatrix из кэша, если она доступна; иначе собрать новую."
+          }
         }
       }
     },
@@ -9402,6 +9954,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Strict imatrix coverage"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Строгое покрытие imatrix"
           }
         }
       }
@@ -9415,6 +9973,12 @@
             "state" : "translated",
             "value" : "Fail when a quantized tensor has no matching imatrix entry instead of falling back to standard oQ."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Завершать с ошибкой, если для квантуемого тензора нет подходящей записи imatrix, вместо отката к стандартному oQ."
+          }
         }
       }
     },
@@ -9427,6 +9991,12 @@
             "state" : "translated",
             "value" : "Use imatrix calibration to weight affine quantization by activation importance."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использовать калибровку imatrix, чтобы взвешивать аффинное квантование по важности активаций."
+          }
         }
       }
     },
@@ -9438,6 +10008,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Enhanced quantization (oQe)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Улучшенное квантование (oQe)"
           }
         }
       }
@@ -13262,6 +13838,12 @@
             "state" : "translated",
             "value" : "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models."
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Формирует несколько черновых токенов за шаг с помощью встроенной MTP-головы модели. До ~1.5× быстрее декодирование для поддерживаемых моделей."
+          }
         }
       }
     },
@@ -13274,6 +13856,12 @@
             "state" : "translated",
             "value" : "Acceleration"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ускорение"
+          }
         }
       }
     },
@@ -13285,6 +13873,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Decoding speedups for models that support them."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ускорение декодирования для моделей, которые его поддерживают."
           }
         }
       }
@@ -19407,6 +20001,12 @@
             "state" : "translated",
             "value" : "模型"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модели"
+          }
         }
       }
     },
@@ -19442,6 +20042,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "沒有可用的模型"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нет доступных моделей"
           }
         }
       }
@@ -19479,6 +20085,12 @@
             "state" : "translated",
             "value" : "正在卸載模型…"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выгрузка модели…"
+          }
         }
       }
     },
@@ -19514,6 +20126,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "正在載入模型…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка модели…"
           }
         }
       }
@@ -19551,6 +20169,12 @@
             "state" : "translated",
             "value" : "卸載模型"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выгрузить модель"
+          }
         }
       }
     },
@@ -19586,6 +20210,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "載入模型"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузить модель"
           }
         }
       }
@@ -19623,6 +20253,12 @@
             "state" : "translated",
             "value" : "模型設定…"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Настройки модели…"
+          }
         }
       }
     },
@@ -19658,6 +20294,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "複製名稱"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скопировать имя"
           }
         }
       }
@@ -19695,6 +20337,12 @@
             "state" : "translated",
             "value" : "載入中…"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка…"
+          }
         }
       }
     },
@@ -19730,6 +20378,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已載入"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загруженные"
           }
         }
       }
@@ -19767,6 +20421,12 @@
             "state" : "translated",
             "value" : "收藏"
           }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Избранные"
+          }
         }
       }
     },
@@ -19802,6 +20462,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "資料庫"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Библиотека"
           }
         }
       }
