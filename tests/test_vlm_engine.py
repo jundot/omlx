@@ -800,6 +800,34 @@ class TestApplyChatTemplate:
         assert "assistant: Hi" in result
         assert result.endswith("assistant:")
 
+    def test_value_error_fallback_uses_get_chat_template(self):
+        """Tokenizer exposes apply_chat_template but has no chat_template set
+        (ValueError) → fall back to mlx-vlm's get_chat_template plain rendering.
+
+        Covers raw OCR checkpoints like baidu/Unlimited-OCR that ship no
+        chat template; the pre-flight token count must not 400.
+        """
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = ValueError(
+            "Cannot use chat template functions because "
+            "tokenizer.chat_template is not set"
+        )
+        engine = _make_loaded_engine(tokenizer=tokenizer)
+        engine._processor = MagicMock()
+
+        messages = [{"role": "user", "content": "document parsing."}]
+        with patch(
+            "mlx_vlm.prompt_utils.get_chat_template",
+            return_value="<image>document parsing.",
+        ) as mock_gct:
+            result = engine._apply_chat_template(messages)
+
+        assert result == "<image>document parsing."
+        mock_gct.assert_called_once()
+        args, kwargs = mock_gct.call_args
+        assert args[0] is engine._processor
+        assert kwargs.get("add_generation_prompt") is True
+
     def test_chat_template_kwargs_override(self):
         """Additional chat_template_kwargs are merged into template kwargs."""
         tokenizer = MagicMock()
