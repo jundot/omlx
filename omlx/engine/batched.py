@@ -278,6 +278,22 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), _load_model_sync
         )
 
+        # Operator opt-out: when the tool-call parser is set to "none"/"off",
+        # disable tool-call extraction so the raw model tokens pass straight
+        # through to the assistant message content. mlx-lm attaches the parser
+        # to the tokenizer at load time, so clear it here and flag the tokenizer
+        # for the server-side parse_tool_calls() / ToolCallStreamFilter checks.
+        # See https://github.com/jundot/omlx/issues/906.
+        parser_choice = getattr(self._scheduler_config, "tool_call_parser", None)
+        if (
+            self._tokenizer is not None
+            and parser_choice is not None
+            and parser_choice.lower() in ("none", "off")
+        ):
+            self._tokenizer.tool_calls_disabled = True
+            self._tokenizer.has_tool_calling = False
+            logger.info("Tool calling disabled: tool_call_parser=none")
+
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
             apply_post_load_transforms,

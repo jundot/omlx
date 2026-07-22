@@ -322,7 +322,27 @@ class TestSchedulerSettings:
             "max_concurrent_requests": 8,
             "embedding_batch_size": 32,
             "chunked_prefill": False,
+            "tool_call_parser": None,
         }
+
+    def test_tool_call_parser_default_is_none(self):
+        """tool_call_parser defaults to None (auto-select, unchanged behavior)."""
+        assert SchedulerSettings().tool_call_parser is None
+
+    def test_tool_call_parser_round_trip(self):
+        """tool_call_parser round-trips through from_dict / to_dict."""
+        settings = SchedulerSettings.from_dict({"tool_call_parser": "none"})
+        assert settings.tool_call_parser == "none"
+        assert settings.to_dict()["tool_call_parser"] == "none"
+
+    def test_tool_call_parser_threads_to_scheduler_config(self):
+        """GlobalSettings carries tool_call_parser into the engine SchedulerConfig."""
+        pytest.importorskip("mlx")  # to_scheduler_config imports the mlx-backed scheduler
+        gs = GlobalSettings()
+        gs.scheduler.tool_call_parser = "none"
+        assert gs.to_scheduler_config().tool_call_parser == "none"
+        # Default stays None (auto-select).
+        assert GlobalSettings().to_scheduler_config().tool_call_parser is None
 
     def test_from_dict(self):
         """Test creation from dictionary."""

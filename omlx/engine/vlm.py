@@ -1904,6 +1904,23 @@ class VLMBatchedEngine(BaseEngine):
         if not chat_template:
             return
 
+        # Operator opt-out: when the tool-call parser is set to "none"/"off",
+        # skip parser injection entirely. With no parser injected, tool-call
+        # extraction is bypassed on every path: parse_tool_calls() is a no-op
+        # without ``has_tool_calling`` (non-streaming + the structured
+        # ``tool_calls`` field), and ToolCallStreamFilter goes inactive when it
+        # sees ``tool_calls_disabled`` (streaming). The raw model tokens then
+        # pass straight through to the assistant message content -- for
+        # downstream systems that own their own tool-call parsing. See
+        # https://github.com/jundot/omlx/issues/906.
+        parser_choice = getattr(
+            self._scheduler_config, "tool_call_parser", None
+        )
+        if parser_choice is not None and parser_choice.lower() in ("none", "off"):
+            tokenizer.tool_calls_disabled = True
+            logger.info("VLM tool calling disabled: tool_call_parser=none")
+            return
+
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
             from mlx_vlm.tool_parsers import (
