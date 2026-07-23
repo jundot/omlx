@@ -1355,7 +1355,7 @@ class TestClaudeCodeIntegration:
         ):
             cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
 
-        assert captured["argv"] == ["claude"]
+        assert captured["argv"] == ["claude-omlx"]
 
     def test_launch_forwards_extra_args(self):
         cc = ClaudeCodeIntegration()
@@ -1380,7 +1380,7 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "--resume", "abc123"]
+        assert captured["argv"] == ["claude-omlx", "--resume", "abc123"]
 
     def test_launch_forwards_short_resume(self):
         cc = ClaudeCodeIntegration()
@@ -1405,7 +1405,7 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "-r", "xyz"]
+        assert captured["argv"] == ["claude-omlx", "-r", "xyz"]
 
 
 class TestCopilotIntegration:

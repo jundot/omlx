@@ -66,7 +66,14 @@ class ClaudeCodeIntegration(Integration):
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
 
         binary = self._find_claude_binary()
-        argv = [binary, *ctx.extra_args]
+        # argv[0] is cosmetic to the OS/claude itself (verified: claude does not
+        # inspect its own argv[0]) but is what tools like `ps` and zellij's
+        # session-resurrection command discovery see. Marking it lets external
+        # tooling tell an omlx-launched session apart from a bare `claude`
+        # invocation or one launched through a different wrapper (e.g. ollama's
+        # `--model` flag), which is otherwise impossible once execvpe replaces
+        # this process.
+        argv = ["claude-omlx", *ctx.extra_args]
         print(f"Launching Claude Code with model {ctx.model}...")
         if ctx.context_window:
             print(f"Auto-compact window: {ctx.context_window:,} tokens")
