@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import subprocess
 import time
 from contextlib import suppress
@@ -990,6 +991,49 @@ class ProcessMemoryEnforcer:
             )
         return freed_total
 
+    # Pool bytes below which a pressure-triggered clear is not worth the
+    # per-clear IOGPUFamily refcount cost (matches the scheduler's own
+    # _periodic_clear_threshold_bytes floor). Above it, a clear meaningfully
+    # returns memory to the OS.
+    _POOL_RECLAIM_FLOOR = 2 * 1024**3
+
+    def _request_scheduler_cache_reclaim(self, freed_hot: int) -> None:
+        """Ask each scheduler to run its step-boundary Metal cache clear.
+
+        Routes the reclaim through the scheduler's shipped, lock-protected,
+        engine-stream-synchronized ``_sync_and_clear_cache`` path (the same
+        one the periodic clear uses) instead of touching Metal from the
+        enforcer thread — the enforcer must never touch Metal directly.
+        Setting the per-scheduler flag is GIL-atomic; the actual clear fires
+        on the inference thread at the next step boundary, even under load —
+        unlike ``request_idle_reclaim``, which never fires while requests are
+        running and so cannot recover a busy server from hard pressure.
+
+        Fires when a hot-cache shrink just freed references (so the freed
+        buffers, now pooled, can be returned to the OS) OR when the MLX
+        buffer pool alone holds a meaningful amount under pressure (the
+        already-wedged case where hot cache is empty but pooled buffers are
+        stranded).
+        """
+        pool_bytes = mx.get_cache_memory()
+        if freed_hot <= 0 and pool_bytes <= self._POOL_RECLAIM_FLOOR:
+            return
+        requested = 0
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            request = getattr(scheduler, "request_pressure_reclaim", None)
+            if callable(request):
+                request()
+                requested += 1
+        if requested:
+            logger.info(
+                "Requested pressure cache reclaim on %d scheduler(s) "
+                "(freed_hot=%s, pool=%s)",
+                requested,
+                _format_gb(freed_hot),
+                _format_gb(pool_bytes),
+            )
+
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.
 
@@ -1377,6 +1421,15 @@ class ProcessMemoryEnforcer:
                 current,
                 soft,
             )
+            # Return reclaimable Metal memory to the OS. The shrink above only
+            # drops mx.array references into MLX's buffer-cache pool, which is
+            # pinned by set_cache_limit(total) (the #300 panic guard), so the
+            # freed bytes never leave the process and phys_footprint does not
+            # drop — the enforcer then wrongly concludes "no evictable models"
+            # and livelocks until restart. Env gate
+            # OMLX_DISABLE_HOTCACHE_RECLAIM=1 restores stock behavior.
+            if os.environ.get("OMLX_DISABLE_HOTCACHE_RECLAIM") != "1":
+                self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
                 emergency = self._is_emergency_pressure(current, ceiling)

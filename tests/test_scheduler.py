@@ -1365,6 +1365,39 @@ class TestSchedulerQueryMethods:
 
         assert scheduler.has_requests() is True
 
+    def test_has_requests_with_pending_pressure_clear(self, mock_model, mock_tokenizer):
+        """A pending hard-pressure clear counts as work for the engine loop."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        assert scheduler.has_requests() is False
+
+        scheduler.request_pressure_reclaim()
+
+        assert scheduler.has_requests() is True
+
+    def test_pressure_clear_drains_under_load(self, mock_model, mock_tokenizer):
+        """The pressure clear is consumed even while the scheduler is busy.
+
+        This is the under-load complement of the idle-gated reclaim: a busy
+        server never reaches the idle drain, so this flag must be consumed
+        regardless of queue state. It feeds the step-boundary
+        _sync_and_clear_cache, which synchronizes in-flight work before
+        clearing (the same ordering the periodic clear relies on).
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="busy-req",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.running[request.request_id] = request
+
+        scheduler.request_pressure_reclaim()
+
+        assert scheduler._consume_pressure_clear() is True
+        assert scheduler._pending_pressure_clear is False
+        # One-shot: no re-fire without a new enforcer request.
+        assert scheduler._consume_pressure_clear() is False
+
     def _install_reclaim_probe(self, scheduler):
         """Stub the Metal-touching reclaim internals; return the call log."""
         calls = []

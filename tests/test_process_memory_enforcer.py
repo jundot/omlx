@@ -2656,3 +2656,38 @@ class TestWiredLimitSuggestionClamp:
         ):
             pme._apply_metal_wired_limit(400 * 1024**3)
         assert [r for r in caplog.records if "jetsam" in r.message]
+
+
+class TestPressureCacheReclaim:
+    """_request_scheduler_cache_reclaim — the under-load drain trigger."""
+
+    def _enforcer(self, schedulers):
+        pool = MagicMock()
+        pool._entries = {
+            f"model-{i}": SimpleNamespace(engine=SimpleNamespace(scheduler=s))
+            for i, s in enumerate(schedulers)
+        }
+        return _make_enforcer(engine_pool=pool)
+
+    def test_fires_when_shrink_freed_refs(self):
+        schedulers = [MagicMock(), MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=0):
+            enforcer._request_scheduler_cache_reclaim(1 * 1024**3)
+        for s in schedulers:
+            s.request_pressure_reclaim.assert_called_once()
+
+    def test_skips_when_nothing_reclaimable(self):
+        schedulers = [MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=1 * 1024**3):
+            enforcer._request_scheduler_cache_reclaim(0)
+        schedulers[0].request_pressure_reclaim.assert_not_called()
+
+    def test_fires_on_stranded_pool_without_hot_cache(self):
+        """The already-wedged case: hot cache empty, bytes parked in the pool."""
+        schedulers = [MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=3 * 1024**3):
+            enforcer._request_scheduler_cache_reclaim(0)
+        schedulers[0].request_pressure_reclaim.assert_called_once()
