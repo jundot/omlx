@@ -189,8 +189,6 @@ Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requ
 
 Context scaling support for running smaller context models with Claude Code. Scales reported token counts so that auto-compact triggers at the right timing, and SSE keep-alive prevents read timeouts during long prefill.
 
-> **Note**: If you see occasional large prefill events mid-session even though your context should be cached, that is Claude Code, not the server. Recent CC versions quietly clear old tool results from the conversation when context usage gets high, which changes earlier tokens and invalidates any server-side prefix cache from that point on. Keeping auto-compact at its default threshold (rather than raising it with `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`) reduces how often this happens.
-
 ### Multi-Model Serving
 
 Load LLMs, VLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:

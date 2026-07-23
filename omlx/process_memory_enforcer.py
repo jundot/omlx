@@ -1433,8 +1433,8 @@ class ProcessMemoryEnforcer:
             # freed bytes never leave the process and phys_footprint does not
             # drop — the enforcer then wrongly concludes "no evictable models"
             # and livelocks until restart. Env gate
-            # OMLX_DISABLE_HOTCACHE_RECLAIM=1 restores stock behavior.
-            if os.environ.get("OMLX_DISABLE_HOTCACHE_RECLAIM") != "1":
+            # OMLX_DISABLE_PRESSURE_RECLAIM=1 restores stock behavior.
+            if os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1":
                 self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
