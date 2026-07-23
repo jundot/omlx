@@ -162,6 +162,38 @@ def _nemotron_h_extract_queries(attn, x, cache=None, **kwargs):
     return queries
 
 
+def _mla_extract_queries(attn, x, cache=None, **kwargs):
+    """DeepSeek/GLM MLA: (optionally low-rank) q projection + partial RoPE.
+
+    MLA caches store keys in a split layout, so queries are built in the
+    matching layout. Absorbed variants (``embed_q``, e.g. glm4_moe_lite)
+    cache the compressed latent as keys and the roped positional slice as
+    values; queries are q_nope absorbed into latent space, concatenated
+    with the roped q_pe. Expanded variants (``kv_b_proj``) cache full
+    per-head keys; queries are concat(q_nope, roped q_pe) directly.
+    Queries are pre-scaled so the scorer's generic 1/sqrt(d) recovers the
+    module's true attention scale (including any yarn mscale correction).
+    """
+    B, L, D = x.shape
+    n_heads = getattr(
+        attn,
+        "num_heads",
+        getattr(attn, "num_attention_heads", getattr(attn, "n_heads", None)),
+    )
+    if getattr(attn, "q_proj", None) is not None:
+        q = attn.q_proj(x)
+    else:
+        q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(x)))
+    q = q.reshape(B, L, n_heads, attn.q_head_dim).transpose(0, 2, 1, 3)
+    q_nope, q_pe = mx.split(q, [attn.qk_nope_head_dim], axis=-1)
+    offset = cache.offset if cache is not None else 0
+    q_pe = attn.rope(q_pe, offset)
+    if getattr(attn, "embed_q", None) is not None:
+        q_nope = attn.embed_q(q_nope)
+    queries = mx.concatenate([q_nope, q_pe], axis=-1)
+    return queries * (attn.scale * queries.shape[-1] ** 0.5)
+
+
 # ---------------------------------------------------------------------------
 # Model topology helpers
 # ---------------------------------------------------------------------------
@@ -300,9 +332,21 @@ def _is_gemma4_attention(attn_obj) -> bool:
     return "shared_kv" in params and "offset" in params
 
 
+def _is_mla_attention(attn_obj) -> bool:
+    """Detect DeepSeek/GLM-style Multi-head Latent Attention.
+
+    The shared latent KV projection (kv_a_proj_with_mqa) is the definitive
+    MLA marker; it is present in both the low-rank-q (q_a_proj/q_b_proj)
+    and full-q (plain q_proj) variants.
+    """
+    return hasattr(attn_obj, "kv_a_proj_with_mqa")
+
+
 def _detect_query_extractor(attn_obj) -> Callable:
     """Auto-detect the appropriate query extractor for the model architecture."""
-    if _uses_gated_q_proj(attn_obj):
+    if _is_mla_attention(attn_obj):
+        return _mla_extract_queries
+    elif _uses_gated_q_proj(attn_obj):
         return _qwen35_extract_queries
     elif _is_gemma4_attention(attn_obj):
         return _gemma4_extract_queries
@@ -420,6 +464,15 @@ def _compute_importance(
             continue
         head_dim = prompt_keys.shape[-1]
         q_stack = mx.concatenate(captures, axis=2)
+        if q_stack.shape[-1] > head_dim and getattr(cache, "values", None) is not None:
+            # Absorbed-MLA caches store the roped positional key slice in
+            # cache.values; concatenate it back so scoring sees the full
+            # split layout the queries were built in. Dim-driven, so
+            # non-MLA architectures never take this branch.
+            prompt_keys = mx.concatenate(
+                [prompt_keys, cache.values[..., :n_prompt, :]], axis=-1
+            )
+            head_dim = prompt_keys.shape[-1]
         if heads_per_group > 1:
             expanded_keys = mx.repeat(prompt_keys, heads_per_group, axis=1)
         else:
@@ -498,6 +551,12 @@ def score_tokens(
     n_kv_heads = getattr(
         attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
     )
+    if n_kv_heads is None and _is_mla_attention(attn_obj):
+        # Absorbed-latent MLA caches store a single shared latent head;
+        # expanded variants store all heads.
+        n_kv_heads = (
+            1 if getattr(attn_obj, "embed_q", None) is not None else n_attn_heads
+        )
 
     if query_extractor is None:
         query_extractor = _detect_query_extractor(attn_obj)
