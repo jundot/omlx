@@ -1666,6 +1666,12 @@ class Scheduler:
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
+        self._specprefill_draft_model_name: str | None = None
+        from .specprefill.selection_cache import SpecPrefillSelectionCache
+
+        # #1079: memoize the score->select result so identical prompts (agent
+        # retry loops, shared prefixes) skip the ~seconds-long re-scoring.
+        self._specprefill_selection_cache = SpecPrefillSelectionCache()
         self._draft_paged_ssd_cache_manager: Any | None = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
@@ -6468,6 +6474,9 @@ class Scheduler:
                 "Could not close the previous SpecPrefill draft SSD cache manager"
             )
         self._specprefill_draft_model = draft_model
+        self._specprefill_draft_model_name = draft_model_name
+        # Selections are specific to this draft model; drop any from a prior one.
+        self._specprefill_selection_cache.clear()
         self._draft_prefix_cache: Any | None = None
         if not draft_model_name:
             logger.info(
@@ -6908,19 +6917,45 @@ class Scheduler:
             return
 
         from .specprefill.draft import run_specprefill_draft_scoring
+        from .specprefill.selection_cache import build_selection_key, memoize_scoring
 
-        run_specprefill_draft_scoring(
+        def _run_scoring() -> None:
+            run_specprefill_draft_scoring(
+                request=request,
+                plan=plan,
+                draft_model=self._specprefill_draft_model,
+                draft_prefix_cache=self._draft_prefix_cache,
+                model_id=self.config.model_name,
+                prefill_step_size=self.config.prefill_step_size,
+                stream=self._stream,
+                extract_cache_states=self._extract_cache_states,
+                sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
+                log=logger,
+            )
+
+        # #1079: an identical prompt (same draft model + scoring params) yields
+        # the same selection, so reuse it instead of re-running the ~seconds-long
+        # lookahead + importance + chunk-select pipeline. The draft KV cache
+        # (fed as existing_cache above) only skips the draft *prefill*; the
+        # scoring on top of it still runs -- that is what this short-circuits.
+        selection_key = build_selection_key(
+            draft_model_id=self._specprefill_draft_model_name or "unnamed-draft",
+            tokens_to_score=plan.tokens_to_score,
+            keep_pct=plan.keep_pct,
+        )
+        reused = memoize_scoring(
+            cache=self._specprefill_selection_cache,
+            key=selection_key,
             request=request,
             plan=plan,
-            draft_model=self._specprefill_draft_model,
-            draft_prefix_cache=self._draft_prefix_cache,
-            model_id=self.config.model_name,
-            prefill_step_size=self.config.prefill_step_size,
-            stream=self._stream,
-            extract_cache_states=self._extract_cache_states,
-            sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
-            log=logger,
+            run_scoring=_run_scoring,
         )
+        if reused:
+            logger.info(
+                "SpecPrefill: selection cache hit, reused "
+                f"{request.specprefill_indices.shape[0]}/{plan.n_to_score} "
+                "tokens (skipped re-scoring)"
+            )
 
     def _cleanup_specprefill(self, request_id: str) -> None:
         """Clean up SpecPrefill RoPE patches when a request finishes."""
@@ -9984,6 +10019,7 @@ class Scheduler:
         self.paged_cache_manager = None
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
+        self._specprefill_selection_cache.clear()
         self.block_aware_cache = None
         self.memory_monitor = None
         self._boundary_snapshot_store = None
@@ -10054,6 +10090,7 @@ class Scheduler:
         self._close_specprefill_draft_cache_manager()
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
+        self._specprefill_selection_cache.clear()
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
