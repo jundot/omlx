@@ -694,6 +694,35 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     return False
 
 
+def _checkpoint_has_gdn_layers(model_path: str | Path) -> bool:
+    """True iff the checkpoint contains GatedDeltaNet / linear_attn weights."""
+    p = Path(model_path)
+    if not p.is_dir():
+        return False
+
+    index_path = p / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text())
+            weight_map = data.get("weight_map") or {}
+            return any("linear_attn" in k for k in weight_map)
+        except Exception:
+            pass
+
+    shards = sorted(p.glob("*.safetensors"))
+    if not shards:
+        return False
+    try:
+        import struct
+
+        with open(shards[0], "rb") as f:
+            hlen = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(hlen))
+            return any("linear_attn" in k for k in header if k != "__metadata__")
+    except Exception:
+        return False
+
+
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 

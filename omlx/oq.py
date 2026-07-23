@@ -274,6 +274,11 @@ def universal_quant_predicate(
         return False
 
     # Gated DeltaNet / Mamba-like SSM sensitive params (Qwen3_5 hybrid arch).
+    # When preserve_gdn is set, keep ALL linear_attn weights at full precision
+    # — quantizing the recurrence collapses GDN state over long sequences.
+    if config.get("_oq_preserve_gdn") and "linear_attn" in path_l:
+        return False
+
     # dt_bias drives the discretization step, keep fp16/fp32 like A_log.
     # conv1d is a small depth-wise causal conv, very sensitive to low bits.
     # linear_attn.out_proj mirrors self_attn.o_proj sensitivity.
@@ -1035,6 +1040,7 @@ def resolve_output_name(
     oq_level: int,
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
+    preserve_gdn: bool = False,
     enhanced: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
@@ -1042,7 +1048,8 @@ def resolve_output_name(
     Appends `-fp16` suffix when dtype is float16. bfloat16 is the default and
     produces no dtype suffix (backwards compatible). When preserve_mtp is True,
     appends `-mtp` so the resulting name reflects that mtp.* tensors and
-    config fields were preserved through quantization.
+    config fields were preserved through quantization. When preserve_gdn is
+    True, appends `-gdn` to indicate GDN/linear_attn layers kept at fp16.
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
@@ -1050,9 +1057,10 @@ def resolve_output_name(
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
+        "Qwen3.6-35B" + 4 + preserve_gdn -> "Qwen3.6-35B-oQ4-gdn"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp|gdn)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1067,6 +1075,8 @@ def resolve_output_name(
         suffix += "-fp16"
     if preserve_mtp:
         suffix += "-mtp"
+    if preserve_gdn:
+        suffix += "-gdn"
     return f"{base}{suffix}"
 
 
@@ -2218,6 +2228,7 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    preserve_gdn: bool = False,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -2272,6 +2283,8 @@ def estimate_bpw_and_size(
     # the per-tensor pricing loop below (the flag changes which predicate
     # branch answers).
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    if preserve_gdn:
+        config["_oq_preserve_gdn"] = True
 
     # Pre-quantized tensors that pass through in source precision (mirrors
     # the decision in quantize_oq_streaming, evaluated pre-boost).
@@ -4033,6 +4046,7 @@ def quantize_oq_streaming(
     sensitivity_model_path: str = "",
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
+    preserve_gdn: bool = False,
     auto_proxy_sensitivity: bool = True,
     trust_remote_code: bool = False,
     enhanced: bool = False,
@@ -4065,6 +4079,9 @@ def quantize_oq_streaming(
             are stripped *and* the output config's mtp_num_hidden_layers /
             num_nextn_predict_layers are normalized to 0 to keep the
             quantized model self-consistent.
+        preserve_gdn: Keep all linear_attn (GatedDeltaNet) weights at full
+            precision. Quantizing recurrence projections collapses GDN state
+            over long sequences.
         auto_proxy_sensitivity: When True (default) and the source model
             exceeds available RAM, automatically build a temporary uniform
             4-bit proxy on disk and run sensitivity measurement on it,
@@ -4123,6 +4140,8 @@ def quantize_oq_streaming(
         config = json.load(f)
     _validate_oq_dtype_for_model(config, dtype)
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    if preserve_gdn:
+        config["_oq_preserve_gdn"] = True
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -4711,6 +4730,7 @@ def quantize_oq_streaming(
         "_oq_boost_map",
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
+        "_oq_preserve_gdn",
     ):
         output_config.pop(temp_key, None)
     if text_only:
@@ -6409,6 +6429,7 @@ def _build_streaming_proxy_for_sensitivity(
         "_oq_boost_map",
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
+        "_oq_preserve_gdn",
     ):
         output_config.pop(temp_key, None)
     if not preserve_mtp:

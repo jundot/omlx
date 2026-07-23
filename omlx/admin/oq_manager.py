@@ -80,6 +80,7 @@ class QuantTask:
     text_only: bool = False
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
+    preserve_gdn: bool = False
     auto_proxy_sensitivity: bool = True
     enhanced: bool = False
     imatrix_cache_path: str = ""
@@ -165,7 +166,7 @@ class OQManager:
 
         def _scan() -> tuple[list[dict], list[dict]]:
             from ..oq import validate_quantizable, estimate_memory
-            from ..utils.model_loading import _checkpoint_has_mtp_weights
+            from ..utils.model_loading import _checkpoint_has_gdn_layers, _checkpoint_has_mtp_weights
 
             source_models = []
             all_models = []
@@ -212,6 +213,7 @@ class OQManager:
                                 config_declares_mtp
                                 and _checkpoint_has_mtp_weights(path)
                             )
+                            has_gdn = _checkpoint_has_gdn_layers(path)
                             info = {
                                 "name": path.name,
                                 "path": str(path),
@@ -225,6 +227,7 @@ class OQManager:
                                 # mm_vision_tower). Same predicate as model_discovery.
                                 "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
+                                "has_gdn_layers": has_gdn,
                             }
                             all_models.append(info)
                             if validate_quantizable(config):
@@ -252,6 +255,7 @@ class OQManager:
         text_only: bool = False,
         dtype: str = "bfloat16",
         preserve_mtp: bool = False,
+        preserve_gdn: bool = False,
         auto_proxy_sensitivity: bool = True,
         enhanced: bool = False,
         imatrix_cache_path: str = "",
@@ -311,6 +315,7 @@ class OQManager:
             oq_level,
             dtype,
             preserve_mtp=preserve_mtp,
+            preserve_gdn=preserve_gdn,
             enhanced=enhanced,
         )
         output_path = self._output_dir / output_name
@@ -370,6 +375,7 @@ class OQManager:
             text_only=text_only,
             dtype=dtype,
             preserve_mtp=preserve_mtp,
+            preserve_gdn=preserve_gdn,
             auto_proxy_sensitivity=auto_proxy_sensitivity,
             enhanced=enhanced,
             imatrix_cache_path=imatrix_cache_path,
@@ -549,6 +555,7 @@ class OQManager:
                     task.sensitivity_model_path,
                     task.dtype,
                     task.preserve_mtp,
+                    task.preserve_gdn,
                     task.auto_proxy_sensitivity,
                     enhanced=task.enhanced,
                     imatrix_cache_path=task.imatrix_cache_path,

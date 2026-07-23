@@ -416,6 +416,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqPreserveGdn: false,
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
@@ -4600,6 +4601,7 @@
                         text_only: this.oqTextOnly,
                         dtype: this.oqDtype,
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                        preserve_gdn: this.oqSelectedModelHasGdn() ? this.oqPreserveGdn : false,
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -4724,6 +4726,11 @@
                 return model?.has_mtp_heads || false;
             },
 
+            oqSelectedModelHasGdn() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.has_gdn_layers || false;
+            },
+
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
@@ -4768,6 +4775,7 @@
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
                             preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
+                            preserve_gdn: this.oqSelectedModelHasGdn() && this.oqPreserveGdn ? 'true' : 'false',
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {

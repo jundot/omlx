@@ -346,6 +346,7 @@ class OQStartRequest(BaseModel):
     text_only: bool = False
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
+    preserve_gdn: bool = False
     auto_proxy_sensitivity: bool = True
     enhanced: bool = False
     imatrix_cache_path: str = ""
@@ -6258,6 +6259,7 @@ async def estimate_oq(
     model_path: str,
     oq_level: float,
     preserve_mtp: bool = False,
+    preserve_gdn: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -6270,6 +6272,7 @@ async def estimate_oq(
             oq_level,
             64,  # group_size (default)
             preserve_mtp,
+            preserve_gdn,
         )
         return result
     except Exception as e:
@@ -6325,6 +6328,7 @@ async def start_oq_quantization(
             text_only=request.text_only,
             dtype=request.dtype,
             preserve_mtp=request.preserve_mtp,
+            preserve_gdn=request.preserve_gdn,
             auto_proxy_sensitivity=request.auto_proxy_sensitivity,
             enhanced=request.enhanced,
             imatrix_cache_path=request.imatrix_cache_path,
