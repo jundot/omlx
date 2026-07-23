@@ -659,10 +659,34 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
 def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     """Apply RoPE at arbitrary positions using pre-computed frequencies.
 
-    For custom RoPE variants (Llama3, Yarn, SuScaled) that store _freqs.
+    For custom RoPE variants (Llama3, Yarn, SuScaled) that store ``_freqs``,
+    and for partial-rotary models that report ``dims`` = full head_dim while
+    their frequency table covers only a rotary sub-slice (e.g. Gemma 4, whose
+    local/global attention heads differ).
+
+    The model's real RoPE (mlx-vlm ``ProportionalRoPE`` / HF ``rotate_half``)
+    pairs dim ``i`` with dim ``i + dims // 2`` over the FULL head, and only the
+    first ``len(freqs)`` of those pairs actually rotate -- the remaining pairs
+    pass through unchanged. We reproduce that exactly by zero-padding the
+    inverse frequencies up to ``dims // 2`` (angle 0 is the identity rotation:
+    ``cos 0 = 1``, ``sin 0 = 0``), so the non-rotating pairs are untouched.
+
+    Bit-exact for full-rotary custom-``_freqs`` models (``len(freqs) == dims //
+    2``, no padding added) and correct for the partial-rotary / mixed-head
+    case. An earlier version derived the width as ``2 * len(freqs)`` and rotated
+    the contiguous first ``2 * len(freqs)`` dims (pairing ``i`` with ``i +
+    len(freqs)``), which rotated the wrong lanes and wrote misrotated KV on
+    every global layer (jundot, PR #2295).
     """
     half = dims // 2
+    n = int(freqs.shape[-1])
     inv_freq = (1.0 / freqs).astype(mx.float32)
+    if n < half:
+        # Zero-pad the unrotated pairs: angle 0 keeps them identity, matching
+        # the model's partial rotary exactly.
+        inv_freq = mx.concatenate(
+            [inv_freq, mx.zeros((half - n,), dtype=mx.float32)], axis=-1
+        )
     angles = positions[:, None].astype(mx.float32) * inv_freq[None, :]
     cos_a = mx.cos(angles)[None, None, :, :]
     sin_a = mx.sin(angles)[None, None, :, :]
@@ -706,7 +730,7 @@ class _PositionMappedRoPE:
             self._dims = _get_dims(original_rope)
             self._pre_scale = _get_pre_scale(original_rope)
         else:
-            self._dims = original_rope.dims
+            self._dims = _get_dims(original_rope)
             self._base = original_rope.base
             self._scale = original_rope.scale
 
@@ -735,6 +759,24 @@ class _OffsetAdjustedRoPE:
 
     def __call__(self, x, offset=0):
         return self._original(x, offset=offset + self._adjustment)
+
+    def __getattr__(self, name):
+        # Delegate unknown attrs (e.g. .dims, .base, ._freqs) to the wrapped
+        # rope so this wrapper is transparent if it is ever re-wrapped. See #766.
+        return getattr(object.__getattribute__(self, "_original"), name)
+
+
+def _unwrap_rope(rope):
+    """Peel any sparse-prefill RoPE wrappers down to the genuine module.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called between multi-turn requests), re-wrapping it would nest wrappers
+    and, before this fix, crash in _PositionMappedRoPE. Always start from the
+    genuine rope. See #766.
+    """
+    while isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
+        rope = rope._original
+    return rope
 
 
 def _get_dims(rope_module):
@@ -835,9 +877,13 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            original_ropes[layer_idx] = attn.rope
+            # Start from the genuine rope: a prior sparse_prefill may have left
+            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
+            # (multi-turn + partial cache hit). See #766.
+            genuine = _unwrap_rope(attn.rope)
+            original_ropes[layer_idx] = genuine
             attn.rope = _PositionMappedRoPE(
-                attn.rope, selected_positions, cache_start=cache_start
+                genuine, selected_positions, cache_start=cache_start
             )
 
     try:
@@ -892,9 +938,9 @@ def cleanup_rope(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):
             continue
-        rope = attn.rope
-        if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            attn.rope = rope._original
+        genuine = _unwrap_rope(attn.rope)
+        if genuine is not attn.rope:
+            attn.rope = genuine
 
 
 # ===========================================================================

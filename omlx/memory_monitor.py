@@ -50,6 +50,45 @@ _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # dim-less path and matches the fp16/bf16 majority of MLX inference models.
 _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 
+# Head dims whose multi-token prefill is routed to an O(L) tiled/online-softmax
+# kernel instead of the unfused O(L^2) score-matrix fallback. Populated at
+# runtime by the kernel patch that installs the route (see
+# omlx/patches/sdpa256_attention.py); empty otherwise, so the estimate stays
+# O(L^2) when no such kernel is active. Maps head_dim -> kv_tile (the kernel's
+# KV block width, which bounds the per-chunk score transient).
+_SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, int] = {}
+_SDPA_TILED_MIN_KV_LEN = 8192
+
+
+def register_tiled_prefill_head_dim(
+    head_dim: int, *, min_kv_len: int = 8192, kv_tile: int = 1024
+) -> None:
+    """Register a head_dim whose long-context prefill now uses an O(L) tiled
+    kernel, so the prefill memory estimate stops charging the O(L^2) score
+    matrix for it. Must be called in lockstep with installing the kernel route,
+    or the guard keeps rejecting valid long-context requests."""
+    global _SDPA_TILED_MIN_KV_LEN
+    _SDPA_TILED_PREFILL_HEAD_DIMS[int(head_dim)] = int(kv_tile)
+    _SDPA_TILED_MIN_KV_LEN = int(min_kv_len)
+
+
+def estimate_unfused_sdpa_call_bytes(
+    n_q_heads: int,
+    query_tokens: int,
+    kv_len: int,
+    head_dim: int,
+    score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
+) -> int:
+    """Transient bytes for ONE SDPA call taking the unfused fallback: the
+    materialized ``[n_q, query_tokens, kv_len]`` score matrix plus the fp32
+    output. Shared by the per-request prefill-peak estimate
+    (``MemoryMonitor._estimate_sdpa_activation_bytes``) and the sdpa256 route
+    gate (``patches/sdpa256_attention._tiled_route_required``) so the guard
+    and the router price the unfused path with the same math (issue #2204)."""
+    scores = n_q_heads * query_tokens * kv_len * score_dtype_size
+    output = n_q_heads * query_tokens * head_dim * 4
+    return int(scores + output)
+
 
 @dataclass
 class MemoryInfo:
@@ -497,8 +536,24 @@ class MemoryMonitor:
         if self._uses_fused_sdpa(query_tokens, kv_len):
             return output
 
-        scores = n_q * query_tokens * kv_len * self._score_dtype_size
-        return scores + output
+        # O(L) tiled-prefill kernel active for this head_dim (e.g. the head_dim
+        # 256 sdpa256 patch): the score matrix is never materialized. The peak
+        # transient is the output plus one KV tile of scores, not the full
+        # [n_q, query_tokens, kv_len] matrix. This matches the kernel's route
+        # gate (query_len > 1, kv_len >= threshold); any query_len <= 1 already
+        # returned above via the fused vector path.
+        kv_tile = _SDPA_TILED_PREFILL_HEAD_DIMS.get(hd)
+        if (
+            kv_tile is not None
+            and query_tokens > 1
+            and kv_len >= _SDPA_TILED_MIN_KV_LEN
+        ):
+            tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            return output + tile_scores
+
+        return estimate_unfused_sdpa_call_bytes(
+            n_q, query_tokens, kv_len, hd, self._score_dtype_size
+        )
 
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0

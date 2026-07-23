@@ -188,7 +188,7 @@ class TestComputeMetrics:
         assert metrics["total_throughput"] == pytest.approx(834.8, abs=1.0)
 
     def test_zero_duration_safety(self):
-        """Test that zero/near-zero durations don't cause division by zero."""
+        """Single-token outputs do not report bogus decode throughput."""
         metrics = _compute_single_metrics(
             prompt_tokens=100,
             completion_tokens=1,
@@ -200,7 +200,8 @@ class TestComputeMetrics:
         )
         # Should not raise, values should be finite
         assert metrics["ttft_ms"] == 0.0
-        assert metrics["gen_tps"] > 0  # Protected by max(duration, 1e-9)
+        assert metrics["gen_tps"] == 0.0
+        assert metrics["tpot_ms"] == 0.0
 
     def test_native_duration_overrides(self):
         """Native engine timings can override streaming timing artifacts."""
@@ -219,6 +220,22 @@ class TestComputeMetrics:
         assert metrics["processing_tps"] == pytest.approx(256.0)
         assert metrics["gen_tps"] == pytest.approx(16.0)
         assert metrics["tpot_ms"] == pytest.approx(62.99, abs=0.01)
+
+    def test_single_token_completion_has_no_decode_rate(self):
+        """Immediate stop has no inter-token decode interval to benchmark."""
+        metrics = _compute_single_metrics(
+            prompt_tokens=16384,
+            completion_tokens=1,
+            start_time=0.0,
+            first_token_time=8.629,
+            end_time=8.629001,
+            peak_memory=0,
+            cached_tokens=0,
+        )
+
+        assert metrics["gen_tps"] == 0.0
+        assert metrics["tpot_ms"] == 0.0
+        assert metrics["total_throughput"] == pytest.approx(1898.7, abs=0.1)
 
 
 class TestRunSingleTest:
@@ -279,6 +296,63 @@ class TestRunSingleTest:
         assert metrics["completion_tokens"] == 128
         assert metrics["gen_tps"] == pytest.approx(64.0)
         assert metrics["tpot_ms"] == pytest.approx(15.75, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_uses_producer_timestamps_for_aggregated_output(self):
+        """Aggregated chunks should use producer-side decode timing."""
+
+        class AggregatedEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x" * 128,
+                    finished=True,
+                    finish_reason="length",
+                    generated_at=0.2,
+                    generated_until=1.2,
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.3]):
+            metrics = await _run_single_test(
+                AggregatedEngine(),
+                prompt="prompt",
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["ttft_ms"] == pytest.approx(200.0)
+        assert metrics["gen_tps"] == pytest.approx(128.0)
+        assert metrics["tpot_ms"] == pytest.approx(7.87, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_aggregated_output_without_end_time_has_no_decode_rate(self):
+        """Single aggregate chunks need a producer-side end time for tg TPS."""
+
+        class AggregatedEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x" * 128,
+                    finished=True,
+                    finish_reason="length",
+                    generated_at=0.2,
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.2]):
+            metrics = await _run_single_test(
+                AggregatedEngine(),
+                prompt="prompt",
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["ttft_ms"] == pytest.approx(200.0)
+        assert metrics["gen_tps"] == 0.0
+        assert metrics["tpot_ms"] == 0.0
 
 
 # =============================================================================
@@ -792,6 +866,67 @@ class TestUploadToOmlxAi:
         assert done_event["data"]["success"] == 1
 
     @pytest.mark.asyncio
+    async def test_upload_skips_unmeasurable_generation_results(self):
+        """Rows without a measured decode rate are not uploaded."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
+
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="Qwen3-30B-4bit",
+                prompt_lengths=[1024, 8192],
+            ),
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 0.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 0,
+            },
+            {
+                "test_type": "single",
+                "pp": 8192,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 500.0,
+                "peak_memory_bytes": 0,
+            },
+        ]
+
+        mock_entry = MagicMock()
+        mock_entry.model_path = "/models/Qwen3-30B-4bit"
+        mock_pool = MagicMock()
+        mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
+
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {
+            "id": "abc12345",
+            "url": "https://omlx.ai/benchmarks/abc12345",
+        }
+        mock_to_thread = AsyncMock(return_value=mock_response)
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        assert mock_to_thread.await_count == 1
+
+        upload_events = [e for e in run.events if e["type"] == "upload"]
+        assert [e["data"]["context_length"] for e in upload_events] == [8192]
+
+        done_event = next(e for e in run.events if e["type"] == "upload_done")
+        assert done_event["data"]["total"] == 1
+        assert done_event["data"]["success"] == 1
+        assert done_event["data"]["failed"] == 0
+        assert done_event["data"]["skipped"] == 1
+
+    @pytest.mark.asyncio
     async def test_upload_skipped_when_experimental_features_enabled(self):
         """Upload is skipped (no HTTP call) when experimental features were active."""
         from omlx.admin.benchmark import _upload_to_omlx_ai
@@ -930,3 +1065,214 @@ class TestSanitizeUploadError:
         from omlx.admin.benchmark import _sanitize_upload_error
         resp = self._resp(status=503, text="")
         assert _sanitize_upload_error(resp) == "HTTP 503"
+
+
+# =============================================================================
+# External endpoint benchmark tests
+# =============================================================================
+
+
+def _external_config():
+    from omlx.admin.external_api import ExternalEndpointConfig
+
+    return ExternalEndpointConfig(
+        base_url="http://localhost:8001/v1",
+        api_key="sk-test",
+        model="remote-model",
+    )
+
+
+def _stream_stats(prompt=1000, completion=128, cached=0):
+    from omlx.admin.external_api import StreamStats
+
+    return StreamStats(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        cached_tokens=cached,
+        start_time=0.0,
+        first_content_time=0.5,
+        last_content_time=1.5,
+        end_time=1.6,
+        text="x" * 16,
+    )
+
+
+class TestExternalBenchmarkRequest:
+    def test_external_accepted(self):
+        req = BenchmarkRequest(
+            model_id="remote-model",
+            prompt_lengths=[1024],
+            external=_external_config(),
+        )
+        assert req.external is not None
+        assert req.external.model == "remote-model"
+
+    def test_external_defaults_to_none(self):
+        req = BenchmarkRequest(model_id="m", prompt_lengths=[1024])
+        assert req.external is None
+
+    def test_external_invalid_base_url_rejected(self):
+        with pytest.raises(ValueError, match="http:// or https://"):
+            BenchmarkRequest(
+                model_id="m",
+                prompt_lengths=[1024],
+                external={"base_url": "localhost:8001", "model": "m"},
+            )
+
+
+class TestGenerateExternalPrompt:
+    def test_scales_with_target(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        short = _generate_external_prompt(1024)
+        long = _generate_external_prompt(4096)
+        assert len(long) > len(short) * 3
+
+    def test_unique_prefix(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        a = _generate_external_prompt(1024)
+        b = _generate_external_prompt(1024)
+        assert a.startswith("BENCH-")
+        assert a != b
+
+
+class TestRunExternalBenchmark:
+    def _make_run(self, prompt_lengths=None, batch_sizes=None):
+        return BenchmarkRun(
+            bench_id="bench-ext",
+            request=BenchmarkRequest(
+                model_id="remote-model",
+                prompt_lengths=prompt_lengths or [1024],
+                batch_sizes=batch_sizes or [],
+                external=_external_config(),
+            ),
+        )
+
+    def _mock_client(self, stats=None):
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(
+            return_value=stats or _stream_stats()
+        )
+        client.aclose = AsyncMock()
+        return client
+
+    async def test_never_touches_engine_pool(self):
+        run = self._make_run(batch_sizes=[2])
+        pool = MagicMock()
+        client = self._mock_client()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        pool.get_engine.assert_not_called()
+        pool.get_loaded_model_ids.assert_not_called()
+        pool._unload_engine.assert_not_called()
+
+    async def test_event_sequence_and_upload_skipped(self):
+        run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
+        client = self._mock_client()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        event_types = [e["type"] for e in run.events]
+        assert event_types == [
+            "progress",  # warmup
+            "progress",  # single
+            "result",
+            "progress",  # batch
+            "result",
+            "done",
+            "upload_skipped",
+        ]
+        skipped = run.events[-1]
+        assert skipped["reason"] == "external_endpoint"
+        assert run.upload_state["phase"] == "skipped"
+        assert run.upload_state["skipped_reason"] == "external_endpoint"
+        client.aclose.assert_awaited()
+
+    async def test_single_result_uses_usage_token_counts(self):
+        run = self._make_run(prompt_lengths=[4096])
+        client = self._mock_client(_stream_stats(prompt=3900, completion=128))
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["test_type"] == "single"
+        assert result["pp"] == 4096
+        # Actual usage counts, not the nominal pp target
+        assert result["prompt_tokens"] == 3900
+        assert result["completion_tokens"] == 128
+        assert result["peak_memory_bytes"] is None
+        # gen duration 1.0s (first 0.5 → last 1.5) with 128 tokens
+        assert result["gen_tps"] == 128.0
+        assert result["ttft_ms"] == 500.0
+
+    async def test_batch_result_aggregates_usage_counts(self):
+        run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
+        client = self._mock_client(_stream_stats(prompt=1000, completion=100))
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        batch = [r for r in run.results if r["test_type"] == "batch"][0]
+        assert batch["batch_size"] == 2
+        assert batch["total_gen_tokens"] == 200
+
+    async def test_missing_usage_fails_run(self):
+        from omlx.admin.external_api import ExternalEndpointError
+
+        run = self._make_run()
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(
+            side_effect=ExternalEndpointError(
+                "External endpoint does not support stream usage"
+            )
+        )
+        client.aclose = AsyncMock()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        assert run.status == "error"
+        assert "stream usage" in run.error_message
+        error_events = [e for e in run.events if e["type"] == "error"]
+        assert error_events and "stream usage" in error_events[0]["message"]
+
+    async def test_cancellation_mid_run(self):
+        run = self._make_run()
+        started = asyncio.Event()
+
+        async def hang(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(side_effect=hang)
+        client.aclose = AsyncMock()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            task = asyncio.create_task(run_benchmark(run, MagicMock()))
+            await started.wait()
+            task.cancel()
+            await task
+
+        assert run.status == "cancelled"
+        assert run.events[-1]["type"] == "error"
+        assert "cancelled" in run.events[-1]["message"].lower()
+        client.aclose.assert_awaited()

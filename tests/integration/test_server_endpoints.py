@@ -6,6 +6,7 @@ Tests the FastAPI endpoints using TestClient with mocked EnginePool and Engine
 to verify request/response formats without loading actual models.
 """
 
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -444,6 +445,114 @@ class TestResponsesEndpoint:
         assert mock_engine_pool.get_engine_calls[-1]["_lease"] is True
         assert mock_engine_pool.release_calls == ["test-model"]
 
+    def test_response_endpoint_includes_reasoning_item_for_think_blocks(
+        self, client, mock_llm_engine
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text="<think>Need to reason.</think>Hello!",
+                prompt_tokens=3,
+                completion_tokens=6,
+                finish_reason="stop",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [item["type"] for item in data["output"]] == ["reasoning", "message"]
+        assert data["output"][0]["summary"][0]["text"] == "Need to reason."
+        assert data["output"][1]["content"][0]["text"] == "Hello!"
+        assert data["usage"]["output_tokens_details"]["reasoning_tokens"] == 3
+
+    def test_responses_forwards_request_chat_template_kwargs(
+        self, client, mock_llm_engine
+    ):
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="pong",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.chat = chat
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Say pong",
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        ct_kwargs = recorded_chat_kwargs[0].get("chat_template_kwargs") or {}
+        assert ct_kwargs["enable_thinking"] is False
+
+    def test_response_stream_includes_reasoning_item_for_think_blocks(
+        self, client, mock_llm_engine
+    ):
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text="<think>Need to reason.</think>Hello!",
+                new_text="<think>Need to reason.</think>Hello!",
+                prompt_tokens=3,
+                completion_tokens=6,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello", "stream": True},
+        )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        reasoning_deltas = [
+            event["delta"]
+            for event in events
+            if event.get("type") == "response.reasoning_summary_text.delta"
+        ]
+        assert "".join(reasoning_deltas) == "Need to reason."
+
+        added_items = [
+            event
+            for event in events
+            if event.get("type") == "response.output_item.added"
+        ]
+        assert added_items[0]["item"]["type"] == "reasoning"
+        assert added_items[0]["output_index"] == 0
+        assert added_items[1]["item"]["type"] == "message"
+        assert added_items[1]["output_index"] == 1
+
+        completed = next(
+            event for event in events if event.get("type") == "response.completed"
+        )
+        output = completed["response"]["output"]
+        assert [item["type"] for item in output] == ["reasoning", "message"]
+        assert output[0]["summary"][0]["text"] == "Need to reason."
+        assert output[1]["content"][0]["text"] == "Hello!"
+        usage = completed["response"]["usage"]
+        assert usage["output_tokens_details"]["reasoning_tokens"] == 3
+
     def test_response_endpoint_recovers_tool_call_from_thinking(self, tmp_path):
         from omlx.server import app, _server_state
 
@@ -494,10 +603,18 @@ class TestResponsesEndpoint:
 
             output_items = response.json()["output"]
             message_items = [item for item in output_items if item["type"] == "message"]
+            reasoning_items = [
+                item for item in output_items if item["type"] == "reasoning"
+            ]
             function_items = [
                 item for item in output_items if item["type"] == "function_call"
             ]
 
+            assert len(reasoning_items) == 1
+            assert reasoning_items[0]["summary"][0]["text"] == (
+                "Need to inspect first.Then continue."
+            )
+            assert "<tool_call>" not in reasoning_items[0]["summary"][0]["text"]
             assert len(message_items) == 1
             assert message_items[0]["content"][0]["text"] == ""
             assert "<tool_call>" not in message_items[0]["content"][0]["text"]
@@ -1394,6 +1511,11 @@ class TestEmbeddingsEndpoint:
         mock_engine_pool._models.append(
             {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
         )
+        image_data_uri = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+            "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        )
 
         response = client.post(
             "/v1/embeddings",
@@ -1401,10 +1523,10 @@ class TestEmbeddingsEndpoint:
                 "model": "test-embed-model",
                 "items": [
                     {"text": "hello"},
-                    {"image": "https://example.com/image.jpg"},
+                    {"image": image_data_uri},
                     {
                         "text": "hello",
-                        "image": "https://example.com/image.jpg",
+                        "image": image_data_uri,
                     },
                 ],
             },

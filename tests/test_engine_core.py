@@ -684,7 +684,12 @@ class TestEngineCoreClose:
             timeout_future = MagicMock()
             timeout_future.result.side_effect = concurrent.futures.TimeoutError
             executor = MagicMock()
-            executor.submit.side_effect = [ok_future, ok_future, timeout_future]
+            executor.submit.side_effect = [
+                ok_future,
+                ok_future,
+                ok_future,
+                timeout_future,
+            ]
             engine._mlx_executor = executor
 
             with (
@@ -1192,6 +1197,37 @@ class TestEngineCoreAbortAllRequests:
                     event = engine._finished_events.get(rid)
                     if event is not None:
                         assert event.is_set()
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_names_tripped_watermark(
+        self, mock_model, mock_tokenizer
+    ):
+        """The abort message names the hard watermark that tripped, not just
+        the ceiling above it (issue #2321)."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                engine.scheduler._memory_hard_limit_bytes = 30 * 1024**3
+                engine.scheduler._memory_hard_watermark_bytes = int(
+                    30 * 1024**3 * 0.95
+                )
+
+                rid = await engine.add_request(prompt="Hello")
+                await engine.abort_all_requests()
+
+                collector = engine._output_collectors.get(rid)
+                assert collector is not None
+                output = collector.get_nowait()
+                assert "abort threshold (hard watermark) 28.5 GB" in output.error
+                assert "ceiling 30.0 GB" in output.error
             finally:
                 await engine.stop()
                 engine.close()

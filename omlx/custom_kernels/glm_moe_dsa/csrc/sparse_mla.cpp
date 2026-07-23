@@ -109,8 +109,9 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
         !last_dim_contiguous(topk_indices)) {
       return true;
     }
-    if (q_latent.shape(1) != 64 || kv_latent.shape(1) != 1 ||
-        k_pe.shape(1) != 1 || topk_indices.shape(1) != 1) {
+    if ((q_latent.shape(1) != 64 && q_latent.shape(1) != 32) ||
+        kv_latent.shape(1) != 1 || k_pe.shape(1) != 1 ||
+        topk_indices.shape(1) != 1) {
       return true;
     }
     if (q_latent.shape(3) != 512 || kv_latent.shape(3) != 512 ||
@@ -166,13 +167,13 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
 
     constexpr int bk = 256;
     constexpr int dc = 32;
-    constexpr int h = 64;
     constexpr int d_latent = 512;
     constexpr int d_pe = 64;
-    constexpr int wm = 8;
 
     const int B = q_latent.shape(0);
     const int H = q_latent.shape(1);
+    const int h = H;                  // head count selects the kernel instantiation
+    const int wm = (H == 64) ? 8 : 4; // TQ = H / (wm * 8) must be >= 1: 64->8, 32->4
     const int qL = q_latent.shape(2);
     const int kL = kv_latent.shape(2);
     int64_t topk_length_strides[2] = {0, 0};

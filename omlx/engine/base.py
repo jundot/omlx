@@ -26,6 +26,19 @@ _preflight_logger = logging.getLogger("omlx.engine.preflight")
 _PREFLIGHT_UNREACHABLE_WARNED: set[tuple[str, str]] = set()
 
 
+def _clear_teardown_references(
+    engine: object,
+    *,
+    none_attrs: tuple[str, ...],
+    false_attrs: tuple[str, ...] = (),
+) -> None:
+    """Clear wrapper-side references in a consistent stop() teardown pass."""
+    for attr in none_attrs:
+        setattr(engine, attr, None)
+    for attr in false_attrs:
+        setattr(engine, attr, False)
+
+
 def _warn_scheduler_unreachable_once(
     engine: object, method: str, detail: str = ""
 ) -> None:
@@ -77,6 +90,9 @@ class GenerationOutput:
     diffusion_work_tokens: int = 0
     diffusion_canvas_tps: float = 0.0
     diffusion_work_tps: float = 0.0
+    generated_at: Optional[float] = None
+    generated_until: Optional[float] = None
+    first_token_at: Optional[float] = None
 
 
 class BaseEngine(ABC):

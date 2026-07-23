@@ -75,6 +75,11 @@ class CacheTypeRegistry:
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
+        # mlx-vlm MTP wraps target RotatingKVCache layers with rollback slack
+        # during speculative decode. The live tensor/state representation is
+        # still rotating-cache compatible and must route through the rotating
+        # handler for prefix-cache storage and reconstruction.
+        "BufferedRotatingKVCache": CacheType.ROTATING_KVCACHE,
         # omlx subclass that overrides size() to clamp by actual buffer
         # length (defined in omlx/cache/_rotating_subclass.py). Cache
         # restore serializes type(cache).__name__, so the registry must

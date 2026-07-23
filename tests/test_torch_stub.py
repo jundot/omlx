@@ -11,13 +11,16 @@ import.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import os
 import subprocess
 import sys
 import textwrap
 import threading
+import tomllib
 import types
 import unittest.mock as mock
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +28,11 @@ import pytest
 _TOUCHED = (
     "torch",
     "torch.cuda",
+    "torch.cuda.amp",
+    "torch.cuda.amp.common",
+    "torch.backends",
+    "torch.backends.mps",
+    "torch.backends.cudnn",
     "torch.version",
     "torch.nn",
     "torch.nn.functional",
@@ -81,6 +89,12 @@ def test_install_returns_true_and_populates_sys_modules(stub_module):
         assert hasattr(torch, alias)
     # Submodules tvm_ffi reaches into.
     assert sys.modules["torch.cuda"].is_available() is False
+    assert sys.modules["torch.cuda"].device_count() == 0
+    assert (
+        sys.modules["torch.cuda.amp.common"].amp_definitely_not_available() is True
+    )
+    assert sys.modules["torch.backends.mps"].is_available() is False
+    assert sys.modules["torch.backends.mps"].is_built() is False
     assert sys.modules["torch.version"].cuda is None
 
 
@@ -357,6 +371,11 @@ def test_stub_modules_have_real_spec_and_loader(stub_module):
     for name in (
         "torch",
         "torch.cuda",
+        "torch.cuda.amp",
+        "torch.cuda.amp.common",
+        "torch.backends",
+        "torch.backends.mps",
+        "torch.backends.cudnn",
         "torch.version",
         "torch.nn",
         "torch.nn.functional",
@@ -493,3 +512,84 @@ def test_xgrammar_imports_against_stub_only(stub_module, tmp_path):
         timeout=30,
     )
     assert b"OK" in out, out
+
+
+def _fake_metadata_version(xgrammar_v, tvm_ffi_v):
+    versions = {"xgrammar": xgrammar_v, "apache-tvm-ffi": tvm_ffi_v}
+
+    def fake(dist):
+        v = versions[dist]
+        if v is None:
+            raise importlib.metadata.PackageNotFoundError(dist)
+        return v
+
+    return fake
+
+
+def test_warn_fires_on_version_drift(stub_module, caplog):
+    fake = _fake_metadata_version("9.9.9", "8.8.8")
+    with (
+        mock.patch("importlib.metadata.version", side_effect=fake),
+        caplog.at_level("WARNING", logger="omlx._torch_stub"),
+    ):
+        stub_module.warn_if_unexpected_versions()
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("xgrammar 9.9.9" in m for m in messages), messages
+    assert any("apache-tvm-ffi 8.8.8" in m for m in messages), messages
+
+
+def test_warn_silent_when_versions_match_targets(stub_module, caplog):
+    fake = _fake_metadata_version(
+        stub_module._TARGET_XGRAMMAR_VERSIONS[0],
+        stub_module._TARGET_TVM_FFI_VERSIONS[0],
+    )
+    with (
+        mock.patch("importlib.metadata.version", side_effect=fake),
+        caplog.at_level("WARNING", logger="omlx._torch_stub"),
+    ):
+        stub_module.warn_if_unexpected_versions()
+    assert not caplog.records, [rec.getMessage() for rec in caplog.records]
+
+
+def test_warn_silent_when_distributions_missing(stub_module, caplog):
+    fake = _fake_metadata_version(None, None)
+    with (
+        mock.patch("importlib.metadata.version", side_effect=fake),
+        caplog.at_level("WARNING", logger="omlx._torch_stub"),
+    ):
+        stub_module.warn_if_unexpected_versions()
+    assert not caplog.records, [rec.getMessage() for rec in caplog.records]
+
+
+def _pyproject_dev_pins(package):
+    """Collect ``package==X`` pins from both dev dependency lists in
+    pyproject.toml (the [dev] extra and the PEP 735 dependency group)."""
+    root = Path(__file__).resolve().parents[1]
+    with open(root / "pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+    specs = list(data["project"]["optional-dependencies"]["dev"])
+    specs += [s for s in data["dependency-groups"]["dev"] if isinstance(s, str)]
+    prefix = f"{package}=="
+    return {s[len(prefix) :] for s in specs if s.startswith(prefix)}
+
+
+def test_pyproject_dev_pins_match_stub_targets(stub_module):
+    """Dependabot bumps the pyproject dev pins but cannot touch this stub,
+    and packaging/build.py ships _TARGET_*_VERSIONS[0] in the DMG. Without
+    this check a bare pyproject bump silently makes dev/CI test a version
+    the bundle does not ship. Bump _TARGET_XGRAMMAR_VERSIONS /
+    _TARGET_TVM_FFI_VERSIONS in omlx/_torch_stub.py alongside the pin.
+    """
+    for package, targets in (
+        ("xgrammar", stub_module._TARGET_XGRAMMAR_VERSIONS),
+        ("apache-tvm-ffi", stub_module._TARGET_TVM_FFI_VERSIONS),
+    ):
+        pins = _pyproject_dev_pins(package)
+        assert len(pins) == 1, (
+            f"{package}: expected one identical pin across both pyproject "
+            f"dev lists, got {sorted(pins) or 'none'}"
+        )
+        assert pins == {targets[0]}, (
+            f"{package}: pyproject dev pin {sorted(pins)} != stub target "
+            f"{targets[0]} — update _TARGET_*_VERSIONS in omlx/_torch_stub.py"
+        )

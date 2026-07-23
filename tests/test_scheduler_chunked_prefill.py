@@ -9,14 +9,19 @@ patching _step_prefill_chunk directly.
 """
 
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import mlx.core as mx
 
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
+    PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
     _PrefillAbortedError,
+    _PrefillEvictionNeeded,
     _PrefillState,
 )
 
@@ -100,8 +105,20 @@ class _RecordingModel:
         self.chunk_lengths.append(int(tokens.shape[1]))
 
 
-def _make_recording_scheduler(model_type: str) -> tuple[Scheduler, _RecordingModel]:
+def _make_recording_scheduler(
+    model_type: str,
+    *,
+    uses_minimax_m3_positions: bool = False,
+    nested_vlm_model_type: str | None = None,
+    model_name: str = "",
+) -> tuple[Scheduler, _RecordingModel]:
     model = _RecordingModel(model_type)
+    if uses_minimax_m3_positions:
+        model._uses_minimax_m3_positions = True
+    if nested_vlm_model_type is not None:
+        model._vlm_model = SimpleNamespace(
+            config=SimpleNamespace(model_type=nested_vlm_model_type)
+        )
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     scheduler = Scheduler(
@@ -111,6 +128,7 @@ def _make_recording_scheduler(model_type: str) -> tuple[Scheduler, _RecordingMod
             prefill_step_size=2048,
             chunked_prefill=True,
             paged_cache_block_size=0,
+            model_name=model_name,
         ),
     )
     return scheduler, model
@@ -275,6 +293,117 @@ class TestGLMAdaptiveChunkedPrefill:
         assert not done
         assert model.chunk_lengths == [2048]
         assert state.tokens_processed == 2048
+
+
+# ---------------------------------------------------------------------------
+# MiniMax M3 adaptive chunked prefill
+# ---------------------------------------------------------------------------
+
+
+class TestMiniMaxM3AdaptiveChunkedPrefill:
+    def test_minimax_m3_uses_4096_for_long_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP_SIZE", raising=False)
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_AFTER", raising=False)
+        monkeypatch.delenv(
+            "MLX_MINIMAX_M3_ADAPTIVE_PREFILL_MIN_REMAINING", raising=False
+        )
+
+        sched, model = _make_recording_scheduler("minimax_m3")
+        req = _make_request("minimax", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_minimax_m3_keeps_2048_for_short_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler("minimax_m3_vl")
+        req = _make_request("minimax-short", n_tokens=4096)
+        state = _make_prefill_state(sched, req, n_remaining=4095)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+
+    def test_minimax_m3_env_can_disable_adaptive_prefill(self, monkeypatch):
+        monkeypatch.setenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", "0")
+
+        sched, model = _make_recording_scheduler("minimax_m3")
+        req = _make_request("minimax-disabled", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+
+    def test_minimax_m3_vlm_adapter_flag_enables_adaptive_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler(
+            "vlm",
+            uses_minimax_m3_positions=True,
+        )
+        req = _make_request("minimax-adapter", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_minimax_m3_nested_vlm_model_enables_adaptive_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler(
+            "vlm",
+            nested_vlm_model_type="minimax_m3_vl",
+        )
+        req = _make_request("minimax-nested-vlm", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_minimax_m3_model_path_enables_adaptive_prefill(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "minimax_m3_vl"}',
+            encoding="utf-8",
+        )
+
+        sched, model = _make_recording_scheduler(
+            "vlm",
+            model_name=str(tmp_path),
+        )
+        req = _make_request("minimax-model-path", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
 
 
 # ---------------------------------------------------------------------------
@@ -951,3 +1080,114 @@ class TestPrefillRejectionReleasesPagedCache:
         assert rejected[0].request_id == "oom-preflight"
         assert rejected[0].finish_reason == "error"
         sched.block_aware_cache.release_cache.assert_called_once_with("oom-preflight")
+
+
+# ---------------------------------------------------------------------------
+# First-chunk eviction pause must preserve a reconstructed prefix (#2180)
+# ---------------------------------------------------------------------------
+
+
+class TestFirstChunkEvictionPreservesPrefix:
+    def test_first_chunk_eviction_pause_keeps_reconstructed_prefix(self):
+        """_PrefillEvictionNeeded raised before the first chunk's forward
+        pass must not discard a reconstructed SSD prefix. The eviction pause
+        keeps prompt_cache / block_table / cached_tokens / remaining_tokens
+        attached, so when no idle model can be evicted the retry prefills
+        only the uncached suffix instead of recomputing the whole prompt
+        cold (#2180)."""
+        sched = _make_scheduler(step_size=4)
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.fetch_cache.return_value = (None, list(range(100)))
+        req = _make_request("evict-first-chunk", n_tokens=100)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        # Simulate the state _prepare_prefix_cache_for_request leaves after a
+        # successful paged/SSD cache hit + reconstruction: 90 cached tokens,
+        # a 10-token uncached suffix, and a live block table.
+        prompt_cache = [MagicMock()]
+        block_table = MagicMock()
+        sched._prefix_cache_prepared.add(req.request_id)
+        req.prompt_cache = prompt_cache
+        req.cached_tokens = 90
+        req.remaining_tokens = req.prompt_token_ids[90:]
+        req.block_table = block_table
+        req.shared_prefix_blocks = 3
+
+        eviction = PrefillEvictionRequest(
+            request_id=req.request_id,
+            model_id="test",
+            current_bytes=1,
+            target_cap_bytes=1,
+            predicted_transient_bytes=1,
+            requested_tokens=4,
+            reason="adaptive_prefill_throttle",
+        )
+        with patch.object(
+            sched,
+            "_begin_prefill",
+            return_value=_make_prefill_state(sched, req),
+        ):
+            with patch.object(
+                sched,
+                "_step_prefill_chunk",
+                side_effect=_PrefillEvictionNeeded(eviction),
+            ):
+                scheduled, rejected = sched._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        # Paused back into the waiting queue with the eviction request pending.
+        assert req in sched.waiting
+        assert sched._pending_prefill_eviction_request is eviction
+        # The reconstructed prefix must survive the pause untouched.
+        assert req.prompt_cache is prompt_cache
+        assert req.cached_tokens == 90
+        assert req.remaining_tokens == req.prompt_token_ids[90:]
+        assert req.block_table is block_table
+        assert req.shared_prefix_blocks == 3
+        sched.block_aware_cache.release_cache.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _schedule_waiting(): specprefill guard defers everything while one is active
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleWaitingSpecPrefillGuard:
+    def test_second_specprefill_deferred_while_one_active(self):
+        """A second specprefill request must wait for the active one (#766).
+
+        Admitting it would replace the live _OffsetAdjustedRoPE on the shared
+        model and corrupt the remaining decode of the active request.
+        """
+        sched = _make_scheduler(chunked_prefill=False)
+        sched._specprefill_active_request_id = "active-req"
+
+        req = _make_request("spec-2", n_tokens=10)
+        req.specprefill_indices = mx.array([0, 2, 4])
+        sched.add_request(req)
+
+        with patch.object(sched, "_do_external_prefill") as mock_ep:
+            scheduled, rejected = sched._schedule_waiting()
+
+        mock_ep.assert_not_called()
+        assert scheduled == []
+        assert rejected == []
+        assert req in sched.waiting
+
+    def test_normal_request_deferred_while_specprefill_active(self):
+        """Non-specprefill requests keep deferring while one is active."""
+        sched = _make_scheduler(chunked_prefill=False)
+        sched._specprefill_active_request_id = "active-req"
+
+        req = _make_request("normal", n_tokens=10)
+        sched.add_request(req)
+
+        with patch.object(sched, "_do_external_prefill") as mock_ep:
+            scheduled, rejected = sched._schedule_waiting()
+
+        mock_ep.assert_not_called()
+        assert scheduled == []
+        assert rejected == []
+        assert req in sched.waiting

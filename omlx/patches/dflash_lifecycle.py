@@ -20,12 +20,25 @@ This module wraps each dflash hook installer so oMLX can:
 
 The wrap is idempotent and runs once per process — typically at the
 beginning of ``DFlashEngine.start()`` just before ``load_target_bundle``.
+
+The wrap also arms a batch-cache guard on every class dflash patches
+(issue #2252): while a DFlash engine is loaded its hooks sit on Python
+classes that other engines share (``mlx_lm.models.qwen3_next``'s
+``Qwen3NextAttention`` is the very class qwen3_5 / qwen3_5_moe import as
+``Attention``), so a concurrent BatchedEngine decode of an unrelated
+model reaches dflash's ``attention_call``, whose ``int(cache.offset)``
+crashes on the per-row ``mx.array`` offset of a ``BatchKVCache`` with
+"[convert] Only length-1 arrays can be converted to Python scalars".
+The guard routes any cache with an ``mx.array`` offset (batch caches
+dflash never owns) to the pre-dflash ``__call__``.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+
+import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +69,48 @@ def _wrap_installer(mod: Any, fn_name: str, flag_name: str) -> bool:
             # First time dflash installs on this class — snapshot the
             # current __call__ so restore can put it back unchanged.
             _DFLASH_BACKUP.setdefault(cls, {"call": cls.__call__, "flag": flag_name})
-        return original(module_target)
+        result = original(module_target)
+        if getattr(cls, flag_name, False):
+            _install_batch_cache_guard(cls)
+        return result
 
     setattr(mod, fn_name, wrapped)
     setattr(mod, "_omlx_wrapped_" + fn_name, True)
     return True
+
+
+def _install_batch_cache_guard(cls: type) -> None:
+    """Wrap the dflash-installed ``__call__`` with a batch-cache bypass.
+
+    dflash's hooks only ever run with its own single-sequence caches,
+    whose ``offset`` is a plain int. Batch caches (``BatchKVCache`` /
+    ``BatchRotatingKVCache``) carry a per-row ``mx.array`` offset, and
+    reaching dflash's hook with one crashes in ``int(cache.offset)``
+    (issue #2252). Any cache with an ``mx.array`` offset therefore goes
+    to the snapshotted pre-dflash ``__call__`` instead.
+
+    Idempotent per installed hook; restore drops the guard together with
+    the hook because it rewrites ``cls.__call__`` from the backup.
+    """
+    dflash_call = cls.__call__
+    if getattr(dflash_call, "_omlx_dflash_batch_guard", False):
+        return
+    info = _DFLASH_BACKUP.get(cls)
+    if info is None:
+        # No snapshot means the installer ran outside the wrap; nothing
+        # safe to fall back to, so leave the hook untouched.
+        return
+    pre_dflash_call = info["call"]
+
+    def guarded_call(
+        self: Any, x: Any, mask: Any = None, cache: Any = None, **kwargs: Any
+    ) -> Any:
+        if isinstance(getattr(cache, "offset", None), mx.array):
+            return pre_dflash_call(self, x, mask=mask, cache=cache, **kwargs)
+        return dflash_call(self, x, mask=mask, cache=cache, **kwargs)
+
+    guarded_call._omlx_dflash_batch_guard = True  # type: ignore[attr-defined]
+    cls.__call__ = guarded_call  # type: ignore[method-assign]
 
 
 def install_dflash_lifecycle_wrap() -> bool:

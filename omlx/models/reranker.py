@@ -11,6 +11,7 @@ Supports:
 - CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
 """
 
+import gc
 import json
 import logging
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
+from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -205,8 +207,8 @@ class MLXRerankerModel:
         """Normalize a rerank input into the mlx-embeddings VL item format.
 
         Accepts either a bare string (text) or a dict with 'text' and/or
-        'image' keys. Image values are strings (URL / base64 data URI / local
-        path) and get loaded via omlx's shared image loader.
+        'image' keys. Request-facing image strings must be base64 data URIs and
+        get loaded via omlx's shared image loader.
         """
         if isinstance(item, str):
             return {"text": item}
@@ -220,7 +222,7 @@ class MLXRerankerModel:
         image_ref = item.get("image")
         if image_ref:
             if isinstance(image_ref, str):
-                result["image"] = load_image(image_ref)
+                result["image"] = load_image(image_ref, field="image")
             else:
                 # Already a PIL image or similar — pass through
                 result["image"] = image_ref
@@ -261,9 +263,10 @@ class MLXRerankerModel:
 
     def _load_causal_lm(self) -> Tuple[Any, Any]:
         """Load a CausalLM-based reranker model using mlx-lm."""
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -297,25 +300,7 @@ class MLXRerankerModel:
             )
 
         # Pre-compute prefix and suffix tokens for the prompt template.
-        # Use apply_chat_template() for portability across tokenizer formats,
-        # then split on a sentinel to extract prefix/suffix boundaries.
-        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
-        messages = [
-            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
-            {"role": "user", "content": _SENTINEL},
-        ]
-        template_str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        parts = template_str.split(_SENTINEL)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Chat template produced unexpected format; "
-                f"could not split on sentinel. Template: {template_str!r}"
-            )
-        prefix = parts[0]
-        # Append <think> block for models that use thinking-then-answering format
-        suffix = parts[1] + "<think>\n\n</think>\n\n"
+        prefix, suffix = self._extract_causal_lm_affixes(tokenizer)
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
@@ -329,6 +314,126 @@ class MLXRerankerModel:
 
         return model, tokenizer
 
+    def _extract_causal_lm_affixes(self, tokenizer: Any) -> Tuple[str, str]:
+        """Extract the static prompt prefix/suffix around the rerank content.
+
+        Handles two chat template shapes:
+
+        1. Standard chat template (system/user roles): render with a sentinel
+           as the user content and split around it.
+        2. Reranker-native template (Qwen/Qwen3-Reranker ships one as
+           chat_template.jinja since its 2026-04 sentence-transformers
+           update, and MLX conversions made after that inherit it): the
+           template only understands system/query/document roles and silently
+           drops user messages, so the sentinel never appears in the output.
+           Render with per-slot sentinels instead and split around the
+           combined "<Instruct>/<Query>/<Document>" block — the exact content
+           that _rerank_causal_lm reconstructs at scoring time.
+        """
+        # Fail fast with a clear error when the tokenizer has no chat template
+        # at all — rendering would only produce an opaque downstream failure.
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is None:
+            raise ValueError(
+                f"Tokenizer for {self.model_name} has no chat template; "
+                f"cannot derive the CausalLM reranker prompt prefix/suffix."
+            )
+
+        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
+        messages = [
+            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
+            {"role": "user", "content": _SENTINEL},
+        ]
+        standard_rendered = ""
+        standard_error: Exception | None = None
+        try:
+            standard_rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            standard_error = e
+            logger.warning(
+                f"system/user chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+
+        parts = standard_rendered.split(_SENTINEL)
+        if len(parts) == 2:
+            suffix = parts[1]
+            # Append <think> block for models that use the
+            # thinking-then-answering format, unless the template already
+            # emitted a think prefill of its own.
+            if "<think>" not in suffix:
+                suffix += "<think>\n\n</think>\n\n"
+            return parts[0], suffix
+
+        native_affixes, native_rendered, native_error = (
+            self._extract_reranker_native_affixes(tokenizer)
+        )
+        if native_affixes is not None:
+            logger.info(
+                "Using reranker-native chat template (query/document roles) "
+                f"for {self.model_name}"
+            )
+            return native_affixes
+
+        raise ValueError(
+            f"Could not extract CausalLM reranker prompt affixes for "
+            f"{self.model_name}. "
+            f"Standard system/user attempt: {standard_rendered!r} "
+            f"(error: {standard_error!r}). "
+            f"Reranker-native query/document attempt: {native_rendered!r} "
+            f"(error: {native_error!r})."
+        ) from (standard_error or native_error)
+
+    def _extract_reranker_native_affixes(
+        self, tokenizer: Any
+    ) -> "Tuple[Tuple[str, str] | None, str, Exception | None]":
+        """Extract affixes from a reranker-native chat template, if present.
+
+        Returns (affixes, rendered, error). Affixes is None when the template
+        raises or does not render the expected "<Instruct>/<Query>/<Document>"
+        content block; the rendered string and the exception (if any) are
+        returned for diagnostics.
+        """
+        instruct_sentinel = "<<__INSTRUCT_SENTINEL__>>"
+        query_sentinel = "<<__QUERY_SENTINEL__>>"
+        document_sentinel = "<<__DOCUMENT_SENTINEL__>>"
+        # The native template maps the system role to the <Instruct> slot; its
+        # judge system prompt is hardcoded inside the template itself.
+        messages = [
+            {"role": "system", "content": instruct_sentinel},
+            {"role": "query", "content": query_sentinel},
+            {"role": "document", "content": document_sentinel},
+        ]
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"reranker-native chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+            return None, "", e
+
+        # Intentionally strict, byte-exact match against the content block the
+        # upstream Qwen/Qwen3-Reranker template renders. _rerank_causal_lm
+        # reconstructs this exact block at scoring time, so tolerating
+        # formatting drift here would silently produce prompts that differ
+        # from what the template intends; failing detection loudly is safer.
+        content_block = (
+            f"<Instruct>: {instruct_sentinel}\n"
+            f"<Query>: {query_sentinel}\n"
+            f"<Document>: {document_sentinel}"
+        )
+        parts = rendered.split(content_block)
+        if len(parts) != 2:
+            return None, rendered, None
+
+        # The native template already emits the trailing <think> block, so the
+        # suffix is used as-is.
+        return (parts[0], parts[1]), rendered, None
+
     def _load_jina_reranker(self) -> Tuple[Any, Any]:
         """
         Load a Jina v3 reranker model using mlx-lm.
@@ -336,9 +441,10 @@ class MLXRerankerModel:
         Jina v3 reranker uses special-token hidden states + projector + cosine
         similarity for listwise scoring.
         """
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -731,6 +837,32 @@ class MLXRerankerModel:
             logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_seq_logits = None
             return False
+
+    def close(self) -> None:
+        """Release model, processor, projector, and compiled reranker resources."""
+        self._compiled_seq_logits = None
+        self._is_compiled = False
+
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        self._num_labels = None
+        self._is_causal_lm = False
+        self._is_jina_reranker = False
+        self._is_vl_reranker = False
+        self._token_true_id = None
+        self._token_false_id = None
+        self._doc_embed_token_id = None
+        self._query_embed_token_id = None
+        self._jina_projector = None
+        self._prefix_tokens = None
+        self._suffix_tokens = None
+
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        clear_thread_compile_cache()
+        gc.collect()
 
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512

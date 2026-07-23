@@ -61,11 +61,41 @@ class _BpeTokenizer:
         return "".join(reverse[token_id] for token_id in token_ids)
 
 
+class BPEStreamingDetokenizer:
+    __module__ = "mlx_vlm.tokenizer_utils"
+
+    def reset(self):
+        pass
+
+
+class _MlxVlmBpeTokenizer:
+    clean_up_tokenization_spaces = False
+
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.detokenizer = BPEStreamingDetokenizer()
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        reverse = {token_id: token for token, token_id in self.vocab.items()}
+        return "".join(reverse[token_id] for token_id in token_ids)
+
+
 class _ExplicitNoDetokenizer:
     detokenizer = None
 
     def decode(self, token_ids, skip_special_tokens: bool = True):
         return ""
+
+
+def _bpe_byte_chars(*byte_values):
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+    BPEStreamingDetokenizer.make_byte_decoder()
+    byte_encoder = {
+        byte_value: char
+        for char, byte_value in BPEStreamingDetokenizer._byte_decoder.items()
+    }
+    return [byte_encoder[byte_value] for byte_value in byte_values]
 
 
 class TestCreateStreamingDetokenizer:
@@ -94,6 +124,42 @@ class TestCreateStreamingDetokenizer:
         )
 
         assert type(detokenizer).__name__ == "BPEStreamingDetokenizer"
+
+    def test_replaces_mlx_vlm_bpe_detokenizer_from_tokenizer_json(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": {"type": "ByteLevel"}})
+        chars = _bpe_byte_chars(0xEC, 0x9E, 0xA0, 0x20)
+        tokenizer = _MlxVlmBpeTokenizer(
+            {
+                chars[0]: 0,
+                chars[1]: 1,
+                chars[2]: 2,
+                chars[3] + "A": 3,
+            }
+        )
+
+        detokenizer = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
+
+        assert type(detokenizer).__module__ == "mlx_lm.tokenizer_utils"
+        parts = []
+        for token_id in [0, 1, 2, 3]:
+            detokenizer.add_token(token_id)
+            parts.append(detokenizer.last_segment)
+        detokenizer.finalize()
+        parts.append(detokenizer.last_segment)
+
+        assert "".join(parts) == "\uc7a0 A"
+
+    def test_mlx_vlm_bpe_replacement_buffers_incomplete_utf8(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": {"type": "ByteLevel"}})
+        lead_byte, space = _bpe_byte_chars(0xEC, 0x20)
+        tokenizer = _MlxVlmBpeTokenizer({lead_byte: 0, space: 1})
+
+        detokenizer = create_streaming_detokenizer(tokenizer, model_path=tmp_path)
+
+        detokenizer.add_token(0)
+        detokenizer.add_token(1)
+
+        assert detokenizer.last_segment == ""
 
     def test_explicit_none_detokenizer_without_model_path_stays_none(self):
         assert create_streaming_detokenizer(_ExplicitNoDetokenizer()) is None
@@ -338,6 +404,35 @@ class TestGetTokenizerConfig:
         """Test config with trust_remote_code enabled."""
         config = get_tokenizer_config("some-model", trust_remote_code=True)
         assert config["trust_remote_code"] is True
+
+    def test_laguna_config_enables_mistral_regex_fix(self, tmp_path):
+        """Laguna's Mistral-derived tokenizer needs the corrected regex."""
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "laguna",
+                "architectures": ["LagunaForCausalLM"],
+            },
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert config["fix_mistral_regex"] is True
+
+    def test_laguna_config_pins_laguna_tool_parser(self, tmp_path):
+        """Laguna templates contain <arg_key>, which mlx-lm's template
+        sniffing misreads as glm47; the vendored parser must be pinned."""
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "laguna",
+                "architectures": ["LagunaForCausalLM"],
+            },
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert config["tool_parser_type"] == "laguna"
 
     def test_qwen3_model_config(self):
         """Test Qwen3 model gets eos_token fix."""

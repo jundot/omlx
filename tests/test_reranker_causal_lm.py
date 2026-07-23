@@ -211,6 +211,172 @@ class TestCausalLMReranker:
             assert args[2] == 512
 
 
+class TestCausalLMPromptAffixes:
+    """Tests for prefix/suffix extraction across chat template shapes."""
+
+    # The reranker-native template Qwen/Qwen3-Reranker-0.6B ships as
+    # chat_template.jinja since its 2026-04 sentence-transformers update.
+    # It only understands system/query/document roles and drops user messages.
+    _NATIVE_TEMPLATE = (
+        '{%- set instruction = messages | selectattr("role", "eq", "system") '
+        '| map(attribute="content") | first | default("Given a web search '
+        'query, retrieve relevant passages that answer the query") -%}\n'
+        '{%- set query_text = messages | selectattr("role", "eq", "query") '
+        '| map(attribute="content") | first -%}\n'
+        '{%- set document_text = messages | selectattr("role", "eq", '
+        '"document") | map(attribute="content") | first -%}\n'
+        "<|im_start|>system\n"
+        "Judge whether the Document meets the requirements based on the Query "
+        "and the Instruct provided. Note that the answer can only be "
+        '"yes" or "no".<|im_end|>\n'
+        "<|im_start|>user\n"
+        "<Instruct>: {{ instruction }}\n"
+        "<Query>: {{ query_text }}\n"
+        "<Document>: {{ document_text }}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        # The upstream file ends with "</think>\n\n\n"; jinja strips exactly
+        # one trailing newline, so the rendered suffix ends with "</think>\n\n"
+        # — byte-identical to the standard-template path.
+        "<think>\n\n</think>\n\n\n"
+    )
+
+    _EXPECTED_PREFIX = (
+        "<|im_start|>system\n"
+        "Judge whether the Document meets the requirements based on the Query "
+        "and the Instruct provided. Note that the answer can only be "
+        '"yes" or "no".<|im_end|>\n'
+        "<|im_start|>user\n"
+    )
+    _EXPECTED_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    class _StandardTokenizer:
+        """Mimics a standard system/user chat template (e.g., Qwen3 ChatML)."""
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True
+        ):
+            rendered = ""
+            for message in messages:
+                rendered += (
+                    f"<|im_start|>{message['role']}\n"
+                    f"{message['content']}<|im_end|>\n"
+                )
+            if add_generation_prompt:
+                rendered += "<|im_start|>assistant\n"
+            return rendered
+
+    class _NativeTokenizer:
+        """Mock tokenizer that renders a hard-coded reranker-native Jinja
+        template (mirroring the upstream Qwen3-Reranker chat_template.jinja)."""
+
+        def __init__(self, template):
+            self._template = template
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True
+        ):
+            jinja2 = pytest.importorskip("jinja2")
+            return (
+                jinja2.Environment()
+                .from_string(self._template)
+                .render(
+                    messages=messages,
+                    add_generation_prompt=add_generation_prompt,
+                )
+            )
+
+    def test_standard_template_extracts_affixes(self):
+        """Sentinel split on a system/user template yields prefix and suffix."""
+        model = MLXRerankerModel("unused")
+        prefix, suffix = model._extract_causal_lm_affixes(self._StandardTokenizer())
+
+        assert prefix == self._EXPECTED_PREFIX
+        assert suffix == self._EXPECTED_SUFFIX
+
+    def test_native_template_extracts_affixes(self):
+        """The reranker-native template (query/document roles) is detected
+        after the standard system/user attempt falls through, and yields the
+        same affixes as the standard template path."""
+        model = MLXRerankerModel("unused")
+        tokenizer = self._NativeTokenizer(self._NATIVE_TEMPLATE)
+
+        role_calls = []
+        original_apply = tokenizer.apply_chat_template
+
+        def recording_apply(messages, **kwargs):
+            role_calls.append([m["role"] for m in messages])
+            return original_apply(messages, **kwargs)
+
+        tokenizer.apply_chat_template = recording_apply
+        prefix, suffix = model._extract_causal_lm_affixes(tokenizer)
+
+        assert prefix == self._EXPECTED_PREFIX
+        assert suffix == self._EXPECTED_SUFFIX
+        # The standard system/user attempt must run first and fall through
+        # (the native template drops the user message, so the sentinel never
+        # appears), then the native query/document attempt succeeds.
+        assert role_calls == [
+            ["system", "user"],
+            ["system", "query", "document"],
+        ]
+
+    def test_standard_template_think_prefill_not_duplicated(self):
+        """A standard template that already emits a think prefill must not
+        get a second <think> block appended."""
+        model = MLXRerankerModel("unused")
+
+        class _ThinkingTokenizer(self._StandardTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                return super().apply_chat_template(messages, **kwargs) + (
+                    "<think>\n\n</think>\n\n"
+                )
+
+        prefix, suffix = model._extract_causal_lm_affixes(_ThinkingTokenizer())
+
+        assert prefix == self._EXPECTED_PREFIX
+        assert suffix == self._EXPECTED_SUFFIX
+        assert suffix.count("<think>") == 1
+
+    def test_missing_chat_template_raises_clear_error(self):
+        """A tokenizer with chat_template=None fails fast with a clear error
+        instead of an opaque rendering failure."""
+        model = MLXRerankerModel("unused")
+
+        class _NoTemplateTokenizer:
+            chat_template = None
+
+        with pytest.raises(ValueError, match="no chat template"):
+            model._extract_causal_lm_affixes(_NoTemplateTokenizer())
+
+    def test_native_template_rendering_error_falls_through(self):
+        """A template that raises on both shapes surfaces both errors."""
+        model = MLXRerankerModel("unused")
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = RuntimeError("bad template")
+
+        with pytest.raises(
+            ValueError, match="Could not extract CausalLM reranker"
+        ) as excinfo:
+            model._extract_causal_lm_affixes(tokenizer)
+
+        # Both attempts' errors are in the message, and the original exception
+        # is chained for debugging.
+        assert "bad template" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+    def test_incompatible_template_raises_value_error(self):
+        """A template matching neither shape raises instead of mis-splitting,
+        and the error includes both rendered attempts."""
+        model = MLXRerankerModel("unused")
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "static output, no slots"
+
+        with pytest.raises(ValueError, match="query/document attempt") as excinfo:
+            model._extract_causal_lm_affixes(tokenizer)
+
+        assert "static output, no slots" in str(excinfo.value)
+
+
 class TestJinaReranker:
     """Focused tests for Jina listwise reranker internals."""
 
@@ -583,3 +749,57 @@ class TestRerankerCompileFallback:
 
         assert result is False
         assert model._compiled_seq_logits is None
+
+
+class TestRerankerClose:
+    """Tests for reranker unload resource release."""
+
+    def test_close_releases_compiled_model_and_processor_resources(self):
+        """close() should drop wrapper references before clearing MLX caches."""
+        model = MLXRerankerModel("test-model")
+        model.model = MagicMock()
+        model.processor = MagicMock()
+        model._loaded = True
+        model._num_labels = 1
+        model._is_causal_lm = True
+        model._is_jina_reranker = True
+        model._is_vl_reranker = True
+        model._token_true_id = 1
+        model._token_false_id = 2
+        model._doc_embed_token_id = 3
+        model._query_embed_token_id = 4
+        model._jina_projector = MagicMock()
+        model._prefix_tokens = [5]
+        model._suffix_tokens = [6]
+        model._is_compiled = True
+        model._compiled_seq_logits = MagicMock()
+
+        with (
+            patch("omlx.models.reranker.gc.collect") as collect,
+            patch("omlx.models.reranker.mx") as mock_mx,
+            patch(
+                "omlx.models.reranker.clear_thread_compile_cache"
+            ) as clear_compile_cache,
+        ):
+            model.close()
+
+        assert model.model is None
+        assert model.processor is None
+        assert model._compiled_seq_logits is None
+        assert model._loaded is False
+        assert model._num_labels is None
+        assert model._is_causal_lm is False
+        assert model._is_jina_reranker is False
+        assert model._is_vl_reranker is False
+        assert model._token_true_id is None
+        assert model._token_false_id is None
+        assert model._doc_embed_token_id is None
+        assert model._query_embed_token_id is None
+        assert model._jina_projector is None
+        assert model._prefix_tokens is None
+        assert model._suffix_tokens is None
+        assert model._is_compiled is False
+        mock_mx.synchronize.assert_called_once()
+        mock_mx.clear_cache.assert_called_once()
+        clear_compile_cache.assert_called_once()
+        assert collect.call_count == 2

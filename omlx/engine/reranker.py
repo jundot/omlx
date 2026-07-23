@@ -85,10 +85,14 @@ class RerankerEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping reranker engine: {self._model_name}")
+        model = self._model
+        loop = asyncio.get_running_loop()
+        close = getattr(model, "close", None)
+        if callable(close):
+            await loop.run_in_executor(get_mlx_executor(), close)
         self._model = None
 
         gc.collect()
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )

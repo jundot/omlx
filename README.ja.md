@@ -72,6 +72,12 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルは、現在 HEAD ビルドが必要です:
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### ソースからインストール
 
 ```bash
@@ -79,6 +85,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # コアのみ
 pip install -e ".[mcp]"   # MCP（Model Context Protocol）サポート付き
+
+# オプション: GLM-5.2 / MiniMax M3 ネイティブカスタムカーネル
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Python 3.10+とApple Silicon（M1/M2/M3/M4）が必要です。
@@ -347,6 +356,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks を強制的に再ビルド（通常は fingerprint でキャッシュ）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルを含めてステージング
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 初回 cold ビルドは 10–20 分かかります（venvstacks Python レイヤーの組み立て）。以降のビルドは `packaging/_export/` のキャッシュを再利用し、約 4 分で完了します。レイヤー構成は [packaging/README.md](packaging/README.md)、Swift ソースは [apps/omlx-mac/](apps/omlx-mac/) を参照してください。

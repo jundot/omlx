@@ -66,7 +66,20 @@ class ClaudeCodeIntegration(Integration):
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
 
         binary = self._find_claude_binary()
-        argv = [binary, *ctx.extra_args]
+        # Deny the LSP tool. Claude Code attaches its full schema to the tools
+        # array the moment a language server connects mid-session; tool schemas
+        # render into the system region of the prompt, so that one insertion
+        # re-prefills the whole conversation on a prefix-caching server (#2349).
+        # LSP code intelligence is marginal against a local model, so the
+        # cache stability is the better default here. Skip it when the caller
+        # already passes their own --disallowedTools so we never fight their
+        # choice or duplicate the flag.
+        extra_args = list(ctx.extra_args)
+        if not any(
+            a in ("--disallowedTools", "--disallowed-tools") for a in extra_args
+        ):
+            extra_args = ["--disallowedTools", "LSP", *extra_args]
+        argv = [binary, *extra_args]
         print(f"Launching Claude Code with model {ctx.model}...")
         if ctx.context_window:
             print(f"Auto-compact window: {ctx.context_window:,} tokens")

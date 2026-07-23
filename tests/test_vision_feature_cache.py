@@ -124,6 +124,18 @@ class TestMemoryCache:
         assert stats["hits"] == 1
         assert stats["misses"] == 1
 
+    def test_close_clears_memory_lru(self):
+        cache = VisionFeatureSSDCache(cache_dir=None, max_memory_entries=3)
+        cache.put("img", "model", mx.ones((2, 2)))
+
+        with cache._memory_lock:
+            assert cache._memory_cache
+
+        cache.close()
+
+        with cache._memory_lock:
+            assert cache._memory_cache == {}
+
 
 class TestSSDCache:
     def test_ssd_write_and_load(self, ssd_cache):

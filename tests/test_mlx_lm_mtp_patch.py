@@ -309,11 +309,13 @@ class TestQwen35MtpNormShift:
 
     def test_oq_discovery_keeps_mtp_norm_shift_on_raw_hf_source(self):
         """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
-        placeholders where the per-key magnitude can't be read. The helper
-        must record a conditional replay transform for MTP norms so the
-        materialization path can still decide from the real tensor value.
-        Otherwise full-precision Qwen3.6 sources with mixed MTP norm
-        conventions can be double-shifted or left unshifted."""
+        placeholders. On a raw-HF source (unsanitized conv1d present) every
+        Qwen3-Next RMSNorm gamma is zero-centered, so MTP-head norms record
+        the same unconditional +1 "add" transform as the backbone norms.
+        (The old conditional add_if_mean_lt_0_5 misclassified q_norm/k_norm
+        [raw mean ~0.75] and mtp.norm [raw ~1.27], costing ~14pp of draft
+        acceptance on Qwen3.6-27B.) Pre-converted sources — no unsanitized
+        conv1d — keep the per-key conditional for mixed-convention bundles."""
         import mlx.core as mx
 
         from omlx.oq import _discover_sanitize_plan
@@ -336,14 +338,10 @@ class TestQwen35MtpNormShift:
         }
         plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
 
-        # Backbone still has a fixed +1 add from the raw-HF conv1d signal.
-        # MTP norms need per-key value checks at materialization time.
+        # Raw-HF source: backbone AND head norms all take the fixed +1 add.
         assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
-        assert (
-            plan["mtp.layers.0.input_layernorm.weight"]["transform"]
-            == "add_if_mean_lt_0_5"
-        )
-        assert plan["mtp.norm.weight"]["transform"] == "add_if_mean_lt_0_5"
+        assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
+        assert plan["mtp.norm.weight"]["transform"] == "add"
 
 
 class TestQwen35MoeSanitize:
@@ -458,6 +456,55 @@ class TestQwen35MoeSanitize:
         assert f"{pfx}.shared_expert.gate_proj.weight" in result
         # No bogus switch_mlp keys synthesized for the dense layer.
         assert f"{pfx}.switch_mlp.gate_proj.weight" not in result
+
+    def test_sanitize_backbone_per_expert_form(self, moe_model):
+        """Ornith / raw Qwen3.5 ship *backbone* MoE layers as per-expert
+        tensors. Sanitize must stack them into switch_mlp, leaving no orphan
+        ``experts.{N}.*`` keys behind."""
+        import mlx.core as mx
+
+        weights = {"language_model.model.embed_tokens.weight": mx.zeros((256, 64))}
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            for e in range(4):
+                weights[f"{pfx}.experts.{e}.gate_proj.weight"] = mx.zeros((128, 64))
+                weights[f"{pfx}.experts.{e}.up_proj.weight"] = mx.zeros((128, 64))
+                weights[f"{pfx}.experts.{e}.down_proj.weight"] = mx.zeros((64, 128))
+
+        result = moe_model.sanitize(weights)
+
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            # Per-expert weights stacked: leading dim == num_experts (4).
+            assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (4, 128, 64)
+            assert result[f"{pfx}.switch_mlp.up_proj.weight"].shape == (4, 128, 64)
+            assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (4, 64, 128)
+            # No orphan per-expert keys survive.
+            assert not any(f"{pfx}.experts." in k for k in result)
+
+    def test_sanitize_backbone_per_expert_quantized(self, moe_model):
+        """A per-expert *quantized* backbone carries ``.scales``/``.biases``
+        alongside ``.weight``. All three must be stacked, or the leftover
+        per-expert scales/biases trip 'Received N parameters not in model'."""
+        import mlx.core as mx
+
+        pfx = "language_model.model.layers.0.mlp"
+        weights = {"language_model.model.embed_tokens.weight": mx.zeros((256, 64))}
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                weights[f"{pfx}.experts.{e}.{proj}.weight"] = mx.zeros((128, 16))
+                weights[f"{pfx}.experts.{e}.{proj}.scales"] = mx.zeros((128, 2))
+                weights[f"{pfx}.experts.{e}.{proj}.biases"] = mx.zeros((128, 2))
+
+        result = moe_model.sanitize(weights)
+
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("weight", "scales", "biases"):
+                key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+                assert key in result, key
+                assert result[key].shape[0] == 4  # stacked over experts
+        # No orphan per-expert metadata survives.
+        assert not any(f"{pfx}.experts." in k for k in result)
 
 
 class TestDeepseekV4Model:
@@ -942,9 +989,11 @@ class TestBatchGeneratorDispatch:
 
         assert batch_generator._generation_batch_has_active_mtp(_EmptyBatch()) is False
 
-    def test_rowwise_batch_eligibility_requires_safe_activation(self):
+    def test_rowwise_batch_eligibility_requires_safe_activation(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _MtpModel:
             def __init__(self):
@@ -976,9 +1025,51 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
-    def test_rowwise_batch_new_activation_requires_aligned_offsets(self):
+    def test_rowwise_batch_new_activation_is_opt_in(self, monkeypatch):
+        # Default (env unset): no NEW row-wise activation — standard batched
+        # decode measured faster at batch >= 2. Existing batch state still
+        # continues so a mid-flight batch is not torn down by a config flip.
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._ROWWISE_BATCH_MTP_ENV, raising=False)
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is False
+
+            batch._omlx_mtp_batch_state = batch_generator._MtpBatchState(
+                states={1: batch_generator._MtpState(uid=1)}
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_rowwise_batch_new_activation_allows_ragged_offsets(self, monkeypatch):
+        # Continuous batching admits rows at different times, so per-row
+        # cache offsets rarely align. Activation must not require alignment:
+        # each row is seeded from its own extract_cache view and steady-state
+        # row cycles diverge the offsets anyway (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _Offset:
             def __init__(self, values):
@@ -1005,12 +1096,133 @@ class TestBatchGeneratorDispatch:
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[SimpleNamespace(offset=_Offset([8, 5]))],
             )
-            assert batch_generator._is_mtp_batch_eligible(batch) is False
-
-            batch.prompt_cache = [SimpleNamespace(offset=_Offset([8, 8]))]
             assert batch_generator._is_mtp_batch_eligible(batch) is True
         finally:
             set_mtp_active(prior_active)
+
+    def test_rowwise_batch_activation_allowed_after_standard_multirow_decode(
+        self, monkeypatch
+    ):
+        # The multirow-decode marker protects singleton re-initialization
+        # only. A batch's first decode step is always standard (MTP has not
+        # activated yet), so blocking batch activation on the marker would
+        # permanently lock every batch out of row-wise MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+
+            singleton = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+            )
+            assert batch_generator._is_mtp_eligible(singleton) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_singleton_recovery_clears_marker_when_cache_compact(self):
+        # A batch that shrinks back to one row with no residual left padding
+        # satisfies the singleton-init invariant again, so the multirow
+        # marker must lift and the surviving request regains MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        batch = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(batch)
+        assert batch._omlx_mtp_saw_standard_multirow_decode is False
+
+        # Residual padding: the invariant does not hold — keep the marker.
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([3]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        # Still multi-row: never clears.
+        multirow = SimpleNamespace(
+            uids=[1, 2],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0, 0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(multirow)
+        assert multirow._omlx_mtp_saw_standard_multirow_decode is True
+
+    def test_singleton_recovery_checks_cachelist_sub_caches(self):
+        # CacheList layers (GLM 5.2 / DeepSeek v3.2 lineage) keep left
+        # padding on their sub-caches, not on the container. The compactness
+        # check must recurse into ``.caches`` instead of skipping the layer,
+        # or the marker clears without verifying anything.
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        class _CacheList:
+            def __init__(self, *caches):
+                self.caches = caches
+
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(SimpleNamespace(left_padding=_Padding([3])))
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        compact = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(
+                    SimpleNamespace(left_padding=_Padding([0])),
+                    SimpleNamespace(left_padding=_Padding([0])),
+                )
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(compact)
+        assert compact._omlx_mtp_saw_standard_multirow_decode is False
 
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
@@ -1252,9 +1464,12 @@ class TestModelSettingsMtp:
         with pytest.raises(ValueError, match="speculative-decoding"):
             ModelSettings(mtp_enabled=True, dflash_enabled=True)
 
-    def test_mutual_exclusion_with_turboquant(self):
-        with pytest.raises(ValueError, match="TurboQuant"):
-            ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+    def test_mtp_with_turboquant_allowed(self):
+        # TurboQuant's attention patch routes MTP's decode-shaped multi-row
+        # verify through the quantized decode kernels, so the combo is valid.
+        s = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert s.mtp_enabled is True
+        assert s.turboquant_kv_enabled is True
 
     def test_mtp_with_specprefill_allowed(self):
         # SpecPrefill targets a different code path (sparse prefill scoring),

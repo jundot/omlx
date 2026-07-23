@@ -14,6 +14,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import gc
 import logging
 import os
 import time
@@ -38,7 +39,7 @@ from .exceptions import PrefillMemoryExceededError
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig
+from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.compile_cache import (
     clear_thread_compile_cache,
     compile_cache_clear_available,
@@ -76,6 +77,13 @@ _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 # these stay empty and the worker threads shut down normally.
 _immortal_mlx_executors: list = []
 _immortal_mlx_streams: list = []
+
+
+def _final_engine_thread_reclaim(stream: Any) -> None:
+    """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
+    gc.collect()
+    _sync_and_clear_cache(stream)
+    gc.collect()
 
 
 def _init_mlx_thread() -> None:
@@ -249,6 +257,11 @@ class EngineCore:
         self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+
+        # Drop transient aliases after ownership moves to the engine/scheduler
+        # graph, so close()/deep_reset() can make that graph unreachable.
+        model = None
+        tokenizer = None
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -482,7 +495,9 @@ class EngineCore:
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )
@@ -667,27 +682,44 @@ class EngineCore:
 
         request_ids = list(self._output_collectors.keys())
         ceiling = 0
+        watermark = 0
         sched = self.scheduler
         if sched is not None:
             ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
+            watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
         usage = get_phys_footprint()
         usage_gb = usage / (1024**3)
         ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
+        watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
+        advice = (
+            "Reduce context length, free system memory, or loosen "
+            "memory_guard_tier (safe → balanced → aggressive)."
+        )
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                if ceiling > 0:
+                # Name the watermark that actually tripped; printing only the
+                # ceiling reads as "usage below limit yet aborted" (#2321).
+                if watermark > 0 and ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, abort threshold "
+                        f"(hard watermark) {watermark_gb:.1f} GB, "
+                        f"ceiling {ceiling_gb:.1f} GB). "
+                        f"{advice}"
+                    )
+                elif ceiling > 0:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 else:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 collector.put(
                     RequestOutput(
@@ -889,10 +921,13 @@ class EngineCore:
 
         # Drain all outputs and get the last one (using the captured reference)
         final_output = None
+        first_token_at = None
         while True:
             output = collector.get_nowait()
             if output is None:
                 break
+            if first_token_at is None and output.generated_at is not None:
+                first_token_at = output.generated_at
             final_output = output
 
         # Cleanup
@@ -904,6 +939,7 @@ class EngineCore:
         if final_output.error:
             _raise_request_output_error(final_output)
 
+        final_output.first_token_at = first_token_at
         return final_output
 
     def generate_batch_sync(
@@ -1043,6 +1079,10 @@ class EngineCore:
                     exc_info=True,
                 )
 
+        # Drop the last bound-method reference from the teardown loop before
+        # the final GC/reclaim pass below.
+        fn = None
+
         # Guarantee the SSD cache manager is released even if shutdown() did not
         # reach its own close() above. The manager's writer thread holds a strong
         # reference to it, so an unclosed manager leaks until restart.
@@ -1057,8 +1097,57 @@ class EngineCore:
                     exc_info=True,
                 )
             self.scheduler.paged_ssd_cache_manager = None
+        manager = None
+
+        # Clear output collectors before dropping model/scheduler references so
+        # any request-side caches they retain are eligible for the final reclaim.
+        for collector in self._output_collectors.values():
+            collector.clear()
+        self._output_collectors.clear()
+        self._stream_states.clear()
+        self._finished_events.clear()
+        self._finished_at.clear()
+
+        release_model_resources = getattr(self.model, "release_resources", None)
+        if callable(release_model_resources):
+            try:
+                release_model_resources()
+            except Exception:
+                logger.warning(
+                    "Engine %s: model resource release failed during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+        release_model_resources = None
+
+        # Release model, tokenizer, and scheduler references before the final
+        # MLX reclaim. The reclaim must run on this engine's worker thread and
+        # stream; clearing on the global executor cannot reliably return this
+        # thread/stream-local Metal memory to MLX.
+        self.model = None
+        self.tokenizer = None
+        self.scheduler = None
 
         if self._mlx_executor is not None:
+            try:
+                self._mlx_executor.submit(
+                    _final_engine_thread_reclaim, self._mlx_stream
+                ).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                fatal_exit(
+                    f"Engine teardown timed out after "
+                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while reclaiming "
+                    f"MLX memory for engine {self._engine_id}"
+                )
+            except RuntimeError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Engine %s: final MLX reclaim raised during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+
             # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
             # this worker thread exits with a non-empty cache, ~CompilerCache
             # frees the cached graphs' Python objects from a thread-exit handler
@@ -1089,19 +1178,6 @@ class EngineCore:
                 _immortal_mlx_executors.append(self._mlx_executor)
                 _immortal_mlx_streams.append(self._mlx_stream)
             self._mlx_executor = None
-
-        # Clear output collectors
-        for collector in self._output_collectors.values():
-            collector.clear()
-        self._output_collectors.clear()
-        self._stream_states.clear()
-        self._finished_events.clear()
-        self._finished_at.clear()
-
-        # Release model and tokenizer references for GC
-        self.model = None
-        self.tokenizer = None
-        self.scheduler = None
 
         logger.debug(f"Engine {self._engine_id} closed")
 
@@ -1137,6 +1213,9 @@ class AsyncEngineCore:
         config: Optional[EngineConfig] = None,
     ):
         self.engine = EngineCore(model, tokenizer, config)
+        # Drop wrapper-local aliases after EngineCore takes ownership.
+        model = None
+        tokenizer = None
 
     @property
     def _mlx_executor(self):

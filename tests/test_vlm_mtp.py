@@ -29,9 +29,7 @@ def _fake_drafter_model(model_type: str = "gemma4_assistant") -> MagicMock:
 def test_load_vlm_mtp_drafter_happy_path():
     """Valid gemma4_assistant artifact returns a populated VLMMTPDrafter."""
     fake_model = _fake_drafter_model("gemma4_assistant")
-    with patch.object(
-        vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")
-    ):
+    with patch.object(vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")):
         drafter = vlm_mtp.load_vlm_mtp_drafter("/path/to/drafter")
     assert isinstance(drafter, vlm_mtp.VLMMTPDrafter)
     assert drafter.draft_kind == "mtp"
@@ -42,9 +40,7 @@ def test_load_vlm_mtp_drafter_happy_path():
 def test_load_vlm_mtp_drafter_accepts_unified_assistant():
     """Valid gemma4_unified_assistant artifact is accepted."""
     fake_model = _fake_drafter_model("gemma4_unified_assistant")
-    with patch.object(
-        vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")
-    ):
+    with patch.object(vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")):
         drafter = vlm_mtp.load_vlm_mtp_drafter("/path/to/drafter")
     assert isinstance(drafter, vlm_mtp.VLMMTPDrafter)
     assert drafter.model is fake_model
@@ -63,9 +59,7 @@ def test_load_vlm_mtp_drafter_rejects_dflash_kind():
 def test_load_vlm_mtp_drafter_accepts_qwen3_5_mtp():
     """qwen3_5_mtp model_type with kind='mtp' is accepted."""
     fake_model = _fake_drafter_model("qwen3_5_mtp")
-    with patch.object(
-        vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")
-    ):
+    with patch.object(vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")):
         drafter = vlm_mtp.load_vlm_mtp_drafter("/path/to/qwen-mtp")
     assert isinstance(drafter, vlm_mtp.VLMMTPDrafter)
     assert drafter.draft_kind == "mtp"
@@ -139,7 +133,9 @@ def test_run_vlm_mtp_decode_batch_dispatches_to_mtp_rounds_batch():
     first_bonus = mx.array([1, 2, 3])  # B=3
     yielded = [([1, None, 3], None), ([None, None, None], None)]
     with (
-        patch.object(vlm_mtp, "_mtp_rounds_batch", return_value=iter(yielded)) as m_batch,
+        patch.object(
+            vlm_mtp, "_mtp_rounds_batch", return_value=iter(yielded)
+        ) as m_batch,
         patch.object(vlm_mtp, "_mtp_rounds") as m_single,
         patch.object(vlm_mtp, "_buffer_mtp_target_cache") as m_buffer,
     ):
@@ -374,6 +370,199 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     assert out.gdn_states is gdn_states
     assert out.shared_kv_states == {}
     assert model.forward_kwargs["capture_layer_ids"] == [1]
+
+
+def test_moe_vlm_sanitize_unfuses_gate_up_by_midpoint(monkeypatch):
+    """The VLM MoE sanitize patch must preserve upstream midpoint slicing."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+
+    assert qwen35_moe_vlm_model.apply() is True
+
+    fake_self = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=1,
+                num_experts=0,
+            )
+        )
+    )
+    gate_up = mx.arange(2 * 6 * 3).reshape(2, 6, 3)
+    weights = {
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+        "model.language_model.layers.0.mlp.experts.down_proj": mx.ones((2, 4, 3)),
+    }
+
+    result = qwen3_5_moe.Model.sanitize(fake_self, weights)
+
+    gate_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    up_key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+    assert bool(mx.all(result[gate_key] == gate_up[:, :3, :]).item())
+    assert bool(mx.all(result[up_key] == gate_up[:, 3:, :]).item())
+
+
+def test_moe_vlm_runtime_sanitize_unfuses_gate_up_by_midpoint():
+    """The runtime sanitize wrapper must not reintroduce the old split path."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+
+    class FakeModel:
+        pass
+
+    fake_outer = SimpleNamespace(Model=FakeModel)
+    qwen35_moe_vlm_runtime._patch_vlm_outer_model_sanitize(fake_outer)
+
+    fake_self = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=1,
+                num_experts=0,
+            )
+        )
+    )
+    gate_up = mx.arange(2 * 6 * 3).reshape(2, 6, 3)
+    weights = {
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+        "model.language_model.layers.0.mlp.experts.down_proj": mx.ones((2, 4, 3)),
+    }
+
+    result = FakeModel.sanitize(fake_self, weights)
+
+    gate_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    up_key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+    assert bool(mx.all(result[gate_key] == gate_up[:, :3, :]).item())
+    assert bool(mx.all(result[up_key] == gate_up[:, 3:, :]).item())
+
+
+def _per_expert_vlm_self(num_experts=2, num_hidden_layers=1):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=num_hidden_layers,
+                num_experts=num_experts,
+            )
+        )
+    )
+
+
+def test_moe_vlm_sanitize_stacks_per_expert_backbone(monkeypatch):
+    """Ornith / raw Qwen3.5 ship backbone MoE layers as per-expert tensors.
+    The model-level sanitize must stack them into switch_mlp form."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        weights[f"{pfx_in}.experts.{e}.gate_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.up_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.down_proj.weight"] = mx.zeros((4, 8))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (2, 8, 4)
+    assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (2, 4, 8)
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_sanitize_stacks_per_expert_backbone_quantized(monkeypatch):
+    """A per-expert *quantized* backbone carries .scales/.biases. The
+    model-level sanitize must stack all three, leaving no orphan keys."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx_in}.experts.{e}.{proj}.weight"] = mx.zeros((8, 4))
+            weights[f"{pfx_in}.experts.{e}.{proj}.scales"] = mx.zeros((8, 1))
+            weights[f"{pfx_in}.experts.{e}.{proj}.biases"] = mx.zeros((8, 1))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+            assert key in result, key
+            assert result[key].shape[0] == 2
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_sanitize_stacks_per_expert_mtp_quantized(monkeypatch):
+    """A per-expert *quantized* MTP head also carries .scales/.biases.
+    The model-level VLM sanitize path must keep parity with the runtime
+    sanitize path and stack all three suffixes."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "mtp.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx_in}.experts.{e}.{proj}.weight"] = mx.zeros((8, 4))
+            weights[f"{pfx_in}.experts.{e}.{proj}.scales"] = mx.zeros((8, 1))
+            weights[f"{pfx_in}.experts.{e}.{proj}.biases"] = mx.zeros((8, 1))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.mtp.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+            assert key in result, key
+            assert result[key].shape[0] == 2
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_runtime_sanitize_stacks_per_expert_backbone():
+    """The runtime sanitize wrapper must also stack per-expert backbone
+    layers (parity with the model-level patch and the LLM patch)."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+
+    class FakeModel:
+        pass
+
+    fake_outer = SimpleNamespace(Model=FakeModel)
+    qwen35_moe_vlm_runtime._patch_vlm_outer_model_sanitize(fake_outer)
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        weights[f"{pfx_in}.experts.{e}.gate_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.up_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.down_proj.weight"] = mx.zeros((4, 8))
+
+    result = FakeModel.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (2, 8, 4)
+    assert result[f"{pfx}.switch_mlp.up_proj.weight"].shape == (2, 8, 4)
+    assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (2, 4, 8)
+    assert not any(f"{pfx}.experts." in k for k in result)
 
 
 # ---------------------------------------------------------------------------

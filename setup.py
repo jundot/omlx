@@ -38,9 +38,21 @@ def _custom_kernel_build_kwargs() -> dict:
     return {
         "ext_modules": [
             extension.CMakeExtension(
+                "omlx.custom_kernels.bonsai._ext",
+                sourcedir="omlx/custom_kernels/bonsai/csrc",
+            ),
+            extension.CMakeExtension(
                 "omlx.custom_kernels.glm_moe_dsa._ext",
                 sourcedir="omlx/custom_kernels/glm_moe_dsa/csrc",
-            )
+            ),
+            extension.CMakeExtension(
+                "omlx.custom_kernels.minimax_m3._ext",
+                sourcedir="omlx/custom_kernels/minimax_m3/csrc",
+            ),
+            extension.CMakeExtension(
+                "omlx.custom_kernels.qwen35_prefill._ext",
+                sourcedir="omlx/custom_kernels/qwen35_prefill/csrc",
+            ),
         ],
         "cmdclass": {"build_ext": extension.CMakeBuild},
     }

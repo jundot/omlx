@@ -393,6 +393,7 @@ def test_prefill_ready_rotating_name_detects_window_padding():
 def test_registry_rotating_family():
     assert CacheTypeRegistry.is_rotating_family("RotatingKVCache")
     assert CacheTypeRegistry.is_rotating_family("PrefillReadyRotatingKVCache")
+    assert CacheTypeRegistry.is_rotating_family("BufferedRotatingKVCache")
     assert CacheTypeRegistry.is_rotating_family("BatchRotatingKVCache")
     assert not CacheTypeRegistry.is_rotating_family("KVCache")
     assert not CacheTypeRegistry.is_rotating_family("TurboQuantKVCache")

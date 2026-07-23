@@ -93,7 +93,7 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.model') }}</label>
                                 <select x-model="benchModelId"
-                                        :disabled="benchRunning"
+                                        :disabled="benchRunning || benchExternalEnabled"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
@@ -149,17 +149,59 @@
                                        class="w-4 h-4 text-neutral-400 transition-transform"
                                        :class="benchAdvancedOptionsOpen && 'rotate-180'"></i>
                                 </button>
-                                <div x-show="benchAdvancedOptionsOpen" x-collapse x-cloak class="mt-3">
+                                <div x-show="benchAdvancedOptionsOpen" x-collapse x-cloak class="mt-3 space-y-3">
                                     <label class="inline-flex items-start gap-2 cursor-pointer">
                                         <input type="checkbox"
                                                x-model="benchForceLmEngine"
-                                               :disabled="benchRunning"
+                                               :disabled="benchRunning || benchExternalEnabled"
                                                class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
                                         <span>
                                             <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.force_lm_engine') }}</span>
                                             <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.force_lm_engine_hint') }}</span>
                                         </span>
                                     </label>
+                                    <!-- External OpenAI-compatible endpoint -->
+                                    <div>
+                                        <label class="inline-flex items-start gap-2 cursor-pointer">
+                                            <input type="checkbox"
+                                                   x-model="benchExternalEnabled"
+                                                   :disabled="benchRunning"
+                                                   class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                            <span>
+                                                <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.external') }}</span>
+                                                <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.external_hint') }}</span>
+                                            </span>
+                                        </label>
+                                        <div x-show="benchExternalEnabled" x-collapse x-cloak class="mt-3 space-y-3 pl-6">
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_base_url') }}</label>
+                                                <input type="url"
+                                                       x-model="externalBaseUrl"
+                                                       @change="saveExternalEndpoint()"
+                                                       :disabled="benchRunning"
+                                                       placeholder="https://api.openai.com/v1"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_api_key') }}</label>
+                                                <input type="password"
+                                                       autocomplete="off"
+                                                       x-model="externalApiKey"
+                                                       @change="saveExternalEndpoint()"
+                                                       :disabled="benchRunning"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_model') }}</label>
+                                                <input type="text"
+                                                       x-model="externalModel"
+                                                       @change="saveExternalEndpoint()"
+                                                       :disabled="benchRunning"
+                                                       placeholder="gpt-4o-mini"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
 
@@ -167,7 +209,7 @@
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"
                                         @click="startBenchmark()"
-                                        :disabled="!benchModelId || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
+                                        :disabled="(benchExternalEnabled ? !externalConfigValid() : !benchModelId) || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
                                         :title="benchOtherActive ? 'Another throughput benchmark is already running in this server.' : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
@@ -403,7 +445,8 @@
                                   x-text="t('bench.upload_skipped.title')"></span>
                         </div>
                         <div class="px-6 py-4 space-y-2">
-                            <p class="text-sm text-amber-600" x-text="t('bench.upload_skipped.reason')"></p>
+                            <p class="text-sm text-amber-600"
+                               x-text="benchUploadSkipped?.reason === 'external_endpoint' ? t('bench.upload_skipped.reason_external') : t('bench.upload_skipped.reason')"></p>
                             <ul class="text-sm text-amber-600 list-disc list-inside">
                                 <template x-for="f in (benchUploadSkipped?.features || [])" :key="f">
                                     <li x-text="t('bench.upload_skipped.features.' + f)"></li>

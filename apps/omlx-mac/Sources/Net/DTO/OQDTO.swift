@@ -67,6 +67,10 @@ struct OQStartRequest: Encodable, Sendable {
     let textOnly: Bool
     let dtype: String
     let preserveMtp: Bool
+    let enhanced: Bool
+    let imatrixCachePath: String
+    let imatrixReuseCache: Bool
+    let imatrixStrict: Bool
 }
 
 struct OQStartResponse: Decodable, Sendable {

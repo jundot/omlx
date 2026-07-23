@@ -62,6 +62,11 @@
         --timeline-accent: #60a5fa;
     }
 
+    [data-theme="dark"] ::selection {
+        background-color: #3f3f46;
+        color: var(--text-primary);
+    }
+
     body {
         background-color: var(--bg-primary) !important;
         color: var(--text-primary) !important;
@@ -979,6 +984,7 @@
 {% block content %}
 <script>
     // Apply theme immediately before render to prevent flash (match applyTheme / Alpine default)
+    // Literal key on purpose: THEME_STORAGE_KEY is declared in the later app script block
     (function () {
         const stored = localStorage.getItem('omlx-chat-theme');
         let theme = stored || 'auto';
@@ -1110,54 +1116,11 @@
         </div>
 
         <!-- Sidebar Footer -->
-        <div class="p-2 border-t border-line space-y-0.5 flex-shrink-0">
-            <a href="/admin/dashboard"
-                class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                <i data-lucide="settings" class="w-3 h-3"></i>
-                {{ t('chat.admin_settings') }}
-            </a>
-            <div class="svg-allow-setting px-2 py-1.5">
-                <div class="svg-allow-row">
-                    <div class="svg-allow-label">
-                        <i data-lucide="wand-sparkles" class="w-3 h-3 shrink-0" style="color: var(--text-tertiary);"></i>
-                        <span class="text-xs truncate" style="color: var(--text-tertiary);"
-                            x-text="window.t('chat.allow_svg')"></span>
-                    </div>
-                    <button type="button" role="switch" class="svg-allow-switch"
-                        :class="{ 'is-on': allowSvg }"
-                        :aria-checked="allowSvg ? 'true' : 'false'"
-                        :aria-label="window.t('chat.allow_svg')"
-                        @click="setAllowSvg(!allowSvg)">
-                        <span class="svg-allow-switch-knob" aria-hidden="true"></span>
-                    </button>
-                </div>
-                <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
-            </div>
-            <!-- Theme Select -->
-            <div class="relative w-full">
-                <div
-                    class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                    <i data-lucide="sun-moon" class="w-3 h-3" x-show="theme === 'auto'"></i>
-                    <i data-lucide="sun" class="w-3 h-3" x-show="theme === 'light'"></i>
-                    <i data-lucide="moon" class="w-3 h-3" x-show="theme === 'dark'"></i>
-                    <select @change="setTheme($event.target.value)"
-                        class="flex-1 bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit"
-                        x-model="theme">
-                        <option value="auto">{{ t('navbar.theme.auto') }}</option>
-                        <option value="light">{{ t('navbar.theme.light_mode') }}</option>
-                        <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
-                    </select>
-                </div>
-            </div>
-            <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
-                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
-                <i data-lucide="trash-2" class="w-3 h-3"></i>
-                {{ t('chat.clear_all_history') }}
-            </button>
-            <button @click="clearApiKey()"
+        <div class="p-2 border-t border-line flex-shrink-0">
+            <button @click="showChatSettingsModal = true"
                 class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                <i data-lucide="key" class="w-3 h-3"></i>
-                {{ t('chat.change_api_key') }}
+                <i data-lucide="settings" class="w-3 h-3"></i>
+                {{ t('chat.chat_settings') }}
             </button>
         </div>
     </div>
@@ -2022,6 +1985,83 @@
         <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
     </div>
 
+    <!-- Chat Settings Modal -->
+    <div x-show="showChatSettingsModal" x-cloak
+        class="fixed inset-0 z-50 overflow-y-auto"
+        @keydown.escape.window="showChatSettingsModal = false"
+        x-transition:enter="transition ease-out duration-200"
+        x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+        x-transition:leave="transition ease-in duration-150"
+        x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0">
+        <div class="fixed inset-0 bg-black/50" @click="showChatSettingsModal = false"></div>
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-surface rounded-2xl shadow-2xl w-full max-w-md p-6" @click.stop
+                x-transition:enter="transition ease-out duration-200"
+                x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+                x-transition:leave="transition ease-in duration-150"
+                x-transition:leave-start="opacity-100 scale-100" x-transition:leave-end="opacity-0 scale-95">
+                <div class="flex items-center justify-between mb-6">
+                    <h3 class="text-lg font-bold" style="color: var(--text-primary);">{{ t('chat.chat_settings') }}</h3>
+                    <button @click="showChatSettingsModal = false"
+                        class="p-2 hover:bg-surface-muted rounded-full transition-colors">
+                        <i data-lucide="x" class="w-5 h-5" style="color: var(--text-tertiary);"></i>
+                    </button>
+                </div>
+                <div class="mb-6">
+                    <label class="block text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.theme_label') }}</label>
+                    <select @change="setTheme($event.target.value)" x-model="theme"
+                        class="w-full px-3 py-2 border border-line rounded-xl text-sm focus:outline-none focus:border-line-strong"
+                        style="background: var(--bg-primary); color: var(--text-primary);">
+                        <option value="auto">{{ t('navbar.theme.auto') }}</option>
+                        <option value="light">{{ t('navbar.theme.light_mode') }}</option>
+                        <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
+                    </select>
+                </div>
+                <div class="mb-6">
+                    <div class="svg-allow-row">
+                        <div class="svg-allow-label">
+                            <i data-lucide="wand-sparkles" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
+                            <span class="text-sm truncate" style="color: var(--text-primary);"
+                                x-text="window.t('chat.allow_svg')"></span>
+                        </div>
+                        <button type="button" role="switch" class="svg-allow-switch"
+                            :class="{ 'is-on': allowSvg }"
+                            :aria-checked="allowSvg ? 'true' : 'false'"
+                            :aria-label="window.t('chat.allow_svg')"
+                            @click="setAllowSvg(!allowSvg)">
+                            <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                        </button>
+                    </div>
+                    <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
+                </div>
+                <div class="pt-4 border-t border-line">
+                    <h4 class="text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.chat_history_label') }}</h4>
+                    <div class="space-y-1">
+                        <button @click="downloadChats()"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-surface-muted rounded-lg"
+                            style="color: var(--text-primary);">
+                            <i data-lucide="download" class="w-4 h-4"></i>
+                            {{ t('chat.download_chats') }}
+                        </button>
+                        <input type="file" accept=".json,application/json" x-ref="importChatsInput"
+                            @change="importChats($event)" class="hidden">
+                        <button @click="$refs.importChatsInput.click()"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-surface-muted rounded-lg"
+                            style="color: var(--text-primary);">
+                            <i data-lucide="upload" class="w-4 h-4"></i>
+                            {{ t('chat.import_chats') }}
+                        </button>
+                        <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-sm text-danger hover:bg-danger-bg rounded-lg">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            {{ t('chat.clear_all_history') }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
 </div>
 {% endblock %}
 
@@ -2044,6 +2084,13 @@
     }
 
     const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
+    const MAX_CHAT_HISTORY_SIZE = 100;
+    const CHAT_HISTORY_STORAGE_KEY = 'omlx_chat_history';
+    const API_KEY_STORAGE_KEY = 'omlx_chat_api_key';
+    const THEME_STORAGE_KEY = 'omlx-chat-theme';
+    const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
+    const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
+    const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
 
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
@@ -2067,8 +2114,9 @@
             isMobile: window.innerWidth < 768,
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
-            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
-            allowSvg: localStorage.getItem('omlx-chat-allow-svg') === 'true',
+            showChatSettingsModal: false,
+            theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
+            allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
 
@@ -2495,9 +2543,12 @@
                         existing.name = m.name;
                     }
                 }
-                return Array.from(byId.values()).sort((a, b) =>
-                    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-                );
+                return Array.from(byId.values()).sort((a, b) => {
+                    // Favorites always sort first; names decide within each group.
+                    const favDiff = (b.is_favorite ? 1 : 0) - (a.is_favorite ? 1 : 0);
+                    if (favDiff !== 0) return favDiff;
+                    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+                });
             },
 
             resolvePreferredDefaultModel(defaultModel) {
@@ -3208,7 +3259,7 @@
                         model: historyChat?.model || (this.currentChatId === chatId ? this.currentModel : null),
                         systemPrompt: historyChat?.systemPrompt ?? (this.currentChatId === chatId
                             ? this.systemPrompt
-                            : (localStorage.getItem('omlx_chat_system_prompt') || '')),
+                            : (localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || '')),
                         activeProfile: historyChat?.activeProfile ?? null,
                         modelSettings: historyChat?.modelSettings
                             ? this.cloneData(historyChat.modelSettings) : null,
@@ -3346,10 +3397,10 @@
                 const serverApiKey = {{ api_key | tojson }};
 
         if (serverApiKey) {
-            localStorage.setItem('omlx_chat_api_key', serverApiKey);
+            localStorage.setItem(API_KEY_STORAGE_KEY, serverApiKey);
         }
 
-        const storedKey = localStorage.getItem('omlx_chat_api_key');
+        const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (storedKey) {
             this.apiKeySet = true;
             await this.loadModels();
@@ -3810,9 +3861,84 @@
         });
     },
 
+    async downloadChats() {
+        const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+        if (!history) {
+            alert(window.t('chat.no_chats_to_export'));
+            return;
+        }
+        try {
+            const chats = JSON.parse(history);
+            if (!chats.length) {
+                alert(window.t('chat.no_chats_to_export'));
+                return;
+            }
+            const json = JSON.stringify(chats, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'omlx-chats.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('Failed to download chats:', e);
+        }
+    },
+
+    importChats(event) {
+        const file = event.target.files?.[0];
+        // Reset so selecting the same file again re-fires the change event
+        event.target.value = '';
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            let imported;
+            try {
+                imported = JSON.parse(e.target.result);
+            } catch {
+                alert(window.t('chat.error.import_invalid'));
+                return;
+            }
+            const valid = Array.isArray(imported)
+                ? imported.filter(c => c && typeof c.id === 'string' && c.id && Array.isArray(c.messages))
+                : [];
+            if (!valid.length) {
+                alert(window.t('chat.error.import_invalid'));
+                return;
+            }
+            const ts = (c) => {
+                const t = c?.updatedAt ? Date.parse(c.updatedAt) : 0;
+                return Number.isNaN(t) ? 0 : t;
+            };
+            const byId = new Map(this.chatHistory.map(c => [c.id, c]));
+            const changed = new Set();
+            for (const entry of valid) {
+                const existing = byId.get(entry.id);
+                if (existing) {
+                    // Never overwrite the open or streaming chat; its live state is the truth
+                    if (entry.id === this.currentChatId || this.isChatStreaming(entry.id)) continue;
+                    if (ts(entry) <= ts(existing)) continue;
+                    delete this.chatSessions[entry.id];
+                }
+                byId.set(entry.id, entry);
+                changed.add(entry.id);
+            }
+            this.chatHistory = [...byId.values()]
+                .sort((a, b) => ts(b) - ts(a))
+                .slice(0, MAX_CHAT_HISTORY_SIZE);
+            this.saveChatHistory();
+            alert(window.t('chat.import_success').replace('{count}', changed.size));
+        };
+        reader.onerror = () => alert(window.t('chat.error.import_invalid'));
+        reader.readAsText(file);
+    },
+
     async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
-        localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
+        localStorage.setItem(API_KEY_STORAGE_KEY, this.apiKeyInput.trim());
         this.apiKeySet = true;
         this.apiKeyInput = '';
         try {
@@ -3826,20 +3952,8 @@
         this.loadChatHistory();
     },
 
-    clearApiKey() {
-        if (confirm(window.t('chat.confirm_change_api_key'))) {
-            this.stopAllStreams();
-            localStorage.removeItem('omlx_chat_api_key');
-            this.apiKeySet = false;
-            this.chatSessions = {};
-            this.streamSessions = {};
-            this.messages = [];
-            this.currentChatId = null;
-        }
-    },
-
     getApiKey() {
-        return localStorage.getItem('omlx_chat_api_key') || '';
+        return localStorage.getItem(API_KEY_STORAGE_KEY) || '';
     },
 
     combineAbortSignals(signals) {
@@ -3893,7 +4007,7 @@
             if (!modelsResponse.ok) {
                 if (modelsResponse.status === 401) {
                     alert(window.t('chat.error.incorrect_api_key'));
-                    localStorage.removeItem('omlx_chat_api_key');
+                    localStorage.removeItem(API_KEY_STORAGE_KEY);
                     this.apiKeySet = false;
                     this.messages = [];
                     this.currentChatId = null;
@@ -3932,6 +4046,11 @@
             const modelsData = await modelsResponse.json();
             const allModels = modelsData.data || [];
 
+            // Favorite gateway ids from the admin list; used to sort favorites first
+            const favoriteIds = new Set(
+                (this._adminModelsList || []).filter(m => m.is_favorite).map(m => m.id)
+            );
+
             // Build available models with gateway id (directory name) as the value
             // Store alias for display (in case we want to show it later)
             this.availableModels = this.dedupeAvailableModels(
@@ -3942,7 +4061,8 @@
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
-                    owned_by: m.owned_by
+                    owned_by: m.owned_by,
+                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id)
                 }))
             );
 
@@ -4132,16 +4252,16 @@
 
     loadPromptProfiles() {
         try {
-            const raw = localStorage.getItem('omlx_chat_prompt_profiles');
+            const raw = localStorage.getItem(PROMPT_PROFILES_STORAGE_KEY);
             if (raw) {
                 this.promptProfiles = JSON.parse(raw);
             } else {
                 // Migrate from old single-default format
-                const oldDefault = localStorage.getItem('omlx_chat_system_prompt');
+                const oldDefault = localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY);
                 if (oldDefault) {
                     this.promptProfiles = [{ name: 'System Default', content: oldDefault }];
                     this._persistPromptProfiles();
-                    localStorage.removeItem('omlx_chat_system_prompt');
+                    localStorage.removeItem(SYSTEM_PROMPT_STORAGE_KEY);
                 }
             }
             // Ensure System Default profile always exists
@@ -4163,7 +4283,7 @@
     },
 
     _persistPromptProfiles() {
-        localStorage.setItem('omlx_chat_prompt_profiles', JSON.stringify(this.promptProfiles));
+        localStorage.setItem(PROMPT_PROFILES_STORAGE_KEY, JSON.stringify(this.promptProfiles));
     },
 
     selectPromptProfile(name) {
@@ -4301,7 +4421,7 @@
     },
 
     loadChatHistory() {
-        const history = localStorage.getItem('omlx_chat_history');
+        const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
         if (history) {
             try {
                 this.chatHistory = JSON.parse(history);
@@ -4327,7 +4447,7 @@
     },
 
     saveChatHistory() {
-        const key = 'omlx_chat_history';
+        const key = CHAT_HISTORY_STORAGE_KEY;
         const persist = () => localStorage.setItem(key, JSON.stringify(this.chatHistory));
         try {
             persist();
@@ -4553,8 +4673,8 @@
             this.chatHistory.unshift(chatData);
         }
 
-        // Keep only last 50 chats
-        this.chatHistory = this.chatHistory.slice(0, 50);
+        // Keep only last MAX_CHAT_HISTORY_SIZE chats
+        this.chatHistory = this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE);
         this.saveChatHistory();
     },
 
@@ -5802,7 +5922,7 @@
 
     setAllowSvg(enabled) {
         this.allowSvg = !!enabled;
-        localStorage.setItem('omlx-chat-allow-svg', this.allowSvg ? 'true' : 'false');
+        localStorage.setItem(ALLOW_SVG_STORAGE_KEY, this.allowSvg ? 'true' : 'false');
         this.refreshCodeBlockButtons();
     },
 
@@ -6089,7 +6209,7 @@
 
     setTheme(theme) {
         this.theme = theme;
-        localStorage.setItem('omlx-chat-theme', this.theme);
+        localStorage.setItem(THEME_STORAGE_KEY, this.theme);
         this.applyTheme();
     },
 

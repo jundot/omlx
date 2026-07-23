@@ -554,6 +554,38 @@ class TestPagedCacheManager:
         assert result is True
         assert block.ref_count == 2
 
+    def test_acquire_cached_block_success(self):
+        """Acquire takes a reference when the block still holds the hash."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block.block_hash = b"chain-hash"
+
+        acquired = manager.acquire_cached_block(block.block_id, b"chain-hash")
+        assert acquired is block
+        assert block.ref_count == 2
+
+    def test_acquire_cached_block_rejects_hash_mismatch(self):
+        """A reassigned block (different hash) must not be handed out."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block.block_hash = b"chain-hash"
+
+        assert manager.acquire_cached_block(block.block_id, b"other-hash") is None
+        assert block.ref_count == 1
+
+    def test_acquire_cached_block_rejects_unallocated(self):
+        """A freed / never-allocated block id must not be handed out."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block.block_hash = b"chain-hash"
+        manager.free_block(block.block_id)
+
+        assert manager.acquire_cached_block(block.block_id, b"chain-hash") is None
+        assert manager.acquire_cached_block(9999, b"chain-hash") is None
+
     def test_create_block_table(self):
         """Test creating a block table for a request."""
         manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)

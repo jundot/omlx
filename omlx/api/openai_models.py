@@ -28,9 +28,9 @@ from omlx.api.shared_models import (
 
 
 class ImageURL(BaseModel):
-    """Image URL or base64 data URI for vision model input."""
+    """Base64 data URI for vision model input."""
 
-    url: str  # "https://..." or "data:image/jpeg;base64,..."
+    url: str  # "data:image/jpeg;base64,..."
     detail: Optional[str] = "auto"  # "low", "high", "auto"
 
 

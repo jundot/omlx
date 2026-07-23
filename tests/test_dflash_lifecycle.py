@@ -25,6 +25,8 @@ def _make_fake_dflash_module():
 
     def fake_installer(linear_attn):
         cls = type(linear_attn)
+        if getattr(cls, "_dflash_speculative_call_installed", False):
+            return
         # Mimic dflash: overwrite cls.__call__ and set its idempotency flag.
         def fake_speculative_call(self, inputs, mask=None, cache=None):
             return inputs
@@ -34,6 +36,8 @@ def _make_fake_dflash_module():
 
     def fake_gqa_installer(attn):
         cls = type(attn)
+        if getattr(cls, "_dflash_full_attention_gqa_installed", False):
+            return
         # Mimic dflash 0.1.7's full-attention GQA hook: overwrite __call__
         # and set its idempotency flag. The real hook's first line does
         # int(cache.offset), which is what crashes on batched offsets.
@@ -221,6 +225,104 @@ class TestQwenGqaHook:
         assert FakeAttention in _DFLASH_BACKUP
 
         # DFlash engine stops -> restore must revert the class and drop flag.
+        restore_dflash_class_patches()
+        assert FakeAttention.__call__ is stock_call
+        assert "_dflash_full_attention_gqa_installed" not in FakeAttention.__dict__
+
+
+class TestBatchCacheGuard:
+    """Regression for issue #2252.
+
+    While a DFlash engine is armed, its class hooks are visible to every
+    engine sharing the patched Python class. A concurrent BatchedEngine
+    decode hands the hook a BatchKVCache whose ``offset`` is a per-row
+    ``mx.array``, which the raw dflash hook converts with ``int()`` and
+    crashes. The lifecycle wrap must guard the installed hook so such
+    caches fall through to the pre-dflash ``__call__``.
+    """
+
+    @staticmethod
+    def _arm(mod, attn_cls):
+        from omlx.patches.dflash_lifecycle import _wrap_installer
+
+        _wrap_installer(
+            mod,
+            "_install_full_attention_gqa_hook",
+            "_dflash_full_attention_gqa_installed",
+        )
+        mod._install_full_attention_gqa_hook(attn_cls())
+
+    def test_batch_cache_falls_through_to_pre_dflash_call(
+        self, _clear_backup_state
+    ):
+        import mlx.core as mx
+
+        mod = _make_fake_dflash_module()
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-attn"
+
+        self._arm(mod, FakeAttention)
+        assert getattr(
+            FakeAttention.__call__, "_omlx_dflash_batch_guard", False
+        )
+
+        class FakeBatchCache:
+            offset = mx.array([3, 7])
+
+        # Multi-row batch cache must bypass the dflash hook entirely.
+        result = FakeAttention()("x", cache=FakeBatchCache())
+        assert result == "stock-attn"
+
+    def test_scalar_offset_cache_still_routes_to_dflash_hook(
+        self, _clear_backup_state
+    ):
+        mod = _make_fake_dflash_module()
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-attn"
+
+        self._arm(mod, FakeAttention)
+
+        class FakeKVCache:
+            offset = 42
+
+        # dflash's own caches carry int offsets; the hook keeps running.
+        assert FakeAttention()("x", cache=FakeKVCache()) == "x"
+        # No cache at all also stays on the dflash hook.
+        assert FakeAttention()("x") == "x"
+
+    def test_guard_is_idempotent_across_layer_installs(
+        self, _clear_backup_state
+    ):
+        mod = _make_fake_dflash_module()
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-attn"
+
+        self._arm(mod, FakeAttention)
+        guarded = FakeAttention.__call__
+        # Second layer of the same class re-runs the installer; the guard
+        # must not wrap itself again.
+        mod._install_full_attention_gqa_hook(FakeAttention())
+        assert FakeAttention.__call__ is guarded
+
+    def test_restore_drops_guard_and_hook(self, _clear_backup_state):
+        from omlx.patches.dflash_lifecycle import restore_dflash_class_patches
+
+        mod = _make_fake_dflash_module()
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-attn"
+
+        stock_call = FakeAttention.__call__
+        self._arm(mod, FakeAttention)
+        assert FakeAttention.__call__ is not stock_call
+
         restore_dflash_class_patches()
         assert FakeAttention.__call__ is stock_call
         assert "_dflash_full_attention_gqa_installed" not in FakeAttention.__dict__

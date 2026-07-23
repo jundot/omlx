@@ -30,7 +30,7 @@ final class ModelSettingsScreenVM {
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
-        case forceSampling, isPinned
+        case forceSampling, isPinned, isFavorite
         case trustRemoteCode
         case reasoningParser
         case chatTemplateKwargs
@@ -58,19 +58,19 @@ final class ModelSettingsScreenVM {
             ("vlm", String(localized: "settings.model_type.vlm",
                            defaultValue: "VLM",
                            comment: "Model type option label for vision-language models")),
-            ("embed", String(localized: "settings.model_type.embed",
-                             defaultValue: "Embedding",
-                             comment: "Model type option label for embedding models")),
-            ("rerank", String(localized: "settings.model_type.rerank",
-                              defaultValue: "Reranker",
-                              comment: "Model type option label for reranker models")),
-            ("audio-stt", String(localized: "settings.model_type.audio_stt",
+            ("embedding", String(localized: "settings.model_type.embed",
+                                 defaultValue: "Embedding",
+                                 comment: "Model type option label for embedding models")),
+            ("reranker", String(localized: "settings.model_type.rerank",
+                                defaultValue: "Reranker",
+                                comment: "Model type option label for reranker models")),
+            ("audio_stt", String(localized: "settings.model_type.audio_stt",
                                  defaultValue: "Audio STT",
                                  comment: "Model type option label for speech-to-text models")),
-            ("audio-tts", String(localized: "settings.model_type.audio_tts",
+            ("audio_tts", String(localized: "settings.model_type.audio_tts",
                                  defaultValue: "Audio TTS",
                                  comment: "Model type option label for text-to-speech models")),
-            ("audio-sts", String(localized: "settings.model_type.audio_sts",
+            ("audio_sts", String(localized: "settings.model_type.audio_sts",
                                  defaultValue: "Audio STS",
                                  comment: "Model type option label for speech-to-speech models")),
         ]
@@ -238,6 +238,7 @@ final class ModelSettingsScreenVM {
     var toolResultLimitTokens: String = "4096"
     var forceSampling: Bool = false
     var isPinned: Bool = false
+    var isFavorite: Bool = false
 
     // Security
     var trustRemoteCode: Bool = false
@@ -366,7 +367,7 @@ final class ModelSettingsScreenVM {
             return true
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
-        case .temperature, .ttl, .isPinned, .trustRemoteCode:
+        case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
             return false
         case .chatTemplateKwargs:
             return false
@@ -423,66 +424,72 @@ final class ModelSettingsScreenVM {
             self.allModels = models
             if let m = models.first(where: { $0.id == modelID }) {
                 self.model = m
-                if let s = m.settings {
-                    self.alias = s.modelAlias ?? ""
-                    self.modelTypeOverride = s.modelTypeOverride ?? ""
-                    self.contextLength = s.maxContextWindow.map(String.init) ?? ""
-                    self.maxTokens = s.maxTokens.map(String.init) ?? ""
-                    self.temperature = s.temperature.map { String($0) } ?? ""
-                    self.topP = s.topP.map { String($0) } ?? ""
-                    self.topK = s.topK.map(String.init) ?? ""
-                    self.minP = s.minP.map { String($0) } ?? ""
-                    self.repetitionPenalty = s.repetitionPenalty.map { String($0) } ?? ""
-                    self.presencePenalty = s.presencePenalty.map { String($0) } ?? ""
-                    self.ttlSeconds = s.ttlSeconds.map(String.init) ?? ""
-                    self.enableThinking = s.enableThinking ?? true
-                    self.thinkingBudgetEnabled = s.thinkingBudgetEnabled ?? false
-                    self.thinkingBudgetTokens = s.thinkingBudgetTokens.map(String.init) ?? "8192"
-                    self.limitToolResults = (s.maxToolResultTokens ?? 0) > 0
-                    if let n = s.maxToolResultTokens, n > 0 {
-                        self.toolResultLimitTokens = String(n)
-                    }
-                    self.forceSampling = s.forceSampling ?? false
-                    self.isPinned = s.isPinned ?? false
-                    self.trustRemoteCode = s.trustRemoteCode ?? false
-                    self.reasoningParser = s.reasoningParser ?? ""
-                    self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
-                        ChatTemplateKwargsCodec.decode(
-                            kwargs: s.chatTemplateKwargs,
-                            forced: s.forcedCtKwargs
-                        )
-                    )
-                    self.turboquantKvEnabled = s.turboquantKvEnabled ?? false
-                    self.turboquantKvBits = s.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
-                    self.indexCacheEnabled = s.indexCacheFreq != nil
-                    self.indexCacheFreq = s.indexCacheFreq.map(String.init) ?? "4"
-                    self.specprefillEnabled = s.specprefillEnabled ?? false
-                    self.specprefillDraftModel = s.specprefillDraftModel ?? ""
-                    self.specprefillKeepPct = s.specprefillKeepPct.map { Self.formatPct($0) } ?? "0.2"
-                    self.specprefillThreshold = s.specprefillThreshold.map(String.init) ?? "8192"
-                    self.dflashEnabled = s.dflashEnabled ?? false
-                    self.dflashDraftModel = s.dflashDraftModel ?? ""
-                    self.dflashDraftQuantEnabled = s.dflashDraftQuantEnabled ?? false
-                    self.dflashDraftQuantWeightBits = s.dflashDraftQuantWeightBits.map(String.init) ?? "4"
-                    self.dflashDraftQuantActivationBits = s.dflashDraftQuantActivationBits.map(String.init) ?? ""
-                    self.dflashDraftQuantGroupSize = s.dflashDraftQuantGroupSize.map(String.init) ?? ""
-                    self.dflashMaxCtx = s.dflashMaxCtx.map(String.init) ?? ""
-                    self.dflashVerifyMode = s.dflashVerifyMode ?? ""
-                    self.dflashDraftWindowSize = s.dflashDraftWindowSize.map(String.init) ?? ""
-                    self.dflashDraftSinkSize = s.dflashDraftSinkSize.map(String.init) ?? ""
-                    self.dflashInMemoryCache = s.dflashInMemoryCache ?? false
-                    self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s.dflashInMemoryCacheMaxBytes)
-                        .map(String.init) ?? "8"
-                    self.dflashInMemoryCacheMaxEntries = s.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
-                    self.dflashSsdCache = s.dflashSsdCache ?? false
-                    self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s.dflashSsdCacheMaxBytes)
-                        .map(String.init) ?? "20"
-                    self.mtpEnabled = s.mtpEnabled ?? false
-                    self.vlmMtpEnabled = s.vlmMtpEnabled ?? false
-                    self.vlmMtpDraftModel = s.vlmMtpDraftModel ?? ""
-                    self.vlmMtpDraftBlockSize = s.vlmMtpDraftBlockSize.map(String.init) ?? ""
-                    self.activeProfileName = s.activeProfileName
+                // A never-customized model has no settings record on the
+                // server, so `settings` arrives nil. Repopulate with the
+                // defaults anyway; skipping would leave edited values on
+                // screen after Discard (#2182).
+                let s = m.settings
+                self.alias = s?.modelAlias ?? ""
+                self.modelTypeOverride = s?.modelTypeOverride ?? ""
+                self.contextLength = s?.maxContextWindow.map(String.init) ?? ""
+                self.maxTokens = s?.maxTokens.map(String.init) ?? ""
+                self.temperature = s?.temperature.map { String($0) } ?? ""
+                self.topP = s?.topP.map { String($0) } ?? ""
+                self.topK = s?.topK.map(String.init) ?? ""
+                self.minP = s?.minP.map { String($0) } ?? ""
+                self.repetitionPenalty = s?.repetitionPenalty.map { String($0) } ?? ""
+                self.presencePenalty = s?.presencePenalty.map { String($0) } ?? ""
+                self.ttlSeconds = s?.ttlSeconds.map(String.init) ?? ""
+                self.enableThinking = s?.enableThinking ?? true
+                self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
+                self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
+                self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
+                if let n = s?.maxToolResultTokens, n > 0 {
+                    self.toolResultLimitTokens = String(n)
+                } else {
+                    self.toolResultLimitTokens = "4096"
                 }
+                self.forceSampling = s?.forceSampling ?? false
+                self.isPinned = s?.isPinned ?? false
+                self.isFavorite = s?.isFavorite ?? false
+                self.trustRemoteCode = s?.trustRemoteCode ?? false
+                self.reasoningParser = s?.reasoningParser ?? ""
+                self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
+                    ChatTemplateKwargsCodec.decode(
+                        kwargs: s?.chatTemplateKwargs,
+                        forced: s?.forcedCtKwargs
+                    )
+                )
+                self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
+                self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
+                self.indexCacheEnabled = s?.indexCacheFreq != nil
+                self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
+                self.specprefillEnabled = s?.specprefillEnabled ?? false
+                self.specprefillDraftModel = s?.specprefillDraftModel ?? ""
+                self.specprefillKeepPct = s?.specprefillKeepPct.map { Self.formatPct($0) } ?? "0.2"
+                self.specprefillThreshold = s?.specprefillThreshold.map(String.init) ?? "8192"
+                self.dflashEnabled = s?.dflashEnabled ?? false
+                self.dflashDraftModel = s?.dflashDraftModel ?? ""
+                self.dflashDraftQuantEnabled = s?.dflashDraftQuantEnabled ?? false
+                self.dflashDraftQuantWeightBits = s?.dflashDraftQuantWeightBits.map(String.init) ?? "4"
+                self.dflashDraftQuantActivationBits = s?.dflashDraftQuantActivationBits.map(String.init) ?? ""
+                self.dflashDraftQuantGroupSize = s?.dflashDraftQuantGroupSize.map(String.init) ?? ""
+                self.dflashMaxCtx = s?.dflashMaxCtx.map(String.init) ?? ""
+                self.dflashVerifyMode = s?.dflashVerifyMode ?? ""
+                self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
+                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? ""
+                self.dflashInMemoryCache = s?.dflashInMemoryCache ?? false
+                self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s?.dflashInMemoryCacheMaxBytes)
+                    .map(String.init) ?? "8"
+                self.dflashInMemoryCacheMaxEntries = s?.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
+                self.dflashSsdCache = s?.dflashSsdCache ?? false
+                self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
+                    .map(String.init) ?? "20"
+                self.mtpEnabled = s?.mtpEnabled ?? false
+                self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
+                self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
+                self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
+                self.activeProfileName = s?.activeProfileName
             }
             self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
             self.templates = (try? await client.listProfileTemplates().templates) ?? []
@@ -575,6 +582,7 @@ final class ModelSettingsScreenVM {
             patch.maxToolResultTokens = n
         case .forceSampling:           patch.forceSampling = forceSampling
         case .isPinned:                patch.isPinned = isPinned
+        case .isFavorite:              patch.isFavorite = isFavorite
         case .trustRemoteCode:         patch.trustRemoteCode = trustRemoteCode
         case .reasoningParser:
             patch.reasoningParser = reasoningParser.isEmpty ? nil : reasoningParser
@@ -746,8 +754,8 @@ final class ModelSettingsScreenVM {
         }
         if vlmMtpEnabled {
             return String(localized: "settings.mtp.conflict.vlm_mtp",
-                          defaultValue: "Disable VLM MTP before enabling Native MTP.",
-                          comment: "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on")
+                          defaultValue: "Disable VLM MTP before enabling Lightning MTP.",
+                          comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
     }
@@ -768,8 +776,8 @@ final class ModelSettingsScreenVM {
         }
         if mtpEnabled {
             return String(localized: "settings.vlm_mtp.conflict.mtp",
-                          defaultValue: "Disable Native MTP before enabling VLM MTP.",
-                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on")
+                          defaultValue: "Disable Lightning MTP before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because Lightning MTP is on")
         }
         if turboquantKvEnabled {
             return String(localized: "settings.vlm_mtp.conflict.turboquant",

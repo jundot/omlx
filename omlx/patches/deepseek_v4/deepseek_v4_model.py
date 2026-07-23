@@ -15,7 +15,10 @@ from .cache import CacheList, PoolingCache, RotatingKVCache
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU
+from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
+_DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = False
 
 
 def _materialize_cache_arrays(cache: Optional[Any]) -> None:
@@ -360,8 +363,51 @@ def _sparse_pooled_attention(
     pooled_mask: Optional[mx.array],
     scale: float,
     sinks: Optional[mx.array],
+    q_offset: Optional[Union[int, mx.array]] = None,
+    compress_ratio: Optional[int] = None,
+    local_window: Optional[int] = None,
 ) -> mx.array:
+    global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+
     B, H, L, D = q.shape
+    if (
+        not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+        and q_offset is not None
+        and compress_ratio is not None
+        and local_window is not None
+        and sinks is not None
+        and not isinstance(q_offset, mx.array)
+        and q.dtype in (mx.float16, mx.bfloat16)
+        and topk.dtype == mx.uint32
+        and B >= 1
+        and H == 64
+        and L > 1
+        and D == 512
+        and local_kv.ndim == 4
+        and local_kv.shape[1] == 1
+        and local_kv.shape[-1] == D
+        and pooled.ndim == 3
+        and pooled.shape[-1] == D
+        and topk.ndim == 3
+    ):
+        try:
+            from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+            if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
+                return glm_fast.deepseek_v4_sparse_attention(
+                    q,
+                    local_kv,
+                    pooled,
+                    topk[:, None],
+                    sinks,
+                    scale,
+                    int(q_offset),
+                    int(compress_ratio),
+                    int(local_window),
+                )
+        except Exception:
+            _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
         mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
@@ -476,6 +522,7 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts = DeepseekV4MLP(
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            swiglu_limit=config.swiglu_limit,
         )
         self.sharding_group = None
 
@@ -484,8 +531,9 @@ class DeepseekV4MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None].astype(y.dtype)).sum(-2)
+        y = self.switch_mlp(x, inds, scores=scores)
+        if y.ndim == scores.ndim + 1:
+            y = (y * scores[..., None].astype(y.dtype)).sum(-2)
         y = y + self.shared_experts(x)
 
         if self.sharding_group is not None:
@@ -540,7 +588,36 @@ class Compressor(nn.Module):
             )
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
-            new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+
+            # Overlap (ratio==4) pools each window from its own lane-B plus the
+            # previous window's lane-A. _overlap_compress_kv gets lane-A via
+            # `kv_a[:, :-1]` (window-axis shift), which collapses to zero-
+            # padding when only one window is in view (every decode step, and
+            # the first window of any prefill/verify chunk). Prepend the last
+            # completed window carried in the cache so the shift sees a real
+            # predecessor; drop the prepend's own (zero lane-A) pooled output.
+            # Mirrors native DS4's rolling state_kv double buffer
+            # (ds4.c compressor_decode_one). The carry is per batch row: rows
+            # without a valid prev come back -inf gated so the kernel masks
+            # their lane-A exactly like its own first-window padding. rope
+            # runs on the current windows only with pool_base, so positions
+            # stay aligned.
+            prev_kv = prev_gate = None
+            if self.overlap and pool_cache is not None:
+                prev_kv, prev_gate = pool_cache.prev_for_prepend()
+            if prev_kv is not None:
+                kv = mx.concatenate([prev_kv, kv], axis=1)
+                gate = mx.concatenate([prev_gate, gate], axis=1)
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+                new_pooled = new_pooled[:, 1:]
+            else:
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+
+            if self.overlap and pool_cache is not None:
+                pool_cache.store_prev(
+                    kv, gate, dropped=1 if prev_kv is not None else 0
+                )
+
             new_pooled = self.norm(new_pooled)
             new_pooled = self.rope(
                 new_pooled[:, None],
@@ -574,6 +651,8 @@ class Indexer(nn.Module):
         pool_cache: Optional[PoolingCache],
         offset: Union[int, mx.array],
     ):
+        global _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED
+
         B, L, _ = x.shape
         pooled = self.compressor(x, pool_cache, offset)
         if pooled.shape[1] == 0:
@@ -583,20 +662,61 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = position_rope(q, offset)
 
+        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
+        k = min(self.index_topk, pooled.shape[1])
+
+        if (
+            not _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED
+            and pooled.shape[1] > self.index_topk
+            and k == self.index_topk
+            and L > 1
+            and L % 64 == 0
+            and pooled.shape[1] % 64 == 0
+            and self.n_heads in (32, 64)
+            and self.head_dim == 128
+            and q.dtype in (mx.float16, mx.bfloat16)
+        ):
+            try:
+                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+                if glm_fast.has_symbol("dsa_indexer_scores") and glm_fast.has_symbol(
+                    "dsa_topk_indices"
+                ):
+                    weights = self.weights_proj(x).astype(q.dtype) * (
+                        (self.n_heads**-0.5) * self.scale
+                    )
+                    scores4 = glm_fast.dsa_indexer_scores(
+                        q,
+                        pooled[:, None],
+                        weights,
+                        causal=False,
+                    )
+                    if pmask is not None:
+                        scores4 = mx.where(
+                            (pmask[:, None] if pmask.ndim == 3 else pmask[None, None]),
+                            scores4,
+                            mx.finfo(scores4.dtype).min,
+                        )
+                    return glm_fast.dsa_topk_indices(
+                        scores4,
+                        self.index_topk,
+                        bucketed=True,
+                    )[:, 0]
+            except Exception:
+                _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = True
+
         scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
             mx.float32
         )
         scores = mx.maximum(scores, 0) * self.scale
         weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
         scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
-        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
                 scores,
                 mx.finfo(scores.dtype).min,
             )
-        k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
 
@@ -907,6 +1027,9 @@ class SparseCompressedAttention(nn.Module):
                 sparse_mask,
                 self.scale,
                 sinks,
+                q_offset=offset,
+                compress_ratio=self.compress_ratio,
+                local_window=self.config.sliding_window,
             )
 
         out = self.rope(out, offset, inverse=True)
@@ -1140,6 +1263,19 @@ class Model(nn.Module):
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
+            skip = False
+            for old, new in (
+                (".hc_attn.", ".attn_hc."),
+                (".hc_ffn.", ".ffn_hc."),
+            ):
+                if old in nk:
+                    candidate = nk.replace(old, new)
+                    if candidate in weights or candidate in remapped:
+                        skip = True
+                        break
+                    nk = candidate
+            if skip:
+                continue
             for old, new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
             remapped[nk] = v
@@ -1162,6 +1298,22 @@ class Model(nn.Module):
                         weights[
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
+
+        for key, value in list(weights.items()):
+            if (
+                ".ffn.switch_mlp." not in key
+                or not key.endswith((".scales", ".biases"))
+                or value.dtype != mx.bfloat16
+            ):
+                continue
+            stem = key.rsplit(".", 1)[0]
+            if (
+                stem + ".weight" in weights
+                and stem + ".scales" in weights
+                and stem + ".biases" in weights
+                and weights[stem + ".weight"].dtype == mx.uint32
+            ):
+                weights[key] = value.astype(mx.float16)
 
         # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers
         for layer_idx in range(n_layers):

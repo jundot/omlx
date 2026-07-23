@@ -39,3 +39,5 @@ instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 
 instantiate_dsa_topk_indices(float16, half, 2048, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);
+instantiate_dsa_topk_indices(float16, half, 512, 1024);
+instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 512, 1024);

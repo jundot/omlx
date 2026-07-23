@@ -73,6 +73,12 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+Les kernels natifs personnalisés optionnels pour GLM-5.2 / MiniMax M3 nécessitent actuellement un build HEAD :
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### Depuis les sources
 
 ```bash
@@ -80,6 +86,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # Core uniquement
 pip install -e ".[mcp]"   # Avec support MCP (Model Context Protocol)
+
+# Optionnel : kernels natifs personnalisés GLM-5.2 / MiniMax M3
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4).
@@ -350,6 +359,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # Forcer une reconstruction de venvstacks (sinon mis en cache par empreinte)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# Préparer avec les kernels natifs personnalisés optionnels GLM-5.2 / MiniMax M3
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 Le premier build à froid prend 10–20 minutes (assemblage des couches Python venvstacks). Les builds suivants réutilisent `packaging/_export/` et finissent en environ 4 minutes. Voir [packaging/README.md](packaging/README.md) pour la configuration des couches et [apps/omlx-mac/](apps/omlx-mac/) pour les sources Swift.

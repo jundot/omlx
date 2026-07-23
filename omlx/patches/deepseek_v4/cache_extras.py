@@ -35,6 +35,17 @@ class PoolingCache(_BaseCache):
         self.pooled = None
         self._undo = None
 
+        # Previous completed window's raw (pre-compression) KV/gate. Only
+        # used by overlap (ratio==4) compressors: decode hands a single
+        # window to _overlap_compress_kv, whose `kv_a[:, :-1]` lane-A shift
+        # collapses to zero-padding and drops the cross-window overlap that
+        # native DS4 keeps via a rolling double buffer (ds4.c
+        # compressor_decode_one). Carrying the last window here lets the
+        # Compressor prepend it so decode preserves the overlap. Simple
+        # (ratio==128) layers leave these None.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
+
     @property
     def offset(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
@@ -50,11 +61,11 @@ class PoolingCache(_BaseCache):
         # One-update undo log for MTP draft rejection: trim() needs the
         # pre-update state plus this update's raw inputs to undo the last
         # token when it completed a pool window. Only decode / MTP-verify
-        # sized updates (L <= 2) are ever trimmed; skipping the stash for
-        # prompt chunks avoids pinning large prefill projections. Buffer
-        # slices are taken before any mutation, so they reference the
-        # pre-update array node.
-        if L <= 2:
+        # sized updates (L <= 8 covers depth-k chain verify windows) are
+        # ever trimmed; skipping the stash for prompt chunks avoids pinning
+        # large prefill projections. Buffer slices are taken before any
+        # mutation, so they reference the pre-update array node.
+        if L <= 8:
             self._undo = (
                 self.buf_kv[:, : self.remainder] if self.remainder > 0 else None,
                 self.buf_gate[:, : self.remainder] if self.remainder > 0 else None,
@@ -62,6 +73,8 @@ class PoolingCache(_BaseCache):
                 self.pooled,
                 kv,
                 gate,
+                self.prev_win_kv,
+                self.prev_win_gate,
             )
         else:
             self._undo = None
@@ -163,6 +176,13 @@ class PoolingCache(_BaseCache):
             self.accumulate_windows(buf_kv, buf_gate, 0)
         self.pooled = pooled
         self._undo = None
+        # prev_win is runtime-only and not part of the persisted 3-tuple, so
+        # a state restore (SSD eviction/recovery) cannot rebuild it. The next
+        # window completed after restore pools with a zero lane-A once, then
+        # prev_win repopulates — a single-window overlap loss, not the
+        # persistent per-window loss the original decode bug caused.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
 
     @property
     def meta_state(self):
@@ -197,11 +217,15 @@ class PoolingCache(_BaseCache):
             return n
         if not self._can_undo(n):
             return 0
-        buf_kv, buf_gate, rem_prev, pooled_prev, kv, gate = self._undo
+        buf_kv, buf_gate, rem_prev, pooled_prev, kv, gate, prev_kv, prev_gate = (
+            self._undo
+        )
         self._undo = None
         k = kv.shape[1] - n
         self.pooled = pooled_prev
         self.remainder = rem_prev
+        self.prev_win_kv = prev_kv
+        self.prev_win_gate = prev_gate
         if buf_kv is not None:
             self.buf_kv[:, :rem_prev] = buf_kv
             self.buf_gate[:, :rem_prev] = buf_gate
@@ -211,6 +235,24 @@ class PoolingCache(_BaseCache):
             self.accumulate_windows(kv[:, :k], gate[:, :k], 0)
             self._undo = None
         return n
+
+    def prev_for_prepend(self):
+        """Previous completed window for the Compressor to prepend, or
+        ``(None, None)`` when no overlap carry is available."""
+        if self.prev_win_kv is None:
+            return None, None
+        return self.prev_win_kv, self.prev_win_gate
+
+    def store_prev(self, kv, gate, dropped):
+        """Roll the prev window after a compression step.
+
+        ``kv``/``gate`` are the (possibly prepended) window tensors the
+        Compressor just pooled; the last window is always this sequence's
+        newest completed window. ``dropped`` is unused for the single
+        sequence cache, kept for signature parity with BatchPoolingCache.
+        """
+        self.prev_win_kv = kv[:, -1:]
+        self.prev_win_gate = gate[:, -1:]
 
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
@@ -254,6 +296,18 @@ class BatchPoolingCache(_BaseCache):
         self._processed = [0] * batch_size
         self._undo = None
 
+        # Previous completed window's raw KV/gate per batch row, for overlap
+        # (ratio==4) compressors — see PoolingCache.prev_win_kv docstring.
+        # Rows complete windows at different steps (their window phase is
+        # their token count mod ratio), so the carry is tracked per row:
+        # _prev_valid[i] says whether row i's slot holds a real window.
+        # Invalid rows are masked with -inf gates at prepend time, which
+        # reproduces the kernel's own zero lane-A masking exactly.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
+        self._prev_valid = [False] * batch_size
+        self._last_usable = [0] * batch_size
+
     @property
     def offset(self):
         return mx.array(self._pool_lengths, dtype=mx.int32)
@@ -282,7 +336,7 @@ class BatchPoolingCache(_BaseCache):
         # the stashed objects keep the pre-update contents. The pooled
         # tensor needs no snapshot: update_and_fetch only writes beyond the
         # old _pool_lengths, so restoring the length lists is enough.
-        if L <= 2:
+        if L <= 8:
             self._undo = (
                 self.buf_kv,
                 self.buf_gate,
@@ -291,6 +345,9 @@ class BatchPoolingCache(_BaseCache):
                 list(self._processed),
                 kv,
                 gate,
+                self.prev_win_kv,
+                self.prev_win_gate,
+                list(self._prev_valid),
             )
         else:
             self._undo = None
@@ -305,6 +362,9 @@ class BatchPoolingCache(_BaseCache):
         usable = [(t // ratio) * ratio for t in totals]
         max_usable = max(usable)
         new_remainder = [t % ratio for t in totals]
+        # Consumed by store_prev right after this step's compression to
+        # locate each row's newest real window inside the ready tensor.
+        self._last_usable = usable
 
         # No sequence produced a full window yet
         if max_usable == 0:
@@ -445,6 +505,12 @@ class BatchPoolingCache(_BaseCache):
     def state(self, v):
         self.buf_kv, self.buf_gate, self.pooled = v
         self._undo = None
+        # prev_win is runtime-only and not part of the persisted state (see
+        # PoolingCache.state); the first window completed after a restore
+        # pools with a zero lane-A once, then the carry repopulates.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
+        self._prev_valid = [False] * len(self.remainder)
 
     @property
     def meta_state(self):
@@ -453,6 +519,11 @@ class BatchPoolingCache(_BaseCache):
     @meta_state.setter
     def meta_state(self, v):
         self.ratio, self.remainder, self._pool_lengths, self._processed = v
+        # Restore order between state and meta_state is not fixed; reset in
+        # both so _prev_valid always matches the restored batch size.
+        self.prev_win_kv = None
+        self.prev_win_gate = None
+        self._prev_valid = [False] * len(self.remainder)
 
     def is_trimmable(self):
         # Trim-by-1 contract (MTP draft rejection): possible while every
@@ -480,7 +551,18 @@ class BatchPoolingCache(_BaseCache):
             return n
         if not self._can_undo(n):
             return 0
-        buf_kv, buf_gate, remainder, pool_lengths, processed, kv, gate = self._undo
+        (
+            buf_kv,
+            buf_gate,
+            remainder,
+            pool_lengths,
+            processed,
+            kv,
+            gate,
+            prev_kv,
+            prev_gate,
+            prev_valid,
+        ) = self._undo
         self._undo = None
         k = kv.shape[1] - n
         # The undo path only triggers when some row completed a window,
@@ -492,12 +574,50 @@ class BatchPoolingCache(_BaseCache):
         self.remainder = list(remainder)
         self._pool_lengths = list(pool_lengths)
         self._processed = list(processed)
+        self.prev_win_kv = prev_kv
+        self.prev_win_gate = prev_gate
+        self._prev_valid = list(prev_valid)
         if k > 0:
             # Replay the confirmed prefix; _can_undo guarantees it stays in
             # the buffer, so no window is recompressed.
             self.accumulate_windows(kv[:, :k], gate[:, :k], 0)
             self._undo = None
         return n
+
+    def prev_for_prepend(self):
+        """Per-row previous window with invalid rows masked via -inf gates.
+
+        A row that has not completed a window since its carry was reset
+        must pool with a zero lane-A exactly like the kernel's own
+        first-window padding, so its prepended gate is forced to -inf
+        (softmax weight 0) instead of leaking zero-filled or stale data
+        at finite gate values.
+        """
+        if self.prev_win_kv is None or not any(self._prev_valid):
+            return None, None
+        if all(self._prev_valid):
+            return self.prev_win_kv, self.prev_win_gate
+        mask = mx.array(self._prev_valid).reshape(-1, 1, 1, 1)
+        gate = mx.where(mask, self.prev_win_gate, -mx.inf)
+        return self.prev_win_kv, gate
+
+    def store_prev(self, kv, gate, dropped):
+        """Roll the per-row prev window after a compression step.
+
+        ``kv``/``gate`` hold ``dropped`` prepended window(s) followed by
+        this step's ready windows, where row ``i`` contributed
+        ``self._last_usable[i] // ratio`` real windows left-aligned and
+        zero-filled up to the batch max. Rows that completed a window
+        advance to their newest real window; rows that did not keep their
+        old carry (slot 0 when prepended) and stay masked via
+        ``_prev_valid``.
+        """
+        n_new = [u // self.ratio for u in self._last_usable]
+        idx = [dropped + n - 1 if n > 0 else 0 for n in n_new]
+        take = mx.array(idx, dtype=mx.int32).reshape(-1, 1, 1, 1)
+        self.prev_win_kv = mx.take_along_axis(kv, take, axis=1)
+        self.prev_win_gate = mx.take_along_axis(gate, take, axis=1)
+        self._prev_valid = [v or n > 0 for v, n in zip(self._prev_valid, n_new)]
 
     def size(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
@@ -530,6 +650,10 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = [self._pool_lengths[i] for i in idx_list]
         self._lengths = [self._lengths[i] for i in idx_list]
         self._processed = [self._processed[i] for i in idx_list]
+        if self.prev_win_kv is not None:
+            self.prev_win_kv = self.prev_win_kv[batch_indices]
+            self.prev_win_gate = self.prev_win_gate[batch_indices]
+        self._prev_valid = [self._prev_valid[i] for i in idx_list]
 
     def extend(self, other):
         # Merge the remainder buffers
@@ -599,10 +723,47 @@ class BatchPoolingCache(_BaseCache):
                     axis=0,
                 )
 
+        # Merge the prev-window carries; rows on a side without one stay
+        # invalid and get -inf masked at prepend time.
+        if self.prev_win_kv is not None or other.prev_win_kv is not None:
+            B1 = len(self.remainder)
+            B2 = len(other.remainder)
+            ref_kv = (
+                self.prev_win_kv
+                if self.prev_win_kv is not None
+                else other.prev_win_kv
+            )
+            ref_gate = (
+                self.prev_win_gate
+                if self.prev_win_gate is not None
+                else other.prev_win_gate
+            )
+
+            def pad_prev(arr, ref, B):
+                if arr is None:
+                    return mx.zeros((B,) + ref.shape[1:], dtype=ref.dtype)
+                return arr
+
+            self.prev_win_kv = mx.concatenate(
+                [
+                    pad_prev(self.prev_win_kv, ref_kv, B1),
+                    pad_prev(other.prev_win_kv, ref_kv, B2),
+                ],
+                axis=0,
+            )
+            self.prev_win_gate = mx.concatenate(
+                [
+                    pad_prev(self.prev_win_gate, ref_gate, B1),
+                    pad_prev(other.prev_win_gate, ref_gate, B2),
+                ],
+                axis=0,
+            )
+
         self.remainder = self.remainder + other.remainder
         self._pool_lengths = self._pool_lengths + other._pool_lengths
         self._lengths = self._lengths + other._lengths
         self._processed = self._processed + other._processed
+        self._prev_valid = self._prev_valid + other._prev_valid
 
     def extract(self, idx):
         cache = PoolingCache(self.ratio)
@@ -616,6 +777,10 @@ class BatchPoolingCache(_BaseCache):
             cache.buf_kv = mx.contiguous(self.buf_kv[idx : idx + 1])
             cache.buf_gate = mx.contiguous(self.buf_gate[idx : idx + 1])
             cache.remainder = r
+
+        if self.prev_win_kv is not None and self._prev_valid[idx]:
+            cache.prev_win_kv = mx.contiguous(self.prev_win_kv[idx : idx + 1])
+            cache.prev_win_gate = mx.contiguous(self.prev_win_gate[idx : idx + 1])
 
         return cache
 
@@ -667,6 +832,22 @@ class BatchPoolingCache(_BaseCache):
                     buf_gate[i, : c.remainder] = c.buf_gate[0, : c.remainder]
             batch_cache.buf_kv = buf_kv
             batch_cache.buf_gate = buf_gate
+
+        # Carry prev windows from members that have one
+        if any(c.prev_win_kv is not None for c in caches):
+            ref_kv = next(c.prev_win_kv for c in caches if c.prev_win_kv is not None)
+            ref_gate = next(
+                c.prev_win_gate for c in caches if c.prev_win_gate is not None
+            )
+            prev_kv = mx.zeros((B,) + ref_kv.shape[1:], dtype=ref_kv.dtype)
+            prev_gate = mx.zeros((B,) + ref_gate.shape[1:], dtype=ref_gate.dtype)
+            for i, c in enumerate(caches):
+                if c.prev_win_kv is not None:
+                    prev_kv[i : i + 1] = c.prev_win_kv
+                    prev_gate[i : i + 1] = c.prev_win_gate
+            batch_cache.prev_win_kv = prev_kv
+            batch_cache.prev_win_gate = prev_gate
+            batch_cache._prev_valid = [c.prev_win_kv is not None for c in caches]
 
         return batch_cache
 

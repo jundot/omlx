@@ -15,8 +15,15 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
+from .msa import (
+    build_grouped_msa_topk,
+    build_grouped_msa_topk_blockwise,
+    msa_sparse_attention_b1,
+)
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
+_MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN = 32768
+_MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = 2
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -876,7 +883,6 @@ class MiniMaxAttention(nn.Module):
             block_scores = mx.logsumexp(scores, axis=-1)
         else:
             block_scores = mx.max(scores, axis=-1)
-        block_scores = mx.max(block_scores, axis=1, keepdims=True)
         selected_scores = mx.where(block_scores == block_scores, block_scores, neg)
 
         blocks = mx.arange(num_blocks)
@@ -926,6 +932,7 @@ class MiniMaxAttention(nn.Module):
         if valid_blocks is None:
             topk_valid = mx.ones(topk_idx.shape, dtype=mx.bool_)
         else:
+            valid_blocks = mx.broadcast_to(valid_blocks, selected_scores.shape)
             topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
         return topk_idx, topk_valid
 
@@ -1037,6 +1044,81 @@ class MiniMaxAttention(nn.Module):
             and sparse_density <= _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
         )
 
+    def _can_use_msa_prefill_attention(
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        mask: Optional[mx.array],
+        q_positions: Optional[mx.array],
+    ) -> bool:
+        B, H, L, D = queries.shape
+        _, K, total_len, _ = keys.shape
+        num_blocks = (total_len + self.sparse_block_size - 1) // self.sparse_block_size
+        selected_len = min(self.sparse_topk_blocks, num_blocks) * self.sparse_block_size
+        sparse_density = selected_len / total_len if total_len else 1.0
+        return (
+            mx.metal.is_available()
+            and self.sparse_score_type == "max"
+            and B == 1
+            and L > 1
+            and q_positions is None
+            and (mask is None or isinstance(mask, str))
+            and self.index_heads == K
+            and H % K == 0
+            and D % 32 == 0
+            and num_blocks >= self.sparse_topk_blocks
+            and sparse_density < _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
+        )
+
+    def _msa_prefill_attention(
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        idx_queries: mx.array,
+        idx_keys: mx.array,
+        q_start: int,
+        mask: Optional[mx.array] = None,
+        q_positions: Optional[mx.array] = None,
+    ):
+        if not self._can_use_msa_prefill_attention(
+            queries, keys, mask, q_positions
+        ):
+            return None
+
+        topk_builder = build_grouped_msa_topk
+        builder_kwargs = {}
+        if idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN:
+            topk_builder = build_grouped_msa_topk_blockwise
+            builder_kwargs["block_chunk_size"] = _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK
+
+        q2k = topk_builder(
+            idx_queries,
+            idx_keys,
+            q_start,
+            self.scale,
+            self.sparse_block_size,
+            self.sparse_topk_blocks,
+            self.sparse_init_blocks,
+            self.sparse_local_blocks,
+            **builder_kwargs,
+        )[0]
+        q = queries[0].transpose(1, 0, 2)
+        k = keys[0].transpose(1, 0, 2)
+        v = values[0].transpose(1, 0, 2)
+        out = msa_sparse_attention_b1(
+            q,
+            k,
+            v,
+            q2k,
+            q_start=q_start,
+            scale=self.scale,
+            block_size=self.sparse_block_size,
+            full_splits=q_start
+            >= (self.sparse_topk_blocks - 1) * self.sparse_block_size,
+        )
+        return out.transpose(1, 0, 2)[None]
+
     def _sparse_block_offsets(self, dtype):
         cache = getattr(self, "_minimax_m3_sparse_block_offsets_cache", None)
         if (
@@ -1074,17 +1156,27 @@ class MiniMaxAttention(nn.Module):
         if selected_len >= total_len:
             return None
 
+        mask = None
+        use_maskless_compact = (
+            topk_all_valid
+            and q_positions is None
+            and q_start + L == total_len
+            and self.sparse_local_blocks > 0
+        )
+        if use_maskless_compact:
+            topk_idx = mx.sort(topk_idx, axis=-1)
+
         block_offsets = self._sparse_block_offsets(topk_idx.dtype)
         positions = topk_idx[..., None] * self.sparse_block_size + block_offsets
         positions = positions.reshape(B, index_heads, L, selected_len)
         if index_heads == 1 and K != 1:
             positions = mx.broadcast_to(positions, (B, K, L, selected_len))
 
-        if topk_all_valid and q_positions is None and q_start + L == total_len:
-            valid = positions < total_len
-            positions = mx.minimum(
-                positions, mx.array(total_len - 1, dtype=positions.dtype)
-            )
+        if use_maskless_compact:
+            num_blocks = (total_len + self.sparse_block_size - 1) // self.sparse_block_size
+            tail_pad = num_blocks * self.sparse_block_size - total_len
+            selected_len = selected_len - tail_pad
+            positions = positions[..., :selected_len]
         else:
             valid = mx.broadcast_to(
                 topk_valid[..., None],
@@ -1108,21 +1200,20 @@ class MiniMaxAttention(nn.Module):
             positions = mx.minimum(
                 positions, mx.array(total_len - 1, dtype=positions.dtype)
             )
+            mask = mx.repeat(valid, H // K, axis=1)
 
         gather_idx = positions[:, :, 0, :, None]
         gather_idx = mx.broadcast_to(gather_idx, (B, K, selected_len, D))
         compact_keys = mx.take_along_axis(keys, gather_idx, axis=2)
         compact_values = mx.take_along_axis(values, gather_idx, axis=2)
 
-        repeat = H // K
-        compact_mask = mx.repeat(valid, repeat, axis=1)
         return scaled_dot_product_attention(
             queries,
             compact_keys,
             compact_values,
             cache=None,
             scale=self.scale,
-            mask=compact_mask,
+            mask=mask,
         )
 
     def __call__(
@@ -1193,6 +1284,22 @@ class MiniMaxAttention(nn.Module):
                 compact_candidate = self._can_use_sparse_decode_attention(
                     queries, keys, original_mask
                 )
+                if self._can_use_msa_prefill_attention(
+                    queries, keys, mask, sparse_q_positions
+                ):
+                    output = self._msa_prefill_attention(
+                        queries,
+                        keys,
+                        values,
+                        idx_queries,
+                        idx_keys,
+                        int(sparse_q_start),
+                        mask=mask,
+                        q_positions=sparse_q_positions,
+                    )
+                    if output is not None:
+                        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                        return self.o_proj(output)
                 sparse_mask = None
                 decode_indices = None
                 if compact_candidate and mask is None:

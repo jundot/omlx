@@ -296,6 +296,19 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.hide_helper_models') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.hide_helper_models_desc') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.model.hide_helper_models = !globalSettings.model.hide_helper_models"
+                                            :class="globalSettings.model.hide_helper_models ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.model.hide_helper_models ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
                                         <div class="flex items-center gap-2">
@@ -1028,6 +1041,25 @@
                         <p class="text-sm text-neutral-500 mt-2">{{ t('settings.models.description') }}</p>
                     </div>
 
+                    <!-- Search + reset sort toolbar -->
+                    <div x-show="!loadingModels && models.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-3 mb-4">
+                        <div class="relative flex-1">
+                            <i data-lucide="search" class="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+                            <input type="text" x-model="modelSearch"
+                                   :placeholder="window.t('settings.models.search_placeholder')"
+                                   class="w-full pl-9 pr-9 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                            <button x-show="modelSearch" @click="modelSearch = ''"
+                                    class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                                <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                            </button>
+                        </div>
+                        <button @click="resetSort()" :disabled="isModelsSortDefault"
+                                class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                            <i data-lucide="arrow-up-down" class="w-3.5 h-3.5"></i>
+                            <span x-text="window.t('settings.models.reset_sort')"></span>
+                        </button>
+                    </div>
+
                     <!-- Loading State -->
                     <div x-show="loadingModels" class="p-12 text-center">
                         <svg class="animate-spin h-8 w-8 text-neutral-400 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -1071,6 +1103,10 @@
                                 {{ t('settings.models.table.pin') }}
                                 <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
+                            <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_hidden')">
+                                {{ t('settings.models.table.visible') }}
+                                <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
                             <div class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
                                 {{ t('settings.models.table.default') }}
                                 <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
@@ -1080,21 +1116,47 @@
 
                         <!-- Table Body -->
                         <div class="divide-y divide-neutral-100">
+                            <div x-show="sortedModels.length === 0" class="px-6 py-10 text-center text-sm text-neutral-500"
+                                 x-text="window.t('settings.models.no_match')"></div>
                             <template x-for="model in sortedModels" :key="model.id">
                                 <div class="hover:bg-neutral-50 transition-colors">
                                     <!-- Main Row -->
                                     <div class="flex items-center gap-4 px-6 py-4">
                                         <!-- Model Name -->
                                         <div class="flex-1 min-w-0 flex items-center gap-3">
-                                            <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center flex-shrink-0">
-                                                <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
-                                            </div>
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_favorite', !model.is_favorite)"
+                                                    @mouseenter="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                    @blur="hideTip()"
+                                                    :class="model.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600'"
+                                                    class="hidden sm:flex w-8 h-8 items-center justify-center flex-shrink-0 rounded-lg hover:bg-neutral-100 transition-colors focus:outline-none">
+                                                    <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="model.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <div class="hidden sm:flex w-8 h-8 bg-neutral-100 rounded-lg items-center justify-center flex-shrink-0">
+                                                    <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                                </div>
+                                            </template>
                                             <p class="text-sm font-medium text-neutral-900 break-all sm:truncate"
                                                :title="model.display_name || model.id"
                                                x-text="model.display_name || model.id"></p>
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
+                                            <span x-show="model.is_helper" x-cloak
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
+                                                  @mouseleave="hideTip()"
+                                                  x-text="window.t('settings.models.table.helper_badge')"></span>
+                                            <span x-show="model.is_hidden" x-cloak
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.hidden_tooltip'))"
+                                                  @mouseleave="hideTip()"
+                                                  x-text="window.t('settings.models.table.hidden_badge')"></span>
                                             <button x-data="{ copied: false }"
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
@@ -1165,6 +1227,10 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
+                                                    @mouseenter="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
@@ -1179,11 +1245,38 @@
                                             </template>
                                         </div>
 
+                                        <!-- Visibility Toggle (on = visible in /v1/models) -->
+                                        <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_hidden', !model.is_hidden)"
+                                                    @mouseenter="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
+                                                    @blur="hideTip()"
+                                                    :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                >
+                                                    <span
+                                                        :class="!model.is_hidden ? 'translate-x-4' : 'translate-x-0'"
+                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                    ></span>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <span class="text-xs text-neutral-300">—</span>
+                                            </template>
+                                        </div>
+
                                         <!-- Default Radio (only for LLM models) -->
                                         <div class="hidden sm:flex w-14 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual && (model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type)">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
+                                                    @mouseenter="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="model.is_default
                                                         ? 'bg-black border-black'
                                                         : 'bg-white border-neutral-300 hover:border-neutral-400'"

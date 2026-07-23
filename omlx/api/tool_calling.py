@@ -130,7 +130,161 @@ class ToolCallExtraction:
     tool_calls_from_thinking: bool = False
 
 
-def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+# Declared-type buckets for schema-aware parameter coercion, mirroring
+# mlx-lm's qwen3_coder parser so fallback-recovered calls keep the same
+# argument types as natively parsed calls (#2332).
+_SCHEMA_STRING_TYPES = {"string", "str", "text", "varchar", "char", "enum"}
+_SCHEMA_BOOL_TYPES = {"boolean", "bool", "binary"}
+_SCHEMA_CONTAINER_TYPES = {"object", "array", "arr"}
+_SCHEMA_INT_PREFIXES = ("int", "uint", "long", "short", "unsigned")
+
+
+def _tool_param_properties(func_name: str, tools: Optional[List]) -> dict:
+    """Return the declared parameter properties for a tool, or {}."""
+    if not tools:
+        return {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function")
+        if not isinstance(func, dict) or func.get("name") != func_name:
+            continue
+        params = func.get("parameters")
+        if isinstance(params, dict):
+            props = params.get("properties")
+            if isinstance(props, dict):
+                return props
+        return {}
+    return {}
+
+
+def _repair_json_value(val: str) -> Optional[Any]:
+    """Best-effort repair of near-valid JSON with unbalanced brackets.
+
+    Rewrites closing brackets that do not match the innermost open bracket
+    (a common small-model slip, e.g. closing an array with "}"), drops
+    closers with no matching opener, terminates an unclosed string, and
+    appends missing closers.  Returns the parsed value, or None when the
+    repaired text still fails to parse.
+    """
+    out: List[str] = []
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in val:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+        elif ch in "[{":
+            stack.append("]" if ch == "[" else "}")
+            out.append(ch)
+        elif ch in "]}":
+            if stack:
+                out.append(stack.pop())
+        else:
+            out.append(ch)
+    if in_string:
+        out.append('"')
+    while stack:
+        out.append(stack.pop())
+    try:
+        return json.loads("".join(out), strict=False)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
+    """Convert an XML-extracted parameter value per its declared schema type.
+
+    Mirrors the type conversion mlx-lm's native qwen3_coder parser applies,
+    with an extra bracket-repair pass for declared container params whose
+    value is near-valid JSON (#2332).  Parameters without a usable declared
+    type keep the legacy best-effort JSON parse.
+    """
+    spec = props.get(key)
+    raw_type = spec.get("type") if isinstance(spec, dict) else None
+    if not isinstance(raw_type, str):
+        # Undeclared param, union type list, or anyOf: legacy behavior.
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, ValueError):
+            return val
+    if val.strip().lower() == "null":
+        return None
+    ptype = raw_type.strip().lower()
+    if ptype in _SCHEMA_STRING_TYPES:
+        # A JSON-quoted string literal (e.g. MiniMax emits "SF" for a string
+        # param) carries JSON encoding on the wire; decode it back to the
+        # underlying string.  Plain values that merely look like JSON (42,
+        # {"a": 1}) are kept verbatim so a string param never gets coerced to a
+        # non-string.
+        stripped = val.strip()
+        if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                decoded = None
+            if isinstance(decoded, str):
+                return decoded
+        return val
+    if ptype in _SCHEMA_BOOL_TYPES:
+        lowered = val.strip().lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+    if ptype.startswith(_SCHEMA_INT_PREFIXES):
+        try:
+            return int(val.strip())
+        except ValueError:
+            pass
+    elif ptype.startswith(("num", "float")):
+        try:
+            num = float(val.strip())
+            return int(num) if num == int(num) else num
+        except (ValueError, OverflowError):
+            pass
+    try:
+        return json.loads(val, strict=False)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        literal = ast.literal_eval(val)
+        if isinstance(literal, (dict, list, tuple)):
+            return list(literal) if isinstance(literal, tuple) else literal
+    except (ValueError, SyntaxError, TypeError, MemoryError):
+        pass
+    if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
+        repaired = _repair_json_value(val)
+        if repaired is not None:
+            logger.warning(
+                "Repaired malformed JSON for parameter %r of tool %r "
+                "(declared type %r)",
+                key,
+                func_name,
+                ptype,
+            )
+            return repaired
+        logger.warning(
+            "Parameter %r of tool %r failed to parse as declared type %r; "
+            "keeping raw string",
+            key,
+            func_name,
+            ptype,
+        )
+    return val
+
+
+def _parse_xml_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for XML-based tool call formats.
 
@@ -138,6 +292,9 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     - GLM format: <tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
     - Qwen/Llama format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
     - Generic JSON: <tool_call>{"name": ..., "arguments": ...}</tool_call>
+
+    When ``tools`` is provided, parameter values are coerced to their
+    declared schema types instead of best-effort JSON parsing.
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
@@ -172,16 +329,14 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         if func_match:
             func_name = func_match.group(1)
             params_text = func_match.group(2)
+            props = _tool_param_properties(func_name, tools)
             arguments = {}
             for pm in re.finditer(
                 r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", params_text, re.DOTALL
             ):
                 key = pm.group(1)
                 val = pm.group(2).strip()
-                try:
-                    arguments[key] = json.loads(val)
-                except (json.JSONDecodeError, ValueError):
-                    arguments[key] = val
+                arguments[key] = _coerce_param_value(val, key, props, func_name)
             tool_calls.append(
                 ToolCall(
                     id=f"call_{uuid.uuid4().hex[:8]}",
@@ -205,13 +360,10 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                 if name_match
                 else content.split("<")[0].strip()
             )
+            props = _tool_param_properties(func_name, tools)
             arguments = {}
             for k, v in zip(arg_keys, arg_values):
-                # Try to parse JSON values (arrays, objects, numbers, booleans)
-                try:
-                    arguments[k] = json.loads(v)
-                except (json.JSONDecodeError, ValueError):
-                    arguments[k] = v
+                arguments[k] = _coerce_param_value(v, k, props, func_name)
             tool_calls.append(
                 ToolCall(
                     id=f"call_{uuid.uuid4().hex[:8]}",
@@ -232,13 +384,16 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
 
 
 def _parse_namespaced_tool_calls(
-    text: str, namespace: str
+    text: str, namespace: str, tools: Optional[List] = None
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse namespaced tool call tags like <minimax:tool_call>...</minimax:tool_call>.
 
     Handles the <invoke name="func"><parameter name="key">value</parameter></invoke>
     format used by MiniMax and similar models.
+
+    When ``tools`` is provided, parameter values are coerced to their
+    declared schema types instead of best-effort JSON parsing.
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
@@ -257,16 +412,14 @@ def _parse_namespaced_tool_calls(
         ):
             func_name = invoke_match.group(1)
             params_text = invoke_match.group(2)
+            props = _tool_param_properties(func_name, tools)
             arguments = {}
             for pm in re.finditer(
                 r'<parameter\s+name="([^"]+)">(.*?)</parameter>', params_text, re.DOTALL
             ):
                 key = pm.group(1)
                 val = pm.group(2).strip()
-                try:
-                    arguments[key] = json.loads(val)
-                except (json.JSONDecodeError, ValueError):
-                    arguments[key] = val
+                arguments[key] = _coerce_param_value(val, key, props, func_name)
             tool_calls.append(
                 ToolCall(
                     id=f"call_{uuid.uuid4().hex[:8]}",
@@ -1212,7 +1365,7 @@ def _parse_tool_calls_impl(
                     # drop when the native parser raises (e.g. ast.literal_eval
                     # SyntaxError on non-Python-literal parameter values).
                     fb_wrapped = f"<tool_call>{match}</tool_call>"
-                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped, tools)
                     if fb_calls:
                         tool_calls.extend(fb_calls)
                         logger.warning(
@@ -1249,13 +1402,13 @@ def _parse_tool_calls_impl(
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
-        return _parse_xml_tool_calls(cleaned_text)
+        return _parse_xml_tool_calls(cleaned_text, tools)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
     ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
-        return _parse_namespaced_tool_calls(cleaned_text, ns)
+        return _parse_namespaced_tool_calls(cleaned_text, ns, tools)
 
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
@@ -2071,7 +2224,7 @@ def parse_json_output(
 
     # json_schema - validate against schema
     if format_type == "json_schema":
-        json_schema_spec = rf_dict.get("json_schema", {})
+        json_schema_spec = rf_dict.get("json_schema") or {}
         schema = json_schema_spec.get("schema", {})
 
         if schema:
@@ -2128,7 +2281,7 @@ def build_json_system_prompt(
         )
 
     if format_type == "json_schema":
-        json_schema_spec = rf_dict.get("json_schema", {})
+        json_schema_spec = rf_dict.get("json_schema") or {}
         schema = json_schema_spec.get("schema", {})
         name = json_schema_spec.get("name", "response")
         description = json_schema_spec.get("description", "")

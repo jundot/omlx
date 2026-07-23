@@ -10,11 +10,20 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
+
+def _detach_import_error(exc: Exception) -> Exception:
+    """Keep the diagnostic message without retaining import caller frames."""
+    exc.__traceback__ = None
+    exc.__cause__ = None
+    exc.__context__ = None
+    return exc
+
+
 try:
     from omlx.custom_kernels.glm_moe_dsa import fast as _native_fast
 except Exception as exc:  # pragma: no cover - depends on native extension build
     _native_fast = None
-    _native_import_error = exc
+    _native_import_error = _detach_import_error(exc)
 else:
     _native_import_error = None
 

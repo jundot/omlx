@@ -111,6 +111,7 @@ class TestKeepaliveChunkFormats:
         body = items[0].removeprefix("data: ").strip()
         payload = json.loads(body)
         assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["role"] == "assistant"
         assert payload["choices"][0]["delta"]["content"] == ""
         assert payload["choices"][0]["finish_reason"] is None
 
@@ -172,6 +173,7 @@ class TestChatKeepaliveSharesStreamId:
         payload = json.loads(frame.removeprefix("data: ").strip())
         assert payload["id"] == "chatcmpl-abc123"
         assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["role"] == "assistant"
         assert payload["choices"][0]["delta"]["content"] == ""
         assert payload["choices"][0]["finish_reason"] is None
 
@@ -182,6 +184,33 @@ class TestChatKeepaliveSharesStreamId:
             _chat_keepalive_chunk("chatcmpl-real").removeprefix("data: ").strip()
         )
         assert payload["id"] != "chatcmpl-keepalive"
+
+
+class TestChatKeepaliveCarriesRole:
+    """Every chat keepalive delta must carry ``role: assistant``.
+
+    The chunk-form keepalive is the first SSE event of every stream, and some
+    accumulators type the whole stream from the first chunk's role.
+    LangChain.js builds a generic ChatMessageChunk when the role is absent and
+    then discards all tool_call_chunks when the real AI chunks merge into it,
+    so streamed tool calls are silently lost (#2074, n8n AI Agent workflows).
+    """
+
+    def _first_chunk_role(self, frame: str):
+        # Mirror the accumulator rule: the stream's type is decided by the
+        # first chunk's delta.role alone.
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        return payload["choices"][0]["delta"].get("role")
+
+    def test_static_sentinel_frame_carries_assistant_role(self):
+        from omlx.server import _KEEPALIVE_CHAT_CHUNK
+
+        assert self._first_chunk_role(_KEEPALIVE_CHAT_CHUNK) == "assistant"
+
+    def test_id_sharing_frame_carries_assistant_role(self):
+        from omlx.server import _chat_keepalive_chunk
+
+        assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
 
 
 class TestResolveKeepalive:

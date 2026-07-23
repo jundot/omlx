@@ -227,6 +227,85 @@ def test_guard_uses_cached_active_when_larger_than_physical():
     assert exc.value.request_id == "r-cached"
 
 
+def test_guard_excludes_hot_cache_bytes_from_physical_usage():
+    """Serialized hot-cache CPU bytes must not be charged twice.
+
+    The enforcer already subtracts a hot-cache reservation from the ceiling it
+    propagates (``_memory_hot_cache_reserved_bytes`` side); counting the same
+    bytes again inside phys_footprint over-rejects by the hot-cache size —
+    the same double-count the scheduler guard fixed for issue 1796. The limit
+    here is chosen so the prefill fits exactly iff the exclusion is applied.
+    """
+    guard = _make_guard()
+    guard._prefill_memory_guard = True
+    phys = 3 * 1024**3
+    hot_used = 1 * 1024**3
+    guard._memory_hot_cache_used_bytes = hot_used
+    peak = guard.memory_monitor.estimate_prefill_peak_bytes(65536, 2048)
+    # Fits with the exclusion (phys - hot_used + peak), not without.
+    guard._memory_hard_limit_bytes = int(phys - hot_used + peak)
+
+    with (
+        patch("omlx.engine.dflash.get_phys_footprint", return_value=phys),
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+    ):
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r-hot")
+
+    # Still rejects when genuinely over even after the exclusion.
+    guard._memory_hard_limit_bytes = int(phys - hot_used + peak - 1)
+    with (
+        patch("omlx.engine.dflash.get_phys_footprint", return_value=phys),
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+        pytest.raises(PrefillMemoryExceededError) as exc,
+    ):
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r-hot2")
+    assert exc.value.estimated_bytes >= int(phys - hot_used + peak)
+
+
+def test_guard_hot_cache_exclusion_clamps_and_keeps_active_floor():
+    """A hot-cache figure larger than phys clamps the phys term to 0 instead
+    of going negative, and the recorded MLX active sample still floors the
+    usage — the exclusion must never eat into *GPU* pressure accounting."""
+    guard = _make_guard()
+    guard._prefill_memory_guard = True
+    active = 1 * 1024**3
+    phys = 2 * 1024**3
+    guard.record_mlx_active_memory(active)
+    guard._memory_hot_cache_used_bytes = 4 * 1024**3  # > phys → clamp to 0
+    peak = guard.memory_monitor.estimate_prefill_peak_bytes(65536, 2048)
+
+    # Usage must be the active floor (1 GiB), not raw phys (2 GiB): a limit
+    # of active + peak fits with the clamp applied, not without.
+    guard._memory_hard_limit_bytes = int(active + peak)
+    with (
+        patch("omlx.engine.dflash.get_phys_footprint", return_value=phys),
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+    ):
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r-clamp")
+
+    # The active floor itself is never reduced by the exclusion.
+    guard._memory_hard_limit_bytes = int(active + peak - 1)
+    with (
+        patch("omlx.engine.dflash.get_phys_footprint", return_value=phys),
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+        pytest.raises(PrefillMemoryExceededError) as exc,
+    ):
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r-clamp2")
+    assert exc.value.estimated_bytes >= int(active + peak)
+
+
 def test_guard_rejects_cached_tokens():
     """The narrowed signature is deliberate: a DFlash prefix-cache hit
     reconstructs KV into active memory, so accepting a hit count here would

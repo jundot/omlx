@@ -75,6 +75,7 @@ def apply() -> bool:
 # TextConfig — retain mtp_num_hidden_layers as instance attribute.
 # ---------------------------------------------------------------------------
 
+
 def _patch_text_config(q35moe_config: Any) -> None:
     """Wrap ``TextConfig.from_dict`` so ``mtp_num_hidden_layers`` survives.
 
@@ -106,6 +107,7 @@ def _patch_text_config(q35moe_config: Any) -> None:
 # ---------------------------------------------------------------------------
 # MTPDecoderLayer + MTPModule — VLM-classes-based.
 # ---------------------------------------------------------------------------
+
 
 def _register_mtp_classes_for_vlm(q35moe_lang: Any) -> None:
     """Attach ``MTPDecoderLayer`` / ``MTPModule`` classes to the mlx-vlm
@@ -191,6 +193,7 @@ def _register_mtp_classes_for_vlm(q35moe_lang: Any) -> None:
 # LanguageModel — wrap __init__, support return_hidden, add mtp_forward/cache.
 # ---------------------------------------------------------------------------
 
+
 def _patch_vlm_language_model(q35moe_lang: Any) -> None:
     cls = q35moe_lang.LanguageModel
     if "_omlx_mtp_runtime_patched" in cls.__dict__:
@@ -224,6 +227,14 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         )
         if n_mtp > 0 and attach_enabled:
             self.mtp = q35moe_lang.MTPModule(args)
+        if self._omlx_mtp_decode_enabled:
+            # Depth-k chained drafting works on this path: mtp_forward
+            # supports return_hidden below, and rollback uses mlx-vlm's
+            # stock rollback_speculative_cache (native partial accepts).
+            from ..mlx_lm_mtp import get_mtp_depth
+
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.
@@ -274,16 +285,33 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             shared_kv_states={} if return_shared_kv else None,
         )
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        """MTP-head forward (see mlx_lm_mtp.qwen35_model for the depth-k
+        chain contract: return_hidden yields the head's post-norm hidden for
+        chaining; logits_keep limits the lm_head to the last N positions)."""
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
             self.model.embed_tokens,
             mtp_cache,
         )
+        logits_source = mtp_out
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, mtp_out
+        return logits
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -300,6 +328,7 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
 # ---------------------------------------------------------------------------
 # VLMModelAdapter — add MTP pass-through methods at runtime.
 # ---------------------------------------------------------------------------
+
 
 def _patch_vlm_model_adapter() -> None:
     """Extend ``omlx.models.vlm.VLMModelAdapter`` with MTP plumbing.
@@ -329,7 +358,25 @@ def _patch_vlm_model_adapter() -> None:
     def mtp(self):
         return getattr(self._language_model, "mtp", None)
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        # Forward the depth-k chain kwargs only when set: chain drafting is
+        # only enabled on language models whose runtime patch supports them
+        # (dense qwen3_5), so a stock/MoE mtp_forward never sees them.
+        if return_hidden or logits_keep:
+            return self._language_model.mtp_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                return_hidden=return_hidden,
+                logits_keep=logits_keep,
+            )
         return self._language_model.mtp_forward(
             hidden_states, next_token_ids, mtp_cache
         )
@@ -356,6 +403,7 @@ def _patch_vlm_model_adapter() -> None:
 # metadata) MoE MTP weights.
 # ---------------------------------------------------------------------------
 
+
 def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
     cls = q35moe_outer.Model
     if "_omlx_mtp_runtime_sanitize_patched" in cls.__dict__:
@@ -379,9 +427,9 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
         if gate_up_key not in weights:
             return False
         gate_up = weights.pop(gate_up_key)
-        gate_w, up_w = mx.split(gate_up, 2, axis=-2)
-        weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_w
-        weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_w
+        mid = gate_up.shape[-2] // 2
+        weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
+        weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
         down_key = f"{prefix}.experts.down_proj"
         if down_key in weights:
             weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(down_key)
@@ -391,25 +439,32 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        # Backbone MoE: convert fused gate_up_proj → switch_mlp.{gate,up,down}.
+        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
+
+        # Backbone MoE: fused gate_up_proj (Qwen3.6) or per-expert tensors
+        # (Ornith / raw Qwen3.5). Unfuse the fused form; fall back to
+        # per-expert stacking when fused keys are absent.
         for l in range(self.config.text_config.num_hidden_layers):
-            _unfuse_layer_experts(
-                weights, f"model.language_model.layers.{l}.mlp"
-            )
+            prefix = f"model.language_model.layers.{l}.mlp"
+            if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
+                continue  # already in switch_mlp form
+            if not _unfuse_layer_experts(weights, prefix):
+                _stack_per_expert(weights, prefix, num_experts)
 
         # MTP MoE layers: discover via weight keys.
         # Two possible prefixes:
         #   ``mtp.layers.N.mlp...``  (raw HF format)
         #   ``language_model.mtp.layers.N.mlp...``  (already-MLX oQ output)
         def _discover_mtp_layers(prefix_root: str):
-            return sorted({
-                int(k[len(prefix_root):].split(".")[0])
-                for k in weights
-                if k.startswith(prefix_root)
-                and k[len(prefix_root):].split(".")[0].isdigit()
-            })
+            return sorted(
+                {
+                    int(k[len(prefix_root) :].split(".")[0])
+                    for k in weights
+                    if k.startswith(prefix_root)
+                    and k[len(prefix_root) :].split(".")[0].isdigit()
+                }
+            )
 
-        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
         for prefix_root in ("mtp.layers.", "language_model.mtp.layers."):
             for layer_idx in _discover_mtp_layers(prefix_root):
                 prefix = f"{prefix_root}{layer_idx}.mlp"
@@ -448,10 +503,7 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
         # for full-precision Qwen3.6 sources where MTP norm conventions are
         # mixed.
         def _is_oq_tracked_tensor(_w):
-            return (
-                _w.__class__.__name__ == "_TrackedTensor"
-                and hasattr(_w, "_clone")
-            )
+            return _w.__class__.__name__ == "_TrackedTensor" and hasattr(_w, "_clone")
 
         def _mark_mtp_norm_conditional_add(_w):
             return _w._clone(transform="add_if_mean_lt_0_5")
@@ -474,7 +526,7 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 key = "language_model." + key
 
             if key.startswith("language_model.model.visual."):
-                key = "vision_tower." + key[len("language_model.model.visual."):]
+                key = "vision_tower." + key[len("language_model.model.visual.") :]
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 # Use the module-level mx.moveaxis so it goes through the

@@ -61,7 +61,7 @@
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.local_models') }}</span>
-                                    <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', hfModels.length)"></span>
+                                    <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', sortedManagerModels.length)"></span>
                                 </div>
                                 <button @click="loadHFModels()"
                                         class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
@@ -70,57 +70,129 @@
                                     {{ t('models.manager.refresh') }}
                                 </button>
                             </div>
-                            <div class="divide-y divide-neutral-100">
-                                <template x-if="hfModels.length === 0">
-                                    <div class="px-6 py-12 text-center">
-                                        <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                        <p class="text-sm text-neutral-500">{{ t('models.manager.no_models') }}</p>
+
+                            <!-- Search + reset sort toolbar -->
+                            <div x-show="hfModels.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-3 px-4 sm:px-6 py-3 border-b border-neutral-100">
+                                <div class="relative flex-1">
+                                    <i data-lucide="search" class="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+                                    <input type="text" x-model="managerSearch"
+                                           :placeholder="window.t('models.manager.search_placeholder')"
+                                           class="w-full pl-9 pr-9 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                    <button x-show="managerSearch" @click="managerSearch = ''"
+                                            class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                                        <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                </div>
+                                <button @click="resetManagerSort()" :disabled="isManagerSortDefault"
+                                        class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                                    <i data-lucide="arrow-up-down" class="w-3.5 h-3.5"></i>
+                                    <span x-text="window.t('models.manager.reset_sort')"></span>
+                                </button>
+                            </div>
+
+                            <!-- Empty (no models on disk) -->
+                            <template x-if="hfModels.length === 0">
+                                <div class="px-6 py-12 text-center">
+                                    <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
+                                    <p class="text-sm text-neutral-500">{{ t('models.manager.no_models') }}</p>
+                                </div>
+                            </template>
+
+                            <!-- Table -->
+                            <div x-show="hfModels.length > 0" class="overflow-x-auto">
+                                <!-- Table Header -->
+                                <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
+                                    <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('name')">
+                                        {{ t('models.manager.table.model') }}
+                                        <span x-show="managerSortBy === 'name'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                                     </div>
-                                </template>
-                                <template x-for="model in hfModels" :key="model.name">
-                                    <div class="px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-neutral-50 transition-colors">
-                                        <div class="min-w-0 flex-1 flex items-center gap-2">
-                                            <span class="text-sm font-medium text-neutral-900 truncate"
-                                                  :title="model.display_name || model.name"
-                                                  x-text="model.display_name || model.name"></span>
-                                            <template x-if="models.find(m => m.id === model.name)?.settings?.model_alias">
-                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
-                                                      x-text="models.find(m => m.id === model.name)?.settings?.model_alias"></span>
-                                            </template>
-                                            <span class="text-xs text-neutral-400 flex-shrink-0" x-text="'(' + model.size_formatted + ')'"></span>
-                                            <button x-data="{ copied: false }"
-                                                    @click.stop="copyToClipboard(models.find(m => m.id === model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="p-1 rounded-md transition-all flex-shrink-0"
-                                                    :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('models.manager.copy_model_name_tooltip')">
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
-                                        </div>
-                                        <div class="flex items-center gap-2 ml-4 shrink-0">
-                                            <template x-if="hfDeleteConfirm !== model.name">
-                                                <button @click="hfDeleteConfirm = model.name"
-                                                        class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                                                        :title="window.t('models.manager.delete_tooltip')">
-                                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                    <div class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('type')">
+                                        {{ t('models.manager.table.type') }}
+                                        <span x-show="managerSortBy === 'type'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                    </div>
+                                    <div class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('size')">
+                                        {{ t('models.manager.table.size') }}
+                                        <span x-show="managerSortBy === 'size'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                    </div>
+                                    <div class="w-20 text-center"></div>
+                                </div>
+
+                                <!-- Table Body -->
+                                <div class="divide-y divide-neutral-100">
+                                    <div x-show="sortedManagerModels.length === 0" class="px-6 py-10 text-center text-sm text-neutral-500"
+                                         x-text="window.t('models.manager.no_match')"></div>
+                                    <template x-for="model in sortedManagerModels" :key="model.name">
+                                        <div class="flex items-center gap-4 px-4 sm:px-6 py-3 hover:bg-neutral-50 transition-colors">
+                                            <!-- Name -->
+                                            <div class="min-w-0 flex-1 flex items-center gap-2">
+                                                <template x-if="managerModelInfo(model.name)">
+                                                    <button
+                                                        @click.stop="updateModelSetting(model.name, 'is_favorite', !managerModelInfo(model.name)?.is_favorite)"
+                                                        @mouseenter="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                        @mouseleave="hideTip()"
+                                                        @focus="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                        @blur="hideTip()"
+                                                        :class="managerModelInfo(model.name)?.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                        class="hidden sm:flex p-1 rounded-md flex-shrink-0 transition-all">
+                                                        <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="managerModelInfo(model.name)?.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                                                    </button>
+                                                </template>
+                                                <span class="text-sm font-medium text-neutral-900 truncate"
+                                                      :title="model.display_name || model.name"
+                                                      x-text="model.display_name || model.name"></span>
+                                                <template x-if="managerModelInfo(model.name)?.settings?.model_alias">
+                                                    <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                          x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>
+                                                </template>
+                                                <button x-data="{ copied: false }"
+                                                        @click.stop="copyToClipboard(managerModelInfo(model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
+                                                        class="p-1 rounded-md transition-all flex-shrink-0"
+                                                        :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                        :title="window.t('models.manager.copy_model_name_tooltip')">
+                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                    <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                                 </button>
-                                            </template>
-                                            <template x-if="hfDeleteConfirm === model.name">
-                                                <div class="flex items-center gap-2">
-                                                    <span class="text-xs text-red-600">{{ t('models.manager.delete_confirm') }}</span>
-                                                    <button @click="deleteHFModel(model.name)"
-                                                            class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
-                                                        {{ t('models.manager.delete_yes') }}
+                                            </div>
+                                            <!-- Type -->
+                                            <div class="hidden sm:flex w-24 justify-center">
+                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 uppercase tracking-wide"
+                                                      x-text="managerModelInfo(model.name)?.model_type || 'llm'"></span>
+                                            </div>
+                                            <!-- Size -->
+                                            <div class="hidden sm:block w-24 text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
+                                            <!-- Actions -->
+                                            <div class="flex items-center justify-end gap-1 shrink-0">
+                                                <template x-if="managerModelInfo(model.name)">
+                                                    <button @click="openModelSettingsFromManager(model.name)"
+                                                            class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all"
+                                                            :title="window.t('models.manager.settings_tooltip')">
+                                                        <i data-lucide="settings-2" class="w-4 h-4"></i>
                                                     </button>
-                                                    <button @click="hfDeleteConfirm = null"
-                                                            class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
-                                                        {{ t('models.manager.delete_no') }}
+                                                </template>
+                                                <template x-if="hfDeleteConfirm !== model.name">
+                                                    <button @click="hfDeleteConfirm = model.name"
+                                                            class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                                            :title="window.t('models.manager.delete_tooltip')">
+                                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
                                                     </button>
-                                                </div>
-                                            </template>
+                                                </template>
+                                                <template x-if="hfDeleteConfirm === model.name">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="text-xs text-red-600 hidden sm:inline">{{ t('models.manager.delete_confirm') }}</span>
+                                                        <button @click="deleteHFModel(model.name)"
+                                                                class="px-2 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                            {{ t('models.manager.delete_yes') }}
+                                                        </button>
+                                                        <button @click="hfDeleteConfirm = null"
+                                                                class="px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                            {{ t('models.manager.delete_no') }}
+                                                        </button>
+                                                    </div>
+                                                </template>
+                                            </div>
                                         </div>
-                                    </div>
-                                </template>
+                                    </template>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -164,6 +236,13 @@
 
                         <!-- ===== HuggingFace Source ===== -->
                         <div x-show="downloaderSource === 'hf'">
+
+                        <!-- Stale HF token warning -->
+                        <div x-show="hfTokenInvalid" x-cloak
+                             class="mb-6 px-4 py-2.5 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-xl flex items-center gap-2">
+                            <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i>
+                            <span>{{ t('models.downloader.token_warning') }}</span>
+                        </div>
 
                         <!-- Download Form Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
@@ -221,7 +300,8 @@
 
                         <!-- Search HuggingFace Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
-                            <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <!-- No overflow-hidden on this card (the suggestion dropdown must escape it), so the header rounds its own top corners -->
+                            <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                                 <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.search.section_label') }}</span>
                             </div>
@@ -841,7 +921,8 @@
 
                                     <!-- Search ModelScope Section -->
                                     <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
-                                        <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                        <!-- No overflow-hidden on this card (the suggestion dropdown must escape it), so the header rounds its own top corners -->
+                                        <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                                             <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
                                             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600" x-text="window.t('models.search.ms_section_label')"></span>
                                         </div>
@@ -1256,15 +1337,15 @@
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.level') }}</label>
                                         <select x-model.number="oqLevel"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <option value="2">oQ2</option>
-                                            <option value="2.5">oQ2.5</option>
-                                            <option value="2.7">oQ2.7</option>
-                                            <option value="3">oQ3</option>
-                                            <option value="3.5">oQ3.5</option>
-                                            <option value="4" selected>oQ4</option>
-                                            <option value="5">oQ5</option>
-                                            <option value="6">oQ6</option>
-                                            <option value="8">oQ8</option>
+                                            <option value="2" x-text="oqLevelLabel(2)"></option>
+                                            <option value="2.5" x-text="oqLevelLabel(2.5)"></option>
+                                            <option value="2.7" x-text="oqLevelLabel(2.7)"></option>
+                                            <option value="3" x-text="oqLevelLabel(3)"></option>
+                                            <option value="3.5" x-text="oqLevelLabel(3.5)"></option>
+                                            <option value="4" selected x-text="oqLevelLabel(4)"></option>
+                                            <option value="5" x-text="oqLevelLabel(5)"></option>
+                                            <option value="6" x-text="oqLevelLabel(6)"></option>
+                                            <option value="8" x-text="oqLevelLabel(8)"></option>
                                         </select>
                                     </div>
                                     <!-- Start Button -->
@@ -1282,6 +1363,57 @@
                                         <span class="inline-flex items-center gap-1.5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg><span x-text="'Estimated memory: ~' + oqEstimatedMemory()"></span></span>
                                         <span class="inline-flex items-center gap-1.5 ml-5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span x-text="oqEstimatedBpw() ? 'Effective ' + oqEstimatedBpw() + ' bpw' : 'Calculating...'"></span></span>
                                         <span class="inline-flex items-center gap-1.5 ml-5"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg><span x-text="oqEstimatedOutputSize() ? 'Output size: ~' + oqEstimatedOutputSize() : 'Calculating...'"></span></span>
+                                    </div>
+                                </div>
+                                <!-- Enhanced quantization (oQe) -->
+                                <div class="mt-4 border-t border-neutral-100 pt-3 space-y-3">
+                                    <div class="flex items-center justify-between">
+                                        <div class="flex-1 min-w-0 pr-3">
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.enhanced_label') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.enhanced_help') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="oqEnhanced = !oqEnhanced"
+                                                :class="oqEnhanced ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="oqEnhanced ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="oqEnhanced" x-cloak x-transition class="pl-4 border-l border-neutral-200 space-y-3">
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0 pr-3">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.imatrix_reuse_cache') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_reuse_cache_help') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="oqeReuseImatrixCache = !oqeReuseImatrixCache"
+                                                    :class="oqeReuseImatrixCache ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqeReuseImatrixCache ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.imatrix_cache_path') }}</label>
+                                            <input type="text"
+                                                   x-model="oqeImatrixCachePath"
+                                                   :placeholder="t('models.oq.imatrix_cache_path_placeholder')"
+                                                   class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0 pr-3">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.imatrix_strict') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_strict_help') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="oqeStrictImatrix = !oqeStrictImatrix"
+                                                    :class="oqeStrictImatrix ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqeStrictImatrix ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                                 <!-- Advanced Settings -->
@@ -1396,6 +1528,8 @@
                                                     </div>
                                                     <p x-show="task.phase && !['completed','failed','cancelled'].includes(task.status)"
                                                        class="text-xs text-neutral-500 mt-1" x-text="task.phase"></p>
+                                                    <p x-show="task.progress_detail && !['completed','failed','cancelled'].includes(task.status)"
+                                                       class="text-xs text-neutral-400 mt-1 break-words" x-text="task.progress_detail"></p>
                                                     <p x-show="task.error"
                                                        class="text-xs text-red-500 mt-1.5 break-all" x-text="task.error"></p>
                                                     <!-- Progress bar -->
@@ -1431,141 +1565,172 @@
                             </div>
                         </template>
                         <!-- About oQ Quantization -->
-                        <div class="bg-neutral-50 rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="px-6 py-4 border-b border-neutral-200">
-                                <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
-                            </div>
-                            <div class="px-6 py-5 text-sm text-neutral-500 leading-relaxed space-y-5">
-                                <!-- Title -->
-                                <h4 class="text-lg font-bold text-neutral-800">oQ: oMLX Universal Dynamic Quantization</h4>
-
-                                <!-- Philosophy -->
-                                <blockquote class="border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
-                                    <p>Quantization should not be exclusive to any particular inference server.</p>
-                                    <p class="mt-1">oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app
-                                    that supports MLX safetensors format.</p>
-                                    <p class="mt-1">No custom loader required.</p>
-                                </blockquote>
-
-                                <!-- Intro -->
+                        <div x-data="{ oqAboutOpen: false }"
+                             class="bg-neutral-50 rounded-2xl border border-neutral-200 overflow-hidden">
+                            <button type="button"
+                                    @click="oqAboutOpen = !oqAboutOpen"
+                                    class="w-full px-6 py-4 flex items-center justify-between gap-4 text-left hover:bg-neutral-100 transition-colors"
+                                    :aria-expanded="oqAboutOpen.toString()"
+                                    aria-controls="oq-about-panel">
                                 <div>
-                                    <p class="mt-1.5 text-sm text-neutral-500">
-                                        oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16)
-                                        and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they
-                                        matter most. Built-in calibration data (600 samples across code, multilingual, reasoning, and
-                                        tool calling). Every model gets a unique bit allocation tuned to its architecture.
+                                    <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
+                                    <p class="mt-1 text-xs text-neutral-500">
+                                        Compare standard oQ with oQe imatrix and how enhanced quantization works.
+                                    </p>
+                                </div>
+                                <i data-lucide="chevron-down"
+                                   class="w-4 h-4 text-neutral-400 shrink-0 transition-transform"
+                                   :class="oqAboutOpen ? 'rotate-180' : ''"></i>
+                            </button>
+                            <div id="oq-about-panel"
+                                 x-show="oqAboutOpen"
+                                 x-cloak
+                                 x-transition
+                                 class="px-6 py-5 border-t border-neutral-200 text-sm text-neutral-500 leading-relaxed space-y-6">
+                                <div>
+                                    <h4 class="text-lg font-bold text-neutral-800">oQ: oMLX Universal Dynamic Quantization</h4>
+                                    <blockquote class="mt-3 border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
+                                        <p>Quantization should not be exclusive to any particular inference server.</p>
+                                        <p class="mt-1">
+                                            oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm,
+                                            LM Studio, and any app that supports MLX safetensors format.
+                                        </p>
+                                        <p class="mt-1">No custom loader required.</p>
+                                    </blockquote>
+                                </div>
+
+                                <div>
+                                    <h5 class="text-base font-bold text-neutral-700">oQ and oQe: MLX-native mixed precision</h5>
+                                    <p class="mt-2">
+                                        The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a
+                                        byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity
+                                        and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted
+                                        affine quantization.
                                     </p>
                                 </div>
 
-                                <!-- Key features -->
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">Key features</h5>
+                                    <h5 class="text-base font-bold text-neutral-700">What standard oQ does</h5>
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Data-driven sensitivity</strong> <span class="text-neutral-500">Per-layer relative MSE measured against float16. Layers are ranked by quantization impact; the top 25% are marked as sensitive and receive priority in bit allocation.</span></div>
+                                            <i data-lucide="activity" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
+                                            <div>
+                                                <strong class="text-neutral-700">Layer sensitivity</strong>
+                                                <span class="text-neutral-500">
+                                                    is measured with calibration prompts by comparing quantized-layer output error
+                                                    against the float baseline.
+                                                </span>
+                                            </div>
                                         </div>
                                         <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Budget-constrained allocation</strong> <span class="text-neutral-500">4-phase greedy plan within a hard bpw cap. Consensus tensors (lm_head, embeddings) get 8-bit first. Then attention and shared-expert layers get a protection floor. Remaining budget goes to the highest-sensitivity tensors. Routed experts (93-98% of MoE params) stay at base bits so the budget concentrates on the layers that actually move output quality.</span></div>
+                                            <i data-lucide="sliders-horizontal" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
+                                            <div>
+                                                <strong class="text-neutral-700">Mixed precision</strong>
+                                                <span class="text-neutral-500">
+                                                    allocates higher bits to sensitive layers and protected tensors while keeping
+                                                    the target bits-per-weight budget under a hard cap.
+                                                </span>
+                                            </div>
                                         </div>
                                         <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M2 12h5l3-9 4 18 3-9h5"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Model-aware quantization</strong> <span class="text-neutral-500">MoE: router fp16, routed experts at base, shared experts protected. VLM: vision encoder fp16. SSM: state tensors fp32. 512+ expert models get larger group size automatically.</span></div>
+                                            <i data-lucide="route" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
+                                            <div>
+                                                <strong class="text-neutral-700">Architecture rules</strong>
+                                                <span class="text-neutral-500">
+                                                    keep MoE routers in fp16, protect shared experts and output-critical tensors,
+                                                    leave vision/audio encoders unquantized, and preserve SSM state tensors.
+                                                </span>
+                                            </div>
                                         </div>
-                                        <div class="flex gap-3">
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-neutral-400 shrink-0 mt-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-                                            <div class="text-sm"><strong class="text-neutral-700">Streaming</strong> <span class="text-neutral-500">Tensor-by-tensor quantization from safetensors. Use a sensitivity model (pre-quantized proxy) to measure layer ranking at ~4x less memory than float16 calibration.</span></div>
-                                        </div>
-
                                     </div>
                                 </div>
 
-                                <!-- Comparison table -->
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">Comparison with other methods</h5>
-                                    <div class="mt-2 overflow-x-auto">
+                                    <h5 class="text-base font-bold text-neutral-700">What oQe adds</h5>
+                                    <p class="mt-2">
+                                        oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step.
+                                        This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from
+                                        representative prompts, then use that information so quantization spends less error on the
+                                        input channels that matter most.
+                                    </p>
+                                    <div class="mt-3 overflow-x-auto">
                                         <table class="w-full text-xs">
                                             <thead>
                                                 <tr class="border-b border-neutral-200">
-                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600"></th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">oQ</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">GGUF K-quant</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">GGUF IQ</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">unsloth Dynamic</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">AWQ</th>
+                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600">Path</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Bit allocation</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Affine quantization</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Best use</th>
                                                 </tr>
                                             </thead>
                                             <tbody class="text-neutral-500">
                                                 <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Format</td>
-                                                    <td class="py-1.5 px-3">MLX safetensors</td>
-                                                    <td class="py-1.5 px-3">GGUF</td>
-                                                    <td class="py-1.5 px-3">GGUF</td>
-                                                    <td class="py-1.5 px-3">GGUF</td>
-                                                    <td class="py-1.5 px-3">safetensors</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Mixed precision</td>
-                                                    <td class="py-1.5 px-3">Data-driven sensitivity (per-layer MSE)</td>
-                                                    <td class="py-1.5 px-3">~15 type rules</td>
-                                                    <td class="py-1.5 px-3">imatrix per-weight</td>
-                                                    <td class="py-1.5 px-3">Per-layer (proprietary)</td>
-                                                    <td class="py-1.5 px-3">Per-channel scaling</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Hybrid modes</td>
-                                                    <td class="py-1.5 px-3">Affine (group_size=64)</td>
-                                                    <td class="py-1.5 px-3">K-quant types</td>
-                                                    <td class="py-1.5 px-3">E8 lattice</td>
-                                                    <td class="py-1.5 px-3">Proprietary</td>
-                                                    <td class="py-1.5 px-3">Affine only</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">MoE support</td>
-                                                    <td class="py-1.5 px-3">Router fp16, expert-aware budget</td>
-                                                    <td class="py-1.5 px-3">Basic</td>
-                                                    <td class="py-1.5 px-3">Basic</td>
-                                                    <td class="py-1.5 px-3">Router fp16</td>
-                                                    <td class="py-1.5 px-3">Limited</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">VLM / SSM</td>
-                                                    <td class="py-1.5 px-3">Vision fp16, SSM F32 state</td>
-                                                    <td class="py-1.5 px-3">Separate mmproj, F32 state</td>
-                                                    <td class="py-1.5 px-3">Separate mmproj, F32 state</td>
-                                                    <td class="py-1.5 px-3">Supported</td>
-                                                    <td class="py-1.5 px-3">Not tested</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Calibration</td>
-                                                    <td class="py-1.5 px-3">Built-in 600 samples (code + multilingual + reasoning)</td>
-                                                    <td class="py-1.5 px-3">None</td>
-                                                    <td class="py-1.5 px-3">imatrix required</td>
-                                                    <td class="py-1.5 px-3">Proprietary data</td>
-                                                    <td class="py-1.5 px-3">Activation data</td>
-                                                </tr>
-                                                <tr class="border-b border-neutral-100">
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Memory</td>
-                                                    <td class="py-1.5 px-3">Streaming (~5-7GB)</td>
-                                                    <td class="py-1.5 px-3">1× model</td>
-                                                    <td class="py-1.5 px-3">1× model</td>
-                                                    <td class="py-1.5 px-3">Proprietary</td>
-                                                    <td class="py-1.5 px-3">1.5× model</td>
+                                                    <td class="py-2 pr-4 font-medium text-neutral-600">oQ</td>
+                                                    <td class="py-2 px-3">Layer-sensitivity mixed precision</td>
+                                                    <td class="py-2 px-3">Standard min/max affine per group</td>
+                                                    <td class="py-2 px-3">Fast, deterministic conversion with strong baseline quality</td>
                                                 </tr>
                                                 <tr>
-                                                    <td class="py-1.5 pr-4 font-medium text-neutral-600">Apple Silicon</td>
-                                                    <td class="py-1.5 px-3">Native (MLX affine)</td>
-                                                    <td class="py-1.5 px-3">Via llama.cpp</td>
-                                                    <td class="py-1.5 px-3">Via llama.cpp</td>
-                                                    <td class="py-1.5 px-3">GGUF only</td>
-                                                    <td class="py-1.5 px-3">MLX (affine)</td>
+                                                    <td class="py-2 pr-4 font-medium text-neutral-600">oQe</td>
+                                                    <td class="py-2 px-3">Same oQ plan</td>
+                                                    <td class="py-2 px-3">imatrix-weighted clipping/search per group</td>
+                                                    <td class="py-2 px-3">Better low-bit retention, especially for MoE and activation-skewed layers</td>
                                                 </tr>
                                             </tbody>
                                         </table>
                                     </div>
                                 </div>
 
+                                <div>
+                                    <h5 class="text-base font-bold text-neutral-700">How oQe imatrix works</h5>
+                                    <div class="mt-3 space-y-3">
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">1</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Collect activation energy.</strong>
+                                                <span class="text-neutral-500">
+                                                    oQe runs calibration samples through the model and records average input
+                                                    activation squared, E[x^2], for each quantized Linear input channel.
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">2</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Track experts separately.</strong>
+                                                <span class="text-neutral-500">
+                                                    For MoE SwitchLinear layers, oQe records one importance vector per expert using
+                                                    the router-selected expert indices, so inactive or rarely active experts are
+                                                    visible in the coverage report.
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">3</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Adapt sample count.</strong>
+                                                <span class="text-neutral-500">
+                                                    Calibration starts from the requested sample count and can continue up to the
+                                                    adaptive maximum when MoE expert coverage is not sufficient.
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3">
+                                            <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">4</span>
+                                            <div>
+                                                <strong class="text-neutral-700">Weight the quantization error.</strong>
+                                                <span class="text-neutral-500">
+                                                    During affine quantization, oQe chooses scale/bias candidates by minimizing
+                                                    sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE.
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <p class="mt-3 text-xs text-neutral-400">
+                                        If a tensor has no matching imatrix entry, the default behavior is to fall back to standard
+                                        oQ for that tensor. Enable strict coverage to fail instead.
+                                    </p>
+                                </div>
                             </div>
                         </div>
                     </div>

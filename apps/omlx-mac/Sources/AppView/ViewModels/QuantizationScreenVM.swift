@@ -10,6 +10,10 @@ final class QuantizationScreenVM {
     var textOnly: Bool = false
     var preserveMtp: Bool = false
     var dtype: String = "bfloat16"
+    var enhanced: Bool = false
+    var imatrixReuseCache: Bool = true
+    var imatrixCachePath: String = ""
+    var imatrixStrict: Bool = false
     var advancedOpen: Bool = false
 
     // Server state
@@ -59,11 +63,10 @@ final class QuantizationScreenVM {
     var sensitivityCandidates: [OQModelInfo] {
         guard let source = models.first(where: { $0.path == selectedModelPath })
         else { return [] }
-        let prefix = source.name.split(separator: "-").prefix(2).joined(separator: "-")
         return allModels.filter { m in
             m.path != selectedModelPath
             && m.isQuantized
-            && m.name.hasPrefix(prefix)
+            && m.modelType == source.modelType
         }
     }
 
@@ -263,12 +266,17 @@ final class QuantizationScreenVM {
             sensitivityModelPath: sensitivityModelPath,
             textOnly: textOnly,
             dtype: dtype,
-            preserveMtp: selectedHasMTP && preserveMtp
+            preserveMtp: selectedHasMTP && preserveMtp,
+            enhanced: enhanced,
+            imatrixCachePath: imatrixCachePath.trimmingCharacters(in: .whitespacesAndNewlines),
+            imatrixReuseCache: imatrixReuseCache,
+            imatrixStrict: imatrixStrict
         )
         let displayName = models.first(where: { $0.path == selectedModelPath })?.name
             ?? selectedModelPath
-        let levelLabel = (oqLevel.rounded() == oqLevel)
-            ? "oQ\(Int(oqLevel))" : "oQ\(oqLevel)"
+        let levelLabel = ((oqLevel.rounded() == oqLevel)
+            ? "oQ\(Int(oqLevel))" : "oQ\(oqLevel)")
+            + (enhanced ? "e" : "")
         Task { [weak self] in
             defer { Task { @MainActor [weak self] in self?.isStarting = false } }
             do {

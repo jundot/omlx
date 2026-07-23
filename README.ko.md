@@ -72,6 +72,12 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+선택사항인 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널은 현재 HEAD 빌드가 필요합니다:
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### 소스에서 설치
 
 ```bash
@@ -79,6 +85,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # 코어만
 pip install -e ".[mcp]"   # MCP (Model Context Protocol) 포함
+
+# 선택사항: GLM-5.2 / MiniMax M3 네이티브 커스텀 커널
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
@@ -363,7 +372,7 @@ open apps/omlx-mac/build/Stage/oMLX.app
 # venvstacks 강제 재빌드 (그 외에는 fingerprint 로 캐시됨)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# 선택 GLM 네이티브 커스텀 커널을 포함해 스테이징
+# 선택 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널을 포함해 스테이징
 apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 

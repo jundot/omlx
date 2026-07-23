@@ -49,8 +49,11 @@ final class ModelsScreenSortingTests: XCTestCase {
             isLoading: false,
             estimatedSize: 0,
             estimatedSizeFormatted: nil,
+            actualSize: nil,
+            actualSizeFormatted: nil,
             pinned: nil,
             isDefault: nil,
+            isFavorite: nil,
             engineType: nil,
             modelType: nil,
             configModelType: nil,
@@ -60,6 +63,7 @@ final class ModelsScreenSortingTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            virtual: nil,
             settings: nil
         )
     }

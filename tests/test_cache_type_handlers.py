@@ -160,6 +160,7 @@ class TestKVCacheHandlerWithMLX:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -524,6 +525,7 @@ class TestRotatingKVCacheHandlerWithMLX:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -596,6 +598,45 @@ class TestRotatingKVCacheHandlerWithMLX:
         # Subclass clamps size() so merge can't overshoot the buffer.
         assert isinstance(cache, PrefillReadyRotatingKVCache)
         assert cache.size() == 100
+
+    def test_reconstruct_cache_missing_meta_and_fields_rejected(self, handler, mx):
+        """No meta_state and no explicit window fields: reject, don't guess.
+
+        A restored rotating layer whose meta never round-tripped used to be
+        rebuilt with keep=0, max_size=keys.shape[2], offset=keys.shape[2]
+        guessed from the buffer shape. Once the window has rotated, the true
+        offset exceeds the buffer length, so the guess silently shifts RoPE
+        positions for every subsequent token and shrinks the window. The
+        handler must return None so the caller rejects the cached prefix and
+        the request re-prefills.
+        """
+        state = {
+            "keys": mx.zeros((1, 8, 256, 64)),
+            "values": mx.zeros((1, 8, 256, 64)),
+            "meta_state": None,
+        }
+
+        assert handler.reconstruct_cache(state, None) is None
+
+    def test_reconstruct_cache_explicit_state_fields_without_meta(self, handler, mx):
+        """Live-path states carry keep/max_size/offset explicitly (extract_state,
+        slice_state, concatenate_states all emit them); those must keep
+        reconstructing without a meta_state tuple."""
+        state = {
+            "keys": mx.zeros((1, 8, 256, 64)),
+            "values": mx.zeros((1, 8, 256, 64)),
+            "keep": 4,
+            "max_size": 256,
+            "offset": 500,
+            "_idx": 100,
+        }
+
+        cache = handler.reconstruct_cache(state, None)
+
+        assert cache is not None
+        assert cache.keep == 4
+        assert cache.max_size == 256
+        assert cache.offset == 500
 
     def test_reconstruct_cache_oversized_trims_to_max_size(self, handler, mx):
         """Oversized prefill-internal snapshot is trimmed to max_size.
@@ -898,6 +939,9 @@ class TestCacheTypeRegistry:
         handler = CacheTypeRegistry.get_handler_by_class_name("RotatingKVCache")
         assert isinstance(handler, RotatingKVCacheHandler)
 
+        handler = CacheTypeRegistry.get_handler_by_class_name("BufferedRotatingKVCache")
+        assert isinstance(handler, RotatingKVCacheHandler)
+
     def test_get_handler_by_class_name_unknown(self):
         """Test getting handler for unknown class name."""
         handler = CacheTypeRegistry.get_handler_by_class_name("UnknownCache")
@@ -919,7 +963,17 @@ class TestCacheTypeRegistry:
         # RotatingKVCache-like
         mock_rotating = MagicMock()
         mock_rotating.__class__.__name__ = "RotatingKVCache"
-        assert CacheTypeRegistry.detect_cache_type(mock_rotating) == CacheType.ROTATING_KVCACHE
+        assert (
+            CacheTypeRegistry.detect_cache_type(mock_rotating)
+            == CacheType.ROTATING_KVCACHE
+        )
+
+        mock_buffered = MagicMock()
+        mock_buffered.__class__.__name__ = "BufferedRotatingKVCache"
+        assert (
+            CacheTypeRegistry.detect_cache_type(mock_buffered)
+            == CacheType.ROTATING_KVCACHE
+        )
 
     def test_detect_cache_type_by_attributes(self):
         """Test detecting cache type by attributes when class name unknown."""
@@ -979,6 +1033,7 @@ class TestCacheTypeRegistry:
         names = CacheTypeRegistry.list_known_class_names()
         assert "KVCache" in names
         assert "RotatingKVCache" in names
+        assert "BufferedRotatingKVCache" in names
         assert "ArraysCache" in names
 
     def test_register_handler(self):
@@ -1167,6 +1222,7 @@ class TestCacheListHandlerWithMLX:
         """Import MLX or skip."""
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -1197,9 +1253,8 @@ class TestCacheListHandlerWithMLX:
         assert hasattr(cache, "caches")
         assert len(cache.caches) == 2
 
-    def test_reconstruct_cache_kvcache_no_fallback(self, handler, mx):
-        """Test CacheList with KVCache sub-caches succeeds via from_state()
-        without falling back to manual reconstruction (GLM-5 scenario)."""
+    def test_reconstruct_cache_kvcache_subs_via_handlers(self, handler, mx):
+        """Test CacheList with KVCache sub-caches succeeds via local handlers."""
         keys1 = mx.zeros((1, 8, 64, 64))
         values1 = mx.zeros((1, 8, 64, 64))
         keys2 = mx.zeros((1, 8, 64, 64))
@@ -1215,20 +1270,42 @@ class TestCacheListHandlerWithMLX:
             ["", ""],
         )
 
-        import logging
-        from unittest.mock import patch
-
-        with patch.object(
-            logging.getLogger("omlx.cache.type_handlers"), "debug"
-        ) as mock_debug:
-            cache = handler.reconstruct_cache(state, meta_state)
+        cache = handler.reconstruct_cache(state, meta_state)
 
         assert cache is not None
         assert hasattr(cache, "caches")
         assert len(cache.caches) == 2
-        # Verify from_state() succeeded without fallback
-        for call_args in mock_debug.call_args_list:
-            assert "from_state() unavailable or failed" not in str(call_args)
+
+    def test_reconstruct_cache_rotating_sub_cache_uses_handler(self, handler, mx):
+        """Nested RotatingKVCache restores as trimmed PrefillReadyRotatingKVCache."""
+        from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
+
+        keys = mx.arange(255).reshape(1, 1, 255, 1)
+        values = mx.arange(1000, 1255).reshape(1, 1, 255, 1)
+        expected_keys = keys[..., -128:, :]
+        expected_values = values[..., -128:, :]
+
+        state = {
+            "sub_states": [(keys, values)],
+        }
+        meta_state = (
+            ["RotatingKVCache"],
+            [("0", "128", "1280", "255")],
+        )
+
+        cache = handler.reconstruct_cache(state, meta_state)
+
+        assert cache is not None
+        assert hasattr(cache, "caches")
+        assert len(cache.caches) == 1
+        sub_cache = cache.caches[0]
+        assert isinstance(sub_cache, PrefillReadyRotatingKVCache)
+        assert sub_cache.keys.shape == (1, 1, 128, 1)
+        assert sub_cache.values.shape == (1, 1, 128, 1)
+        assert bool(mx.all(sub_cache.keys == expected_keys).item())
+        assert bool(mx.all(sub_cache.values == expected_values).item())
+        assert sub_cache.offset == 1280
+        assert sub_cache._idx == 128
 
     def test_reconstruct_cache_mixed_types(self, handler, mx):
         """Test reconstructing CacheList with ArraysCache + KVCache."""

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -79,6 +80,20 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from . import cache_rollback as _rollback_mod
 
 logger = logging.getLogger(__name__)
+
+
+def _set_verify_qmm_armed(flag: bool) -> None:
+    """Arm the verify-shape qmm routing for the duration of an MTP forward.
+
+    Import is deferred and failure-tolerant: the kernel module is optional
+    and its absence must not affect the MTP path.
+    """
+    try:
+        from ..qwen35_verify_qmm import set_verify_qmm_armed
+
+        set_verify_qmm_armed(flag)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -121,6 +136,7 @@ def apply() -> bool:
             realign_rows = getattr(self, "_omlx_realign_rows", None)
             if callable(realign_rows):
                 realign_rows()
+            _maybe_clear_multirow_marker(self)
 
             if _is_mtp_batch_eligible(self):
                 try:
@@ -145,6 +161,7 @@ def apply() -> bool:
                     _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             return original_next(self, *args, **kwargs)
 
@@ -303,10 +320,41 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
     return True
 
 
+_ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
+
+
+def _rowwise_batch_mtp_enabled() -> bool:
+    """Opt-in for row-wise MTP on multi-row batches (default off).
+
+    The row-wise path runs one backbone forward per row per cycle, so its
+    aggregate throughput is roughly single-stream MTP throughput regardless
+    of batch size, while standard batched decode amortizes one forward over
+    all rows. Measured on Qwen3.6-27B-oQ4e-mtp / M3 Ultra (pp1024/tg128):
+    row-wise 53.3 / 52.5 tok/s aggregate at batch 2 / 4 versus 65.2 / 86.5
+    for standard batched decode — despite 83-93% draft acceptance. It only
+    pays off when tokens-per-cycle exceeds the row count, so it stays off
+    unless explicitly requested.
+    """
+    return os.environ.get(_ROWWISE_BATCH_MTP_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
     if getattr(gen_batch, state_attr, None) is not None:
         return True
-    if getattr(gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False):
+    # The multirow-decode marker guards the singleton-init invariant only
+    # (see _mark_standard_multirow_decode). Row-wise batch activation seeds
+    # every row from a freshly extracted per-row cache, so a prior standard
+    # multi-row decode is exactly the state it expects — blocking it here
+    # would permanently lock batches out of MTP, because a batch's first
+    # decode step is always standard.
+    if state_attr == "_omlx_mtp_state" and getattr(
+        gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False
+    ):
         return False
     return bool(getattr(gen_batch, "_omlx_mtp_activation_safe", True))
 
@@ -318,6 +366,10 @@ def _mark_standard_multirow_decode(gen_batch: Any) -> None:
     no longer satisfies the narrow invariant that singleton MTP initialization
     relies on. Existing row-wise MTP state may continue, but starting a fresh
     singleton MTP state after late-join/late-finish reshaping is unsafe.
+
+    The marker is not permanent: once the batch shrinks back to one row with a
+    verifiably compact cache, ``_maybe_clear_multirow_marker`` lifts it so the
+    surviving request regains MTP for the rest of its generation.
     """
     try:
         if len(getattr(gen_batch, "uids", []) or []) > 1:
@@ -326,21 +378,73 @@ def _mark_standard_multirow_decode(gen_batch: Any) -> None:
         pass
 
 
-def _batch_rows_aligned_for_mtp(gen_batch: Any) -> bool:
-    """True when all batch rows share the same target-cache decode position."""
-    prompt_cache = getattr(gen_batch, "prompt_cache", None) or []
-    for cache in prompt_cache:
-        offset = getattr(cache, "offset", None)
-        if offset is None:
+def _log_multirow_mtp_inactive_once(gen_batch: Any) -> None:
+    """Say once, at INFO, why an MTP-capable batch is decoding without MTP.
+
+    #2150 showed the silent fallback is easy to misread: the benchmark's
+    batched phases report plain continuous-batching numbers while every log
+    line about MTP inactivity hides at DEBUG. One line per batch keeps the
+    signal visible without per-step spam.
+    """
+    if getattr(gen_batch, "_omlx_mtp_inactive_logged", False):
+        return
+    uids = getattr(gen_batch, "uids", None)
+    if uids is None or len(uids) <= 1:
+        return
+    if not _mtp_common_eligible(gen_batch):
+        return
+    gen_batch._omlx_mtp_inactive_logged = True
+    if not _rowwise_batch_mtp_enabled():
+        logger.info(
+            "MTP inactive for %d-row batch: standard batched decode is faster "
+            "at this batch size (set %s=1 to force row-wise MTP)",
+            len(uids),
+            _ROWWISE_BATCH_MTP_ENV,
+        )
+    else:
+        logger.info(
+            "MTP inactive for %d-row batch: %s",
+            len(uids),
+            _ineligibility_reason(gen_batch) or "activation deferred",
+        )
+
+
+def _maybe_clear_multirow_marker(gen_batch: Any) -> None:
+    """Re-enable singleton MTP once a shrunken batch is verifiably safe again.
+
+    The multirow marker exists because a row surviving batch reshaping may sit
+    in a cache whose layout singleton MTP's raw backbone calls don't expect
+    (left padding). ``BatchKVCache.filter()`` shifts out the minimum shared
+    left padding, so a batch filtered down to one row is compact again in the
+    common case — verify that per layer instead of assuming, and only then
+    lift the marker. Without this, a request that ever shared a decode step
+    with another request is locked out of MTP for the rest of its generation
+    even once it is running alone (#2150).
+    """
+    if not getattr(gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False):
+        return
+    uids = getattr(gen_batch, "uids", None)
+    if uids is None or len(uids) != 1:
+        return
+    # CacheList layers (GLM 5.2 / DeepSeek v3.2 lineage) keep left padding on
+    # their sub-caches, not on the container — recurse instead of skipping.
+    pending = list(getattr(gen_batch, "prompt_cache", None) or [])
+    while pending:
+        cache = pending.pop()
+        sub_caches = getattr(cache, "caches", None)
+        if sub_caches is not None:
+            pending.extend(sub_caches)
+            continue
+        left_padding = getattr(cache, "left_padding", None)
+        if left_padding is None:
             continue
         try:
-            if hasattr(offset, "tolist"):
-                values = [int(v) for v in offset.tolist()]
-                return len(set(values)) <= 1
-            return True
+            if max(int(v) for v in left_padding.tolist()) > 0:
+                return
         except Exception:
-            return False
-    return True
+            return
+    gen_batch._omlx_mtp_saw_standard_multirow_decode = False
+    logger.info("MTP singleton recovery: multirow marker cleared (compact cache)")
 
 
 def _is_mtp_eligible(gen_batch: Any) -> bool:
@@ -376,8 +480,14 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
         return False
     if getattr(
         gen_batch, "_omlx_mtp_batch_state", None
-    ) is None and not _batch_rows_aligned_for_mtp(gen_batch):
+    ) is None and not _rowwise_batch_mtp_enabled():
         return False
+    # No cache-position alignment requirement: activation seeds each row from
+    # its own extract_cache(idx) view and steady-state row cycles diverge the
+    # per-row offsets immediately anyway (accept counts differ per row), so
+    # the merge path already handles ragged rows. Under continuous batching
+    # rows join at different times, so requiring aligned offsets at
+    # activation kept this path from ever engaging (#2150).
     return True
 
 
@@ -405,8 +515,15 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     if uids is None:
         return "GenerationBatch has no uids"
     if len(uids) != 1:
-        if not _batch_rows_aligned_for_mtp(gen_batch):
-            return "row-wise MTP requires aligned target-cache positions"
+        if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
+            return "pending prompt work may still merge into this batch"
+        if getattr(
+            gen_batch, "_omlx_mtp_batch_state", None
+        ) is None and not _rowwise_batch_mtp_enabled():
+            return (
+                f"row-wise batch MTP is opt-in ({_ROWWISE_BATCH_MTP_ENV}=1); "
+                "standard batched decode is faster at batch >= 2"
+            )
         return ""
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
         return "pending prompt work may still merge into this singleton batch"
@@ -434,12 +551,17 @@ class _MtpStats:
     """
 
     cycles: int = 0  # number of verify cycles run
-    accepts: int = 0  # cycles where the draft was accepted
-    rejects: int = 0  # cycles where the draft was rejected
+    accepts: int = 0  # accepted draft tokens (depth-k: sum over positions)
+    rejects: int = 0  # cycles that ended in a rejection
     init_emits: int = 0  # tokens emitted from the post-init queue (always 2)
     draft_emits: int = 0  # tokens emitted as accepted drafts
     bonus_emits: int = 0  # tokens emitted as bonus (accepted + emit_bonus)
     verify_emits: int = 0  # tokens emitted as verify-position correction (reject path)
+    # Per-depth accept telemetry for chained drafting: drafted[j] counts
+    # cycles where a draft existed at depth j; accepted[j] counts how many
+    # of those were verified. Depth-1 legacy path fills index 0 only.
+    depth_drafted: List[int] = field(default_factory=list)
+    depth_accepted: List[int] = field(default_factory=list)
     # Component-level timings. Help diagnose where MTP overhead comes from
     # when accept rate is healthy but wall-clock throughput isn't.
     backbone_ms: float = 0.0  # cumulative time inside the 2-token verify forward
@@ -481,6 +603,39 @@ class _MtpState:
     # verify cycle can compare draft vs verify ids without a separate
     # GPU→CPU sync (`int(draft_tok.tolist()[0])` would force a stall).
     draft_id: int = -1
+
+    # --- depth-k chained drafting (Qwen3.5/3.6 only) ---
+    # chain=True routes decode through _run_verify_cycle_chain; False keeps
+    # the PR-990 depth-1 legacy cycle.
+    chain: bool = False
+    depth: int = 1
+    # head_clone=True runs speculative head steps on a per-cycle cache clone
+    # (models whose head cache can't be exactly trimmed once rotated).
+    head_clone: bool = False
+    # Pending draft tokens for the next verify forward: (depth,) uint32 array.
+    # Host-side ids are read in the verify cycle's single sync, not here.
+    drafts: Optional[Any] = None
+    # Per-draft raw logprob rows (vocab,) — emitted as the accepted drafts'
+    # logprobs (PR 990 contract) — and sampler-filtered rows for stochastic
+    # acceptance. Lazy arrays; only evaluated if a consumer touches them.
+    draft_lps: List[Any] = field(default_factory=list)
+    draft_accept_lps: List[Any] = field(default_factory=list)
+    # MTP-head cache offset at cycle start. Chain entries beyond this offset
+    # are speculative and trimmed at commit; committed history is re-appended
+    # from verify-forward hidden rows so the head sees a dense, committed-only
+    # timeline.
+    hist_offset: int = 0
+    # Sampler for draft tokens (lazily resolved). For stochastic target
+    # samplers this is a *sharper* distribution than the target (temp 0.6 /
+    # top_p 0.95 / top_k 20) — the Leviathan/Chen acceptance ratio uses the
+    # true draft distribution q, so any q keeps the output distribution
+    # exact, and truncating the 1-layer head's noisy tail is what keeps
+    # acceptance usable on high-entropy content (creative prose collapses to
+    # ~10-20% with matched-temp drafts).
+    draft_sampler: Optional[Any] = None
+    # Adaptive depth controller (None = fixed depth). Chooses how many
+    # drafts the next chain builds from rolling accept/latency estimates.
+    controller: Optional[Any] = None
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
@@ -1032,6 +1187,12 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
     """
     for c in prompt_cache:
         if getattr(c, "rollback_state", None) is not None:
+            # A draft stash marks the chain-path *pre-forward* snapshot
+            # semantics (qwen35_model unsplit verify); restoring it here
+            # would drop the confirmed token too. Only mtp_partial_rollback
+            # knows how to replay it — refuse so the caller falls back.
+            if getattr(c, "_mtp_draft_stash", None) is not None:
+                return False
             continue
         if hasattr(c, "is_trimmable") and c.is_trimmable():
             continue
@@ -1110,9 +1271,11 @@ def _call_backbone(
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
     _rollback_mod.set_undo_armed(True)
+    _set_verify_qmm_armed(True)
     try:
         result = model(inputs, **kwargs)
     finally:
+        _set_verify_qmm_armed(False)
         _rollback_mod.set_undo_armed(False)
 
     # LanguageModelOutput (mlx-vlm dataclass)
@@ -1134,6 +1297,8 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
     for c in prompt_cache:
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
             c.rollback_state = None
+        if getattr(c, "_mtp_draft_stash", None) is not None:
+            c._mtp_draft_stash = None
         if getattr(c, "_mtp_undo", None) is not None:
             c._mtp_undo = None
         for sub in getattr(c, "caches", ()):
@@ -1148,6 +1313,471 @@ def _ensure_uint32(arr):
     if arr.dtype == mx.uint32:
         return arr
     return arr.astype(mx.uint32)
+
+
+# ---------------------------------------------------------------------------
+# Depth-k chained drafting helpers (Qwen3.5/3.6): a linear draft chain through
+# the MTP head, one batched verify forward covering all drafts plus a free
+# bonus row, offset-trim KV rollback with GDN prefix replay, and a
+# committed-only MTP-head history rebuilt from verify hidden rows each cycle.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
+    """Read the chain capability markers stamped on the model at load.
+
+    Returns ``(chain, depth, head_clone)``. ``head_clone`` marks models
+    whose MTP-head cache cannot be exactly trimmed (e.g. DeepSeek-V4's
+    RotatingKVCache head once rotated): the chain then runs its speculative
+    draft steps on a per-cycle clone and keeps the persistent head cache
+    committed-only, instead of trimming speculative entries afterwards.
+    """
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        if getattr(candidate, "_omlx_mtp_chain", False):
+            depth = int(getattr(candidate, "_omlx_mtp_depth", 1) or 1)
+            head_clone = bool(getattr(candidate, "_omlx_mtp_head_clone", False))
+            return True, max(1, min(8, depth)), head_clone
+    return False, 1, False
+
+
+def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
+    """Detached per-cycle copy of the MTP-head cache for speculative steps.
+
+    ``copy.copy`` keeps scalars; mx.array attributes are detached with
+    ``v + 0`` so the clone's in-place ring writes never mutate arrays the
+    persistent cache still references; list attributes are shallow-copied.
+    Container caches (``CacheList``-style, exposing ``.caches``) recurse.
+    """
+    import copy
+
+    import mlx.core as mx
+
+    def clone_one(c):
+        if c is None:
+            return None
+        subs = getattr(c, "caches", None)
+        if subs is not None:
+            return type(c)(*[clone_one(sub) for sub in subs])
+        new = copy.copy(c)
+        for attr, val in vars(c).items():
+            if isinstance(val, mx.array):
+                setattr(new, attr, val + 0)
+            elif isinstance(val, list):
+                setattr(new, attr, list(val))
+        return new
+
+    return [clone_one(c) for c in mtp_cache]
+
+
+def _trunk_norm_module(model: Any):
+    """Final RMSNorm of the backbone (for post_norm head inputs).
+
+    Walks both wrapper conventions: mlx-lm's outer ``Model.language_model``
+    and oMLX's ``VLMModelAdapter._language_model`` (mlx-vlm path).
+
+    Models whose ``return_hidden`` output is already post-norm mark
+    ``_omlx_mtp_head_hidden_normed`` (instance or inner language model) and
+    get an identity here — applying the trunk norm again would double-norm
+    the head inputs, and the ``inner.model.norm`` walk does not fit every
+    backbone layout (e.g. ``backbone.norm_f``).
+    """
+    inner = model
+    for attr in ("language_model", "_language_model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None:
+            inner = candidate
+            break
+    if getattr(model, "_omlx_mtp_head_hidden_normed", False) or getattr(
+        inner, "_omlx_mtp_head_hidden_normed", False
+    ):
+        return lambda x: x
+    return inner.model.norm
+
+
+# The MTP head is fed the trunk's *post-norm* hidden and chains on its own
+# post-norm output. Measured on Qwen3.6-27B this accepts a few points higher
+# than PR 990's pre-norm at every depth. Draft-side only, so output identity
+# is unaffected regardless.
+_HEAD_HIDDEN_POST_NORM = True
+
+
+def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
+    """Trim speculative chain entries so the head cache ends at ``offset``."""
+    for c in mtp_cache:
+        current = int(getattr(c, "offset", 0))
+        extra = current - offset
+        if extra > 0:
+            c.trim(extra)
+
+
+class _DepthController:
+    """Adaptive draft-depth selection.
+
+    Pure host-side bookkeeping — no extra GPU syncs. Tracks an EMA of
+    conditional acceptance per depth position and a wall-time EMA of cycle
+    cost per depth used, then picks the depth with the best expected tokens
+    per unit time:
+
+        score(d) = (1 + p1 + p1*p2 + ... ) / t_est(d)
+
+    Everything the decision uses is measured on this machine, on this model,
+    under the current load — no hand-tuned per-chip or per-model value:
+
+    - Cost: a warmup sweep runs each depth once so every ``t[d]`` starts from
+      a real cycle; the marginal cost of an extra verify row is the measured
+      slope between depths (``_marginal_est``), so a fine-grained MoE on a
+      bandwidth-limited chip learns its true (large) marginal within the first
+      few cycles. ``MARGINAL_MS`` is only the pre-measurement fallback.
+    - Drift: the cost EMA horizon is wall-clock (``TAU_MS``), not a cycle
+      count, so context growth, thermal throttling and external GPU contention
+      are tracked at constant real-time responsiveness however long a cycle
+      is; a one-off slow cycle is damped (``SPIKE_RATIO``).
+    - Staleness: only the depth currently run gets fresh measurements, and a
+      fresh-vs-stale cost comparison is systematically biased — e.g. a depth
+      whose t was measured during the slow post-prefill cycles looks expensive
+      forever, so the controller locks into its rival (measured as a depth-2
+      lock costing prose ~2-4%). Probes are therefore BIDIRECTIONAL and
+      staleness-directed: on a wall-clock cadence, re-run the best rival depth
+      (shallower or deeper) when its score is within ``PROBE_MARGIN`` of the
+      current choice, and periodically the most-stale depth, so every t[d] has
+      bounded age. On heavy models a fixed wall-clock cadence would spend a
+      large share of cycles probing, so probing is duty-bounded to
+      ~``PROBE_DUTY`` of cycles — a scale-free ratio, not a per-model tuning.
+
+    Content-adaptive by construction: prose/chat settles at depth 1,
+    code/predictable text climbs. Rejected alternatives (interleaved
+    in-process A/B, rotated order, paired per rep, on Qwen3.6-35B-A3B +
+    GLM-5.2, M3 Ultra): a fixed shallow-bias constant (won earlier separate-
+    process comparisons only by masking the staleness lock; this design beats
+    it on 3 of 4 model x content cells and ties the 4th), a pure realized
+    tok/s bandit (exploration tax), a live per-cycle learned correction
+    (decision churn), a frozen cross-generation correction (content
+    oscillation), and a base x shape cost decomposition (unidentifiable while
+    one depth runs for long stretches).
+    """
+
+    ALPHA = 0.08  # acceptance EMA weight (token domain, content-driven)
+    TAU_MS = 400.0  # cost EMA horizon in wall-clock ms (load/thermal/context)
+    PROBE_PERIOD_MS = 1000.0  # min wall-time between probes (light models)
+    PROBE_PERIOD_MAX_MS = 5000.0  # staleness-exploration cadence floor
+    PROBE_LEN = 4
+    PROBE_DUTY = 0.15  # probes never consume more than ~this share of cycles
+    PROBE_MARGIN = 1.15  # a rival within this score ratio is worth re-measuring
+    SPIKE_RATIO = 2.0  # a cycle above this * the EMA is treated as an outlier
+    SPIKE_DAMP = 0.25  # ...and folded in at this fraction of the normal weight
+    # Fallback prior for one extra verify token's cost, used only until two
+    # depths have actually been measured; after that the marginal is the
+    # measured slope between depths. 7 ms matches dense backbones (6-10 ms).
+    MARGINAL_MS = 7.0
+    HYSTERESIS = 1.03  # switch depth only for a >3% score gain
+
+    def __init__(self, max_depth: int, marginal_ms: Optional[float] = None):
+        if marginal_ms:
+            self.MARGINAL_MS = float(marginal_ms)
+        self.max_depth = max(1, int(max_depth))
+        self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
+        self.p = [0.6] * self.max_depth
+        self.t: Dict[int, float] = {}
+        self.t_age: Dict[int, float] = {}  # ms since each depth was measured
+        self.cycles = 0
+        self.probe_left = 0
+        self._ms_probe = 0.0  # wall-time since any probe burst
+        self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
+        # Measure each depth once (max..1) before the score gate takes over, so
+        # t[] and the marginal estimate are data-driven within max_depth cycles.
+        self._warmup: List[int] = list(range(self.max_depth, 0, -1))
+
+    def observe(self, used: int, accepted: int, cycle_ms: float) -> None:
+        self.cycles += 1
+        used = max(1, min(int(used), self.max_depth))
+        accepted = max(0, min(int(accepted), used))
+        # Acceptance: token-domain EMA (a property of model/content, not load).
+        a = self.ALPHA
+        for j in range(used):
+            hit = 1.0 if j < accepted else 0.0
+            self.p[j] = (1.0 - a) * self.p[j] + a * hit
+            if j >= accepted:
+                break
+        # Cost: wall-time-domain EMA with a one-off-spike guard, plus per-depth
+        # ages so probes can target the estimate that is most stale.
+        cycle_ms = max(0.0, float(cycle_ms))
+        self._update_time(used, cycle_ms)
+        for d in list(self.t_age):
+            self.t_age[d] += cycle_ms
+        self.t_age[used] = 0.0
+        self._ms_probe += cycle_ms
+        self._ms_explore += cycle_ms
+
+        # Warmup sweep: keep walking max..1 until every depth is measured once.
+        if self._warmup:
+            self._warmup.pop(0)
+            if self._warmup:
+                self.cur = self._warmup[0]
+                return
+            self.cur = self._best()
+            self._ms_probe = 0.0
+            return
+
+        # Finishing a probe burst.
+        if self.probe_left > 0:
+            self.probe_left -= 1
+            if self.probe_left == 0:
+                self.cur = self._best()
+                self._ms_probe = 0.0
+            return
+
+        # Re-decide every cycle (cheap); HYSTERESIS in _best prevents thrash.
+        self.cur = self._best()
+
+        # Probe scheduling: bounded-staleness re-measurement in either
+        # direction, at a duty-bounded wall-clock cadence.
+        if self.max_depth > 1:
+            period = max(
+                self.PROBE_PERIOD_MS,
+                self.PROBE_LEN * cycle_ms / self.PROBE_DUTY,
+            )
+            if self._ms_probe >= period:
+                explore_due = self._ms_explore >= max(
+                    self.PROBE_PERIOD_MAX_MS, 2.0 * period
+                )
+                target = (
+                    self._most_stale() if explore_due else self._best_rival()
+                )
+                if target is not None:
+                    self.cur = target
+                    self.probe_left = self.PROBE_LEN
+                    self._ms_probe = 0.0
+                    if explore_due:
+                        self._ms_explore = 0.0
+
+    def _time_alpha(self, cycle_ms: float) -> float:
+        # EMA weight for a cycle of this wall-time: the memory horizon is
+        # ~TAU_MS regardless of cycle duration, so responsiveness is constant
+        # in real time whether a cycle is 8 ms (short) or 80 ms (128k context).
+        return 1.0 - math.exp(-max(0.0, float(cycle_ms)) / self.TAU_MS)
+
+    def _update_time(self, used: int, cycle_ms: float) -> None:
+        cycle_ms = max(0.0, float(cycle_ms))
+        prev = self.t.get(used)
+        if prev is None:
+            self.t[used] = cycle_ms
+            return
+        # Deliberately a per-cycle EMA, NOT an irregular-sampling EMA weighted
+        # by staleness age. Age-weighting (nearly replacing a stale estimate at
+        # the first probe cycle) is the textbook form, but it was measured
+        # WORSE here: single-cycle noise is ~±10%, so replacing an estimate
+        # from a 4-cycle probe burst injects that noise straight into the depth
+        # decision every probe (~1s), and prose re-over-drafted (-1.6%). The
+        # slow EMA is a variance shield; stale errors are corrected by probe
+        # REPETITION instead (each ~1s rival probe moves the estimate ~10% of
+        # the gap, converging within a few seconds).
+        a = self._time_alpha(cycle_ms)
+        if cycle_ms > self.SPIKE_RATIO * prev:
+            a *= self.SPIKE_DAMP  # a one-off spike moves the estimate slowly
+        self.t[used] = (1.0 - a) * prev + a * cycle_ms
+
+    def _marginal_est(self) -> float:
+        # Measured cost of one extra verify row: the slope between the cheapest
+        # and priciest measured depths. Falls back to the prior until two
+        # depths exist. This is what self-calibrates the controller to the real
+        # (model x chip x context) marginal instead of a hardcoded value.
+        if len(self.t) >= 2:
+            depths = sorted(self.t)
+            lo, hi = depths[0], depths[-1]
+            if hi > lo:
+                slope = (self.t[hi] - self.t[lo]) / (hi - lo)
+                if slope > 0.0:
+                    return slope
+        return self.MARGINAL_MS
+
+    def _t_est(self, d: int) -> float:
+        if d in self.t:
+            return self.t[d]
+        if not self.t:
+            return 30.0 + self.MARGINAL_MS * d
+        ref = min(self.t, key=lambda x: abs(x - d))
+        return self.t[ref] + self._marginal_est() * (d - ref)
+
+    def _score(self, d: int) -> float:
+        expected = 1.0
+        run = 1.0
+        for j in range(d):
+            run *= self.p[j]
+            expected += run
+        return expected / max(1e-6, self._t_est(d))
+
+    def _best_rival(self) -> Optional[int]:
+        # The highest-scoring depth other than cur, if within PROBE_MARGIN —
+        # i.e. a depth whose (possibly stale) estimate could flip the choice.
+        # Bidirectional on purpose: re-measuring a SHALLOWER rival is what
+        # breaks the depth-2 lock (a stale-high t[1] hides depth 1's true
+        # advantage and nothing else would ever refresh it).
+        best = self._score(self.cur)
+        if best <= 0.0:
+            return self._most_stale()
+        rival = None
+        rival_score = 0.0
+        for d in range(1, self.max_depth + 1):
+            if d == self.cur:
+                continue
+            s = self._score(d)
+            if s > rival_score:
+                rival, rival_score = d, s
+        if rival is not None and rival_score >= best / self.PROBE_MARGIN:
+            return rival
+        return None
+
+    def _most_stale(self) -> Optional[int]:
+        # The depth whose cost estimate has gone longest unmeasured (never
+        # measured counts as infinitely stale). Keeps every t[d] fresh enough
+        # that fresh-vs-stale comparison bias stays bounded.
+        cand = None
+        worst = -1.0
+        for d in range(1, self.max_depth + 1):
+            if d == self.cur:
+                continue
+            age = self.t_age.get(d)
+            age = float("inf") if age is None else age
+            if age > worst:
+                cand, worst = d, age
+        return cand
+
+    def _best(self) -> int:
+        # argmax of measured score with switch hysteresis; the shallow-to-deep
+        # scan with strict '>' keeps the lower depth on an exact tie.
+        scores = [self._score(d) for d in range(1, self.max_depth + 1)]
+        best_i = 0
+        for i in range(1, self.max_depth):
+            if scores[i] > scores[best_i]:
+                best_i = i
+        best_d = best_i + 1
+        if best_d != self.cur and scores[best_i] < scores[self.cur - 1] * self.HYSTERESIS:
+            return self.cur
+        return best_d
+
+
+# Draft sampler for stochastic (temp > 0) decoding. A sharper distribution
+# than the target: the 1-layer head's noisy tail otherwise gets sampled and
+# rejected, collapsing acceptance on high-entropy content. Exactness holds
+# because the Leviathan/Chen ratio uses this sampler's own distribution as q.
+_DRAFT_SAMPLER_TEMP = 0.6
+_DRAFT_SAMPLER_TOP_P = 0.95
+_DRAFT_SAMPLER_TOP_K = 20
+
+
+def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
+    """Sampler used to draw MTP draft tokens.
+
+    Greedy target → greedy drafts (preserves the greedy-identity contract).
+    Stochastic target → the sharper draft sampler above. The acceptance ratio
+    and residual sampling use this sampler's filtered distribution as q, so
+    the emitted token distribution still equals the target sampler's exactly.
+    """
+    if state.draft_sampler is not None:
+        return state.draft_sampler
+    if _is_greedy(gen_batch):
+        state.draft_sampler = _resolve_sampler(gen_batch)
+        return state.draft_sampler
+
+    from omlx.utils.sampling import make_sampler
+
+    state.draft_sampler = make_sampler(
+        temp=_DRAFT_SAMPLER_TEMP,
+        top_p=_DRAFT_SAMPLER_TOP_P,
+        top_k=_DRAFT_SAMPLER_TOP_K,
+    )
+    return state.draft_sampler
+
+
+def _chain_next_drafts(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_rows: Any,
+    committed: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    """Rebuild committed MTP-head history and draft the next chain.
+
+    ``hidden_rows`` is the trunk hidden at the positions of the n tokens
+    *preceding* each committed token — (1, n, H) pre-norm for Qwen (the
+    final trunk norm is applied here), or the model's native 4D raw hidden
+    for DeepSeek-V4 (passed through untouched); ``committed`` is the (n,)
+    uint32 committed tokens. One batched head forward appends n committed
+    history entries and yields the next cycle's first draft logits for free
+    (its last entry pairs the newest committed token with the hidden of its
+    predecessor — exactly the fused state that predicts the next-next token).
+    The remaining drafts chain on the head's own output hidden; with
+    ``state.head_clone`` those speculative steps run on a per-cycle clone so
+    the persistent head cache stays committed-only.
+
+    Populates ``state.drafts`` / ``draft_lps`` / ``draft_accept_lps`` and
+    advances ``state.hist_offset`` by n. All arrays are dispatched with
+    ``mx.async_eval`` and stay lazy on the host; the next verify cycle's
+    single sync resolves them.
+    """
+    import mlx.core as mx
+
+    model = gen_batch.model
+    sampler = _resolve_draft_sampler(gen_batch, state)
+    procs = _proc_list(gen_batch)
+
+    if _HEAD_HIDDEN_POST_NORM and hidden_rows.ndim == 3:
+        hidden_rows = _trunk_norm_module(model)(hidden_rows)
+
+    n = committed.shape[0]
+    logits, head_hidden = model.mtp_forward(
+        hidden_rows,
+        committed.reshape(1, n),
+        state.mtp_cache,
+        return_hidden=True,
+        logits_keep=1,
+    )
+    state.hist_offset += int(n)
+
+    draft_toks: List[Any] = []
+    draft_lps: List[Any] = []
+    draft_accept_lps: List[Any] = []
+
+    chain_prefix = committed[-1:]
+    h = head_hidden[:, -1:]
+    depth = state.controller.cur if state.controller is not None else state.depth
+    chain_cache = state.mtp_cache
+    if state.head_clone and depth > 1:
+        chain_cache = _clone_mtp_head_cache(state.mtp_cache)
+    for j in range(depth):
+        logits_2d = logits[:, -1, :]
+        if procs is not None and prev_buf is not None:
+            prev = mx.concatenate(
+                [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
+                + [t.reshape(1).astype(mx.int32) for t in draft_toks]
+            )
+            logits_2d = _apply_processors(procs, prev, logits_2d)
+        lp_2d = _logprobs(logits_2d)
+        tok = _ensure_uint32(sampler(lp_2d))
+        draft_toks.append(tok)
+        draft_lps.append(lp_2d.squeeze(0))
+        draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
+        if j + 1 == depth:
+            break
+        logits, head_hidden = model.mtp_forward(
+            h,
+            tok.reshape(1, 1),
+            chain_cache,
+            return_hidden=True,
+        )
+        h = head_hidden[:, -1:]
+
+    state.drafts = mx.concatenate(draft_toks)
+    state.draft_lps = draft_lps
+    state.draft_accept_lps = draft_accept_lps
+    # Fire-and-forget dispatch: the GPU evaluates the chain while the host
+    # finishes emit bookkeeping; the next cycle's sync finds it materialized.
+    mx.async_eval(state.drafts)
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1834,40 @@ def _post_init_mtp(gen_batch: Any) -> None:
     next_main_logits = _apply_processors(procs, prev_buf, next_main_logits)
     next_main_lp = _logprobs(next_main_logits)
     next_main_tok = sampler(next_main_lp)  # (1,)
+
+    chain, depth, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
+
+    if chain:
+        # Depth-k seed: the history fold pairs hidden(main_tok) with
+        # next_main_tok — the first committed history entry — and its logits
+        # are the first draft's distribution; the rest of the chain follows.
+        mx.eval(main_tok, next_main_tok)
+        state = _MtpState(uid=gen_batch.uids[0])
+        state.chain = True
+        state.depth = depth
+        state.head_clone = head_clone
+        if depth > 1:
+            state.controller = _DepthController(
+                depth,
+                marginal_ms=getattr(
+                    gen_batch.model, "_omlx_mtp_marginal_ms", None
+                ),
+            )
+        state.mtp_cache = gen_batch.model.make_mtp_cache()
+        state.next_main = _ensure_uint32(next_main_tok)
+        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+        state.queue.append(
+            (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+        )
+        _chain_next_drafts(
+            gen_batch,
+            state,
+            hidden[:, -1:],
+            state.next_main,
+            prev_buf,
+        )
+        gen_batch._omlx_mtp_state = state
+        return
 
     # MTP head sees (hidden_at_main, next_main_tok) and proposes the draft
     # that the *next* verify cycle will check against forward([next_main, draft]).
@@ -1392,21 +2056,34 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     total_emits = (
         stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
     )
-    if stats.cycles > 0:
-        rate_str = f"{stats.accepts / stats.cycles * 100:.1f}%"
+    total_drafted = sum(stats.depth_drafted) or stats.cycles
+    if total_drafted > 0:
+        rate_str = f"{stats.accepts / total_drafted * 100:.1f}%"
     else:
         rate_str = "n/a"
+    if stats.depth_drafted:
+        depth_str = " depth[" + ",".join(
+            f"d{i + 1}={a}/{d}"
+            for i, (a, d) in enumerate(
+                zip(stats.depth_accepted, stats.depth_drafted)
+            )
+        ) + "]"
+    else:
+        depth_str = ""
+    tpc = total_emits / stats.cycles if stats.cycles else 0.0
     logger.info(
-        "MTP[%s] finish=%s tokens=%d cycles=%d accept=%d/%d (%s) "
+        "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
         "emits[init=%d,draft=%d,bonus=%d,verify=%d] "
         "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms cache=%.1fms]",
         uid,
         finish_reason,
         total_emits,
         stats.cycles,
+        tpc,
         stats.accepts,
-        stats.cycles,
+        total_drafted,
         rate_str,
+        depth_str,
         stats.init_emits,
         stats.draft_emits,
         stats.bonus_emits,
@@ -1435,6 +2112,250 @@ def _bump_emit_stat(state: _MtpState, source: str) -> None:
 
 
 def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
+    """Dispatch to the depth-k chain cycle or the PR-990 depth-1 legacy cycle."""
+    if state.chain:
+        return _run_verify_cycle_chain(gen_batch, state)
+    return _run_verify_cycle_legacy(gen_batch, state)
+
+
+def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
+    """One depth-k verify cycle.
+
+    Verify ``[next_main, d1..dk]`` in a single backbone forward with
+    ``n_confirmed=1``. Greedy acceptance is computed in-graph, so the whole
+    cycle costs exactly ONE host sync (a ~2k-int ``tolist``); the next draft
+    chain is dispatched with ``mx.async_eval`` and resolves inside the next
+    cycle's sync. Emits ``m + 1`` tokens per cycle (m = accepted drafts, plus
+    bonus on full accept or the verify-position correction on reject).
+    """
+    import time
+
+    import mlx.core as mx
+
+    if state.next_main is None or state.drafts is None:
+        raise _MtpStepFallback("chain cycle entered without next_main / drafts")
+
+    sampler = _resolve_sampler(gen_batch)
+    procs = _proc_list(gen_batch)
+    is_greedy = _is_greedy(gen_batch)
+    # Adaptive depth: the chain may have drafted fewer than state.depth
+    # tokens this cycle — the verify window follows the actual drafts.
+    k = int(state.drafts.shape[0])
+    cycle_t0 = time.perf_counter()
+
+    inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
+
+    # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
+    # processor prefix is everything before that input position.
+    prev_rows: List[Optional[Any]] = [None] * (k + 1)
+    if procs is not None:
+        buf = gen_batch._token_context[0]
+        prev_rows[0] = buf.update_and_fetch(state.next_main)
+        for j in range(k):
+            prev_rows[j + 1] = buf.update_and_fetch(state.drafts[j : j + 1])
+
+    # --- backbone verify forward + single host sync ---
+    t0 = time.perf_counter()
+    logits, hidden, gdn_states = _call_backbone(
+        gen_batch.model,
+        inputs[None, :],
+        gen_batch.prompt_cache,
+        n_confirmed=1,
+    )
+    rows = logits[0]  # (k+1, vocab)
+    if procs is not None:
+        rows = mx.stack(
+            [
+                _apply_processors(procs, prev_rows[j], rows[j : j + 1]).squeeze(0)
+                for j in range(k + 1)
+            ]
+        )
+    combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
+
+    if is_greedy:
+        targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
+        matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
+        m_arr = mx.cumprod(matches).sum().reshape(1)
+        host = mx.concatenate(
+            [m_arr, targets, state.drafts.astype(mx.int32)]
+        ).tolist()
+        m = int(host[0])
+        target_ids = host[1 : k + 2]
+        draft_ids = host[k + 2 :]
+        state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        emit_last_id = target_ids[m] if m < k else target_ids[k]
+        emit_last_lp = combined_lp[m if m < k else k]
+    else:
+        # Stochastic: batched Leviathan/Chen acceptance computed in-graph —
+        # per-position ratios of the filtered target rows (p) against the
+        # draft sampler's filtered rows (q), cumulative accept, residual
+        # samples for every position, and the bonus draw, all resolved in
+        # ONE host sync (mirrors the greedy path's sync structure).
+        accept_rows = _accept_lp_for(sampler, combined_lp)  # (k+1, V)
+        q_rows = mx.stack(state.draft_accept_lps)  # (k, V)
+        idx = state.drafts.astype(mx.int32)[:, None]
+        p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
+        q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
+        ratio = p_at - q_at  # (k,) log acceptance ratios
+        u = mx.random.uniform(shape=(k,))
+        acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
+        m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
+        # Residual distributions max(p - q, 0) per draft position. Only the
+        # reject position's sample is used; computing all k keeps the cycle
+        # single-sync and costs a few elementwise vocab ops on GPU.
+        p_all = mx.exp(accept_rows[:k])
+        res = mx.maximum(p_all - mx.exp(q_rows), 0.0)
+        z = res.sum(axis=-1, keepdims=True)
+        res_dist = mx.where(z > 0, res, p_all)
+        res_samples = mx.random.categorical(mx.log(res_dist))  # (k,)
+        bonus_tok = sampler(combined_lp[k : k + 1]).reshape(1)
+        host = mx.concatenate(
+            [
+                m_arr.astype(mx.int32),
+                state.drafts.astype(mx.int32),
+                res_samples.astype(mx.int32),
+                bonus_tok.astype(mx.int32),
+            ]
+        ).tolist()
+        m = int(host[0])
+        draft_ids = host[1 : k + 1]
+        res_ids = host[k + 1 : 2 * k + 1]
+        bonus_id = host[2 * k + 1]
+        state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        if m < k:
+            emit_last_id = res_ids[m]
+            emit_last_lp = combined_lp[m]
+        else:
+            emit_last_id = bonus_id
+            emit_last_lp = combined_lp[k]
+
+    # Boundary-aligned commit: when the scheduler needs block-boundary
+    # cache snapshots (hybrid models), land the committed run exactly on
+    # the next block boundary whenever it falls inside the accepted
+    # drafts. The emit-time snapshot capture can then observe the boundary
+    # state (cache offset == emitted count), which the emit queue's
+    # run-ahead otherwise makes rare. Emitting fewer verified drafts is
+    # distribution-exact; the cost is at most depth-1 verified tokens once
+    # per block.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    if align > 0 and m > 0:
+        emitted = len(gen_batch.tokens[0])
+        aligned = ((emitted // align) + 1) * align - emitted
+        if 0 < aligned < m:
+            m = aligned
+            emit_last_id = draft_ids[m]
+            emit_last_lp = combined_lp[m]
+
+    # Clamp the accepted count to what every cache layer can roll back
+    # (optional model hook — DeepSeek-V4 PoolingCache replay windows are
+    # bounded). Emitting fewer verified drafts is always correct; position
+    # ``m`` was itself accepted when the clamp lowers it, so its draft
+    # token is a fair emit for the correction slot.
+    if m < k:
+        clamp = getattr(gen_batch.model, "mtp_clamp_accept", None)
+        if callable(clamp):
+            clamped = int(clamp(gen_batch.prompt_cache, m, k))
+            if clamped < m:
+                m = clamped
+                emit_last_id = draft_ids[m]
+                emit_last_lp = combined_lp[m]
+
+    # --- stats ---
+    state.stats.cycles += 1
+    if len(state.stats.depth_drafted) < state.depth:
+        pad = state.depth - len(state.stats.depth_drafted)
+        state.stats.depth_drafted.extend([0] * pad)
+        state.stats.depth_accepted.extend([0] * pad)
+    for j in range(k):
+        state.stats.depth_drafted[j] += 1
+        if j < m:
+            state.stats.depth_accepted[j] += 1
+        else:
+            break
+    state.stats.accepts += m
+    if m < k:
+        state.stats.rejects += 1
+    state.stats.sample_ms += (time.perf_counter() - t0) * 1000
+
+    # --- commit: queue emits + cache rollback ---
+    t0 = time.perf_counter()
+    for j in range(m):
+        state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
+    if m == k:
+        state.queue.append((int(emit_last_id), emit_last_lp, "bonus"))
+        _clear_rollback(gen_batch.prompt_cache)
+    else:
+        state.queue.append((int(emit_last_id), emit_last_lp, "verify"))
+        if not _chain_rollback(
+            gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
+        ):
+            if procs is not None:
+                _trim_token_buffer(gen_batch, k - m)
+            raise _MtpStepFallback("cache layer rejects chain rollback")
+        if procs is not None:
+            _trim_token_buffer(gen_batch, k - m)
+    state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+
+    # --- MTP-head history + next draft chain (async-dispatched) ---
+    t0 = time.perf_counter()
+    if not state.head_clone:
+        _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+    committed = mx.array(
+        [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
+    )
+    next_main = committed[-1:]
+    hidden_rows = hidden[:, : m + 1]
+    prev_buf = None
+    if procs is not None:
+        prev_buf = gen_batch._token_context[0].tokens
+    _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
+    state.next_main = next_main
+    state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+    if state.controller is not None:
+        state.controller.observe(
+            k, m, (time.perf_counter() - cycle_t0) * 1000
+        )
+
+
+def _chain_rollback(
+    model: Any,
+    prompt_cache: List[Any],
+    accepted: int,
+    num_drafts: int,
+    gdn_states: Optional[list] = None,
+) -> bool:
+    """Roll the backbone cache back to ``accepted`` drafts after a chain verify.
+
+    mlx-vlm path (``gdn_states`` populated): delegate to the stock
+    ``rollback_speculative_cache``, which natively supports partial accepts —
+    it keeps ``accepted + 1`` positions of the ``num_drafts + 1``-token
+    verify window and replays the accepted prefix through the captured GDN
+    states. mlx-lm path: ``mtp_partial_rollback`` (qwen35_model patch).
+    """
+    if gdn_states is not None and hasattr(model, "rollback_speculative_cache"):
+        try:
+            model.rollback_speculative_cache(
+                prompt_cache, gdn_states, accepted, num_drafts + 1
+            )
+            return True
+        except Exception as exc:
+            logger.debug("rollback_speculative_cache failed: %s", exc)
+            return False
+    rollback = getattr(model, "mtp_partial_rollback", None)
+    if callable(rollback):
+        try:
+            return bool(rollback(prompt_cache, accepted, num_drafts))
+        except Exception as exc:
+            logger.debug("mtp_partial_rollback failed: %s", exc)
+            return False
+    if accepted == 0 and num_drafts == 1:
+        return _restore_or_trim_caches(prompt_cache)
+    return False
+
+
+def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     """Run one verify cycle. Populates ``state.queue`` with 1 (reject) or 2
     (accept) tokens for upcoming emit calls. Updates ``state.next_main`` and
     ``state.draft_tok`` / ``state.draft_lp`` for the cycle after that.

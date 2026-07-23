@@ -30,7 +30,8 @@ struct ModelsScreen: View {
                 onLoad: { id in vm.load(id: id, client: services.client) },
                 onUnload: { id in vm.unload(id: id, client: services.client) },
                 onOpenSettings: { id in services.modelDetailID = id },
-                onRequestRemove: { id in vm.pendingRemoveID = id }
+                onRequestRemove: { id in vm.pendingRemoveID = id },
+                onToggleFavorite: { id, fav in vm.setFavorite(id: id, favorite: fav, client: services.client) }
             )
 
             if let error = vm.lastError {
@@ -174,6 +175,7 @@ private struct LibrarySection: View {
     let onUnload: (String) -> Void
     let onOpenSettings: (String) -> Void
     let onRequestRemove: (String) -> Void
+    let onToggleFavorite: (String, Bool) -> Void
 
     @Environment(\.omlxTheme) private var theme
 
@@ -186,7 +188,7 @@ private struct LibrarySection: View {
                                     defaultValue: "Model Library",
                                     comment: "Section heading for the on-disk model library"),
                       subtitle: String(localized: "models.library.subtitle",
-                                       defaultValue: "\(models.count) models · \(formatBytes(totalSize)) on disk",
+                                       defaultValue: "Models: \(models.count) · \(formatBytes(totalSize)) on disk",
                                        comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk"))
 
         ListGroup {
@@ -211,6 +213,21 @@ private struct LibrarySection: View {
                 ForEach(Array(models.enumerated()), id: \.element.id) { idx, m in
                     FreeRow(isLast: idx == models.count - 1) {
                         HStack(spacing: 10) {
+                            Button {
+                                onToggleFavorite(m.id, !(m.isFavorite ?? false))
+                            } label: {
+                                Image(systemName: (m.isFavorite ?? false) ? "star.fill" : "star")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle((m.isFavorite ?? false) ? Color.yellow : theme.textTertiary)
+                            }
+                            .buttonStyle(.plain)
+                            .help((m.isFavorite ?? false)
+                                ? String(localized: "models.library.favorite_on.help",
+                                         defaultValue: "Favorite — click to remove",
+                                         comment: "Tooltip on the filled star that removes a model from favorites")
+                                : String(localized: "models.library.favorite_off.help",
+                                         defaultValue: "Add to favorites",
+                                         comment: "Tooltip on the outlined star that adds a model to favorites"))
                             Squircle(systemSymbol: iconName(for: m),
                                      size: 26,
                                      gradient: gradient(for: m))
@@ -229,47 +246,62 @@ private struct LibrarySection: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
-                            .layoutPriority(1)
                             Spacer(minLength: 8)
-                            if isModelLoaded(m.id) {
-                                Button(String(localized: "models.library.unload",
-                                              defaultValue: "Unload",
-                                              comment: "Button label that unloads a library model from memory")) { onUnload(m.id) }
+                            HStack(spacing: 10) {
+                                if isModelLoaded(m.id) {
+                                    Button {
+                                        onUnload(m.id)
+                                    } label: {
+                                        Text(String(localized: "models.library.unload",
+                                                    defaultValue: "Unload",
+                                                    comment: "Button label that unloads a library model from memory"))
+                                            .lineLimit(1)
+                                            .frame(minWidth: 48)
+                                    }
                                     .buttonStyle(.omlx(.plain, size: .small))
-                            } else {
-                                Button(String(localized: "models.library.load",
-                                              defaultValue: "Load",
-                                              comment: "Button label that loads a library model into memory")) { onLoad(m.id) }
+                                } else {
+                                    Button {
+                                        onLoad(m.id)
+                                    } label: {
+                                        Text(String(localized: "models.library.load",
+                                                    defaultValue: "Load",
+                                                    comment: "Button label that loads a library model into memory"))
+                                            .lineLimit(1)
+                                            .frame(minWidth: 48)
+                                    }
                                     .buttonStyle(.omlx(.normal, size: .small))
                                     .disabled(m.isLoading)
-                            }
-                            Button {
-                                onOpenSettings(m.id)
-                            } label: {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 11))
-                            }
-                            .buttonStyle(.omlx(.plain, size: .small))
-                            .help(String(localized: "models.library.settings.help",
-                                         defaultValue: "Settings",
-                                         comment: "Tooltip on the chevron that opens a model's settings screen"))
-                            Button {
-                                onRequestRemove(m.id)
-                            } label: {
-                                if deletingID == m.id {
-                                    ProgressView()
-                                        .controlSize(.mini)
-                                } else {
-                                    Image(systemName: "trash")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(theme.redDot)
                                 }
+                                Button {
+                                    onOpenSettings(m.id)
+                                } label: {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 11))
+                                }
+                                .buttonStyle(.omlx(.plain, size: .small))
+                                .help(String(localized: "models.library.settings.help",
+                                             defaultValue: "Settings",
+                                             comment: "Tooltip on the chevron that opens a model's settings screen"))
+                                Button {
+                                    onRequestRemove(m.id)
+                                } label: {
+                                    if deletingID == m.id {
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "trash")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(theme.redDot)
+                                    }
+                                }
+                                .buttonStyle(.omlx(.plain, size: .small))
+                                .disabled(deletingID != nil)
+                                .help(String(localized: "models.library.remove.help",
+                                             defaultValue: "Remove from disk",
+                                             comment: "Tooltip on the trash button that deletes a model from local storage"))
                             }
-                            .buttonStyle(.omlx(.plain, size: .small))
-                            .disabled(deletingID != nil)
-                            .help(String(localized: "models.library.remove.help",
-                                         defaultValue: "Remove from disk",
-                                         comment: "Tooltip on the trash button that deletes a model from local storage"))
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(1)
                         }
                     }
                 }
@@ -279,8 +311,8 @@ private struct LibrarySection: View {
 
     private func gradient(for m: ModelDTO) -> [Color] {
         switch m.modelType {
-        case "embed", "rerank": return SquircleGradient.downloads
-        case "audio-stt", "audio-tts", "audio-sts": return SquircleGradient.integrations
+        case "embedding", "reranker": return SquircleGradient.downloads
+        case "audio_stt", "audio_tts", "audio_sts": return SquircleGradient.integrations
         case "vlm":             return SquircleGradient.update
         default:                return SquircleGradient.models
         }
@@ -288,9 +320,9 @@ private struct LibrarySection: View {
 
     private func iconName(for m: ModelDTO) -> String {
         switch m.modelType {
-        case "embed":   return "cube.transparent"
-        case "rerank":  return "arrow.up.arrow.down"
-        case "audio-stt", "audio-tts", "audio-sts": return "waveform"
+        case "embedding": return "cube.transparent"
+        case "reranker":  return "arrow.up.arrow.down"
+        case "audio_stt", "audio_tts", "audio_sts": return "waveform"
         case "vlm":     return "eye"
         default:        return "cpu"
         }
@@ -301,6 +333,10 @@ private struct LibrarySection: View {
 
 func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
     models.enumerated().sorted { lhs, rhs in
+        // Favorites always sort first; names decide within each group.
+        let lf = lhs.element.isFavorite ?? false
+        let rf = rhs.element.isFavorite ?? false
+        if lf != rf { return lf }
         switch lhs.element.displayTitle.localizedCaseInsensitiveCompare(
             rhs.element.displayTitle
         ) {

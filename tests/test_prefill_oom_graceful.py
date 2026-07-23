@@ -107,6 +107,7 @@ def _throttle_ctx(
         _prefill_safe_zone_ratio=soft_ratio,
         _prefill_min_chunk_tokens=min_chunk,
         _prefill_abort_margin=abort_margin,
+        _prefill_headroom_safety=Scheduler._PREFILL_HEADROOM_SAFETY,
         _prefill_transient_tracker=tracker,
         memory_monitor=monitor,
         _PREFILL_STEP_TIERS=Scheduler._PREFILL_STEP_TIERS,
@@ -467,6 +468,7 @@ def test_step_prefill_reclaims_before_first_guard():
             "_sync_and_clear_cache",
             side_effect=lambda stream=None: events.append("sync"),
         ),
+        patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
         patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
     ):

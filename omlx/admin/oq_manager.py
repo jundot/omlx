@@ -7,6 +7,7 @@ as hf_downloader.py (DownloadTask / HFDownloader).
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import time
@@ -66,6 +67,8 @@ class QuantTask:
     status: QuantStatus = QuantStatus.PENDING
     progress: float = 0.0
     phase: str = ""
+    progress_detail: str = ""
+    progress_meta: dict = field(default_factory=dict)
     error: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
@@ -78,6 +81,12 @@ class QuantTask:
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
+    enhanced: bool = False
+    imatrix_cache_path: str = ""
+    imatrix_reuse_cache: bool = True
+    imatrix_strict: bool = False
+    imatrix_num_samples: int = 128
+    imatrix_seq_length: int = 512
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -91,6 +100,8 @@ class QuantTask:
             "status": self.status.value,
             "progress": round(self.progress, 1),
             "phase": self.phase,
+            "progress_detail": self.progress_detail,
+            "progress_meta": self.progress_meta,
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -98,6 +109,8 @@ class QuantTask:
             "source_size": self.source_size,
             "output_size": self.output_size,
             "dtype": self.dtype,
+            "enhanced": self.enhanced,
+            "imatrix_cache_path": self.imatrix_cache_path,
         }
 
 
@@ -240,12 +253,18 @@ class OQManager:
         dtype: str = "bfloat16",
         preserve_mtp: bool = False,
         auto_proxy_sensitivity: bool = True,
+        enhanced: bool = False,
+        imatrix_cache_path: str = "",
+        imatrix_reuse_cache: bool = True,
+        imatrix_strict: bool = False,
+        imatrix_num_samples: int = 128,
+        imatrix_seq_length: int = 512,
     ) -> QuantTask:
         """Start a quantization job.
 
         Args:
             model_path: Path to source model directory.
-            oq_level: oQ level (2, 3, 4, 6, or 8).
+            oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
 
@@ -288,7 +307,11 @@ class OQManager:
 
         model_name = source.name
         output_name = resolve_output_name(
-            model_name, oq_level, dtype, preserve_mtp=preserve_mtp
+            model_name,
+            oq_level,
+            dtype,
+            preserve_mtp=preserve_mtp,
+            enhanced=enhanced,
         )
         output_path = self._output_dir / output_name
 
@@ -304,11 +327,29 @@ class OQManager:
                 task.model_path == model_path
                 and task.oq_level == oq_level
                 and task.dtype == dtype
+                and task.enhanced == enhanced
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
-                    f"Quantization for '{model_name}' at oQ{oq_level:g} "
+                    f"Quantization for '{model_name}' at oQ{oq_level:g}"
+                    f"{'e' if enhanced else ''} "
                     f"({dtype}) is already in progress"
+                )
+
+        if enhanced:
+            if imatrix_num_samples < 1:
+                raise ValueError("imatrix_num_samples must be >= 1")
+            if imatrix_seq_length < 1:
+                raise ValueError("imatrix_seq_length must be >= 1")
+            if not imatrix_cache_path:
+                digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+                imatrix_cache_path = str(
+                    self._output_dir
+                    / ".oqe_imatrix"
+                    / (
+                        f"{model_name}-{digest}-s{int(imatrix_num_samples)}"
+                        f"-l{int(imatrix_seq_length)}.npz"
+                    )
                 )
 
         source_size = sum(f.stat().st_size for f in source.glob("*.safetensors"))
@@ -330,6 +371,12 @@ class OQManager:
             dtype=dtype,
             preserve_mtp=preserve_mtp,
             auto_proxy_sensitivity=auto_proxy_sensitivity,
+            enhanced=enhanced,
+            imatrix_cache_path=imatrix_cache_path,
+            imatrix_reuse_cache=imatrix_reuse_cache,
+            imatrix_strict=imatrix_strict,
+            imatrix_num_samples=imatrix_num_samples,
+            imatrix_seq_length=imatrix_seq_length,
         )
         self._tasks[task_id] = task
 
@@ -338,7 +385,8 @@ class OQManager:
         )
 
         logger.info(
-            f"oQ quantization queued: {model_name} -> oQ{oq_level:g} "
+            f"oQ quantization queued: {model_name} -> "
+            f"oQ{oq_level:g}{'e' if enhanced else ''} "
             f"(task_id={task_id})"
         )
         return task
@@ -460,11 +508,26 @@ class OQManager:
                 task.phase = "Loading model..."
                 task.progress = 5.0
 
-                def _progress_cb(phase: str, pct: float) -> None:
+                def _progress_cb(
+                    phase: str,
+                    pct: float,
+                    detail: str = "",
+                    meta: dict | None = None,
+                ) -> None:
                     if task_id in self._cancelled:
                         raise _QuantCancelled(f"Task {task_id} cancelled")
-                    task.phase = self._phase_label(phase, task.oq_level)
+                    base_phase = phase.split("|", 1)[0]
+                    if base_phase.startswith("quantizing"):
+                        task.status = QuantStatus.QUANTIZING
+                    elif base_phase == "saving":
+                        task.status = QuantStatus.SAVING
+                    else:
+                        task.status = QuantStatus.LOADING
+                    task.phase = self._phase_label(phase, task.oq_level, task.enhanced)
+                    task.progress_detail = detail or ""
+                    task.progress_meta = meta or {}
                     task.progress = pct
+                    task._last_progress_callback_at = time.time()
 
                 # Start time-based progress estimation
                 self._progress_tasks[task_id] = asyncio.create_task(
@@ -487,6 +550,12 @@ class OQManager:
                     task.dtype,
                     task.preserve_mtp,
                     task.auto_proxy_sensitivity,
+                    enhanced=task.enhanced,
+                    imatrix_cache_path=task.imatrix_cache_path,
+                    imatrix_reuse_cache=task.imatrix_reuse_cache,
+                    imatrix_strict=task.imatrix_strict,
+                    imatrix_num_samples=task.imatrix_num_samples,
+                    imatrix_seq_length=task.imatrix_seq_length,
                 )
 
                 if task_id in self._cancelled:
@@ -496,6 +565,8 @@ class OQManager:
                 task.status = QuantStatus.COMPLETED
                 task.progress = 100.0
                 task.phase = "Completed"
+                task.progress_detail = ""
+                task.progress_meta = {}
                 task.completed_at = time.time()
                 task.output_size = _dir_size(Path(task.output_path))
 
@@ -551,9 +622,13 @@ class OQManager:
             while task_id not in self._cancelled and task.status in _ACTIVE_STATUSES:
                 await asyncio.sleep(2)
                 elapsed = time.time() - start
+                if time.time() - getattr(task, "_last_progress_callback_at", 0.0) < 5:
+                    continue
                 if task.status == QuantStatus.QUANTIZING:
+                    if self._has_explicit_quant_progress(task):
+                        continue
                     fraction = min(elapsed / estimated_total, 0.95)
-                    task.progress = 30.0 + fraction * 60.0
+                    task.progress = max(task.progress, 30.0 + fraction * 60.0)
                 elif task.status == QuantStatus.SAVING:
                     # During save, poll output dir size
                     output = Path(task.output_path)
@@ -563,16 +638,29 @@ class OQManager:
                         expected = task.source_size * task.oq_level / 16
                         if expected > 0:
                             save_frac = min(current / expected, 0.99)
-                            task.progress = 90.0 + save_frac * 10.0
+                            task.progress = max(task.progress, 90.0 + save_frac * 10.0)
         except asyncio.CancelledError:
             pass
 
     @staticmethod
-    def _phase_label(phase: str, oq_level: float) -> str:
+    def _has_explicit_quant_progress(task: QuantTask) -> bool:
+        """Return True once the quantizer emits byte-level progress."""
+        meta = task.progress_meta if isinstance(task.progress_meta, dict) else {}
+        try:
+            total_bytes = int(meta.get("total_bytes") or 0)
+            processed_bytes = int(meta.get("processed_bytes") or 0)
+        except (TypeError, ValueError):
+            return False
+        return total_bytes > 0 and processed_bytes >= 0
+
+    @staticmethod
+    def _phase_label(phase: str, oq_level: float, enhanced: bool = False) -> str:
         """Human-readable phase label."""
+        oq_label = f"oQ{oq_level:g}{'e' if enhanced else ''}"
         labels = {
             "loading": "Loading model...",
-            "quantizing": f"Quantizing to oQ{oq_level:g}...",
+            "imatrix": "Collecting oQe imatrix...",
+            "quantizing": f"Quantizing to {oq_label}...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"
@@ -586,7 +674,7 @@ class OQManager:
                 if current.isdigit() and total.isdigit()
                 else 0
             )
-            label = f"oQ{oq_level:g}: {pct}%"
+            label = f"{oq_label}: {pct}%"
             if eta:
                 label += f" ({eta} remaining)"
             return label

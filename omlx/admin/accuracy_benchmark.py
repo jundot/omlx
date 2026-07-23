@@ -12,10 +12,17 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
+
+from .external_api import (
+    ExternalAPIClient,
+    ExternalChatAdapter,
+    ExternalEndpointConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +38,15 @@ _queue_running: bool = False
 _current_run_id: Optional[str] = None
 _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
+# Chain-ownership token. A "chain" is one start_next_from_queue call plus
+# the _continue_queue tail it spawns. Each chain captures the token current
+# at its start; cancel_queue and start_next_from_queue bump it. A chain
+# whose token is stale (e.g. it was soft-cancelled and only noticed at its
+# next checkpoint, after the user already started a new chain) must not pop
+# the queue or mutate _queue_running/_current_run_id — otherwise it starts
+# a run concurrently with the live chain, whose Phase 1 "unload all models"
+# rips the engine out from under the active run.
+_chain_id: int = 0
 
 VALID_BENCHMARKS = [
     "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
@@ -38,6 +54,11 @@ VALID_BENCHMARKS = [
     "gsm8k", "mathqa", "humaneval", "mbpp", "livecodebench",
     "bbq", "safetybench",
 ]
+
+# Sampling profile for an accuracy run. "deterministic" (default) runs greedy
+# (temperature 0) so saved scores stay reproducible; "model_settings" opts in to
+# the model's configured sampling (temperature, top_p, …) for a real-world score.
+SamplingProfile = Literal["deterministic", "model_settings"]
 
 
 class AccuracyBenchmarkRequest(BaseModel):
@@ -47,6 +68,19 @@ class AccuracyBenchmarkRequest(BaseModel):
     benchmarks: dict[str, int]  # name -> sample_size (0 = full dataset)
     batch_size: int = 1
     enable_thinking: bool = False
+    sampling_profile: SamplingProfile = "deterministic"
+    # When set, the benchmark runs against a remote OpenAI-compatible
+    # endpoint instead of a local engine and model_id is the remote
+    # model name (not validated against the local catalog).
+    external: Optional[ExternalEndpointConfig] = None
+
+    @model_validator(mode="after")
+    def _force_thinking_off_for_external(self) -> "AccuracyBenchmarkRequest":
+        # enable_thinking is a local chat-template kwarg; external requests
+        # never send it, so keep the stored flag honest.
+        if self.external is not None:
+            self.enable_thinking = False
+        return self
 
     @field_validator("batch_size")
     @classmethod
@@ -172,7 +206,11 @@ def get_queue_status() -> dict:
         # the result card alone tells the story.
         "phase": phase,
         "queue": [
-            {"model_id": r.model_id, "benchmarks": list(r.benchmarks.keys())}
+            {
+                "model_id": r.model_id,
+                "benchmarks": list(r.benchmarks.keys()),
+                "external": r.external is not None,
+            }
             for r in _queue
         ],
     }
@@ -193,6 +231,7 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
     This is synchronous so the caller gets the bench_id immediately.
     """
     global _queue_running, _current_run_id, _current_model, _engine_pool_ref
+    global _chain_id
 
     _engine_pool_ref = engine_pool
 
@@ -205,6 +244,10 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
     request = _queue.pop(0)
     _queue_running = True
     _current_model = request.model_id
+    # This chain takes ownership of the queue; any earlier chain still
+    # draining a soft-cancelled run bails at its next _continue_queue call.
+    _chain_id += 1
+    my_chain = _chain_id
 
     cleanup_old_runs()
     run = create_run(request)
@@ -221,15 +264,24 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
         except Exception as e:
             logger.error(f"Queue: error running {request.model_id}: {e}")
         # Auto-continue with next in queue
-        await _continue_queue(engine_pool)
+        await _continue_queue(engine_pool, my_chain)
 
     run.task = asyncio.create_task(_run_and_continue())
     return run.bench_id
 
 
-async def _continue_queue(engine_pool: Any) -> None:
-    """Continue processing the queue after a run completes."""
+async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
+    """Continue processing the queue after a run completes.
+
+    `chain_id` is the ownership token captured when this chain started.
+    A stale chain (orphaned by cancel_queue, with a new chain started by
+    the user since) returns without popping the queue or touching the
+    gate, so it cannot start a run concurrently with the live chain.
+    """
     global _queue_running, _current_run_id, _current_model
+
+    if chain_id != _chain_id:
+        return
 
     if not _queue:
         _queue_running = False
@@ -243,6 +295,10 @@ async def _continue_queue(engine_pool: Any) -> None:
     cleanup_old_runs()
     run = create_run(request)
     _current_run_id = run.bench_id
+    # Queue-continued runs execute inside this chain's own task; record it
+    # so cancel_queue can hard-cancel them instead of waiting for the next
+    # on_progress checkpoint (up to a full generation batch away).
+    run.task = asyncio.current_task()
 
     logger.info(
         f"Queue: continuing with {request.model_id} "
@@ -254,14 +310,18 @@ async def _continue_queue(engine_pool: Any) -> None:
     except Exception as e:
         logger.error(f"Queue: error running {request.model_id}: {e}")
 
-    await _continue_queue(engine_pool)
+    await _continue_queue(engine_pool, chain_id)
 
 
 async def cancel_queue() -> None:
     """Cancel the current run and clear the queue."""
-    global _queue_running, _current_run_id, _current_model
+    global _queue_running, _current_run_id, _current_model, _chain_id
 
     _queue.clear()
+    # Orphan the live chain before releasing the gate: if the cancelled run
+    # only notices at its next checkpoint, its trailing _continue_queue must
+    # not race whatever chain the user starts after this cancel.
+    _chain_id += 1
 
     if _current_run_id:
         run = get_run(_current_run_id)
@@ -312,61 +372,91 @@ async def run_accuracy_benchmark(
 
     request = run.request
 
-    # Suppress TTL auto-unload during benchmark
-    engine_pool._suppress_ttl = True
+    # Suppress TTL auto-unload during benchmark (local engines only)
+    if request.external is None:
+        engine_pool._suppress_ttl = True
     start_time = time.time()
+    client: Optional[ExternalAPIClient] = None
 
     try:
-        # Phase 1: Unload all models
         run.phase = "loading"
-        loaded_ids = engine_pool.get_loaded_model_ids()
-        if loaded_ids:
+        if request.external is not None:
+            # External endpoint: no local model lifecycle. The adapter owns
+            # the sampling-profile mapping, so sampling_kwargs stays empty
+            # (enable_thinking is already forced off by request validation).
             await _send_event(run, {
                 "type": "progress",
-                "phase": "unload",
+                "phase": "connect",
                 "model_id": request.model_id,
                 "benchmark": "",
-                "message": f"Unloading {len(loaded_ids)} model(s)...",
+                "message": f"Connecting to {request.external.base_url}...",
                 "current": 0,
                 "total": len(request.benchmarks),
             })
-            for model_id in loaded_ids:
-                try:
-                    await engine_pool._unload_engine(model_id)
-                except Exception as e:
-                    logger.warning(f"Failed to unload {model_id}: {e}")
+            client = ExternalAPIClient(request.external)
+            engine = ExternalChatAdapter(client, request.sampling_profile)
+            # Fail fast on auth/URL/model errors so a wrong API key cannot
+            # silently produce a 0% score.
+            await engine.preflight()
+            sampling_kwargs = {}
+        else:
+            # Phase 1: Unload all models
+            loaded_ids = engine_pool.get_loaded_model_ids()
+            if loaded_ids:
+                await _send_event(run, {
+                    "type": "progress",
+                    "phase": "unload",
+                    "model_id": request.model_id,
+                    "benchmark": "",
+                    "message": f"Unloading {len(loaded_ids)} model(s)...",
+                    "current": 0,
+                    "total": len(request.benchmarks),
+                })
+                for model_id in loaded_ids:
+                    try:
+                        await engine_pool._unload_engine(model_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to unload {model_id}: {e}")
 
-        # Phase 2: Load target model
-        await _send_event(run, {
-            "type": "progress",
-            "phase": "load",
-            "model_id": request.model_id,
-            "benchmark": "",
-            "message": f"Loading {request.model_id}...",
-            "current": 0,
-            "total": len(request.benchmarks),
-        })
+            # Phase 2: Load target model
+            await _send_event(run, {
+                "type": "progress",
+                "phase": "load",
+                "model_id": request.model_id,
+                "benchmark": "",
+                "message": f"Loading {request.model_id}...",
+                "current": 0,
+                "total": len(request.benchmarks),
+            })
 
-        # Force LM engine for accuracy benchmarks — text-only tasks
-        # don't need VLM and the VLM adapter can produce empty responses.
-        engine = await engine_pool.get_engine(request.model_id, force_lm=True)
+            # Force LM engine for accuracy benchmarks — text-only tasks
+            # don't need VLM and the VLM adapter can produce empty responses.
+            engine = await engine_pool.get_engine(request.model_id, force_lm=True)
 
-        # Load model sampling settings
-        sampling_kwargs = {}
-        if engine_pool._settings_manager is not None:
-            ms = engine_pool._settings_manager.get_settings(request.model_id)
-            if ms.top_p is not None:
-                sampling_kwargs["top_p"] = ms.top_p
-            if ms.top_k is not None:
-                sampling_kwargs["top_k"] = ms.top_k
-            if ms.min_p is not None:
-                sampling_kwargs["min_p"] = ms.min_p
-            if ms.repetition_penalty is not None:
-                sampling_kwargs["repetition_penalty"] = ms.repetition_penalty
-            if ms.presence_penalty is not None:
-                sampling_kwargs["presence_penalty"] = ms.presence_penalty
-            if ms.chat_template_kwargs:
-                sampling_kwargs["chat_template_kwargs"] = ms.chat_template_kwargs
+            # Load model sampling settings. Under the default "deterministic"
+            # profile sampling params are not read — the benchmark runs greedy
+            # (temperature 0) so saved scores stay reproducible. Only the
+            # explicit "model_settings" opt-in honors the model's configured
+            # sampling. chat_template_kwargs is prompt construction, not
+            # sampling, so it is forwarded in both profiles.
+            sampling_kwargs = {}
+            if engine_pool._settings_manager is not None:
+                ms = engine_pool._settings_manager.get_settings(request.model_id)
+                if ms.chat_template_kwargs:
+                    sampling_kwargs["chat_template_kwargs"] = ms.chat_template_kwargs
+                if request.sampling_profile == "model_settings":
+                    if ms.temperature is not None:
+                        sampling_kwargs["temperature"] = ms.temperature
+                    if ms.top_p is not None:
+                        sampling_kwargs["top_p"] = ms.top_p
+                    if ms.top_k is not None:
+                        sampling_kwargs["top_k"] = ms.top_k
+                    if ms.min_p is not None:
+                        sampling_kwargs["min_p"] = ms.min_p
+                    if ms.repetition_penalty is not None:
+                        sampling_kwargs["repetition_penalty"] = ms.repetition_penalty
+                    if ms.presence_penalty is not None:
+                        sampling_kwargs["presence_penalty"] = ms.presence_penalty
 
         # Phase 3: Run each benchmark
         run.phase = "evaluating"
@@ -459,29 +549,80 @@ async def run_accuracy_benchmark(
                 run.error_message = str(e)
                 return
 
-            # Build result
+            question_results = []
+            for qr in result.question_results:
+                question_data = {
+                    "id": qr.question_id,
+                    "correct": qr.correct,
+                    "expected": qr.expected,
+                    "predicted": qr.predicted,
+                    "question": qr.question_text,
+                    "raw_response": qr.raw_response,
+                    "category": qr.category,
+                    "time_s": round(qr.time_seconds, 3),
+                }
+                if request.external is not None:
+                    question_data.update({
+                        "status": qr.status,
+                        "finish_reason": qr.finish_reason,
+                        "reasoning_fields_present": qr.reasoning_fields_present,
+                        "reasoning_fields_nonempty": qr.reasoning_fields_nonempty,
+                        "prompt_tokens": qr.prompt_tokens,
+                        "completion_tokens": qr.completion_tokens,
+                        "error_message": qr.error_message,
+                    })
+                question_results.append(question_data)
+
             result_data = {
                 "model_id": request.model_id,
+                "external": request.external is not None,
                 "benchmark": result.benchmark_name,
                 "accuracy": round(result.accuracy, 4),
                 "thinking_used": result.thinking_used,
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),
-                "question_results": [
-                    {
-                        "id": qr.question_id,
-                        "correct": qr.correct,
-                        "expected": qr.expected,
-                        "predicted": qr.predicted,
-                        "question": qr.question_text,
-                        "raw_response": qr.raw_response,
-                        "category": qr.category,
-                        "time_s": round(qr.time_seconds, 3),
-                    }
-                    for qr in result.question_results
-                ],
+                "question_results": question_results,
             }
+            if request.external is not None:
+                status_counts = Counter(
+                    qr.status or "invalid_response" for qr in result.question_results
+                )
+                valid_responses = status_counts["correct"] + status_counts["wrong"]
+                total_questions = result.total_questions
+                result_data.update({
+                    "valid_response_count": valid_responses,
+                    "empty_content_count": status_counts["empty_content"],
+                    "truncated_count": status_counts["truncated"],
+                    "timeout_count": status_counts["timeout"],
+                    "http_error_count": status_counts["http_error"],
+                    "connection_error_count": status_counts["connection_error"],
+                    "invalid_response_count": status_counts["invalid_response"],
+                    "parse_error_count": status_counts["parse_error"],
+                    "wrong_count": status_counts["wrong"],
+                    "valid_response_rate": round(
+                        valid_responses / total_questions
+                        if total_questions > 0 else 0.0,
+                        4,
+                    ),
+                    "valid_answer_accuracy": round(
+                        result.correct_count / valid_responses
+                        if valid_responses > 0 else 0.0,
+                        4,
+                    ),
+                    "reliability_warning": any(
+                        status_counts[name] > 0
+                        for name in (
+                            "empty_content",
+                            "truncated",
+                            "timeout",
+                            "http_error",
+                            "connection_error",
+                            "invalid_response",
+                            "parse_error",
+                        )
+                    ),
+                })
             if result.category_scores:
                 result_data["category_scores"] = {
                     k: round(v, 4) for k, v in result.category_scores.items()
@@ -503,10 +644,11 @@ async def run_accuracy_benchmark(
         # (the result card has already appeared on screen — telling the
         # user "still running" while we clean up reads as a bug).
         run.phase = "unloading"
-        try:
-            await engine_pool._unload_engine(request.model_id)
-        except Exception:
-            pass
+        if request.external is None:
+            try:
+                await engine_pool._unload_engine(request.model_id)
+            except Exception:
+                pass
 
         # Phase 5: Done
         total_time = time.time() - start_time
@@ -541,3 +683,5 @@ async def run_accuracy_benchmark(
     finally:
         # Re-enable TTL auto-unload
         engine_pool._suppress_ttl = False
+        if client is not None:
+            await client.aclose()

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from omlx.admin.oq_manager import OQManager
+from omlx.admin.oq_manager import OQManager, QuantStatus, QuantTask
 
 
 @pytest.fixture
@@ -74,6 +74,47 @@ class TestOQManagerUpdateModelDirs:
 
         manager.update_model_dirs([str(second_fp_model_dir), str(fp_model_dir)])
         assert manager._output_dir == second_fp_model_dir
+
+
+class TestOQManagerMxfp8Discovery:
+    @pytest.mark.asyncio
+    async def test_mxfp8_source_is_available_for_quantization(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        model = root / "MiniMax-M3-MXFP8"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "minimax_m3_vl",
+                    "text_config": {
+                        "num_hidden_layers": 60,
+                        "num_local_experts": 128,
+                        "num_mtp_modules": 1,
+                    },
+                    "vision_config": {"num_hidden_layers": 32},
+                    "quantization_config": {
+                        "quant_method": "mxfp8",
+                        "activation_scheme": "dynamic",
+                        "weight_block_size": [1, 32],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+
+        manager = OQManager(model_dirs=[str(root)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert [entry["name"] for entry in source_models] == ["MiniMax-M3-MXFP8"]
+        assert source_models[0]["is_quantized"] is False
+        assert source_models[0]["is_vlm"] is True
+        # The published checkpoint advertises this training metadata but has
+        # no MTP/nextn tensors, so it must not offer fake MTP preservation.
+        assert source_models[0]["has_mtp_heads"] is False
+        assert source_models[0]["num_layers"] == 60
+        assert [entry["name"] for entry in all_models] == ["MiniMax-M3-MXFP8"]
 
 
 class TestOQManagerMtpDetection:
@@ -179,3 +220,62 @@ class TestOQManagerDtypeSupport:
 
         assert manager._tasks == {}
         assert not (root / "DeepSeek-V4-Flash-oQ4-fp16").exists()
+
+
+class TestOQManagerProgress:
+    def test_byte_level_quant_progress_disables_time_estimator(self):
+        task = QuantTask(
+            task_id="task",
+            model_name="Model",
+            model_path="/tmp/Model",
+            oq_level=2.5,
+            output_name="Model-oQ2.5e",
+            output_path="/tmp/Model-oQ2.5e",
+            status=QuantStatus.QUANTIZING,
+            progress=39.0,
+            progress_meta={"processed_bytes": 31, "total_bytes": 100},
+        )
+
+        assert OQManager._has_explicit_quant_progress(task) is True
+
+    def test_non_byte_quant_progress_can_use_time_estimator(self):
+        task = QuantTask(
+            task_id="task",
+            model_name="Model",
+            model_path="/tmp/Model",
+            oq_level=2.5,
+            output_name="Model-oQ2.5e",
+            output_path="/tmp/Model-oQ2.5e",
+            status=QuantStatus.QUANTIZING,
+            progress=30.0,
+            progress_meta={},
+        )
+
+        assert OQManager._has_explicit_quant_progress(task) is False
+
+
+class TestOQManagerEnhanced:
+    @pytest.mark.asyncio
+    async def test_start_quantization_uses_enhanced_name_and_cache_path(
+        self, fp_model_dir, monkeypatch
+    ):
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        task = await manager.start_quantization(
+            str(fp_model_dir / "Llama-3B"),
+            4,
+            enhanced=True,
+            imatrix_num_samples=8,
+            imatrix_seq_length=128,
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.enhanced is True
+        assert task.output_name == "Llama-3B-oQ4e"
+        assert ".oqe_imatrix" in task.imatrix_cache_path
+        assert task.imatrix_cache_path.endswith("-s8-l128.npz")

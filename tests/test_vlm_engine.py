@@ -143,6 +143,39 @@ class TestVLMStreamingCleanup:
 
         assert fake_engine.aborted_request_id == "vlm-request-1"
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_preserves_generation_timestamps(self):
+        """VLM benchmark timing needs producer-side token timestamps."""
+
+        class TimestampCore(FakeStreamingCore):
+            async def stream_outputs(self, request_id):
+                yield SimpleNamespace(
+                    output_text="done",
+                    new_text="done",
+                    prompt_tokens=8,
+                    completion_tokens=4,
+                    finished=True,
+                    finish_reason="length",
+                    tool_calls=None,
+                    cached_tokens=0,
+                    generated_at=10.0,
+                    generated_until=12.0,
+                )
+
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = TimestampCore()
+
+        outputs = []
+        async for output in engine.stream_generate("hello"):
+            outputs.append(output)
+
+        assert len(outputs) == 1
+        assert outputs[0].generated_at == 10.0
+        assert outputs[0].generated_until == 12.0
+
 
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
@@ -766,6 +799,34 @@ class TestApplyChatTemplate:
         assert "user: Hello" in result
         assert "assistant: Hi" in result
         assert result.endswith("assistant:")
+
+    def test_value_error_fallback_uses_get_chat_template(self):
+        """Tokenizer exposes apply_chat_template but has no chat_template set
+        (ValueError) → fall back to mlx-vlm's get_chat_template plain rendering.
+
+        Covers raw OCR checkpoints like baidu/Unlimited-OCR that ship no
+        chat template; the pre-flight token count must not 400.
+        """
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = ValueError(
+            "Cannot use chat template functions because "
+            "tokenizer.chat_template is not set"
+        )
+        engine = _make_loaded_engine(tokenizer=tokenizer)
+        engine._processor = MagicMock()
+
+        messages = [{"role": "user", "content": "document parsing."}]
+        with patch(
+            "mlx_vlm.prompt_utils.get_chat_template",
+            return_value="<image>document parsing.",
+        ) as mock_gct:
+            result = engine._apply_chat_template(messages)
+
+        assert result == "<image>document parsing."
+        mock_gct.assert_called_once()
+        args, kwargs = mock_gct.call_args
+        assert args[0] is engine._processor
+        assert kwargs.get("add_generation_prompt") is True
 
     def test_chat_template_kwargs_override(self):
         """Additional chat_template_kwargs are merged into template kwargs."""
@@ -1685,7 +1746,7 @@ class TestCountChatTokens:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,abc"},
+                        "image_url": {"url": _png_data_uri(1, 1)},
                     },
                     {"type": "text", "text": "Describe"},
                 ],
@@ -1867,6 +1928,65 @@ class TestStopSafety:
 
         mock_inner_engine.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_stop_drops_vlm_refs_and_cache_before_inner_close(self):
+        """VLM wrapper refs and feature cache are released before final reclaim."""
+        engine = _make_loaded_engine()
+        events = []
+        vision_cache = MagicMock()
+        vision_cache.close.side_effect = lambda: events.append("vision_cache")
+        engine._vision_cache = vision_cache
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        engine._grammar_compiler = object()
+        engine._grammar_compiler_init_attempted = True
+
+        mock_inner_engine = MagicMock()
+
+        def close_side_effect():
+            events.append("inner_close")
+            assert engine._engine is None
+            assert engine._vlm_model is None
+            assert engine._processor is None
+            assert engine._adapter is None
+            assert engine._tokenizer is None
+            assert engine._grammar_compiler is None
+            assert engine._grammar_compiler_init_attempted is False
+            assert engine._vision_cache is None
+
+        mock_inner_engine.close.side_effect = close_side_effect
+        engine._engine.engine = mock_inner_engine
+
+        await engine.stop()
+
+        assert events == ["stop", "vision_cache", "inner_close"]
+
+    @pytest.mark.asyncio
+    async def test_stop_sets_diffusion_cancel_before_dropping_model_refs(self):
+        """Diffusion workers see cancellation before model refs are cleared."""
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._engine = None
+        engine._processor = MagicMock()
+        events = []
+
+        class RecordingCancelEvent:
+            def set(self):
+                events.append(
+                    (
+                        "cancel",
+                        engine._vlm_model is not None,
+                        engine._processor is not None,
+                    )
+                )
+
+        engine._diffusion_cancel_events = {RecordingCancelEvent()}
+
+        await engine.stop()
+
+        assert events == [("cancel", True, True)]
+        assert engine._vlm_model is None
+        assert engine._processor is None
+
 
 # ---------------------------------------------------------------------------
 # TestPreflightImageTokenCount
@@ -1936,6 +2056,14 @@ class TestReadImageDims:
         part = {"type": "image_url",
                 "image_url": {"url": "https://example.com/x.jpg"}}
         assert _read_image_dims(part) is None
+
+    def test_local_path_returns_none_without_opening(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url", "image_url": {"url": "/tmp/private.png"}}
+        with patch("PIL.Image.open") as image_open:
+            assert _read_image_dims(part) is None
+        image_open.assert_not_called()
 
     def test_garbage_returns_none(self):
         from omlx.engine.vlm import _read_image_dims

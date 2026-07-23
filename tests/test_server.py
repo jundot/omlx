@@ -8,7 +8,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from omlx.engine_pool import EngineEntry
-from omlx.exceptions import InvalidRequestError, ModelNotFoundError
+from omlx.exceptions import (
+    InvalidRequestError,
+    ModelNotFoundError,
+    ModelUnavailableError,
+)
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.server import (
     EngineType,
@@ -16,14 +20,14 @@ from omlx.server import (
     ServerState,
     _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
-    _resolve_metric_durations,
     _reset_boundary_snapshots_for_server,
+    _resolve_metric_durations,
     app,
     get_engine,
     get_max_context_window,
     get_sampling_params,
 )
-from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+from omlx.settings import GlobalSettings
 
 
 class TestBoundarySnapshotLifecycle:
@@ -558,6 +562,25 @@ class TestModelFallback:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_model_unavailable_returns_409(self):
+        """Cached model load failures return 409 instead of an unhandled 500."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = False
+        self._state.default_model = "default-model"
+
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_engine = AsyncMock(
+            side_effect=ModelUnavailableError("broken-model", "cached failure")
+        )
+        self._state.engine_pool = pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("broken-model", EngineType.LLM)
+
+        assert exc_info.value.status_code == 409
+
 
 class TestGetEngineLLMTypeValidation:
     """LLM endpoints must reject non-LLM engines with a clean 400 (#507).
@@ -942,3 +965,41 @@ class TestExposedProfileModels:
         max_context = get_max_context_window("qwen-base:thinking")
 
         assert max_context == 4096
+
+
+class TestHealthPreloadReadiness:
+    """/health must answer 503 "loading" during the startup pinned preload
+    and 200 "healthy" after, so port watchdogs see liveness instead of a
+    closed port while a large pinned model loads (#2184)."""
+
+    @pytest.mark.asyncio
+    async def test_health_503_while_preloading(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        old = server_mod._server_state.pinned_preload_complete
+        try:
+            server_mod._server_state.pinned_preload_complete = False
+            resp = Response()
+            body = await server_mod.health(resp)
+            assert resp.status_code == 503
+            assert body["status"] == "loading"
+        finally:
+            server_mod._server_state.pinned_preload_complete = old
+
+    @pytest.mark.asyncio
+    async def test_health_200_after_preload(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        old = server_mod._server_state.pinned_preload_complete
+        try:
+            server_mod._server_state.pinned_preload_complete = True
+            resp = Response()
+            body = await server_mod.health(resp)
+            assert resp.status_code == 200
+            assert body["status"] == "healthy"
+        finally:
+            server_mod._server_state.pinned_preload_complete = old

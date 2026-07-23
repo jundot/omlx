@@ -91,6 +91,13 @@ enum ShellEnvWriter {
             }
             return .publicCommandReady(path: path.path)
         case .failed(let reasons):
+            // A GUI launch only sees the launchd PATH, so an rc-based
+            // install is invisible to the PATH scan above. The shim
+            // marker in a shell file is the only signal that "Update
+            // Shell File" already ran.
+            if shellPathExportAlreadyInstalled() {
+                return .publicCommandReady(path: shimURL.path)
+            }
             return .needsShellPathPrompt(reason: reasons.joined(separator: "\n"))
         }
     }
@@ -256,15 +263,22 @@ enum ShellEnvWriter {
         try? data.write(to: url, options: [.atomic])
     }
 
-    private static func ensureCLIPathExport() throws {
-        let files = candidateFiles()
-        for url in files where FileManager.default.fileExists(atPath: url.path) {
+    private static func shellPathExportAlreadyInstalled() -> Bool {
+        for url in candidateFiles() where FileManager.default.fileExists(atPath: url.path) {
             let raw = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
             if raw.contains(cliShimBeginMarker) {
-                return
+                return true
             }
         }
+        return false
+    }
 
+    private static func ensureCLIPathExport() throws {
+        if shellPathExportAlreadyInstalled() {
+            return
+        }
+
+        let files = candidateFiles()
         let target = primaryFile() ?? files.first(where: {
             FileManager.default.fileExists(atPath: $0.path)
         }) ?? files.first!

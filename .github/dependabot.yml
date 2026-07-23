@@ -9,3 +9,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # xgrammar 0.2.4+ caps transformers at <5, which conflicts with
+      # our transformers>=5.7.0 pin and breaks pip/uv dev installs
+      # (#2289). Drop this once upstream lifts the cap.
+      - dependency-name: xgrammar

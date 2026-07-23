@@ -16,9 +16,11 @@ def test_minimax_m3_compat_installs_vendor_modules():
     import mlx_vlm.models.minimax_m3  # noqa: F401
     import mlx_vlm.models.minimax_m3_vl  # noqa: F401
     import mlx_vlm.models.minimax_m3_vl.language as language
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
     import mlx_vlm.tool_parsers.minimax_m3 as parser
 
     assert hasattr(language, "MiniMaxM3KVCache")
+    assert hasattr(msa, "build_grouped_msa_topk")
     assert hasattr(parser, "parse_tool_call")
 
 

@@ -111,6 +111,80 @@ def server_tts_client():
 # ---------------------------------------------------------------------------
 
 
+class TestTTSKokoroLangInference:
+    """Kokoro G2P lang_code inference from the voice naming convention.
+
+    Kokoro voice names are ``<lang><gender>_<name>`` (af_heart, bm_george,
+    zf_xiaoxiao). Without a lang_code the pipeline falls back to English
+    G2P and non-English text is mangled. Names that don't match the
+    convention (Qwen3-TTS speakers like 'aiden') must NOT trigger
+    inference — those backends have their own lang_code defaults.
+    """
+
+    @staticmethod
+    def _engine_with_fake_model(captured: dict):
+        import numpy as np
+        from types import SimpleNamespace
+
+        from omlx.engine.tts import TTSEngine
+
+        class FakeModel:
+            sample_rate = 24000
+
+            def generate(
+                self, *, text, verbose=False, voice=None, lang_code=None, **kw
+            ):
+                captured["voice"] = voice
+                captured["lang_code"] = lang_code
+                captured["had_lang_code"] = lang_code is not None
+                return [SimpleNamespace(audio=np.zeros(100, dtype=np.float32))]
+
+        engine = TTSEngine("kokoro")
+        engine._model = FakeModel()
+        return engine
+
+    def test_helper_covers_all_kokoro_languages(self):
+        from omlx.engine.tts import _infer_kokoro_lang_code
+
+        for code in "abefhijpz":
+            assert _infer_kokoro_lang_code(f"{code}f_test") == code
+            assert _infer_kokoro_lang_code(f"{code}m_test") == code
+
+    def test_helper_rejects_non_kokoro_names(self):
+        from omlx.engine.tts import _infer_kokoro_lang_code
+
+        for name in ("aiden", "eric", "alloy", "zeta", "af", "xf_test", None, ""):
+            assert _infer_kokoro_lang_code(name) is None
+
+    @pytest.mark.asyncio
+    async def test_kokoro_voice_infers_lang_code(self):
+        captured: dict = {}
+        engine = self._engine_with_fake_model(captured)
+
+        await engine.synthesize("你好世界", voice="zf_xiaoxiao")
+
+        assert captured["lang_code"] == "z"
+
+    @pytest.mark.asyncio
+    async def test_explicit_language_wins_over_inference(self):
+        captured: dict = {}
+        engine = self._engine_with_fake_model(captured)
+
+        await engine.synthesize("hello", voice="zf_xiaoxiao", language="en")
+
+        assert captured["lang_code"] == "en"
+
+    @pytest.mark.asyncio
+    async def test_non_kokoro_voice_gets_no_inferred_lang_code(self):
+        """Qwen3-TTS-style speakers must keep the backend's own default."""
+        captured: dict = {}
+        engine = self._engine_with_fake_model(captured)
+
+        await engine.synthesize("hello", voice="aiden")
+
+        assert captured["had_lang_code"] is False
+
+
 class TestTTSEndpointBasic:
     """Core TTS endpoint behaviour."""
 
@@ -122,6 +196,21 @@ class TestTTSEndpointBasic:
             json={"model": "qwen3-tts", "input": "Hello, world!", "voice": "alloy"},
         )
         assert response.status_code == 200
+
+    def test_post_speech_rejects_unsupported_format(self, server_tts_client):
+        """Unsupported response_format gets 400, not silently-WAV bytes."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello", "response_format": "aac"},
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get(
+            "message", ""
+        )
+        # The error must name both the rejected format and the supported ones.
+        assert "aac" in detail
+        assert "wav" in detail.lower()
 
     def test_response_is_audio_bytes(self, server_tts_client):
         """Response body is non-empty bytes."""
@@ -194,6 +283,79 @@ class TestTTSEndpointBasic:
             json={"model": "qwen3-tts", "input": "Test", "response_format": "wav"},
         )
         assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# TestTTSResponseFormatTranscoding
+# ---------------------------------------------------------------------------
+
+
+class TestTTSResponseFormatTranscoding:
+    """Non-streaming transcoding of the native WAV output (#753, #1013).
+
+    The encoder tests need soundfile (ships with the audio extra via
+    mlx-audio -> librosa) and skip when it isn't installed; pcm and wav
+    passthrough only use the stdlib.
+    """
+
+    def _post_speech(self, client, response_format):
+        return client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello",
+                "response_format": response_format,
+            },
+        )
+
+    def test_wav_stays_untranscoded(self, server_tts_client):
+        """Explicit wav returns the engine bytes as-is."""
+        client, _ = server_tts_client
+        response = self._post_speech(client, "wav")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        assert response.content == DUMMY_WAV
+
+    def test_pcm_returns_raw_frames(self, server_tts_client):
+        """pcm strips the RIFF header and returns the raw sample frames."""
+        client, _ = server_tts_client
+        response = self._post_speech(client, "pcm")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/pcm"
+        with wave.open(io.BytesIO(DUMMY_WAV), "rb") as wf:
+            expected = wf.readframes(wf.getnframes())
+        assert response.content == expected
+
+    def test_mp3_returns_decodable_mpeg(self, server_tts_client):
+        """mp3 output is not WAV and decodes back to audio samples."""
+        sf = pytest.importorskip("soundfile")
+        client, _ = server_tts_client
+        response = self._post_speech(client, "mp3")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/mpeg"
+        assert not response.content.startswith(RIFF_MAGIC)
+        data, _ = sf.read(io.BytesIO(response.content))
+        assert len(data) > 0
+
+    def test_opus_returns_ogg_container(self, server_tts_client):
+        """opus output is an Ogg container (needs a 24 kHz source)."""
+        pytest.importorskip("soundfile")
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.synthesize = AsyncMock(return_value=_make_wav_bytes(sample_rate=24000))
+        response = self._post_speech(client, "opus")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/ogg"
+        assert response.content.startswith(b"OggS")
+
+    def test_flac_returns_flac_header(self, server_tts_client):
+        """flac output carries the fLaC stream marker."""
+        pytest.importorskip("soundfile")
+        client, _ = server_tts_client
+        response = self._post_speech(client, "flac")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/flac"
+        assert response.content.startswith(b"fLaC")
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +541,7 @@ class TestTTSStreaming:
             assert call.kwargs.get("max_tokens") == 512
 
     def test_streaming_rejects_non_wav_response_format(self, server_tts_client):
-        """stream=true only supports response_format=wav in phase 1."""
+        """The response_format guard covers the streaming path too."""
         client, _ = server_tts_client
         response = client.post(
             "/v1/audio/speech",

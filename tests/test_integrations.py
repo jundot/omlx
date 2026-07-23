@@ -917,6 +917,32 @@ class TestHermesIntegration:
 
         assert captured["argv"] == ["hermes", "chat", "--tui"]
 
+    def test_launch_forwards_extra_args(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.hermes.os.execvpe", side_effect=fake_execvpe),
+        ):
+            hermes.launch(
+                ctx(port=8000, api_key="", model="qwen3.5", extra_args=("--continue",))
+            )
+
+        assert captured["argv"] == [
+            "hermes",
+            "chat",
+            "--tui",
+            "-m",
+            "qwen3.5",
+            "--continue",
+        ]
+
     def test_type(self):
         hermes = HermesIntegration()
         assert hermes.type == "config_file"
@@ -1329,7 +1355,8 @@ class TestClaudeCodeIntegration:
         ):
             cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
 
-        assert captured["argv"] == ["claude"]
+        # No caller extra_args, but the launcher injects its own LSP denial.
+        assert captured["argv"] == ["claude", "--disallowedTools", "LSP"]
 
     def test_launch_forwards_extra_args(self):
         cc = ClaudeCodeIntegration()
@@ -1354,7 +1381,13 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "--resume", "abc123"]
+        assert captured["argv"] == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            "--resume",
+            "abc123",
+        ]
 
     def test_launch_forwards_short_resume(self):
         cc = ClaudeCodeIntegration()
@@ -1379,7 +1412,55 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "-r", "xyz"]
+        assert captured["argv"] == ["claude", "--disallowedTools", "LSP", "-r", "xyz"]
+
+    def test_launch_denies_lsp_by_default(self):
+        """LSP's schema joins the tools array mid-session and re-prefills the
+        whole conversation on a caching server (#2349); the launcher denies it
+        so the tools array stays stable."""
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        assert captured["argv"] == ["claude", "--disallowedTools", "LSP"]
+
+    def test_launch_respects_user_disallowed_tools(self):
+        """A caller-supplied --disallowedTools takes over: don't inject ours
+        on top (would duplicate the flag / fight their choice)."""
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="qwen3.5",
+                    extra_args=("--disallowedTools", "Bash"),
+                )
+            )
+
+        assert captured["argv"] == ["claude", "--disallowedTools", "Bash"]
 
 
 class TestCopilotIntegration:

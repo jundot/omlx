@@ -96,6 +96,105 @@ def test_pre_load_dispatch_applies_glm_patch(tmp_path, monkeypatch):
     apply_mock.assert_called_once_with()
 
 
+def test_glm_fused_gate_up_quant_spec_expanded_for_mxfp4_config():
+    quant = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "model.layers.1.mlp.switch_mlp.gate_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.up_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.down_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+    }
+    cfg = {"model_type": "glm_moe_dsa", "quantization": dict(quant)}
+
+    model_loading.expand_glm_moe_dsa_fused_quant_keys(cfg)
+
+    assert cfg["quantization"]["model.layers.1.mlp.switch_mlp.gate_up_proj"] == {
+        "bits": 4,
+        "group_size": 32,
+        "mode": "mxfp4",
+    }
+    assert "model.layers.1.mlp.switch_mlp.gate_proj" in cfg["quantization"]
+    assert "model.layers.1.mlp.switch_mlp.up_proj" in cfg["quantization"]
+
+
+def test_glm_mxfp4_fused_gate_up_quant_spec_avoids_bias_parameter():
+    pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from mlx.utils import tree_flatten
+
+    glm_moe_dsa = _load_patched_glm_module()
+    args = _small_glm_args(glm_moe_dsa)
+    gate_path = "model.layers.1.mlp.switch_mlp.gate_up_proj"
+    base_quant = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "model.layers.1.mlp.switch_mlp.gate_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.up_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.down_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+    }
+    weights = {f"{gate_path}.scales": object()}
+
+    def gate_up_params(quantization):
+        args.quantization = quantization
+        model = glm_moe_dsa.Model(args)
+
+        def class_predicate(path, module):
+            if path in quantization:
+                return quantization[path]
+            if not hasattr(module, "to_quantized"):
+                return False
+            return f"{path}.scales" in weights
+
+        nn.quantize(
+            model,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
+            class_predicate=class_predicate,
+        )
+        return {
+            name
+            for name, _ in tree_flatten(model.parameters())
+            if name.startswith(gate_path)
+        }
+
+    before = gate_up_params(dict(base_quant))
+    fixed_cfg = {"model_type": "glm_moe_dsa", "quantization": dict(base_quant)}
+    model_loading.expand_glm_moe_dsa_fused_quant_keys(fixed_cfg)
+    after = gate_up_params(fixed_cfg["quantization"])
+
+    assert f"{gate_path}.biases" in before
+    assert f"{gate_path}.weight" in after
+    assert f"{gate_path}.scales" in after
+    assert f"{gate_path}.biases" not in after
+
+
 def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
     from omlx.patches.glm_moe_dsa.generate_patch import (
         _glm_dsa_adaptive_prefill_config,
@@ -195,6 +294,32 @@ def test_glm_patch_installs_native_indexer_schedule():
     assert [len(c.caches) for c in model.make_cache()] == [2, 1, 2, 1, 2, 1]
 
 
+def test_glm_indexer_rope_interleave_matches_upstream_contract(monkeypatch):
+    glm_moe_dsa = _load_patched_glm_module()
+
+    from omlx.patches.glm_moe_dsa import deepseek_v32 as vendored_deepseek_v32
+
+    glm_fields = glm_moe_dsa.ModelArgs.__dataclass_fields__
+    dsv32_fields = vendored_deepseek_v32.ModelArgs.__dataclass_fields__
+
+    assert glm_fields["indexer_rope_interleave"].default is True
+    assert dsv32_fields["indexer_rope_interleave"].default is False
+
+    calls = []
+
+    def fake_initialize_rope(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(vendored_deepseek_v32, "initialize_rope", fake_initialize_rope)
+
+    args = _small_glm_args(glm_moe_dsa)
+    assert args.indexer_rope_interleave is True
+    vendored_deepseek_v32.Indexer(args)
+
+    assert calls[-1]["traditional"] is True
+
+
 def test_glm_direct_sparse_mla_uses_fork_default_threshold(monkeypatch):
     from omlx.patches.glm_moe_dsa import glm_moe_dsa_model
 
@@ -220,20 +345,25 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
 
     mx.random.seed(7)
 
-    tokens, topk, dims = 8, 8, 64
-    x_sorted = mx.random.normal((tokens * topk, 1, dims), dtype=mx.float16)
-    inv_order = mx.array(list(range(tokens * topk - 1, -1, -1)), dtype=mx.uint32)
-    scores = mx.softmax(
-        mx.random.normal((tokens, topk), dtype=mx.float32),
-        axis=-1,
-    )
-    y_native = fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
-    x_ref = mx.squeeze(x_sorted, -2)
-    x_ref = mx.take(x_ref, inv_order, axis=0)
-    x_ref = mx.reshape(x_ref, scores.shape + (dims,))
-    y_ref = mx.sum(x_ref * mx.expand_dims(scores, -1), axis=-2).astype(mx.float16)
-    mx.eval(y_native, y_ref)
-    assert float(mx.max(mx.abs(y_native - y_ref)).item()) == 0.0
+    tokens, dims = 8, 64
+    for topk in (8, 6):
+        x_sorted = mx.random.normal((tokens * topk, 1, dims), dtype=mx.float16)
+        inv_order = mx.array(
+            list(range(tokens * topk - 1, -1, -1)), dtype=mx.uint32
+        )
+        scores = mx.softmax(
+            mx.random.normal((tokens, topk), dtype=mx.float32),
+            axis=-1,
+        )
+        y_native = fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
+        x_ref = mx.squeeze(x_sorted, -2)
+        x_ref = mx.take(x_ref, inv_order, axis=0)
+        x_ref = mx.reshape(x_ref, scores.shape + (dims,))
+        y_ref = mx.sum(x_ref * mx.expand_dims(scores, -1), axis=-2).astype(
+            mx.float16
+        )
+        mx.eval(y_native, y_ref)
+        assert float(mx.max(mx.abs(y_native - y_ref)).item()) == 0.0
 
     batch, heads, length, latent, values = 1, 64, 1, 512, 256
     x = mx.random.normal((batch, heads, length, latent), dtype=mx.float16)
@@ -506,6 +636,281 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     assert topk_indices.shape == (1, 1, 2, 2048)
 
 
+def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
+    mx = pytest.importorskip("mlx.core")
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+    except Exception as exc:  # pragma: no cover - depends on local native build
+        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    if not fast.has_symbol("deepseek_affine_gather_qmm_blocks"):
+        pytest.skip("DeepSeek affine block-list kernels are unavailable")
+
+    from omlx.patches.deepseek_v4.switch_layers import (
+        _build_mxfp4_blocks,
+        _mxfp4_block_config,
+    )
+
+    mx.random.seed(11)
+    experts, output_dims, input_dims, routes = 8, 64, 128, 192
+    indices = mx.array(
+        sorted((i * 7) % experts for i in range(routes)),
+        dtype=mx.int32,
+    )
+    block_bm, block_variant = _mxfp4_block_config(indices.size)
+    block_meta, block_count = _build_mxfp4_blocks(indices, experts, block_bm)
+
+    for dtype in (mx.bfloat16, mx.float16):
+        x = mx.random.normal((routes, 1, input_dims), dtype=dtype)
+        for bits in (2, 3):
+            w0 = mx.random.normal(
+                (experts, output_dims, input_dims),
+                dtype=dtype,
+            )
+            w1 = mx.random.normal(
+                (experts, output_dims, input_dims),
+                dtype=dtype,
+            )
+            q0, s0, b0 = mx.quantize(
+                w0,
+                group_size=64,
+                bits=bits,
+                mode="affine",
+            )
+            q1, s1, b1 = mx.quantize(
+                w1,
+                group_size=64,
+                bits=bits,
+                mode="affine",
+            )
+
+            y_ref = mx.gather_qmm(
+                x,
+                q0,
+                s0,
+                b0,
+                rhs_indices=indices,
+                transpose=True,
+                group_size=64,
+                bits=bits,
+                mode="affine",
+                sorted_indices=True,
+            )
+            y_native = fast.deepseek_affine_gather_qmm_blocks(
+                x,
+                q0,
+                s0,
+                b0,
+                block_meta,
+                block_count,
+                64,
+                bits,
+                block_variant,
+            )
+            y_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+                x,
+                q0,
+                s0,
+                b0,
+                q1,
+                s1,
+                b1,
+                block_meta,
+                block_count,
+                64,
+                bits,
+                block_variant,
+            )
+            y1_ref = mx.gather_qmm(
+                x,
+                q1,
+                s1,
+                b1,
+                rhs_indices=indices,
+                transpose=True,
+                group_size=64,
+                bits=bits,
+                mode="affine",
+                sorted_indices=True,
+            )
+
+            y0_pair = y_pair[..., :output_dims]
+            y1_pair = y_pair[..., output_dims:]
+            mx.eval(y_ref, y_native, y0_pair, y1_ref, y1_pair)
+            assert float(mx.max(mx.abs(y_ref - y_native)).item()) == 0.0
+            assert float(mx.max(mx.abs(y_ref - y0_pair)).item()) == 0.0
+            assert float(mx.max(mx.abs(y1_ref - y1_pair)).item()) == 0.0
+
+
+def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+    except Exception as exc:  # pragma: no cover - depends on local native build
+        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
+        pytest.skip("DeepSeek affine block-list kernels are unavailable")
+
+    from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    mx.random.seed(13)
+
+    def quantized_affine(layer):
+        layer = layer.to_quantized(
+            group_size=64,
+            bits=3,
+            mode="affine",
+        )
+        layer.scales = layer.scales.astype(mx.bfloat16)
+        layer.biases = layer.biases.astype(mx.bfloat16)
+        return layer
+
+    model = SwitchGLU(128, 64, 8)
+    model.gate_proj = quantized_affine(model.gate_proj)
+    model.up_proj = quantized_affine(model.up_proj)
+    model.down_proj = quantized_affine(model.down_proj)
+
+    calls = {"pair": 0, "single": 0}
+    orig_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks
+    orig_single = fast.deepseek_affine_gather_qmm_blocks
+
+    def pair_spy(*args, **kwargs):
+        calls["pair"] += 1
+        return orig_pair(*args, **kwargs)
+
+    def single_spy(*args, **kwargs):
+        calls["single"] += 1
+        return orig_single(*args, **kwargs)
+
+    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
+    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
+
+    x = mx.random.normal((1, 32, 128), dtype=mx.bfloat16)
+    indices = mx.array(
+        [[[(i + j) % 8 for j in range(2)] for i in range(32)]],
+        dtype=mx.int32,
+    )
+    y = model(x, indices)
+    mx.eval(y)
+
+    assert y.shape == (1, 32, 2, 128)
+    assert calls == {"pair": 1, "single": 1}
+
+
+def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+    except Exception as exc:  # pragma: no cover - depends on local native build
+        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+
+    if not fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
+        pytest.skip("DeepSeek affine block-list kernels are unavailable")
+
+    from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    mx.random.seed(19)
+
+    def quantized_affine(layer):
+        layer = layer.to_quantized(
+            group_size=64,
+            bits=3,
+            mode="affine",
+        )
+        layer.scales = layer.scales.astype(mx.float16)
+        layer.biases = layer.biases.astype(mx.float16)
+        return layer
+
+    model = SwitchGLU(128, 64, 8)
+    model.gate_proj = quantized_affine(model.gate_proj)
+    model.up_proj = quantized_affine(model.up_proj)
+    model.down_proj = quantized_affine(model.down_proj)
+
+    calls = {"pair": 0, "single": 0, "pair_dtype": None, "single_dtype": None}
+    orig_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks
+    orig_single = fast.deepseek_affine_gather_qmm_blocks
+
+    def pair_spy(x, *args, **kwargs):
+        calls["pair"] += 1
+        calls["pair_dtype"] = x.dtype
+        return orig_pair(x, *args, **kwargs)
+
+    def single_spy(x, *args, **kwargs):
+        calls["single"] += 1
+        calls["single_dtype"] = x.dtype
+        return orig_single(x, *args, **kwargs)
+
+    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
+    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
+
+    x = mx.random.normal((1, 32, 128), dtype=mx.bfloat16)
+    indices = mx.array(
+        [[[(i + j) % 8 for j in range(2)] for i in range(32)]],
+        dtype=mx.int32,
+    )
+    y = model(x, indices)
+    mx.eval(y)
+
+    assert y.dtype == mx.bfloat16
+    assert y.shape == (1, 32, 2, 128)
+    assert calls == {
+        "pair": 1,
+        "single": 1,
+        "pair_dtype": mx.float16,
+        "single_dtype": mx.float16,
+    }
+
+
+def test_deepseek_switchglu_does_not_use_native_weighted_sum(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    orig_has_symbol = fast.has_symbol
+    calls = {"weighted_sum": 0}
+
+    def has_symbol(name):
+        if name == "glm_moe_weighted_sum":
+            return True
+        return orig_has_symbol(name)
+
+    def weighted_sum_spy(*args, **kwargs):
+        calls["weighted_sum"] += 1
+        raise AssertionError("DeepSeek V4 must use the reference scatter path")
+
+    monkeypatch.setattr(fast, "has_symbol", has_symbol)
+    monkeypatch.setattr(fast, "glm_moe_weighted_sum", weighted_sum_spy)
+
+    mx.random.seed(17)
+    model = SwitchGLU(16, 8, 8)
+    x = mx.random.normal((1, 11, 16), dtype=mx.bfloat16)
+    indices = mx.array(
+        [[[(i + j) % 8 for j in range(6)] for i in range(11)]],
+        dtype=mx.int32,
+    )
+    scores = mx.softmax(
+        mx.random.normal(indices.shape, dtype=mx.float32),
+        axis=-1,
+    )
+
+    y = model(x, indices, scores=scores)
+    mx.eval(y)
+
+    assert y.shape == (1, 11, 6, 16)
+    assert calls["weighted_sum"] == 0
+
+
 def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):
     glm_moe_dsa = _load_patched_glm_module()
 
@@ -697,3 +1102,64 @@ def test_glm_cachelist_hot_and_cold_round_trip(tmp_path):
         assert cold_manager._hot_cache_get(block_hash) is not None
     finally:
         cold_manager.close()
+
+
+def test_glm_indexer_decode_rows_skip_fused_scores_kernel(monkeypatch):
+    """MTP verify forwards (tiny multi-row decode) must not enter the
+    prefill-shaped fused indexer scores kernel (issue #2160): it runs ~5x
+    slower than the matmul + fused reduce fallback at tiny row counts and
+    the gap grows with context length."""
+    mx = pytest.importorskip("mlx.core")
+    glm_moe_dsa = _load_patched_glm_module()
+
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.glm_moe_dsa import deepseek_v32 as dsv32
+
+    assert dsv32._FUSED_SCORES_MIN_S == 16
+
+    args = _small_glm_args(glm_moe_dsa)
+    indexer = dsv32.Indexer(args)
+    mx.eval(indexer.parameters())
+
+    fused_calls = []
+    real_fused = dsv32.fused_indexer_scores
+
+    def counting_fused(*a, **kw):
+        fused_calls.append(a[0].shape)
+        return real_fused(*a, **kw)
+
+    monkeypatch.setattr(dsv32, "fused_indexer_scores", counting_fused)
+
+    def causal_mask(s, total):
+        q_pos = mx.arange(total - s, total)[:, None]
+        k_pos = mx.arange(total)[None, :]
+        return k_pos <= q_pos
+
+    cache = KVCache()
+    hidden = args.hidden_size
+
+    # Prefill-shaped call (s >= floor) still routes through the fused kernel.
+    s0 = 16
+    x0 = mx.random.normal((1, s0, hidden)).astype(mx.bfloat16)
+    qr0 = mx.random.normal((1, s0, args.q_lora_rank)).astype(mx.bfloat16)
+    out0 = indexer(x0, qr0, causal_mask(s0, s0), cache=cache)
+    mx.eval(out0 if not isinstance(out0, tuple) else out0[0])
+    assert len(fused_calls) == 1
+
+    # Decode-verify-shaped call (1 < s < floor) must skip the fused kernel
+    # and still produce causally valid top-k indices.
+    s1 = 3
+    x1 = mx.random.normal((1, s1, hidden)).astype(mx.bfloat16)
+    qr1 = mx.random.normal((1, s1, args.q_lora_rank)).astype(mx.bfloat16)
+    total = s0 + s1
+    out1 = indexer(x1, qr1, causal_mask(s1, total), cache=cache)
+    assert len(fused_calls) == 1
+
+    idx = out1[0] if isinstance(out1, tuple) else out1
+    assert idx is not None
+    mx.eval(idx)
+    assert idx.shape == (1, 1, s1, args.index_topk)
+    for row in range(s1):
+        row_pos = total - s1 + row
+        assert max(idx[0, 0, row].tolist()) <= row_pos

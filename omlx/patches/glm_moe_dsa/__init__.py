@@ -80,12 +80,17 @@ def apply_glm_moe_dsa_patch() -> bool:
     _APPLIED = True
     missing = _missing_fast_symbols()
     if missing:
+        native_error = glm_fast.native_import_error()
         logger.warning(
             "GLM MoE DSA optimized patch applied, but fast kernel symbols are "
-            "missing from %s and mx.fast: %s. Build the native extension for "
-            "the accelerated path.",
+            "missing from %s and mx.fast: %s. Prefill for glm_moe_dsa models "
+            "will run a much slower non-fused fallback with higher memory use "
+            "(see issue #2137). Build the native extension for the accelerated "
+            "path (pip install with OMLX_WITH_CUSTOM_KERNEL=1; requires the "
+            "Metal toolchain) or use an official release build.%s",
             NATIVE_KERNELS_PACKAGE,
             ", ".join(missing),
+            f" Native import error: {native_error}" if native_error else "",
         )
     elif glm_fast.native_available():
         logger.info(

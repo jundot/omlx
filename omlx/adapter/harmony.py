@@ -18,8 +18,13 @@ Channels:
 - final: User-visible response (plain text)
 - analysis: Chain-of-thought reasoning (wrapped in <think>...</think> for streaming)
 - commentary: Tool/function calls (non-streaming only)
+
+gpt-oss also emits tool calls on the analysis channel with an explicit
+``to=functions.*`` recipient; those are honored as tool calls when the
+arguments form a JSON object (#2216).
 """
 
+import json
 import logging
 import re
 import time
@@ -58,6 +63,41 @@ _HARMONY_SPECIAL_TOKENS = [
 def _has_no_real_recipient(recipient: str | None) -> bool:
     """Return True when the parser only preserved the primed assistant header."""
     return recipient is None or recipient == "<|start|>assistant"
+
+
+def _message_content_text(msg: Any) -> str:
+    """Concatenate the text parts of a parsed Harmony message."""
+    text = ""
+    content = getattr(msg, "content", None)
+    if content is not None:
+        for part in content:
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str):
+                text += part_text
+    return text
+
+
+def _is_tool_call_message(msg: Any) -> bool:
+    """Return True when a parsed message is a genuine tool invocation.
+
+    Commentary is the canonical tool-call channel. gpt-oss also emits tool
+    calls on the analysis channel with an explicit functions.* recipient
+    (#2216); those count only when the arguments form a JSON object, so
+    recipient-less tool syntax reasoned about in thinking and prose
+    addressed to a tool both stay in the reasoning output (#2032).
+    """
+    recipient = getattr(msg, "recipient", None)
+    if not (isinstance(recipient, str) and recipient.startswith("functions.")):
+        return False
+    channel = getattr(msg, "channel", None)
+    if channel == "commentary":
+        return True
+    if channel != "analysis":
+        return False
+    try:
+        return isinstance(json.loads(_message_content_text(msg)), dict)
+    except ValueError:
+        return False
 
 
 @lru_cache(maxsize=1)
@@ -333,19 +373,11 @@ class HarmonyStreamingParser:
                 return tool_calls
 
             for msg in messages:
-                if not msg.recipient or not msg.recipient.startswith("functions."):
+                if not _is_tool_call_message(msg):
                     continue
 
                 name = msg.recipient[10:]  # Remove "functions." prefix
-                content = ""
-
-                # Safely iterate over content
-                msg_content = getattr(msg, "content", None)
-                if msg_content is not None:
-                    for c in msg_content:
-                        text = getattr(c, "text", None)
-                        if isinstance(text, str):
-                            content += text
+                content = _message_content_text(msg)
 
                 tool_calls.append({"name": name, "arguments": content})
                 logger.info(f"Extracted tool call: {name}, arguments={content}")
@@ -456,7 +488,15 @@ def parse_tool_calls_from_tokens(
             if msg_content is None:
                 continue
 
-            if msg.channel == "final":
+            # Checked before the analysis branch so analysis-channel tool
+            # calls do not leak their arguments into reasoning text.
+            if _is_tool_call_message(msg):
+                name = msg.recipient[10:]  # Remove "functions." prefix
+                tool_calls.append(
+                    {"name": name, "arguments": _message_content_text(msg)}
+                )
+
+            elif msg.channel == "final":
                 # Extract text from final channel
                 for content in msg_content:
                     text = getattr(content, "text", None)
@@ -469,16 +509,6 @@ def parse_tool_calls_from_tokens(
                     text = getattr(content, "text", None)
                     if isinstance(text, str):
                         analysis_text += text
-
-            elif msg.recipient and msg.recipient.startswith("functions."):
-                # Extract tool calls from commentary channel
-                name = msg.recipient[10:]  # Remove "functions." prefix
-                arguments = ""
-                for content in msg_content:
-                    text = getattr(content, "text", None)
-                    if isinstance(text, str):
-                        arguments += text
-                tool_calls.append({"name": name, "arguments": arguments})
 
             elif msg.channel != "commentary" and _has_no_real_recipient(msg.recipient):
                 # Preserve malformed/unknown assistant channels as visible text

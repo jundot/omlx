@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.admin import routes as admin_routes
-from omlx.model_settings import ModelSettingsManager
+from omlx.model_settings import ModelSettings, ModelSettingsManager
 
 
 class _FakeEntry:
@@ -301,6 +301,105 @@ class TestProfileRoutes:
         tmpl = mgr.get_template("coding")
         assert tmpl is not None
         assert tmpl["settings"] == {"temperature": 0.0}
+
+
+class TestApplySnapshotSemantics:
+    """Applying a profile is authoritative over universal fields: absent
+    keys reset to defaults so clearing a value in the editor round-trips.
+    Model-specific and excluded fields are not reset."""
+
+    def test_apply_resets_universal_fields_removed_from_profile(self, client):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "p",
+                "display_name": "P",
+                "settings": {
+                    "max_context_window": 8192,
+                    "max_tokens": 512,
+                    "temperature": 0.7,
+                },
+            },
+        )
+        r = c.post("/admin/api/models/model-a/profiles/p/apply")
+        assert r.json()["settings"]["max_tokens"] == 512
+
+        r = c.put(
+            "/admin/api/models/model-a/profiles/p",
+            json={"settings": {"temperature": 0.7}},
+        )
+        assert r.status_code == 200, r.text
+        r = c.post("/admin/api/models/model-a/profiles/p/apply")
+        settings = r.json()["settings"]
+        assert settings["temperature"] == 0.7
+        assert "max_context_window" not in settings
+        assert "max_tokens" not in settings
+
+    def test_apply_clears_kwargs_removed_from_profile(self, client):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "p",
+                "display_name": "P",
+                "settings": {
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "forced_ct_kwargs": ["enable_thinking"],
+                },
+            },
+        )
+        r = c.post("/admin/api/models/model-a/profiles/p/apply")
+        assert r.json()["settings"]["chat_template_kwargs"] == {
+            "enable_thinking": True
+        }
+
+        c.put(
+            "/admin/api/models/model-a/profiles/p",
+            json={"settings": {"temperature": 0.5}},
+        )
+        r = c.post("/admin/api/models/model-a/profiles/p/apply")
+        settings = r.json()["settings"]
+        assert "chat_template_kwargs" not in settings
+        assert "forced_ct_kwargs" not in settings
+
+    def test_profile_settings_sanitized_on_create_and_update(self, client):
+        c, mgr = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "p",
+                "display_name": "P",
+                "settings": {"temperature": 0.5, "max_tokens": "", "top_p": None},
+            },
+        )
+        assert mgr.get_profile("model-a", "p")["settings"] == {"temperature": 0.5}
+
+        c.put(
+            "/admin/api/models/model-a/profiles/p",
+            json={"settings": {"top_p": 0.9, "max_context_window": ""}},
+        )
+        assert mgr.get_profile("model-a", "p")["settings"] == {"top_p": 0.9}
+
+    def test_apply_preserves_excluded_and_model_specific_settings(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(ttl_seconds=300, model_alias="keep-me", dflash_enabled=True),
+        )
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "p",
+                "display_name": "P",
+                "settings": {"temperature": 0.7},
+            },
+        )
+        r = c.post("/admin/api/models/model-a/profiles/p/apply")
+        settings = r.json()["settings"]
+        assert settings["ttl_seconds"] == 300
+        assert settings["model_alias"] == "keep-me"
+        assert settings["dflash_enabled"] is True
 
 
 def test_all_model_settings_fields_classified():

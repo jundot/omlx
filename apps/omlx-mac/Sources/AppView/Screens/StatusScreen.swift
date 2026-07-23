@@ -289,26 +289,16 @@ private struct RuntimeCacheSection: View {
 
     private var memoryEntriesText: String {
         let n = cache?.hotCacheEntries ?? 0
-        if n == 1 {
-            return String(localized: "status.runtime_cache.memory_entries.one",
-                          defaultValue: "1 entry",
-                          comment: "Singular memory cache entry count")
-        }
-        return String(localized: "status.runtime_cache.memory_entries.other",
-                      defaultValue: "\(n) entries",
-                      comment: "Plural memory cache entry count; placeholder is the number of entries")
+        return String(localized: "status.runtime_cache.memory_entries.count",
+                      defaultValue: "Entries: \(n)",
+                      comment: "Memory cache entry count; placeholder is the number of entries")
     }
 
     private var fileCountText: String {
         guard let n = cache?.totalNumFiles else { return "—" }
-        if n == 1 {
-            return String(localized: "status.runtime_cache.file_count.one",
-                          defaultValue: "1 file",
-                          comment: "Singular cache file count")
-        }
-        return String(localized: "status.runtime_cache.file_count.other",
-                      defaultValue: "\(n) files",
-                      comment: "Plural cache file count; placeholder is the number of files")
+        return String(localized: "status.runtime_cache.file_count.count",
+                      defaultValue: "Files: \(n)",
+                      comment: "Cache file count; placeholder is the number of files")
     }
 
     private var sizeText: String {

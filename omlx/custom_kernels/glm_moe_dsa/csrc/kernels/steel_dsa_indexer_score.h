@@ -16,6 +16,10 @@ METAL_FUNC uint dsa_ordered_key_16(T x) {
   return (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
 }
 
+METAL_FUNC uint dsa_ordered_key_16_bits(ushort bits) {
+  return (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+}
+
 template <typename T, typename O, int TOPK, int THREADS>
 [[kernel, max_total_threads_per_threadgroup(THREADS)]] void dsa_topk_indices_16bit(
     const device T* scores [[buffer(0)]],
@@ -134,19 +138,63 @@ template <typename T, typename O, int TOPK, int THREADS>
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   } else {
-    for (int i = int(tid); i < scan_limit; i += THREADS) {
+    // Deterministic output pass (replaces the atomic-race append, which made both
+    // tie MEMBERSHIP and output ORDER GPU-scheduling-dependent — measured: the
+    // selected set changed on ~80% of realistic rows across re-runs, so replicated
+    // TP ranks could pick different tie-band keys). Raking scan: each thread owns
+    // one contiguous segment of the row (count pass -> one threadgroup-wide
+    // exclusive scan of per-thread totals, ~3 barriers total -> emit pass).
+    // Strictly-greater entries fill [0, n_greater) and threshold ties fill
+    // [n_greater, TOPK) lowest-index-first — membership and order are functions of
+    // the scores alone. Costs one extra read of the score row vs the racy append.
+    constexpr uint kSimdgroups = THREADS / 32;
+    threadgroup uint tg_partials_g[kSimdgroups];
+    threadgroup uint tg_partials_t[kSimdgroups];
+    const uint simd_id = tid / 32;
+    const uint lane_id = tid % 32;
+    const int seg = (scan_limit + THREADS - 1) / THREADS;
+    const int s0 = int(tid) * seg;
+    const int s1 = metal::min(s0 + seg, scan_limit);
+
+    uint local_g = 0;
+    uint local_t = 0;
+    for (int i = s0; i < s1; ++i) {
       const uint key = dsa_ordered_key_16(row_scores[i]);
-      if (key > threshold_key) {
-        const uint pos =
-            atomic_fetch_add_explicit(&counters[0], 1, memory_order_relaxed);
-        if (pos < uint(TOPK)) {
-          row_out[pos] = O(i);
-        }
-      } else if (key == threshold_key) {
-        const uint pos =
-            atomic_fetch_add_explicit(&counters[1], 1, memory_order_relaxed);
-        if (pos < uint(TOPK)) {
-          row_out[pos] = O(i);
+      local_g += key > threshold_key ? 1u : 0u;
+      local_t += key == threshold_key ? 1u : 0u;
+    }
+
+    // Exclusive scan of the 1024 per-thread (greater, tie) totals.
+    uint pre_g = metal::simd_prefix_exclusive_sum(local_g);
+    uint pre_t = metal::simd_prefix_exclusive_sum(local_t);
+    if (lane_id == 31) {
+      tg_partials_g[simd_id] = pre_g + local_g;
+      tg_partials_t[simd_id] = pre_t + local_t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id == 0) {
+      const uint pg = lane_id < kSimdgroups ? tg_partials_g[lane_id] : 0u;
+      const uint pt = lane_id < kSimdgroups ? tg_partials_t[lane_id] : 0u;
+      const uint sg = metal::simd_prefix_exclusive_sum(pg);
+      const uint st = metal::simd_prefix_exclusive_sum(pt);
+      if (lane_id < kSimdgroups) {
+        tg_partials_g[lane_id] = sg;
+        tg_partials_t[lane_id] = st;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint pos_g = tg_partials_g[simd_id] + pre_g;
+    uint pos_t = uint(state[3]) + tg_partials_t[simd_id] + pre_t;
+    if (local_g > 0 || (local_t > 0 && pos_t < uint(TOPK))) {
+      for (int j = s0; j < s1; ++j) {
+        const uint key = dsa_ordered_key_16(row_scores[j]);
+        if (key > threshold_key) {
+          row_out[pos_g++] = O(j);
+        } else if (key == threshold_key) {
+          if (pos_t < uint(TOPK)) {
+            row_out[pos_t++] = O(j);
+          }
         }
       }
     }

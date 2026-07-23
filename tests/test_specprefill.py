@@ -110,6 +110,103 @@ class TestManualRoPE:
         assert mx.allclose(result[..., dims:], x[..., dims:])
 
 
+class TestManualRopeWithFreqs:
+    """Tests for manual_rope_with_freqs() — RoPE from a precomputed freq table."""
+
+    @staticmethod
+    def _reference_partial_rotary(x, positions, dims, freqs):
+        """Independent oracle for the model's real partial rotary, written as an
+        explicit per-pair rotation in numpy so it shares NO code with the MLX
+        implementation under test. Pairs dim ``j`` with dim ``j + dims // 2``
+        over the full head and rotates ONLY the first ``len(freqs)`` pairs;
+        every other lane passes through. The old contiguous ``2 * len(freqs)``
+        pairing diverges from this by construction, which is what caught the
+        bug (jundot, PR #2295)."""
+        import numpy as np
+
+        xn = np.array(x, dtype=np.float64)
+        half = dims // 2
+        n = int(freqs.shape[-1])
+        inv = 1.0 / np.array(freqs, dtype=np.float64)
+        pos = np.array(positions, dtype=np.float64)
+        out = xn.copy()
+        for j in range(n):
+            ang = pos * inv[j]
+            c, s = np.cos(ang), np.sin(ang)
+            a = xn[..., j]
+            b = xn[..., j + half]
+            out[..., j] = a * c - b * s
+            out[..., j + half] = a * s + b * c
+        return out
+
+    def test_partial_rotary_matches_reference_rope(self):
+        # The corrected fix must match the model's real rope: pair dim i with
+        # dim i + dims//2 and rotate only the first len(freqs) pairs. The earlier
+        # 2*len(freqs) contiguous pairing diverged by ~5.9 abs and wrote
+        # misrotated KV on every Gemma-4 global layer.
+        import numpy as np
+
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        B, n_heads, L, head_dim = 1, 2, 8, 256
+        n_freqs = 64  # rotary sub-dim 128 < head_dim 256 (Gemma-4 style)
+        freqs = mx.arange(1, n_freqs + 1, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((B, n_heads, L, head_dim))
+        positions = mx.arange(L)
+
+        got = np.array(
+            manual_rope_with_freqs(x, positions, dims=head_dim, freqs=freqs),
+            dtype=np.float64,
+        )
+        want = self._reference_partial_rotary(x, positions, head_dim, freqs)
+        assert got.shape == tuple(x.shape)
+        assert np.max(np.abs(got - want)) < 1e-4
+
+    def test_partial_rotary_rotates_only_first_freqs_of_each_half(self):
+        # Exactly the lanes the real rope touches change, and no others: for
+        # head_dim 256 (half 128, n_freqs 64), dims [0:64] and [128:192] rotate;
+        # [64:128] and [192:256] pass through (the zero-angle, unrotated pairs).
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        B, n_heads, L, head_dim = 1, 2, 8, 256
+        n_freqs, half = 64, 128
+        freqs = mx.arange(1, n_freqs + 1, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((B, n_heads, L, head_dim))
+        result = manual_rope_with_freqs(x, mx.arange(L), dims=head_dim, freqs=freqs)
+
+        assert result.shape == x.shape
+        # Rotated lanes: the first n_freqs of each half of the head.
+        assert not mx.allclose(result[..., 0:n_freqs], x[..., 0:n_freqs])
+        assert not mx.allclose(
+            result[..., half : half + n_freqs], x[..., half : half + n_freqs]
+        )
+        # Untouched lanes: the remainder of each half.
+        assert mx.allclose(result[..., n_freqs:half], x[..., n_freqs:half])
+        assert mx.allclose(result[..., half + n_freqs :], x[..., half + n_freqs :])
+
+    def test_full_rotary_matches_reference_rope(self):
+        # Full rotary (len(freqs) == dims//2): no zero-padding path, every pair
+        # rotates, and it still matches the independent oracle exactly -- proving
+        # the fix is a no-op for full-rotary custom-_freqs models.
+        import numpy as np
+
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        B, n_heads, L, head_dim = 1, 2, 4, 64
+        n_freqs = head_dim // 2
+        freqs = mx.arange(1, n_freqs + 1, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((B, n_heads, L, head_dim))
+        positions = mx.arange(L)
+
+        got = np.array(
+            manual_rope_with_freqs(x, positions, dims=head_dim, freqs=freqs),
+            dtype=np.float64,
+        )
+        want = self._reference_partial_rotary(x, positions, head_dim, freqs)
+        assert got.shape == tuple(x.shape)
+        assert np.max(np.abs(got - want)) < 1e-4
+
+
 class TestAvgPool1d:
     """Tests for _avg_pool1d helper."""
 
@@ -496,6 +593,28 @@ class TestRoPEWrappers:
         cleanup_rope(model)
         assert layer.self_attn.rope is original_rope
 
+    def test_cleanup_rope_unwraps_nested(self):
+        from unittest.mock import MagicMock
+
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            cleanup_rope,
+        )
+
+        original_rope = MagicMock()
+        nested = _OffsetAdjustedRoPE(
+            _OffsetAdjustedRoPE(original_rope, adjustment=3), adjustment=5
+        )
+
+        model = MagicMock()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = nested
+        model.layers = [layer]
+
+        cleanup_rope(model)
+        assert layer.self_attn.rope is original_rope
+
 
 class TestModelSettings:
     """Tests for SpecPrefill fields in ModelSettings."""
@@ -608,3 +727,129 @@ class TestEngineCorePropagation:
         req = core.scheduler.add_request.call_args[0][0]
         assert not hasattr(req, "_specprefill_threshold")
         assert not hasattr(req, "_specprefill_keep_pct")
+
+
+class TestRoPEReWrap:
+    """Regression tests for #766 — re-wrapping a leftover _OffsetAdjustedRoPE.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called, e.g. an aborted request or a multi-turn partial cache hit), the
+    next sparse_prefill used to capture that wrapper as `original` and re-wrap it
+    in _PositionMappedRoPE, whose __init__ dereferenced `original_rope.dims` and
+    raised `'_OffsetAdjustedRoPE' object has no attribute 'dims'`.
+    """
+
+    class _GenuineRoPE:
+        dims = 128
+        base = 10000.0
+        scale = 1.0
+
+        def __call__(self, x, offset=0):
+            return x
+
+    def test_offset_adjusted_delegates_attrs(self):
+        from omlx.patches.specprefill import _OffsetAdjustedRoPE
+
+        wrapped = _OffsetAdjustedRoPE(self._GenuineRoPE(), adjustment=5)
+        # unknown attrs delegate to the wrapped rope
+        assert wrapped.dims == 128
+        assert wrapped.base == 10000.0
+
+    def test_unwrap_peels_to_genuine(self):
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+            _unwrap_rope,
+        )
+
+        genuine = self._GenuineRoPE()
+        positions = mx.arange(16)
+        assert _unwrap_rope(genuine) is genuine
+        assert _unwrap_rope(_OffsetAdjustedRoPE(genuine, 5)) is genuine
+        nested = _PositionMappedRoPE(_OffsetAdjustedRoPE(genuine, 5), positions)
+        assert _unwrap_rope(nested) is genuine
+
+    def test_rewrap_leftover_does_not_crash(self):
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+        )
+
+        genuine = self._GenuineRoPE()
+        leftover = _OffsetAdjustedRoPE(genuine, adjustment=5)
+        # Previously raised AttributeError on original_rope.dims (#766)
+        pm = _PositionMappedRoPE(leftover, mx.arange(16))
+        assert pm._dims == 128
+
+
+class TestTargetPrefillLeftoverCleanup:
+    """run_specprefill_target_prefill restores RoPE at entry (#766 follow-up).
+
+    A stale _OffsetAdjustedRoPE left by an aborted specprefill request must be
+    removed before the system prompt prefill runs, otherwise system KV is
+    written at offset-shifted positions.
+    """
+
+    def test_leftover_unwrapped_before_prefill(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import omlx.patches.specprefill as patches
+        import omlx.specprefill.target as target_mod
+        from omlx.specprefill.planning import SpecPrefillTargetPlan
+
+        class FakeRoPE:
+            dims = 64
+            base = 10000.0
+            scale = 1.0
+
+            def __call__(self, x, offset=0):
+                return x
+
+        genuine = FakeRoPE()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = patches._OffsetAdjustedRoPE(genuine, adjustment=7)
+        model = MagicMock()
+        model.layers = [layer]
+
+        seen = {}
+
+        def fake_sparse_prefill(m, tokens, selected, cache, **kwargs):
+            seen["rope"] = layer.self_attn.rope
+            return mx.zeros((1, 1))
+
+        monkeypatch.setattr(patches, "sparse_prefill", fake_sparse_prefill)
+        monkeypatch.setattr(target_mod, "make_prompt_cache", lambda m: [])
+
+        plan = SpecPrefillTargetPlan(
+            system_token_count=0,
+            conversation_tokens=list(range(8)),
+            conversation_token_count=8,
+            generation_kickoff_index=7,
+            remove_kickoff_index=False,
+            sparse_selected_token_count=4,
+            total_tracker_prefill_count=4,
+            position_offset=0,
+        )
+        request = MagicMock()
+        request.num_prompt_tokens = 8
+        request.cached_tokens = 0
+
+        target_mod.run_specprefill_target_prefill(
+            target_model=model,
+            request=request,
+            plan=plan,
+            all_tokens=list(range(8)),
+            selected_indices=mx.array([0, 2, 4, 7]),
+            prefill_step_size=4,
+            stream=mx.cpu,
+            check_abort=lambda n: None,
+            report_system_progress=lambda p, t: None,
+            report_sparse_progress=lambda p, t: None,
+            sync_and_clear_cache=lambda: None,
+            log=MagicMock(),
+        )
+
+        # Entry cleanup must restore the genuine rope before prefill runs
+        assert seen["rope"] is genuine
+        assert layer.self_attn.rope is genuine

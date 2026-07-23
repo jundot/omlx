@@ -2,7 +2,7 @@
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
     _build_codec,
@@ -144,6 +144,29 @@ def test_batch_tq_merge_extract():
     e2 = batch.extract(1)
     assert e1.offset == 8
     assert e2.offset == 4
+
+
+def test_batch_tq_merge_rejects_mixed_bit_depths():
+    """#2045 last-line guard: members packed at different depths (or seeds)
+    have incompatible packed widths/codecs and must fail loud at merge, not
+    as a raw mx.concatenate shape error deep in _concat_state_batch."""
+    c4 = TurboQuantKVCache(bits=4.0)
+    c4.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    c6 = TurboQuantKVCache(bits=6.0)
+    c6.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    mx.eval(c4.keys, c4.values, c6.keys, c6.values)
+
+    with pytest.raises(ValueError, match="mixed quantization"):
+        BatchTurboQuantKVCache.merge([c4, c6])
+
+    with pytest.raises(ValueError, match="mixed quantization"):
+        BatchTurboQuantKVCache.merge(
+            [c4, TurboQuantKVCache(bits=4.0, seed=1)]
+        )
 
 
 def test_batch_tq_merge_preserves_empty_rows():
@@ -506,6 +529,272 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     assert calls == {"quantized": 1, "dequantize": 1}
 
 
+@pytest.mark.parametrize("q_len", [2, 4, 9])
+def test_decode_multirow_matches_dequantize_reference(q_len):
+    """MTP-verify-shaped attention (fold path at small q_len, single-chunk
+    quantized_attention above the folded-repeat knee) must match the
+    dequantize+SDPA reference with an explicit causal tail mask."""
+    from omlx.patches.turboquant_attention import _decode_multirow_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D, T = 1, 24, 4, 256, 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    out = _decode_multirow_attention(tq, queries, ks, vs, scale)
+    assert out is not None
+    assert out.shape == (B, n_q, q_len, D)
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - q_len, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
+    # The causal tail mask must actually bind (an unmasked reference differs).
+    ref_nomask = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=None
+    )
+    assert mx.abs(ref_nomask - ref).max().item() > 1e-3
+
+
+@pytest.mark.parametrize("q_len", [2, 3, 4])
+def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
+    """Above the token floor, MSE-codec MTP verify takes the fused multi-row
+    kernel (one KV unpack shared across rows, issue #2215). Its output must
+    match the dequantize+SDPA reference with the causal tail mask, and the
+    dispatcher must route to it bit-exactly."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D = 1, 16, 2, 256
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    fused = tq_attention._fused_multirow_mse_attention(
+        tq, queries, tq._unwrap(ks), tq._unwrap(vs), scale, T
+    )
+    assert fused is not None
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - q_len, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(fused.astype(mx.float32) - ref).max().item() < 5e-3
+
+    routed = tq_attention._decode_multirow_attention(tq, queries, ks, vs, scale)
+    routed_diff = mx.abs(routed.astype(mx.float32) - fused.astype(mx.float32))
+    assert routed_diff.max().item() == 0.0
+
+
+@pytest.mark.parametrize("bits", [2.5, 3.5, 8])
+def test_fused_multirow_kernel_handles_mixed_bit_codecs(bits):
+    """Fractional turboquant_kv_bits split into different K/V integer bit
+    widths (2.5 -> K=2/V=3); the fused kernel templates the two widths
+    independently and must stay parity-correct across them."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D = 1, 16, 2, 256
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, 3, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    fused = tq_attention._fused_multirow_mse_attention(
+        tq, queries, tq._unwrap(ks), tq._unwrap(vs), scale, T
+    )
+    assert fused is not None
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - 3, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(fused.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+def test_fused_multirow_kernel_respects_token_floor(monkeypatch):
+    """Below the token floor the dispatcher must not call the fused helper
+    (the fold path is already cheap there and the 2-pass block split needs
+    enough tokens per block)."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D, T = 1, 16, 2, 256, 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, 3, D)).astype(mx.float16)
+
+    def fail_fused(*args, **kwargs):
+        raise AssertionError("fused kernel must not run below the token floor")
+
+    monkeypatch.setattr(
+        tq_attention, "_fused_multirow_mse_attention", fail_fused
+    )
+    out = tq_attention._decode_multirow_attention(tq, queries, ks, vs, D**-0.5)
+    assert out is not None
+    assert out.shape == (B, n_q, 3, D)
+
+
+def test_attention_patch_routes_decode_multirow_causal(monkeypatch):
+    """A decode-shaped multi-row causal call (MTP verify) must take the
+    multirow decode route — never prefill_attention / dequantize (issue
+    #2127 class: those re-scan the whole cache per verify cycle)."""
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 4, 64, 256)).astype(mx.float16),
+        mx.random.normal((1, 4, 64, 256)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+
+    def fail_prefill(self, *args, **kwargs):
+        raise AssertionError("verify must not take prefill_attention")
+
+    def fail_dequantize(self, *args, **kwargs):
+        raise AssertionError("verify must not dequantize the cache")
+
+    monkeypatch.setattr(TurboQuantKVCache, "prefill_attention", fail_prefill)
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", fail_dequantize)
+
+    queries = mx.random.normal((1, 24, 4, 256)).astype(mx.float16)
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=256**-0.5, mask="causal"
+    )
+    mx.eval(out)
+    assert out.shape == queries.shape
+
+
+def test_attention_patch_multirow_ignores_non_causal_masks():
+    """Array masks and mask=None keep the existing prefill routing (the
+    multirow route encodes causal-tail semantics only)."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+
+    from mlx_lm.models import base as mlx_base
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((1, 4, 2, 32))
+    # mask=None multi-row: full (non-causal) attention via the prefill chain.
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=None
+    )
+    mx.eval(out)
+    assert out.shape == queries.shape
+    dk, dv = tq.dequantize()
+    ref = mx.fast.scaled_dot_product_attention(
+        queries, dk.astype(queries.dtype), dv.astype(queries.dtype),
+        scale=32**-0.5, mask=None,
+    )
+    assert mx.abs(out - ref).max().item() < 5e-2
+
+
+def test_vlm_target_verify_attention_handles_tq_proxies():
+    """mlx-vlm's qwen3_5 MTP verify slices keys per draft row, which crashes
+    on TurboQuant's packed state proxies ('_QuantizedStateProxy' object is
+    not subscriptable, issue #2139). The patched helper must route TurboQuant
+    caches through one causal SDPA call with identical per-row semantics."""
+    pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    tq_attention._patch_vlm_target_verify_attention()
+
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    assert getattr(q35_lang, "_omlx_tq_target_verify_patched", False)
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D, T, L = 1, 4, 2, 32, 24, 3
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, L, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    out = q35_lang._target_verify_left_padded_attention(
+        queries, ks, vs, cache=tq, scale=scale, mask=None
+    )
+    mx.eval(out)
+    assert out.shape == queries.shape
+
+    # Reference: the caller's per-row causal slicing on dequantized arrays.
+    dk, dv = tq.dequantize()
+    dk = dk.astype(queries.dtype)
+    dv = dv.astype(queries.dtype)
+    prefix = T - L
+    ref = mx.concatenate(
+        [
+            mx.fast.scaled_dot_product_attention(
+                queries[:, :, i : i + 1, :],
+                dk[:, :, : prefix + i + 1, :],
+                dv[:, :, : prefix + i + 1, :],
+                scale=scale,
+                mask=None,
+            )
+            for i in range(L)
+        ],
+        axis=2,
+    )
+    assert mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max().item() < 5e-2
+
+    # Non-TurboQuant caches keep the original helper behavior (declines
+    # plain KVCache with no left padding -> caller uses its own path).
+    plain_ks, plain_vs = fp_cache.state
+    assert (
+        q35_lang._target_verify_left_padded_attention(
+            queries, plain_ks, plain_vs, cache=fp_cache, scale=scale, mask=None
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild tests (SSD cache reconstruction, issue #577)
 # ---------------------------------------------------------------------------
@@ -851,3 +1140,175 @@ def test_batch_masked_decode_is_accurate():
     assert (
         rel < 0.05
     ), f"B>1 masked decode inaccurate (err {rel:.1%}) — RHT fix missing from pinned mlx-vlm?"
+
+
+def _make_ragged_batch(bits=8.0, t_long=48, t_short=32, nkv=2, d=32, seed=5):
+    mx.random.seed(seed)
+    rows = []
+    for t in (t_long, t_short):
+        c = TurboQuantKVCache(bits=bits)
+        k = mx.random.normal((1, nkv, t, d)).astype(mx.float16)
+        v = mx.random.normal((1, nkv, t, d)).astype(mx.float16)
+        c.update_and_fetch(k, v)
+        mx.eval(c.keys, c.values)
+        rows.append((c, k, v))
+    batch = BatchTurboQuantKVCache.merge([c for c, _, _ in rows])
+    return batch, rows
+
+
+def test_batch_tq_append_position_survives_min_lp_row_departure():
+    """Continuous batching: when the zero-left-padding row departs (filter),
+    the physical append position must stay at the buffer's written end.
+    Deriving it from offset.max() makes every later decode write land
+    min(left_padding) columns early — overwriting the surviving rows' live
+    KV in place and silently losing the appended tokens (issue class: batched
+    TurboQuant intelligence collapse)."""
+    batch, rows = _make_ragged_batch()
+    _, k2, v2 = rows[1]
+
+    batch.filter(mx.array([1]))  # the lp=0 row departs; padding compacts away
+
+    ref_k = [k2[0]]
+    for _ in range(3):
+        nk = mx.random.normal((1, 2, 1, 32)).astype(mx.float16)
+        nv = mx.random.normal((1, 2, 1, 32)).astype(mx.float16)
+        batch.update_and_fetch(nk, nv)
+        ref_k.append(nk[0])
+    mx.eval(batch.keys, batch.values)
+
+    ref_k = mx.concatenate(ref_k, axis=1)  # (nkv, 35, d) logical truth
+    dk, _ = batch.dequantize()
+    lp = int(batch.left_padding[0].item())
+    stored = dk.shape[2] - lp
+    assert stored >= ref_k.shape[1], (
+        f"appended tokens lost: {stored} stored of {ref_k.shape[1]} logical"
+    )
+    got = dk[0, :, lp : lp + ref_k.shape[1], :].astype(mx.float32)
+    err = mx.abs(got - ref_k.astype(mx.float32)).max().item()
+    assert err < 0.2, f"surviving row KV stomped in place (max err {err:.3f})"
+
+
+def test_batch_tq_make_mask_width_after_min_lp_row_departure():
+    """After the lp=0 row departs, filter() compacts the shared padding away
+    (mirroring BatchKVCache), leaving the single survivor at lp=0 with the
+    written end equal to its own length, so a decode step needs no mask.
+    Survivors with residual padding are covered by
+    test_batch_tq_filter_compacts_left_padding_like_batch_kv."""
+    batch, _ = _make_ragged_batch()
+    batch.filter(mx.array([1]))
+    assert batch._phys_end == 32, (
+        f"written end {batch._phys_end}, expected 32 after dropping the "
+        "departed row's 16 shared padding columns"
+    )
+    assert batch.left_padding.tolist() == [0]
+    m = batch.make_mask(1, return_array=True)
+    assert m is None, f"expected no mask for the unpadded survivor, got {m}"
+
+
+def test_batch_tq_filter_compacts_left_padding_like_batch_kv():
+    """Issue #2237: BatchKVCache.filter() shifts its buffer left by
+    min(left_padding) once the zero-left-padding row departs; the TQ batch
+    cache must mirror that compaction. The model builds ONE decode mask from
+    the first (TQ) layer and feeds it to every attention layer, including the
+    turboquant_skip_last dense BatchKVCache layer, so diverging physical
+    widths crash the next step with a broadcast error."""
+    mx.random.seed(7)
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=8.0)
+    dense = BatchKVCache([0, 1, 2])
+    for t in (8, 1, 1, 1):
+        k = mx.random.normal((3, 2, t, 32)).astype(mx.float16)
+        v = mx.random.normal((3, 2, t, 32)).astype(mx.float16)
+        tq.update_and_fetch(k, v)
+        dense.update_and_fetch(k, v)
+
+    # The zero-left-padding row departs; survivors keep lp > 0.
+    keep = mx.array([1, 2])
+    tq.filter(keep)
+    dense.filter(keep)
+    assert tq.left_padding.tolist() == dense.left_padding.tolist(), (
+        f"left_padding diverges after filter: TQ={tq.left_padding.tolist()} "
+        f"BK={dense.left_padding.tolist()}"
+    )
+    assert tq._phys_end == dense._idx, (
+        f"physical end diverges after filter: TQ={tq._phys_end} "
+        f"BK={dense._idx}"
+    )
+
+    # Next decode step: shared mask width vs dense layer keys width.
+    k = mx.random.normal((2, 2, 1, 32)).astype(mx.float16)
+    v = mx.random.normal((2, 2, 1, 32)).astype(mx.float16)
+    mask = tq.make_mask(1)
+    dk, _ = dense.update_and_fetch(k, v)
+    tq.update_and_fetch(k, v)
+    assert mask.shape[-1] == dk.shape[2], (
+        f"decode mask spans {mask.shape[-1]} columns but the dense skip-last "
+        f"layer has {dk.shape[2]}, broadcast crash in SDPA (#2237)"
+    )
+
+    # Compaction must shift content, not corrupt it: compare each row's
+    # valid region against the exact dense copy of the same stream.
+    dqk, _ = tq.dequantize()
+    for i in range(2):
+        lp_i = int(dense.left_padding[i].item())
+        err = (
+            mx.abs(
+                dqk[i, :, lp_i:, :].astype(mx.float32)
+                - dk[i, :, lp_i:, :].astype(mx.float32)
+            )
+            .max()
+            .item()
+        )
+        assert err < 0.2, f"row {i} content shifted by compaction (err {err:.3f})"
+
+    # Second departure leaves a single survivor whose padding compacts to 0;
+    # both caches must stay in lockstep there too.
+    tq.filter(mx.array([1]))
+    dense.filter(mx.array([1]))
+    assert tq.left_padding.tolist() == dense.left_padding.tolist()
+    assert tq._phys_end == dense._idx
+
+
+def test_batch_tq_append_growth_keeps_content_and_geometry():
+    """Appending past the merged buffer's exact capacity must step-grow the
+    state without shifting content or leaking unwritten capacity columns
+    into .state / attention geometry."""
+    batch, rows = _make_ragged_batch()
+    _, k1, _ = rows[0]
+
+    nk = mx.random.normal((2, 2, 1, 32)).astype(mx.float16)
+    nv = mx.random.normal((2, 2, 1, 32)).astype(mx.float16)
+    batch.update_and_fetch(nk, nv)  # write at 48 -> triggers reserve growth
+    mx.eval(batch.keys, batch.values)
+
+    ks, _ = batch.state
+    from omlx.turboquant_kv import _state_length as _sl
+    assert _sl(getattr(ks, "_state", ks)) == 49, (
+        f".state exposes {_sl(getattr(ks, '_state', ks))} columns, expected 49"
+    )
+    dk, _ = batch.dequantize()
+    got = dk[0, :, :48, :].astype(mx.float32)
+    err = mx.abs(got - k1[0].astype(mx.float32)).max().item()
+    assert err < 0.2, f"row0 content shifted/corrupted after growth ({err:.3f})"
+    err_new = mx.abs(dk[0, :, 48, :].astype(mx.float32) - nk[0, :, 0, :].astype(mx.float32)).max().item()
+    assert err_new < 0.2, f"appended token not at written end ({err_new:.3f})"
+
+
+def test_batch_tq_state_restore_resets_phys_end():
+    """A state restore hands the cache back to the parent's int-offset (B=1)
+    bookkeeping, where the offset is the write cursor. A stale batch-mode
+    _phys_end must not survive the restore: _ensure_array_offset takes the
+    max of both, so a leftover value from a longer previous batch would win
+    over the restored cursor and leave a gap of unwritten columns."""
+    batch, _ = _make_ragged_batch()  # B=2, written end 48
+
+    single = TurboQuantKVCache(bits=8.0)
+    k = mx.random.normal((1, 2, 20, 32)).astype(mx.float16)
+    single.update_and_fetch(k, k)
+    batch.state = single.state  # restore a 20-token state onto the object
+
+    assert isinstance(batch.offset, int) and batch.offset == 20
+    batch._ensure_array_offset()
+    assert batch._phys_end == 20, (
+        f"stale batch-mode _phys_end leaked through restore "
+        f"({batch._phys_end} != 20)"
+    )

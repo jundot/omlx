@@ -61,6 +61,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_sink_size",
     "dflash_verify_mode",
     "mtp_enabled",
+    "mtp_num_draft_tokens",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -76,6 +77,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
     {
         "is_pinned",
         "is_default",
+        "is_hidden",
+        "is_favorite",
         "display_name",
         "description",
         "model_alias",
@@ -88,16 +91,32 @@ EXCLUDED_FROM_PROFILES = frozenset(
 )
 
 
+UNIVERSAL_FIELDS_SET = frozenset(UNIVERSAL_PROFILE_FIELDS)
+PROFILE_FIELDS_SET = UNIVERSAL_FIELDS_SET | frozenset(MODEL_SPECIFIC_PROFILE_FIELDS)
+
+
+def _filter_and_sanitize(
+    data: dict[str, Any], allowed: frozenset[str]
+) -> dict[str, Any]:
+    """Keep allowlisted keys that carry a real value.
+
+    None and "" are "unset" markers (older clients stored them for cleared
+    inputs); under snapshot apply an unset field must be absent, so both are
+    dropped on save and when overlaying stored (possibly legacy) records.
+    """
+    return {
+        k: v for k, v in data.items() if k in allowed and v is not None and v != ""
+    }
+
+
 def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
-    """Return a new dict containing only UNIVERSAL_PROFILE_FIELDS keys."""
-    allowed = set(UNIVERSAL_PROFILE_FIELDS)
-    return {k: v for k, v in data.items() if k in allowed}
+    """Return a new dict of UNIVERSAL_PROFILE_FIELDS keys with real values."""
+    return _filter_and_sanitize(data, UNIVERSAL_FIELDS_SET)
 
 
 def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
-    """Return a new dict containing UNIVERSAL + MODEL_SPECIFIC keys."""
-    allowed = set(UNIVERSAL_PROFILE_FIELDS) | set(MODEL_SPECIFIC_PROFILE_FIELDS)
-    return {k: v for k, v in data.items() if k in allowed}
+    """Return a new dict of UNIVERSAL + MODEL_SPECIFIC keys with real values."""
+    return _filter_and_sanitize(data, PROFILE_FIELDS_SET)
 
 
 @dataclass

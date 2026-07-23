@@ -28,6 +28,14 @@ class QuestionResult:
     question_text: str = ""
     raw_response: str = ""
     category: Optional[str] = None
+    # Populated only for external API evaluations.
+    status: Optional[str] = None
+    finish_reason: Optional[str] = None
+    reasoning_fields_present: list[str] = field(default_factory=list)
+    reasoning_fields_nonempty: list[str] = field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    error_message: str = ""
 
 
 @dataclass
@@ -169,20 +177,61 @@ class BaseBenchmark(ABC):
         """Remove <think>...</think> blocks from model output."""
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
+    def _classify_response(
+        self,
+        response_text: str,
+        item: dict,
+        diagnostics: dict[str, Any],
+    ) -> tuple[str, bool, Optional[str]]:
+        """Score a response while preserving legacy local-evaluation behavior."""
+        external_status = diagnostics.get("status")
+        if external_status is None:
+            predicted = self.extract_answer(response_text, item)
+            return predicted, self.check_answer(predicted, item), None
+
+        if external_status != "ok":
+            return "", False, external_status
+
+        predicted = self.extract_answer(response_text, item)
+        if not predicted:
+            return "", False, "parse_error"
+        is_correct = self.check_answer(predicted, item)
+        return predicted, is_correct, "correct" if is_correct else "wrong"
+
+    @staticmethod
+    def _diagnostic_result_fields(diagnostics: dict[str, Any]) -> dict[str, Any]:
+        """Map internal external diagnostics onto QuestionResult fields."""
+        return {
+            "status": diagnostics.get("status"),
+            "finish_reason": diagnostics.get("finish_reason"),
+            "reasoning_fields_present": diagnostics.get(
+                "reasoning_fields_present", []
+            ),
+            "reasoning_fields_nonempty": diagnostics.get(
+                "reasoning_fields_nonempty", []
+            ),
+            "prompt_tokens": diagnostics.get("prompt_tokens", 0),
+            "completion_tokens": diagnostics.get("completion_tokens", 0),
+            "error_message": diagnostics.get("error_message", ""),
+        }
+
     async def _eval_single(
         self, engine: Any, item: dict, index: int,
         sampling_kwargs: Optional[dict] = None,
         enable_thinking: bool = False,
-    ) -> tuple[int, dict, str, str, str]:
+    ) -> tuple[int, dict, str, str, str, dict[str, Any]]:
         """Evaluate a single item.
 
-        Returns (index, item, response_text, prompt_text, raw_text).
+        Returns (index, item, response_text, prompt_text, raw_text, diagnostics).
         raw_text is the unstripped output for auto-detection of thinking tags.
+        diagnostics is empty for local engines and contains external response
+        metadata for remote evaluations.
         """
         messages = self.format_prompt(item)
         prompt_text = "\n".join(m.get("content", "") for m in messages)
         kwargs = dict(sampling_kwargs or {})
-        # Force benchmark-controlled params (override model settings)
+        # max_tokens is always benchmark-controlled — a model's small configured
+        # limit must not truncate long answers and corrupt scores.
         max_tokens = self.get_max_tokens()
         # Harmony models (gpt_oss) use analysis + final channels;
         # analysis can consume the entire budget before final is emitted
@@ -193,9 +242,13 @@ class BaseBenchmark(ABC):
                 max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
             )
         kwargs["max_tokens"] = max_tokens
-        kwargs["temperature"] = 0.0
-        kwargs["presence_penalty"] = 0.0
-        kwargs["repetition_penalty"] = 1.0
+        # Greedy/neutral defaults keep scores reproducible. setdefault (not
+        # force-set) lets the caller's "model_settings" sampling profile supply
+        # its own temperature/penalties; the default profile passes none, so
+        # these fall through to deterministic values.
+        kwargs.setdefault("temperature", 0.0)
+        kwargs.setdefault("presence_penalty", 0.0)
+        kwargs.setdefault("repetition_penalty", 1.0)
         # Merge enable_thinking into any existing chat_template_kwargs
         ct_kwargs = kwargs.pop("chat_template_kwargs", {}) or {}
         ct_kwargs["enable_thinking"] = enable_thinking
@@ -207,10 +260,38 @@ class BaseBenchmark(ABC):
             )
             raw_text = output.text
             text = self._strip_think_tags(raw_text)
-            return index, item, text, prompt_text, raw_text
+            diagnostics: dict[str, Any] = {}
+            if getattr(engine, "is_external_api", False):
+                diagnostics = {
+                    "status": getattr(output, "external_status", "invalid_response"),
+                    "finish_reason": getattr(output, "finish_reason", None),
+                    "reasoning_fields_present": list(
+                        getattr(output, "reasoning_fields_present", ())
+                    ),
+                    "reasoning_fields_nonempty": list(
+                        getattr(output, "reasoning_fields_nonempty", ())
+                    ),
+                    "prompt_tokens": int(getattr(output, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(
+                        getattr(output, "completion_tokens", 0) or 0
+                    ),
+                    "error_message": getattr(output, "error_message", ""),
+                }
+            return index, item, text, prompt_text, raw_text, diagnostics
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
-            return index, item, "", prompt_text, ""
+            diagnostics = {}
+            if getattr(engine, "is_external_api", False):
+                diagnostics = {
+                    "status": getattr(e, "status", "invalid_response"),
+                    "finish_reason": None,
+                    "reasoning_fields_present": [],
+                    "reasoning_fields_nonempty": [],
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "error_message": str(e),
+                }
+            return index, item, "", prompt_text, "", diagnostics
 
     async def run(
         self,
@@ -261,10 +342,15 @@ class BaseBenchmark(ABC):
             batch_results = await asyncio.gather(*tasks)
 
             # Auto-detection: check first batch for <think> tags
-            if not thinking_used and not auto_switched and batch_start == 0:
+            if (
+                not getattr(engine, "is_external_api", False)
+                and not thinking_used
+                and not auto_switched
+                and batch_start == 0
+            ):
                 auto_switched = True
                 has_think_tags = any(
-                    "<think>" in raw for _, _, _, _, raw in batch_results
+                    "<think>" in raw for _, _, _, _, raw, _ in batch_results
                 )
                 if has_think_tags:
                     logger.warning(
@@ -284,9 +370,19 @@ class BaseBenchmark(ABC):
             batch_elapsed = time.time() - batch_start_time
 
             # Process results in order
-            for idx, item, response_text, prompt_text, _raw in sorted(batch_results, key=lambda x: x[0]):
-                predicted = self.extract_answer(response_text, item)
-                is_correct = self.check_answer(predicted, item)
+            for (
+                idx,
+                item,
+                response_text,
+                prompt_text,
+                _raw,
+                diagnostics,
+            ) in sorted(batch_results, key=lambda x: x[0]):
+                predicted, is_correct, question_status = self._classify_response(
+                    response_text, item, diagnostics
+                )
+                result_diagnostics = self._diagnostic_result_fields(diagnostics)
+                result_diagnostics["status"] = question_status
 
                 if is_correct:
                     correct += 1
@@ -309,6 +405,7 @@ class BaseBenchmark(ABC):
                         question_text=prompt_text,
                         raw_response=response_text,
                         category=cat,
+                        **result_diagnostics,
                     )
                 )
 

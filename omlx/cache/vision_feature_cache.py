@@ -185,6 +185,8 @@ class VisionFeatureSSDCache:
 
     def close(self) -> None:
         """Shut down the background writer and flush pending writes."""
+        with self._memory_lock:
+            self._memory_cache.clear()
         self._writer_shutdown.set()
         # Send sentinel to unblock the writer
         try:

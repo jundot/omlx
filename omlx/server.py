@@ -47,13 +47,13 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -121,12 +121,13 @@ from .api.openai_models import (
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
-    FunctionCall,
     ModelInfo,
     ModelsResponse,
     PromptTokensDetails,
-    ToolCall,
     Usage,
+)
+from .api.parser_tool_calls import (
+    convert_parser_tool_calls as _convert_parser_tool_calls,
 )
 from .api.rerank_models import (
     RerankRequest,
@@ -185,9 +186,11 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
+from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -196,26 +199,6 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
-
-
-def _convert_parser_tool_calls(tool_calls: list[dict] | None) -> list[ToolCall]:
-    converted: list[ToolCall] = []
-    for tool_call in tool_calls or []:
-        if not isinstance(tool_call, dict):
-            continue
-        converted.append(
-            ToolCall(
-                id=tool_call.get("id")
-                or tool_call.get("call_id")
-                or f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tool_call.get("name", ""),
-                    arguments=tool_call.get("arguments", "{}") or "{}",
-                ),
-            )
-        )
-    return converted
 
 
 # =============================================================================
@@ -279,6 +262,10 @@ class ServerState:
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
+    # False while the startup pinned-model preload is still running.
+    # /health returns 503 with status "loading" until it flips to True so
+    # port watchdogs see liveness instead of a closed port (#2184).
+    pinned_preload_complete: bool = True
 
 
 # Global server state instance
@@ -397,10 +384,6 @@ async def lifespan(app: FastAPI):
 
     _reset_boundary_snapshots_for_server()
 
-    # Startup: Preload pinned models
-    if _server_state.engine_pool is not None:
-        await _server_state.engine_pool.preload_pinned_models()
-
     # Start process memory enforcer if configured
     if (
         _server_state.global_settings is not None
@@ -425,7 +408,37 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._process_memory_enforcer = enforcer
         # Engine pool consults the enforcer for the pre-load ceiling.
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        # Best-effort fallback so model-swap eviction keeps working when
+        # the memory guard is disabled (#2290).
+        _server_state.engine_pool._get_admission_ceiling = (
+            enforcer.get_admission_ceiling
+        )
+        # Pre-load eviction targets the soft watermark so idle models are
+        # unloaded before the new weights allocate (#2319).
+        _server_state.engine_pool._get_admission_soft_target = (
+            enforcer.get_admission_soft_target
+        )
         enforcer.start()
+
+    # Startup: Preload pinned models in the background so uvicorn binds the
+    # HTTP port immediately after this lifespan yields. A large pinned
+    # preload (hundreds of GB) otherwise keeps the port closed for minutes,
+    # and anything watchdogging the port hard-kills the process mid-load —
+    # the worst moment for the kernel wired-memory stranding in #2184.
+    # /health answers 503 with status "loading" until the preload finishes.
+    # Runs after the enforcer wiring above so the preload sees the final
+    # memory ceiling.
+    preload_task = None
+    if _server_state.engine_pool is not None:
+        _server_state.pinned_preload_complete = False
+
+        async def _preload_pinned() -> None:
+            try:
+                await _server_state.engine_pool.preload_pinned_models()
+            finally:
+                _server_state.pinned_preload_complete = True
+
+        preload_task = asyncio.create_task(_preload_pinned())
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -466,6 +479,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    if preload_task is not None and not preload_task.done():
+        # SIGTERM arrived while pinned models were still loading. Cancel the
+        # await; engine_pool.shutdown() below unloads whatever finished.
+        preload_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await preload_task
     get_server_metrics().save_alltime()
     if ttl_task is not None:
         ttl_task.cancel()
@@ -763,6 +782,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         request.method,
         request.url.path,
         exc,
+        exc_info=exc,
     )
     if _is_api_route(request):
         content = _openai_error_body("Internal server error", 500)
@@ -954,6 +974,8 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ModelBusyError as e:
@@ -1854,10 +1876,18 @@ def init_server(
 _KEEPALIVE_SENTINEL = object()
 
 _KEEPALIVE_COMMENT = ": keep-alive\n\n"
+# The delta carries "role":"assistant" because this frame is the FIRST event
+# of every stream and some accumulators type the whole stream from the first
+# chunk's role: LangChain.js builds a generic ChatMessageChunk when it is
+# absent, and merging the real chunks into it silently discards all
+# tool_call_chunks (#2074, hits n8n AI Agent workflows). Cloud APIs open every
+# stream with a role chunk, so clients rely on it; the OpenAI SDKs, openai-go,
+# and LangChain all tolerate the duplicate role in later chunks.
 _KEEPALIVE_CHAT_CHUNK = (
     'data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk",'
     '"created":0,"model":"keepalive",'
-    '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+    '"finish_reason":null}]}\n\n'
 )
 _KEEPALIVE_COMPLETION_CHUNK = (
     'data: {"id":"cmpl-keepalive","object":"text_completion","created":0,'
@@ -1906,11 +1936,16 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     keepalive with the stream's own ``response_id`` makes it a true no-op for
     those clients while remaining a parseable data event for clients that can't
     handle SSE comment lines.
+
+    The delta must also carry ``"role":"assistant"`` — see the comment on
+    ``_KEEPALIVE_CHAT_CHUNK`` (accumulators that type the stream from the
+    first chunk's role drop tool_call_chunks without it, #2074).
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
         '"created":0,"model":"keepalive",'
-        '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+        '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+        '"finish_reason":null}]}\n\n'
     )
 
 
@@ -2109,8 +2144,13 @@ async def _with_json_keepalive(
 
 
 @app.get("/health")
-async def health():
-    """Health check endpoint."""
+async def health(response: Response):
+    """Health check endpoint.
+
+    Answers 503 with status "loading" while the startup pinned-model
+    preload is still running: the port is already bound (liveness for
+    watchdogs, #2184) but the server is not ready to serve those models.
+    """
     mcp_info = None
     if _server_state.mcp_manager is not None:
         connected = sum(
@@ -2142,8 +2182,11 @@ async def health():
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
+    loading = not _server_state.pinned_preload_complete
+    if loading:
+        response.status_code = 503
     return {
-        "status": "healthy",
+        "status": "loading" if loading else "healthy",
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,
@@ -2153,6 +2196,7 @@ async def health():
 @app.get("/api/status")
 async def server_status(_: bool = Depends(verify_api_key)):
     """Lightweight status endpoint for external tool polling (statuslines, scripts)."""
+    from .custom_kernels import native_kernel_status
     from .model_discovery import format_size
     from .server_metrics import get_server_metrics
 
@@ -2228,6 +2272,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "model_memory_max_formatted": (
             format_size(model_memory_max) if model_memory_max else "unlimited"
         ),
+        "custom_kernels": native_kernel_status(),
     }
 
 
@@ -2488,17 +2533,55 @@ async def _create_markitdown_chat_completion(
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
+    favorite_ids: set[str] = set()
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
+
+        hide_helpers = bool(
+            _server_state.global_settings is not None
+            and _server_state.global_settings.model.hide_helper_models
+        )
+        # Set of draft-model references (paths / repo ids) pointed at by other
+        # models' speculative settings — used to flag "helper" drafters that
+        # only differ from a chat model by being referenced elsewhere.
+        referenced_drafts: set[str] = set()
+        if hide_helpers and settings_manager:
+            for _ms in settings_manager.get_all_settings().values():
+                for ref in (
+                    _ms.specprefill_draft_model,
+                    _ms.dflash_draft_model,
+                    _ms.vlm_mtp_draft_model,
+                ):
+                    if ref:
+                        referenced_drafts.add(ref)
+
+        excluded_model_ids: set[str] = set()
         for m in status["models"]:
             model_id = m["id"]
             display_id = model_id
+            ms = None
             if settings_manager:
                 ms = settings_manager.get_settings(model_id)
                 if ms.model_alias:
                     display_id = ms.model_alias
+            # Per-model hide: user-selected, always applied.
+            is_hidden = ms is not None and ms.is_hidden
+            # Global helper hide: skip drafters when the toggle is on. A model
+            # is a drafter if intrinsically flagged at discovery (config marker)
+            # or referenced as another model's draft.
+            is_hidden_helper = hide_helpers and (
+                m.get("is_helper")
+                or model_id in referenced_drafts
+                or m.get("model_path") in referenced_drafts
+                or (m.get("source_repo_id") in referenced_drafts)
+            )
+            if is_hidden or is_hidden_helper:
+                excluded_model_ids.add(model_id)
+                continue
+            if ms is not None and ms.is_favorite:
+                favorite_ids.add(display_id)
             models.append(
                 ModelInfo(
                     id=display_id,
@@ -2514,6 +2597,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 profile_model_id = profile["model_id"]
                 if (
                     source_model_id not in physical_ids
+                    or source_model_id in excluded_model_ids
                     or profile_model_id in existing_ids
                 ):
                     continue
@@ -2530,6 +2614,10 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         m.id == MARKITDOWN_MODEL_ID for m in models
     ):
         models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
+
+    # Favorites first; stable sort keeps alphabetical order within groups.
+    if favorite_ids:
+        models.sort(key=lambda m: m.id not in favorite_ids)
 
     return ModelsResponse(data=models)
 
@@ -2611,8 +2699,22 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 
     try:
         await _server_state.engine_pool.get_engine(model_id)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ModelTooLargeError as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelLoadingError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except EnginePoolError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
@@ -2953,6 +3055,10 @@ async def create_completion(
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
 
+            # First prompt's first-token timestamp only: later prompts start
+            # after earlier generations, so their first_token_at would count
+            # prior generation time as prefill.
+            first_token_at = None
             for i, prompt in enumerate(prompts):
                 output = await engine.generate(
                     prompt=prompt,
@@ -2970,6 +3076,8 @@ async def create_completion(
                     seed=request.seed,
                     **gen_kwargs,
                 )
+                if i == 0:
+                    first_token_at = getattr(output, "first_token_at", None)
 
                 choices.append(
                     CompletionChoice(
@@ -2988,11 +3096,18 @@ async def create_completion(
                 f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 cached_tokens=total_cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolve_model_id(request.model) or request.model,
             )
 
@@ -3088,8 +3203,6 @@ async def create_chat_completion(
 
         # Get per-model settings
         max_tool_result_tokens = None
-        merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
         reasoning_parser = None
         settings_guided_grammar = None
         ms = get_model_settings_for_request(request.model)
@@ -3097,20 +3210,10 @@ async def create_chat_completion(
             max_tool_result_tokens = ms.max_tool_result_tokens
             reasoning_parser = ms.reasoning_parser
             settings_guided_grammar = _settings_guided_grammar(ms)
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
-        # Per-request kwargs override model settings (except forced keys)
-        if request.chat_template_kwargs:
-            for k, v in request.chat_template_kwargs.items():
-                if k not in forced_keys:
-                    merged_ct_kwargs[k] = v
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
 
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -3454,10 +3557,18 @@ async def create_chat_completion(
                 f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
                 f"request_max_tokens={request.max_tokens}"
             )
+            first_token_at = getattr(output, "first_token_at", None)
+            ttft = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                generation_duration=elapsed,
+                prefill_duration=ttft,
+                generation_duration=gen_duration,
             )
 
             get_server_metrics().record_request_complete(
@@ -4146,6 +4257,71 @@ async def stream_completion(
     yield "data: [DONE]\n\n"
 
 
+def _copy_chat_template_messages(messages: list) -> list:
+    return [
+        dict(message) if isinstance(message, dict) else message for message in messages
+    ]
+
+
+def _render_chat_prompt_for_thinking_detection(
+    engine: BaseEngine,
+    messages: list,
+    kwargs: dict,
+) -> tuple[str, list[int] | None]:
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return "", None
+
+    template_messages = _copy_chat_template_messages(messages)
+    tools = kwargs.get("tools")
+    chat_template_kwargs = kwargs.get("chat_template_kwargs")
+    is_partial = kwargs.get("is_partial")
+    engine_renderer = getattr(engine, "_apply_chat_template", None)
+
+    if is_partial is not None:
+        for message in template_messages:
+            if isinstance(message, dict):
+                message.pop("partial", None)
+
+    if callable(engine_renderer):
+        prompt = engine_renderer(
+            template_messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+    else:
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": not bool(is_partial),
+        }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+
+        try:
+            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    template_kwargs.pop(key, None)
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
+
+    if isinstance(prompt, str):
+        return prompt, None
+    if isinstance(prompt, list):
+        try:
+            return "", [int(token_id) for token_id in prompt]
+        except (TypeError, ValueError):
+            return str(prompt), None
+    return str(prompt), None
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4166,7 +4342,19 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        logger.debug("Could not detect chat stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4556,8 +4744,22 @@ async def stream_anthropic_messages(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
 
-    # Track content blocks with thinking separation
-    thinking_parser = ThinkingParser()
+    # Track content blocks with thinking separation. Some templates open the
+    # thinking block in the prompt itself, so the generated text starts with
+    # reasoning body and only later emits </think>.
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -4914,25 +5116,14 @@ async def create_anthropic_message(
 
         # Get per-model settings
         max_tool_result_tokens = None
-        merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
         ms = get_model_settings_for_request(request.model)
         if ms:
             max_tool_result_tokens = ms.max_tool_result_tokens
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
-        # Per-request kwargs override model settings (except forced keys)
-        if request.chat_template_kwargs:
-            for k, v in request.chat_template_kwargs.items():
-                if k not in forced_keys:
-                    merged_ct_kwargs[k] = v
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
+        forced_keys = forced_ct_keys(ms)
 
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
@@ -4942,6 +5133,8 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
+
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -4954,7 +5147,6 @@ async def create_anthropic_message(
         is_dflash_vlm = not is_vlm and getattr(
             engine, "supports_multimodal_fallback", False
         )
-        _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -5186,11 +5378,19 @@ async def create_anthropic_message(
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 cached_tokens=output.cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolved_model,
             )
 
@@ -5445,19 +5645,16 @@ async def create_response(
             )
 
         # Get per-model settings
-        merged_ct_kwargs = {}
         reasoning_parser = None
         ms = get_model_settings_for_request(request.model)
         if ms:
             reasoning_parser = ms.reasoning_parser
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
+
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
         # are NOT called here because convert_responses_input_to_messages() already
@@ -5600,7 +5797,6 @@ async def create_response(
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
         # receive an unknown kwarg.
-        _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
         if (
             native_reasoning
@@ -5673,11 +5869,19 @@ async def create_response(
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 cached_tokens=output.cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolved_model,
             )
 
@@ -5687,8 +5891,11 @@ async def create_response(
 
             # Parse tool calls
             if output.tool_calls:
-                tool_calls = output.tool_calls
+                tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
+                cleaned_thinking = sanitize_tool_call_markup(
+                    thinking_content, engine.tokenizer
+                )
             else:
                 extraction = extract_tool_calls_with_thinking(
                     thinking_content,
@@ -5698,6 +5905,7 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
             if tool_calls and "gemma" in (resolved_model or "").lower():
@@ -5723,8 +5931,8 @@ async def create_response(
 
             # Build output items
             output_items: list[OutputItem] = []
-            reasoning_text = (thinking_content or "").strip()
-            if native_reasoning and reasoning_text:
+            reasoning_text = (cleaned_thinking or "").strip()
+            if reasoning_text:
                 output_items.append(build_reasoning_output_item(reasoning_text))
             output_items.append(
                 build_message_output_item(cleaned_text.strip() if cleaned_text else "")
@@ -5831,6 +6039,7 @@ async def stream_responses_api(
     message_opened = False
     next_output_index = 0
     reasoning_output_index: Optional[int] = None  # captured when reasoning opens
+    msg_output_index: Optional[int] = None  # captured when message opens
 
     # Build initial response object (in_progress, empty output)
     initial_response = ResponseObject(
@@ -5871,11 +6080,12 @@ async def stream_responses_api(
 
     # --- helper closures for lazy item emission ----------------------
     def _open_reasoning():
-        nonlocal seq, reasoning_opened, reasoning_output_index
+        nonlocal seq, reasoning_opened, reasoning_output_index, next_output_index
         if reasoning_opened:
             return []
         reasoning_opened = True
         reasoning_output_index = next_output_index
+        next_output_index += 1
         events = []
         seq += 1
         events.append(
@@ -5911,11 +6121,11 @@ async def stream_responses_api(
         return events
 
     def _close_reasoning():
-        nonlocal seq, reasoning_closed, next_output_index
+        nonlocal seq, reasoning_closed
         if reasoning_closed or not reasoning_opened:
             return []
         reasoning_closed = True
-        next_output_index += 1
+        reasoning_text = accumulated_reasoning
         events = []
         seq += 1
         events.append(
@@ -5926,7 +6136,7 @@ async def stream_responses_api(
                     "item_id": reasoning_id,
                     "output_index": reasoning_output_index,
                     "summary_index": 0,
-                    "text": accumulated_reasoning,
+                    "text": reasoning_text,
                     "sequence_number": seq,
                 },
             )
@@ -5940,7 +6150,7 @@ async def stream_responses_api(
                     "item_id": reasoning_id,
                     "output_index": reasoning_output_index,
                     "summary_index": 0,
-                    "part": {"type": "summary_text", "text": accumulated_reasoning},
+                    "part": {"type": "summary_text", "text": reasoning_text},
                     "sequence_number": seq,
                 },
             )
@@ -5956,9 +6166,7 @@ async def stream_responses_api(
                         "type": "reasoning",
                         "id": reasoning_id,
                         "status": "completed",
-                        "summary": [
-                            {"type": "summary_text", "text": accumulated_reasoning}
-                        ],
+                        "summary": [{"type": "summary_text", "text": reasoning_text}],
                     },
                     "sequence_number": seq,
                 },
@@ -5967,11 +6175,12 @@ async def stream_responses_api(
         return events
 
     def _open_message():
-        nonlocal seq, message_opened, next_output_index
+        nonlocal seq, message_opened, next_output_index, msg_output_index
         if message_opened:
             return []
         message_opened = True
         msg_output_index = next_output_index
+        next_output_index += 1
         events = []
         seq += 1
         events.append(
@@ -6007,24 +6216,46 @@ async def stream_responses_api(
         )
         return events
 
+    def _emit_reasoning_delta(delta: str):
+        nonlocal seq, accumulated_reasoning
+        if not delta:
+            return []
+        accumulated_reasoning += delta
+        events = []
+        events.extend(_open_reasoning())
+        seq += 1
+        events.append(
+            format_sse_event(
+                "response.reasoning_summary_text.delta",
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_output_index,
+                    "summary_index": 0,
+                    "delta": delta,
+                    "sequence_number": seq,
+                },
+            )
+        )
+        return events
+
     # -----------------------------------------------------------------
 
-    # If not native reasoning, open message immediately (legacy behavior)
-    if not native_reasoning:
-        for ev in _open_message():
-            yield ev
+    # Open message/reasoning items lazily so non-native <think> blocks can still
+    # become a leading Responses reasoning item.
 
     # Stream tokens
     tool_filter = None
+    thinking_filter = None
     stream_content = True
     if has_tools:
-        _f = ToolCallStreamFilter(engine.tokenizer)
-        if _f.active:
-            tool_filter = _f
+        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        if _content_filter.active:
+            tool_filter = _content_filter
+            thinking_filter = _thinking_filter
         else:
             stream_content = False
-
-    msg_output_index = None  # will be set when message opens
 
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -6037,31 +6268,18 @@ async def stream_responses_api(
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
-                if thinking_delta and native_reasoning:
-                    accumulated_reasoning += thinking_delta
-                    for ev in _open_reasoning():
+                if thinking_delta:
+                    if thinking_filter:
+                        thinking_delta = thinking_filter.feed(thinking_delta)
+                    for ev in _emit_reasoning_delta(thinking_delta):
                         yield ev
-                    seq += 1
-                    yield format_sse_event(
-                        "response.reasoning_summary_text.delta",
-                        {
-                            "type": "response.reasoning_summary_text.delta",
-                            "item_id": reasoning_id,
-                            "output_index": reasoning_output_index,
-                            "summary_index": 0,
-                            "delta": thinking_delta,
-                            "sequence_number": seq,
-                        },
-                    )
 
                 if content_delta:
-                    if native_reasoning and reasoning_opened and not reasoning_closed:
+                    if reasoning_opened and not reasoning_closed:
                         for ev in _close_reasoning():
                             yield ev
                     for ev in _open_message():
                         yield ev
-                    if msg_output_index is None:
-                        msg_output_index = next_output_index
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
@@ -6090,23 +6308,24 @@ async def stream_responses_api(
         )
         return
 
-    # Close reasoning if still open
-    if native_reasoning and reasoning_opened and not reasoning_closed:
-        for ev in _close_reasoning():
-            yield ev
-
-    # Ensure message item is opened (even if no content was streamed)
-    for ev in _open_message():
-        yield ev
-    if msg_output_index is None:
-        msg_output_index = next_output_index
-
     # Flush remaining content from parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
-        if thinking_delta and native_reasoning:
-            accumulated_reasoning += thinking_delta
+        if thinking_delta:
+            if thinking_filter:
+                thinking_delta = thinking_filter.feed(thinking_delta)
+            for ev in _emit_reasoning_delta(thinking_delta):
+                yield ev
+        if thinking_filter:
+            remaining_thinking = thinking_filter.finish()
+            for ev in _emit_reasoning_delta(remaining_thinking):
+                yield ev
         if content_delta:
+            if reasoning_opened and not reasoning_closed:
+                for ev in _close_reasoning():
+                    yield ev
+            for ev in _open_message():
+                yield ev
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
@@ -6125,6 +6344,11 @@ async def stream_responses_api(
         if tool_filter:
             remaining = tool_filter.finish()
             if remaining:
+                if reasoning_opened and not reasoning_closed:
+                    for ev in _close_reasoning():
+                        yield ev
+                for ev in _open_message():
+                    yield ev
                 seq += 1
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -6142,7 +6366,7 @@ async def stream_responses_api(
     tool_calls = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
-        tool_calls = last_output.tool_calls
+        tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(accumulated_text)
@@ -6154,7 +6378,16 @@ async def stream_responses_api(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        if not stream_content:
+            cleaned_thinking = (extraction.cleaned_thinking or "").strip()
+            for ev in _emit_reasoning_delta(cleaned_thinking):
+                yield ev
+            if reasoning_opened and not reasoning_closed:
+                for ev in _close_reasoning():
+                    yield ev
         if not stream_content and cleaned_text:
+            for ev in _open_message():
+                yield ev
             seq += 1
             yield format_sse_event(
                 "response.output_text.delta",
@@ -6193,6 +6426,14 @@ async def stream_responses_api(
             final_text = json.dumps(parsed_json)
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
+
+    if reasoning_opened and not reasoning_closed:
+        for ev in _close_reasoning():
+            yield ev
+
+    # Ensure message item is opened (even if no content was streamed).
+    for ev in _open_message():
+        yield ev
 
     # response.output_text.done
     seq += 1
@@ -6244,13 +6485,14 @@ async def stream_responses_api(
 
     # Build output items for final response
     output_items = []
-    if native_reasoning and accumulated_reasoning:
+    reasoning_text = accumulated_reasoning
+    if reasoning_text:
         output_items.append(
             {
                 "type": "reasoning",
                 "id": reasoning_id,
                 "status": "completed",
-                "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
+                "summary": [{"type": "summary_text", "text": reasoning_text}],
             }
         )
     output_items.append(
@@ -6265,7 +6507,7 @@ async def stream_responses_api(
 
     # Emit function call items if present
     if tool_calls:
-        output_index = next_output_index + 1
+        output_index = next_output_index
         for tc in tool_calls:
             if hasattr(tc, "function"):
                 call_id = tc.id
@@ -6350,6 +6592,7 @@ async def stream_responses_api(
 
             output_items.append(completed_fc)
             output_index += 1
+            next_output_index = output_index
 
     # Record metrics
     usage_data = None
@@ -6370,9 +6613,7 @@ async def stream_responses_api(
             model_id=resolved_model or request.model,
         )
         reasoning_token_count = (
-            len(engine.tokenizer.encode(accumulated_reasoning))
-            if accumulated_reasoning
-            else 0
+            len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
@@ -6491,13 +6732,11 @@ Examples:
     # Multi-model serving
     python -m omlx.server --model-dir /path/to/models
 
-    # With pinned models
-    python -m omlx.server --model-dir /path/to/models --pin llama-3b,qwen-7b
-
     # With MCP tools
     python -m omlx.server --model-dir /path/to/models --mcp-config mcp.json
 
-Note: Use the omlx CLI for full feature support.
+Note: Use the omlx CLI for full feature support. Pinned models, default
+model and sampling defaults are managed via the admin page.
         """,
     )
     parser.add_argument(
@@ -6505,18 +6744,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         required=True,
         help="Directory containing model subdirectories",
-    )
-    parser.add_argument(
-        "--pin",
-        type=str,
-        default=None,
-        help="Comma-separated model names to keep always loaded",
-    )
-    parser.add_argument(
-        "--default-model",
-        type=str,
-        default=None,
-        help="Default model when not specified in request",
     )
     parser.add_argument(
         "--host",
@@ -6536,12 +6763,6 @@ Note: Use the omlx CLI for full feature support.
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
     )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Default max tokens for generation",
-    )
 
     args = parser.parse_args()
 
@@ -6549,14 +6770,33 @@ Note: Use the omlx CLI for full feature support.
     if args.mcp_config:
         os.environ["OMLX_MCP_CONFIG"] = args.mcp_config
 
-    # Parse pinned models
-    pinned_models = args.pin.split(",") if args.pin else []
+    # Load settings and hand them to init_server the way the omlx CLI
+    # does. The admin page resolves settings through
+    # _server_state.global_settings, so booting without them leaves
+    # _get_global_settings() returning None and the initial API-key
+    # setup form crashing with a 500 (#2282). Passing api_key keeps the
+    # two entry points enforcing the same auth. Scheduler/cache wiring
+    # stays CLI-only on purpose; this entry point remains minimal.
+    from .settings import init_settings
+
+    settings = init_settings()
+    settings.ensure_directories()
+
+    # Match the cli.py launcher: keep freed GPU buffers in the pool so
+    # allocator::free() never releases a buffer the GPU may still be
+    # using (kernel panics on M4 otherwise; see cli.py and issue #300).
+    # EnginePool eviction also assumes this cache limit is in place.
+    import mlx.core as mx
+
+    total_mem = mx.device_info().get("memory_size", 0)
+    if total_mem > 0:
+        mx.set_cache_limit(total_mem)
+
     # Initialize server
     init_server(
-        model_dir=args.model_dir,
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
+        model_dirs=args.model_dir,
+        api_key=settings.auth.api_key,
+        global_settings=settings,
     )
 
     # Start server
@@ -6566,4 +6806,15 @@ Note: Use the omlx CLI for full feature support.
 
 
 if __name__ == "__main__":
+    # ``python -m omlx.server`` executes this file as the ``__main__``
+    # module, but the admin routes import it back as ``omlx.server`` at
+    # request time. Without this alias that import executes the module a
+    # SECOND time, and the fresh copy's module-level set_admin_getters()
+    # call repoints the admin state getters at a server state that
+    # init_server() never touched, so the settings main() wires in are
+    # invisible to /admin (#2282). Alias the canonical name to this
+    # instance so every later import resolves to the running server.
+    import sys
+
+    sys.modules.setdefault("omlx.server", sys.modules[__name__])
     main()

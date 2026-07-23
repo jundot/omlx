@@ -18,6 +18,13 @@ import pytest
 from omlx._torch_stub import install as _install_torch_stub
 _install_torch_stub()
 
+# Run tests under the same M5 sorted gather_qmm reroute the server
+# installs at model load (issue #2267). Without it, kernel-sensitive
+# tests (e.g. the SwitchGLU fusion bit-exactness test, whose inter=32
+# down_proj runs at K=32) fail on M5 hardware. No-op elsewhere.
+from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
+apply_m5_gather_qmm_workaround()
+
 from omlx.request import Request, SamplingParams
 
 

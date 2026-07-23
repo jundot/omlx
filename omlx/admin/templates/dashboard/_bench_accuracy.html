@@ -26,7 +26,7 @@
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.model') }}</label>
                                 <select x-model="accModelId"
                                         @change="const sel = models.find(m => m.id === accModelId); if (sel) { const s = sel.settings || {}; accEnableThinking = s.enable_thinking != null ? s.enable_thinking : (sel.thinking_default || false); }"
-                                        :disabled="false"
+                                        :disabled="accExternalEnabled"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('acc_bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
@@ -40,8 +40,9 @@
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.thinking') }}</label>
                                 <div class="flex items-center gap-3">
                                     <button type="button"
-                                            @click="accEnableThinking = !accEnableThinking"
-                                            :class="accEnableThinking ? 'bg-black' : 'bg-neutral-200'"
+                                            @click="if (!accExternalEnabled) accEnableThinking = !accEnableThinking"
+                                            :disabled="accExternalEnabled"
+                                            :class="[accEnableThinking ? 'bg-black' : 'bg-neutral-200', accExternalEnabled ? 'opacity-40 cursor-not-allowed' : '']"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="accEnableThinking ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -65,6 +66,85 @@
                                     </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.batch_size_hint') }}</p>
+                            </div>
+
+                            <!-- Advanced Options -->
+                            <div class="pt-2 border-t border-neutral-100">
+                                <button type="button"
+                                        @click="accAdvancedOptionsOpen = !accAdvancedOptionsOpen"
+                                        :aria-expanded="accAdvancedOptionsOpen.toString()"
+                                        class="flex items-center gap-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 transition-colors disabled:opacity-50">
+                                    <i data-lucide="sliders-horizontal" class="w-4 h-4"></i>
+                                    <span>{{ t('acc_bench.config.advanced_options') }}</span>
+                                    <i data-lucide="chevron-down"
+                                       class="w-4 h-4 text-neutral-400 transition-transform"
+                                       :class="accAdvancedOptionsOpen && 'rotate-180'"></i>
+                                </button>
+                                <div x-show="accAdvancedOptionsOpen" x-collapse x-cloak class="mt-3 space-y-5">
+                                    <!-- Sampling -->
+                                    <div>
+                                        <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.sampling') }}</label>
+                                        <div class="flex items-center gap-3">
+                                            <button type="button"
+                                                    @click="accSamplingProfile = accSamplingProfile === 'model_settings' ? 'deterministic' : 'model_settings'"
+                                                    :class="accSamplingProfile === 'model_settings' ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="accSamplingProfile === 'model_settings' ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                            <span class="text-sm text-neutral-600" x-text="accSamplingProfile === 'model_settings' ? '{{ t('acc_bench.config.sampling_model') }}' : '{{ t('acc_bench.config.sampling_deterministic') }}'"></span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.sampling_hint') }}</p>
+                                    </div>
+                                    <!-- External OpenAI-compatible endpoint -->
+                                    <div>
+                                        <label class="inline-flex items-start gap-2 cursor-pointer">
+                                            <input type="checkbox"
+                                                   x-model="accExternalEnabled"
+                                                   class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                            <span>
+                                                <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.external') }}</span>
+                                                <span class="block text-xs text-neutral-400 mt-1">{{ t('acc_bench.config.external_hint') }}</span>
+                                            </span>
+                                        </label>
+                                        <div x-show="accExternalEnabled" x-collapse x-cloak class="mt-3 space-y-3 pl-6">
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_base_url') }}</label>
+                                                <input type="url"
+                                                       x-model="externalBaseUrl"
+                                                       @change="saveExternalEndpoint()"
+                                                       placeholder="https://api.openai.com/v1"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_api_key') }}</label>
+                                                <input type="password"
+                                                       autocomplete="off"
+                                                       x-model="externalApiKey"
+                                                       @change="saveExternalEndpoint()"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_model') }}</label>
+                                                <input type="text"
+                                                       x-model="externalModel"
+                                                       @change="saveExternalEndpoint()"
+                                                       placeholder="gpt-4o-mini"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('acc_bench.config.external_extra_body') }}</label>
+                                                <textarea x-model="accExternalExtraBody"
+                                                          @input="accError = ''"
+                                                          rows="4"
+                                                          spellcheck="false"
+                                                          placeholder='{"thinking":{"type":"disabled"}}'
+                                                          class="w-full max-w-md px-3 py-2 text-sm font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50 resize-y"></textarea>
+                                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.external_extra_body_hint') }}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
 
                             <!-- Benchmark Selection — Card Grid -->
@@ -132,7 +212,7 @@
                             <!-- Add & Run Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button @click="addToAccQueue()"
-                                        :disabled="!accModelId || !Object.values(accBenchmarks).some(v => v)"
+                                        :disabled="(accExternalEnabled ? !externalConfigValid() : !accModelId) || !Object.values(accBenchmarks).some(v => v)"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
                                     {{ t('acc_bench.config.add_run') }}
@@ -238,14 +318,66 @@
                                                 <template x-if="r.thinking_used">
                                                     <span class="text-xs font-medium text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.thinking_badge') }}</span>
                                                 </template>
+                                                <template x-if="r.external">
+                                                    <span class="text-xs font-medium text-sky-600 bg-sky-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.external_badge') }}</span>
+                                                </template>
                                             </div>
                                             <span class="text-xs text-neutral-400" x-text="r.correct + ' / ' + r.total + ' correct · ' + r.time_s + 's'"></span>
                                         </div>
                                     </div>
                                     <div class="text-right">
+                                        <div x-show="r.external" class="text-[10px] uppercase tracking-wide text-neutral-400 mb-0.5">{{ t('acc_bench.results.total_accuracy') }}</div>
                                         <span class="text-2xl font-bold tabular-nums"
                                               :class="r.accuracy >= 0.7 ? 'text-green-600' : r.accuracy >= 0.4 ? 'text-amber-600' : 'text-red-600'"
                                               x-text="(r.accuracy * 100).toFixed(1) + '%'"></span>
+                                    </div>
+                                </div>
+
+                                <div x-show="r.external && r.reliability_warning" x-cloak
+                                     class="mt-4 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800">
+                                    <i data-lucide="triangle-alert" class="w-4 h-4 flex-shrink-0 mt-0.5"></i>
+                                    <span class="text-xs font-medium">{{ t('acc_bench.results.reliability_warning') }}</span>
+                                </div>
+                                <div x-show="r.external" x-cloak class="mt-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_responses') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.valid_response_count + ' / ' + r.total"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_response_rate') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="(r.valid_response_rate * 100).toFixed(1) + '%'"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_answer_accuracy') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="(r.valid_answer_accuracy * 100).toFixed(1) + '%'"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.empty_content') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.empty_content_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.truncated') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.truncated_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.timeout') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.timeout_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.http_errors') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.http_error_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.invalid_responses') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.invalid_response_count"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.parse_errors') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.parse_error_count"></div>
+                                    </div>
+                                    <div x-show="r.connection_error_count > 0" class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.connection_errors') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.connection_error_count"></div>
                                     </div>
                                 </div>
 

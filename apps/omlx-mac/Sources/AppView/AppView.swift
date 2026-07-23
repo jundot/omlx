@@ -34,11 +34,13 @@ struct AppView: View {
         // the shell tracks System Settings instead of a fixed canvas color.
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
-        .onChange(of: services.requestedSection) { _, requested in
+        .onChange(of: services.requestedSection, initial: true) { _, requested in
             // A screen asked us to navigate elsewhere (e.g. "Edit on
             // Server →" from the per-model Profiles tab). Clear the
             // request after applying so the same section can be requested
-            // twice in a row.
+            // twice in a row. `initial: true` also applies a request set
+            // before the window first mounted (e.g. "Model Settings…" from
+            // the menubar while AppView had never been opened).
             if let requested {
                 if requested != .models { services.modelDetailID = nil }
                 selection = requested
@@ -96,6 +98,7 @@ struct AppView: View {
     private func screen(for section: AppSection) -> some View {
         switch section {
         case .server:       ServerScreen()
+        case .appearance:   AppearanceScreen()
         case .network:      NetworkScreen()
         case .performance:  PerformanceScreen()
         case .status:       StatusScreen()
@@ -439,6 +442,7 @@ private struct SettingsSidebar: View {
         List(selection: $selection) {
             Section {
                 SidebarRow(section: .status)
+                SidebarRow(section: .appearance)
                 SidebarRow(section: .server)
                 SidebarRow(section: .network)
                 SidebarRow(section: .performance)

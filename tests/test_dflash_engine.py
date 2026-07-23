@@ -207,6 +207,33 @@ class TestDFlashEngineInit:
 
         assert engine.scheduler is scheduler
 
+    def test_scheduler_config_snapshot_at_construction(self):
+        """The engine pool mutates the shared scheduler config on every model
+        load, so DFlashEngine must snapshot it at construction time for the
+        lazily started fallback engine (PR #2178 follow-up)."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        from omlx.scheduler import SchedulerConfig
+
+        shared_config = SchedulerConfig(
+            model_name="model-a", model_path="/models/model-a"
+        )
+        engine = DFlashEngine(
+            model_name="/models/model-a",
+            draft_model_path="test-draft",
+            scheduler_config=shared_config,
+        )
+
+        # Simulate the pool loading another model afterwards
+        shared_config.model_name = "model-b"
+        shared_config.model_path = "/models/model-b"
+
+        assert engine._scheduler_config.model_name == "model-a"
+        assert engine._scheduler_config.model_path == "/models/model-a"
+
     def test_quant_disabled_keeps_none(self):
         try:
             from omlx.engine.dflash import DFlashEngine

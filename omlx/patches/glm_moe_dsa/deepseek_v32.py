@@ -32,21 +32,68 @@ def _use_load_fused_wk_weights_proj(args) -> bool:
     if not isinstance(quantization, dict):
         return False
 
+    def resolved_spec(name):
+        spec = quantization.get(name, quantization)
+        return spec if isinstance(spec, dict) else {}
+
     def is_indexer_q8(name):
-        spec = quantization.get(name)
+        spec = resolved_spec(name)
         return (
-            isinstance(spec, dict)
-            and spec.get("bits") == 8
+            spec.get("bits") == 8
             and spec.get("group_size") == 64
             and spec.get("mode", "affine") == "affine"
         )
 
-    return any(
-        key.endswith(".self_attn.indexer.wk")
-        and is_indexer_q8(key)
-        and is_indexer_q8(key[:-2] + "weights_proj")
-        for key in quantization
-    )
+    prefixes = []
+    indexer_types = getattr(args, "indexer_types", None) or []
+    num_hidden_layers = int(getattr(args, "num_hidden_layers", 0) or 0)
+    for layer_idx, indexer_type in enumerate(indexer_types[:num_hidden_layers]):
+        if indexer_type == "full":
+            prefixes.append(f"model.layers.{layer_idx}.self_attn.indexer")
+
+    # Preserved MTP checkpoints use runtime mtp.* paths. Include explicit MTP
+    # specs when present, but do not treat their absence as the global default:
+    # third-party dynamic checkpoints can omit nextn overrides and recover them
+    # from tensor shapes later in sanitize (issue #2326).
+    for key in quantization:
+        if key.startswith("mtp.") and ".block.self_attn.indexer." in key:
+            prefix, projection = key.rsplit(".", 1)
+            if projection in ("wq_b", "wk", "weights_proj"):
+                prefixes.append(prefix)
+
+    prefixes = sorted(set(prefixes))
+    if not prefixes:
+        return False
+
+    paths = [
+        f"{prefix}.{projection}"
+        for prefix in prefixes
+        for projection in ("wq_b", "wk", "weights_proj")
+    ]
+    q8_paths = [path for path in paths if is_indexer_q8(path)]
+    if not q8_paths:
+        return False
+    if len(q8_paths) != len(paths):
+        offenders = [
+            (
+                path,
+                resolved_spec(path).get("bits"),
+                resolved_spec(path).get("group_size"),
+                resolved_spec(path).get("mode", "affine"),
+            )
+            for path in paths
+            if not is_indexer_q8(path)
+        ]
+        detail = ", ".join(
+            f"{path}={bits}-bit/gs{group_size}/{mode}"
+            for path, bits, group_size, mode in offenders[:4]
+        )
+        raise ValueError(
+            "Invalid GLM DSA indexer quantization: Q8 fusion requires every "
+            "full-indexer projection to use 8-bit affine quantization with "
+            f"group_size=64; found {detail}"
+        )
+    return True
 
 
 def _dequant_mla_proj_mode(args) -> str:
@@ -103,6 +150,17 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    indexer_rope_interleave: bool = False
+
+
+# Decode-shaped multi-row forwards (MTP draft verify, L = depth clamp 8 + 1
+# rows at most) must not enter the prefill-shaped fused scores kernel: its
+# grid is sized for many query rows, runs ~5x slower than the plain matmul +
+# fused reduce at tiny L, and the gap grows with context length (~3 ms per
+# indexer layer at 128k). Below this floor the s > 1 scoring falls through to
+# the q @ k.T + fused_index_score_reduce path, whose causal fill uses the
+# same decode offsets. 16 mirrors the sdpa256/fa256 prefill-routing floors.
+_FUSED_SCORES_MIN_S = 16
 
 
 class Indexer(nn.Module):
@@ -141,7 +199,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=True,
+            traditional=args.indexer_rope_interleave,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -262,7 +320,7 @@ class Indexer(nn.Module):
         causal_valid_prefix_topk = fuse_causal_mask
 
         scores = None
-        if s > 1 and (mask is None or fuse_causal_mask):
+        if s >= _FUSED_SCORES_MIN_S and (mask is None or fuse_causal_mask):
             scores_feed_exact_topk = causal_valid_prefix_topk and use_fast_topk
             candidate_prefix_rows = 0
             if use_fast_topk and scores_feed_exact_topk:
@@ -760,63 +818,6 @@ class Model(nn.Module):
     ):
         out = self.model(inputs, cache)
         return self.lm_head(out)
-
-    def update_quantization_config(self, config):
-        if _use_glm_shared_fused_gate_up(self.args):
-            for key in ("quantization", "quantization_config"):
-                quantization = config.get(key)
-                if not isinstance(quantization, dict):
-                    continue
-                for l in range(self.args.num_hidden_layers):
-                    prefix = f"model.layers.{l}.mlp.shared_experts"
-                    gate_path = f"{prefix}.gate_proj"
-                    up_path = f"{prefix}.up_proj"
-                    fused_path = f"{prefix}.gate_up_proj"
-                    gate_spec = quantization.get(gate_path)
-                    up_spec = quantization.get(up_path)
-                    if gate_spec is not None and gate_spec == up_spec:
-                        quantization[fused_path] = dict(gate_spec)
-                        quantization.pop(gate_path, None)
-                        quantization.pop(up_path, None)
-
-        dequant_mla_proj = _dequant_mla_proj_mode(self.args)
-        dequant_embed_q = dequant_mla_proj in {
-            "1",
-            "true",
-            "all",
-            "both",
-            "embed",
-            "embed_q",
-        }
-        dequant_unembed_out = dequant_mla_proj in {
-            "1",
-            "true",
-            "all",
-            "both",
-            "unembed",
-            "unembed_out",
-            "out",
-        }
-        if not (dequant_embed_q or dequant_unembed_out):
-            return
-        skip_quantization = config.setdefault("_skip_quantization_paths", set())
-        if not isinstance(skip_quantization, set):
-            skip_quantization = set(skip_quantization)
-            config["_skip_quantization_paths"] = skip_quantization
-        for key in ("quantization", "quantization_config"):
-            quantization = config.get(key)
-            if not isinstance(quantization, dict):
-                continue
-            for l in range(self.args.num_hidden_layers):
-                prefix = f"model.layers.{l}.self_attn"
-                if dequant_embed_q:
-                    path = f"{prefix}.embed_q"
-                    skip_quantization.add(path)
-                    quantization.pop(path, None)
-                if dequant_unembed_out:
-                    path = f"{prefix}.unembed_out"
-                    skip_quantization.add(path)
-                    quantization.pop(path, None)
 
     def sanitize(self, weights):
         # Remove multi-token prediction layers

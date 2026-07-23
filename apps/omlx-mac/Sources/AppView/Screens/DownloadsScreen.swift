@@ -737,7 +737,7 @@ private struct CompletedTasksSection: View {
                                   defaultValue: "Recent Tasks",
                                   comment: "Section heading for recently completed or failed downloads"),
                           subtitle: String(localized: "downloads.recent.subtitle",
-                                           defaultValue: "\(tasks.count) recent",
+                                           defaultValue: "Recent: \(tasks.count)",
                                            comment: "Subtitle for Recent Tasks; placeholder is the count of recent terminal tasks"))
             ListGroup {
                 ForEach(Array(tasks.enumerated()), id: \.element.id) { idx, task in

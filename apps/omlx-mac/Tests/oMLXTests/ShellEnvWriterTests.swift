@@ -148,6 +148,18 @@ final class ShellEnvWriterTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "/tmp/custom-omlx")
     }
 
+    func testEnsureCLIShimSkipsPromptWhenShellExportInstalled() throws {
+        try ShellEnvWriter.ensureShellPathExport()
+
+        let result = try ShellEnvWriter.ensureCLIShim(appBundleURL: try makeFakeAppURL())
+
+        let shim = tempHome
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("omlx")
+        XCTAssertEqual(result, .publicCommandReady(path: shim.path))
+    }
+
     func testDismissForeverPreferenceRoundTrips() throws {
         XCTAssertFalse(ShellEnvWriter.shouldSuppressCLIPathPrompt())
 

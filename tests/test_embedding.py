@@ -31,8 +31,15 @@ from omlx.api.embedding_utils import (
     truncate_embedding,
 )
 from omlx.engine.embedding import EmbeddingEngine
+from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
 from omlx.models.embedding import EmbeddingOutput
+
+IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 
 class TestEmbeddingModels:
@@ -83,7 +90,7 @@ class TestEmbeddingModels:
         request = EmbeddingRequest(
             items=[
                 EmbeddingInputItem(text="hello"),
-                EmbeddingInputItem(image="https://example.com/image.jpg"),
+                EmbeddingInputItem(image=IMAGE_DATA_URI),
             ],
             model="test-model",
         )
@@ -238,19 +245,19 @@ class TestEmbeddingUtils:
         result = normalize_embedding_items(
             [
                 EmbeddingInputItem(text="hello"),
-                EmbeddingInputItem(image="https://example.com/image.jpg"),
+                EmbeddingInputItem(image=IMAGE_DATA_URI),
                 EmbeddingInputItem(
                     text="hello",
-                    image="https://example.com/image.jpg",
+                    image=IMAGE_DATA_URI,
                 ),
             ]
         )
         assert result == [
             {"text": "hello"},
-            {"image": "https://example.com/image.jpg"},
+            {"image": IMAGE_DATA_URI},
             {
                 "text": "hello",
-                "image": "https://example.com/image.jpg",
+                "image": IMAGE_DATA_URI,
             },
         ]
 
@@ -716,8 +723,8 @@ class TestEmbeddingCompileFallback:
         mock_generate.assert_not_called()
         assert result.embeddings[0] == pytest.approx([0.7, 0.8, 0.9], abs=1e-5)
 
-    def test_custom_processor_receives_image_items_unchanged(self):
-        """Custom processors should receive raw image strings unchanged."""
+    def test_custom_processor_receives_valid_image_items_unchanged(self):
+        """Custom processors should receive validated data URI strings unchanged."""
         import mlx.core as mx
         from omlx.models.embedding import MLXEmbeddingModel
 
@@ -743,10 +750,10 @@ class TestEmbeddingCompileFallback:
 
         inputs = [
             {"text": "hello"},
-            {"image": "https://example.com/image.jpg"},
+            {"image": IMAGE_DATA_URI},
             {
                 "text": "hello",
-                "image": "https://example.com/image.jpg",
+                "image": IMAGE_DATA_URI,
             },
         ]
         result = model.embed(inputs)
@@ -755,6 +762,20 @@ class TestEmbeddingCompileFallback:
             inputs, return_tensors="mlx"
         )
         assert result.embeddings[0] == pytest.approx([0.3, 0.4, 0.5], abs=1e-5)
+
+    def test_custom_processor_rejects_remote_image_url(self):
+        """Image embedding refs reject remote URLs before processor handling."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=[])
+
+        with pytest.raises(InvalidRequestError):
+            model.embed([{"image": "https://example.com/image.jpg"}])
 
     def test_custom_processor_counts_image_only_tokens_from_prepared_inputs(self):
         """Image-only custom processor inputs should contribute to usage stats."""
@@ -781,7 +802,7 @@ class TestEmbeddingCompileFallback:
         )
         model.processor = processor
 
-        result = model.embed([{"image": "https://example.com/image.jpg"}])
+        result = model.embed([{"image": IMAGE_DATA_URI}])
 
         assert result.total_tokens == 4
 
@@ -797,7 +818,56 @@ class TestEmbeddingCompileFallback:
         model.processor = MagicMock()
 
         with pytest.raises(ValueError, match="does not support image inputs"):
-            model.embed([{"image": "https://example.com/image.jpg"}])
+            model.embed([{"image": IMAGE_DATA_URI}])
+
+    def test_try_compile_respects_disable_env(self, monkeypatch):
+        """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        monkeypatch.setenv("OMLX_EMBEDDING_COMPILE", "0")
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+
+        with patch("omlx.models.embedding.mx") as mock_mx:
+            result = model._try_compile()
+
+        assert result is False
+        assert model._compiled_embed is None
+        mock_mx.compile.assert_not_called()
+
+    def test_close_releases_compiled_model_and_processor_resources(self):
+        """close() should drop wrapper references before clearing MLX caches."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+        model.processor = MagicMock()
+        model._loaded = True
+        model._hidden_size = 384
+        model._using_native = False
+        model._is_compiled = True
+        model._compiled_embed = MagicMock()
+        model._remap_input_ids_to_inputs = True
+
+        with patch("omlx.models.embedding.gc.collect") as collect, \
+             patch("omlx.models.embedding.mx") as mock_mx, \
+             patch(
+                 "omlx.models.embedding.clear_thread_compile_cache"
+             ) as clear_compile_cache:
+            model.close()
+
+        assert model.model is None
+        assert model.processor is None
+        assert model._compiled_embed is None
+        assert model._loaded is False
+        assert model._hidden_size is None
+        assert model._using_native is False
+        assert model._is_compiled is False
+        assert model._remap_input_ids_to_inputs is False
+        mock_mx.synchronize.assert_called_once()
+        mock_mx.clear_cache.assert_called_once()
+        clear_compile_cache.assert_called_once()
+        assert collect.call_count == 2
 
 
 class TestEmbeddingEngine:
@@ -822,6 +892,8 @@ class TestEmbeddingEngine:
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
+            mock_model.close.assert_called_once()
+            assert engine._model is None
 
     def test_engine_embed(self):
         """Test embedding generation through engine."""
@@ -1559,3 +1631,155 @@ class TestGetEmbeddingMaxLength:
 
         with patch.object(server, "get_max_context_window", return_value=None):
             assert server.get_embedding_max_length("m", None) is None
+
+
+class TestNativeQwen2Embedding:
+    """Native Qwen2-decoder embedding adapter (jina-code / gte-Qwen2; #686)."""
+
+    # Tiny Qwen2 config exercising grouped-query attention (4 heads / 2 kv).
+    _CONFIG = {
+        "model_type": "qwen2",
+        "architectures": ["Qwen2ForCausalLM"],
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 128,
+        "vocab_size": 128,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": True,
+    }
+
+    class MockQwen2Tokenizer:
+        """Right-padding tokenizer mirroring the native-path encode contract."""
+
+        def __init__(self, vocab_size: int):
+            self.vocab_size = vocab_size
+
+        def encode(self, text: str, add_special_tokens: bool = True):
+            return [abs(hash(token)) % self.vocab_size for token in text.split()] or [1]
+
+        def __call__(
+            self,
+            texts,
+            *,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="np",
+        ):
+            del truncation, return_tensors
+            encoded = [self.encode(t)[:max_length] for t in texts]
+            target = max((len(ids) for ids in encoded), default=0) if padding else 0
+            input_ids, attention_mask = [], []
+            for ids in encoded:
+                pad = max(target - len(ids), 0)
+                input_ids.append(ids + [0] * pad)
+                attention_mask.append([1] * len(ids) + [0] * pad)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def _write_full_qwen2_checkpoint(self, tmp_path, config):
+        """Write a complete native Qwen2 checkpoint from the adapter's own params."""
+        from mlx.utils import tree_flatten
+        from omlx.models.qwen2_embedding import Model, ModelArgs
+        from safetensors.numpy import save_file
+
+        model = Model(ModelArgs(**config))
+        weights = {
+            name: np.array(value) for name, value in tree_flatten(model.parameters())
+        }
+        save_file(weights, str(tmp_path / "model.safetensors"))
+
+    def _load(self, tmp_path):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        (tmp_path / "config.json").write_text(json.dumps(self._CONFIG))
+        self._write_full_qwen2_checkpoint(tmp_path, self._CONFIG)
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockQwen2Tokenizer(vocab_size=self._CONFIG["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ):
+            model.load()
+        return model
+
+    def test_load_native_qwen2_takes_native_path(self, tmp_path):
+        """Qwen2ForCausalLM routes through the native adapter, not mlx-embeddings."""
+        model = self._load(tmp_path)
+        assert model._using_native is True
+        assert model._hidden_size == self._CONFIG["hidden_size"]
+        # The adapter, not the qwen3/mlx-embeddings fallback.
+        from omlx.models.qwen2_embedding import Model as Qwen2EmbeddingModel
+
+        assert isinstance(model.model, Qwen2EmbeddingModel)
+
+    def test_qwen2_embed_shape_and_normalized(self, tmp_path):
+        """embed() returns one L2-normalized vector per input at the model dim."""
+        model = self._load(tmp_path)
+        output = model.embed(["def add(a, b): return a + b", "how to sort a list"])
+
+        assert len(output.embeddings) == 2
+        for emb in output.embeddings:
+            assert len(emb) == self._CONFIG["hidden_size"]
+            norm = math.sqrt(sum(x * x for x in emb))
+            assert abs(norm - 1.0) < 1e-3, f"not L2-normalized: norm={norm}"
+
+    def test_qwen2_last_token_pool_is_mask_aware(self, tmp_path):
+        """Left- vs right-padding the same sequence yields the same vector.
+
+        A causal decoder with RoPE encodes only relative positions, so the
+        final real-token state is padding-side invariant *iff* the pool indexes
+        the last non-pad token via the attention mask. A hardcoded ``[:, -1]``
+        would read a pad position under right padding and diverge.
+        """
+        import mlx.core as mx
+        from omlx.models.qwen2_embedding import Model, ModelArgs
+
+        mx.random.seed(0)
+        model = Model(ModelArgs(**self._CONFIG))
+        mx.eval(model.parameters())
+
+        right_ids = mx.array([[5, 9, 7, 0, 0]])
+        right_mask = mx.array([[1, 1, 1, 0, 0]])
+        left_ids = mx.array([[0, 0, 5, 9, 7]])
+        left_mask = mx.array([[0, 0, 1, 1, 1]])
+
+        right = np.array(model(right_ids, right_mask).text_embeds[0].tolist())
+        left = np.array(model(left_ids, left_mask).text_embeds[0].tolist())
+
+        # Mask-aware pooling agrees to float32 noise (~1e-4); a hardcoded
+        # ``[:, -1]`` pool would read the trailing pad token under right padding
+        # and diverge by O(0.1+). 1e-3 sits cleanly between the two regimes.
+        assert np.max(np.abs(right - left)) < 1e-3, (
+            "last-token pool is not mask-aware: left/right padding diverged"
+        )
+
+    def test_qwen2_is_causal_flag_controls_attention(self, tmp_path):
+        """is_causal=False makes attention bidirectional (gte-Qwen2 family).
+
+        Under causal attention an earlier token cannot attend to a later one, so
+        perturbing the last token leaves earlier hidden states unchanged; under
+        bidirectional attention it changes them. This pins the config gate that
+        distinguishes jina-code (causal) from gte-Qwen2 (``is_causal: false``).
+        """
+        import mlx.core as mx
+        from omlx.models.qwen2_embedding import Model, ModelArgs
+
+        base = mx.array([[5, 9, 7, 3]])
+        perturbed = mx.array([[5, 9, 7, 8]])  # differ only in the LAST token
+        mask = mx.array([[1, 1, 1, 1]])
+
+        def first_token_drift(is_causal):
+            mx.random.seed(0)
+            model = Model(ModelArgs(**{**self._CONFIG, "is_causal": is_causal}))
+            mx.eval(model.parameters())
+            a = np.array(model.model(base, mask).tolist())[0, 0]
+            b = np.array(model.model(perturbed, mask).tolist())[0, 0]
+            return float(np.max(np.abs(a - b)))
+
+        assert first_token_drift(is_causal=True) < 1e-6, "causal leaked future token"
+        assert first_token_drift(is_causal=False) > 1e-3, "bidirectional did not attend forward"

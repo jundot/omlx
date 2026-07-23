@@ -39,6 +39,32 @@ final class DTOFixtureTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
+    // MARK: - oQ quantization
+
+    func testOQStartRequestEncodesEnhancedOptions() throws {
+        let request = OQStartRequest(
+            modelPath: "/Users/test/models/model",
+            oqLevel: 4,
+            groupSize: 64,
+            sensitivityModelPath: "",
+            textOnly: false,
+            dtype: "bfloat16",
+            preserveMtp: false,
+            enhanced: true,
+            imatrixCachePath: "/Users/test/cache/imatrix.npz",
+            imatrixReuseCache: true,
+            imatrixStrict: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let body = try JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+
+        XCTAssertEqual(body?["enhanced"] as? Bool, true)
+        XCTAssertEqual(body?["imatrix_cache_path"] as? String, "/Users/test/cache/imatrix.npz")
+        XCTAssertEqual(body?["imatrix_reuse_cache"] as? Bool, true)
+        XCTAssertEqual(body?["imatrix_strict"] as? Bool, true)
+    }
+
     // MARK: - Stats
 
     func testStatsSessionFixtureDecodes() throws {

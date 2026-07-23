@@ -29,6 +29,14 @@
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
+		3BB000000000000000000010 /* MenubarMetricPrefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000010 /* MenubarMetricPrefs.swift */; };
+		3BB000000000000000000011 /* MenubarMetricsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000011 /* MenubarMetricsStore.swift */; };
+		3BB000000000000000000012 /* MenubarMetricGlyph.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000012 /* MenubarMetricGlyph.swift */; };
+		3BB000000000000000000013 /* MenubarMetricItemsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000013 /* MenubarMetricItemsController.swift */; };
+		3BB000000000000000000014 /* MenubarMetricPopover.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000014 /* MenubarMetricPopover.swift */; };
+		3BB000000000000000000015 /* SystemStatsSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000015 /* SystemStatsSampler.swift */; };
+		3BB000000000000000000016 /* SystemStatsPanels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000016 /* SystemStatsPanels.swift */; };
+		3BB000000000000000000017 /* SystemMenubarItemsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000017 /* SystemMenubarItemsController.swift */; };
 		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
 		3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000005 /* APIKeyGenerator.swift */; };
 		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
@@ -38,6 +46,7 @@
 		6BB000000000000000000002 /* AppSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000002 /* AppSection.swift */; };
 		6BB000000000000000000004 /* ServerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000004 /* ServerScreen.swift */; };
 		6BB000000000000000000005 /* StatusScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000005 /* StatusScreen.swift */; };
+		6BB000000000000000000011 /* AppearanceScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000011 /* AppearanceScreen.swift */; };
 		6BB000000000000000000006 /* LogsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000006 /* LogsScreen.swift */; };
 		6BB000000000000000000007 /* ModelsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000007 /* ModelsScreen.swift */; };
 		6BB000000000000000000008 /* DownloadsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000008 /* DownloadsScreen.swift */; };
@@ -107,6 +116,8 @@
 		DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */; };
 		DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000F /* LocalizationSmokeTests.swift */; };
 		DBB000000000000000000100 /* MenubarControllerPortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000100 /* MenubarControllerPortTests.swift */; };
+		DBB000000000000000000111 /* MenubarMetricTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000111 /* MenubarMetricTests.swift */; };
+		DBB000000000000000000112 /* SystemStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000112 /* SystemStatsTests.swift */; };
 		DBB000000000000000000101 /* ModelCardDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000101 /* ModelCardDTO.swift */; };
 		DBB000000000000000000102 /* ModelCardSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000102 /* ModelCardSheet.swift */; };
 		DBB000000000000000000103 /* ModelCardDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */; };
@@ -114,6 +125,7 @@
 		DBB000000000000000000105 /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000105 /* ThemeTests.swift */; };
 		DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000106 /* ReleasesCheckerTests.swift */; };
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
+		DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000110 /* MenubarControllerModelsTests.swift */; };
 		DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
@@ -154,6 +166,14 @@
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
 		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
 		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
+		3CC000000000000000000010 /* MenubarMetricPrefs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricPrefs.swift; sourceTree = "<group>"; };
+		3CC000000000000000000011 /* MenubarMetricsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricsStore.swift; sourceTree = "<group>"; };
+		3CC000000000000000000012 /* MenubarMetricGlyph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricGlyph.swift; sourceTree = "<group>"; };
+		3CC000000000000000000013 /* MenubarMetricItemsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricItemsController.swift; sourceTree = "<group>"; };
+		3CC000000000000000000014 /* MenubarMetricPopover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricPopover.swift; sourceTree = "<group>"; };
+		3CC000000000000000000015 /* SystemStatsSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemStatsSampler.swift; sourceTree = "<group>"; };
+		3CC000000000000000000016 /* SystemStatsPanels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemStatsPanels.swift; sourceTree = "<group>"; };
+		3CC000000000000000000017 /* SystemMenubarItemsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMenubarItemsController.swift; sourceTree = "<group>"; };
 		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
 		3CC000000000000000000005 /* APIKeyGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGenerator.swift; sourceTree = "<group>"; };
 		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
@@ -163,6 +183,7 @@
 		6CC000000000000000000002 /* AppSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSection.swift; sourceTree = "<group>"; };
 		6CC000000000000000000004 /* ServerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000005 /* StatusScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000011 /* AppearanceScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000006 /* LogsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000007 /* ModelsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000008 /* DownloadsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsScreen.swift; sourceTree = "<group>"; };
@@ -233,6 +254,8 @@
 		DCC00000000000000000000F /* LocalizationSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationSmokeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		DCC000000000000000000100 /* MenubarControllerPortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerPortTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000111 /* MenubarMetricTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000112 /* SystemStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemStatsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000101 /* ModelCardDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardDTO.swift; sourceTree = "<group>"; };
 		DCC000000000000000000102 /* ModelCardSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardSheet.swift; sourceTree = "<group>"; };
 		DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardDTODecodeTests.swift; sourceTree = "<group>"; };
@@ -240,6 +263,7 @@
 		DCC000000000000000000105 /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000106 /* ReleasesCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesCheckerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000110 /* MenubarControllerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerModelsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVMTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -270,6 +294,46 @@
 				1BBBBBBBBBBBBBBBBBBBBBB5 /* Resources */,
 				1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				DEE000000000000000000002 /* oMLXTests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000002 /* oMLXTests */ = {
+			isa = PBXGroup;
+			children = (
+				DCC000000000000000000001 /* AppServicesPathTests.swift */,
+				DCC000000000000000000002 /* AppConfigTests.swift */,
+				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
+				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
+				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
+				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
+				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
+				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
+				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
+				DCC00000000000000000000A /* ProfileScopeTests.swift */,
+				DCC00000000000000000000B /* SystemMetricsTests.swift */,
+				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
+				DCC00000000000000000000D /* DTOFixtureTests.swift */,
+				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
+				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
+				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
+				DCC000000000000000000111 /* MenubarMetricTests.swift */,
+				DCC000000000000000000112 /* SystemStatsTests.swift */,
+				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
+				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
+				DCC000000000000000000105 /* ThemeTests.swift */,
+				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
+				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
+				DCC000000000000000000110 /* MenubarControllerModelsTests.swift */,
+				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
+			);
+			path = oMLXTests;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */ = {
@@ -303,6 +367,14 @@
 				1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */,
 				3CC000000000000000000002 /* MenubarStatsPoller.swift */,
 				3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */,
+				3CC000000000000000000010 /* MenubarMetricPrefs.swift */,
+				3CC000000000000000000011 /* MenubarMetricsStore.swift */,
+				3CC000000000000000000012 /* MenubarMetricGlyph.swift */,
+				3CC000000000000000000013 /* MenubarMetricItemsController.swift */,
+				3CC000000000000000000014 /* MenubarMetricPopover.swift */,
+				3CC000000000000000000015 /* SystemStatsSampler.swift */,
+				3CC000000000000000000016 /* SystemStatsPanels.swift */,
+				3CC000000000000000000017 /* SystemMenubarItemsController.swift */,
 			);
 			path = Menubar;
 			sourceTree = "<group>";
@@ -396,6 +468,7 @@
 			children = (
 				6CC000000000000000000004 /* ServerScreen.swift */,
 				6CC000000000000000000005 /* StatusScreen.swift */,
+				6CC000000000000000000011 /* AppearanceScreen.swift */,
 				6CC000000000000000000006 /* LogsScreen.swift */,
 				6CC000000000000000000007 /* ModelsScreen.swift */,
 				6CC000000000000000000008 /* DownloadsScreen.swift */,
@@ -493,43 +566,6 @@
 				ACC000000000000000000001 /* WelcomeWindow.swift */,
 			);
 			path = Welcome;
-			sourceTree = "<group>";
-		};
-		DEE000000000000000000001 /* Tests */ = {
-			isa = PBXGroup;
-			children = (
-				DEE000000000000000000002 /* oMLXTests */,
-			);
-			path = Tests;
-			sourceTree = "<group>";
-		};
-		DEE000000000000000000002 /* oMLXTests */ = {
-			isa = PBXGroup;
-			children = (
-				DCC000000000000000000001 /* AppServicesPathTests.swift */,
-				DCC000000000000000000002 /* AppConfigTests.swift */,
-				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
-				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
-				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
-				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
-				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
-				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
-				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
-				DCC00000000000000000000A /* ProfileScopeTests.swift */,
-				DCC00000000000000000000B /* SystemMetricsTests.swift */,
-				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
-				DCC00000000000000000000D /* DTOFixtureTests.swift */,
-				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
-				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
-				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
-				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
-				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
-				DCC000000000000000000105 /* ThemeTests.swift */,
-				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
-				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
-				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
-			);
-			path = oMLXTests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -657,6 +693,14 @@
 				3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */,
 				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
 				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
+				3BB000000000000000000010 /* MenubarMetricPrefs.swift in Sources */,
+				3BB000000000000000000011 /* MenubarMetricsStore.swift in Sources */,
+				3BB000000000000000000012 /* MenubarMetricGlyph.swift in Sources */,
+				3BB000000000000000000013 /* MenubarMetricItemsController.swift in Sources */,
+				3BB000000000000000000014 /* MenubarMetricPopover.swift in Sources */,
+				3BB000000000000000000015 /* SystemStatsSampler.swift in Sources */,
+				3BB000000000000000000016 /* SystemStatsPanels.swift in Sources */,
+				3BB000000000000000000017 /* SystemMenubarItemsController.swift in Sources */,
 				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
 				4BB000000000000000000002 /* SignalHandlers.swift in Sources */,
 				4BB000000000000000000003 /* AppControlServer.swift in Sources */,
@@ -664,6 +708,7 @@
 				6BB000000000000000000002 /* AppSection.swift in Sources */,
 				6BB000000000000000000004 /* ServerScreen.swift in Sources */,
 				6BB000000000000000000005 /* StatusScreen.swift in Sources */,
+				6BB000000000000000000011 /* AppearanceScreen.swift in Sources */,
 				AAD9D51F2FE2843F00FAEA05 /* DownloadsScreenVM.swift in Sources */,
 				6BB000000000000000000006 /* LogsScreen.swift in Sources */,
 				6BB000000000000000000007 /* ModelsScreen.swift in Sources */,
@@ -737,11 +782,14 @@
 				DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */,
 				DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */,
 				DBB000000000000000000100 /* MenubarControllerPortTests.swift in Sources */,
+				DBB000000000000000000111 /* MenubarMetricTests.swift in Sources */,
+				DBB000000000000000000112 /* SystemStatsTests.swift in Sources */,
 				DBB000000000000000000103 /* ModelCardDTODecodeTests.swift in Sources */,
 				DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */,
 				DBB000000000000000000105 /* ThemeTests.swift in Sources */,
 				DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */,
 				DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */,
+				DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */,
 				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

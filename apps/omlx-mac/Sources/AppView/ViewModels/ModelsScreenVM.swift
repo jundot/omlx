@@ -64,6 +64,20 @@ final class ModelsScreenVM {
         }
     }
 
+    func setFavorite(id: String, favorite: Bool, client: OMLXClient) {
+        Task { [weak self] in
+            do {
+                var patch = ModelSettingsPatch()
+                patch.isFavorite = favorite
+                _ = try await client.updateModelSettings(id: id, patch: patch)
+                await self?.refresh()
+            } catch {
+                guard let self else { return }
+                self.lastError = error.omlxDescription
+            }
+        }
+    }
+
     func remove(id: String, client: OMLXClient) {
         pendingRemoveID = nil
         deletingID = id

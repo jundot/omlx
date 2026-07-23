@@ -28,7 +28,7 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, NewType, Optional, Tuple
 
@@ -562,6 +562,14 @@ class PagedCacheManager(CacheManager):
         # paged SSD cache manager for storage (set via set_paged_ssd_cache_manager)
         self._paged_ssd_cache_manager: Optional[Any] = None
 
+        # Lifecycle hooks for hash-keyed side indexes (e.g. the prefix index
+        # in BlockAwarePrefixCache). on_block_hash_dropped fires when a
+        # (hash -> block) association ceases to exist; on_hash_map_cleared
+        # fires after a wholesale hash-map clear. Callbacks may run with
+        # self._lock held and must not call back into this manager.
+        self.on_block_hash_dropped: Callable[[BlockHash], None] | None = None
+        self.on_hash_map_cleared: Callable[[], None] | None = None
+
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
             f"initial_blocks={initial_count}, max_blocks={max_blocks}, "
@@ -699,6 +707,21 @@ class PagedCacheManager(CacheManager):
 
             return blocks
 
+    def _notify_hash_dropped(self, block_hash: BlockHash | None) -> None:
+        """Fire on_block_hash_dropped once a hash maps to no block at all.
+
+        Called from every path that can kill a (hash -> block) association —
+        the internal free/evict paths hold self._lock, while the prefix
+        cache's own map pops call it lock-free (dict reads and the callback's
+        dict.pop are GIL-atomic). The get_block re-check keeps hybrid models
+        correct: the same hash can map to several blocks (one per KV cache
+        group), and the association only dies with the last one.
+        """
+        if block_hash is None or self.on_block_hash_dropped is None:
+            return
+        if self.cached_block_hash_to_block.get_block(block_hash) is None:
+            self.on_block_hash_dropped(block_hash)
+
     def _maybe_evict_cached_block(self, block: CacheBlock) -> bool:
         """
         Evict a block from the hash cache if present.
@@ -715,9 +738,9 @@ class PagedCacheManager(CacheManager):
         if block.block_hash is None:
             return False
 
-        evicted = self.cached_block_hash_to_block.pop(
-            block.block_hash, block.block_id
-        )
+        block_hash = block.block_hash
+        evicted = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
+        self._notify_hash_dropped(block_hash)
 
         if evicted:
             block.reset_hash()
@@ -748,6 +771,7 @@ class PagedCacheManager(CacheManager):
                 # Remove from hash cache
                 if block.block_hash is not None:
                     self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                    self._notify_hash_dropped(block.block_hash)
 
                 # Remove from allocated
                 del self.allocated_blocks[block_id]
@@ -786,6 +810,7 @@ class PagedCacheManager(CacheManager):
                     # Remove from hash cache
                     if block.block_hash is not None:
                         self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                        self._notify_hash_dropped(block.block_hash)
 
                     del self.allocated_blocks[block.block_id]
                     to_free.append(block)
@@ -838,6 +863,37 @@ class PagedCacheManager(CacheManager):
                 self.stats.shared_blocks += 1
 
             return True
+
+    def acquire_cached_block(
+        self, block_id: int, expected_hash: BlockHash
+    ) -> CacheBlock | None:
+        """Atomically take a reference on a block iff it still holds a hash.
+
+        Prefix-index entries can outlive the blocks they point at (a block
+        may have been freed and reused for other content). Checking the hash
+        and taking the reference under the same lock keeps a concurrent
+        eviction from slipping in between the two steps.
+
+        Args:
+            block_id: Physical block index to acquire.
+            expected_hash: Chain hash the block must still hold.
+
+        Returns:
+            The block on success, None when it is gone or reassigned.
+        """
+        with self._lock:
+            block = self.allocated_blocks.get(block_id)
+            if (
+                block is None
+                or block.is_null
+                or block.block_hash != expected_hash
+            ):
+                return None
+            block.ref_count += 1
+            block.touch()
+            if block.ref_count == 2:
+                self.stats.shared_blocks += 1
+            return block
 
     def decrement_ref(self, block_id: int) -> bool:
         """Decrement reference count (alias for free_block)."""
@@ -1356,6 +1412,8 @@ class PagedCacheManager(CacheManager):
                 return False
 
             self.cached_block_hash_to_block.clear()
+            if self.on_hash_map_cleared is not None:
+                self.on_hash_map_cleared()
 
             for block in self.blocks:
                 block.reset_hash()
@@ -1389,6 +1447,8 @@ class PagedCacheManager(CacheManager):
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
             self.cached_block_hash_to_block.clear()
+            if self.on_hash_map_cleared is not None:
+                self.on_hash_map_cleared()
             self.request_tables.clear()
             self.allocated_blocks.clear()
 
@@ -1534,6 +1594,7 @@ class PagedCacheManager(CacheManager):
             # Remove from hash cache
             if block.block_hash is not None:
                 self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                self._notify_hash_dropped(block.block_hash)
 
             # Clear metadata
             block.reset_hash()

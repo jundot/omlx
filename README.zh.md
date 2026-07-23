@@ -72,6 +72,12 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+可选的 GLM-5.2 / MiniMax M3 原生自定义内核目前需要 HEAD 构建：
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### 从源码安装
 
 ```bash
@@ -79,6 +85,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # 仅核心
 pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
+
+# 可选：GLM-5.2 / MiniMax M3 原生自定义内核
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
@@ -350,6 +359,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # 强制重建 venvstacks（默认按指纹缓存）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# 暂存包含可选 GLM-5.2 / MiniMax M3 原生自定义内核的应用
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 首次 cold 构建需要 10–20 分钟（venvstacks Python 层组装）。后续构建复用 `packaging/_export/` 缓存，约 4 分钟完成。层配置请参阅 [packaging/README.md](packaging/README.md)，Swift 源码请参阅 [apps/omlx-mac/](apps/omlx-mac/)。
