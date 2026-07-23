@@ -1015,7 +1015,13 @@ class ProcessMemoryEnforcer:
         already-wedged case where hot cache is empty but pooled buffers are
         stranded).
         """
-        pool_bytes = mx.get_cache_memory()
+        raw_pool = mx.get_cache_memory()
+        try:
+            pool_bytes = int(raw_pool)
+        except (TypeError, ValueError):
+            # A non-numeric reading (e.g. a wholesale-mocked mx in unit
+            # tests) cannot justify a clear; treat it as an empty pool.
+            pool_bytes = 0
         if freed_hot <= 0 and pool_bytes <= self._POOL_RECLAIM_FLOOR:
             return
         requested = 0

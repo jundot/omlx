@@ -2691,3 +2691,12 @@ class TestPressureCacheReclaim:
         with patch.object(pme.mx, "get_cache_memory", return_value=3 * 1024**3):
             enforcer._request_scheduler_cache_reclaim(0)
         schedulers[0].request_pressure_reclaim.assert_called_once()
+
+    def test_tolerates_non_numeric_pool_reading(self):
+        """A wholesale-mocked mx (as the wider suite uses) must not break
+        enforcement — a non-numeric cache reading is treated as empty."""
+        schedulers = [MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=object()):
+            enforcer._request_scheduler_cache_reclaim(0)
+        schedulers[0].request_pressure_reclaim.assert_not_called()
