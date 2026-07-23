@@ -341,9 +341,20 @@ class DFlashEngine(BaseEngine):
             # Native MTP load on the same process would see leftover dflash
             # hooks and crash with TypeError on n_confirmed (issue #1388).
             # Idempotent — only wraps once per process.
+            from ..patches.dflash_draft_config import (
+                install_dflash_draft_config_normalizer,
+            )
             from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
 
             install_dflash_lifecycle_wrap()
+            # Newer z-lab drafts ship transformers 5.x-style configs that nest
+            # rope_theta under rope_parameters and block_size under
+            # dflash_config, but DFlashDraftModelArgs requires both at the
+            # config root with no defaults. Without this, load_draft_bundle
+            # crashes with a missing-positional-argument TypeError and
+            # engine_pool falls back to the vlm engine (issue #2317).
+            # Idempotent — only wraps once per process.
+            install_dflash_draft_config_normalizer()
 
             target_bundle = load_target_bundle(
                 self._model_name,
