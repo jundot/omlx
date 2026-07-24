@@ -346,6 +346,22 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
 
+        # Nemotron-H decode step -> two fused Metal kernels (conv+dt+SSD
+        # with an in-kernel S-loop and register-resident state, plus
+        # swiglu+grouped-RMSNorm), replacing the per-layer decode glue and
+        # the mlx_lm_mtp chain's sequential verify loop; MTP verify windows
+        # get their per-position rollback states captured in-kernel.
+        try:
+            from ..patches.nemotron_decode_fused import (
+                apply_nemotron_decode_fused_patch,
+            )
+
+            apply_nemotron_decode_fused_patch()
+        except Exception:
+            logger.debug(
+                "Nemotron fused decode patch not applied", exc_info=True
+            )
+
         # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
         # Strictly shape-gated; decode, quantized-cache paths, and unsupported
         # models fall through to the previous SDPA implementation.
