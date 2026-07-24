@@ -42,6 +42,33 @@ logger = logging.getLogger(__name__)
 # Max pending writes before save() blocks.
 _MAX_PENDING_WRITES = 128
 
+# Large fp32 snapshot states (hybrid-model SSM states) are stored as int8
+# with per-row fp32 scales: 4x smaller serialize copies, pending buffers,
+# and files; error bounded by rowmax/254. Disable via OMLX_SNAPSHOT_Q8=0.
+_Q8_ENABLED = os.environ.get("OMLX_SNAPSHOT_Q8", "1") != "0"
+_Q8_MIN_ELEMS = 65536
+
+
+def _q8_eligible(elem) -> bool:
+    return (
+        _Q8_ENABLED
+        and HAS_MLX
+        and elem.dtype == mx.float32
+        and elem.ndim >= 2
+        and elem.size >= _Q8_MIN_ELEMS
+    )
+
+
+def _q8_quantize(elem):
+    scale = mx.max(mx.abs(elem), axis=-1, keepdims=True) / 127.0
+    scale = mx.maximum(scale, 1e-12)
+    q = mx.round(elem / scale).astype(mx.int8)
+    return q, scale.astype(mx.float32)
+
+
+def _q8_dequantize(q, scale):
+    return q.astype(mx.float32) * scale
+
 
 def reset_boundary_snapshot_root(base_dir: Path) -> None:
     """Remove all boundary snapshot sessions for a server lifecycle boundary."""
@@ -702,6 +729,11 @@ class BoundarySnapshotSSDStore:
                         if _has_zero_dim(elem):
                             arrays[f"layer_{i}_state_{k}"] = mx.zeros((1,))
                             info[f"zero_dim_{k}"] = _encode_shape(elem.shape)
+                        elif _q8_eligible(elem):  # int8 snapshot state
+                            q8, q8s = _q8_quantize(elem)
+                            arrays[f"layer_{i}_state_{k}"] = q8
+                            arrays[f"layer_{i}_state_{k}_q8s"] = q8s
+                            info[f"q8_{k}"] = "1"
                         else:
                             arrays[f"layer_{i}_state_{k}"] = elem
                 else:
@@ -849,6 +881,13 @@ class BoundarySnapshotSSDStore:
                     zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
                     restored = _restore_tensor_from_bytes(raw, dtype_str, [1])
                     elements.append(mx.zeros(zd_shape, dtype=restored.dtype))
+                elif (  # int8 snapshot state
+                    info.get(f"q8_{k}") == "1" and f"{key}_q8s" in tensors_raw
+                ):
+                    q8 = _restore_tensor_from_bytes(raw, dtype_str, shape)
+                    sraw, sdt, sshape = tensors_raw[f"{key}_q8s"]
+                    q8s = _restore_tensor_from_bytes(sraw, sdt, sshape)
+                    elements.append(_q8_dequantize(q8, q8s))
                 else:
                     elements.append(_restore_tensor_from_bytes(raw, dtype_str, shape))
             return tuple(elements)
@@ -983,6 +1022,11 @@ class BoundarySnapshotSSDStore:
                 if zd_marker in info:
                     zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
                     elements.append(mx.zeros(zd_shape, dtype=tensor.dtype))
+                elif (  # int8 snapshot state
+                    info.get(f"q8_{k}") == "1"
+                    and arrays.get(f"{key}_q8s") is not None
+                ):
+                    elements.append(_q8_dequantize(tensor, arrays[f"{key}_q8s"]))
                 else:
                     elements.append(tensor)
             return tuple(elements)
