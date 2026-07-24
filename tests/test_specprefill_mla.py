@@ -149,3 +149,26 @@ class TestMlaExtractorNumerics:
         ) * attn.scale
 
         assert mx.allclose(ext_scores, ref_scores, atol=1e-4, rtol=1e-4)
+
+
+class TestManualRopePreservesDtype:
+    """manual_rope/manual_rope_with_freqs compute angles in float32 but must
+    return the input dtype (like native mx RoPE). A float32 leak becomes
+    float32 roped KV during sparse_prefill, and on mask-fused MLA targets
+    (GLM DSA passes pe_scores as the sdpa mask) a float32 mask that cannot
+    promote to bfloat16 output."""
+
+    def test_manual_rope_bfloat16(self):
+        from omlx.patches.specprefill import manual_rope
+
+        x = mx.random.normal((1, 2, 4, 16)).astype(mx.bfloat16)
+        out = manual_rope(x, mx.array([3, 7, 11, 200]), dims=16)
+        assert out.dtype == mx.bfloat16
+
+    def test_manual_rope_with_freqs_bfloat16(self):
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        x = mx.random.normal((1, 2, 4, 16)).astype(mx.bfloat16)
+        freqs = mx.exp(mx.arange(4, dtype=mx.float32))
+        out = manual_rope_with_freqs(x, mx.array([3, 7, 11, 200]), dims=16, freqs=freqs)
+        assert out.dtype == mx.bfloat16
