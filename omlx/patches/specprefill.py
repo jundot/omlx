@@ -712,7 +712,12 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
     rotated = mx.concatenate(
         [x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a], axis=-1
     )
-    return mx.concatenate([rotated, x_pass], axis=-1)
+    # Angles are computed in float32 for precision, but the output must
+    # keep the input dtype like native mx RoPE does: a float32 leak here
+    # becomes float32 roped K in the cache, and on mask-fused MLA targets
+    # (GLM DSA passes pe_scores as the sdpa mask) a float32 mask that
+    # cannot promote to the model's bfloat16 output.
+    return mx.concatenate([rotated, x_pass], axis=-1).astype(x.dtype)
 
 
 def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
@@ -756,7 +761,12 @@ def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     rotated = mx.concatenate(
         [x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a], axis=-1
     )
-    return mx.concatenate([rotated, x_pass], axis=-1)
+    # Angles are computed in float32 for precision, but the output must
+    # keep the input dtype like native mx RoPE does: a float32 leak here
+    # becomes float32 roped K in the cache, and on mask-fused MLA targets
+    # (GLM DSA passes pe_scores as the sdpa mask) a float32 mask that
+    # cannot promote to the model's bfloat16 output.
+    return mx.concatenate([rotated, x_pass], axis=-1).astype(x.dtype)
 
 
 # ---------------------------------------------------------------------------
