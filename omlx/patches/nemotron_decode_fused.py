@@ -37,7 +37,6 @@ ragged batches, and prefill chunks fall through to the previous call chain
 
 import logging
 import math
-from typing import Optional, Tuple
 
 import mlx.core as mx
 
@@ -303,12 +302,22 @@ def _get_kernels():
         _kernel_a = mx.fast.metal_kernel(
             name="mamba2_decode_fused",
             input_names=[
-                "proj", "conv_state_in", "ssm_state_in", "conv_w", "conv_b",
-                "A_log", "dt_bias", "D", "lim",
+                "proj",
+                "conv_state_in",
+                "ssm_state_in",
+                "conv_w",
+                "conv_b",
+                "A_log",
+                "dt_bias",
+                "D",
+                "lim",
             ],
             output_names=[
-                "y_out", "conv_state_out", "ssm_state_out",
-                "cap_state", "cap_conv",
+                "y_out",
+                "conv_state_out",
+                "ssm_state_out",
+                "cap_state",
+                "cap_conv",
             ],
             header=_HEADER,
             source=_KERNEL_A_SRC,
@@ -327,7 +336,8 @@ def supported(num_heads, head_dim, state_size, n_groups, conv_kernel, group_size
     return (
         conv_kernel == 4
         and head_dim in (32, 64, 128)
-        and 32 <= state_size <= 256 and state_size % 32 == 0
+        and 32 <= state_size <= 256
+        and state_size % 32 == 0
         and num_heads % n_groups == 0
         and (num_heads * head_dim) % group_size == 0
         and group_size % 256 == 0
@@ -335,15 +345,15 @@ def supported(num_heads, head_dim, state_size, n_groups, conv_kernel, group_size
 
 
 def mamba2_decode_step(
-    proj: mx.array,            # [N, S, P] in_proj output
-    conv_state: mx.array,      # [N, K-1, CD]
-    ssm_state: mx.array,       # [N, H, Dh, Ds]
-    conv_w: mx.array,          # [CD, K, 1]
-    conv_b: mx.array,          # [CD]
-    A_log: mx.array,           # [H] fp32
-    dt_bias: mx.array,         # [H] fp32
-    D: mx.array,               # [H]
-    norm_w: mx.array,          # [ID]
+    proj: mx.array,  # [N, S, P] in_proj output
+    conv_state: mx.array,  # [N, K-1, CD]
+    ssm_state: mx.array,  # [N, H, Dh, Ds]
+    conv_w: mx.array,  # [CD, K, 1]
+    conv_b: mx.array,  # [CD]
+    A_log: mx.array,  # [H] fp32
+    dt_bias: mx.array,  # [H] fp32
+    D: mx.array,  # [H]
+    norm_w: mx.array,  # [ID]
     *,
     num_heads: int,
     head_dim: int,
@@ -351,7 +361,7 @@ def mamba2_decode_step(
     n_groups: int,
     eps: float,
     group_size: int,
-    time_step_limit: Optional[Tuple[float, float]] = None,
+    time_step_limit: tuple[float, float] | None = None,
     capture: bool = False,
 ):
     """Fused decode step. Returns (out, conv_state_out, ssm_state_out,
@@ -362,9 +372,8 @@ def mamba2_decode_step(
     ID = H * Dh
     CD = ID + 2 * n_groups * Ds
     tdt = proj.dtype
-    has_limit = (
-        time_step_limit is not None
-        and not (time_step_limit[0] == 0.0 and math.isinf(time_step_limit[1]))
+    has_limit = time_step_limit is not None and not (
+        time_step_limit[0] == 0.0 and math.isinf(time_step_limit[1])
     )
     lo = float(time_step_limit[0]) if has_limit else 0.0
     hi = float(time_step_limit[1]) if has_limit else 0.0
@@ -373,9 +382,17 @@ def mamba2_decode_step(
     cap_conv_shape = (S, N, 3, CD) if capture else (1, 1, 1, 1)
 
     tmpl_a = [
-        ("T", tdt), ("U", ssm_state.dtype), ("S", S), ("Dh", Dh), ("Ds", Ds),
-        ("H", H), ("G", H // n_groups), ("NG", n_groups), ("NB", N * H),
-        ("CAPTURE", 1 if capture else 0), ("HAS_LIMIT", 1 if has_limit else 0),
+        ("T", tdt),
+        ("U", ssm_state.dtype),
+        ("S", S),
+        ("Dh", Dh),
+        ("Ds", Ds),
+        ("H", H),
+        ("G", H // n_groups),
+        ("NG", n_groups),
+        ("NB", N * H),
+        ("CAPTURE", 1 if capture else 0),
+        ("HAS_LIMIT", 1 if has_limit else 0),
     ]
     y, conv_out, ssm_out, cap_state, cap_conv = ka(
         inputs=[proj, conv_state, ssm_state, conv_w, conv_b, A_log, dt_bias, D, lim],
@@ -383,16 +400,24 @@ def mamba2_decode_step(
         grid=(32, Dh, H * N),
         threadgroup=(32, 8, 1),
         output_shapes=[
-            (N, S, ID), conv_state.shape, ssm_state.shape,
-            cap_state_shape, cap_conv_shape,
+            (N, S, ID),
+            conv_state.shape,
+            ssm_state.shape,
+            cap_state_shape,
+            cap_conv_shape,
         ],
         output_dtypes=[tdt, tdt, ssm_state.dtype, ssm_state.dtype, tdt],
     )
     (out,) = kb(
         inputs=[proj, y, norm_w, _eps_array(float(eps))],
         template=[
-            ("T", tdt), ("H", H), ("Dh", Dh), ("Ds", Ds), ("NG", n_groups),
-            ("S", S), ("GS", group_size),
+            ("T", tdt),
+            ("H", H),
+            ("Dh", Dh),
+            ("Ds", Ds),
+            ("NG", n_groups),
+            ("S", S),
+            ("GS", group_size),
         ],
         grid=(256, ID // group_size, S * N),
         threadgroup=(256, 1, 1),
@@ -502,4 +527,88 @@ def apply_nemotron_decode_fused_patch() -> bool:
         "Nemotron-H fused decode patch applied "
         "(fused conv+dt+SSD and gate+norm kernels, S<=8, in-kernel captures)"
     )
+    apply_nemotron_attention_verify_patch()
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Attention verify-window fix: per-position SDPA for 3 <= S <= 8
+# --------------------------------------------------------------------------- #
+# mx.fast.scaled_dot_product_attention has a fast vector path for S<=2 but
+# falls onto a full-attention path at S>=3 that is catastrophically slow at
+# decode context lengths (measured 1.56 ms/layer at 10k ctx, 4.0 ms at 32k
+# vs ~0.3 ms for S<=2). MTP verify windows at draft depth >= 2 are exactly
+# S in 3..depth+1, so every deeper-than-depth-1 probe pays ~8x this per
+# attention layer — decomposing into S single-position calls with sliced KV
+# (exact causal semantics) is 3.6-6x faster and scales with context.
+_ATTN_MARKER = "_omlx_nemotron_sdpa_verify"
+
+
+def apply_nemotron_attention_verify_patch() -> bool:
+    if not (mx.metal.is_available() and mx.default_device() == mx.gpu):
+        return False
+    try:
+        from mlx_lm.models import nemotron_h as nh
+    except Exception:
+        return False
+
+    Attn = nh.NemotronHAttention
+    prev_call = Attn.__call__
+    if getattr(prev_call, _ATTN_MARKER, False):
+        return True
+    sdpa = nh.scaled_dot_product_attention
+
+    def _dense_kv(cache):
+        # Dense, non-rotating KV only: the per-position slices assume the
+        # returned keys are in chronological order (RotatingKVCache is not;
+        # quantized caches return tuples). nemotron_h.make_cache always
+        # builds plain KVCache, so this is belt and suspenders.
+        if getattr(cache, "max_size", None) is not None:
+            return False
+        keys = getattr(cache, "keys", None)
+        return keys is None or isinstance(keys, mx.array)
+
+    def __call__(self, x, mask=None, cache=None):
+        B, L, _ = x.shape
+        if not (
+            cache is not None
+            and 3 <= L <= 8
+            and (mask is None or (isinstance(mask, str) and mask == "causal"))
+            and _dense_kv(cache)
+        ):
+            return prev_call(self, x, mask, cache)
+
+        queries = self.q_proj(x).reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        keys = (
+            self.k_proj(x)
+            .reshape(B, L, self.num_key_value_heads, -1)
+            .transpose(0, 2, 1, 3)
+        )
+        values = (
+            self.v_proj(x)
+            .reshape(B, L, self.num_key_value_heads, -1)
+            .transpose(0, 2, 1, 3)
+        )
+        keys, values = cache.update_and_fetch(keys, values)
+        kv_len = keys.shape[2]
+        outs = []
+        for i in range(L):
+            end = kv_len - L + i + 1
+            outs.append(
+                sdpa(
+                    queries[:, :, i : i + 1],
+                    keys[:, :, :end],
+                    values[:, :, :end],
+                    cache=None,
+                    scale=self.scale,
+                    mask=None,
+                )
+            )
+        output = mx.concatenate(outs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
+
+    setattr(__call__, _ATTN_MARKER, True)
+    Attn.__call__ = __call__
+    logger.info("Nemotron-H per-position SDPA verify patch applied (3<=S<=8)")
     return True

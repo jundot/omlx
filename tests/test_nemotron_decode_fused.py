@@ -34,6 +34,7 @@ pytestmark = pytest.mark.skipif(
 # applied by an earlier test file, this is their wrap — which is exactly the
 # stock decode behavior for plain calls.)
 _STOCK_CALL = nh.NemotronHMamba2Mixer.__call__
+_STOCK_ATTN_CALL = nh.NemotronHAttention.__call__
 
 # Small but kernel-eligible dims: Dh 64, Ds 128, norm group 512 (=2048/4).
 DIMS = dict(
@@ -63,9 +64,7 @@ def make_mixer(dtype, seed=17, **overrides):
     mixer.dt_bias = mx.random.normal((args.mamba_num_heads,)) * 0.5
     mixer.D = mx.random.normal((args.mamba_num_heads,)) * 0.5 + 1.0
     mixer.set_dtype(dtype)
-    mixer.A_log = mx.log(
-        mx.arange(1, args.mamba_num_heads + 1, dtype=mx.float32) * 0.5
-    )
+    mixer.A_log = mx.log(mx.arange(1, args.mamba_num_heads + 1, dtype=mx.float32) * 0.5)
     mixer.dt_bias = mixer.dt_bias.astype(mx.float32)
     return mixer, args
 
@@ -87,14 +86,23 @@ def fused_decode(mixer, args, hs, cache, capture=False):
             dtype=mx.float32,
         )
     y, conv_out, ssm_out, cap_s, cap_c = mamba2_decode_step(
-        proj, cache[0], cache[1],
-        mixer.conv1d.weight, mixer.conv1d.bias,
-        mixer.A_log, mixer.dt_bias, mixer.D.astype(hs.dtype),
+        proj,
+        cache[0],
+        cache[1],
+        mixer.conv1d.weight,
+        mixer.conv1d.bias,
+        mixer.A_log,
+        mixer.dt_bias,
+        mixer.D.astype(hs.dtype),
         mixer.norm.weight,
-        num_heads=mixer.num_heads, head_dim=mixer.head_dim,
-        state_size=mixer.ssm_state_size, n_groups=mixer.n_groups,
-        eps=1e-5, group_size=mixer.norm.group_size,
-        time_step_limit=args.time_step_limit, capture=capture,
+        num_heads=mixer.num_heads,
+        head_dim=mixer.head_dim,
+        state_size=mixer.ssm_state_size,
+        n_groups=mixer.n_groups,
+        eps=1e-5,
+        group_size=mixer.norm.group_size,
+        time_step_limit=args.time_step_limit,
+        capture=capture,
     )
     cache[0], cache[1] = conv_out, ssm_out
     cache.advance(hs.shape[1])
@@ -231,3 +239,56 @@ def test_unsupported_dims_fall_through():
     out = mixer(hs, None, cache)
     mx.eval(out, cache[0], cache[1])
     assert out.shape == (1, 1, 1024)
+
+
+def test_attention_verify_per_position_sdpa():
+    """3 <= S <= 8 attention routes to per-position SDPA (exact causal
+    semantics via KV slicing) and matches the stock fused path; S=2 and
+    S=12 fall through byte-identically."""
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.patches.nemotron_decode_fused import (
+        apply_nemotron_attention_verify_patch,
+    )
+
+    stock_call = _STOCK_ATTN_CALL
+    assert apply_nemotron_attention_verify_patch()
+    assert apply_nemotron_attention_verify_patch()  # idempotent
+
+    args = SimpleNamespace(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=128,
+        attention_bias=False,
+    )
+    mx.random.seed(21)
+    attn = nh.NemotronHAttention(args)
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        lin = getattr(attn, name)
+        lin.weight = mx.random.normal(lin.weight.shape) * 0.05
+    attn.set_dtype(mx.bfloat16)
+
+    def warm_kv(ctx, seed):
+        mx.random.seed(seed)
+        c = KVCache()
+        k = (mx.random.normal((1, 2, ctx, 128)) * 0.3).astype(mx.bfloat16)
+        v = (mx.random.normal((1, 2, ctx, 128)) * 0.3).astype(mx.bfloat16)
+        c.update_and_fetch(k, v)
+        mx.eval(c.keys, c.values)
+        return c
+
+    for S, exact in ((2, True), (3, False), (4, False), (8, False), (12, True)):
+        mx.random.seed(50 + S)
+        x = (mx.random.normal((1, S, 1024)) * 0.1).astype(mx.bfloat16)
+        c_ref = warm_kv(512, seed=99)
+        c_new = warm_kv(512, seed=99)
+        ref = stock_call(attn, x, "causal", c_ref)
+        out = attn(x, "causal", c_new)
+        mx.eval(ref, out)
+        err = rel(out, ref)
+        assert err < (1e-9 if exact else 1e-4), (S, err)
+        assert (
+            rel(c_new.keys[:, :, : c_new.offset], c_ref.keys[:, :, : c_ref.offset])
+            == 0.0
+        )
