@@ -1,0 +1,971 @@
+            <div x-show="mainTab === 'status'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Serving Stats Header -->
+                    <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
+                        <div>
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('status.section_label') }}</h2>
+                            <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <!-- Scope toggle -->
+                            <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
+                                <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                        :class="statsScope === 'session' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                        class="px-3 py-1.5 text-xs font-medium transition-all">
+                                    {{ t('status.scope_session') }}
+                                </button>
+                                <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                        :class="statsScope === 'alltime' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                        class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200">
+                                    {{ t('status.scope_alltime') }}
+                                </button>
+                            </div>
+                            <!-- Clear button -->
+                            <div class="flex items-center gap-1.5">
+                                <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
+                                        @click="statsScope === 'session' ? showClearStatsConfirm = true : showClearAlltimeConfirm = true"
+                                        class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
+                                        :title="statsScope === 'session' ? window.t('status.clear_tooltip') : window.t('status.clear_alltime_tooltip')">
+                                    <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                                    {{ t('status.clear') }}
+                                </button>
+                                <div x-show="(statsScope === 'session' && showClearStatsConfirm) || (statsScope === 'alltime' && showClearAlltimeConfirm)"
+                                     x-cloak class="flex items-center gap-1.5">
+                                    <span class="text-xs text-red-600">{{ t('status.clear_confirm') }}</span>
+                                    <button @click="statsScope === 'session' ? clearStats() : clearAlltimeStats()"
+                                            class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                        {{ t('status.clear_yes') }}
+                                    </button>
+                                    <button @click="showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                            class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                        {{ t('status.clear_cancel') }}
+                                    </button>
+                                </div>
+                            </div>
+                            <select x-model="selectedStats模型"
+                                    @change="loadStats()"
+                                    class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                <option value="">{{ t('status.filter_all_models') }}</option>
+                                <template x-for="m in llm模型s" :key="m.id">
+                                    <option :value="m.id" x-text="m.id"></option>
+                                </template>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Three Stat Cards -->
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
+                        <!-- Total Prefill Tokens -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
+                        </div>
+
+                        <!-- Cached Tokens Served -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
+                               x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
+                        </div>
+
+                        <!-- Cache Efficiency -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
+                            <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
+                            <p class="font-bold tracking-tight text-neutral-900 transition-all"
+                               :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
+                               x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
+                        </div>
+                    </div>
+
+                    <!-- Speed Stats -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.speed.section_label') }}</span>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
+                            <div class="p-6">
+                                <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
+                            </div>
+                            <div class="p-6">
+                                <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
+                                <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Active 模型s -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
+                        <div class="lg:hidden flex flex-col gap-2 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
+                            </div>
+                            <div class="flex flex-col gap-1.5 w-full min-w-0">
+                                <div class="w-full h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+                                    <div class="rounded-full transition-all duration-300"
+                                         :style="active模型sPressureBarStyle"></div>
+                                    <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && active模型sSoftPercent > 0"
+                                         x-cloak
+                                         class="absolute inset-y-0"
+                                         :style="active模型sSoftMarkerStyle">
+                                    </div>
+                                </div>
+                                <span class="text-xs font-medium text-neutral-500"
+                                      x-text="active模型sPressureLabel()"></span>
+                            </div>
+                        </div>
+                        <div class="hidden lg:flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
+                            </div>
+                            <div class="flex items-center gap-3">
+                                <!-- 内存 progress bar -->
+                                <div class="flex items-center gap-2">
+                                    <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+                                        <div class="rounded-full transition-all duration-300"
+                                             :style="active模型sPressureBarStyle"></div>
+                                        <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && active模型sSoftPercent > 0"
+                                             x-cloak
+                                             class="absolute inset-y-0"
+                                             :style="active模型sSoftMarkerStyle">
+                                        </div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="active模型sPressureLabel()"></span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <!-- Empty state -->
+                            <div x-show="!stats.active_models.models || stats.active_models.models.length === 0"
+                                 class="px-6 py-8 text-center text-sm text-neutral-400">
+                                {{ t('status.active_models.no_models') }}
+                            </div>
+                            <!-- 模型 rows -->
+                            <template x-for="m in (stats.active_models.models || [])" :key="m.id">
+                                <div class="px-4 lg:px-6 py-3 group min-w-0">
+                                    <div class="lg:hidden flex items-center gap-2 min-w-0">
+                                        <i x-show="m.pinned" data-lucide="pin" class="w-3 h-3 text-neutral-400 flex-shrink-0"></i>
+                                        <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
+                                        <div class="min-w-0 flex-1">
+                                            <div class="text-sm font-medium text-neutral-800 min-w-0 break-words leading-snug" x-text="m.id"></div>
+                                            <div class="mt-1.5 space-y-1 min-w-0">
+                                                <template x-if="m.is_loading">
+                                                    <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-500 font-medium">
+                                                        <svg class="w-3 h-3 shrink-0 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                                        <span class="min-w-0" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
+                                                    <div class="flex items-center gap-1.5 text-xs text-blue-600 font-medium">
+                                                        <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse shrink-0"></span>
+                                                        <span x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests > 0">
+                                                    <div class="flex items-center gap-1.5 text-xs text-green-600 font-medium">
+                                                        <span class="w-2 h-2 rounded-full bg-green-500 shrink-0"></span>
+                                                        <span x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
+                                                    </div>
+                                                </template>
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
+                                                    <div class="flex items-center gap-1.5 text-xs text-neutral-400 min-w-0">
+                                                        <span class="w-2 h-2 rounded-full bg-neutral-300 shrink-0"></span>
+                                                        <span class="min-w-0"
+                                                              x-text="'idle' + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <div class="text-xs text-neutral-400 font-mono min-w-0 break-all"
+                                                     x-text="(m.is_loading ? 'est. ' : '') + modelSizeLabel(m)"></div>
+                                            </div>
+                                        </div>
+                                        <div x-show="!m.is_loading" class="relative shrink-0 self-center">
+                                            <button @click="unload模型(m.id)"
+                                                    class="p-1.5 rounded-md text-neutral-400 hover:text-red-500 hover:bg-red-50 transition-all"
+                                                    :aria-label="window.t('status.active_models.unload')">
+                                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                            </button>
+                                        </div>
+                                        <div x-show="m.is_loading" class="shrink-0 w-9 self-center" aria-hidden="true"></div>
+                                    </div>
+                                    <div class="hidden lg:flex items-center justify-between">
+                                        <div class="flex items-center gap-2">
+                                            <!-- Pin icon -->
+                                            <i x-show="m.pinned" data-lucide="pin" class="w-3 h-3 text-neutral-400 flex-shrink-0"></i>
+                                            <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
+                                            <!-- 模型 name -->
+                                            <span class="text-sm font-medium text-neutral-800" x-text="m.id"></span>
+                                        </div>
+                                        <div class="flex items-center gap-3">
+                                            <!-- Status indicator -->
+                                            <div class="flex items-center gap-1.5">
+                                                <!-- Loading spinner -->
+                                                <template x-if="m.is_loading">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                                        <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <!-- Prefilling -->
+                                                <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
+                                                        <span class="text-xs text-blue-600 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <!-- Active (generation only) -->
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests > 0">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                                                        <span class="text-xs text-green-600 font-medium" x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
+                                                    </div>
+                                                </template>
+                                                <!-- Idle -->
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
+                                                    <div class="flex items-center gap-1.5 flex-wrap">
+                                                        <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
+                                                        <span class="text-xs text-neutral-400">idle</span>
+                                                        <template x-if="m.idle_seconds != null">
+                                                            <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
+                                                        </template>
+                                                        <template x-if="m.ttl_remaining_seconds != null">
+                                                            <span class="text-[10px] text-neutral-400" x-text="'~' + formatDurationShort(m.ttl_remaining_seconds) + ' left'"></span>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                            <!-- 内存 size -->
+                                            <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="modelSizeLabel(m)"></span>
+                                            <!-- Unload button -->
+                                            <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
+                                                 x-data="{ showTip: false }"
+                                                 @mouseenter="showTip = true" @mouseleave="showTip = false">
+                                                <button @click="unload模型(m.id)"
+                                                        class="p-1 rounded-md text-neutral-300 hover:text-red-500 hover:bg-red-50 transition-all">
+                                                    <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                                <div x-show="showTip" x-cloak
+                                                     class="absolute top-1/2 -translate-y-1/2 right-full mr-1.5 px-2 py-1 text-[10px] font-medium text-white bg-neutral-800 rounded whitespace-nowrap z-10"
+                                                     x-text="window.t('status.active_models.unload')"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <!-- Prefill sub-rows -->
+                                    <template x-if="m.prefilling && m.prefilling.length > 0">
+                                        <div class="mt-2 ml-5 space-y-1.5">
+                                            <template x-for="pp in m.prefilling" :key="pp.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="pp.request_id.substring(0, 8)"></span>
+                                                    <div class="flex-1 h-1.5 bg-neutral-100 rounded-full overflow-hidden max-w-[120px]">
+                                                        <div class="h-full bg-blue-400 rounded-full transition-all duration-300"
+                                                             :style="'width: ' + (pp.total > 0 ? Math.min(100, pp.processed / pp.total * 100) : 0) + '%'"></div>
+                                                    </div>
+                                                    <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
+                                                    <span class="text-[10px] text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
+                                                    <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
+                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
+                                                    <span x-show="pp.elapsed != null" class="text-[10px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
+                                                    <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
+                                                          x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Generating sub-rows -->
+                                    <template x-if="m.generating && m.generating.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="gen in m.generating" :key="gen.request_id">
+                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                    </span>
+                                                    <span class="text-[10px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
+                                                    <span x-show="gen.tokens_per_second > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
+                                                          x-text="gen.tokens_per_second.toFixed(1) + ' tok/s'"></span>
+                                                    <span x-show="gen.last_activity_age_seconds >= 3" class="text-[10px] text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
+                                                    <span x-show="gen.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap"
+                                                          x-text="formatDurationShort(gen.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Non-streaming activity sub-rows -->
+                                    <template x-if="m.activities && m.activities.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="activity in m.activities" :key="activity.request_id">
+                                                <div class="flex flex-wrap items-center gap-x-5 gap-y-1">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                                    </span>
+                                                    <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
+                                                    <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Waiting sub-rows -->
+                                    <template x-if="m.waiting && m.waiting.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="wait in m.waiting" :key="wait.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
+                                                    <span class="w-2 h-2 rounded-full bg-amber-300"></span>
+                                                    <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
+                                                    <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
+                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="'prompt: ' + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+                        <!-- Footer: Active/Waiting totals -->
+                        <div x-show="stats.active_models.total_active_requests > 0 || stats.active_models.total_waiting_requests > 0"
+                             class="px-6 py-3 bg-neutral-50 border-t border-neutral-100 flex items-center gap-3">
+                            <span x-show="stats.active_models.total_active_requests > 0"
+                                  class="text-xs text-neutral-500">
+                                <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.active') + ': ' + stats.active_models.total_active_requests"></span>
+                            </span>
+                            <span x-show="stats.active_models.total_active_requests > 0 && stats.active_models.total_waiting_requests > 0"
+                                  class="text-neutral-300">·</span>
+                            <span x-show="stats.active_models.total_waiting_requests > 0"
+                                  class="text-xs text-neutral-500">
+                                <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.waiting') + ': ' + stats.active_models.total_waiting_requests"></span>
+                            </span>
+                        </div>
+                    </div>
+
+                    <!-- 运行时缓存可观测性 -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="lg:hidden flex flex-col gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3 min-w-0">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500 shrink-0"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600 break-words">运行时缓存可观测性</span>
+                            </div>
+                            <div class="flex flex-col gap-2 min-w-0">
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex flex-wrap items-center gap-2 min-w-0">
+                                    <span class="text-xs text-neutral-400 shrink-0">内存</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track shrink-0">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeHotCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 min-w-0 break-words"
+                                          x-text="formatSizeBytes(stats.runtime_cache.hot_cache_size_bytes) + ' / ' + formatSizeBytes(stats.runtime_cache.hot_cache_max_bytes) + ' · ' + (stats.runtime_cache.hot_cache_entries || 0) + ' entries'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
+                                                @click="showClearHotCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                title="Clear memory cache">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <button @click="clearHotCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearHotCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2 min-w-0">
+                                    <span class="text-xs text-neutral-400 shrink-0">SSD</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track shrink-0">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 min-w-0 break-words"
+                                          x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
+                                                @click="showClearSsdCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                :title="window.t('status.clear_ssd_cache_tooltip')">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
+                                            <button @click="clearSsdCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearSsdCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hidden lg:flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">运行时缓存可观测性</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <!-- 内存 gauge (only when hot cache is enabled AND models are loaded) -->
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex items-center gap-2">
+                                    <span class="text-xs text-neutral-400">内存</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeHotCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.runtime_cache.hot_cache_size_bytes) + ' / ' + formatSizeBytes(stats.runtime_cache.hot_cache_max_bytes) + ' · ' + (stats.runtime_cache.hot_cache_entries || 0) + ' entries'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
+                                                @click="showClearHotCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                title="Clear memory cache">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <button @click="clearHotCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearHotCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Separator (only when both tiers visible) -->
+                                <span x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
+                                <!-- SSD gauge (always visible) -->
+                                <div class="flex items-center gap-2">
+                                    <span class="text-xs text-neutral-400">SSD</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                                </div>
+                                <div class="flex items-center gap-1.5">
+                                    <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
+                                            @click="showClearSsdCacheConfirm = true"
+                                            class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                            :title="window.t('status.clear_ssd_cache_tooltip')">
+                                        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                    <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                        <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
+                                        <button @click="clearSsdCache()"
+                                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                            {{ t('status.clear_yes') }}
+                                        </button>
+                                        <button @click="showClearSsdCacheConfirm = false"
+                                                class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                            {{ t('status.clear_cancel') }}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="px-6 py-4 space-y-3">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-1">当前 base_path</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.base_path || '-' "></code>
+                                </div>
+                                <div>
+                                    <div class="text-neutral-400 mb-1">有效 ssd_cache_dir</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.ssd_cache_dir || '-' "></code>
+                                </div>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <div class="text-neutral-400 mb-1">response-state directory</div>
+                                    <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
+                                          x-text="stats.runtime_cache?.response_state_dir || '-' "></code>
+                                </div>
+                            </div>
+
+                            <!-- Cache rates (visible when models are loaded, session scope only) -->
+                            <div x-show="statsScope !== 'alltime' && stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
+                                 x-data="{ get c() { return cacheObsCumulative(stats, selectedStats模型) } }"
+                                 :class="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2'"
+                                 class="grid gap-3 border border-neutral-100 rounded-lg p-3">
+                                <div>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">前缀命中率</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="((c.prefix_hit_rate || 0) * 100).toFixed(1) + '%'"></p>
+                                </div>
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">内存 Hit Rate</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="((c.ssd_hot_rate || 0) * 100).toFixed(1) + '%'"></p>
+                                </div>
+                                <div>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">前缀淘汰数</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="(c.evictions || 0).toLocaleString()"></p>
+                                </div>
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">内存 Evictions</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="(c.hot_cache_evictions || 0).toLocaleString()"></p>
+                                </div>
+                            </div>
+
+                            <div x-show="stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
+                                 class="overflow-x-auto border border-neutral-100 rounded-lg">
+                                <table class="min-w-full text-xs">
+                                    <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
+                                        <tr>
+                                            <th class="px-3 py-2 text-left">模型</th>
+                                            <th class="px-3 py-2 text-right">块大小</th>
+                                            <th class="px-3 py-2 text-right">索引块数</th>
+                                            <th class="px-3 py-2 text-right">子块缓存</th>
+                                            <th class="px-3 py-2 text-right">SSD 文件数</th>
+                                            <th class="px-3 py-2 text-right">SSD 大小</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">内存 Entries</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">内存 Size</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-neutral-100 text-neutral-700">
+                                        <template x-for="m in stats.runtime_cache.models" :key="m.id">
+                                            <tr>
+                                                <td class="px-3 py-2 font-medium" x-text="m.id"></td>
+                                                <td class="px-3 py-2 text-right" x-text="m.block_size ? (m.block_size + ' tks') : '-' "></td>
+                                                <td class="px-3 py-2 text-right">
+                                                    <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
+                                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
+                                                </td>
+                                                <td class="px-3 py-2 text-right">
+                                                    <span x-show="m.has_sub_block_cache"
+                                                          class="text-amber-600"
+                                                          x-text="'cached (' + (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))) + ' tokens)'">
+                                                    </span>
+                                                    <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>
+                                                </td>
+                                                <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
+                                                <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>
+                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="formatSizeBytes(m.hot_cache_size_bytes || 0)"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="text-[11px] text-neutral-500">
+                                Note: <span class="font-medium text-amber-600">子块缓存</span> means requests below one full block (for example &lt;1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- API Endpoints -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="link" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
+                            </div>
+                            <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
+                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">Host</label>
+                                <select id="server-alias-select"
+                                        x-model="selectedAlias"
+                                        class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
+                                    <template x-for="alias in serverAliases" :key="alias">
+                                        <option :value="alias" x-text="alias"></option>
+                                    </template>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.openai') }}</label>
+                                <div class="flex items-center gap-2">
+                                    <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                          x-text="'http://' + displayHost + ':' + stats.port + '/v1'"></code>
+                                    <button x-data="{ copied: false }"
+                                            @click="copyToClipboard('http://' + displayHost + ':' + stats.port + '/v1'); copied = true; setTimeout(() => copied = false, 2000)"
+                                            class="p-1.5 rounded-lg transition-all"
+                                            :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
+                                            :title="window.t('status.api.copy_tooltip')">
+                                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                <label class="text-sm text-neutral-700 font-medium">{{ t('status.api.claude') }}</label>
+                                <div class="flex items-center gap-2">
+                                    <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                          x-text="'http://' + displayHost + ':' + stats.port"></code>
+                                    <button x-data="{ copied: false }"
+                                            @click="copyToClipboard('http://' + displayHost + ':' + stats.port); copied = true; setTimeout(() => copied = false, 2000)"
+                                            class="p-1.5 rounded-lg transition-all"
+                                            :class="copied ? 'text-green-500' : 'text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100'"
+                                            :title="window.t('status.api.copy_tooltip')">
+                                        <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                        <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Claude Code with oMLX -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="terminal" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.claude_code.section_label') }}</span>
+                            </div>
+                        </div>
+                        <div class="px-6 py-5">
+                            <div class="flex flex-col sm:flex-row gap-4 items-start">
+                                <!-- Left: Mode Toggle -->
+                                <div class="w-full sm:w-48 sm:flex-shrink-0">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.mode') }}</label>
+                                    <div class="flex items-center gap-3">
+                                        <button type="button"
+                                                @click="globalSettings.claude_code.mode = (globalSettings.claude_code.mode === 'cloud' ? 'local' : 'cloud'); saveClaudeCodeSettings()"
+                                                :class="globalSettings.claude_code.mode === 'local' ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                            <span :class="globalSettings.claude_code.mode === 'local' ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                                        </button>
+                                        <span class="text-sm font-medium text-neutral-700" x-text="globalSettings.claude_code.mode === 'cloud' ? window.t('status.claude_code.mode_cloud') : window.t('status.claude_code.mode_local')"></span>
+                                    </div>
+                                </div>
+
+                                <!-- Right: Command -->
+                                <div class="flex-1 min-w-0">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.command') }}</label>
+                                    <div class="relative group">
+                                        <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
+                                             x-text="claudeCodeCommand"></pre>
+                                        <button x-data="{ copied: false }"
+                                                @click="copyToClipboard(claudeCodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
+                                                :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
+                                                :title="window.t('status.claude_code.copy_command_tooltip')">
+                                            <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                            <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Per-tier model selectors (Local mode only) — 3 columns -->
+                            <div x-show="globalSettings.claude_code.mode === 'local'" x-cloak class="mt-4 pt-4 border-t border-neutral-100">
+                                <!-- No models loaded warning -->
+                                <div x-show="llm模型s.length === 0" x-cloak
+                                     class="flex items-center gap-2 px-3 py-2.5 mb-4 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+                                    <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                    <span>{{ t('status.claude_code.no_models_warning') }}</span>
+                                </div>
+                                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                    <!-- Opus tier -->
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.opus_tier') }}</label>
+                                        <select x-model="globalSettings.claude_code.opus_model"
+                                                @change="globalSettings.claude_code.opus_model = globalSettings.claude_code.opus_model || null; saveClaudeCodeSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.claude_code.select_model') }}</option>
+                                            <template x-for="m in llm模型s" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.claude_code.opus_model && llm模型s.length > 0 && !llm模型s.find(m => m.id === globalSettings.claude_code.opus_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.claude_code.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <!-- Sonnet tier -->
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.sonnet_tier') }}</label>
+                                        <select x-model="globalSettings.claude_code.sonnet_model"
+                                                @change="globalSettings.claude_code.sonnet_model = globalSettings.claude_code.sonnet_model || null; saveClaudeCodeSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.claude_code.select_model') }}</option>
+                                            <template x-for="m in llm模型s" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.claude_code.sonnet_model && llm模型s.length > 0 && !llm模型s.find(m => m.id === globalSettings.claude_code.sonnet_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.claude_code.model_unavailable') }}</span>
+                                        </div>
+                                    </div>
+                                    <!-- Haiku tier -->
+                                    <div>
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.haiku_tier') }}</label>
+                                        <select x-model="globalSettings.claude_code.haiku_model"
+                                                @change="globalSettings.claude_code.haiku_model = globalSettings.claude_code.haiku_model || null; saveClaudeCodeSettings()"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                            <option value="">{{ t('status.claude_code.select_model') }}</option>
+                                            <template x-for="m in llm模型s" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
+                                        <div x-show="globalSettings.claude_code.haiku_model && llm模型s.length > 0 && !llm模型s.find(m => m.id === globalSettings.claude_code.haiku_model)"
+                                             x-cloak
+                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                            <span>{{ t('status.claude_code.model_unavailable') }}</span>
+                                        </div>
+                                        <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Context Scaling for Claude Code -->
+                            <div class="mt-4 pt-4 border-t border-neutral-100">
+                                <div class="flex flex-col sm:flex-row gap-4 sm:items-center">
+                                    <div class="flex items-center gap-3">
+                                        <label class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('status.claude_code.context_scaling') }}</label>
+                                        <button type="button"
+                                                @click="globalSettings.claude_code.context_scaling_enabled = !globalSettings.claude_code.context_scaling_enabled; saveClaudeCodeSettings()"
+                                                :class="globalSettings.claude_code.context_scaling_enabled ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                            <span :class="globalSettings.claude_code.context_scaling_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                                        </button>
+                                    </div>
+
+                                    <div class="flex items-center gap-2" x-show="globalSettings.claude_code.context_scaling_enabled" x-cloak>
+                                        <label class="text-xs font-bold uppercase tracking-wider text-neutral-500 whitespace-nowrap">{{ t('status.claude_code.target_context_size') }}</label>
+                                        <input type="number"
+                                               x-model.number="globalSettings.claude_code.target_context_size"
+                                               @change="saveClaudeCodeSettings()"
+                                               min="1024" step="1024"
+                                               class="w-32 px-3 py-1.5 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                        <span class="text-xs text-neutral-400">{{ t('status.claude_code.tokens_unit') }}</span>
+                                    </div>
+                                </div>
+                                <p class="mt-2 text-xs text-neutral-400 leading-relaxed">{{ t('status.claude_code.context_scaling_description') }}</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Applications -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="layout-grid" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.integrations.section_label') }}</span>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+
+                            <!-- Claude Code -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/claude.png" alt="Claude Code" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Claude Code</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="claudeCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(claudeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- Codex -->
+                            <div class="flex items-start gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/codex.png" alt="Codex" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0 space-y-2">
+                                    <div class="text-sm font-semibold text-neutral-800">Codex</div>
+                                    <div class="space-y-1.5">
+                                        <div class="flex items-center gap-2 min-w-0">
+                                            <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">CLI</span>
+                                            <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexCommand"></code>
+                                            <button x-data="{ copied: false }"
+                                                    @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                                    :title="window.t('status.integrations.copy_command_tooltip')">
+                                                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+                                        <div class="flex items-center gap-2 min-w-0">
+                                            <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">App</span>
+                                            <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexAppCommand"></code>
+                                            <button x-data="{ copied: false }"
+                                                    @click="copyToClipboard(codexAppCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                                    :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                                    :title="window.t('status.integrations.copy_command_tooltip')">
+                                                <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- OpenCode -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/opencode.png" alt="OpenCode" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">OpenCode</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="opencodeCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(opencodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- OpenClaw -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/openclaw.png" alt="OpenClaw" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">OpenClaw</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="openclawCommand"></code>
+                                </div>
+                                <select x-model="globalSettings.integrations.openclaw_tools_profile"
+                                        @change="saveIntegrationSettings()"
+                                        class="text-xs border border-neutral-200 rounded-md px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
+                                    <option value="minimal">Minimal</option>
+                                    <option value="coding">Coding</option>
+                                    <option value="messaging">Messaging</option>
+                                    <option value="full">Full</option>
+                                </select>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- Hermes Agent -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/hermes.svg" alt="Hermes Agent" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Hermes Agent</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="hermesCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(hermesCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- Pi -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/pi.svg" alt="Pi" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Pi</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="piCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(piCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- Copilot CLI -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/copilot.svg" alt="Copilot CLI" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Copilot CLI</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="copilotCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(copilotCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                        </div>
+                    </div>
+
+                    <!-- Engine Versions -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="cpu" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.engines.section_label') }}</span>
+                            </div>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <template x-for="[key, engine] in Object.entries(stats.engines || {})" :key="key">
+                                <div class="flex items-center justify-between px-6 py-4">
+                                    <label class="text-sm text-neutral-700 font-medium" x-text="engine.name"></label>
+                                    <div class="flex items-center gap-2">
+                                        <template x-if="engine.commit && engine.url">
+                                            <a :href="engine.url" target="_blank" rel="noopener noreferrer"
+                                               class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-all"
+                                               x-text="engine.commit.substring(0, 7)"></a>
+                                        </template>
+                                        <template x-if="!engine.commit">
+                                            <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                                  x-text="engine.version || 'unknown'"></code>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>
