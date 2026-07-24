@@ -4292,6 +4292,36 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
+        # #2219: both chunked-completion paths (inline first chunk and
+        # _advance_chunked_prefills) funnel through here, but external VLM MTP
+        # routing only existed on the non-chunked prefill exit -- so any prompt
+        # long enough to be chunk-prefilled silently bypassed VLM MTP. Re-apply
+        # the decision at this shared choke point, BEFORE the TurboQuant convert
+        # below, so the drafter's final forward sees the un-quantized cache. A
+        # declined route (e.g. the single-in-flight drafter is busy) falls
+        # through to BatchGenerator, matching short-prompt behaviour.
+        if self._vlm_mtp_drafter is not None and state.cache is not None:
+            vlm_mtp_uid = self._route_to_vlm_mtp(
+                request, state.cache, state.last_token, state.sampler, state.sm
+            )
+            if vlm_mtp_uid is not None:
+                self.request_id_to_uid[request.request_id] = vlm_mtp_uid
+                self.uid_to_request_id[vlm_mtp_uid] = request.request_id
+                now = time.monotonic()
+                request.batch_uid = vlm_mtp_uid
+                request.status = RequestStatus.RUNNING
+                request.generation_started_at = now
+                request.last_activity_at = now
+                self.running[request.request_id] = request
+                scheduled.append(request)
+                self.total_prompt_tokens += request.num_prompt_tokens
+                logger.debug(
+                    "Scheduled chunked-prefill request %s via vlm_mtp (uid=%d)",
+                    request.request_id,
+                    vlm_mtp_uid,
+                )
+                return
+
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
         if request.sampling_params.seed is not None:
