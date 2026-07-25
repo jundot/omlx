@@ -173,7 +173,12 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
     // at S=131k (real top-k index patterns, M3 Ultra), 85.4 ms at S=303k; output
     // differs from BK=256 only in bf16 summation-order rounding (identical error
     // vs fp32 ground-truth attention). BK=64 over-fragments (102 ms). The 64-head
-    // variant keeps BK=256 (untested at other sizes; its slab already fits 1/core).
+    // variant keeps BK=256, and not because its slab is smaller: at ~26KB it is
+    // in the same one-threadgroup-per-core situation. It just runs wm=8, so a
+    // single threadgroup already holds 256 threads and fills the core, and
+    // halving BK only fragments the K tile into more barrier-separated phases
+    // (measured 2-9% slower at BK=128 and 10-29% slower at BK=64, across
+    // qL=512..8192 and four top-k index layouts on an M3 Ultra).
     const int bk = (q_latent.shape(1) == 32) ? 128 : 256;
     constexpr int dc = 32;
     constexpr int d_latent = 512;
