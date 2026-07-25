@@ -929,6 +929,44 @@ class TestEmbeddingEngine:
         with pytest.raises(RuntimeError, match="Engine not started"):
             asyncio.run(engine.embed(["Hello"]))
 
+    def test_engine_embed_groups_by_length_and_restores_caller_order(self):
+        """A batch pads to its longest member, so inputs are embedded length-sorted.
+
+        The caller's order must survive that: every embedding comes back on the
+        input it was produced from, or a document silently receives its
+        neighbour's vector.
+        """
+        import asyncio
+
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.models.embedding import EmbeddingOutput
+
+        texts = ["cccc", "a", "eeeeeeee", "bb", "dddddd", "a", "", "fffffffffff"]
+        seen_batches = []
+
+        def fake_embed(inputs, **kwargs):
+            seen_batches.append(list(inputs))
+            # the vector identifies the text it was produced from
+            return EmbeddingOutput(
+                embeddings=[[float(len(t))] for t in inputs],
+                total_tokens=sum(len(t) for t in inputs),
+                dimensions=1,
+            )
+
+        engine = EmbeddingEngine("test-model")
+        mock_model = MagicMock()
+        mock_model.embed.side_effect = fake_embed
+        engine._model = mock_model
+        engine._batch_size = 3
+
+        output = asyncio.run(engine.embed(texts))
+
+        assert [v[0] for v in output.embeddings] == [float(len(t)) for t in texts]
+
+        embedded = [t for batch in seen_batches for t in batch]
+        assert sorted(embedded, key=len) == embedded
+        assert sorted(embedded) == sorted(texts)
+
     def test_engine_get_stats(self):
         """Test engine statistics."""
         from omlx.engine.embedding import EmbeddingEngine
