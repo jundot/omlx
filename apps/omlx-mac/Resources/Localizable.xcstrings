@@ -1530,7 +1530,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CMMLU (Chinese)"
+            "value" : "CMMLU (китайский)"
           }
         }
       }
@@ -1548,7 +1548,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "JMMLU (Japanese)"
+            "value" : "JMMLU (японский)"
           }
         }
       }
@@ -1566,7 +1566,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "KMMLU (Korean)"
+            "value" : "KMMLU (корейский)"
           }
         }
       }
@@ -5089,7 +5089,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "server.log (current)"
+            "value" : "server.log (текущий)"
           }
         }
       }
@@ -6457,7 +6457,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CA bundle"
+            "value" : "Набор CA-сертификатов"
           }
         }
       }
@@ -6475,7 +6475,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Абсолютный путь к PEM-encoded CA bundle. Пусто = системное хранилище доверия."
+            "value" : "Абсолютный путь к набору CA-сертификатов в формате PEM. Пусто = системное хранилище доверия."
           }
         }
       }
@@ -7169,7 +7169,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Самый консервативный. Оставляет больше запаса перед планированием memory-heavy prefill."
+            "value" : "Самый консервативный. Оставляет больше запаса перед планированием ресурсоёмкого префилла."
           }
         }
       }
@@ -7367,7 +7367,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Защита памяти prefill"
+            "value" : "Защита памяти префилла"
           }
         }
       }
@@ -7385,7 +7385,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Проверять память для prefill перед запуском движка. Отбрасывает запросы, которые привели бы к OOM."
+            "value" : "Проверять память для префилла перед запуском движка. Отбрасывает запросы, которые привели бы к OOM."
           }
         }
       }
@@ -7403,7 +7403,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chunked prefill"
+            "value" : "Порционный префилл"
           }
         }
       }
@@ -7421,7 +7421,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Разбивать длинные промпты по тикам scheduler, чтобы другие запросы могли чередоваться."
+            "value" : "Разбивать длинные промпты по тикам планировщика, чтобы другие запросы могли чередоваться."
           }
         }
       }
@@ -8897,7 +8897,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "profile-name"
+            "value" : "имя-профиля"
           }
         }
       }
@@ -12069,7 +12069,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chunk"
+            "value" : "Фрагмент"
           }
         }
       }
@@ -12087,7 +12087,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Comment"
+            "value" : "Комментарий"
           }
         }
       }
@@ -12123,7 +12123,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Как сервер удерживает долгоживущие SSE-потоки открытыми. \"chunk\" отправляет пустую data-строку, \"comment\" отправляет `: ping`, \"off\" отключает."
+            "value" : "Как сервер удерживает открытыми долгоживущие SSE-потоки. \"chunk\" отправляет пустую data-строку, \"comment\" отправляет `: ping`, \"off\" отключает режим."
           }
         }
       }
@@ -12660,7 +12660,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Debug"
+            "value" : "Отладка"
           }
         }
       }
@@ -12678,7 +12678,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Error"
+            "value" : "Ошибка"
           }
         }
       }
@@ -12696,7 +12696,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Info"
+            "value" : "Информация"
           }
         }
       }
@@ -12714,7 +12714,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Trace"
+            "value" : "Трассировка"
           }
         }
       }
@@ -12732,7 +12732,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Warning"
+            "value" : "Предупреждение"
           }
         }
       }
@@ -14292,7 +14292,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Reasoning parser"
+            "value" : "Парсер рассуждений"
           }
         }
       }
@@ -14310,7 +14310,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Переопределить parser chain-of-thought. Оставьте пустым, чтобы использовать значение модели по умолчанию."
+            "value" : "Переопределяет парсер chain-of-thought. Оставьте пустым, чтобы использовать значение модели по умолчанию."
           }
         }
       }
@@ -14562,7 +14562,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Лимит сгенерированных токенов (пусто = default)"
+            "value" : "Лимит сгенерированных токенов (пусто = значение по умолчанию)"
           }
         }
       }
@@ -15372,7 +15372,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Максимум prefix snapshots в RAM. Каждая запись хранит KV + состояние draft GDN."
+            "value" : "Максимум префиксных снимков в оперативной памяти. Каждая запись хранит KV и состояние draft GDN."
           }
         }
       }
@@ -15408,7 +15408,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "L1 prefix snapshot cache DFlash в RAM."
+            "value" : "L1-кэш префиксных снимков DFlash в оперативной памяти."
           }
         }
       }
@@ -15426,7 +15426,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Draft sink size"
+            "value" : "Размер attention sink"
           }
         }
       }
@@ -15444,7 +15444,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-sink токены, всегда сохраняемые в окне. Пусто = default DFlash (64)."
+            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение DFlash по умолчанию (64)."
           }
         }
       }
@@ -15516,7 +15516,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "L2 spill вытесненных L1-записей на диск."
+            "value" : "L2-хранилище для вытесненных L1-записей на диске."
           }
         }
       }
@@ -15588,7 +15588,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Режим verifier"
+            "value" : "Режим верификатора"
           }
         }
       }
@@ -15606,7 +15606,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Алгоритм verifier. \"adaptive\" уменьшает размер блока при падении acceptance; \"off\" отключает speculative verify."
+            "value" : "Алгоритм верификатора. \"adaptive\" уменьшает размер блока при снижении доли принятых токенов; \"off\" отключает спекулятивную проверку."
           }
         }
       }
@@ -15642,7 +15642,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sliding-attention окно draft-модели. Пусто = default DFlash (1024)."
+            "value" : "Sliding-attention-окно драфт-модели. Пусто = значение DFlash по умолчанию (1024)."
           }
         }
       }
@@ -15732,7 +15732,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Keep rate"
+            "value" : "Доля сохранения"
           }
         }
       }
@@ -15768,7 +15768,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-based sparse prefill для MoE/hybrid моделей."
+            "value" : "Разреженный префилл на основе attention для MoE- и гибридных моделей."
           }
         }
       }
@@ -15804,7 +15804,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Минимум токенов промпта для срабатывания (короткие промпты используют полный prefill)."
+            "value" : "Минимум токенов промпта для срабатывания (короткие промпты используют полный префилл)."
           }
         }
       }
@@ -15840,7 +15840,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Квантовать KV-кэш во время prefill. Экономит память с небольшой потерей качества."
+            "value" : "Квантовать KV-кэш во время префилла. Экономит память с небольшой потерей качества."
           }
         }
       }
@@ -15876,7 +15876,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Токены, draft-ируемые за раунд. Пусто использует default mlx-vlm."
+            "value" : "Количество токенов драфта за раунд. Пусто = значение mlx-vlm по умолчанию."
           }
         }
       }
@@ -18472,7 +18472,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Всего prefill-токенов"
+            "value" : "Всего токенов префилла"
           }
         }
       }
@@ -18490,7 +18490,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "prompt + completion"
+            "value" : "промпт + ответ"
           }
         }
       }
@@ -18634,7 +18634,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stable получает проверенные релизы. Beta раньше получает новые функции."
+            "value" : "Стабильный канал получает проверенные релизы. Бета-канал раньше получает новые функции."
           }
         }
       }
@@ -18937,7 +18937,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Beta"
+            "value" : "Бета"
           }
         }
       }
@@ -18973,7 +18973,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nightly"
+            "value" : "Ночная сборка"
           }
         }
       }
@@ -18991,7 +18991,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Release Candidate"
+            "value" : "Релиз-кандидат"
           }
         }
       }
@@ -19009,7 +19009,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stable"
+            "value" : "Стабильный"
           }
         }
       }
