@@ -42,6 +42,39 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
         qwen3_vl_processor, "AutoImageProcessor", None
     )
 
+    class OMLXQwen3VLImageProcessor(Qwen3VLImageProcessor):
+        """Preserve batched image nesting expected by ProcessorMixin.
+
+        Transformers passes multimodal chat-template images as a nested
+        ``list[list[image]]``. mlx-vlm's Qwen3-VL override only handles a flat
+        list, so an inner list is converted to a one-dimensional numpy array
+        instead of a ``(C, H, W)`` image.
+        """
+
+        def fetch_images(self, images):
+            if isinstance(images, (list, tuple)):
+                return [self.fetch_images(image) for image in images]
+            if isinstance(images, str) and images.strip().lower().startswith(
+                "data:image/"
+            ):
+                from omlx.utils.image import load_image
+
+                images = load_image(images, field="items[].image")
+            return super().fetch_images(images)[0]
+
+        def __call__(self, images, **kwargs):
+            flattened = []
+
+            def append_images(value):
+                if isinstance(value, (list, tuple)):
+                    for image in value:
+                        append_images(image)
+                else:
+                    flattened.append(value)
+
+            append_images(images)
+            return super().__call__(flattened, **kwargs)
+
     class TorchFreeQwen3VLAutoImageProcessor:
         _omlx_original_auto_image_processor = original_auto_image_processor
 
@@ -52,7 +85,7 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
                 pretrained_model_name_or_path,
                 default_patch_size=16,
             )
-            return Qwen3VLImageProcessor(**image_kwargs)
+            return OMLXQwen3VLImageProcessor(**image_kwargs)
 
     qwen3_vl_processor.AutoImageProcessor = TorchFreeQwen3VLAutoImageProcessor
 

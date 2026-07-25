@@ -46,6 +46,15 @@ def test_qwen3_vl_auto_image_processor_uses_mlx_vlm_torch_free_loader(monkeypatc
         def __init__(self, **kwargs):
             captured["kwargs"] = kwargs
 
+        def fetch_images(self, images):
+            if not isinstance(images, list):
+                images = [images]
+            return [type(image).__name__ for image in images]
+
+        def __call__(self, images, **kwargs):
+            del kwargs
+            return images
+
     def fake_image_kwargs(model_path, default_patch_size=16):
         captured["model_path"] = model_path
         captured["default_patch_size"] = default_patch_size
@@ -93,6 +102,21 @@ def test_qwen3_vl_auto_image_processor_uses_mlx_vlm_torch_free_loader(monkeypatc
     assert captured["model_path"] == "/models/Qwen3-VL-Embedding-8B-8bit-mlx"
     assert captured["default_patch_size"] == 16
     assert captured["kwargs"] == {"patch_size": 16, "merge_size": 2}
+
+    nested_images = image_processor.fetch_images([["first-image"], ["second-image"]])
+    assert nested_images == [["str"], ["str"]]
+    assert image_processor(nested_images) == ["str", "str"]
+
+    nested_data_uri = image_processor.fetch_images(
+        [
+            [
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCA"
+                "QAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+            ]
+        ]
+    )
+    assert nested_data_uri == [["Image"]]
+    assert image_processor(nested_data_uri) == ["Image"]
 
 
 def test_qwen3_vl_build_processor_gets_multimodal_token_id_fields(monkeypatch):
