@@ -1063,15 +1063,20 @@ templates.env.globals["current_lang"] = "en"
 
 
 def _load_locale(language: str) -> dict:
-    """Load locale dict for a given language code. Falls back to en on error."""
+    """Load locale dict and fill missing keys from English."""
+    fallback = dict(_en_locale)
     path = _i18n_dir / f"{language}.json"
+    if language == "en":
+        return fallback
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        locale = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         try:
             return json.loads((_i18n_dir / "en.json").read_text(encoding="utf-8"))
         except Exception:
             return {}
+    fallback.update(locale)
+    return fallback
 
 
 def _make_t(locale: dict):
