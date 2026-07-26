@@ -660,3 +660,76 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+class TestModelSettingsManagerSave:
+    """Tests for _save link-preservation and crash-safety (issue #1958)."""
+
+    def test_symlink_preserved_after_save(self):
+        """Saving must write through a symlink, not replace it with a regular file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_file = Path(tmpdir) / "real_model_settings.json"
+            link_file = Path(tmpdir) / "model_settings.json"
+
+            real_file.write_text("{}", encoding="utf-8")
+            link_file.symlink_to(real_file)
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("mymodel", ModelSettings(temperature=0.7))
+
+            assert link_file.is_symlink(), "symlink was replaced with a regular file"
+            assert link_file.resolve() == real_file.resolve(), (
+                "symlink target changed after save"
+            )
+            saved = json.loads(real_file.read_text())
+            assert "mymodel" in saved["models"]
+
+    def test_hard_link_preserved_after_save(self):
+        """Saving must write through a hard link (shared inode), not break it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            hard_link = Path(tmpdir) / "model_settings_backup.json"
+
+            settings_file.write_text("{}", encoding="utf-8")
+            hard_link.hardlink_to(settings_file)
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("mymodel", ModelSettings(temperature=0.5))
+
+            assert settings_file.stat().st_ino == hard_link.stat().st_ino, (
+                "hard link inode changed — atomic rename broke the link"
+            )
+            saved = json.loads(hard_link.read_text())
+            assert "mymodel" in saved["models"]
+
+    def test_temp_file_cleaned_up_on_success(self):
+        """The .tmp backup file must be removed after a successful save."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("mymodel", ModelSettings(temperature=0.3))
+
+            tmp_path = Path(tmpdir) / "model_settings.tmp"
+            assert not tmp_path.exists(), ".tmp file was not cleaned up after save"
+
+    def test_serialization_error_leaves_file_untouched(self):
+        """A JSON encoding error must not corrupt the existing settings file."""
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("mymodel", ModelSettings(temperature=0.9))
+
+            settings_file = Path(tmpdir) / "model_settings.json"
+            original_content = settings_file.read_text()
+
+            # Make json.dumps raise before any file is touched
+            with mock.patch(
+                "omlx.model_settings.json.dumps",
+                side_effect=TypeError("not serializable"),
+            ):
+                with pytest.raises(Exception):
+                    manager.set_settings("another", ModelSettings())
+
+            # Original file must be unchanged and no stray temp file
+            assert settings_file.read_text() == original_content
+            assert not (Path(tmpdir) / "model_settings.tmp").exists()
