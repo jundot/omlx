@@ -13,7 +13,13 @@ These models define the request and response schemas for:
 import json
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -298,6 +304,10 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Convenience top-level toggle folded into chat_template_kwargs below, so
+    # callers can control Qwen3-style thinking without knowing the nested
+    # incantation (matches the Qwen model card and other MLX servers).
+    enable_thinking: Optional[bool] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)
@@ -316,6 +326,23 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def _fold_enable_thinking(self):
+        """Fold a top-level ``enable_thinking`` into ``chat_template_kwargs``.
+
+        Downstream (``merge_chat_template_request_kwargs``) only reads
+        ``chat_template_kwargs``, so mapping here makes the top-level toggle work
+        on every path (streaming and non-streaming) and keeps the model's
+        ``forced_ct_kwargs`` lock authoritative.  An explicit nested value wins:
+        the top-level toggle only fills the key when it is not already set.
+        """
+        if self.enable_thinking is None:
+            return self
+        kwargs = dict(self.chat_template_kwargs or {})
+        kwargs.setdefault("enable_thinking", self.enable_thinking)
+        self.chat_template_kwargs = kwargs
+        return self
 
 
 class AssistantMessage(BaseModel):

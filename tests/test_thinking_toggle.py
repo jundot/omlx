@@ -2,8 +2,11 @@
 
 import json
 
+import pytest
+
+from omlx.api.openai_models import ChatCompletionRequest
 from omlx.model_discovery import detect_preserve_thinking, detect_thinking_default
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, merge_chat_template_request_kwargs
 
 # ---------------------------------------------------------------------------
 # detect_thinking_default
@@ -209,3 +212,75 @@ class TestModelSettingsPreserveThinking:
     def test_set_to_false(self):
         ms = ModelSettings(preserve_thinking=False)
         assert ms.preserve_thinking is False
+
+
+# ---------------------------------------------------------------------------
+# Top-level enable_thinking on ChatCompletionRequest (#2367)
+# ---------------------------------------------------------------------------
+
+
+def _chat_request(**extra):
+    return ChatCompletionRequest.model_validate(
+        {
+            "model": "qwen3.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            **extra,
+        }
+    )
+
+
+class TestRequestEnableThinkingToggle:
+    """A top-level ``enable_thinking`` folds into ``chat_template_kwargs`` so
+    callers don't have to know the nested incantation (#2367)."""
+
+    def test_top_level_false_folds_into_chat_template_kwargs(self):
+        req = _chat_request(enable_thinking=False)
+        assert req.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_top_level_true_folds_into_chat_template_kwargs(self):
+        req = _chat_request(enable_thinking=True)
+        assert req.chat_template_kwargs == {"enable_thinking": True}
+
+    def test_absent_leaves_chat_template_kwargs_untouched(self):
+        # No thinking control means the model default applies downstream.
+        assert _chat_request().chat_template_kwargs is None
+
+    def test_nested_value_wins_over_top_level(self):
+        req = _chat_request(
+            enable_thinking=True,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        assert req.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_top_level_fills_alongside_other_kwargs(self):
+        req = _chat_request(
+            enable_thinking=False,
+            chat_template_kwargs={"reasoning_effort": "low"},
+        )
+        assert req.chat_template_kwargs == {
+            "reasoning_effort": "low",
+            "enable_thinking": False,
+        }
+
+    def test_non_boolean_is_rejected(self):
+        # Accept-and-ignore is the original bug; a wrong type must 422, not pass.
+        with pytest.raises(ValueError):
+            _chat_request(enable_thinking="banana")
+
+    def test_reaches_render_kwargs_end_to_end(self):
+        req = _chat_request(enable_thinking=False)
+        merged = merge_chat_template_request_kwargs(None, req.chat_template_kwargs)
+        assert merged == {"enable_thinking": False}
+
+    def test_forced_lock_overrides_top_level(self):
+        # A model that forces enable_thinking ignores the per-request toggle.
+        ms = ModelSettings(enable_thinking=True, forced_ct_kwargs=["enable_thinking"])
+        req = _chat_request(enable_thinking=False)
+        merged = merge_chat_template_request_kwargs(ms, req.chat_template_kwargs)
+        assert merged == {"enable_thinking": True}
+
+    def test_top_level_overrides_unlocked_model_default(self):
+        ms = ModelSettings(enable_thinking=True)
+        req = _chat_request(enable_thinking=False)
+        merged = merge_chat_template_request_kwargs(ms, req.chat_template_kwargs)
+        assert merged == {"enable_thinking": False}
