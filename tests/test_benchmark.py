@@ -1464,3 +1464,132 @@ class TestRunExternalBenchmark:
         assert run.events[-1]["type"] == "error"
         assert "cancelled" in run.events[-1]["message"].lower()
         client.aclose.assert_awaited()
+
+
+# =============================================================================
+# SpecPrefill per-model settings forwarding (regression for #1145)
+# =============================================================================
+
+
+class TestSpecPrefillSettingsLoad:
+    """``run_benchmark`` must forward the model's configured SpecPrefill
+    overrides (``specprefill_keep_pct`` / ``specprefill_threshold``) to every
+    benchmark request. Otherwise the engine silently falls back to its built-in
+    defaults (``DEFAULT_THRESHOLD=8192``) and the produced numbers do not match
+    the user's configured threshold — exactly the symptom reported in #1145.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_test_forwards_threshold_and_keep_pct(self):
+        """``_run_single_test`` must thread SpecPrefill kwargs to stream_generate."""
+        from omlx.admin.benchmark import _run_single_test
+
+        captured: dict = {}
+
+        async def fake_stream_generate(**kwargs):
+            captured.update(kwargs)
+            yield MagicMock(
+                completion_tokens=1,
+                prompt_tokens=512,
+                new_text="x",
+                cached_tokens=0,
+                finished=True,
+            )
+
+        engine = MagicMock()
+        engine.stream_generate = fake_stream_generate
+
+        await _run_single_test(
+            engine=engine,
+            prompt="hello",
+            max_tokens=4,
+            pp_len=512,
+            specprefill_kwargs={
+                "specprefill": True,
+                "specprefill_keep_pct": 0.3,
+                "specprefill_threshold": 512,
+            },
+        )
+
+        assert captured.get("specprefill") is True
+        assert captured.get("specprefill_keep_pct") == 0.3
+        # The whole point of #1145: the user-configured threshold must reach
+        # the engine; otherwise the engine substitutes DEFAULT_THRESHOLD=8192.
+        assert captured.get("specprefill_threshold") == 512
+
+    @pytest.mark.asyncio
+    async def test_single_test_no_kwargs_when_disabled(self):
+        """When the model has no SpecPrefill settings, no specprefill_* kwargs
+        should leak into ``stream_generate`` — preserves the engine's default
+        path for models the user has not opted in for."""
+        from omlx.admin.benchmark import _run_single_test
+
+        captured: dict = {}
+
+        async def fake_stream_generate(**kwargs):
+            captured.update(kwargs)
+            yield MagicMock(
+                completion_tokens=1,
+                prompt_tokens=32,
+                new_text="x",
+                cached_tokens=0,
+                finished=True,
+            )
+
+        engine = MagicMock()
+        engine.stream_generate = fake_stream_generate
+
+        await _run_single_test(
+            engine=engine,
+            prompt="hi",
+            max_tokens=4,
+            pp_len=32,
+            specprefill_kwargs=None,
+        )
+
+        assert "specprefill" not in captured
+        assert "specprefill_keep_pct" not in captured
+        assert "specprefill_threshold" not in captured
+
+    @pytest.mark.asyncio
+    async def test_batch_test_forwards_to_add_request(self):
+        """``_run_batch_test`` must thread SpecPrefill kwargs to add_request."""
+        from omlx.admin.benchmark import _run_batch_test
+
+        captured: list[dict] = []
+
+        async def fake_add_request(**kwargs):
+            captured.append(kwargs)
+            return f"req-{len(captured)}"
+
+        async def fake_stream_outputs(_request_id):
+            yield MagicMock(
+                completion_tokens=1,
+                finished=True,
+            )
+
+        engine_core = MagicMock()
+        engine_core.add_request = fake_add_request
+        engine_core.stream_outputs = fake_stream_outputs
+
+        engine = MagicMock()
+        engine._engine = engine_core
+
+        await _run_batch_test(
+            engine=engine,
+            prompts=["a", "b"],
+            prompt_tokens=512,
+            max_tokens=2,
+            batch_size=2,
+            specprefill_kwargs={
+                "specprefill": True,
+                "specprefill_threshold": 512,
+            },
+        )
+
+        # Both batched requests must have received the same SpecPrefill
+        # overrides — a per-call leak would be a regression.
+        assert len(captured) == 2
+        for call_kwargs in captured:
+            assert call_kwargs.get("specprefill") is True
+            assert call_kwargs.get("specprefill_threshold") == 512

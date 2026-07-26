@@ -318,8 +318,17 @@ async def _run_single_test(
     prompt: str,
     max_tokens: int,
     pp_len: int,
+    specprefill_kwargs: Optional[dict] = None,
 ) -> dict:
-    """Run a single request benchmark test and return metrics."""
+    """Run a single request benchmark test and return metrics.
+
+    Args:
+        specprefill_kwargs: Optional per-request SpecPrefill overrides
+            (e.g. ``specprefill``, ``specprefill_keep_pct``,
+            ``specprefill_threshold``) forwarded to ``engine.stream_generate``
+            so the model's configured threshold (not the engine default) takes
+            effect during benchmarking.
+    """
     # Reset peak memory tracking
     try:
         mx.reset_peak_memory()
@@ -337,6 +346,7 @@ async def _run_single_test(
         max_tokens=max_tokens,
         temperature=0.0,
         top_p=1.0,
+        **(specprefill_kwargs or {}),
     ):
         # Detect first generated token via completion_tokens count,
         # not new_text. Some models (e.g. Harmony/gpt-oss) produce
@@ -426,6 +436,7 @@ async def _run_batch_test(
     prompt_tokens: int,
     max_tokens: int,
     batch_size: int,
+    specprefill_kwargs: Optional[dict] = None,
 ) -> dict:
     """Run a continuous batching benchmark test.
 
@@ -437,6 +448,10 @@ async def _run_batch_test(
                  all entries are identical. For different-prompt tests, each
                  has a unique UUID prefix.
         prompt_tokens: Number of prompt tokens per request (for pp TPS calc).
+        specprefill_kwargs: Optional per-request SpecPrefill overrides
+            forwarded to ``engine_core.add_request`` so the model's configured
+            threshold (not the engine default) takes effect during batch
+            benchmarking.
     """
     from ..request import SamplingParams
 
@@ -450,6 +465,8 @@ async def _run_batch_test(
         top_p=1.0,
     )
 
+    add_request_kwargs = dict(specprefill_kwargs or {})
+
     async def _single_request(prompt: str) -> dict:
         """Run a single request within the batch."""
         start = time.perf_counter()
@@ -460,6 +477,7 @@ async def _run_batch_test(
         request_id = await engine_core.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            **add_request_kwargs,
         )
 
         async for output in engine_core.stream_outputs(request_id):
@@ -970,10 +988,11 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     overall_start = time.perf_counter()
 
     try:
-        # Snapshot experimental flags at run start. Settings can change mid-run,
-        # and the produced numbers are tied to whatever was active when
-        # generation actually ran.
+        # Snapshot experimental flags at run start. Settings can change mid-run
+        # (user toggling DFlash/SpecPrefill/TurboQuant), and the produced
+        # numbers are tied to whatever was active when generation actually ran.
         model_settings = None
+        specprefill_kwargs: dict = {}
         sm = getattr(engine_pool, "_settings_manager", None)
         if sm is not None:
             try:
@@ -981,6 +1000,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 run.experimental_features.extend(
                     _detect_experimental_features(model_settings)
                 )
+                # When SpecPrefill is enabled, forward the model's per-request
+                # overrides (keep_pct, threshold) to every benchmark call. The
+                # chat-completion path does the same load (see server.py around
+                # the per-request override block); without this, benchmark
+                # silently falls back to the engine defaults
+                # (DEFAULT_THRESHOLD=8192) and reports numbers that don't match
+                # the user's configured threshold. See issue #1145.
+                if getattr(model_settings, "specprefill_enabled", False):
+                    specprefill_kwargs["specprefill"] = True
+                    keep_pct = getattr(model_settings, "specprefill_keep_pct", None)
+                    if keep_pct is not None:
+                        specprefill_kwargs["specprefill_keep_pct"] = keep_pct
+                    threshold = getattr(model_settings, "specprefill_threshold", None)
+                    if threshold is not None:
+                        specprefill_kwargs["specprefill_threshold"] = threshold
             except Exception as e:
                 logger.warning(
                     f"Benchmark: failed to read experimental flags for "
@@ -1054,7 +1088,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             else 8
         )
         async for _ in engine.stream_generate(
-            prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
+            prompt=warmup_prompt,
+            max_tokens=warmup_max_tokens,
+            temperature=0.0,
+            **specprefill_kwargs,
         ):
             pass
         logger.info("Benchmark: warmup complete")
@@ -1077,6 +1114,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 prompt=prompts[pp_len],
                 max_tokens=request.generation_length,
                 pp_len=pp_len,
+                specprefill_kwargs=specprefill_kwargs,
             )
 
             result = {
@@ -1122,6 +1160,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 prompt_tokens=1024,
                 max_tokens=request.generation_length,
                 batch_size=batch_size,
+                specprefill_kwargs=specprefill_kwargs,
             )
 
             result = {
