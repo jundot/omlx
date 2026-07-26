@@ -398,7 +398,10 @@ class ExternalAPIClient:
                     content = delta.get("content")
                     if content:
                         text_parts.append(content)
-                    if content or delta.get("reasoning_content"):
+                    has_reasoning = any(
+                        delta.get(name) for name in _REASONING_FIELD_NAMES
+                    )
+                    if content or has_reasoning:
                         now = time.perf_counter()
                         if first_content_time is None:
                             first_content_time = now

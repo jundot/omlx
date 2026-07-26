@@ -289,6 +289,59 @@ class TestStreamChatCompletion:
         assert stats.text == "answer"
         assert stats.first_content_time < stats.last_content_time
 
+    async def test_reasoning_field_variant_sets_timing_but_not_text(self):
+        """Some providers (e.g. Ollama) name the field 'reasoning', not
+        'reasoning_content'. Timing must still be detected (#opsx fix-external-bench-reasoning-field)."""
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=_sse_body([
+                    {"choices": [{"delta": {"reasoning": "thinking..."}}]},
+                    _content_chunk("answer"),
+                    _usage_chunk(),
+                ]),
+            )
+
+        client = _client(handler)
+        try:
+            stats = await client.stream_chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=0.0,
+            )
+        finally:
+            await client.aclose()
+        assert stats.text == "answer"
+        assert stats.first_content_time < stats.last_content_time
+
+    async def test_reasoning_only_field_variant_measures_full_span(self):
+        """When a thinking model spends its whole budget on 'reasoning' deltas
+        and never emits 'content', decode timing must still span the reasoning
+        chunks instead of collapsing to end_time."""
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=_sse_body([
+                    {"choices": [{"delta": {"reasoning": "step one "}}]},
+                    {"choices": [{"delta": {"reasoning": "step two"}}]},
+                    _usage_chunk(completion=2),
+                ]),
+            )
+
+        client = _client(handler)
+        try:
+            stats = await client.stream_chat_completion(
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=0.0,
+            )
+        finally:
+            await client.aclose()
+        assert stats.text == ""
+        assert stats.first_content_time <= stats.last_content_time
+
     async def test_auth_error_message_without_key(self):
         def handler(request):
             return httpx.Response(401, json={"error": {"message": "bad key"}})

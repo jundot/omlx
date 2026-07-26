@@ -3073,8 +3073,16 @@
 
             benchGetSpeedup(batchResult) {
                 const baseline = this.benchSingleResults.find(r => r.pp === 1024);
-                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return 0;
+                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return null;
+                if (batchResult.tg_tps === null || batchResult.tg_tps === undefined) return null;
                 return batchResult.tg_tps / baseline.gen_tps;
+            },
+
+            // Unmeasured metrics (tpot_ms/gen_tps/tg_tps) come through as
+            // null rather than a misleading 0.0 — render them as N/A.
+            benchFmtNum(value, decimals, suffix = '') {
+                if (value === null || value === undefined) return 'N/A';
+                return value.toFixed(decimals) + suffix;
             },
 
             benchFormatMemory(bytes) {
@@ -3112,9 +3120,9 @@
                         const row = [
                             rpad(`pp${r.pp}/tg${r.tg}`, 16),
                             pad(r.ttft_ms.toFixed(1), 10),
-                            pad(r.tpot_ms.toFixed(2), 10),
+                            pad(this.benchFmtNum(r.tpot_ms, 2), 10),
                             pad(r.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(r.gen_tps.toFixed(1) + ' tok/s', 12),
+                            pad(this.benchFmtNum(r.gen_tps, 1, ' tok/s'), 12),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                             pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
@@ -3136,7 +3144,7 @@
                     if (baseline) {
                         const row = [
                             rpad('1x', 8),
-                            pad(baseline.gen_tps.toFixed(1) + ' tok/s', 12),
+                            pad(this.benchFmtNum(baseline.gen_tps, 1, ' tok/s'), 12),
                             pad('1.00x', 8),
                             pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
                             pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
@@ -3146,11 +3154,11 @@
                         lines.push(row.join('  '));
                     }
                     for (const r of results) {
-                        const speedup = baseline && baseline.gen_tps > 0 ? (r.tg_tps / baseline.gen_tps).toFixed(2) + 'x' : '-';
+                        const speedup = this.benchGetSpeedup(r);
                         const row = [
                             rpad(r.batch_size + 'x', 8),
-                            pad(r.tg_tps.toFixed(1) + ' tok/s', 12),
-                            pad(speedup, 8),
+                            pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
+                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : 'N/A', 8),
                             pad(r.pp_tps.toFixed(1) + ' tok/s', 12),
                             pad((r.pp_tps / r.batch_size).toFixed(1) + ' tok/s', 12),
                             pad(r.avg_ttft_ms.toFixed(1), 10),

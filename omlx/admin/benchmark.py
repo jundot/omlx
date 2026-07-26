@@ -252,18 +252,21 @@ def _compute_single_metrics(
 
     ttft_ms = ttft_s * 1000
     if generation_measured and completion_tokens > 1 and gen_duration > 0:
-        tpot_ms = (gen_duration / (completion_tokens - 1)) * 1000
-        gen_tps = completion_tokens / gen_duration
+        tpot_ms: float | None = (gen_duration / (completion_tokens - 1)) * 1000
+        gen_tps: float | None = completion_tokens / gen_duration
     else:
-        tpot_ms = 0.0
-        gen_tps = 0.0
+        # Generation timing could not be measured (e.g. all content arrived
+        # in a single burst with no measurable inter-token span) — report
+        # unmeasured rather than a misleading 0.0.
+        tpot_ms = None
+        gen_tps = None
     processing_tps = prompt_tokens / max(prefill_duration, 1e-9)
     total_throughput = (prompt_tokens + completion_tokens) / max(e2e_duration, 1e-9)
 
     return {
         "ttft_ms": round(ttft_ms, 1),
-        "tpot_ms": round(tpot_ms, 2),
-        "gen_tps": round(gen_tps, 1),
+        "tpot_ms": round(tpot_ms, 2) if tpot_ms is not None else None,
+        "gen_tps": round(gen_tps, 1) if gen_tps is not None else None,
         "processing_tps": round(processing_tps, 1),
         "e2e_latency_s": round(e2e_duration, 3),
         "total_throughput": round(total_throughput, 1),
@@ -567,12 +570,18 @@ async def _run_external_batch_test(
     max_first_token = max(s.first_content_time for s in stats_list)
     pp_tps = total_prompt_tokens / max(max_first_token - wall_start, 1e-9)
 
-    # tg TPS: total generated tokens / generation wall time
-    tg_tps = total_gen_tokens / max(wall_end - max_first_token, 1e-9)
+    # tg TPS: total generated tokens / generation wall time. When the
+    # aggregate generation window collapses to zero or less (e.g. every
+    # request's content arrived at ~the same instant the batch finished),
+    # the rate is unmeasurable — report None instead of flooring the
+    # denominator, which would otherwise produce an inflated, meaningless
+    # tok/s figure.
+    gen_window = wall_end - max_first_token
+    tg_tps = round(total_gen_tokens / gen_window, 1) if gen_window > 0 else None
 
     return {
         "pp_tps": round(pp_tps, 1),
-        "tg_tps": round(tg_tps, 1),
+        "tg_tps": tg_tps,
         "avg_ttft_ms": round(avg_ttft_ms, 1),
         "e2e_latency_s": round(wall_time, 3),
         "total_gen_tokens": total_gen_tokens,
