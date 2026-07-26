@@ -8897,7 +8897,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "имя-профиля"
+            "value" : "profile-name"
           }
         }
       }
@@ -15642,7 +15642,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sliding-attention-окно драфт-модели. Пусто = значение DFlash по умолчанию (1024)."
+            "value" : "Sliding-attention-окно draft-модели. Пусто = значение DFlash по умолчанию (1024)."
           }
         }
       }
@@ -15876,7 +15876,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Количество токенов драфта за раунд. Пусто = значение mlx-vlm по умолчанию."
+            "value" : "Количество draft-токенов за раунд. Пусто = значение mlx-vlm по умолчанию."
           }
         }
       }
@@ -17705,7 +17705,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Очистить все файлы SSD-кэша? Загруженные модели перестроят KV-кэш при следующем prefill."
+            "value" : "Очистить все файлы SSD-кэша? Загруженные модели перестроят KV-кэш при следующем префилле."
           }
         }
       }
