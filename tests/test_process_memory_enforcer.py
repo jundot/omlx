@@ -2782,3 +2782,75 @@ class TestPublicCeilingBreakdown:
             "metal_cap": 0,
             "hard_limit": 0,
         }
+
+
+class TestBusyAbortReclaimGrace:
+    """Reclaim-before-abort grace: a fat MLX buffer pool gets a bounded
+    number of polls to drain before the busy-request abort fires
+    (measured: aborts 0.1GB over the watermark with 3.7GB pooled)."""
+
+    def _busy_setup(self, enforcer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=1)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_abort_deferred_while_pool_reclaimable(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            # Fixture thresholds are 1.0: 11GB is over the 10GB watermark
+            # but not emergency (needs ceiling + 2GB or 2 polls over).
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_not_awaited()
+        assert enforcer._busy_abort_grace_polls == 1
+
+    @pytest.mark.asyncio
+    async def test_abort_fires_after_grace_exhausted(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        enforcer._busy_abort_grace_polls = (
+            enforcer._BUSY_ABORT_GRACE_POLLS_MAX
+        )
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_abort_immediate_when_pool_below_floor(self, enforcer):
+        """Custom-regime parity: nothing worth draining -> no deferral."""
+        engine = self._busy_setup(enforcer)
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 1 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited_once()
+        assert enforcer._busy_abort_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_grace_counter_resets_on_recovery(self, enforcer):
+        self._busy_setup(enforcer)
+        enforcer._busy_abort_grace_polls = 3
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 1 * 1024**3
+            mock_mx.get_cache_memory.return_value = 0
+            await enforcer._check_and_enforce()
+        assert enforcer._busy_abort_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_emergency_aborts_despite_pool(self, enforcer):
+        """At/over the ceiling the grace never applies."""
+        engine = self._busy_setup(enforcer)
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            # 13GB: >= ceiling + 2GB -> emergency on the first poll.
+            mock_mx.get_active_memory.return_value = 13 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited()

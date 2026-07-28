@@ -718,3 +718,121 @@ def test_exception_during_descent_is_swallowed():
     # Monitor exists but dims stayed None — estimator returns 0 / guard skips.
     assert sched.memory_monitor is not None
     assert sched.memory_monitor._num_layers is None
+
+
+def test_scheduler_init_populates_rotating_specs():
+    """Hybrid make_cache classification reaches the monitor: full layers
+    counted strictly, rotating layers grouped by window."""
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    model = MagicMock()
+    model.layers = []
+    model.config = _ModelConfig()
+    model.make_cache = lambda: (
+        [KVCache() for _ in range(5)]
+        + [RotatingKVCache(max_size=1024) for _ in range(27)]
+    )
+
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    config = SchedulerConfig(
+        max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0
+    )
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
+    assert monitor._num_kv_cache_layers == 5
+    assert monitor._rotating_layer_specs == ((27, 1024),)
+    # No ArraysCache layers: the fixed-state probe stays unarmed.
+    assert scheduler._fixed_state_measure_armed is False
+
+
+def test_admission_estimate_is_the_single_formula():
+    """Every preflight path prices current + kv_exact + transient."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    floor = min(max(1, scheduler._prefill_min_chunk_tokens), 32768)
+    assert est.floor_chunk == floor
+    assert est.kv_len == 32767
+    assert est.kv_exact == int(
+        scheduler.memory_monitor.estimate_resident_kv_bytes(
+            32768, chunk_tokens=floor
+        )
+    )
+    assert est.transient == int(scheduler._admission_transient_bound(floor, 32767))
+    assert est.estimated == est.kv_exact + est.transient
+
+
+def test_preflight_charges_observed_max_transient():
+    """A session's observed max chunk transient converts a would-be
+    mid-prefill abort into an upfront 400."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    # Keep the safety cap out of the way so the hard limit drives.
+    scheduler._memory_abort_limit_bytes = 10**18
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    scheduler._memory_hard_limit_bytes = int(est.estimated) + 1
+
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)  # fits
+
+    scheduler._prefill_transient_tracker._observed_max_bytes = (
+        est.transient + 2 * 1024**3
+    )
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_admission_compares_against_hard_watermark():
+    """The enforcer kills at the watermark, so admission must not admit
+    into the watermark..hard-limit band."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+
+    # Watermark unset: falls back to the hard limit, request fits.
+    scheduler._memory_hard_limit_bytes = int(est.estimated) + 1
+    scheduler._memory_hard_watermark_bytes = 0
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+    # Watermark below the estimate: the same request is now an upfront 400.
+    scheduler._memory_hard_watermark_bytes = int(est.estimated) - 1
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError) as ei:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+    assert ei.value.limit_bytes == int(est.estimated) - 1
+
+    # Watermark above the estimate: admitted again.
+    scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)

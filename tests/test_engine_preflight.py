@@ -718,9 +718,11 @@ class TestRejectionMessageNamesBindingCeiling:
         ``_preflight_memory_check`` so we can inspect the message it
         returns."""
         # Peak chosen larger than any ceiling tested below so the
-        # rejection branch fires deterministically.
+        # rejection branch fires deterministically. Admission charges the
+        # exact resident KV plus the floor-chunk transient bound; drive the
+        # rejection through the KV term.
         sched.memory_monitor = MagicMock()
-        sched.memory_monitor.estimate_prefill_peak_bytes.return_value = 512 * 1024**3
+        sched.memory_monitor.estimate_resident_kv_bytes.return_value = 512 * 1024**3
 
         import omlx.scheduler as scheduler_mod
 

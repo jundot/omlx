@@ -124,6 +124,22 @@ class _PreflightRejection:
 
 
 @dataclass
+class _AdmissionEstimate:
+    """Single deterministic admission estimate shared by every preflight
+    path: ``current + kv_exact + transient`` is compared against both the
+    dynamic hard limit and the prefill safety cap. ``kv_exact`` is the
+    exact-shape resident KV (full + window-capped rotating + fixed state),
+    ``transient`` the floor-chunk charge including the session's observed
+    max chunk transient."""
+
+    kv_exact: int
+    transient: int
+    floor_chunk: int
+    kv_len: int
+    estimated: int
+
+
+@dataclass
 class _VLMMTPDecodeState:
     """Per-request state for vlm_mtp decode that bypasses BatchGenerator.
 
@@ -317,13 +333,18 @@ class _StoreCacheGate:
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
     from .cache.paged_ssd_cache import PagedSSDCacheManager
-    from .memory_monitor import MemoryMonitor, estimate_mla_kv_bytes_per_token
+    from .memory_monitor import (
+        MemoryMonitor,
+        collect_kv_layer_specs,
+        estimate_mla_kv_bytes_per_token,
+    )
 
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
+    collect_kv_layer_specs = None
     estimate_mla_kv_bytes_per_token = None
     HAS_TIERED_CACHE = False
 
@@ -1702,6 +1723,11 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
+        # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
+        # armed by _set_model_info_for_monitor when ArraysCache layers exist
+        # and taken after the first prefill chunk's eval.
+        self._fixed_state_measure_armed: bool = False
+        self._fixed_state_recorded: bool = False
         # Let the sdpa256 head_dim-256 prefill route ask for live guard
         # headroom so it only takes the slow O(L) tiled pass when the faster
         # unfused fallback would not fit (issue #2204). Weakly held; harmless
@@ -3171,6 +3197,15 @@ class Scheduler:
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
             )
+            self._maybe_record_fixed_state_bytes(prompt_cache)
+            # Enforcer-requested hard-pressure drain. The flag's normal
+            # consumption point is the end-of-step cleanup, but this loop
+            # runs inside a single step() for the whole prefill — minutes at
+            # a time — so without a chunk-boundary drain the enforcer's
+            # reclaim request can never land before its abort escalation
+            # (measured: aborts 0.1GB over the watermark with 3.7GB pooled).
+            if self._consume_pressure_clear():
+                _sync_and_clear_cache(self._stream)
 
             processed_tokens += n_to_process
 
@@ -3378,6 +3413,32 @@ class Scheduler:
             per_token = max(per_token, float(static) / n_tokens)
         return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
 
+    def _admission_transient_bound(self, n_tokens: int, kv_len: int) -> float:
+        """Transient charge for admission and the guard's pass/abort gates.
+
+        The largest FLOOR-SIZE chunk transient observed this session is a
+        floor no prediction should undercut: a throttled prefill cannot get
+        under it by shrinking (gemma-4 measured 786-1177MB at 32-token
+        chunks), so admitting below it converts a deterministic pre-abort
+        into a probabilistic mid-prefill abort. Only floor-size samples
+        feed the max — big-chunk transients differ by an order of magnitude
+        on some models (Qwen3.6: ~3GB at 2048 tokens) and belong to the
+        throttle, which shrinks chunks long before admission's charge is
+        relevant. The observed max gets no extra safety multiplier — it is
+        already the max of noisy samples, kv_len growth is covered by the
+        predicted term, and the abort cap itself keeps a margin below the
+        ceiling.
+
+        Never use this for chunk *sizing* — the throttle and the guard's
+        shrink arithmetic stay on ``_predicted_chunk_transient``; a flat
+        size-invariant bound would zero out their proportional response.
+        """
+        bound = self._predicted_chunk_transient(n_tokens, kv_len)
+        tracker = self._prefill_transient_tracker
+        if tracker is not None:
+            bound = max(bound, float(tracker.observed_max_bytes))
+        return bound
+
     def _prefill_abort_cap(self) -> int:
         """Safety cap a chunk's predicted peak must stay under.
 
@@ -3387,6 +3448,25 @@ class Scheduler:
         """
         cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
         return int(cap * self._prefill_abort_margin) if cap > 0 else 0
+
+    def _admission_limit_bytes(self) -> int:
+        """The line admission estimates must stay under.
+
+        The enforcer kills running requests at the hard WATERMARK
+        (ceiling * hard_threshold, typically 95%), not at the raw hard
+        limit — the remaining 5% is its reaction margin. Admitting a
+        request whose predicted peak lands in that band means it starts,
+        burns a minute of prefill, and dies at the watermark anyway
+        (measured: every residual mid-abort across three A/B regimes sat
+        in this band). Comparing against the watermark converts those into
+        upfront 400s. Falls back to the hard limit before the enforcer has
+        propagated a watermark.
+        """
+        hard_limit = self._memory_hard_limit_bytes
+        watermark = self._memory_hard_watermark_bytes
+        if hard_limit > 0 and watermark > 0:
+            return min(hard_limit, watermark)
+        return hard_limit or watermark
 
     def _prefill_abort_description(self) -> tuple[int, int, float]:
         """Return (base cap, safety cap, margin) for diagnostics."""
@@ -3501,12 +3581,12 @@ class Scheduler:
             return n_tokens
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         current = self._current_usage_bytes()
-        if current + self._predicted_chunk_transient(n_tokens, kv_len) <= cap:
+        if current + self._admission_transient_bound(n_tokens, kv_len) <= cap:
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
         current = self._reclaim_prefill_headroom()
-        min_transient = self._predicted_chunk_transient(min_chunk, kv_len)
+        min_transient = self._admission_transient_bound(min_chunk, kv_len)
         if current + min_transient > cap:
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
@@ -4076,9 +4156,11 @@ class Scheduler:
                 delta,
             )
             return
-        self._prefill_transient_tracker.update(n_tokens, delta)
+        self._prefill_transient_tracker.update(
+            n_tokens, delta, floor_sample=n_tokens <= min_chunk
+        )
         logger.debug(
-            "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB samples=%d",
+            "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
             loop_label,
             request_id,
             n_tokens,
@@ -4086,8 +4168,46 @@ class Scheduler:
             delta / 1024**2,
             (delta / max(n_tokens, 1)) / 1024,
             self._prefill_transient_tracker.bytes_per_token / 1024,
+            self._prefill_transient_tracker.observed_max_bytes / 1024**2,
             self._prefill_transient_tracker.samples,
         )
+
+    def _maybe_record_fixed_state_bytes(self, cache_list: Any) -> None:
+        """Measure the GDN/Mamba fixed recurrent-state footprint once.
+
+        ArraysCache state shapes are unknown until the first forward, so
+        this probe runs right after the first prefill chunk's eval and
+        feeds the per-sequence constant term of
+        ``MemoryMonitor.estimate_resident_kv_bytes``. One-shot: after the
+        first attempt (successful or empty) the hot path is a flag check.
+        """
+        if self._fixed_state_recorded or not self._fixed_state_measure_armed:
+            return
+        if self.memory_monitor is None or not cache_list:
+            return
+
+        def _walk(c: Any) -> int:
+            sub = getattr(c, "caches", None)
+            if isinstance(sub, (list, tuple)):
+                return sum(_walk(inner) for inner in sub)
+            if type(c).__name__ in ("ArraysCache", "SizedArraysCache", "MambaCache"):
+                state = getattr(c, "state", None)
+                if isinstance(state, (list, tuple)):
+                    return sum(int(getattr(a, "nbytes", 0) or 0) for a in state)
+            return 0
+
+        try:
+            total = sum(_walk(c) for c in cache_list)
+        except Exception as e:
+            logger.debug(f"Fixed-state probe failed: {e}")
+            return
+        self._fixed_state_recorded = True
+        if total > 0:
+            self.memory_monitor.set_fixed_state_bytes(total)
+            logger.debug(
+                "Fixed recurrent state measured: %.1fMB per sequence",
+                total / 1024**2,
+            )
 
     def _reclaim_prefill_headroom(self) -> int:
         """Reclaim Metal headroom mid-prefill and return the re-measured usage.
@@ -4282,6 +4402,7 @@ class Scheduler:
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
         )
+        self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
         # Boundary snapshot
@@ -7729,20 +7850,20 @@ class Scheduler:
 
         prompt_tokens = request.num_prompt_tokens
         cached_tokens = request.cached_tokens or 0
-        new_tokens = max(prompt_tokens - cached_tokens, 0)
-
-        if new_tokens == 0:
-            return None
-
-        peak = self._admission_peak_bytes(new_tokens, cached_tokens)
-        if peak == 0:
-            return None  # can't estimate, skip
 
         current = self._current_usage_bytes()
-        estimated = current + peak
-        hard_limit = self._memory_hard_limit_bytes
+        est = self._admission_estimate(
+            num_prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            current=current,
+        )
+        if est is None:
+            return None  # can't estimate, skip
 
-        if estimated > hard_limit:
+        hard_limit = self._admission_limit_bytes()
+        peak = est.kv_exact + est.transient
+
+        if est.estimated > hard_limit:
             # Try LRU eviction first (upstream's predictive-throttle
             # path): if eviction can free enough headroom this raises
             # ``_PrefillEvictionNeeded`` and the request is paused for
@@ -7754,28 +7875,26 @@ class Scheduler:
                 current=current,
                 target_cap=hard_limit,
                 predicted_transient=peak,
-                requested_tokens=min(new_tokens, self.config.prefill_step_size),
+                requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
 
             message = self._format_rejection_message(
-                estimated=estimated,
+                estimated=est.estimated,
                 current=current,
                 peak=peak,
                 hard_limit=hard_limit,
             )
             return _PreflightRejection(
                 message=message,
-                estimated_bytes=int(estimated),
+                estimated_bytes=int(est.estimated),
                 limit_bytes=int(hard_limit),
             )
         safety_rejection = self._preflight_safety_rejection(
-            num_prompt_tokens=prompt_tokens,
-            cached_tokens=cached_tokens,
+            est=est,
             current_usage_bytes=current,
         )
         if safety_rejection is not None:
-            requested_tokens = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
             self._raise_prefill_eviction_if_available(
                 request_id=request.request_id,
                 current=current,
@@ -7783,37 +7902,62 @@ class Scheduler:
                 predicted_transient=max(
                     0, int(safety_rejection.estimated_bytes) - int(current)
                 ),
-                requested_tokens=requested_tokens,
+                requested_tokens=est.floor_chunk,
                 reason="prefill_safety_cap",
             )
             return safety_rejection
         return None
 
-    def _admission_peak_bytes(self, new_tokens: int, cached_tokens: int) -> float:
-        """Peak this prefill will actually reach, for admission decisions.
+    def _admission_estimate(
+        self,
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int,
+        current: int,
+    ) -> _AdmissionEstimate | None:
+        """Deterministic admission estimate shared by every preflight path.
 
-        ``estimate_prefill_peak_bytes`` prices the SDPA term at the chunk size
-        it is handed, and every admission site handed it
-        ``config.prefill_step_size`` (2048). But when memory is tight the
-        adaptive throttle runs the same prefill at
-        ``prefill_min_chunk_tokens``, so admission was refusing prompts on a
-        peak no chunk that request would ever submit could produce — measured
-        on gemma-4 at a 31.56GB ceiling, 80k tokens was rejected for a 3.15GB
-        KV+SDPA estimate while 60k ran to completion at 32-token chunks.
+        One formula: ``current + kv_exact + transient`` where
 
-        Charging the floor chunk instead leaves the KV term, which chunking
-        cannot reduce, as the real limit. Nothing about safety moves: the
-        throttle, the pre-chunk guard and the enforcer's abort all still run,
-        and this only lowers an up-front refusal to a level the request will
-        actually operate at.
+        - ``kv_exact`` is the exact-shape resident KV this prefill will
+          allocate (full-attention layers linear in new tokens, sliding
+          window layers capped at window + floor_chunk - 1, MLA override,
+          measured GDN/Mamba fixed state) — the part chunking cannot reduce,
+        - ``transient`` is the floor-chunk charge at the full prompt kv_len,
+          floored by the session's observed max chunk transient (chunk
+          transients are size-invariant, so the throttle cannot get under
+          it by shrinking).
+
+        Charging the floor chunk instead of ``prefill_step_size`` is
+        deliberate: when memory is tight the adaptive throttle runs the same
+        prefill at ``prefill_min_chunk_tokens``, so admission must price the
+        peak a throttled prefill actually produces — measured on gemma-4 at
+        a 31.56GB ceiling, charging the full step rejected 80k tokens while
+        60k ran to completion at 32-token chunks.
+
+        Returns None when nothing can be estimated (no model info and no
+        measurements yet); callers skip the check, as before.
         """
         monitor = self.memory_monitor
         if monitor is None:
-            return 0.0
-        floor_chunk = max(1, self._prefill_min_chunk_tokens)
-        chunk = min(self.config.prefill_step_size, floor_chunk)
-        return monitor.estimate_prefill_peak_bytes(
-            new_tokens, chunk, cached_tokens=cached_tokens
+            return None
+        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+        if new_tokens == 0:
+            return None
+        floor_chunk = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
+        kv_len = max(int(num_prompt_tokens) - 1, 1)
+        kv_exact = int(
+            monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
+        )
+        transient = int(self._admission_transient_bound(floor_chunk, kv_len))
+        if kv_exact <= 0 and transient <= 0:
+            return None
+        return _AdmissionEstimate(
+            kv_exact=kv_exact,
+            transient=transient,
+            floor_chunk=floor_chunk,
+            kv_len=kv_len,
+            estimated=int(current) + kv_exact + transient,
         )
 
     def _format_rejection_message(
@@ -7884,26 +8028,27 @@ class Scheduler:
         if self.memory_monitor is None:
             return
 
-        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
-        if new_tokens == 0:
-            return
-
-        peak = self._admission_peak_bytes(new_tokens, cached_tokens)
-        if peak == 0:
-            return
-
         current = self._current_usage_bytes(refresh_mlx_active=False)
+        est = self._admission_estimate(
+            num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
+            current=current,
+        )
+        if est is None:
+            return
+
         if not request_id:
             import uuid as _uuid
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
-        if current + peak > self._memory_hard_limit_bytes:
+        admission_limit = self._admission_limit_bytes()
+        if est.estimated > admission_limit:
             message = self._format_rejection_message(
-                estimated=current + peak,
+                estimated=est.estimated,
                 current=current,
-                peak=peak,
-                hard_limit=self._memory_hard_limit_bytes,
+                peak=est.kv_exact + est.transient,
+                hard_limit=admission_limit,
             )
 
             logger.warning(
@@ -7916,13 +8061,12 @@ class Scheduler:
             raise PrefillMemoryExceededError(
                 message=message,
                 request_id=request_id,
-                estimated_bytes=int(current + peak),
-                limit_bytes=int(self._memory_hard_limit_bytes),
+                estimated_bytes=int(est.estimated),
+                limit_bytes=int(admission_limit),
             )
 
         safety_rejection = self._preflight_safety_rejection(
-            num_prompt_tokens=num_prompt_tokens,
-            cached_tokens=cached_tokens,
+            est=est,
             current_usage_bytes=current,
         )
         if safety_rejection is None:
@@ -7965,34 +8109,36 @@ class Scheduler:
         if self.memory_monitor is None:
             return None
 
-        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
-        if new_tokens == 0:
-            return None
-
         current = self._current_usage_bytes(refresh_mlx_active=False)
         request_id = request_id or "preflight"
 
-        peak = self._admission_peak_bytes(new_tokens, cached_tokens)
-        if peak and current + peak > self._memory_hard_limit_bytes:
+        est = self._admission_estimate(
+            num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
+            current=current,
+        )
+        if est is None:
+            return None
+
+        admission_limit = self._admission_limit_bytes()
+        if est.estimated > admission_limit:
             return PrefillEvictionRequest(
                 request_id=request_id,
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
-                target_cap_bytes=int(self._memory_hard_limit_bytes),
-                predicted_transient_bytes=int(peak),
-                requested_tokens=int(min(new_tokens, self.config.prefill_step_size)),
+                target_cap_bytes=int(admission_limit),
+                predicted_transient_bytes=int(est.kv_exact + est.transient),
+                requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
 
         safety_rejection = self._preflight_safety_rejection(
-            num_prompt_tokens=num_prompt_tokens,
-            cached_tokens=cached_tokens,
+            est=est,
             current_usage_bytes=current,
         )
         if safety_rejection is None:
             return None
 
-        requested_tokens = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
         return PrefillEvictionRequest(
             request_id=request_id,
             model_id=getattr(self.config, "model_name", ""),
@@ -8001,42 +8147,31 @@ class Scheduler:
             predicted_transient_bytes=max(
                 0, int(safety_rejection.estimated_bytes) - int(current)
             ),
-            requested_tokens=int(requested_tokens),
+            requested_tokens=est.floor_chunk,
             reason="prefill_safety_cap",
         )
 
     def _preflight_safety_rejection(
         self,
         *,
-        num_prompt_tokens: int,
-        cached_tokens: int = 0,
+        est: _AdmissionEstimate,
         current_usage_bytes: int,
     ) -> _PreflightRejection | None:
         """Predict whether even the safety floor chunk cannot fit.
 
         This mirrors the mid-prefill ``_guard_prefill_chunk`` rejection, but
-        runs before the route returns a ``StreamingResponse``. It charges the
-        resident KV that will be allocated by the prompt plus the minimum
-        chunk transient at the full prompt context length.
+        runs before the route returns a ``StreamingResponse``. Consumes the
+        shared ``_AdmissionEstimate`` so the guard and every preflight path
+        price the same formula: exact resident KV plus the floor-chunk
+        transient bound at the full prompt context length.
         """
-        if self.memory_monitor is None:
-            return None
         base_cap, cap, margin = self._prefill_abort_description()
         if cap <= 0:
             return None
 
-        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
-        if new_tokens == 0:
-            return None
-
-        floor_chunk = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
-        kv_len = max(int(num_prompt_tokens) - 1, 1)
-        kv_growth = self.memory_monitor.estimate_prompt_kv_bytes(new_tokens)
-        min_transient = self._predicted_chunk_transient(floor_chunk, kv_len)
-        if kv_growth <= 0 and min_transient <= 0:
-            return None
-
-        estimated = int(current_usage_bytes + kv_growth + min_transient)
+        kv_growth = est.kv_exact
+        min_transient = est.transient
+        estimated = int(current_usage_bytes) + kv_growth + min_transient
         if estimated <= cap:
             return None
 
@@ -8059,8 +8194,8 @@ class Scheduler:
         )
         message = (
             "Prefill context too large for available memory "
-            f"(preflight safety guard, kv_len={kv_len}, "
-            f"min_chunk={floor_chunk}): predicted peak would require "
+            f"(preflight safety guard, kv_len={est.kv_len}, "
+            f"min_chunk={est.floor_chunk}): predicted peak would require "
             f"~{format_bytes(estimated)} "
             f"(current {format_bytes(current_usage_bytes)} + "
             f"KV {format_bytes(kv_growth)} + "
@@ -10452,29 +10587,34 @@ class Scheduler:
                 or num_kv_heads
             )
 
-            # Count KVCache layers for hybrid models
+            # Classify layer cache types for hybrid models
             cache_list_for_tq = None
             actual_kv_cache_layers = None
             num_kv_cache_layers = num_layers
+            rotating_layer_specs: list[tuple[int, int]] = []
+            arrays_cache_layers = 0
             if not hasattr(self.model, "make_cache"):
                 actual_kv_cache_layers = num_layers
-            else:
+            elif collect_kv_layer_specs is not None:
                 try:
                     cache_list = self.model.make_cache()
                     cache_list_for_tq = cache_list
-                    from mlx_lm.models.cache import CacheList, KVCache
-
-                    def _count_kv(c: Any) -> int:
-                        if type(c) is KVCache:
-                            return 1
-                        if isinstance(c, CacheList):
-                            return sum(_count_kv(inner) for inner in c.caches)
-                        return 0
-
-                    actual_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
-                    num_kv_cache_layers = actual_kv_cache_layers
-                    if num_kv_cache_layers == 0:
-                        num_kv_cache_layers = num_layers  # fallback
+                    full_layers, rotating_layer_specs, arrays_cache_layers = (
+                        collect_kv_layer_specs(cache_list)
+                    )
+                    actual_kv_cache_layers = full_layers
+                    num_kv_cache_layers = full_layers
+                    # Fall back to charging every layer only when
+                    # classification found nothing at all. A genuine 0
+                    # full-attention count next to rotating/arrays layers
+                    # must stay 0, or the rotating term would double-count
+                    # on top of a linear all-layers term.
+                    if (
+                        full_layers == 0
+                        and not rotating_layer_specs
+                        and not arrays_cache_layers
+                    ):
+                        num_kv_cache_layers = num_layers
                 except Exception:
                     pass
 
@@ -10535,10 +10675,16 @@ class Scheduler:
                     # dtype, not the (possibly fractional TurboQuant) KV width.
                     compute_dtype_size=base_dtype_size,
                     kv_bytes_per_token=kv_bytes_per_token,
+                    rotating_layer_specs=rotating_layer_specs,
                 )
+                # Fixed recurrent state (GDN/Mamba) can only be measured from
+                # a live cache after the first forward; arm a one-shot probe.
+                self._fixed_state_measure_armed = arrays_cache_layers > 0
                 logger.debug(
                     f"Model info for memory estimation: "
-                    f"layers={num_layers} ({num_kv_cache_layers} KVCache), "
+                    f"layers={num_layers} ({num_kv_cache_layers} KVCache, "
+                    f"rotating={rotating_layer_specs}, "
+                    f"arrays={arrays_cache_layers}), "
                     f"kv_heads={num_kv_heads}, q_heads={num_attention_heads}, "
                     f"head_dim={head_dim}, dtype_size={dtype_size}"
                 )

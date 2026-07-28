@@ -384,6 +384,10 @@ class ProcessMemoryEnforcer:
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
         self._over_ceiling_polls: int = 0
+        # Consecutive hard-pressure polls we have deferred the busy-request
+        # abort while a fat Metal buffer pool drains at the next prefill
+        # chunk / step boundary. See the grace check in _check_and_enforce.
+        self._busy_abort_grace_polls: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1005,6 +1009,17 @@ class ProcessMemoryEnforcer:
     # _periodic_clear_threshold_bytes floor). Above it, a clear meaningfully
     # returns memory to the OS.
     _POOL_RECLAIM_FLOOR = 2 * 1024**3
+    # Max consecutive hard-pressure polls the busy-request abort is deferred
+    # while a reclaimable pool drains. Prefill chunks run ~5s at full step
+    # size, so 5 one-second polls cover at least one chunk boundary.
+    _BUSY_ABORT_GRACE_POLLS_MAX = 5
+
+    def _pool_bytes(self) -> int:
+        """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
+        try:
+            return int(mx.get_cache_memory())
+        except (TypeError, ValueError):
+            return 0
 
     def _request_scheduler_cache_reclaim(self, freed_hot: int) -> None:
         """Ask each scheduler to run its step-boundary Metal cache clear.
@@ -1024,13 +1039,9 @@ class ProcessMemoryEnforcer:
         already-wedged case where hot cache is empty but pooled buffers are
         stranded).
         """
-        raw_pool = mx.get_cache_memory()
-        try:
-            pool_bytes = int(raw_pool)
-        except (TypeError, ValueError):
-            # A non-numeric reading (e.g. a wholesale-mocked mx in unit
-            # tests) cannot justify a clear; treat it as an empty pool.
-            pool_bytes = 0
+        # A non-numeric reading (e.g. a wholesale-mocked mx in unit tests)
+        # cannot justify a clear; _pool_bytes treats it as an empty pool.
+        pool_bytes = self._pool_bytes()
         if freed_hot <= 0 and pool_bytes <= self._POOL_RECLAIM_FLOOR:
             return
         requested = 0
@@ -1424,6 +1435,12 @@ class ProcessMemoryEnforcer:
         else:
             new_level = "hard"
 
+        if new_level != "hard":
+            # The hard episode ended (drain worked or the load finished):
+            # the next one gets a fresh abort-grace budget. Must happen
+            # before the ok-level early return below.
+            self._busy_abort_grace_polls = 0
+
         if new_level != prev_level:
             self._pressure_level = new_level
             self._propagate_memory_limit()
@@ -1528,6 +1545,33 @@ class ProcessMemoryEnforcer:
                 if new_level == "hard":
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
+                        # Reclaim-before-abort grace: when the MLX buffer pool
+                        # alone holds more than the reclaim floor, the pressure
+                        # clear requested above can very likely recover below
+                        # the watermark without killing anything (measured:
+                        # aborts fired 0.1GB over the watermark with 3.7GB of
+                        # pooled buffers on the table). The drain runs on the
+                        # inference thread at the next prefill-chunk or step
+                        # boundary, so give it a bounded number of polls.
+                        # Never defers an emergency (at/over the ceiling).
+                        if (
+                            not emergency
+                            and self._busy_abort_grace_polls
+                            < self._BUSY_ABORT_GRACE_POLLS_MAX
+                            and self._pool_bytes() > self._POOL_RECLAIM_FLOOR
+                        ):
+                            self._busy_abort_grace_polls += 1
+                            logger.info(
+                                "Hard memory pressure on '%s': deferring "
+                                "request abort (poll %d/%d) while %s of "
+                                "pooled Metal buffers drain",
+                                busy_victim,
+                                self._busy_abort_grace_polls,
+                                self._BUSY_ABORT_GRACE_POLLS_MAX,
+                                _format_gb(self._pool_bytes()),
+                            )
+                            break
+                        self._busy_abort_grace_polls = 0
                         entry = self._engine_pool._entries.get(busy_victim)
                         aborted = 0
                         if (
@@ -1639,6 +1683,10 @@ class ProcessMemoryEnforcer:
             post_level = "hard"
         if post_ceiling <= 0 or post_current < post_ceiling:
             self._over_ceiling_polls = 0
+        if post_level != "hard":
+            # Same reset as the pre-action check: eviction inside this tick
+            # may already have ended the hard episode.
+            self._busy_abort_grace_polls = 0
         if post_level != self._pressure_level:
             self._pressure_level = post_level
             self._propagate_memory_limit()
