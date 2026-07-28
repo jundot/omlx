@@ -28,6 +28,14 @@
                         class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
                         {{ t('navbar.dropdown.accuracy') }}
                     </button>
+                    <button
+                        @click="setBenchTab('context')"
+                        :class="benchTab === 'context'
+                            ? 'bg-neutral-900 text-white'
+                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                        {{ t('navbar.dropdown.context') }}
+                    </button>
                 </div>
 
                 <!-- Throughput tab -->
@@ -528,4 +536,5 @@
 
                 <!-- Accuracy tab -->
                 {% include "dashboard/_bench_accuracy.html" %}
+                {% include "dashboard/_bench_context.html" %}
             </div>

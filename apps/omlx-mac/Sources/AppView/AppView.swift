@@ -114,6 +114,7 @@ struct AppView: View {
         case .quantization: QuantizationScreen()
         case .throughputBench: ThroughputBenchScreen(vm: services.throughputBench)
         case .accuracyBench:   AccuracyBenchScreen(vm: services.accuracyBench)
+        case .contextBench:    ContextBenchScreen(vm: services.contextBench)
         case .security:     SecurityScreen()
         case .about:        AboutScreen()
         }
@@ -465,6 +466,7 @@ private struct SettingsSidebar: View {
             Section {
                 SidebarRow(section: .throughputBench)
                 SidebarRow(section: .accuracyBench)
+                SidebarRow(section: .contextBench)
             } header: {
                 Text(String(localized: "sidebar.group.benchmark",
                             defaultValue: "Benchmark",

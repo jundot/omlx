@@ -64,7 +64,7 @@
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
-    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
@@ -486,6 +486,16 @@
             benchTab: 'throughput',
             benchDropdown: false,
 
+            // Context benchmark state
+            ctxBenchModelId: '',
+            ctxBenchTarget: 131072,
+            ctxBenchRunning: false,
+            ctxBenchBenchId: null,
+            ctxBenchProgress: null,   // { phase, progress, message }
+            ctxBenchResult: null,
+            ctxBenchError: '',
+            ctxBenchEventSource: null,
+
             // Accuracy benchmark state
             accModelId: '',
             accBenchmarks: { mmlu: true, mmlu_pro: false, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, mathqa: false, humaneval: true, mbpp: false, livecodebench: false, bbq: false, safetybench: false },
@@ -665,6 +675,7 @@
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadBenchState();
                     await this.loadAccState();
+                    await this.loadCtxBenchState();
                 }
             },
 
@@ -3071,6 +3082,138 @@
                 // SSE handler will update state when error/done event arrives
             },
 
+            // Context benchmark functions
+            async startContextBenchmark() {
+                if (!this.ctxBenchModelId || this.ctxBenchRunning) return;
+
+                this.ctxBenchRunning = true;
+                this.ctxBenchProgress = null;
+                this.ctxBenchResult = null;
+                this.ctxBenchError = '';
+                this.ctxBenchBenchId = null;
+
+                try {
+                    const response = await fetch('/admin/api/bench/context/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: this.ctxBenchModelId,
+                            target_tokens: this.ctxBenchTarget,
+                        }),
+                    });
+
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.ctxBenchError = data.detail || window.t('js.error.start_context_bench_failed');
+                        this.ctxBenchRunning = false;
+                        return;
+                    }
+
+                    const data = await response.json();
+                    this.ctxBenchBenchId = data.bench_id;
+                    this.connectContextBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to start context benchmark:', err);
+                    this.ctxBenchError = window.t('js.error.start_context_bench_failed');
+                    this.ctxBenchRunning = false;
+                }
+            },
+
+            connectContextBenchSSE(benchId) {
+                if (this.ctxBenchEventSource) {
+                    this.ctxBenchEventSource.close();
+                }
+
+                const es = new EventSource(`/admin/api/bench/context/${benchId}/stream`);
+                this.ctxBenchEventSource = es;
+
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+
+                        if (data.type === 'progress') {
+                            this.ctxBenchProgress = {
+                                phase: data.phase,
+                                progress: data.progress,
+                                message: data.message,
+                            };
+                        } else if (data.type === 'result') {
+                            this.ctxBenchResult = data.data;
+                        } else if (data.type === 'done') {
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            // The applied setting changed the model row.
+                            this.loadModels();
+                        } else if (data.type === 'error') {
+                            this.ctxBenchError = data.message;
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            this.loadModels();
+                        }
+                    } catch (err) {
+                        console.error('Failed to parse SSE event:', err);
+                    }
+                };
+
+                es.onerror = () => {
+                    if (this.ctxBenchRunning) {
+                        this.ctxBenchError = window.t('js.error.benchmark_connection_lost');
+                        this.ctxBenchRunning = false;
+                        this.ctxBenchProgress = null;
+                    }
+                    es.close();
+                    this.ctxBenchEventSource = null;
+                };
+            },
+
+            async cancelContextBenchmark() {
+                if (!this.ctxBenchBenchId) return;
+                try {
+                    await fetch(`/admin/api/bench/context/${this.ctxBenchBenchId}/cancel`, { method: 'POST' });
+                } catch (err) {
+                    console.error('Failed to cancel context benchmark:', err);
+                }
+                // SSE handler will update state when the error event arrives
+            },
+
+            async loadCtxBenchState() {
+                // Attach to an in-flight context bench (page refresh, other tab).
+                try {
+                    const resp = await fetch('/admin/api/bench/context/active');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (!data.running || !data.bench_id) return;
+                    if (this.ctxBenchBenchId === data.bench_id && this.ctxBenchEventSource) {
+                        return;
+                    }
+                    this.ctxBenchBenchId = data.bench_id;
+                    this.ctxBenchModelId = data.model_id;
+                    if (data.target_tokens) this.ctxBenchTarget = data.target_tokens;
+                    this.ctxBenchRunning = true;
+                    this.ctxBenchResult = null;
+                    this.ctxBenchError = '';
+                    this.connectContextBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to load context bench state:', err);
+                }
+            },
+
+            ctxBenchCappedByLabel() {
+                const capped = this.ctxBenchResult?.capped_by;
+                if (capped === 'target') return window.t('ctx_bench.capped.target');
+                if (capped === 'native') return window.t('ctx_bench.capped.native');
+                return window.t('ctx_bench.capped.memory');
+            },
+
             benchGetSpeedup(batchResult) {
                 const baseline = this.benchSingleResults.find(r => r.pp === 1024);
                 if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return null;
@@ -3326,6 +3469,9 @@
                 if (tab === 'throughput') {
                     this.loadBenchDeviceInfo();
                     this.loadBenchState();
+                }
+                if (tab === 'context') {
+                    this.loadCtxBenchState();
                 }
             },
 

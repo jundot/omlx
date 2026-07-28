@@ -476,6 +476,22 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.accuracyCancel)
     }
 
+    // Context bench
+
+    @discardableResult
+    func startContextBench(_ body: ContextBenchStartRequest) async throws -> ContextBenchStartResponse {
+        try await post(AdminAPI.contextBenchStart, body: body)
+    }
+
+    func getContextBenchStatus(benchId: String) async throws -> ContextBenchStatusResponse {
+        try await get(AdminAPI.contextBenchResults(benchId))
+    }
+
+    @discardableResult
+    func cancelContextBench(benchId: String) async throws -> BenchCancelResponse {
+        try await postEmpty(AdminAPI.contextBenchCancel(benchId))
+    }
+
     // MARK: - Core request
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {

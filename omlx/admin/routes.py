@@ -5753,6 +5753,19 @@ async def add_to_accuracy_queue(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
+    from .context_benchmark import get_active_run as get_active_context_run
+
+    context_active = get_active_context_run()
+    if context_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A context benchmark is already running "
+                f"(bench_id={context_active.bench_id}, "
+                f"model_id={context_active.request.model_id})."
+            ),
+        )
+
     body = await request.json()
     try:
         bench_request = AccuracyBenchmarkRequest(**body)
@@ -5904,6 +5917,244 @@ async def stream_accuracy_benchmark(
 
 
 # =============================================================================
+# Context Benchmark API Routes (MUST be before throughput {bench_id} routes)
+# =============================================================================
+
+
+@router.get("/api/bench/context/active")
+async def get_active_context_benchmark(is_admin: bool = Depends(require_admin)):
+    """Return the currently-running context benchmark, if any."""
+    from .context_benchmark import get_active_run
+
+    run = get_active_run()
+    if run is None:
+        return {"running": False, "bench_id": None, "model_id": None}
+    return {
+        "running": True,
+        "bench_id": run.bench_id,
+        "model_id": run.request.model_id,
+        "target_tokens": run.request.target_tokens,
+    }
+
+
+@router.post("/api/bench/context/start")
+async def start_context_benchmark(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start a context window benchmark run.
+
+    Rejects with 409 while any benchmark (context, throughput, accuracy)
+    is running — they all unload/load models and would corrupt each
+    other. Rejects with 400 when the memory guard is off: there is no
+    admission boundary to measure and an unguarded probe prefill can
+    genuinely exhaust the machine.
+    """
+    from .accuracy_benchmark import get_queue_status
+    from .benchmark import get_active_run as get_active_throughput_run
+    from .context_benchmark import (
+        ContextBenchmarkRequest,
+        cleanup_old_runs,
+        create_run,
+        get_active_run,
+        run_context_benchmark,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    active = get_active_run()
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A context benchmark is already running "
+                f"(bench_id={active.bench_id}, "
+                f"model_id={active.request.model_id})."
+            ),
+        )
+    throughput_active = get_active_throughput_run()
+    if throughput_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A throughput benchmark is already running "
+                f"(bench_id={throughput_active.bench_id}, "
+                f"model_id={throughput_active.request.model_id})."
+            ),
+        )
+    accuracy_status = get_queue_status()
+    if accuracy_status.get("running"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An accuracy benchmark is already running "
+                f"(model_id={accuracy_status.get('current_model')})."
+            ),
+        )
+
+    from ..server import _server_state
+
+    enforcer = getattr(_server_state, "process_memory_enforcer", None)
+    final_ceiling = 0
+    if enforcer is not None:
+        try:
+            final_ceiling = int(enforcer.get_final_ceiling())
+        except Exception:
+            final_ceiling = 0
+    if final_ceiling <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Memory Guard is disabled. The context benchmark measures "
+                "the guard's admission boundary, and probing without it can "
+                "exhaust system memory. Enable Memory Guard and retry."
+            ),
+        )
+
+    body = await request.json()
+    try:
+        bench_request = ContextBenchmarkRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    entry = engine_pool.get_entry(bench_request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {bench_request.model_id}"
+        )
+    if entry.model_type not in ("llm", "vlm", None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model {bench_request.model_id} is not a supported model "
+                f"(type: {entry.model_type})"
+            ),
+        )
+
+    cleanup_old_runs()
+    run = create_run(bench_request)
+    run.task = asyncio.create_task(run_context_benchmark(run, engine_pool))
+
+    logger.info(
+        f"Context benchmark started: {run.bench_id} "
+        f"model={bench_request.model_id} target={bench_request.target_tokens}"
+    )
+
+    return {
+        "bench_id": run.bench_id,
+        "status": "started",
+        "target_tokens": bench_request.target_tokens,
+    }
+
+
+@router.get("/api/bench/context/{bench_id}/stream")
+async def stream_context_benchmark(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stream context benchmark progress via Server-Sent Events."""
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from .context_benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404, detail=f"Benchmark not found: {bench_id}"
+        )
+
+    async def event_generator():
+        # Replay-then-attach, same shape as the throughput bench stream.
+        # Terminal events here are `done` and `error`.
+        seen = 0
+        try:
+            while True:
+                async with run.cond:
+                    while seen >= len(run.events) and not run.terminal:
+                        try:
+                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                        except TimeoutError:
+                            break
+                    new = list(run.events[seen:])
+                    seen = len(run.events)
+                    done = run.terminal
+
+                for ev in new:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if not new and not done:
+                    yield ": keepalive\n\n"
+                if done:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/bench/context/{bench_id}/cancel")
+async def cancel_context_benchmark(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Cancel a running context benchmark."""
+    from .context_benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404, detail=f"Benchmark not found: {bench_id}"
+        )
+
+    if run.status != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Benchmark is not running (status: {run.status})",
+        )
+
+    if run.task and not run.task.done():
+        run.task.cancel()
+
+    return {"status": "cancelled", "bench_id": bench_id}
+
+
+@router.get("/api/bench/context/{bench_id}/results")
+async def get_context_benchmark_results(
+    bench_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get status and result of a context benchmark (REST poll surface)."""
+    from .context_benchmark import get_run
+
+    run = get_run(bench_id)
+    if run is None:
+        raise HTTPException(
+            status_code=404, detail=f"Benchmark not found: {bench_id}"
+        )
+
+    return {
+        "bench_id": run.bench_id,
+        "status": run.status,
+        "phase": run.phase,
+        "progress": run.progress,
+        "message": run.message,
+        "result": run.result,
+        "error": run.error_message if run.error_message else None,
+    }
+
+
+# =============================================================================
 # Benchmark API Routes (Throughput)
 # =============================================================================
 
@@ -5967,6 +6218,19 @@ async def start_benchmark(
             detail=(
                 f"A throughput benchmark is already running "
                 f"(bench_id={active.bench_id}, model_id={active.request.model_id})."
+            ),
+        )
+
+    from .context_benchmark import get_active_run as get_active_context_run
+
+    context_active = get_active_context_run()
+    if context_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A context benchmark is already running "
+                f"(bench_id={context_active.bench_id}, "
+                f"model_id={context_active.request.model_id})."
             ),
         )
 

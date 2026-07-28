@@ -3088,6 +3088,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             **specprefill_kwargs,
         )
 

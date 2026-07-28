@@ -817,6 +817,7 @@ class BatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             **specprefill_kwargs,
         )
 

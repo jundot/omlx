@@ -9238,7 +9238,13 @@ class Scheduler:
             store_future = None
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
-                    if (
+                    # Internal probes (context benchmark) opt out of the
+                    # completion-time store entirely — no boundary snapshot
+                    # prep, no host memcpy, no SSD write. They still take
+                    # the block leak-guard branch below so their paged
+                    # blocks are released for eviction.
+                    skip_store = getattr(request, "skip_cache_store", False)
+                    if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
                     ):
@@ -9253,10 +9259,13 @@ class Scheduler:
                             )
                         )
 
-                    if (
-                        hasattr(request, "_extracted_cache")
-                        and request._extracted_cache is not None
-                    ) or prompt_boundary_store is not None:
+                    if not skip_store and (
+                        (
+                            hasattr(request, "_extracted_cache")
+                            and request._extracted_cache is not None
+                        )
+                        or prompt_boundary_store is not None
+                    ):
                         try:
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids

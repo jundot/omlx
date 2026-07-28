@@ -2273,6 +2273,330 @@
         }
       }
     },
+    "bench.context.button.run" : {
+      "comment" : "Context Bench primary button that starts the measurement",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start Benchmark"
+          }
+        }
+      }
+    },
+    "bench.context.capped.memory" : {
+      "comment" : "Limited-by value when free memory bounded the result",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Available memory"
+          }
+        }
+      }
+    },
+    "bench.context.capped.native" : {
+      "comment" : "Limited-by value when the model's own context length bounded the result",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model's native context length"
+          }
+        }
+      }
+    },
+    "bench.context.capped.target" : {
+      "comment" : "Limited-by value when the selected target bounded the result",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Selected target"
+          }
+        }
+      }
+    },
+    "bench.context.header.eyebrow" : {
+      "comment" : "Eyebrow label above the Context Bench screen header",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Context Benchmark"
+          }
+        }
+      }
+    },
+    "bench.context.header.subtitle" : {
+      "comment" : "Context Bench screen subtitle describing what the benchmark measures",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Finds the largest context window this machine can actually prefill for a model, then applies it to the model's Context Window setting."
+          }
+        }
+      }
+    },
+    "bench.context.header.title" : {
+      "comment" : "Context Bench screen primary header",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Measure usable context"
+          }
+        }
+      }
+    },
+    "bench.context.model.loaded_badge" : {
+      "comment" : "Model picker entry for a loaded model; placeholder is the model id",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%@ • loaded"
+          }
+        }
+      }
+    },
+    "bench.context.model.placeholder" : {
+      "comment" : "Placeholder option in the Context Bench model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select a model…"
+          }
+        }
+      }
+    },
+    "bench.context.progress.starting" : {
+      "comment" : "Context Bench progress label before the first server update arrives",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Starting…"
+          }
+        }
+      }
+    },
+    "bench.context.result.applied_note" : {
+      "comment" : "Hint under the Context Bench result confirming the setting was written",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The value has been applied to this model's Context Window setting."
+          }
+        }
+      }
+    },
+    "bench.context.result.capped_by" : {
+      "comment" : "Result row label for what bounded the measurement",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limited by"
+          }
+        }
+      }
+    },
+    "bench.context.result.duration" : {
+      "comment" : "Result row label for how long the benchmark took",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Duration"
+          }
+        }
+      }
+    },
+    "bench.context.result.measured" : {
+      "comment" : "Result row label for the raw measured admission boundary",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Admission boundary"
+          }
+        }
+      }
+    },
+    "bench.context.result.snapshot_note" : {
+      "comment" : "Hint under the Context Bench result explaining the measurement is a snapshot",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The result reflects free memory and the Memory Guard tier at benchmark time; rerun after major changes to either."
+          }
+        }
+      }
+    },
+    "bench.context.result.tokens_label" : {
+      "comment" : "Unit caption next to the applied context window headline number",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tokens applied to Context Window"
+          }
+        }
+      }
+    },
+    "bench.context.result.verified" : {
+      "comment" : "Result row label for the prompt size the verification prefill completed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verified prefill"
+          }
+        }
+      }
+    },
+    "bench.context.row.model.label" : {
+      "comment" : "Row label for the Context Bench model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model"
+          }
+        }
+      }
+    },
+    "bench.context.row.model.sub" : {
+      "comment" : "Sublabel under the Context Bench model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loaded or unloaded — server will load on demand"
+          }
+        }
+      }
+    },
+    "bench.context.row.target.label" : {
+      "comment" : "Row label for the Context Bench target selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum context to test"
+          }
+        }
+      }
+    },
+    "bench.context.row.target.sub" : {
+      "comment" : "Sublabel under the Context Bench target selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The search stops at this size; larger targets take longer to verify"
+          }
+        }
+      }
+    },
+    "bench.context.section.configuration" : {
+      "comment" : "Section header for the Context Bench configuration block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Configuration"
+          }
+        }
+      }
+    },
+    "bench.context.section.result" : {
+      "comment" : "Section header for the Context Bench result block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Result"
+          }
+        }
+      }
+    },
+    "bench.context.subtitle.loading_models" : {
+      "comment" : "Context Bench section subtitle while models are loading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading models…"
+          }
+        }
+      }
+    },
+    "bench.context.subtitle.model_count" : {
+      "comment" : "Context Bench section subtitle showing how many models are available; placeholder is the count",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Models available: %lld"
+          }
+        }
+      }
+    },
+    "bench.context.warning.body" : {
+      "comment" : "Body of the warning callout above the Context Bench start button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This benchmark can take a long time — verification prefills a real prompt at the measured size, which may take many minutes for large models. All loaded models are unloaded when it starts, interrupting active requests. When it finishes, the result is automatically applied to the model's Context Window setting."
+          }
+        }
+      }
+    },
+    "bench.context.warning.title" : {
+      "comment" : "Heading of the warning callout above the Context Bench start button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Before you start"
+          }
+        }
+      }
+    },
     "bench.throughput.batch.baseline_label" : {
       "comment" : "Row label for the synthetic 1x baseline in the batch results table",
       "extractionState" : "manual",
@@ -17051,6 +17375,47 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Точность"
+          }
+        }
+      }
+    },
+    "sidebar.contextBench" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Context"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コンテキスト"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨텍스트"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上下文"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上下文"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Контекст"
           }
         }
       }

@@ -544,6 +544,7 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        skip_cache_store: bool = False,
     ) -> str:
         """
         Add a request for processing.
@@ -581,6 +582,7 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=skip_cache_store,
         )
 
         # SpecPrefill: resolve per-request settings.
