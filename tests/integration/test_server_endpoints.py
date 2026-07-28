@@ -445,6 +445,67 @@ class TestResponsesEndpoint:
         assert mock_engine_pool.get_engine_calls[-1]["_lease"] is True
         assert mock_engine_pool.release_calls == ["test-model"]
 
+    def test_idempotency_key_replays_and_supports_authoritative_lookup(
+        self, tmp_path
+    ):
+        from omlx.server import app, _server_state
+
+        state_dir = tmp_path / "response-state"
+        engine = RecordingResponsesEngine()
+        pool = MockEnginePool(llm_engine=engine)
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_store = _server_state.responses_store
+        try:
+            _server_state.engine_pool = pool
+            _server_state.default_model = "test-model"
+            _server_state.responses_store = ResponseStore(state_dir=state_dir)
+            client = TestClient(app)
+            headers = {"Idempotency-Key": "forgegraph-attempt-1"}
+            body = {"model": "test-model", "input": "Hello"}
+
+            _server_state.responses_store = ResponseStore()
+            unavailable = client.post("/v1/responses", json=body, headers=headers)
+            assert unavailable.status_code == 503
+            _server_state.responses_store = ResponseStore(state_dir=state_dir)
+
+            first = client.post("/v1/responses", json=body, headers=headers)
+            replay = client.post("/v1/responses", json=body, headers=headers)
+            lookup = client.get("/v1/responses/idempotency", headers=headers)
+            conflict = client.post(
+                "/v1/responses",
+                json={"model": "test-model", "input": "Different"},
+                headers=headers,
+            )
+            missing = client.get(
+                "/v1/responses/idempotency",
+                headers={"Idempotency-Key": "never-claimed"},
+            )
+            missing_header = client.get("/v1/responses/idempotency")
+            delete = client.delete(f"/v1/responses/{first.json()['id']}")
+
+            assert first.status_code == replay.status_code == lookup.status_code == 200
+            assert first.json() == replay.json() == lookup.json()
+            assert len(engine.recorded_messages) == 1
+            assert conflict.status_code == 409
+            assert missing.status_code == 404
+            assert missing.json()["final"] is True
+            assert missing_header.status_code == 400
+            assert delete.status_code == 409
+
+            _server_state.responses_store = ResponseStore(state_dir=state_dir)
+            after_restart = client.post(
+                "/v1/responses",
+                json=body,
+                headers=headers,
+            )
+            assert after_restart.json() == first.json()
+            assert len(engine.recorded_messages) == 1
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.responses_store = original_store
+
     def test_response_endpoint_includes_reasoning_item_for_think_blocks(
         self, client, mock_llm_engine
     ):

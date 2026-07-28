@@ -40,6 +40,7 @@ The server provides:
 
 import argparse
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -141,6 +142,7 @@ from .api.responses_models import (
     ResponsesRequest,
 )
 from .api.responses_utils import (
+    ResponseIdempotencyConflictError,
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
@@ -5558,6 +5560,45 @@ def _should_store_response(store_flag: Optional[bool]) -> bool:
     return store_flag is not False
 
 
+def _response_idempotency_key(
+    http_request: FastAPIRequest,
+    *,
+    required: bool = False,
+) -> Optional[str]:
+    key = http_request.headers.get("idempotency-key")
+    if key is None:
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail="Idempotency-Key header is required.",
+            )
+        return None
+    if not 1 <= len(key) <= 255 or not key.isascii() or not key.isprintable():
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key must be 1-255 printable ASCII characters.",
+        )
+    return key
+
+
+def _response_request_fingerprint(request: ResponsesRequest) -> str:
+    payload = json.dumps(
+        request.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _require_persistent_response_store() -> None:
+    if _server_state.responses_store.state_dir is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Idempotency requires persistent response state.",
+        )
+
+
 def _resolve_previous_response_messages(previous_response_id: str) -> list[dict]:
     """Resolve a previous_response_id chain into chat messages."""
     try:
@@ -5614,6 +5655,48 @@ async def create_response(
     logger.debug(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
+
+    idempotency_key = _response_idempotency_key(http_request)
+    idempotent_response_id: Optional[str] = None
+    if idempotency_key is not None:
+        _require_persistent_response_store()
+        if request.stream:
+            raise HTTPException(
+                status_code=400,
+                detail="Idempotency-Key currently requires stream=false.",
+            )
+        if request.store is False:
+            raise HTTPException(
+                status_code=400,
+                detail="Idempotency-Key requires durable response storage.",
+            )
+        initial_response = ResponseObject(
+            id=ResponseStore.response_id_for_idempotency_key(idempotency_key),
+            model=request.model,
+            status="in_progress",
+            previous_response_id=request.previous_response_id,
+            metadata=request.metadata or {},
+        ).model_dump(exclude_none=True)
+        try:
+            claimed, existing_response = (
+                _server_state.responses_store.claim_idempotency(
+                    idempotency_key,
+                    _response_request_fingerprint(request),
+                    initial_response,
+                )
+            )
+        except ResponseIdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        idempotent_response_id = initial_response["id"]
+        if not claimed:
+            return JSONResponse(
+                status_code=(
+                    202
+                    if existing_response.get("status") == "in_progress"
+                    else 200
+                ),
+                content=existing_response,
+            )
 
     load_start = time.perf_counter()
     lease = _LLMEngineLease()
@@ -5982,7 +6065,11 @@ async def create_response(
                 cached_tokens=output.cached_tokens,
             )
 
+            response_kwargs = (
+                {"id": idempotent_response_id} if idempotent_response_id else {}
+            )
             response_obj = ResponseObject(
+                **response_kwargs,
                 model=request.model,
                 status="completed",
                 output=output_items,
@@ -5993,6 +6080,7 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
+                metadata=request.metadata or {},
             )
 
             # Store response
@@ -6002,17 +6090,38 @@ async def create_response(
                     input_messages=current_input_messages,
                 )
 
-            return response_obj.model_dump_json()
+            return response_obj.model_dump_json(
+                exclude_none=idempotent_response_id is not None
+            )
+
+        async def _build_responses_api_with_failure():
+            try:
+                return await _build_responses_api()
+            except BaseException:
+                if idempotent_response_id:
+                    _server_state.responses_store.fail_idempotency(
+                        idempotent_response_id,
+                        "generation_failed",
+                    )
+                raise
 
         return StreamingResponse(
             _release_after_stream(
-                _with_json_keepalive(http_request, _build_responses_api()),
+                _with_json_keepalive(
+                    http_request,
+                    _build_responses_api_with_failure(),
+                ),
                 lease,
             ),
             media_type="application/json",
         )
 
     except BaseException:
+        if idempotent_response_id:
+            _server_state.responses_store.fail_idempotency(
+                idempotent_response_id,
+                "request_failed",
+            )
         await lease.release()
         raise
 
@@ -6672,6 +6781,27 @@ async def stream_responses_api(
         _store_response_state(final_response, input_messages=input_messages or [])
 
 
+@app.get("/v1/responses/idempotency")
+async def get_response_by_idempotency_key(
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_api_key),
+):
+    """Retrieve a response claim without repeating the request."""
+    idempotency_key = _response_idempotency_key(http_request, required=True)
+    _require_persistent_response_store()
+    data = _server_state.responses_store.get_by_idempotency_key(idempotency_key)
+    if data is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "object": "response.lookup",
+                "status": "not_found",
+                "final": True,
+            },
+        )
+    return data
+
+
 @app.get("/v1/responses/{response_id}")
 async def get_response(
     response_id: str,
@@ -6690,6 +6820,11 @@ async def delete_response(
     _: bool = Depends(verify_api_key),
 ):
     """Delete a stored response."""
+    if _server_state.responses_store.is_idempotent(response_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotent response claims cannot be deleted.",
+        )
     if not _server_state.responses_store.delete(response_id):
         raise HTTPException(status_code=404, detail="Response not found")
     return {"id": response_id, "object": "response.deleted", "deleted": True}
