@@ -1,6 +1,6 @@
 # DFlash-MLX Integration Report
 
-Date: 2026-04-14
+Date: 2026-07-28
 
 ## Overview
 
@@ -53,6 +53,7 @@ DFlashEngine is a `BaseEngine` implementation that:
 | File | Role |
 |------|------|
 | `omlx/engine/dflash.py` | DFlashEngine class — BaseEngine impl, event consumer, fallback routing |
+| `omlx/patches/dflash_laguna.py` | Laguna target adapter, gated drafter, fused-QKV loader, and mixed-cache rollback |
 | `omlx/engine/__init__.py` | DFlashEngine export (required dependency) |
 | `omlx/engine_pool.py` | DFlash routing: checks `dflash_enabled` before engine type switch |
 | `omlx/model_settings.py` | Per-model settings: `dflash_enabled`, `dflash_draft_model`, `dflash_draft_quant_bits` |
@@ -60,16 +61,17 @@ DFlashEngine is a `BaseEngine` implementation that:
 | `omlx/admin/templates/dashboard/_modal_model_settings.html` | UI: toggle, draft model dropdown, quantization selector |
 | `omlx/admin/static/js/dashboard.js` | Frontend settings binding |
 | `omlx/admin/benchmark.py` | Batch test skip guard for DFlashEngine |
-| `tests/test_dflash_engine.py` | Unit tests (14 tests) |
+| `tests/test_dflash_engine.py` | DFlash engine and routing tests |
+| `tests/test_dflash_laguna.py` | Laguna adapter parity, cache rollback, config, and checkpoint-layout tests |
 
 ### Dependency
 
-- `dflash-mlx` pinned to `bstnxbt/dflash-mlx@20d68db` (original repo, v0.1.5.1, includes Gemma4 backend + runtime package refactor)
+- `dflash-mlx` pinned to `bstnxbt/dflash-mlx@9ca0028` (v0.1.10)
 - Listed as required dependency in `pyproject.toml` and `packaging/venvstacks.toml`
 
 ### Supported models
 
-DFlash registers `QwenGdnTargetOps` and `Gemma4TargetOps`. Draft checkpoints currently exist for the Qwen3.x and Gemma4 families:
+DFlash upstream registers `QwenGdnTargetOps` and `Gemma4TargetOps`. oMLX also registers a Laguna backend and the `DFlashLagunaForCausalLM` drafter used by Poolside's official checkpoints:
 
 | Target model | Draft checkpoint |
 |--------------|-----------------|
@@ -86,8 +88,23 @@ DFlash registers `QwenGdnTargetOps` and `Gemma4TargetOps`. Draft checkpoints cur
 | Qwen/Qwen3.6-35B-A3B | z-lab/Qwen3.6-35B-A3B-DFlash |
 | google/gemma-4-31b-it | z-lab/gemma-4-31B-it-DFlash |
 | google/gemma-4-26b-a4b-it | z-lab/gemma-4-26B-A4B-it-DFlash |
+| poolside/Laguna-XS-2.1 | poolside/Laguna-XS-2.1-DFlash |
+| poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
+| poolside/Laguna-S-2.1-NVFP4(-mlx) | poolside/Laguna-S-2.1-DFlash-NVFP4 |
 
 Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
+
+Laguna target and draft checkpoints must be from the same size family and should
+use Poolside's quantization-matched draft when one is published (for example,
+`Laguna-S-2.1-DFlash-NVFP4` with the NVFP4 target). The adapter validates target
+depth, hidden size, and capture-layer IDs at load time. It implements Laguna's
+per-head/per-element softplus attention gating, partial RoPE,
+per-captured-layer RMS normalization, Poolside's fused `qkv_proj` checkpoint
+layout, mixed full/sliding target caches, and rejection rollback. DDTree
+verification, target KV quantization, and the specialized verify-linear path
+are deliberately disabled for Laguna until they have dedicated
+numerical-parity coverage; ordinary adaptive DFlash verification remains
+available.
 
 Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding via mlx-vlm — do not mix these in the DFlash toggle.
 
@@ -182,7 +199,7 @@ DFlash effectiveness degrades with long contexts:
 
 ### 3. Model support
 
-Only Qwen3.5 family has draft checkpoints. Each new model family requires:
+Qwen, Gemma4, and Laguna have compatible target adapters and published draft checkpoints. Each additional model family still requires:
 - A trained DFlash draft checkpoint (block diffusion model matching target hidden dimensions)
 - Support in dflash-mlx's target model handling (hidden state extraction, cache rollback)
 
@@ -271,16 +288,17 @@ DFlash context fallback: 5120 >= 4096, using vlm engine
 
 ## Testing
 
-### Unit tests (`tests/test_dflash_engine.py` — 14 tests)
+### Unit tests
 
 - ModelSettings: default values, serialization roundtrip, removed field handling
 - DFlashEngine: properties, stats, cache stats
 - EnginePool routing: disabled/enabled/draft model checks
+- Laguna: native-forward parity, hidden-state capture, full/rotating-cache rollback, gated draft forward, target binding, and fused-QKV checkpoint loading
 
 ### Manual testing
 
 1. Enable DFlash in admin UI for a supported model
-2. Set draft model path (e.g., `z-lab/Qwen3.5-4B-DFlash`)
+2. Set the matching draft model path (for example, `poolside/Laguna-S-2.1-DFlash-NVFP4` for an NVFP4 Laguna S target)
 3. Reload model
 4. Send short prompt → verify DFlash logs (acceptance ratio, tok/s)
 5. Send long prompt (>4K tokens) → verify fallback to BatchedEngine logs
