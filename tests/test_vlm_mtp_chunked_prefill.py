@@ -28,10 +28,11 @@ from omlx.scheduler import Scheduler
 
 
 def _make_fixture(monkeypatch, drafter_returns_uid):
-    calls = {"route": 0, "bg_insert": 0}
+    calls = {"route": 0, "bg_insert": 0, "events": []}
 
     def fake_route(request, cache, last_tokens, sampler, sm):
         calls["route"] += 1
+        calls["events"].append("route")
         return -7 if drafter_returns_uid else None  # negative uid, or ineligible
 
     def fake_bg_insert(*args, **kwargs):
@@ -86,7 +87,9 @@ def test_chunked_prefilled_request_routes_to_vlm_mtp_when_eligible(monkeypatch):
     Scheduler._insert_prefilled_request(sched, request, state, scheduled)
 
     assert calls["route"] == 1, "vlm_mtp routing was never considered (the #2219 bug)"
-    assert calls["bg_insert"] == 0, "request went to BatchGenerator despite eligible vlm_mtp"
+    assert (
+        calls["bg_insert"] == 0
+    ), "request went to BatchGenerator despite eligible vlm_mtp"
     # negative-uid bookkeeping mirrors the non-chunked routing path
     assert request.batch_uid == -7
     assert request.status == RequestStatus.RUNNING
@@ -95,6 +98,24 @@ def test_chunked_prefilled_request_routes_to_vlm_mtp_when_eligible(monkeypatch):
     assert sched.running["req-long-text"] is request
     assert request in scheduled
     assert sched.total_prompt_tokens == 32768
+
+
+def test_seed_is_applied_before_vlm_mtp_sampling(monkeypatch):
+    """A successful VLM MTP route must honor the request seed before sampling."""
+    sched, request, state, scheduled, calls = _make_fixture(
+        monkeypatch, drafter_returns_uid=True
+    )
+    request.sampling_params.seed = 123
+
+    monkeypatch.setattr(
+        scheduler_mod.mx.random,
+        "seed",
+        lambda seed: calls["events"].append(("seed", seed)),
+    )
+
+    Scheduler._insert_prefilled_request(sched, request, state, scheduled)
+
+    assert calls["events"] == [("seed", 123), "route"]
 
 
 def test_falls_back_to_batch_generator_when_drafter_ineligible(monkeypatch):

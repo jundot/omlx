@@ -4292,6 +4292,9 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
+        if request.sampling_params.seed is not None:
+            mx.random.seed(request.sampling_params.seed)
+
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
         # routing only existed on the non-chunked prefill exit -- so any prompt
@@ -4323,9 +4326,6 @@ class Scheduler:
                 return
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
-
-        if request.sampling_params.seed is not None:
-            mx.random.seed(request.sampling_params.seed)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
