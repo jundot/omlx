@@ -672,8 +672,7 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 9981
         mock_settings.auth.api_key = "super-secret-key"
-        mock_settings.claude_code.context_scaling_enabled = True
-        mock_settings.claude_code.target_context_size = 200000
+        mock_settings.claude_code.autocompact_threshold_pct = 85
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -742,8 +741,7 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 8000
         mock_settings.auth.api_key = ""
-        mock_settings.claude_code.context_scaling_enabled = False
-        mock_settings.claude_code.target_context_size = 200000
+        mock_settings.claude_code.autocompact_threshold_pct = 85
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -775,8 +773,7 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 8000
         mock_settings.auth.api_key = ""
-        mock_settings.claude_code.context_scaling_enabled = False
-        mock_settings.claude_code.target_context_size = 200000
+        mock_settings.claude_code.autocompact_threshold_pct = 85
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {

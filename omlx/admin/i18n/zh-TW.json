@@ -94,10 +94,6 @@
   "status.claude_code.model_unavailable": "先前儲存的模型已無法使用",
   "status.claude_code.command": "命令",
   "status.claude_code.copy_command_tooltip": "複製命令",
-  "status.claude_code.context_scaling": "Claude Code 情境縮放",
-  "status.claude_code.target_context_size": "目標情境大小",
-  "status.claude_code.tokens_unit": "tokens",
-  "status.claude_code.context_scaling_description": "縮放 Token 用量，使 Claude Code 的自動壓縮在較小情境模型上正確觸發。",
   "status.integrations.section_label": "應用程式",
   "status.integrations.copy_command_tooltip": "複製命令",
   "status.engines.section_label": "引擎版本",
@@ -955,5 +951,7 @@
   "js.error.delete_model_failed": "刪除模型失敗",
   "js.error.delete_model_connection": "刪除模型失敗，請檢查伺服器連線。",
   "js.success.download_started": "已開始下載：{repo_id}",
-  "js.success.settings_saved": "設定儲存成功"
+  "js.success.settings_saved": "設定儲存成功",
+  "status.claude_code.autocompact_threshold_pct": "自動壓縮閾值",
+  "status.claude_code.autocompact_threshold_pct_description": "模型真實最大情境窗口中觸發 Claude Code 自動壓縮的百分比（預設 85%）。"
 }

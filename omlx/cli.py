@@ -416,6 +416,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     opus_model = cli_opus_model or settings_opus_model
     sonnet_model = cli_sonnet_model or settings_sonnet_model
     haiku_model = cli_haiku_model or settings_haiku_model
+    autocompact_threshold_pct = getattr(
+        claude_settings, "autocompact_threshold_pct", 85
+    )
 
     # Build headers for authenticated requests
     headers = {}
@@ -497,6 +500,9 @@ def launch_command(args, extra_args: list[str] | None = None):
         reasoning=model_info.get("enable_thinking"),
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
+        autocompact_threshold_pct=(
+            autocompact_threshold_pct if tool_name == "claude" else None
+        ),
     )
 
     # Launch

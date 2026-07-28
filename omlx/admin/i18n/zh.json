@@ -94,10 +94,6 @@
   "status.claude_code.model_unavailable": "已保存的模型不再可用",
   "status.claude_code.command": "命令",
   "status.claude_code.copy_command_tooltip": "复制命令",
-  "status.claude_code.context_scaling": "Claude Code 上下文缩放",
-  "status.claude_code.target_context_size": "目标上下文大小",
-  "status.claude_code.tokens_unit": "tokens",
-  "status.claude_code.context_scaling_description": "缩放 Token 用量，使 Claude Code 的自动压缩在较小上下文模型上正确触发。",
   "status.integrations.section_label": "应用程序",
   "status.integrations.copy_command_tooltip": "复制命令",
   "status.engines.section_label": "引擎版本",
@@ -955,5 +951,7 @@
   "js.error.delete_model_failed": "删除模型失败",
   "js.error.delete_model_connection": "删除模型失败，请检查服务器连接。",
   "js.success.download_started": "已开始下载：{repo_id}",
-  "js.success.settings_saved": "设置已成功保存"
+  "js.success.settings_saved": "设置已成功保存",
+  "status.claude_code.autocompact_threshold_pct": "自动压缩阈值",
+  "status.claude_code.autocompact_threshold_pct_description": "模型真实最大上下文窗口中触发 Claude Code 自动压缩的百分比（默认 85%）。"
 }

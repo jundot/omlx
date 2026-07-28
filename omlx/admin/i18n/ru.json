@@ -94,10 +94,6 @@
   "status.claude_code.model_unavailable": "Сохраненная модель больше не доступна.",
   "status.claude_code.command": "Команда",
   "status.claude_code.copy_command_tooltip": "Копировать команду",
-  "status.claude_code.context_scaling": "Масштабирование контекста для Claude Code",
-  "status.claude_code.target_context_size": "Размер целевого контекста",
-  "status.claude_code.tokens_unit": "токены",
-  "status.claude_code.context_scaling_description": "Масштабирует использование токенов, поэтому автоматическое сжатие Claude Code правильно срабатывает с меньшими контекстными моделями.",
   "status.integrations.section_label": "Приложения",
   "status.integrations.copy_command_tooltip": "Копировать команду",
   "status.engines.section_label": "Версии движков",
@@ -955,5 +951,7 @@
   "js.error.delete_model_failed": "Не удалось удалить модель",
   "js.error.delete_model_connection": "Не удалось удалить модель. Проверьте соединение с сервером.",
   "js.success.download_started": "Загрузка начата: {repo_id}",
-  "js.success.settings_saved": "Настройки успешно сохранены"
+  "js.success.settings_saved": "Настройки успешно сохранены",
+  "status.claude_code.autocompact_threshold_pct": "Порог автосжатия",
+  "status.claude_code.autocompact_threshold_pct_description": "Процент реального максимального размера контекста модели, при котором Claude Code запускает автоматическое сжатие (по умолчанию 85%)."
 }

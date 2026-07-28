@@ -1607,38 +1607,6 @@ def get_embedding_max_length(
     return get_max_context_window(model_id)
 
 
-def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
-    """
-    Scale token count for Anthropic API response if context scaling is enabled.
-
-    Adjusts reported token counts so that Claude Code's auto-compact
-    triggers at the correct timing when using models with smaller context
-    windows than the target (default 200k).
-
-    Formula: scaled = token_count * (target_context_size / actual_context_size)
-
-    Args:
-        token_count: Original token count to scale.
-        model_id: Model ID to get context window for.
-
-    Returns:
-        Scaled token count, or original if scaling not applicable.
-    """
-    global_settings = _server_state.global_settings
-    if global_settings is None:
-        return token_count
-
-    cc = global_settings.claude_code
-    if not cc.context_scaling_enabled:
-        return token_count
-
-    actual = get_max_context_window(model_id)
-    if not actual or actual >= cc.target_context_size:
-        return token_count
-
-    return int(token_count * cc.target_context_size / actual)
-
-
 def validate_context_window(
     num_prompt_tokens: int, model_id: str | None = None
 ) -> None:
@@ -4817,11 +4785,7 @@ async def stream_anthropic_messages(
     yield create_message_start_event(
         message_id=message_id,
         model=request.model,
-        input_tokens=(
-            0
-            if uses_cache_control
-            else scale_anthropic_tokens(estimated_input_tokens, request.model)
-        ),
+        input_tokens=(0 if uses_cache_control else estimated_input_tokens),
     )
 
     # 3. Stream content with thinking/content separation
@@ -5043,15 +5007,9 @@ async def stream_anthropic_messages(
         output.finish_reason if output else "stop", bool(tool_calls)
     )
     # Use actual token counts from the last output
-    actual_input_tokens = scale_anthropic_tokens(
-        last_output.prompt_tokens if last_output else 0, request.model
-    )
-    actual_output_tokens = scale_anthropic_tokens(
-        last_output.completion_tokens if last_output else 0, request.model
-    )
-    actual_cached_tokens = scale_anthropic_tokens(
-        last_output.cached_tokens if last_output else 0, request.model
-    )
+    actual_input_tokens = last_output.prompt_tokens if last_output else 0
+    actual_output_tokens = last_output.completion_tokens if last_output else 0
+    actual_cached_tokens = last_output.cached_tokens if last_output else 0
     yield create_message_delta_event(
         stop_reason=stop_reason,
         output_tokens=actual_output_tokens,
@@ -5442,18 +5400,12 @@ async def create_anthropic_message(
             response = convert_internal_to_anthropic_response(
                 text=cleaned_text.strip() if cleaned_text else "",
                 model=request.model,
-                prompt_tokens=scale_anthropic_tokens(
-                    output.prompt_tokens, request.model
-                ),
-                completion_tokens=scale_anthropic_tokens(
-                    output.completion_tokens, request.model
-                ),
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
                 tool_calls=tool_calls,
                 thinking=cleaned_thinking if cleaned_thinking else None,
-                cached_tokens=scale_anthropic_tokens(
-                    output.cached_tokens, request.model
-                ),
+                cached_tokens=output.cached_tokens,
                 request_uses_cache_control=request_has_cache_control(request),
             )
 
@@ -5539,7 +5491,7 @@ async def count_anthropic_tokens(
         else:
             token_ids = prompt  # Already tokenized
 
-        input_tokens = scale_anthropic_tokens(len(token_ids), request.model)
+        input_tokens = len(token_ids)
         logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
         return TokenCountResponse(input_tokens=input_tokens)

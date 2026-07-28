@@ -94,10 +94,6 @@
   "status.claude_code.model_unavailable": "Le modèle enregistré n'est plus disponible",
   "status.claude_code.command": "Commande",
   "status.claude_code.copy_command_tooltip": "Copier la commande",
-  "status.claude_code.context_scaling": "Mise à l'échelle du contexte pour Claude Code",
-  "status.claude_code.target_context_size": "Taille de contexte cible",
-  "status.claude_code.tokens_unit": "tokens",
-  "status.claude_code.context_scaling_description": "Ajuste l'utilisation des tokens pour que le compactage automatique de Claude Code se déclenche correctement avec les modèles de contexte plus petit.",
   "status.integrations.section_label": "Autres intégrations",
   "status.integrations.copy_command_tooltip": "Copier la commande",
   "status.engines.section_label": "Versions du moteur",
@@ -955,5 +951,7 @@
   "js.error.delete_model_failed": "Impossible de supprimer le modèle",
   "js.error.delete_model_connection": "Impossible de supprimer le modèle. Vérifiez la connexion au serveur.",
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
-  "js.success.settings_saved": "Paramètres enregistrés avec succès"
+  "js.success.settings_saved": "Paramètres enregistrés avec succès",
+  "status.claude_code.autocompact_threshold_pct": "Seuil de compactage automatique",
+  "status.claude_code.autocompact_threshold_pct_description": "Pourcentage de la fenêtre de contexte maximale réelle du modèle à partir duquel Claude Code déclenche le compactage automatique (85 % par défaut)."
 }

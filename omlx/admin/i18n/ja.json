@@ -94,10 +94,6 @@
   "status.claude_code.model_unavailable": "保存されたモデルは利用できなくなりました",
   "status.claude_code.command": "コマンド",
   "status.claude_code.copy_command_tooltip": "コマンドをコピー",
-  "status.claude_code.context_scaling": "Claude Codeコンテキストスケーリング",
-  "status.claude_code.target_context_size": "目標コンテキストサイズ",
-  "status.claude_code.tokens_unit": "tokens",
-  "status.claude_code.context_scaling_description": "トークン使用量をスケーリングし、小さなコンテキストモデルでClaude Codeの自動圧縮が正しく動作するようにします。",
   "status.integrations.section_label": "アプリケーション",
   "status.integrations.copy_command_tooltip": "コマンドをコピー",
   "status.engines.section_label": "エンジンバージョン",
@@ -955,5 +951,7 @@
   "js.error.delete_model_failed": "モデルの削除に失敗しました",
   "js.error.delete_model_connection": "モデルの削除に失敗しました。サーバー接続を確認してください。",
   "js.success.download_started": "ダウンロード開始: {repo_id}",
-  "js.success.settings_saved": "設定が保存されました"
+  "js.success.settings_saved": "設定が保存されました",
+  "status.claude_code.autocompact_threshold_pct": "自動圧縮のしきい値",
+  "status.claude_code.autocompact_threshold_pct_description": "モデルの実際の最大コンテキストウィンドウのうち、Claude Codeが自動圧縮を開始する割合（デフォルト85%）。"
 }

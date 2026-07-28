@@ -695,8 +695,7 @@ class UISettings:
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
-    context_scaling_enabled: bool = False
-    target_context_size: int = 200000  # Claude Code default (200k)
+    autocompact_threshold_pct: int = 85
     # Mode: "cloud" = native claude.ai subscription, "local" = route through omlx.
     # Default is "cloud" so upgrades don't silently route traffic to omlx.
     mode: str = "cloud"
@@ -707,8 +706,7 @@ class ClaudeCodeSettings:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "context_scaling_enabled": self.context_scaling_enabled,
-            "target_context_size": self.target_context_size,
+            "autocompact_threshold_pct": self.autocompact_threshold_pct,
             "mode": self.mode,
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
@@ -719,8 +717,7 @@ class ClaudeCodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
         return cls(
-            context_scaling_enabled=data.get("context_scaling_enabled", False),
-            target_context_size=data.get("target_context_size", 200000),
+            autocompact_threshold_pct=data.get("autocompact_threshold_pct", 85),
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
@@ -1365,10 +1362,10 @@ class GlobalSettings:
             )
 
         # Claude Code validation
-        if self.claude_code.target_context_size <= 0:
+        if not 50 <= self.claude_code.autocompact_threshold_pct <= 95:
             errors.append(
-                f"Invalid target_context_size: "
-                f"{self.claude_code.target_context_size} (must be > 0)"
+                f"Invalid autocompact_threshold_pct: "
+                f"{self.claude_code.autocompact_threshold_pct} (must be 50-95)"
             )
         valid_modes = {"local", "cloud"}
         if self.claude_code.mode not in valid_modes:

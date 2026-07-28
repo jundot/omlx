@@ -1347,6 +1347,86 @@ class TestClaudeCodeIntegration:
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
 
+    def test_launch_sets_autocompact_pct_override_default(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                    context_window=128000,
+                    autocompact_threshold_pct=85,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
+        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "0.85"
+
+    def test_launch_sets_autocompact_pct_override_custom(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                    context_window=128000,
+                    autocompact_threshold_pct=90,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
+        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "0.9"
+
+    def test_launch_omits_pct_override_when_not_configured(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                    context_window=128000,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in env
+
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()
         captured = {}

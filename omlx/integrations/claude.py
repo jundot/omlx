@@ -64,6 +64,10 @@ class ClaudeCodeIntegration(Integration):
 
         if ctx.context_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
+        if ctx.autocompact_threshold_pct is not None:
+            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(
+                ctx.autocompact_threshold_pct / 100
+            )
 
         binary = self._find_claude_binary()
         # Deny the LSP tool. Claude Code attaches its full schema to the tools
@@ -82,5 +86,12 @@ class ClaudeCodeIntegration(Integration):
         argv = [binary, *extra_args]
         print(f"Launching Claude Code with model {ctx.model}...")
         if ctx.context_window:
-            print(f"Auto-compact window: {ctx.context_window:,} tokens")
+            window_msg = f"Auto-compact window: {ctx.context_window:,} tokens"
+            if ctx.autocompact_threshold_pct is not None:
+                trigger_at = int(ctx.context_window * ctx.autocompact_threshold_pct / 100)
+                window_msg += (
+                    f" (compacts at {ctx.autocompact_threshold_pct}% "
+                    f"≈ {trigger_at:,} tokens)"
+                )
+            print(window_msg)
         os.execvpe(binary, argv, env)

@@ -94,10 +94,6 @@
   "status.claude_code.model_unavailable": "El modelo guardado ya no está disponible",
   "status.claude_code.command": "Comando",
   "status.claude_code.copy_command_tooltip": "Copiar comando",
-  "status.claude_code.context_scaling": "Escalado de Contexto para Claude Code",
-  "status.claude_code.target_context_size": "Tamaño de Contexto Objetivo",
-  "status.claude_code.tokens_unit": "tokens",
-  "status.claude_code.context_scaling_description": "Escala el uso de tokens para que el auto-compact de Claude Code se active correctamente con modelos de contexto reducido.",
   "status.integrations.section_label": "Aplicaciones",
   "status.integrations.copy_command_tooltip": "Copiar comando",
   "status.engines.section_label": "Versiones de Motor",
@@ -955,5 +951,7 @@
   "js.error.delete_model_failed": "Error al eliminar el modelo",
   "js.error.delete_model_connection": "Error al eliminar el modelo. Verifica la conexión con el servidor.",
   "js.success.download_started": "Descarga iniciada: {repo_id}",
-  "js.success.settings_saved": "Configuración guardada correctamente"
+  "js.success.settings_saved": "Configuración guardada correctamente",
+  "status.claude_code.autocompact_threshold_pct": "Umbral de Auto-compact",
+  "status.claude_code.autocompact_threshold_pct_description": "Porcentaje de la ventana de contexto máxima real del modelo en el que Claude Code activa el auto-compact (85% por defecto)."
 }
