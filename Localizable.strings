@@ -1,0 +1,1858 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>about.credits.mlx.role</key>
+	<string>Apple 的数组框架——驱动全部模型运行的核心引擎</string>
+	<key>about.credits.mlx_audio.role</key>
+	<string>基于 MLX 的音频（语音转文字 / 文字转语音 / 语音转语音）模型</string>
+	<key>about.credits.mlx_embeddings.role</key>
+	<string>基于 MLX 的嵌入（Embedding）与重排序（Reranker）模型</string>
+	<key>about.credits.mlx_lm.role</key>
+	<string>基于 MLX 的语言模型执行与微调</string>
+	<key>about.credits.mlx_vlm.role</key>
+	<string>基于 MLX 的视觉语言模型</string>
+	<key>about.hero.tagline</key>
+	<string>本地 AI，Mac 上即刻响应。</string>
+	<key>about.license.name</key>
+	<string>Apache License 2.0</string>
+	<key>about.license.notice</key>
+	<string>Copyright © oMLX 贡献者。依据 Apache License, Version 2.0 授权。请查阅代码仓库中的 LICENSE 文件获取完整文本。</string>
+	<key>about.project.docs.label</key>
+	<string>文档</string>
+	<key>about.project.docs.sub</key>
+	<string>安装、模型管理、集成</string>
+	<key>about.project.github.label</key>
+	<string>GitHub 仓库</string>
+	<key>about.project.github.sub</key>
+	<string>源码、问题追踪与路线图</string>
+	<key>about.project.issue.label</key>
+	<string>报告问题</string>
+	<key>about.project.issue.sub</key>
+	<string>在 GitHub 上报 Bug 与功能请求</string>
+	<key>about.project.releases.label</key>
+	<string>版本发布</string>
+	<key>about.project.releases.sub</key>
+	<string>下载最新的 CLI 与 macOS 应用</string>
+	<key>about.section.built_on</key>
+	<string>底层技术</string>
+	<key>about.section.license</key>
+	<string>许可证</string>
+	<key>about.section.project</key>
+	<string>项目</string>
+	<key>appearance.model_scope.all</key>
+	<string>所有模型</string>
+	<key>appearance.model_scope.favorites</key>
+	<string>仅收藏</string>
+	<key>appearance.row.alltime_activity</key>
+	<string>全时段活动</string>
+	<key>appearance.row.alltime_activity.sub</key>
+	<string>全部会话的平均速度（ALL）。</string>
+	<key>appearance.row.average_activity</key>
+	<string>平均会话活动</string>
+	<key>appearance.row.average_activity.sub</key>
+	<string>服务端自启动以来的平均速度（AVG）。</string>
+	<key>appearance.row.cpu_item</key>
+	<string>CPU（中央处理器）</string>
+	<key>appearance.row.cpu_item.sub</key>
+	<string>CPU 使用量，显示为垂直柱状图。</string>
+	<key>appearance.row.gpu_item</key>
+	<string>GPU（图形处理器）</string>
+	<key>appearance.row.gpu_item.sub</key>
+	<string>GPU 使用量，显示为垂直柱状图。</string>
+	<key>appearance.row.live_activity</key>
+	<string>实时活动</string>
+	<key>appearance.row.live_activity.sub</key>
+	<string>当前运行请求的处理速度（LIV）。</string>
+	<key>appearance.row.memory_item</key>
+	<string>内存</string>
+	<key>appearance.row.memory_item.sub</key>
+	<string>内存使用量，显示为垂直柱状图（MEM）。</string>
+	<key>appearance.row.refresh_interval</key>
+	<string>刷新间隔</string>
+	<key>appearance.row.refresh_interval.sub</key>
+	<string>菜单栏项目及其图表的更新频率。</string>
+	<key>appearance.row.show_dock_icon</key>
+	<string>显示 Dock 图标</string>
+	<key>appearance.row.show_dock_icon.sub</key>
+	<string>即使没有打开窗口也保持 Dock 图标可见。</string>
+	<key>appearance.row.visible_models</key>
+	<string>可见模型</string>
+	<key>appearance.row.visible_models.sub</key>
+	<string>菜单栏“模型”菜单中列出的模型。已加载模型始终显示。</string>
+	<key>appearance.section.general</key>
+	<string>通用</string>
+	<key>appearance.section.menubar_items</key>
+	<string>菜单栏项目</string>
+	<key>appearance.section.menubar_items.sub</key>
+	<string>菜单栏中的每个项目都会显示提示词处理与令牌生成速度。点击项目可查看详情和实时图表。</string>
+	<key>appearance.section.model_library</key>
+	<string>菜单栏模型库</string>
+	<key>bench.accuracy.benchmarks.subtitle.empty</key>
+	<string>点击选择。0 表示使用完整数据集。</string>
+	<key>bench.accuracy.benchmarks.title</key>
+	<string>基准测试</string>
+	<key>bench.accuracy.button.add</key>
+	<string>加入队列并运行</string>
+	<key>bench.accuracy.button.adding</key>
+	<string>加入中…</string>
+	<key>bench.accuracy.card.samples_label</key>
+	<string>样本：</string>
+	<key>bench.accuracy.category.code</key>
+	<string>代码</string>
+	<key>bench.accuracy.category.knowledge</key>
+	<string>知识</string>
+	<key>bench.accuracy.category.math</key>
+	<string>数学</string>
+	<key>bench.accuracy.category.reasoning</key>
+	<string>推理</string>
+	<key>bench.accuracy.category.safety</key>
+	<string>安全</string>
+	<key>bench.accuracy.dataset.cmmlu</key>
+	<string>CMMLU（中文）</string>
+	<key>bench.accuracy.dataset.jmmlu</key>
+	<string>JMMLU（日文）</string>
+	<key>bench.accuracy.dataset.kmmlu</key>
+	<string>KMMLU（韩文）</string>
+	<key>bench.accuracy.header.eyebrow</key>
+	<string>准确率基准测试</string>
+	<key>bench.accuracy.header.subtitle</key>
+	<string>为模型设置基准测试队列。结果会累计，直到你手动清除。可通过服务端队列实现应用关闭后恢复。</string>
+	<key>bench.accuracy.header.title</key>
+	<string>测量模型准确率</string>
+	<key>bench.accuracy.model.loaded_badge</key>
+	<string> • 已加载</string>
+	<key>bench.accuracy.model.placeholder</key>
+	<string>选择一个模型…</string>
+	<key>bench.accuracy.queue.remove.help</key>
+	<string>从队列移除</string>
+	<key>bench.accuracy.queue.running.placeholder</key>
+	<string>运行中…</string>
+	<key>bench.accuracy.queue.subtitle.empty</key>
+	<string>当前没有活跃任务</string>
+	<key>bench.accuracy.result.categories</key>
+	<string>分类</string>
+	<key>bench.accuracy.result.thinking_pill</key>
+	<string>扩展思考</string>
+	<key>bench.accuracy.results.clear_all</key>
+	<string>清除全部</string>
+	<key>bench.accuracy.row.batch_size.label</key>
+	<string>批次大小</string>
+	<key>bench.accuracy.row.batch_size.sub</key>
+	<string>更大的批次能更快完成，但会占用更多内存</string>
+	<key>bench.accuracy.row.model.label</key>
+	<string>模型</string>
+	<key>bench.accuracy.row.model.sub</key>
+	<string>已加载模型会排在前面</string>
+	<key>bench.accuracy.row.thinking.label</key>
+	<string>扩展思考</string>
+	<key>bench.accuracy.row.thinking.sub</key>
+	<string>逐题启用推理追踪（速度降低）</string>
+	<key>bench.accuracy.sample_size.full</key>
+	<string>完整</string>
+	<key>bench.accuracy.section.configuration</key>
+	<string>配置</string>
+	<key>bench.accuracy.section.queue</key>
+	<string>队列</string>
+	<key>bench.accuracy.section.results</key>
+	<string>结果</string>
+	<key>bench.accuracy.section.text_export</key>
+	<string>文本导出</string>
+	<key>bench.accuracy.status.running</key>
+	<string>运行中</string>
+	<key>bench.accuracy.subtitle.loading_models</key>
+	<string>加载模型…</string>
+	<key>bench.accuracy.text_export.copied</key>
+	<string>已复制</string>
+	<key>bench.accuracy.text_export.hide</key>
+	<string>隐藏文本转储</string>
+	<key>bench.accuracy.text_export.show</key>
+	<string>显示文本转储</string>
+	<key>bench.throughput.batch.baseline_label</key>
+	<string>1× 基准</string>
+	<key>bench.throughput.batch.col.avg_ttft</key>
+	<string>平均 TTFT（毫秒）</string>
+	<key>bench.throughput.batch.col.batch</key>
+	<string>批次</string>
+	<key>bench.throughput.batch.col.e2e</key>
+	<string>端到端耗时（秒）</string>
+	<key>bench.throughput.batch.col.pp_tps</key>
+	<string>pp TPS（流水线并行每秒令牌数）</string>
+	<key>bench.throughput.batch.col.speedup</key>
+	<string>加速比</string>
+	<key>bench.throughput.batch.col.tg_tps</key>
+	<string>tg TPS（令牌生成每秒令牌数）</string>
+	<key>bench.throughput.batch.subtitle</key>
+	<string>连续批处理与 1× 基准的对比</string>
+	<key>bench.throughput.button.run</key>
+	<string>运行基准测试</string>
+	<key>bench.throughput.header.eyebrow</key>
+	<string>吞吐量基准测试</string>
+	<key>bench.throughput.header.subtitle</key>
+	<string>单请求 TTFT（首令牌延迟）/ TPOT（每令牌输出时间）+ 连续批处理 TPS，扫描上下文长度与批次大小。结果会保留在内存中直至屏幕卸载。</string>
+	<key>bench.throughput.header.title</key>
+	<string>测量推理速度</string>
+	<key>bench.throughput.model.placeholder</key>
+	<string>选择一个模型…</string>
+	<key>bench.throughput.progress.warming_up</key>
+	<string>预热中…</string>
+	<key>bench.throughput.row.batch_sizes.sub</key>
+	<string>连续批处理阶段中每批次的并发请求数</string>
+	<key>bench.throughput.row.batch_sizes.title</key>
+	<string>批次大小</string>
+	<key>bench.throughput.row.context_lengths.sub</key>
+	<string>每次单请求试验输入的提示令牌数</string>
+	<key>bench.throughput.row.context_lengths.title</key>
+	<string>上下文长度</string>
+	<key>bench.throughput.row.gen_length.label</key>
+	<string>生成长度</string>
+	<key>bench.throughput.row.gen_length.sub</key>
+	<string>每次单请求试验的输出令牌数</string>
+	<key>bench.throughput.row.model.label</key>
+	<string>模型</string>
+	<key>bench.throughput.row.model.sub</key>
+	<string>已加载或未加载——服务端将按需加载</string>
+	<key>bench.throughput.section.batch_results</key>
+	<string>批次结果</string>
+	<key>bench.throughput.section.configuration</key>
+	<string>配置</string>
+	<key>bench.throughput.section.leaderboard</key>
+	<string>社区排行榜</string>
+	<key>bench.throughput.section.single_results</key>
+	<string>单请求结果</string>
+	<key>bench.throughput.single.col.e2e</key>
+	<string>端到端耗时（秒）</string>
+	<key>bench.throughput.single.col.peak_mem</key>
+	<string>峰值内存</string>
+	<key>bench.throughput.single.col.pp_tps</key>
+	<string>pp TPS（流水线并行每秒令牌数）</string>
+	<key>bench.throughput.single.col.test</key>
+	<string>测试</string>
+	<key>bench.throughput.single.col.tg_tps</key>
+	<string>tg TPS（令牌生成每秒令牌数）</string>
+	<key>bench.throughput.single.col.throughput</key>
+	<string>吞吐量</string>
+	<key>bench.throughput.single.col.tpot</key>
+	<string>TPOT（毫秒）</string>
+	<key>bench.throughput.single.col.ttft</key>
+	<string>TTFT（毫秒）</string>
+	<key>bench.throughput.subtitle.loading_models</key>
+	<string>加载模型…</string>
+	<key>bench.throughput.text_export.title</key>
+	<string>文本导出</string>
+	<key>bench.throughput.upload.owner_hash.label</key>
+	<string>所有者哈希</string>
+	<key>bench.throughput.upload.row.already</key>
+	<string>已提交</string>
+	<key>bench.throughput.upload.row.no_url</key>
+	<string>未返回 URL</string>
+	<key>bench.throughput.upload.row.submitted</key>
+	<string>已提交</string>
+	<key>bench.throughput.upload.skipped.default</key>
+	<string>服务端跳过了这些结果的上传。</string>
+	<key>bench.throughput.upload.skipped.experimental_default</key>
+	<string>实验性功能</string>
+	<key>bench.throughput.upload.skipped.title</key>
+	<string>已跳过社区上传</string>
+	<key>bench.throughput.upload.subtitle.skipped</key>
+	<string>已跳过</string>
+	<key>bench.throughput.upload.subtitle.uploading</key>
+	<string>提交结果…</string>
+	<key>bench.throughput.upload.uploading</key>
+	<string>正在上传至 omlx.ai…</string>
+	<key>common.back</key>
+	<string>返回</string>
+	<key>common.cancel</key>
+	<string>取消</string>
+	<key>common.copy</key>
+	<string>复制</string>
+	<key>common.copy_model_id</key>
+	<string>复制模型 ID</string>
+	<key>common.create</key>
+	<string>创建</string>
+	<key>common.open</key>
+	<string>打开</string>
+	<key>common.save</key>
+	<string>保存</string>
+	<key>downloads.active.subtitle.empty</key>
+	<string>没有活跃任务</string>
+	<key>downloads.active.title</key>
+	<string>下载中</string>
+	<key>downloads.button.download</key>
+	<string>下载</string>
+	<key>downloads.button.retry</key>
+	<string>重试</string>
+	<key>downloads.button.show_card</key>
+	<string>查看模型卡片</string>
+	<key>downloads.cancel.help</key>
+	<string>取消</string>
+	<key>downloads.card.close</key>
+	<string>关闭</string>
+	<key>downloads.card.download</key>
+	<string>下载</string>
+	<key>downloads.card.empty</key>
+	<string>此模型未附带说明文档。</string>
+	<key>downloads.card.error</key>
+	<string>无法加载模型卡片</string>
+	<key>downloads.card.files.empty</key>
+	<string>未报告文件。</string>
+	<key>downloads.card.loading</key>
+	<string>加载模型卡片…</string>
+	<key>downloads.card.lora_warning</key>
+	<string>这是一个 LoRA（低秩适配器）适配器。它需要一个兼容的基础模型才能运行——单独下载无法在 oMLX 中加载。</string>
+	<key>downloads.card.retry</key>
+	<string>重试</string>
+	<key>downloads.card.tab.card</key>
+	<string>模型卡片</string>
+	<key>downloads.card.tab.files</key>
+	<string>文件</string>
+	<key>downloads.card.tab.tags</key>
+	<string>标签</string>
+	<key>downloads.card.tags.empty</key>
+	<string>暂无标签。</string>
+	<key>downloads.card.view_upstream</key>
+	<string>在 %@ 中查看</string>
+	<key>downloads.hf.mirror.placeholder</key>
+	<string>https://hf-mirror.com（留空为 huggingface.co）</string>
+	<key>downloads.hf.section.title</key>
+	<string>从 Hugging Face 添加模型</string>
+	<key>downloads.mirror.configure</key>
+	<string>配置镜像…</string>
+	<key>downloads.mirror.custom</key>
+	<string>自定义</string>
+	<key>downloads.mirror.label</key>
+	<string>镜像：</string>
+	<key>downloads.mirror.reset</key>
+	<string>重置</string>
+	<key>downloads.ms.mirror.placeholder</key>
+	<string>https://modelscope.cn（留空为 ModelScope 默认）</string>
+	<key>downloads.ms.section.title</key>
+	<string>从 ModelScope 添加模型</string>
+	<key>downloads.recent.title</key>
+	<string>最近任务</string>
+	<key>downloads.search.loading</key>
+	<string>搜索中…</string>
+	<key>downloads.source.hf</key>
+	<string>Hugging Face</string>
+	<key>downloads.source.ms</key>
+	<string>ModelScope</string>
+	<key>downloads.source.ms_unavailable</key>
+	<string>此版本中 ModelScope SDK 不可用</string>
+	<key>downloads.status.cancelled</key>
+	<string>已取消</string>
+	<key>downloads.status.completed</key>
+	<string>已完成</string>
+	<key>downloads.status.downloading</key>
+	<string>下载中</string>
+	<key>downloads.status.failed</key>
+	<string>失败</string>
+	<key>downloads.status.paused</key>
+	<string>已暂停</string>
+	<key>downloads.status.queued</key>
+	<string>已排队</string>
+	<key>downloads.suggested.empty</key>
+	<string>当前暂无推荐。</string>
+	<key>downloads.suggested.get</key>
+	<string>获取</string>
+	<key>downloads.suggested.hint.filtered_by_ram</key>
+	<string>按可用内存筛选</string>
+	<key>downloads.suggested.loading</key>
+	<string>推荐加载中…</string>
+	<key>downloads.suggested.sort.downloads</key>
+	<string>下载最多</string>
+	<key>downloads.suggested.sort.params</key>
+	<string>参数量：从高到低</string>
+	<key>downloads.suggested.sort.size</key>
+	<string>大小：从高到低</string>
+	<key>downloads.suggested.title</key>
+	<string>推荐模型</string>
+	<key>integrations.claude.context_scaling</key>
+	<string>上下文缩放</string>
+	<key>integrations.claude.context_scaling.sub</key>
+	<string>为长时间代理会话扩展上下文窗口</string>
+	<key>integrations.claude.haiku</key>
+	<string>Haiku 层级</string>
+	<key>integrations.claude.haiku.sub</key>
+	<string>用于后台任务与工具调用</string>
+	<key>integrations.claude.mode</key>
+	<string>模式</string>
+	<key>integrations.claude.mode.cloud</key>
+	<string>云端</string>
+	<key>integrations.claude.mode.local</key>
+	<string>本地</string>
+	<key>integrations.claude.opus</key>
+	<string>Opus 层级</string>
+	<key>integrations.claude.sonnet</key>
+	<string>Sonnet 层级</string>
+	<key>integrations.claude.target_context</key>
+	<string>目标上下文大小</string>
+	<key>integrations.claude.target_context.sub</key>
+	<string>Claude Code 每次请求将缩放的上下文窗口大小</string>
+	<key>integrations.command.terminal_caption</key>
+	<string>$ 终端</string>
+	<key>integrations.error.target_context_invalid</key>
+	<string>目标上下文大小必须为正整数。</string>
+	<key>integrations.mcp.apply</key>
+	<string>应用</string>
+	<key>integrations.mcp.config_path</key>
+	<string>配置路径</string>
+	<key>integrations.mcp.config_path.sub</key>
+	<string>MCP（模型上下文协议）配置文件路径。留空则禁用。</string>
+	<key>integrations.model.select_placeholder</key>
+	<string>选择一个模型…</string>
+	<key>integrations.openclaw.profile.coding</key>
+	<string>编程</string>
+	<key>integrations.openclaw.profile.full</key>
+	<string>完整</string>
+	<key>integrations.openclaw.profile.messaging</key>
+	<string>消息</string>
+	<key>integrations.openclaw.profile.minimal</key>
+	<string>极简</string>
+	<key>integrations.openclaw.profile_label</key>
+	<string>工具配置文件</string>
+	<key>integrations.openclaw.profile_sub</key>
+	<string>OpenClaw 启动器提供的内置 MCP（模型上下文协议）工具</string>
+	<key>integrations.section.claude_code</key>
+	<string>Claude Code</string>
+	<key>integrations.section.claude_code.sub</key>
+	<string>将 Claude Code 请求路由到本地模型或云端</string>
+	<key>integrations.section.mcp</key>
+	<string>MCP（模型上下文协议）</string>
+	<key>integrations.section.mcp.sub</key>
+	<string>MCP（模型上下文协议）服务器配置文件的路径。所有集成启动器共享。</string>
+	<key>integrations.section.other</key>
+	<string>其他集成</string>
+	<key>integrations.section.other.sub</key>
+	<string>每个命名集成的默认模型与启动器命令</string>
+	<key>integrations.section.setup_command</key>
+	<string>设置命令</string>
+	<key>integrations.setup.advanced.cloud</key>
+	<string>重置 Anthropic 环境变量，让真实的 claude 二进制文件与云端通信。</string>
+	<key>integrations.setup.advanced.label</key>
+	<string>高级——直接运行 `claude`</string>
+	<key>integrations.setup.advanced.local</key>
+	<string>将真实的 claude 二进制文件指向本地 oMLX 服务端。</string>
+	<key>integrations.tool.codex</key>
+	<string>Codex</string>
+	<key>integrations.tool.copilot</key>
+	<string>Copilot CLI</string>
+	<key>integrations.tool.hermes</key>
+	<string>Hermes Agent</string>
+	<key>integrations.tool.openclaw</key>
+	<string>OpenClaw</string>
+	<key>integrations.tool.opencode</key>
+	<string>OpenCode</string>
+	<key>integrations.tool.pi</key>
+	<string>Pi</string>
+	<key>logs.empty</key>
+	<string>没有日志条目。</string>
+	<key>logs.file.current</key>
+	<string>server.log（当前）</string>
+	<key>logs.lines.100</key>
+	<string>最近 100 行</string>
+	<key>logs.lines.1000</key>
+	<string>最近 1,000 行</string>
+	<key>logs.lines.20000</key>
+	<string>最近 20,000 行</string>
+	<key>logs.lines.500</key>
+	<string>最近 500 行</string>
+	<key>logs.lines.5000</key>
+	<string>最近 5,000 行</string>
+	<key>logs.row.file.label</key>
+	<string>日志文件</string>
+	<key>logs.section.title</key>
+	<string>服务端日志</string>
+	<key>menubar.alert.ok</key>
+	<string>确定</string>
+	<key>menubar.alert.pid_unknown</key>
+	<string>PID 未知</string>
+	<key>menubar.header.loading</key>
+	<string>服务端：加载中...</string>
+	<key>menubar.header.starting</key>
+	<string>服务端：正在启动...</string>
+	<key>menubar.header.stopped</key>
+	<string>oMLX 已停止</string>
+	<key>menubar.header.stopping</key>
+	<string>服务端：正在停止...</string>
+	<key>menubar.item.about</key>
+	<string>关于 oMLX</string>
+	<key>menubar.item.chat</key>
+	<string>与 oMLX 对话</string>
+	<key>menubar.item.force_restart</key>
+	<string>强制重启</string>
+	<key>menubar.item.models</key>
+	<string>模型</string>
+	<key>menubar.item.quit</key>
+	<string>退出 oMLX</string>
+	<key>menubar.item.serving_stats</key>
+	<string>服务统计</string>
+	<key>menubar.item.settings</key>
+	<string>设置…</string>
+	<key>menubar.item.start_server</key>
+	<string>启动服务端</string>
+	<key>menubar.item.stop_server</key>
+	<string>停止服务端</string>
+	<key>menubar.item.system_stats</key>
+	<string>系统状态</string>
+	<key>menubar.item.web_dashboard</key>
+	<string>打开 Web 仪表盘</string>
+	<key>menubar.metric.activity</key>
+	<string>活动</string>
+	<key>menubar.metric.dashboard</key>
+	<string>仪表盘</string>
+	<key>menubar.metric.live_unavailable</key>
+	<string>设置 API Key（应用程序接口密钥） 以启用实时活动</string>
+	<key>menubar.metric.server_off</key>
+	<string>服务端已关闭</string>
+	<key>menubar.metric.settings</key>
+	<string>设置</string>
+	<key>menubar.metric.title.alltime</key>
+	<string>全时段</string>
+	<key>menubar.metric.title.average</key>
+	<string>平均会话</string>
+	<key>menubar.metric.title.live</key>
+	<string>实时活动</string>
+	<key>menubar.models.copy_name</key>
+	<string>复制名称</string>
+	<key>menubar.models.empty</key>
+	<string>没有可用模型</string>
+	<key>menubar.models.fetching</key>
+	<string>加载中…</string>
+	<key>menubar.models.load</key>
+	<string>加载模型</string>
+	<key>menubar.models.loading</key>
+	<string>正在加载模型…</string>
+	<key>menubar.models.no_favorites</key>
+	<string>还没有收藏的模型</string>
+	<key>menubar.models.section.favorites</key>
+	<string>收藏</string>
+	<key>menubar.models.section.library</key>
+	<string>库</string>
+	<key>menubar.models.section.loaded</key>
+	<string>已加载</string>
+	<key>menubar.models.settings</key>
+	<string>模型设置…</string>
+	<key>menubar.models.unload</key>
+	<string>卸载模型</string>
+	<key>menubar.models.unloading</key>
+	<string>正在卸载模型…</string>
+	<key>menubar.stats.alltime_section</key>
+	<string>全时段</string>
+	<key>menubar.stats.avg_pp_speed</key>
+	<string>平均 PP 速度</string>
+	<key>menubar.stats.avg_tg_speed</key>
+	<string>平均 TG 速度</string>
+	<key>menubar.stats.cache_efficiency</key>
+	<string>缓存效率</string>
+	<key>menubar.stats.cached_tokens</key>
+	<string>已缓存令牌</string>
+	<key>menubar.stats.live_activity</key>
+	<string>实时活动</string>
+	<key>menubar.stats.loading</key>
+	<string>加载统计数据…</string>
+	<key>menubar.stats.no_api_key</key>
+	<string>设置 OMLX_API_KEY 以启用统计</string>
+	<key>menubar.stats.server_off</key>
+	<string>服务端已关闭</string>
+	<key>menubar.stats.session_section</key>
+	<string>会话</string>
+	<key>menubar.stats.total_requests</key>
+	<string>总请求数</string>
+	<key>menubar.stats.total_tokens</key>
+	<string>总处理令牌</string>
+	<key>menubar.system.active</key>
+	<string>活跃</string>
+	<key>menubar.system.compressed</key>
+	<string>压缩</string>
+	<key>menubar.system.cpu_caption</key>
+	<string>E（能效核，橙色）/ P（性能核，蓝色）使用率</string>
+	<key>menubar.system.e_cores</key>
+	<string>E 核（能效核心）</string>
+	<key>menubar.system.free</key>
+	<string>空闲</string>
+	<key>menubar.system.gpu_caption</key>
+	<string>GPU（图形处理器，绿色）/ GPU 内存（青色）</string>
+	<key>menubar.system.gpu_memory</key>
+	<string>GPU 内存</string>
+	<key>menubar.system.in_use</key>
+	<string>%@ 使用中</string>
+	<key>menubar.system.load_avg</key>
+	<string>平均负载</string>
+	<key>menubar.system.memory_title</key>
+	<string>内存</string>
+	<key>menubar.system.p_cores</key>
+	<string>P 核（性能核心）</string>
+	<key>menubar.system.thermal</key>
+	<string>温度</string>
+	<key>menubar.system.uptime</key>
+	<string>运行时间</string>
+	<key>menubar.system.wired</key>
+	<string>固定</string>
+	<key>metrics.thermal.critical</key>
+	<string>严重</string>
+	<key>metrics.thermal.fair</key>
+	<string>一般</string>
+	<key>metrics.thermal.nominal</key>
+	<string>正常</string>
+	<key>metrics.thermal.serious</key>
+	<string>较严重</string>
+	<key>models.active.badge.idle</key>
+	<string>空闲</string>
+	<key>models.active.badge.loaded</key>
+	<string>已加载</string>
+	<key>models.active.empty</key>
+	<string>没有加载模型</string>
+	<key>models.active.title</key>
+	<string>已激活模型</string>
+	<key>models.active.unload.help</key>
+	<string>卸载模型</string>
+	<key>models.delete.confirm_message</key>
+	<string>模型文件将被永久从磁盘移除，如当前正在运行则会取消加载。</string>
+	<key>models.delete.confirm_title</key>
+	<string>从磁盘删除此模型？</string>
+	<key>models.library.empty.sub</key>
+	<string>前往“下载”页面从 Hugging Face 获取模型。</string>
+	<key>models.library.empty.title</key>
+	<string>未发现模型</string>
+	<key>models.library.load</key>
+	<string>加载</string>
+	<key>models.library.remove.help</key>
+	<string>从磁盘移除</string>
+	<key>models.library.settings.help</key>
+	<string>设置</string>
+	<key>models.library.title</key>
+	<string>模型库</string>
+	<key>models.library.unload</key>
+	<string>卸载</string>
+	<key>network.button.apply</key>
+	<string>应用</string>
+	<key>network.row.ca_bundle.label</key>
+	<string>CA 证书包</string>
+	<key>network.row.ca_bundle.sub</key>
+	<string>PEM（隐私增强邮件）格式 CA 证书包的绝对路径。留空 = 系统信任库。</string>
+	<key>network.row.http_proxy.label</key>
+	<string>HTTP（超文本传输协议）代理</string>
+	<key>network.row.https_proxy.label</key>
+	<string>HTTPS（安全超文本传输协议）代理</string>
+	<key>network.row.no_proxy.label</key>
+	<string>不使用代理</string>
+	<key>network.row.no_proxy.sub</key>
+	<string>逗号分隔的主机 / CIDR 列表，用于绕过代理。</string>
+	<key>network.section.proxies.subtitle</key>
+	<string>出站 HTTP（超文本传输协议） 路由。留空 = 不使用代理。将应用 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。</string>
+	<key>network.section.proxies.title</key>
+	<string>代理设置</string>
+	<key>network.section.tls.subtitle</key>
+	<string>在存在 TLS（传输层安全）检查代理的环境中使用的自定义根 CA。</string>
+	<key>network.section.tls.title</key>
+	<string>TLS（传输层安全）</string>
+	<key>performance.button.apply</key>
+	<string>应用</string>
+	<key>performance.cache.enabled</key>
+	<string>缓存开关</string>
+	<key>performance.cache.enabled.sub</key>
+	<string>引擎 KV（键值）缓存子系统的总开关。</string>
+	<key>performance.cache.hot_only</key>
+	<string>仅热缓存</string>
+	<key>performance.cache.hot_only.sub</key>
+	<string>跳过 SSD（固态硬盘）溢出。适用于拥有充足内存的快速机器。</string>
+	<key>performance.cache.hot_size</key>
+	<string>热缓存大小</string>
+	<key>performance.cache.hot_size.sub</key>
+	<string>热缓存的 RAM（随机存取存储器）上限。"0" 表示禁用，"8GB" 可接受。</string>
+	<key>performance.cache.initial_blocks</key>
+	<string>初始缓存块</string>
+	<key>performance.cache.initial_blocks.sub</key>
+	<string>服务端启动时预分配的缓存块。修改后需重启生效。</string>
+	<key>performance.cache.ssd_dir</key>
+	<string>SSD（固态硬盘）缓存目录</string>
+	<key>performance.cache.ssd_dir.sub</key>
+	<string>冷溢出块的存储位置。留空 = base_path/cache。</string>
+	<key>performance.cache.ssd_size</key>
+	<string>SSD（固态硬盘）缓存大小</string>
+	<key>performance.cache.ssd_size.sub</key>
+	<string>冷溢出上限。"auto" = SSD（固态硬盘）容量的 10%。</string>
+	<key>performance.error.embedding_batch_size_invalid</key>
+	<string>嵌入批次大小必须为正整数。</string>
+	<key>performance.error.idle_timeout_invalid</key>
+	<string>空闲超时必须 ≥ 60 秒（或留空以保持不变）。</string>
+	<key>performance.error.initial_blocks_invalid</key>
+	<string>初始缓存块必须为正整数（或留空）。</string>
+	<key>performance.error.max_concurrent_invalid</key>
+	<string>最大并发请求数必须为正整数。</string>
+	<key>performance.memory.idle_timeout</key>
+	<string>空闲超时</string>
+	<key>performance.memory.idle_timeout.placeholder</key>
+	<string>关闭</string>
+	<key>performance.memory.idle_timeout.sub</key>
+	<string>全局自动卸载，N 秒无活动后执行。留空 = 禁用。最小 60。</string>
+	<key>performance.memory.max_model</key>
+	<string>最大模型内存</string>
+	<key>performance.memory.max_model.sub</key>
+	<string>引擎池上限。高于此值的模型不会被自动加载。</string>
+	<key>performance.memory.max_process</key>
+	<string>最大进程内存</string>
+	<key>performance.memory.max_process.sub</key>
+	<string>服务端进程的总驻留内存上限。</string>
+	<key>performance.memory.model_fallback</key>
+	<string>模型回落</string>
+	<key>performance.memory.model_fallback.sub</key>
+	<string>当请求的模型未加载时，路由到任何已加载模型，而非返回 404（未找到）。</string>
+	<key>performance.memory.placeholder_auto</key>
+	<string>auto</string>
+	<key>performance.memory.prefill_guard</key>
+	<string>预填充内存保护</string>
+	<key>performance.memory.prefill_guard.sub</key>
+	<string>启动引擎前预检查预填充内存。拒绝会导致内存不足（OOM）的请求。</string>
+	<key>performance.scheduler.chunked_prefill</key>
+	<string>分块预填充</string>
+	<key>performance.scheduler.chunked_prefill.sub</key>
+	<string>将长提示词拆分到调度器的多个 tick 中，以便其他请求交错执行。</string>
+	<key>performance.scheduler.embedding_batch_size</key>
+	<string>嵌入批次大小</string>
+	<key>performance.scheduler.embedding_batch_size.sub</key>
+	<string>每次嵌入前向传播的最大输入文本数。</string>
+	<key>performance.scheduler.max_concurrent</key>
+	<string>最大并发请求数</string>
+	<key>performance.scheduler.max_concurrent.sub</key>
+	<string>同时 /v1 请求的上限。</string>
+	<key>performance.section.cache</key>
+	<string>缓存</string>
+	<key>performance.section.cache.sub</key>
+	<string>KV（键值）缓存溢出。总开关控制以下所有内容。</string>
+	<key>performance.section.memory</key>
+	<string>内存与生命周期</string>
+	<key>performance.section.memory.sub</key>
+	<string>上限 + 自动卸载行为。内存限制接受 "auto"、"disabled"、"24GB" 或 "50%"。</string>
+	<key>performance.section.scheduler</key>
+	<string>调度器</string>
+	<key>performance.section.scheduler.sub</key>
+	<string>控制同时运行的请求数量以及引擎如何批处理它们。</string>
+	<key>profile.banner.action.discard</key>
+	<string>丢弃</string>
+	<key>profile.banner.action.revert</key>
+	<string>还原</string>
+	<key>profile.banner.action.save_as_new</key>
+	<string>另存为新配置</string>
+	<key>profile.banner.defaults.subtitle</key>
+	<string>使用服务端默认值 · 编辑任意字段以创建可用的配置方案</string>
+	<key>profile.banner.defaults.title</key>
+	<string>无配置方案</string>
+	<key>profile.banner.working.subtitle.defaults</key>
+	<string>未保存 · 基于服务端默认值</string>
+	<key>profile.banner.working.title</key>
+	<string>当前工作配置方案</string>
+	<key>profile.detail.acceleration.dflash</key>
+	<string>DFlash（动态闪存加速）</string>
+	<key>profile.detail.acceleration.mtp</key>
+	<string>Lightning MTP（轻量多令牌预测）</string>
+	<key>profile.detail.acceleration.specprefill</key>
+	<string>SpecPrefill（规格化预填充）</string>
+	<key>profile.detail.acceleration.turboquant</key>
+	<string>TurboQuant KV（TurboQuant 量化）</string>
+	<key>profile.detail.acceleration.vlm_mtp</key>
+	<string>VLM MTP（视觉语言模型多令牌预测）</string>
+	<key>profile.detail.action.apply</key>
+	<string>应用</string>
+	<key>profile.detail.action.done</key>
+	<string>完成</string>
+	<key>profile.detail.action.update_with_working</key>
+	<string>以工作配置更新</string>
+	<key>profile.detail.badge.active</key>
+	<string>激活</string>
+	<key>profile.detail.badge.base_of_working</key>
+	<string>工作配置基准</string>
+	<key>profile.detail.badge.unsaved</key>
+	<string>未保存</string>
+	<key>profile.detail.behavior.force_sampling</key>
+	<string>强制采样</string>
+	<key>profile.detail.behavior.limit_tool_output</key>
+	<string>限制工具输出</string>
+	<key>profile.detail.behavior.pinned</key>
+	<string>固定在内存中</string>
+	<key>profile.detail.behavior.thinking</key>
+	<string>思考</string>
+	<key>profile.detail.behavior.thinking_budget.off</key>
+	<string>思考预算</string>
+	<key>profile.detail.capacity.context</key>
+	<string>上下文</string>
+	<key>profile.detail.capacity.max_tokens</key>
+	<string>最大令牌</string>
+	<key>profile.detail.capacity.ttl</key>
+	<string>TTL（生存时间）</string>
+	<key>profile.detail.capacity.ttl.persistent</key>
+	<string>持久</string>
+	<key>profile.detail.capacity.type</key>
+	<string>类型</string>
+	<key>profile.detail.empty</key>
+	<string>此配置方案未覆盖任何设置。</string>
+	<key>profile.detail.penalty.presence</key>
+	<string>存在度惩罚</string>
+	<key>profile.detail.penalty.repetition</key>
+	<string>重复度惩罚</string>
+	<key>profile.detail.sampling.min_p</key>
+	<string>Min P（最小概率）</string>
+	<key>profile.detail.sampling.temperature</key>
+	<string>温度</string>
+	<key>profile.detail.sampling.top_k</key>
+	<string>Top K</string>
+	<key>profile.detail.sampling.top_p</key>
+	<string>Top P</string>
+	<key>profile.detail.section.acceleration</key>
+	<string>加速</string>
+	<key>profile.detail.section.behavior</key>
+	<string>行为</string>
+	<key>profile.detail.section.capacity</key>
+	<string>容量</string>
+	<key>profile.detail.section.penalties</key>
+	<string>惩罚项</string>
+	<key>profile.detail.section.sampling</key>
+	<string>采样</string>
+	<key>profile.detail.section.templates</key>
+	<string>模板</string>
+	<key>profile.detail.subtitle.defaults</key>
+	<string>未设配置方案时回退到此处，或配置方案中该字段为空时使用</string>
+	<key>profile.detail.subtitle.scope.profile</key>
+	<string>配置方案</string>
+	<key>profile.detail.subtitle.working_defaults</key>
+	<string>工作配置方案 · 基于服务端默认值</string>
+	<key>profile.group.refresh.help</key>
+	<string>从 omlx.ai 刷新预设</string>
+	<key>profile.group.save_current_as_new</key>
+	<string>保存当前为新方案</string>
+	<key>profile.save_as.name.placeholder</key>
+	<string>profile-name</string>
+	<key>profile.save_as.title</key>
+	<string>将当前方案另存为</string>
+	<key>profile.scope.global</key>
+	<string>全局</string>
+	<key>profile.scope.model</key>
+	<string>模型</string>
+	<key>profile.scope.preset</key>
+	<string>预设</string>
+	<key>quant.about.intro_title</key>
+	<string>oQ：oMLX 通用动态量化</string>
+	<key>quant.about.mixed_precision.body</key>
+	<string>量化器从 safetensors（安全张量格式）读取张量，逐层测量敏感度，并写入按字节预算混合精度检查点。标准 oQ 聚焦于逐层敏感度与模型级保护规则。oQe 沿用相同的 oQ 方案，并额外增加重要性矩阵加权仿射量化。</string>
+	<key>quant.about.mixed_precision.title</key>
+	<string>oQ 与 oQe：MLX（机器学习加速框架）原生混合精度</string>
+	<key>quant.about.oqe.fallback</key>
+	<string>若张量没有匹配的 imatrix（重要性矩阵）条目，默认行为是回退到该张量的标准 oQ。启用严格覆盖则会直接失败。</string>
+	<key>quant.about.oqe.heading</key>
+	<string>oQe 新增内容</string>
+	<key>quant.about.oqe.how.heading</key>
+	<string>oQe imatrix 的工作原理</string>
+	<key>quant.about.oqe.intro</key>
+	<string>oQe 使用相同的 oQ 敏感度规划器，随后增加重要性矩阵校准步骤。该算法明确借鉴了 llama.cpp 的 imatrix 思路：收集代表性提示词的激活能量，然后量化时将更少的误差分配给对输入重要的通道。</string>
+	<key>quant.about.oqe.step.adapt.body</key>
+	<string>校准从请求的样本数量开始，当 MoE（混合专家）专家覆盖不足时可继续增至自适应最大值。</string>
+	<key>quant.about.oqe.step.adapt.title</key>
+	<string>自适应样本数量。</string>
+	<key>quant.about.oqe.step.collect.body</key>
+	<string>oQe 将校准样本通过模型并记录每个量化 Linear 输入通道的平均输入激活平方 E[x^2]。</string>
+	<key>quant.about.oqe.step.collect.title</key>
+	<string>收集激活能量。</string>
+	<key>quant.about.oqe.step.experts.body</key>
+	<string>对于 MoE（混合专家）SwitchLinear 层，oQe 使用路由器选中的专家索引为每个专家记录一个重要性向量，因此不活跃或很少活跃的专家在覆盖报告中可见。</string>
+	<key>quant.about.oqe.step.experts.title</key>
+	<string>单独跟踪专家。</string>
+	<key>quant.about.oqe.step.weight.body</key>
+	<string>在仿射量化过程中，oQe 通过最小化 sum(importance * (weight - dequantized_weight)^2) 选择缩放/偏置候选，而不是普通的最小均方误差（MSE）。</string>
+	<key>quant.about.oqe.step.weight.title</key>
+	<string>对量化误差加权。</string>
+	<key>quant.about.quote.exclusive</key>
+	<string>量化不应被任何特定的推理服务端所独占。</string>
+	<key>quant.about.quote.no_loader</key>
+	<string>无需自定义加载器。</string>
+	<key>quant.about.quote.works_everywhere</key>
+	<string>oQ 生成标准的 mlx-lm 模型，可在任何地方运行——oMLX（本地 MLX 应用）、mlx-lm、LM Studio（语言模型工作室），以及任何支持 MLX safetensors（安全张量）格式的应用。</string>
+	<key>quant.about.standard.architecture.body</key>
+	<string>将 MoE（混合专家）路由器保留为 fp16（16 位浮点），保护共享专家和输出关键张量，未量化视觉/音频编码器，并保留 SSM（状态空间模型）状态张量。</string>
+	<key>quant.about.standard.architecture.title</key>
+	<string>架构规则</string>
+	<key>quant.about.standard.heading</key>
+	<string>标准 oQ 的功能</string>
+	<key>quant.about.standard.layer_sensitivity.body</key>
+	<string>通过校准提示词测量，将量化层输出误差与浮点基准进行比较。</string>
+	<key>quant.about.standard.layer_sensitivity.title</key>
+	<string>层敏感度</string>
+	<key>quant.about.standard.mixed_precision.body</key>
+	<string>为敏感层和受保护张量分配更高比特，同时将目标每权重比特预算保持在硬上限以下。</string>
+	<key>quant.about.standard.mixed_precision.title</key>
+	<string>混合精度</string>
+	<key>quant.about.subtitle</key>
+	<string>比较标准 oQ 与 oQe imatrix（重要性矩阵），以及增强式量化如何工作。</string>
+	<key>quant.about.table.header.affine</key>
+	<string>仿射量化</string>
+	<key>quant.about.table.header.bits</key>
+	<string>比特分配</string>
+	<key>quant.about.table.header.path</key>
+	<string>路径</string>
+	<key>quant.about.table.header.use</key>
+	<string>最佳用途</string>
+	<key>quant.about.table.oq.affine</key>
+	<string>每组分标准最小/最大仿射</string>
+	<key>quant.about.table.oq.bits</key>
+	<string>逐层敏感度混合精度</string>
+	<key>quant.about.table.oq.use</key>
+	<string>快速、确定性转换，基线质量强</string>
+	<key>quant.about.table.oqe.affine</key>
+	<string>每组分 imatrix（重要性矩阵）加权裁剪/搜索</string>
+	<key>quant.about.table.oqe.bits</key>
+	<string>沿用 oQ 方案</string>
+	<key>quant.about.table.oqe.use</key>
+	<string>更好的低比特保留能力，尤其适用于 MoE（混合专家）和激活偏移层</string>
+	<key>quant.about.title</key>
+	<string>关于 oQ 量化</string>
+	<key>quant.advanced.dtype.label</key>
+	<string>非量化数据类型</string>
+	<key>quant.advanced.dtype.sub</key>
+	<string>保持未量化的张量精度（范数、缩放）</string>
+	<key>quant.advanced.preserve_mtp.label</key>
+	<string>保留 MTP（多令牌预测）</string>
+	<key>quant.advanced.preserve_mtp.sub.available</key>
+	<string>在量化输出中保留多令牌预测头</string>
+	<key>quant.advanced.preserve_mtp.sub.unavailable</key>
+	<string>不可用——源模型没有 MTP（多令牌预测）头</string>
+	<key>quant.advanced.text_only.label</key>
+	<string>仅文本</string>
+	<key>quant.advanced.text_only.sub</key>
+	<string>排除视觉编码器权重（约缩小 2-3%，仅文本输出）</string>
+	<key>quant.advanced.title</key>
+	<string>高级设置</string>
+	<key>quant.button.start</key>
+	<string>开始量化</string>
+	<key>quant.button.starting</key>
+	<string>开始中...</string>
+	<key>quant.empty_models</key>
+	<string>磁盘上未找到全精度模型。请先在“下载”页面下载。</string>
+	<key>quant.enhanced.cache_path.label</key>
+	<string>Imatrix（重要性矩阵）缓存路径</string>
+	<key>quant.enhanced.cache_path.placeholder</key>
+	<string>自动</string>
+	<key>quant.enhanced.cache_path.sub</key>
+	<string>留空以使用自动缓存位置。</string>
+	<key>quant.enhanced.enable.label</key>
+	<string>启用 oQe</string>
+	<key>quant.enhanced.enable.sub</key>
+	<string>收集激活重要性并利用其降低仿射量化误差。</string>
+	<key>quant.enhanced.reuse.label</key>
+	<string>复用 imatrix（重要性矩阵）缓存</string>
+	<key>quant.enhanced.reuse.sub</key>
+	<string>在可用时使用兼容的缓存 imatrix（重要性矩阵）；否则重新收集。</string>
+	<key>quant.enhanced.strict.label</key>
+	<string>严格 imatrix（重要性矩阵）覆盖</string>
+	<key>quant.enhanced.strict.sub</key>
+	<string>当量化张量没有匹配的 imatrix（重要性矩阵）条目时失败，而非回退到标准 oQ。</string>
+	<key>quant.enhanced.subtitle</key>
+	<string>利用激活重要性的 imatrix（重要性矩阵）校准为仿射量化加权。</string>
+	<key>quant.enhanced.title</key>
+	<string>增强式量化（oQe）</string>
+	<key>quant.error.server_refused</key>
+	<string>服务端拒绝请求</string>
+	<key>quant.estimate.calculating</key>
+	<string>计算中...</string>
+	<key>quant.header.eyebrow</key>
+	<string>oQ 量化</string>
+	<key>quant.header.subtitle</key>
+	<string>选择一个全精度模型，选定 oQ 等级，oMLX 将根据该模型的逐层敏感度构建混合精度方案。输出为标准 mlx-lm（MLX 语言模型）safetensors——可在任何 MLX（机器学习加速框架）运行时中使用。</string>
+	<key>quant.header.title</key>
+	<string>在设备上量化</string>
+	<key>quant.queue.cancel.help</key>
+	<string>取消</string>
+	<key>quant.queue.remove.help</key>
+	<string>移除</string>
+	<key>quant.queue.title</key>
+	<string>队列</string>
+	<key>quant.queue.upload</key>
+	<string>上传到 Hugging Face（中心）</string>
+	<key>quant.queue.upload.help</key>
+	<string>上传到 Hugging Face Hub</string>
+	<key>quant.source.option.no_sensitivity</key>
+	<string>无（使用源模型）</string>
+	<key>quant.source.option.select</key>
+	<string>选择一个模型…</string>
+	<key>quant.source.row.level.label</key>
+	<string>oQ 等级</string>
+	<key>quant.source.row.level.sub</key>
+	<string>比特数越低 = 体积越小、速度越快、精度越低</string>
+	<key>quant.source.row.sensitivity.label</key>
+	<string>敏感度模型</string>
+	<key>quant.source.row.sensitivity.sub</key>
+	<string>使用量化变体以约 4 倍更少的内存分析层敏感度</string>
+	<key>quant.source.row.source.label</key>
+	<string>源模型</string>
+	<key>quant.source.row.source.sub</key>
+	<string>只有全精度模型才能被量化</string>
+	<key>quant.source.subtitle.loading</key>
+	<string>加载中...</string>
+	<key>quant.source.title</key>
+	<string>源模型</string>
+	<key>quant.status.cancelled</key>
+	<string>已取消</string>
+	<key>quant.status.completed</key>
+	<string>已完成</string>
+	<key>quant.status.failed</key>
+	<string>失败</string>
+	<key>quant.status.loading</key>
+	<string>加载中</string>
+	<key>quant.status.pending</key>
+	<string>等待中</string>
+	<key>quant.status.quantizing</key>
+	<string>量化中</string>
+	<key>quant.status.saving</key>
+	<string>保存中</string>
+	<key>quant.upload.error.empty_token</key>
+	<string>令牌为空</string>
+	<key>quant.upload.error.server_refused</key>
+	<string>服务端拒绝请求</string>
+	<key>quant.upload_modal.credentials.subtitle.needs_validate</key>
+	<string>验证令牌以上传</string>
+	<key>quant.upload_modal.credentials.title</key>
+	<string>凭据</string>
+	<key>quant.upload_modal.namespace.label</key>
+	<string>目标命名空间</string>
+	<key>quant.upload_modal.namespace.sub.unvalidated</key>
+	<string>验证后可用</string>
+	<key>quant.upload_modal.namespace.sub.user_only</key>
+	<string>你的账户是唯一可用的命名空间</string>
+	<key>quant.upload_modal.namespace.sub.with_orgs</key>
+	<string>发布至你的账户或你所属的组织</string>
+	<key>quant.upload_modal.notice.label.add</key>
+	<string>添加重新下载通知</string>
+	<key>quant.upload_modal.notice.label.copied</key>
+	<string>重新下载通知</string>
+	<key>quant.upload_modal.notice.off</key>
+	<string>关闭</string>
+	<key>quant.upload_modal.notice.sub.add</key>
+	<string>添加横幅提醒下游用户重新拉取</string>
+	<key>quant.upload_modal.notice.sub.copied</key>
+	<string>复制现有 README 时已禁用</string>
+	<key>quant.upload_modal.private.label</key>
+	<string>私有仓库</string>
+	<key>quant.upload_modal.private.sub</key>
+	<string>仅你和你的组织能查看此模型</string>
+	<key>quant.upload_modal.readme.title</key>
+	<string>README</string>
+	<key>quant.upload_modal.readme_source.auto</key>
+	<string>自动生成</string>
+	<key>quant.upload_modal.readme_source.label</key>
+	<string>来源</string>
+	<key>quant.upload_modal.readme_source.sub</key>
+	<string>自动生成默认卡片或从另一本地模型复制</string>
+	<key>quant.upload_modal.repo.title</key>
+	<string>仓库</string>
+	<key>quant.upload_modal.repo_name.label</key>
+	<string>仓库名称</string>
+	<key>quant.upload_modal.title</key>
+	<string>上传到 Hugging Face（中心）</string>
+	<key>quant.upload_modal.token.label</key>
+	<string>HF 令牌</string>
+	<key>quant.upload_modal.token.revalidate</key>
+	<string>重新验证</string>
+	<key>quant.upload_modal.token.sub</key>
+	<string>存储在 macOS 钥匙串中。需要对你的账户有写入权限。</string>
+	<key>quant.upload_modal.token.validate</key>
+	<string>验证</string>
+	<key>quant.upload_modal.token.validating</key>
+	<string>验证中…</string>
+	<key>quant.upload_modal.upload</key>
+	<string>上传</string>
+	<key>quant.upload_modal.uploading</key>
+	<string>上传中…</string>
+	<key>quant.upload_status.cancelled</key>
+	<string>已取消</string>
+	<key>quant.upload_status.completed</key>
+	<string>已完成</string>
+	<key>quant.upload_status.failed</key>
+	<string>失败</string>
+	<key>quant.upload_status.pending</key>
+	<string>等待中</string>
+	<key>quant.upload_status.uploading</key>
+	<string>上传中...</string>
+	<key>quant.uploads.cancel.help</key>
+	<string>取消</string>
+	<key>quant.uploads.open</key>
+	<string>打开</string>
+	<key>quant.uploads.remove.help</key>
+	<string>移除</string>
+	<key>quant.uploads.title</key>
+	<string>上传</string>
+	<key>security.api_key.copy</key>
+	<string>复制到剪贴板</string>
+	<key>security.api_key.generate</key>
+	<string>生成随机密钥</string>
+	<key>security.api_key.hide</key>
+	<string>隐藏密钥</string>
+	<key>security.api_key.row_label</key>
+	<string>API Key（应用程序接口密钥）</string>
+	<key>security.api_key.save</key>
+	<string>保存</string>
+	<key>security.api_key.saving</key>
+	<string>保存中…</string>
+	<key>security.api_key.show</key>
+	<string>显示密钥</string>
+	<key>security.api_key.sublabel.set</key>
+	<string>用于对 /v1 和管理请求进行身份验证。≥ 4 个可打印字符，不含空格。</string>
+	<key>security.api_key.sublabel.unset</key>
+	<string>暴露服务端前请先设置。≥ 4 个可打印字符，不含空格。</string>
+	<key>security.auth.disable_verify</key>
+	<string>禁用 API Key 验证</string>
+	<key>security.auth.disable_verify.sub</key>
+	<string>允许未认证的 /v1 和管理请求。仅用于开发环境。</string>
+	<key>security.section.api_key</key>
+	<string>API Key（应用程序接口密钥）</string>
+	<key>security.section.api_key.sub</key>
+	<string>用于对 /v1 请求和管理会话进行身份验证</string>
+	<key>security.section.authentication</key>
+	<string>认证</string>
+	<key>security.section.sub_keys</key>
+	<string>子密钥</string>
+	<key>security.section.sub_keys.sub</key>
+	<string>为单个应用或用户颁发范围受限的密钥。子密钥不能授予管理员访问权限。</string>
+	<key>security.sub_keys.created_unknown</key>
+	<string>创建时间 · 未知</string>
+	<key>security.sub_keys.empty</key>
+	<string>还没有子密钥。</string>
+	<key>security.sub_keys.key_label</key>
+	<string>密钥</string>
+	<key>security.sub_keys.key_placeholder</key>
+	<string>sk-omlx-sub-…</string>
+	<key>security.sub_keys.name_label</key>
+	<string>名称</string>
+	<key>security.sub_keys.name_placeholder</key>
+	<string>Claude Code on laptop</string>
+	<key>security.sub_keys.name_sub</key>
+	<string>可选的人类可读标签</string>
+	<key>security.sub_keys.new</key>
+	<string>新建</string>
+	<key>security.sub_keys.revoke</key>
+	<string>撤销</string>
+	<key>security.sub_keys.unnamed</key>
+	<string>（未命名）</string>
+	<key>server.advanced.aliases</key>
+	<string>服务端别名</string>
+	<key>server.advanced.aliases.sub</key>
+	<string>服务端识别的额外主机名。逗号分隔。用于 Cookie / Host 头匹配。</string>
+	<key>server.advanced.sse_keepalive</key>
+	<string>SSE 保活模式</string>
+	<key>server.advanced.sse_keepalive.chunk</key>
+	<string>Chunk（块）</string>
+	<key>server.advanced.sse_keepalive.comment</key>
+	<string>注释</string>
+	<key>server.advanced.sse_keepalive.off</key>
+	<string>关闭</string>
+	<key>server.advanced.sse_keepalive.sub</key>
+	<string>服务端如何保持长期 SSE（服务器发送事件）流开启。"chunk" 发出一个空数据行，"comment" 发出 `: ping`，"off" 禁用保活。</string>
+	<key>server.button.apply</key>
+	<string>应用</string>
+	<key>server.endpoint.anthropic</key>
+	<string>Anthropic / Claude Code</string>
+	<key>server.endpoint.health</key>
+	<string>Health 探针</string>
+	<key>server.endpoint.metrics</key>
+	<string>指标（Prometheus 协议）</string>
+	<key>server.endpoint.openai</key>
+	<string>OpenAI 兼容</string>
+	<key>server.error.base_path_empty</key>
+	<string>基础路径不能为空。</string>
+	<key>server.error.context_window_invalid</key>
+	<string>上下文窗口必须为正整数。</string>
+	<key>server.error.max_tokens_invalid</key>
+	<string>最大令牌数必须为正整数。</string>
+	<key>server.error.models_dir_empty</key>
+	<string>模型目录不能为空。</string>
+	<key>server.error.nothing_to_apply</key>
+	<string>无需应用——两个字段均与当前配置匹配。</string>
+	<key>server.error.port_invalid</key>
+	<string>端口必须是 1 到 65535 之间的数字。</string>
+	<key>server.error.repetition_penalty_invalid</key>
+	<string>重复度惩罚必须为非负数。</string>
+	<key>server.error.temperature_invalid</key>
+	<string>温度必须是 [0, 2] 区间内的数字。</string>
+	<key>server.error.top_k_invalid</key>
+	<string>Top K 必须 ≥ 0。</string>
+	<key>server.error.top_p_invalid</key>
+	<string>Top P 必须是 [0, 1] 区间内的数字。</string>
+	<key>server.footer.hint</key>
+	<string>更改监听地址和端口时端点会实时更新。部分更改（主机、端口）在服务端重启后生效。</string>
+	<key>server.hero.pill.unresponsive</key>
+	<string>无响应</string>
+	<key>server.hero.restart</key>
+	<string>重启</string>
+	<key>server.hero.start</key>
+	<string>启动服务端</string>
+	<key>server.hero.stop</key>
+	<string>停止</string>
+	<key>server.hero.subtitle.not_running</key>
+	<string>未运行</string>
+	<key>server.hero.subtitle.stopping</key>
+	<string>正在停止…</string>
+	<key>server.hero.title</key>
+	<string>oMLX 服务端</string>
+	<key>server.hero.working</key>
+	<string>工作中…</string>
+	<key>server.host.all_networks</key>
+	<string>0.0.0.0（所有网络）</string>
+	<key>server.host.local_only</key>
+	<string>127.0.0.1（仅本地）</string>
+	<key>server.host.localhost</key>
+	<string>localhost（本地主机）</string>
+	<key>server.log_level.debug</key>
+	<string>Debug（调试）</string>
+	<key>server.log_level.error</key>
+	<string>Error（错误）</string>
+	<key>server.log_level.info</key>
+	<string>Info（信息）</string>
+	<key>server.log_level.trace</key>
+	<string>Trace（追踪）</string>
+	<key>server.log_level.warning</key>
+	<string>Warning（警告）</string>
+	<key>server.profile.context_window</key>
+	<string>上下文窗口</string>
+	<key>server.profile.context_window.sub</key>
+	<string>最大令牌数 = 提示词 + 补全。</string>
+	<key>server.profile.enable_thinking</key>
+	<string>启用思考</string>
+	<key>server.profile.enable_thinking.note</key>
+	<string>仅模型级设置——在配置方案上设置。</string>
+	<key>server.profile.force_sampling</key>
+	<string>强制采样</string>
+	<key>server.profile.force_sampling.note</key>
+	<string>仅模型级设置。</string>
+	<key>server.profile.limit_tool_output</key>
+	<string>限制工具输出</string>
+	<key>server.profile.limit_tool_output.note</key>
+	<string>仅模型级设置。</string>
+	<key>server.profile.max_tokens</key>
+	<string>最大令牌数</string>
+	<key>server.profile.max_tokens.sub</key>
+	<string>全局生成令牌上限。</string>
+	<key>server.profile.min_p</key>
+	<string>Min P</string>
+	<key>server.profile.min_p.note</key>
+	<string>服务器默认值不包含 min_p；请在模型配置方案上设置。</string>
+	<key>server.profile.per_model_only</key>
+	<string>仅模型级设置</string>
+	<key>server.profile.pin_in_memory</key>
+	<string>固定在内存中</string>
+	<key>server.profile.pin_in_memory.note</key>
+	<string>仅模型级设置。</string>
+	<key>server.profile.presence_penalty</key>
+	<string>存在度惩罚</string>
+	<key>server.profile.presence_penalty.note</key>
+	<string>仅模型级设置。</string>
+	<key>server.profile.repetition_penalty</key>
+	<string>重复度惩罚</string>
+	<key>server.profile.repetition_penalty.sub</key>
+	<string>对重复令牌施加惩罚。</string>
+	<key>server.profile.show_all</key>
+	<string>显示全部字段…</string>
+	<key>server.profile.show_fewer</key>
+	<string>折叠</string>
+	<key>server.profile.speculative_decoding</key>
+	<string>推测解码</string>
+	<key>server.profile.speculative_decoding.note</key>
+	<string>仅模型级设置——请去 模型 → [model] → 高级。</string>
+	<key>server.profile.temperature</key>
+	<string>温度</string>
+	<key>server.profile.temperature.sub</key>
+	<string>采样随机性（0–2）。</string>
+	<key>server.profile.top_k</key>
+	<string>Top K</string>
+	<key>server.profile.top_k.sub</key>
+	<string>将候选限制为 Top K。0 = 禁用。</string>
+	<key>server.profile.top_p</key>
+	<string>Top P（核采样）</string>
+	<key>server.profile.top_p.sub</key>
+	<string>核采样截止值（0–1）。</string>
+	<key>server.profile.ttl</key>
+	<string>TTL（生存时间）</string>
+	<key>server.profile.ttl.note</key>
+	<string>仅模型级设置——请去 模型 → [model] → 基础。</string>
+	<key>server.row.auto_start_on_launch</key>
+	<string>启动时自动启动服务端</string>
+	<key>server.row.auto_start_on_launch.sub</key>
+	<string>禁用时，菜单栏应用会打开但不会启动服务端。</string>
+	<key>server.row.base_path</key>
+	<string>基础路径</string>
+	<key>server.row.base_path.sub</key>
+	<string>OMLX_BASE_PATH。更改后文件会移动且服务端会重启。</string>
+	<key>server.row.listen_address</key>
+	<string>监听地址</string>
+	<key>server.row.log_level</key>
+	<string>日志级别</string>
+	<key>server.row.models_directory</key>
+	<string>模型目录</string>
+	<key>server.row.models_directory.sub</key>
+	<string>服务端读取和写入模型权重的位置。已下载模型会存储在这里。</string>
+	<key>server.row.port</key>
+	<string>端口</string>
+	<key>server.row.port.sub</key>
+	<string>绑定 /v1 的本地 TCP 端口</string>
+	<key>server.section.advanced</key>
+	<string>高级设置</string>
+	<key>server.section.default_profile</key>
+	<string>默认配置方案</string>
+	<key>server.section.default_profile.sub</key>
+	<string>模型未设配置方案时回退使用的值，或配置方案字段为空时使用</string>
+	<key>server.section.endpoints</key>
+	<string>API 端点</string>
+	<key>server.section.logging</key>
+	<string>日志记录</string>
+	<key>server.section.network</key>
+	<string>网络</string>
+	<key>server.section.startup</key>
+	<string>服务端启动</string>
+	<key>server.section.storage</key>
+	<string>存储</string>
+	<key>server.section.storage.sub</key>
+	<string>模型、设置、日志和 SSD 缓存的存储位置。</string>
+	<key>settings.acceleration.mtp.label</key>
+	<string>Lightning MTP（轻量多令牌预测）</string>
+	<key>settings.acceleration.mtp.sub</key>
+	<string>使用模型内置 MTP（多令牌预测）头逐步骤草拟多个令牌。受支持模型解码速度最高提升约 1.5 倍。</string>
+	<key>settings.acceleration.section</key>
+	<string>加速</string>
+	<key>settings.acceleration.subtitle</key>
+	<string>为支持推测解码的模型提供解码加速。</string>
+	<key>settings.advanced.chat_template.add_custom</key>
+	<string>自定义…</string>
+	<key>settings.advanced.chat_template.add_kwarg</key>
+	<string>添加 kwarg</string>
+	<key>settings.advanced.chat_template.empty</key>
+	<string>无聊天模板 kwarg。</string>
+	<key>settings.advanced.chat_template.force</key>
+	<string>强制</string>
+	<key>settings.advanced.chat_template.force.help</key>
+	<string>将此键添加到 forced_ct_kwargs，使请求体无法覆盖它。</string>
+	<key>settings.advanced.chat_template.key_placeholder</key>
+	<string>key</string>
+	<key>settings.advanced.chat_template.remove</key>
+	<string>移除 kwarg</string>
+	<key>settings.advanced.chat_template.section</key>
+	<string>聊天模板 Kwargs</string>
+	<key>settings.advanced.chat_template.subtitle</key>
+	<string>转发到模型的聊天模板。切换“强制”以覆盖每请求值。</string>
+	<key>settings.advanced.chat_template.type.custom</key>
+	<string>CUSTOM（自定义）</string>
+	<key>settings.advanced.chat_template.type.enable_thinking</key>
+	<string>ENABLE_THINKING（启用思考）</string>
+	<key>settings.advanced.chat_template.type.reasoning_effort</key>
+	<string>REASONING_EFFORT（推理力度）</string>
+	<key>settings.advanced.chat_template.value_placeholder</key>
+	<string>value</string>
+	<key>settings.advanced.enable_thinking.label</key>
+	<string>启用思考</string>
+	<key>settings.advanced.enable_thinking.sub</key>
+	<string>为此模型启用推理/思考模式</string>
+	<key>settings.advanced.experimental.section</key>
+	<string>实验性</string>
+	<key>settings.advanced.experimental.subtitle</key>
+	<string>推测解码、KV 缓存量化及其他研究功能。</string>
+	<key>settings.advanced.force_sampling.label</key>
+	<string>强制采样</string>
+	<key>settings.advanced.force_sampling.sub</key>
+	<string>使用配置的值覆盖请求采样参数</string>
+	<key>settings.advanced.pin_memory.label</key>
+	<string>固定在内存中</string>
+	<key>settings.advanced.pin_memory.sub</key>
+	<string>在请求之间保持此模型驻留内存</string>
+	<key>settings.advanced.reasoning_parser.label</key>
+	<string>推理解析器</string>
+	<key>settings.advanced.reasoning_parser.sub</key>
+	<string>覆盖思维链解析器。留空以使用模型默认值。</string>
+	<key>settings.advanced.section</key>
+	<string>高级设置</string>
+	<key>settings.advanced.thinking_budget.label</key>
+	<string>思考预算</string>
+	<key>settings.advanced.thinking_budget.sub</key>
+	<string>限制推理模型的思考令牌数。超出后强制结束思考。</string>
+	<key>settings.advanced.tool_result_limit.label</key>
+	<string>限制工具结果令牌数</string>
+	<key>settings.advanced.tool_result_limit.sub</key>
+	<string>将大型工具结果（如文件读取）截断至令牌限制</string>
+	<key>settings.advanced.trust_remote_code.label</key>
+	<string>信任远程代码</string>
+	<key>settings.advanced.trust_remote_code.sub</key>
+	<string>执行 Hugging Face 自定义模型代码。仅在你信任的模型上启用。每个模型单独设置——不会从配置方案继承。</string>
+	<key>settings.basic.alias.label</key>
+	<string>模型别名</string>
+	<key>settings.basic.alias.sub</key>
+	<string>回退到模型 ID</string>
+	<key>settings.basic.context_window.label</key>
+	<string>上下文窗口</string>
+	<key>settings.basic.context_window.sub</key>
+	<string>每次请求的最大令牌数</string>
+	<key>settings.basic.max_tokens.label</key>
+	<string>最大令牌数</string>
+	<key>settings.basic.max_tokens.placeholder</key>
+	<string>默认</string>
+	<key>settings.basic.max_tokens.sub</key>
+	<string>生成令牌上限（留空 = 默认）</string>
+	<key>settings.basic.min_p.label</key>
+	<string>Min P</string>
+	<key>settings.basic.min_p.sub</key>
+	<string>最小概率下限（0 ≤ p ≤ 1）。</string>
+	<key>settings.basic.model_type.label</key>
+	<string>模型类型</string>
+	<key>settings.basic.presence_penalty.label</key>
+	<string>存在度惩罚</string>
+	<key>settings.basic.presence_penalty.sub</key>
+	<string>对已出现令牌施加惩罚（-2 到 2）。</string>
+	<key>settings.basic.repetition_penalty.label</key>
+	<string>重复度惩罚</string>
+	<key>settings.basic.repetition_penalty.sub</key>
+	<string>对重复令牌施加惩罚（-2 到 2）。</string>
+	<key>settings.basic.section</key>
+	<string>基础设置</string>
+	<key>settings.basic.temperature.label</key>
+	<string>温度</string>
+	<key>settings.basic.temperature.sub</key>
+	<string>采样随机性（≥ 0）。0 = 确定性。</string>
+	<key>settings.basic.top_k.label</key>
+	<string>Top K</string>
+	<key>settings.basic.top_k.sub</key>
+	<string>将候选限制为 Top K（正整数）。</string>
+	<key>settings.basic.top_p.label</key>
+	<string>Top P（核采样）</string>
+	<key>settings.basic.top_p.sub</key>
+	<string>核采样截止值（0 &lt; p ≤ 1）。</string>
+	<key>settings.basic.ttl.label</key>
+	<string>TTL（生存时间）</string>
+	<key>settings.basic.ttl.placeholder</key>
+	<string>无 TTL</string>
+	<key>settings.basic.ttl.sub</key>
+	<string>空闲卸载前的秒数（留空 = 无 TTL）</string>
+	<key>settings.dflash.quant.4bit</key>
+	<string>4 比特</string>
+	<key>settings.dflash.quant.8bit</key>
+	<string>8 比特</string>
+	<key>settings.dflash.quant.bf16</key>
+	<string>bf16（默认）</string>
+	<key>settings.draft_model.placeholder</key>
+	<string>选择草稿模型…</string>
+	<key>settings.experimental.dflash.draft.label</key>
+	<string>DFlash 草稿模型</string>
+	<key>settings.experimental.dflash.draft_quant.label</key>
+	<string>草稿量化</string>
+	<key>settings.experimental.dflash.label</key>
+	<string>DFlash（动态闪存加速）</string>
+	<key>settings.experimental.dflash.max_ctx.label</key>
+	<string>最大上下文（回退）</string>
+	<key>settings.experimental.dflash.max_ctx.placeholder</key>
+	<string>无限制</string>
+	<key>settings.experimental.dflash.max_ctx.sub</key>
+	<string>达到或超过此令牌数的提示词将切换至 BatchedEngine。留空 = 无限制。</string>
+	<key>settings.experimental.dflash.mem_cache.label</key>
+	<string>DFlash 内存缓存</string>
+	<key>settings.experimental.dflash.mem_cache.sub</key>
+	<string>DFlash L1 前缀快照缓存，位于 RAM（随机存取存储器）中。</string>
+	<key>settings.experimental.dflash.ssd_cache.label</key>
+	<string>DFlash SSD 缓存</string>
+	<key>settings.experimental.dflash.ssd_cache.sub</key>
+	<string>将驱逐的 L1 条目溢出到磁盘的 L2。</string>
+	<key>settings.experimental.dflash.ssd_cache.sub.needs_l1</key>
+	<string>需要启用内存缓存。</string>
+	<key>settings.experimental.dflash.ssd_cache.sub.unavailable</key>
+	<string>请先启用全局分页 SSD 缓存目录。</string>
+	<key>settings.experimental.dflash.sub</key>
+	<string>基于块扩散的推测解码。仅单流（请求一次运行一个）。</string>
+	<key>settings.experimental.indexcache.label</key>
+	<string>IndexCache（索引缓存）</string>
+	<key>settings.experimental.indexcache.sub</key>
+	<string>用于 DSA 模型的稀疏注意力索引缓存。THUDM/IndexCache。</string>
+	<key>settings.experimental.specprefill.draft.label</key>
+	<string>草稿模型</string>
+	<key>settings.experimental.specprefill.draft.sub</key>
+	<string>与目标共享分词器的小模型。</string>
+	<key>settings.experimental.specprefill.keep_rate.label</key>
+	<string>保留率</string>
+	<key>settings.experimental.specprefill.label</key>
+	<string>SpecPrefill（规格化预填充）</string>
+	<key>settings.experimental.specprefill.sub</key>
+	<string>面向 MoE / 混合模型的基于注意力的稀疏预填充。</string>
+	<key>settings.experimental.specprefill.threshold.label</key>
+	<string>阈值</string>
+	<key>settings.experimental.specprefill.threshold.sub</key>
+	<string>触发所需最少提示令牌（过短提示使用完整预填充）</string>
+	<key>settings.experimental.turboquant.label</key>
+	<string>TurboQuant KV（量化加速）缓存</string>
+	<key>settings.experimental.turboquant.sub</key>
+	<string>在预填充期间量化 KV（键值）缓存。以少量质量损失节省内存。</string>
+	<key>settings.experimental.vlm_mtp.block_size.label</key>
+	<string>草稿块大小</string>
+	<key>settings.experimental.vlm_mtp.block_size.sub</key>
+	<string>每轮草拟的令牌数。留空使用 mlx-vlm 默认值。</string>
+	<key>settings.experimental.vlm_mtp.draft.label</key>
+	<string>VLM 草稿模型</string>
+	<key>settings.experimental.vlm_mtp.draft.sub</key>
+	<string>与目标共享分词器的助手草稿模型。</string>
+	<key>settings.experimental.vlm_mtp.label</key>
+	<string>VLM MTP（视觉语言模型多令牌预测）</string>
+	<key>settings.experimental.vlm_mtp.sub</key>
+	<string>通过助手草稿模型为视觉语言模型提供多令牌预测。</string>
+	<key>settings.header.back_to_models</key>
+	<string>返回模型</string>
+	<key>settings.model_type.audio_sts</key>
+	<string>音频 STS（语音转语音）</string>
+	<key>settings.model_type.audio_stt</key>
+	<string>音频 STT（语音转文字）</string>
+	<key>settings.model_type.audio_tts</key>
+	<string>音频 TTS（文字转语音）</string>
+	<key>settings.model_type.auto_detect</key>
+	<string>自动检测</string>
+	<key>settings.model_type.embed</key>
+	<string>Embedding（嵌入）</string>
+	<key>settings.model_type.llm</key>
+	<string>LLM（大语言模型）</string>
+	<key>settings.model_type.rerank</key>
+	<string>Reranker（重排序器）</string>
+	<key>settings.model_type.vlm</key>
+	<string>VLM（视觉语言模型）</string>
+	<key>settings.mtp.conflict.dflash</key>
+	<string>启用 Lightning MTP 前请先禁用 DFlash。</string>
+	<key>settings.mtp.conflict.turboquant</key>
+	<string>启用 Lightning MTP 前请先禁用 TurboQuant KV。</string>
+	<key>settings.mtp.conflict.vlm_mtp</key>
+	<string>启用 Lightning MTP 前请先禁用 VLM MTP。</string>
+	<key>settings.profiles.edit_on_server</key>
+	<string>在服务端上编辑 →</string>
+	<key>settings.profiles.global.label</key>
+	<string>全局配置</string>
+	<key>settings.profiles.no_profile.name</key>
+	<string>无配置方案</string>
+	<key>settings.profiles.preset.label</key>
+	<string>预设配置方案</string>
+	<key>settings.profiles.server_default.name</key>
+	<string>服务端默认配置方案</string>
+	<key>settings.profiles.server_defaults.subtitle</key>
+	<string>未设配置方案时使用，或配置方案字段为空时使用</string>
+	<key>settings.profiles.server_defaults.title</key>
+	<string>服务端默认配置</string>
+	<key>settings.profiles.working.name</key>
+	<string>工作配置方案</string>
+	<key>settings.section.advanced</key>
+	<string>高级设置</string>
+	<key>settings.section.basic</key>
+	<string>基础设置</string>
+	<key>settings.section.profiles</key>
+	<string>配置方案</string>
+	<key>settings.specprefill.keep.10</key>
+	<string>10% — 激进（约 5-7x，质量下降）</string>
+	<key>settings.specprefill.keep.20</key>
+	<string>20% — 平衡（约 3x，推荐）</string>
+	<key>settings.specprefill.keep.25</key>
+	<string>25% — 保守+（约 2.5x）</string>
+	<key>settings.specprefill.keep.30</key>
+	<string>30% — 保守（约 2.2x）</string>
+	<key>settings.specprefill.keep.40</key>
+	<string>40% — 轻度（约 1.8x）</string>
+	<key>settings.specprefill.keep.50</key>
+	<string>50% — 极保守（约 1.5x）</string>
+	<key>settings.speculative.conflict.vlm_mtp</key>
+	<string>启用此功能前请先禁用 VLM MTP。</string>
+	<key>settings.turboquant.bits.2</key>
+	<string>2 比特</string>
+	<key>settings.turboquant.bits.2_5</key>
+	<string>2.5 比特</string>
+	<key>settings.turboquant.bits.3</key>
+	<string>3 比特</string>
+	<key>settings.turboquant.bits.3_5</key>
+	<string>3.5 比特</string>
+	<key>settings.turboquant.bits.4</key>
+	<string>4 比特</string>
+	<key>settings.turboquant.bits.6</key>
+	<string>6 比特</string>
+	<key>settings.turboquant.bits.8</key>
+	<string>8 比特</string>
+	<key>settings.validator.min_p.name</key>
+	<string>Min P（最小概率）</string>
+	<key>settings.validator.min_p.range</key>
+	<string>Min P 必须在 [0, 1] 区间内。</string>
+	<key>settings.validator.presence_penalty.name</key>
+	<string>存在度惩罚</string>
+	<key>settings.validator.repetition_penalty.name</key>
+	<string>重复度惩罚</string>
+	<key>settings.validator.temperature.name</key>
+	<string>温度</string>
+	<key>settings.validator.temperature.range</key>
+	<string>温度必须 ≥ 0。</string>
+	<key>settings.validator.top_k.integer</key>
+	<string>Top K 必须为整数。</string>
+	<key>settings.validator.top_k.positive</key>
+	<string>Top K 必须为正整数。</string>
+	<key>settings.validator.top_p.name</key>
+	<string>Top P（核采样）</string>
+	<key>settings.validator.top_p.range</key>
+	<string>Top P 必须在 (0, 1] 区间内。</string>
+	<key>settings.vlm_mtp.conflict.dflash</key>
+	<string>启用 VLM MTP 前请先禁用 DFlash。</string>
+	<key>settings.vlm_mtp.conflict.mtp</key>
+	<string>启用 VLM MTP 前请先禁用 Lightning MTP。</string>
+	<key>settings.vlm_mtp.conflict.specprefill</key>
+	<string>启用 VLM MTP 前请先禁用 SpecPrefill。</string>
+	<key>settings.vlm_mtp.conflict.turboquant</key>
+	<string>启用 VLM MTP 前请先禁用 TurboQuant KV。</string>
+	<key>settings.vlm_mtp.draft.placeholder</key>
+	<string>选择助手草稿模型…</string>
+	<key>sidebar.about</key>
+	<string>关于</string>
+	<key>sidebar.accuracyBench</key>
+	<string>准确率基准</string>
+	<key>sidebar.appearance</key>
+	<string>外观</string>
+	<key>sidebar.downloads</key>
+	<string>下载</string>
+	<key>sidebar.integrations</key>
+	<string>集成</string>
+	<key>sidebar.logs</key>
+	<string>日志</string>
+	<key>sidebar.models</key>
+	<string>模型</string>
+	<key>sidebar.network</key>
+	<string>网络</string>
+	<key>sidebar.performance</key>
+	<string>性能</string>
+	<key>sidebar.quantization</key>
+	<string>量化</string>
+	<key>sidebar.security</key>
+	<string>安全</string>
+	<key>sidebar.server</key>
+	<string>服务端</string>
+	<key>sidebar.status</key>
+	<string>状态</string>
+	<key>sidebar.throughputBench</key>
+	<string>吞吐量基准</string>
+	<key>status.active_now.badge.generating</key>
+	<string>生成中</string>
+	<key>status.active_now.badge.loaded</key>
+	<string>已加载</string>
+	<key>status.active_now.badge.waiting</key>
+	<string>等待中</string>
+	<key>status.active_now.empty</key>
+	<string>服务端空闲——未加载模型</string>
+	<key>status.arch.apple_silicon</key>
+	<string>Apple Silicon（苹果芯片）</string>
+	<key>status.arch.intel</key>
+	<string>Intel（英特尔）</string>
+	<key>status.clear.alltime.help</key>
+	<string>清除全时段统计</string>
+	<key>status.clear.session.help</key>
+	<string>清除会话统计</string>
+	<key>status.confirm.clear_alltime</key>
+	<string>清除全时段统计？此操作不可撤销。</string>
+	<key>status.confirm.clear_button</key>
+	<string>清除</string>
+	<key>status.confirm.clear_session</key>
+	<string>清除会话统计？</string>
+	<key>status.confirm.clear_ssd</key>
+	<string>清除全部 SSD（固态硬盘）缓存文件？已加载的模型将在下次预填充时重建其 KV（键值）缓存。</string>
+	<key>status.row.gpu_memory</key>
+	<string>GPU（图形处理器）固定内存</string>
+	<key>status.row.gpu_utilization</key>
+	<string>GPU（图形处理器）利用率</string>
+	<key>status.row.gpu_utilization.sub</key>
+	<string>近似值 · 活跃请求负载</string>
+	<key>status.row.server_uptime</key>
+	<string>服务端运行时间</string>
+	<key>status.row.system_ram</key>
+	<string>系统内存</string>
+	<key>status.row.thermal_state</key>
+	<string>温度状态</string>
+	<key>status.row.version</key>
+	<string>oMLX 版本</string>
+	<key>status.runtime_cache.clear_ssd</key>
+	<string>清除 SSD（固态硬盘） 缓存</string>
+	<key>status.runtime_cache.file_count.count</key>
+	<string>文件数：%lld</string>
+	<key>status.runtime_cache.file_count.one</key>
+	<string>文件：1</string>
+	<key>status.runtime_cache.files</key>
+	<string>缓存文件</string>
+	<key>status.runtime_cache.location</key>
+	<string>位置</string>
+	<key>status.runtime_cache.memory_entries.count</key>
+	<string>条目数：%lld</string>
+	<key>status.runtime_cache.size</key>
+	<string>总大小</string>
+	<key>status.scope.alltime</key>
+	<string>全时段</string>
+	<key>status.scope.session</key>
+	<string>会话</string>
+	<key>status.section.active_now</key>
+	<string>当前活跃</string>
+	<key>status.section.runtime_cache</key>
+	<string>运行时缓存</string>
+	<key>status.section.system</key>
+	<string>系统</string>
+	<key>status.session_stats</key>
+	<string>服务统计</string>
+	<key>status.speed.prompt_processing</key>
+	<string>提示词处理</string>
+	<key>status.speed.prompt_processing.tile</key>
+	<string>提示词处理（不含缓存）</string>
+	<key>status.speed.prompt_processing_note</key>
+	<string>（不含缓存）</string>
+	<key>status.speed.section_label</key>
+	<string>平均速度</string>
+	<key>status.speed.token_generation</key>
+	<string>令牌生成</string>
+	<key>status.tile.cache_efficiency</key>
+	<string>缓存效率</string>
+	<key>status.tile.cached</key>
+	<string>已缓存令牌</string>
+	<key>status.tile.generation</key>
+	<string>生成</string>
+	<key>status.tile.generation.sub</key>
+	<string>跨活跃模型</string>
+	<key>status.tile.requests</key>
+	<string>请求数</string>
+	<key>status.tile.total</key>
+	<string>总预填充令牌</string>
+	<key>status.tile.total.sub</key>
+	<string>提示词 + 补全</string>
+	<key>status.updates.auto_check</key>
+	<string>自动检查更新</string>
+	<key>status.updates.auto_check.sub</key>
+	<string>每天在后台自动查找更新</string>
+	<key>status.updates.auto_download</key>
+	<string>通知可用更新</string>
+	<key>status.updates.auto_download.sub</key>
+	<string>在后台下载前显示发行说明</string>
+	<key>status.updates.channel</key>
+	<string>更新通道</string>
+	<key>status.updates.channel.sub</key>
+	<string>Stable 通道接收经测试的发布版本。Beta 通道更早获得新功能。</string>
+	<key>status.updates.check</key>
+	<string>立即检查</string>
+	<key>status.updates.checking_button</key>
+	<string>检查中…</string>
+	<key>status.updates.checking_primary</key>
+	<string>检查更新…</string>
+	<key>status.updates.checking_secondary</key>
+	<string>检查 GitHub 版本…</string>
+	<key>status.updates.downloading_button</key>
+	<string>下载中… %lld%%</string>
+	<key>status.updates.downloading_primary</key>
+	<string>正在下载更新…</string>
+	<key>status.updates.downloading_secondary</key>
+	<string>下载 · %lld%%</string>
+	<key>status.updates.error_primary</key>
+	<string>更新检查失败</string>
+	<key>status.updates.install</key>
+	<string>安装并重启</string>
+	<key>status.updates.never_checked</key>
+	<string>从未检查</string>
+	<key>status.updates.ready_secondary</key>
+	<string>%@ 已就绪，可安装</string>
+	<key>status.updates.title</key>
+	<string>更新</string>
+	<key>status.updates.up_to_date_primary</key>
+	<string>oMLX 已是最新</string>
+	<key>update.channel.beta</key>
+	<string>Beta（测试）</string>
+	<key>update.channel.dev</key>
+	<string>Dev（开发）</string>
+	<key>update.channel.nightly</key>
+	<string>Nightly（每日构建）</string>
+	<key>update.channel.release_candidate</key>
+	<string>Release Candidate（候选版本）</string>
+	<key>update.channel.stable</key>
+	<string>Stable（稳定）</string>
+	<key>update.confirm.empty_notes</key>
+	<string>此版本不包含详细说明。</string>
+	<key>update.confirm.install</key>
+	<string>下载、安装并重新启动</string>
+	<key>update.confirm.install_ready</key>
+	<string>安装并重新启动</string>
+	<key>update.confirm.later</key>
+	<string>稍后</string>
+	<key>update.confirm.restart_notice</key>
+	<string>oMLX 将退出、安装更新并重新启动。</string>
+	<key>update.confirm.size</key>
+	<string>下载大小：%@</string>
+	<key>update.confirm.subtitle</key>
+	<string>下载并重新启动前请查看发行说明。</string>
+	<key>update.confirm.title</key>
+	<string>oMLX %@ 可用</string>
+	<key>update.confirm.view_release</key>
+	<string>在 GitHub 上查看版本</string>
+	<key>update.error.no_dmg</key>
+	<string>该版本未附带可安装的 DMG（磁盘映像）文件。</string>
+	<key>update.error.swap_failed</key>
+	<string>找不到暂存的更新。请重新下载。</string>
+	<key>welcome.api_key.hide</key>
+	<string>隐藏密钥</string>
+	<key>welcome.api_key.label</key>
+	<string>API Key（应用程序接口密钥）</string>
+	<key>welcome.api_key.placeholder</key>
+	<string>创建 API 密钥</string>
+	<key>welcome.api_key.show</key>
+	<string>显示密钥</string>
+	<key>welcome.api_key.sub</key>
+	<string>此密钥同时也是你的 Web 仪表盘登录密码。</string>
+	<key>welcome.browse.base_message</key>
+	<string>选择一个父文件夹。.omlx 目录将在其中创建。</string>
+	<key>welcome.browse.model_message</key>
+	<string>选择包含模型文件的目录。</string>
+	<key>welcome.browse.prompt</key>
+	<string>选择</string>
+	<key>welcome.button.browse</key>
+	<string>浏览…</string>
+	<key>welcome.button.get_started</key>
+	<string>开始使用</string>
+	<key>welcome.button.open_dashboard</key>
+	<string>打开 Web 仪表盘</string>
+	<key>welcome.button.start_server</key>
+	<string>启动服务端</string>
+	<key>welcome.button.starting</key>
+	<string>正在启动服务端...</string>
+	<key>welcome.complete.description</key>
+	<string>oMLX 已在本地 http://127.0.0.1:%@ 上运行。打开 Web 仪表盘下载你的第一个模型、管理设置并连接编码工具。</string>
+	<key>welcome.complete.status</key>
+	<string>服务端已启动。仪表盘已就绪。</string>
+	<key>welcome.complete.title</key>
+	<string>一切就绪！</string>
+	<key>welcome.error.base_dir_required</key>
+	<string>基础目录必填。</string>
+	<key>welcome.error.invalid_port</key>
+	<string>端口无效。</string>
+	<key>welcome.error.key_non_ascii</key>
+	<string>API 密钥只能包含可打印的 ASCII 字符。</string>
+	<key>welcome.error.key_too_short</key>
+	<string>API 密钥至少需要 4 个字符。</string>
+	<key>welcome.error.key_whitespace</key>
+	<string>API 密钥不能包含空格。</string>
+	<key>welcome.error.port_out_of_range</key>
+	<string>端口必须是 1 到 65535 之间的数字。</string>
+	<key>welcome.header.meta</key>
+	<string>Apple Silicon（苹果芯片） · macOS 原生 · Apache 2.0</string>
+	<key>welcome.header.subtitle</key>
+	<string>本地 AI，无需等待。</string>
+	<key>welcome.header.tagline</key>
+	<string>macOS 原生 MLX 服务端，带智能缓存。Claude Code、OpenClaw 和 Cursor 响应时间由 90 秒降至 5 秒。</string>
+	<key>welcome.header.title</key>
+	<string>oMLX</string>
+	<key>welcome.hint.settings_path</key>
+	<string>设置存储在 ~/.omlx/settings.json。</string>
+	<key>welcome.intro</key>
+	<string>选择模型存储位置、设定端口，并创建用于应用和 Web 仪表盘的 API 密钥。</string>
+	<key>welcome.setup.local.body</key>
+	<string>oMLX 在首次启动时绑定到 127.0.0.1，因此本机上的客户端无需将服务端暴露到网络即可使用。</string>
+	<key>welcome.setup.local.title</key>
+	<string>本地服务端</string>
+	<key>welcome.setup.title</key>
+	<string>设置你的本地服务端</string>
+	<key>welcome.storage.model_dir.label</key>
+	<string>模型目录</string>
+	<key>welcome.storage.model_dir.sub</key>
+	<string>已下载模型的存储位置。</string>
+	<key>welcome.storage.port.label</key>
+	<string>端口</string>
+	<key>welcome.storage.port.sub</key>
+	<string>默认为 8000。仅当端口已被使用时更改。</string>
+	<key>welcome.window.title</key>
+	<string>欢迎使用 oMLX</string>
+</dict>
+</plist>
