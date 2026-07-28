@@ -1306,6 +1306,16 @@ def _get_attr_or_key(obj: Any, name: str) -> Any:
     return value
 
 
+# Fraction of the room between current usage and the enforcer's abort
+# watermark that one prefill chunk may plan to consume once the sizing target
+# is already exceeded. Must stay below 1.0: a chunk sized to land exactly on
+# the watermark is a chunk planning to be aborted. OMLX_PREFILL_WATERMARK_SHARE
+# overrides it for A/B measurement.
+def _chunk_snap_enabled() -> bool:
+    """OMLX_CHUNK_SNAP=0 disables chunk quantization (A/B measurement)."""
+    return os.environ.get("OMLX_CHUNK_SNAP", "1") != "0"
+
+
 def _model_declares_llama4(model: Any) -> bool:
     """Return True if the loaded model/config tree declares Llama 4."""
     seen: set[int] = set()
@@ -1674,6 +1684,11 @@ class Scheduler:
         self._prefill_safe_zone_ratio: float = 0.80
         self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
+        # Requests that already emitted the INFO throttle notice. The per-chunk
+        # shrink log is DEBUG, so a throttled prefill used to be silent at the
+        # default level even while it ran an order of magnitude slower; one
+        # line per request keeps that visible without a line per chunk.
+        self._throttle_notified_requests: set[str] = set()
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         self._memory_admission_blocked_request_id: str | None = None
         self._memory_admission_blocked_since: float = 0.0
@@ -3154,6 +3169,7 @@ class Scheduler:
                 _throttle_post,
                 request_id=request.request_id,
                 loop_label="external",
+                kv_len=base_size + processed_tokens,
             )
 
             processed_tokens += n_to_process
@@ -3550,6 +3566,10 @@ class Scheduler:
         per_token = self._predicted_chunk_transient(n_tokens, kv_len) / n_tokens
         safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
         n_fit = max(min_chunk, min(n_tokens, safe_n))
+        # Same quantization as the adaptive throttle: an off-grid size here
+        # would reintroduce the near-miss buffers _snap_chunk_size exists to
+        # avoid.
+        n_fit = self._snap_chunk_size(n_fit, n_tokens)
         if n_fit < n_tokens:
             logger.debug(
                 "[guard:%s] shrink %d -> %d at progress=%d kv_len=%d "
@@ -3563,6 +3583,33 @@ class Scheduler:
                 cap / 1024**3,
             )
         return n_fit
+
+    def _snap_chunk_size(self, n: int, requested: int) -> int:
+        """Quantize a throttled chunk to a multiple of the min-chunk floor.
+
+        A sliding-window layer allocates ``max_size + n - 1`` per chunk
+        (mlx_lm RotatingKVCache._update_concat), so each distinct chunk size
+        asks MLX for a distinct buffer size. MLX only reuses a pooled buffer
+        within ``min(2*size, size + 2*page_size)`` of the request, which above
+        ~32KB is a near-exact match (mlx/backend/common/buffer_cache.h). The
+        throttle used to emit 33, 34, 36, 40, 41, 56 ... as headroom/per_token
+        happened to land, so the pool filled with buffers 1-3% off from each
+        other and none could serve the next request.
+
+        Traced over one 20k gemma-4 prefill: of 10,143 requests for the
+        chunk-32 buffer, 5,329 missed, and the pool's nearest candidate was
+        only 0.9-3% larger in most of them — buffers left by neighbouring
+        chunk sizes. Quantizing collapses those onto one size per multiple.
+
+        Chunks at or below the floor keep their size (a short tail before a
+        block boundary), and an unthrottled chunk is returned untouched.
+        """
+        if not _chunk_snap_enabled():
+            return n
+        grid = max(1, self._prefill_min_chunk_tokens)
+        if n >= requested or n <= grid:
+            return n
+        return (n // grid) * grid
 
     def _adaptive_chunk_size(
         self,
@@ -3676,7 +3723,12 @@ class Scheduler:
         # Secondary clamp: once in the watermark caution zone, cap by the
         # discrete tiers so a mispredicting EWMA can't run an oversized chunk
         # in deep pressure. Skipped below the watermark so a low-baseline chunk
-        # with ample headroom isn't needlessly shrunk.
+        # with ample headroom isn't needlessly shrunk. Descending through the
+        # tiers instead of dropping to the floor once the target is crossed was
+        # measured and rejected: gemma-4 at a 31.56GB ceiling aborted at both
+        # 60k and 70k tokens, because the chunks spent at 512/256/128 while
+        # already over the target pushed usage past the abort watermark before
+        # the ladder reached the floor.
         band_ratio = -1.0
         if current >= soft_watermark and hard_cap > soft_watermark:
             band = hard_cap - soft_watermark
@@ -3686,6 +3738,36 @@ class Scheduler:
             else:
                 bucket = self._PREFILL_STEP_TIERS[1]  # 512
             n = max(min_chunk, min(n, bucket))
+
+        n = self._snap_chunk_size(n, requested)
+
+        if n < requested and request_id not in self._throttle_notified_requests:
+            self._throttle_notified_requests.add(request_id)
+            binding_str, advice = describe_ceiling_binding(
+                static=self._memory_static_ceiling_bytes,
+                dynamic=self._memory_dynamic_ceiling_bytes,
+                metal_cap=self._memory_metal_cap_bytes,
+                tier=self._memory_guard_tier,
+                current=current,
+                fmt=format_bytes,
+                tail="reduce context length",
+            )
+            logger.info(
+                "Prefill throttled for %s: chunk %d -> %d "
+                "(usage %.2fGB vs sizing target %.2fGB, %s ceiling %.2fGB, "
+                "per_token=%.1fKB, floor=%d). Prefill runs slower until usage "
+                "drops. %s.",
+                request_id,
+                requested,
+                n,
+                current / 1024**3,
+                target / 1024**3,
+                binding_str,
+                hard_cap / 1024**3,
+                per_token / 1024,
+                min_chunk,
+                advice,
+            )
 
         if n < requested:
             logger.debug(
@@ -3799,6 +3881,7 @@ class Scheduler:
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
+        self._throttle_notified_requests.discard(request_id)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
@@ -3956,8 +4039,21 @@ class Scheduler:
         *,
         request_id: str,
         loop_label: str,
+        kv_len: int = 0,
     ) -> None:
-        """Feed one chunk's measured transient into the EWMA tracker."""
+        """Feed one chunk's measured transient into the EWMA tracker.
+
+        ``kv_len`` is logged, not used: the phys delta this records is far
+        noisier than it looks — over one 13k prefill on Qwen3.6, 262 chunks of
+        the SAME 32 tokens produced 5.2MB to 812.4MB (155x), because the delta
+        largely tracks MLX buffer-pool growth rather than the chunk. Sampling
+        phys during the chunk reproduces the delta exactly (it is monotonic
+        within a chunk), and MLX's active high-water is 2x-tight but excludes
+        the pool, which is real occupancy under set_cache_limit(total). So no
+        better per-chunk signal was found, and anything sized from this number
+        has to stay conservative. Keeping kv_len in the log is what made that
+        analysis possible.
+        """
         delta = post_bytes - pre_bytes
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
@@ -3982,11 +4078,11 @@ class Scheduler:
             return
         self._prefill_transient_tracker.update(n_tokens, delta)
         logger.debug(
-            "[throttle:%s] measure rid=%s n=%d transient=%.2fMB "
-            "per_token=%.1fKB ewma=%.1fKB samples=%d",
+            "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB samples=%d",
             loop_label,
             request_id,
             n_tokens,
+            kv_len,
             delta / 1024**2,
             (delta / max(n_tokens, 1)) / 1024,
             self._prefill_transient_tracker.bytes_per_token / 1024,
@@ -4184,6 +4280,7 @@ class Scheduler:
             _throttle_post,
             request_id=state.request.request_id,
             loop_label="chunked_step",
+            kv_len=state.base_size + state.tokens_processed,
         )
         state.tokens_processed += n
 
@@ -7637,9 +7734,7 @@ class Scheduler:
         if new_tokens == 0:
             return None
 
-        peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
-        )
+        peak = self._admission_peak_bytes(new_tokens, cached_tokens)
         if peak == 0:
             return None  # can't estimate, skip
 
@@ -7693,6 +7788,33 @@ class Scheduler:
             )
             return safety_rejection
         return None
+
+    def _admission_peak_bytes(self, new_tokens: int, cached_tokens: int) -> float:
+        """Peak this prefill will actually reach, for admission decisions.
+
+        ``estimate_prefill_peak_bytes`` prices the SDPA term at the chunk size
+        it is handed, and every admission site handed it
+        ``config.prefill_step_size`` (2048). But when memory is tight the
+        adaptive throttle runs the same prefill at
+        ``prefill_min_chunk_tokens``, so admission was refusing prompts on a
+        peak no chunk that request would ever submit could produce — measured
+        on gemma-4 at a 31.56GB ceiling, 80k tokens was rejected for a 3.15GB
+        KV+SDPA estimate while 60k ran to completion at 32-token chunks.
+
+        Charging the floor chunk instead leaves the KV term, which chunking
+        cannot reduce, as the real limit. Nothing about safety moves: the
+        throttle, the pre-chunk guard and the enforcer's abort all still run,
+        and this only lowers an up-front refusal to a level the request will
+        actually operate at.
+        """
+        monitor = self.memory_monitor
+        if monitor is None:
+            return 0.0
+        floor_chunk = max(1, self._prefill_min_chunk_tokens)
+        chunk = min(self.config.prefill_step_size, floor_chunk)
+        return monitor.estimate_prefill_peak_bytes(
+            new_tokens, chunk, cached_tokens=cached_tokens
+        )
 
     def _format_rejection_message(
         self,
@@ -7766,9 +7888,7 @@ class Scheduler:
         if new_tokens == 0:
             return
 
-        peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
-        )
+        peak = self._admission_peak_bytes(new_tokens, cached_tokens)
         if peak == 0:
             return
 
@@ -7852,9 +7972,7 @@ class Scheduler:
         current = self._current_usage_bytes(refresh_mlx_active=False)
         request_id = request_id or "preflight"
 
-        peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
-        )
+        peak = self._admission_peak_bytes(new_tokens, cached_tokens)
         if peak and current + peak > self._memory_hard_limit_bytes:
             return PrefillEvictionRequest(
                 request_id=request_id,
@@ -8967,6 +9085,10 @@ class Scheduler:
         tracker = get_prefill_tracker()
         for rid in finished_ids:
             tracker.remove(rid)
+            # _clear_request_admission_bookkeeping only runs on abort/failure
+            # paths, so a request that was throttled and then completed
+            # normally would keep its id here forever.
+            self._throttle_notified_requests.discard(rid)
 
         for request_id in finished_ids:
             request = self.running.get(request_id)

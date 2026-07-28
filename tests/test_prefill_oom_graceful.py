@@ -13,6 +13,7 @@ All tests are unit-level: the throttle/requeue logic is exercised on a light
 fake object so no model load or GPU is required.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -116,6 +117,8 @@ def _throttle_ctx(
         _prefill_min_chunk_tokens=min_chunk,
         _prefill_abort_margin=abort_margin,
         _prefill_headroom_safety=Scheduler._PREFILL_HEADROOM_SAFETY,
+        # Dedupes the once-per-request INFO throttle notice.
+        _throttle_notified_requests=set(),
         _prefill_transient_tracker=tracker,
         memory_monitor=monitor,
         _PREFILL_STEP_TIERS=Scheduler._PREFILL_STEP_TIERS,
@@ -125,6 +128,7 @@ def _throttle_ctx(
         _last_mlx_active_memory_bytes=0,
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
+    ns._snap_chunk_size = Scheduler._snap_chunk_size.__get__(ns, Scheduler)
     ns._current_usage_bytes = Scheduler._current_usage_bytes.__get__(ns, Scheduler)
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
@@ -236,6 +240,54 @@ def test_throttle_floors_at_min_chunk_when_over_ceiling():
     )
     ns._fake_current = hard + _GB
     assert _call(ns, 2048, kv_len=5000) == 32
+
+
+def test_throttle_emits_one_info_notice_per_request(caplog):
+    """A throttled prefill has to be visible at the default log level.
+
+    The per-chunk shrink line is DEBUG, so a request running an order of
+    magnitude slower used to leave no trace in a normal server log — the
+    gap that made a measured 2.6x slowdown undiagnosable. One INFO line
+    per request, not per chunk: a 6k-token prompt floored at 32 tokens
+    submits ~190 chunks.
+    """
+    hard = 40 * _GB
+    ns = _throttle_ctx(
+        current=hard + _GB, hard=hard, samples_bpt=1_000_000, min_chunk=32
+    )
+    ns._fake_current = hard + _GB
+
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        for _ in range(5):
+            _call(ns, 2048, kv_len=5000)
+
+    notices = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "Prefill throttled" in r.getMessage()
+    ]
+    assert len(notices) == 1
+    message = notices[0].getMessage()
+    assert "chunk 2048 -> 32" in message
+    assert "floor=32" in message
+
+
+def test_throttle_notice_repeats_for_a_new_request():
+    """The dedupe is per request id, not process-wide."""
+    hard = 40 * _GB
+    ns = _throttle_ctx(
+        current=hard + _GB, hard=hard, samples_bpt=1_000_000, min_chunk=32
+    )
+    ns._fake_current = hard + _GB
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
+    ):
+        for rid in ("r1", "r2"):
+            Scheduler._adaptive_chunk_size(
+                ns, 2048, request_id=rid, loop_label="test", kv_len=5000
+            )
+    assert ns._throttle_notified_requests == {"r1", "r2"}
 
 
 def test_throttle_predictor_anchors_on_recent_measurement():
@@ -495,6 +547,7 @@ def test_step_prefill_reclaims_before_first_guard():
         300,
         request_id="req-prefill",
         loop_label="chunked_step",
+        kv_len=0,
     )
 
 
