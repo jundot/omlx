@@ -29,9 +29,10 @@ Numerics deliberately mirror the stock mlx_lm path cast-for-cast:
     weight-mul).
 
 Gating: decode/verify shapes only (1 <= S <= 8), mask/lengths None. All
-shapes templated: Dh in {32,64,128}, Ds multiple of 32, any H/groups whose
-gated-norm group size is a multiple of 256. Unsupported shapes, masked or
-ragged batches, and prefill chunks fall through to the previous call chain
+shapes templated: Dh in {32,64,128}, Ds = 128 (kernel A's 256-thread B/C
+conv staging covers exactly 2*Ds channels), any H/groups whose gated-norm
+group size is a multiple of 256. Unsupported shapes, masked or ragged
+batches, and prefill chunks fall through to the previous call chain
 (including the sequential chain-verify path this patch supersedes).
 """
 
@@ -336,8 +337,11 @@ def supported(num_heads, head_dim, state_size, n_groups, conv_kernel, group_size
     return (
         conv_kernel == 4
         and head_dim in (32, 64, 128)
-        and 32 <= state_size <= 256
-        and state_size % 32 == 0
+        # Kernel A stages the B/C conv channels with its 256 threads mapped
+        # as ``tid < Ds -> B, else C`` over Ds-float threadgroup tiles, and
+        # writes the B/C conv-state tail with the same mapping. That cover
+        # is complete and in-bounds only when 2 * state_size == 256.
+        and state_size == 128
         and num_heads % n_groups == 0
         and (num_heads * head_dim) % group_size == 0
         and group_size % 256 == 0
@@ -447,12 +451,17 @@ def _mixer_fused_ok(mixer):
 
 def _run_fused(mixer, hidden_states, cache, capture):
     proj = mixer.in_proj(hidden_states)
+    # use_conv_bias=False configs build a bias-less Conv1d; the kernel adds
+    # the bias unconditionally, so feed it zeros.
+    conv_bias = getattr(mixer.conv1d, "bias", None)
+    if conv_bias is None:
+        conv_bias = mx.zeros((mixer.conv_dim,), dtype=hidden_states.dtype)
     y, conv_out, ssm_out, cap_s, cap_c = mamba2_decode_step(
         proj,
         cache[0],
         cache[1],
         mixer.conv1d.weight,
-        mixer.conv1d.bias,
+        conv_bias,
         mixer.A_log,
         mixer.dt_bias,
         mixer.D.astype(hidden_states.dtype),
@@ -560,10 +569,15 @@ def apply_nemotron_attention_verify_patch() -> bool:
 
     def _dense_kv(cache):
         # Dense, non-rotating KV only: the per-position slices assume the
-        # returned keys are in chronological order (RotatingKVCache is not;
-        # quantized caches return tuples). nemotron_h.make_cache always
-        # builds plain KVCache, so this is belt and suspenders.
+        # returned keys are in chronological order (RotatingKVCache is not)
+        # and mx.array KV. Quantized caches return tuples from
+        # update_and_fetch even when still empty (keys is None), so gate on
+        # the quantization attribute rather than the current keys value.
+        # nemotron_h.make_cache always builds plain KVCache, so this is
+        # belt and suspenders.
         if getattr(cache, "max_size", None) is not None:
+            return False
+        if getattr(cache, "bits", None) is not None:
             return False
         keys = getattr(cache, "keys", None)
         return keys is None or isinstance(keys, mx.array)

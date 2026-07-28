@@ -59,7 +59,8 @@ def make_mixer(dtype, seed=17, **overrides):
     mixer.in_proj.weight = mx.random.normal(mixer.in_proj.weight.shape) * scale
     mixer.out_proj.weight = mx.random.normal(mixer.out_proj.weight.shape) * scale
     mixer.conv1d.weight = mx.random.normal(mixer.conv1d.weight.shape) * 0.3
-    mixer.conv1d.bias = mx.random.normal(mixer.conv1d.bias.shape) * 0.1
+    if getattr(mixer.conv1d, "bias", None) is not None:
+        mixer.conv1d.bias = mx.random.normal(mixer.conv1d.bias.shape) * 0.1
     mixer.norm.weight = mx.random.normal(mixer.norm.weight.shape) * 0.2 + 1.0
     mixer.dt_bias = mx.random.normal((args.mamba_num_heads,)) * 0.5
     mixer.D = mx.random.normal((args.mamba_num_heads,)) * 0.5 + 1.0
@@ -221,6 +222,58 @@ def test_mixer_wrap_verify_window_and_fall_through():
     assert c_big._mtp_pos_states is not None and len(c_big._mtp_pos_states) == 12
 
 
+def test_state_size_gate():
+    """Kernel A's 256-thread B/C staging covers exactly 2*Ds channels, so
+    only Ds=128 is admitted; other multiples of 32 must fall through."""
+    assert supported(32, 64, 128, 4, 4, 512)
+    for ds in (32, 64, 96, 160, 192, 256):
+        assert not supported(32, 64, ds, 4, 4, 512), ds
+
+    assert apply_nemotron_decode_fused_patch()
+    dtype = mx.bfloat16
+    mixer, args = make_mixer(
+        dtype,
+        mamba_num_heads=32,
+        mamba_head_dim=64,
+        ssm_state_size=64,
+        n_groups=4,
+        hidden_size=1024,
+    )
+    cache = ArraysCache(size=2)
+    mx.random.seed(61)
+    hs = (mx.random.normal((1, 2, 1024)) * 0.5).astype(dtype)
+    out = mixer(hs, None, cache)
+    mx.eval(out, cache[0], cache[1])
+    assert out.shape == (1, 2, 1024)
+    assert cache[1].shape == (1, 32, 64, 64)
+
+
+def test_conv_bias_disabled():
+    """use_conv_bias=False builds a bias-less Conv1d; the fused path must
+    feed the kernel zeros instead of crashing on ``mixer.conv1d.bias``."""
+    assert apply_nemotron_decode_fused_patch()
+    dtype = mx.bfloat16
+    mixer, args = make_mixer(dtype, use_conv_bias=False)
+    assert getattr(mixer.conv1d, "bias", None) is None
+    mixer_ref, _ = make_mixer(dtype, use_conv_bias=False)
+
+    mx.random.seed(71)
+    warm = (mx.random.normal((1, 3, 1024)) * 0.5).astype(dtype)
+    hs = (mx.random.normal((1, 2, 1024)) * 0.5).astype(dtype)
+
+    c_fus, c_ref = ArraysCache(size=2), ArraysCache(size=2)
+    for s in range(3):
+        _ = _STOCK_CALL(mixer, warm[:, s : s + 1, :], None, c_fus)
+        _ = _STOCK_CALL(mixer_ref, warm[:, s : s + 1, :], None, c_ref)
+
+    out = mixer(hs, None, cache=c_fus)  # fused: dims supported, cache warm
+    ref = stock_decode(mixer_ref, hs, c_ref)
+    mx.eval(out, ref, c_fus[0], c_fus[1])
+    assert rel(out, ref) < 2e-2
+    assert rel(c_fus[0], c_ref[0]) < 2e-2
+    assert rel(c_fus[1], c_ref[1]) < 2e-2
+
+
 def test_unsupported_dims_fall_through():
     # Dh=16 is outside the kernel's shape set; the wrap must route to stock.
     assert not supported(4, 16, 32, 2, 4, 32)
@@ -292,3 +345,52 @@ def test_attention_verify_per_position_sdpa():
             rel(c_new.keys[:, :, : c_new.offset], c_ref.keys[:, :, : c_ref.offset])
             == 0.0
         )
+
+
+def test_attention_verify_quantized_kv_fall_through():
+    """QuantizedKVCache must fall through byte-identically to the stock
+    path — including when the cache is still empty (keys is None), where
+    the first update_and_fetch during a short prefill already returns
+    quantized tuples."""
+    from mlx_lm.models.cache import QuantizedKVCache
+
+    from omlx.patches.nemotron_decode_fused import (
+        apply_nemotron_attention_verify_patch,
+    )
+
+    stock_call = _STOCK_ATTN_CALL
+    assert apply_nemotron_attention_verify_patch()
+
+    args = SimpleNamespace(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=128,
+        attention_bias=False,
+    )
+    mx.random.seed(81)
+    attn = nh.NemotronHAttention(args)
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        lin = getattr(attn, name)
+        lin.weight = mx.random.normal(lin.weight.shape) * 0.05
+    attn.set_dtype(mx.bfloat16)
+
+    def warm_quant_kv(ctx, seed):
+        c = QuantizedKVCache(group_size=64, bits=8)
+        if ctx:
+            mx.random.seed(seed)
+            k = (mx.random.normal((1, 2, ctx, 128)) * 0.3).astype(mx.bfloat16)
+            v = (mx.random.normal((1, 2, ctx, 128)) * 0.3).astype(mx.bfloat16)
+            c.update_and_fetch(k, v)
+        return c
+
+    for ctx in (0, 512):  # empty short-prefill case, then warmed decode case
+        mx.random.seed(90 + ctx)
+        x = (mx.random.normal((1, 4, 1024)) * 0.1).astype(mx.bfloat16)
+        c_ref = warm_quant_kv(ctx, seed=77)
+        c_new = warm_quant_kv(ctx, seed=77)
+        ref = stock_call(attn, x, "causal", c_ref)
+        out = attn(x, "causal", c_new)
+        mx.eval(ref, out)
+        assert rel(out, ref) == 0.0, ctx
+        assert c_new.offset == c_ref.offset
