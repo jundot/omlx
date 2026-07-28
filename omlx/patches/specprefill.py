@@ -564,7 +564,7 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
+        cached_len = _cache_offset(cache[0])
         suffix = tokens[cached_len:]
         if suffix:
             logits = _prefill_draft(
@@ -599,7 +599,7 @@ def score_tokens(
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
     # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    pre_lookahead_offset = _cache_offset(cache[0], default=n_prompt)
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -805,6 +805,61 @@ def _scalar_offset(offset) -> int:
     return int(offset)
 
 
+def _cache_offset(cache_entry, default: int = 0) -> int:
+    """Token offset of a per-layer cache entry, descending into CacheList.
+
+    DSA layers (GLM-5.2, DeepSeek V3.2/V4) wrap several caches in a
+    ``CacheList``: the latent MLA cache at index 0 and the indexer cache at
+    index 1. ``CacheList`` deliberately exposes no ``offset`` of its own, so a
+    bare ``hasattr(entry, "offset")`` check reports False and silently yields
+    0 (or the fallback) on exactly those models. Everything keyed off that
+    number — position mapping, draft scoring, lookahead trimming — then works
+    from a wrong base as soon as a system prompt's KV has been restored.
+    """
+    if cache_entry is None:
+        return default
+    if hasattr(cache_entry, "offset"):
+        return _scalar_offset(cache_entry.offset)
+    inner = getattr(cache_entry, "caches", None)
+    if inner:
+        return _cache_offset(inner[0], default)
+    return default
+
+
+# Slot of each RoPE owner inside a DSA layer's CacheList: the attention itself
+# reads cache[0] (latent MLA), the indexer reads cache[1].
+_ROPE_SLOT_ATTENTION = 0
+_ROPE_SLOT_INDEXER = 1
+
+
+def _rope_owners(attn):
+    """Yield ``(slot, module)`` for every module whose RoPE tracks positions.
+
+    A DSA layer rotates twice: once in the attention, and once in the indexer
+    that picks the sparse top-k. The indexer owns a separate ``rope`` instance
+    and a separate cache, so leaving it on raw contiguous offsets makes it
+    score mis-rotated keys — the top-k selection is then wrong on every DSA
+    layer, which corrupts generation after an otherwise correct sparse
+    prefill.
+    """
+    if attn is None:
+        return
+    if hasattr(attn, "rope"):
+        yield _ROPE_SLOT_ATTENTION, attn
+    indexer = getattr(attn, "indexer", None)
+    # Shared DSA layers carry indexer=None and reuse the previous full layer.
+    if indexer is not None and hasattr(indexer, "rope"):
+        yield _ROPE_SLOT_INDEXER, indexer
+
+
+def _slot_cache_offset(cache_entry, slot: int, default: int = 0) -> int:
+    """Cache offset for one RoPE owner's own cache within a CacheList."""
+    inner = getattr(cache_entry, "caches", None)
+    if inner is not None and slot < len(inner):
+        return _cache_offset(inner[slot], default)
+    return _cache_offset(cache_entry, default)
+
+
 class _PositionMappedRoPE:
     """Applies RoPE at non-contiguous positions during sparse prefill.
 
@@ -955,11 +1010,7 @@ def sparse_prefill(
     layer_to_cache = _build_layer_to_cache_map(model)
     first_attn_layer_idx = attn_layers[0][0]
     first_attn_cache_idx = layer_to_cache[first_attn_layer_idx]
-    cache_start = (
-        cache[first_attn_cache_idx].offset
-        if hasattr(cache[first_attn_cache_idx], "offset")
-        else 0
-    )
+    cache_start = _cache_offset(cache[first_attn_cache_idx])
 
     # Check if model has RoPE (Nemotron-H doesn't)
     first_attn = _get_attn_module(attn_layers[0][1])
@@ -970,14 +1021,21 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            # Start from the genuine rope: a prior sparse_prefill may have left
-            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
-            # (multi-turn + partial cache hit). See #766.
-            genuine = _unwrap_rope(attn.rope)
-            original_ropes[layer_idx] = genuine
-            attn.rope = _PositionMappedRoPE(
-                genuine, selected_positions, cache_start=cache_start
-            )
+            layer_cache = cache[layer_to_cache[layer_idx]]
+            # A DSA layer has two RoPE owners (attention + indexer); every
+            # other architecture yields just the attention. Each reads its own
+            # cache slot, so each gets its own start offset.
+            for slot, owner in _rope_owners(attn):
+                # Start from the genuine rope: a prior sparse_prefill may have
+                # left an _OffsetAdjustedRoPE installed if cleanup_rope wasn't
+                # called (multi-turn + partial cache hit). See #766.
+                genuine = _unwrap_rope(owner.rope)
+                original_ropes[(layer_idx, slot)] = (owner, genuine)
+                owner.rope = _PositionMappedRoPE(
+                    genuine,
+                    selected_positions,
+                    cache_start=_slot_cache_offset(layer_cache, slot, cache_start),
+                )
 
     try:
         prompt = selected_tokens
@@ -1010,13 +1068,14 @@ def sparse_prefill(
             total_prompt_len = position_offset + M
             final_cache_offset = cache_start + N
             adjustment = int(total_prompt_len) - int(final_cache_offset)
-            for layer_idx, layer in attn_layers:
-                attn = _get_attn_module(layer)
-                original = original_ropes[layer_idx]
+            # Restore every owner we wrapped — the indexer included, otherwise
+            # it keeps decoding at compacted positions while the attention has
+            # moved to the true ones.
+            for owner, original in original_ropes.values():
                 if adjustment > 0:
-                    attn.rope = _OffsetAdjustedRoPE(original, adjustment)
+                    owner.rope = _OffsetAdjustedRoPE(original, adjustment)
                 else:
-                    attn.rope = original
+                    owner.rope = original
 
     return logits
 
@@ -1029,11 +1088,10 @@ def cleanup_rope(model):
     """
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
-        if attn is None or not hasattr(attn, "rope"):
-            continue
-        genuine = _unwrap_rope(attn.rope)
-        if genuine is not attn.rope:
-            attn.rope = genuine
+        for _slot, owner in _rope_owners(attn):
+            genuine = _unwrap_rope(owner.rope)
+            if genuine is not owner.rope:
+                owner.rope = genuine
 
 
 # ===========================================================================
