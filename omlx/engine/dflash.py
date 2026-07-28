@@ -2,8 +2,8 @@
 """
 DFlash engine for block diffusion speculative decoding.
 
-This engine wraps dflash-mlx (>= 0.1.5) to provide 3-4x faster decoding on
-Apple Silicon for Qwen and Gemma4 model families. By default it serves all
+This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
+Silicon for Qwen, Gemma4, and Laguna model families. By default it serves all
 requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
 evicting the dflash models and delegating long-context requests to omlx's
 BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
@@ -42,8 +42,9 @@ logger = logging.getLogger(__name__)
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.5 registers QwenGdnTargetOps and Gemma4TargetOps. The
-    top-level ``model_type`` is the canonical discriminator: Gemma4 multimodal
+    DFlash 0.1.10 registers QwenGdnTargetOps and Gemma4TargetOps; oMLX adds a
+    Laguna target/draft adapter. The top-level ``model_type`` is the canonical
+    discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
     though their nested ``text_config.model_type`` is still ``gemma4_text``.
@@ -66,9 +67,10 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
 
     is_qwen = "qwen" in model_type
     is_gemma4 = model_type in ("gemma4", "gemma4_text")
-    if not (is_qwen or is_gemma4):
+    is_laguna = model_type == "laguna"
+    if not (is_qwen or is_gemma4 or is_laguna):
         return False, (
-            f"DFlash supports only Qwen and Gemma4 models "
+            f"DFlash supports only Qwen, Gemma4, and Laguna models "
             f"(model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -331,6 +333,7 @@ class DFlashEngine(BaseEngine):
 
         def _load_models():
             from dflash_mlx.draft_backend import EagerDraftBackend
+            from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
                 load_target_bundle,
@@ -345,6 +348,13 @@ class DFlashEngine(BaseEngine):
             maybe_apply_pre_load_patches(
                 self._model_name, model_settings=self._model_settings
             )
+
+            # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
+            # TargetOps plus the official gated Laguna drafter specialization
+            # before load_target_bundle resolves either architecture.
+            from ..patches.dflash_laguna import install_dflash_laguna_backend
+
+            install_dflash_laguna_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -362,6 +372,30 @@ class DFlashEngine(BaseEngine):
                 ),
                 verify_config=getattr(runtime_context, "verify", None),
             )
+
+            # Keep DFlash targets on the same post-load MoE fast path as the
+            # regular batched engine.  Laguna uses mlx-lm's SwitchGLU for its
+            # routed experts, so fusing gate+up removes one gather_qmm launch
+            # per MoE layer in both target prefill and block verification.
+            if (
+                getattr(
+                    self._model_settings,
+                    "moe_gate_up_fusion_enabled",
+                    True,
+                )
+                is not False
+            ):
+                try:
+                    from ..patches.qwen35_moe_gate_up import (
+                        apply_qwen35_moe_gate_up_fusion,
+                    )
+
+                    apply_qwen35_moe_gate_up_fusion(target_bundle.model)
+                except Exception:
+                    logger.debug(
+                        "DFlash target MoE gate+up fusion not applied",
+                        exc_info=True,
+                    )
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=(
@@ -373,6 +407,11 @@ class DFlashEngine(BaseEngine):
                     if self._draft_quant_enabled
                     else None
                 ),
+            )
+            bind_draft_to_target(
+                draft,
+                target_bundle.model,
+                target_ops=target_bundle.target_ops,
             )
             draft_backend = EagerDraftBackend()
             return target_bundle, draft, draft_backend
