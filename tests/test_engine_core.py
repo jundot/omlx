@@ -18,8 +18,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.engine_core import AsyncEngineCore, EngineConfig, EngineCore
-from omlx.exceptions import PrefillMemoryExceededError
+from omlx.engine_core import (
+    AsyncEngineCore,
+    EngineConfig,
+    EngineCore,
+    _raise_request_output_error,
+)
+from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
@@ -1836,3 +1841,50 @@ class TestOrphanedCollectorReaping:
             finally:
                 await engine.stop()
                 engine.close()
+
+
+class TestMemoryAbortErrorSurface:
+    """The mid-prefill memory abort must surface like the pre-flight guard.
+
+    The enforcer's abort output used to carry only ``error``, so
+    ``_raise_request_output_error`` fell through to a bare RuntimeError.
+    Nothing upstream recognized it as a memory rejection: the JSON keepalive
+    wrapper (which already handles PrefillMemoryExceededError) let it escape,
+    the response generator died mid-body, and the client saw a truncated read
+    plus a 500 traceback instead of the actionable 400 the pre-flight path
+    returns for the same condition.
+    """
+
+    def _abort_output(self, **overrides):
+        payload = dict(
+            request_id="req-abort",
+            finished=True,
+            finish_reason="error",
+            error=(
+                "Request aborted: process memory limit exceeded (usage 4.4 GB, "
+                "abort threshold (hard watermark) 4.1 GB, dynamic ceiling 4.3 GB)."
+            ),
+            error_code="prefill_memory_aborted",
+            error_metadata={"request_id": "req-abort", "limit_bytes": 4_100_000_000},
+        )
+        payload.update(overrides)
+        return RequestOutput(**payload)
+
+    def test_abort_code_raises_typed_error(self):
+        with pytest.raises(PrefillMemoryAbortedError) as exc:
+            _raise_request_output_error(self._abort_output())
+        assert exc.value.request_id == "req-abort"
+        assert exc.value.limit_bytes == 4_100_000_000
+
+    def test_abort_error_keeps_the_400_mapping(self):
+        """Subclassing is what routes it to the existing handler / keepalive
+        catch, so the relationship is part of the contract, not an accident."""
+        with pytest.raises(PrefillMemoryExceededError):
+            _raise_request_output_error(self._abort_output())
+
+    def test_uncoded_error_still_raises_runtime_error(self):
+        with pytest.raises(RuntimeError) as exc:
+            _raise_request_output_error(
+                self._abort_output(error_code=None, error_metadata=None)
+            )
+        assert not isinstance(exc.value, PrefillMemoryExceededError)

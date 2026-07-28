@@ -468,6 +468,19 @@ class PrefillMemoryExceededError(OMLXMemoryError):
         self.limit_bytes = limit_bytes
 
 
+class PrefillMemoryAbortedError(PrefillMemoryExceededError):
+    """
+    An admitted request was aborted mid-prefill by the memory enforcer.
+
+    The pre-flight guard let this request in, but process usage crossed the
+    hard watermark while it was prefilling, so the enforcer aborted it to
+    keep the server alive. Subclassing PrefillMemoryExceededError is what
+    routes this to the same HTTP 400 mapping and the JSON keepalive body;
+    the separate type only exists so the wording can say "aborted
+    mid-prefill" instead of "rejected this prompt".
+    """
+
+
 # =============================================================================
 # Engine Pool Exceptions
 # =============================================================================
