@@ -249,6 +249,141 @@ def test_target_ops_prefix_snapshot_round_trip_preserves_mixed_cache():
     _assert_close(actual, expected)
 
 
+def test_laguna_draft_decodes_trimmed_prefix_snapshot():
+    from dflash_mlx.cache.codecs import build_snapshot
+    from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+    from dflash_mlx.draft_backend import EagerDraftBackend
+    from dflash_mlx.engine.events import SummaryEvent
+    from dflash_mlx.runtime import stream_dflash_generate
+    from dflash_mlx.runtime.context import build_offline_runtime_context
+
+    from omlx.patches.dflash_laguna import (
+        LagunaDFlashDraftModel,
+        LagunaDFlashDraftModelArgs,
+        LagunaTargetOps,
+    )
+
+    target = _target_model()
+    ops = LagunaTargetOps()
+    draft = LagunaDFlashDraftModel(
+        LagunaDFlashDraftModelArgs.from_dict(_draft_config())
+    )
+    draft.bind_target_model(target, target_ops=ops)
+
+    prefix_ids = [1, 2, 3, 4, 5, 6, 7]
+    target_cache = ops.make_cache(target, enable_speculative_linear_cache=True)
+    logits, captured = ops.forward_with_hidden_capture(
+        target,
+        input_ids=mx.array([prefix_ids], dtype=mx.int32),
+        cache=target_cache,
+        capture_layer_ids={1, 4},
+    )
+    target_hidden = ops.extract_context_feature(captured, [0, 3])
+    projected = draft.project_target_hidden(target_hidden)
+    snapshot = build_snapshot(
+        token_ids=prefix_ids,
+        target_cache=target_cache,
+        target_hidden=projected,
+        last_logits=logits[:, -1, :],
+        key=DFlashPrefixKey(
+            target_model_id="tiny-laguna-target",
+            draft_model_id="tiny-laguna-draft",
+            capture_layer_ids=(0, 3),
+            draft_sink_size=2,
+            draft_window_size=4,
+            template_hash="template",
+            prompt_policy_hash="policy",
+        ),
+        draft_model=draft,
+        trim_target_hidden=True,
+        draft_sink_size=2,
+        draft_window_size=4,
+    )
+
+    assert snapshot.target_hidden_chunk_spans == ((0, 2), (3, 7))
+
+    def generate(prefix_snapshot=None, *, hit_kind="miss"):
+        return list(
+            stream_dflash_generate(
+                target_model=target,
+                target_ops=ops,
+                tokenizer=None,
+                draft_model=draft,
+                draft_backend=EagerDraftBackend(),
+                prompt_tokens_override=prefix_ids,
+                max_new_tokens=3,
+                block_tokens=4,
+                stop_token_ids=[],
+                prefix_snapshot=prefix_snapshot,
+                prefix_hit_kind=hit_kind,
+                publish_generation_snapshot=False,
+                runtime_context=build_offline_runtime_context(
+                    draft_sink_size=2,
+                    draft_window_size=4,
+                ),
+            )
+        )
+
+    cold_events = generate()
+    events = generate(snapshot, hit_kind="l1")
+    cold_summary = next(
+        event for event in cold_events if isinstance(event, SummaryEvent)
+    )
+    summary = next(event for event in events if isinstance(event, SummaryEvent))
+    assert summary.generated_token_ids == cold_summary.generated_token_ids
+    assert summary.generation_tokens == 3
+    assert summary.hit_kind == "l1"
+    assert summary.fallback_ar is False
+
+
+def test_laguna_draft_advances_trimmed_projected_context():
+    from dflash_mlx.cache.snapshot import TargetHiddenChunks
+    from dflash_mlx.draft_backend import EagerDraftBackend
+
+    from omlx.patches.dflash_laguna import (
+        LagunaDFlashDraftModel,
+        LagunaDFlashDraftModelArgs,
+    )
+
+    draft = LagunaDFlashDraftModel(
+        LagunaDFlashDraftModelArgs.from_dict(_draft_config())
+    )
+    backend = EagerDraftBackend()
+    dense = mx.arange(7 * 32, dtype=mx.float32).reshape(1, 7, 32)
+    sparse = TargetHiddenChunks(
+        total_len=7,
+        chunks=(dense[:, :2, :], dense[:, 3:, :]),
+        spans=((0, 2), (3, 7)),
+    )
+    dense_cache = backend.make_cache(
+        draft_model=draft,
+        sink_size=2,
+        window_size=4,
+    )
+    sparse_cache = backend.make_cache(
+        draft_model=draft,
+        sink_size=2,
+        window_size=4,
+    )
+
+    draft.advance_projected_context_cache(
+        draft_context=dense,
+        cache=dense_cache,
+    )
+    draft.advance_projected_context_cache(
+        draft_context=sparse,
+        cache=sparse_cache,
+    )
+
+    for dense_entry, sparse_entry in zip(dense_cache, sparse_cache, strict=True):
+        dense_keys, dense_values = dense_entry.fetch()
+        sparse_keys, sparse_values = sparse_entry.fetch()
+        _assert_close(sparse_keys, dense_keys)
+        _assert_close(sparse_values, dense_values)
+        _assert_close(sparse_entry.position_indices(), dense_entry.position_indices())
+        assert sparse_entry.offset == dense_entry.offset == 7
+
+
 def test_laguna_draft_normalizes_nested_config_and_builds_gated_layers():
     from omlx.patches.dflash_laguna import (
         LagunaDFlashDraftModel,

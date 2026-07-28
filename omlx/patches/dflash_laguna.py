@@ -18,6 +18,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from dflash_mlx.cache.snapshot import TargetHiddenChunks
 from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.model import (
     ContextOnlyDraftKVCache,
@@ -33,6 +34,20 @@ from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
 
 _BACKEND_PATH = "omlx.patches.dflash_laguna:LagunaTargetOps"
+
+
+def _normalize_target_hidden(
+    norm: nn.RMSNorm,
+    target_hidden: mx.array | TargetHiddenChunks,
+) -> mx.array | TargetHiddenChunks:
+    """Normalize sparse target context without materializing trimmed spans."""
+    if isinstance(target_hidden, TargetHiddenChunks):
+        return TargetHiddenChunks(
+            total_len=int(target_hidden.total_len),
+            chunks=tuple(norm(chunk) for chunk in target_hidden.chunks),
+            spans=target_hidden.spans,
+        )
+    return norm(target_hidden)
 
 
 def _model_type(model: Any) -> str:
@@ -553,12 +568,12 @@ class LagunaDFlashDecoderLayer(DFlashDecoderLayer):
         self,
         hidden_states: mx.array,
         *,
-        target_hidden: mx.array,
+        target_hidden: mx.array | TargetHiddenChunks,
         cache: Any | None = None,
     ) -> mx.array:
         residual = hidden_states
         attention_input = self.input_layernorm(hidden_states)
-        context_input = self.input_layernorm(target_hidden)
+        context_input = _normalize_target_hidden(self.input_layernorm, target_hidden)
         hidden_states = self.self_attn(
             attention_input, target_hidden=context_input, cache=cache
         )
@@ -568,10 +583,11 @@ class LagunaDFlashDecoderLayer(DFlashDecoderLayer):
         return residual + hidden_states
 
     def advance_projected_context_cache(
-        self, *, target_hidden: mx.array, cache: Any
+        self, *, target_hidden: mx.array | TargetHiddenChunks, cache: Any
     ) -> None:
         self.self_attn.append_projected_context_cache(
-            target_hidden=self.input_layernorm(target_hidden), cache=cache
+            target_hidden=_normalize_target_hidden(self.input_layernorm, target_hidden),
+            cache=cache,
         )
 
 
