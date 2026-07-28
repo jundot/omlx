@@ -50,6 +50,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = ["/path/to/models"]
         global_settings.model.model_dir = "/path/to/models"
+        global_settings.model.get_configured_model_dirs.return_value = [
+            Path("/path/to/models")
+        ]
         global_settings.get_effective_model_dirs = MagicMock(
             return_value=["/path/to/models"]
         )
@@ -72,7 +75,10 @@ class TestReloadModels:
                     assert success is True
                     assert "5 models" in msg
                     settings_manager._load.assert_called_once()
-                    mock_apply.assert_called_once_with(["/path/to/models"])
+                    mock_apply.assert_called_once_with(
+                        ["/path/to/models"],
+                        reconciliation_model_dirs=["/path/to/models"],
+                    )
                     pool.preload_pinned_models.assert_called_once()
         finally:
             _restore_mocks(originals)
@@ -128,6 +134,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = ["/bad/path"]
         global_settings.model.model_dir = "/bad/path"
+        global_settings.model.get_configured_model_dirs.return_value = [
+            Path("/bad/path")
+        ]
         global_settings.get_effective_model_dirs = MagicMock(return_value=["/bad/path"])
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
@@ -160,6 +169,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = []
         global_settings.model.model_dir = "/fallback/path"
+        global_settings.model.get_configured_model_dirs.return_value = [
+            Path("/fallback/path")
+        ]
         global_settings.get_effective_model_dirs = MagicMock(
             return_value=["/fallback/path"]
         )
@@ -178,7 +190,10 @@ class TestReloadModels:
                 ) as mock_apply:
                     success, msg = asyncio.run(admin_routes._reload_models())
                     assert success is True
-                    mock_apply.assert_called_once_with(["/fallback/path"])
+                    mock_apply.assert_called_once_with(
+                        ["/fallback/path"],
+                        reconciliation_model_dirs=["/fallback/path"],
+                    )
         finally:
             _restore_mocks(originals)
 
@@ -276,3 +291,86 @@ class TestApplyModelDirsRuntime:
         assert "from 1 directory" in msg
         assert primary.is_dir()
         pool.discover_models.assert_called_once_with([str(primary.resolve())], [])
+
+    def test_non_directory_refresh_does_not_reconcile_persisted_state(
+        self, tmp_path, monkeypatch
+    ):
+        """HF-cache discovery changes must not act like model deletion."""
+        primary = tmp_path / "primary"
+        primary.mkdir()
+        monkeypatch.setattr(admin_routes, "_hf_downloader", None)
+        monkeypatch.setattr(admin_routes, "_ms_downloader", None)
+        monkeypatch.setattr(admin_routes, "_oq_manager", None)
+        monkeypatch.setattr(admin_routes, "_hf_uploader", None)
+
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = []
+        pool.model_count = 0
+        settings_manager = MagicMock()
+        mock_server_state = MagicMock()
+        mock_server_state.engine_pool = pool
+        mock_server_state.settings_manager = settings_manager
+
+        with (
+            patch.object(omlx.server, "_server_state", mock_server_state),
+            patch("omlx.server.reconcile_discovered_model_state") as reconcile,
+        ):
+            success, _ = asyncio.run(
+                admin_routes._apply_model_dirs_runtime([str(primary)])
+            )
+
+        assert success is True
+        reconcile.assert_not_called()
+        pool.apply_settings_overrides.assert_called_once_with(settings_manager)
+
+    def test_observation_only_refresh_seeds_inventory_without_pruning(
+        self, tmp_path, monkeypatch
+    ):
+        """Non-deletion refreshes pass explicit observation-only policy."""
+        primary = tmp_path / "primary"
+        primary.mkdir()
+        monkeypatch.setattr(admin_routes, "_hf_downloader", None)
+        monkeypatch.setattr(admin_routes, "_ms_downloader", None)
+        monkeypatch.setattr(admin_routes, "_oq_manager", None)
+        monkeypatch.setattr(admin_routes, "_hf_uploader", None)
+
+        discovery = object()
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = []
+        pool.model_count = 0
+        pool.discover_models.return_value = discovery
+        settings_manager = MagicMock()
+        global_settings = MagicMock()
+        global_settings.get_hf_cache_dir.return_value = tmp_path / "hf-cache"
+        global_settings.huggingface.hf_cache_enabled = False
+        mock_server_state = MagicMock()
+        mock_server_state.engine_pool = pool
+        mock_server_state.settings_manager = settings_manager
+
+        with (
+            patch.object(omlx.server, "_server_state", mock_server_state),
+            patch.object(
+                admin_routes,
+                "_get_global_settings",
+                return_value=global_settings,
+            ),
+            patch("omlx.server.reconcile_discovered_model_state") as reconcile,
+        ):
+            success, _ = asyncio.run(
+                admin_routes._apply_model_dirs_runtime(
+                    [str(primary)],
+                    reconciliation_model_dirs=[str(primary)],
+                    prune_missing=False,
+                )
+            )
+
+        assert success is True
+        reconcile.assert_called_once_with(
+            settings_manager,
+            discovery,
+            [str(primary)],
+            hf_cache_dir=tmp_path / "hf-cache",
+            hf_cache_enabled=False,
+            retire_unobserved_configured=False,
+            prune_missing=False,
+        )

@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import re
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+RootFingerprint = tuple[int, int]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -354,6 +356,59 @@ class DiscoveredModel:
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+
+
+@dataclass
+class ModelDiscoveryResult:
+    """Discovered models plus per-root scan and structural-presence evidence.
+
+    ``root_models`` contains loadable models. ``root_model_entries`` also
+    includes structurally present local folders and HF cache entries that are
+    temporarily incomplete, so persistence cleanup can remain conservative
+    without exposing those entries as active models.
+    """
+
+    models: dict[str, DiscoveredModel]
+    root_complete: dict[Path, bool]
+    root_models: dict[Path, frozenset[str]]
+    root_model_entries: dict[Path, frozenset[str]]
+    root_fingerprints: dict[Path, RootFingerprint | None]
+
+
+@dataclass
+class _DiscoveryHealth:
+    """Mutable scan state shared by one root's best-effort traversal."""
+
+    complete: bool = True
+
+
+def _model_root_key(path: Path) -> Path:
+    """Return the normalized physical key used by discovery reports."""
+    try:
+        return path.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return path.expanduser().absolute()
+
+
+def _root_fingerprint(
+    path: Path,
+    *,
+    health: _DiscoveryHealth | None = None,
+) -> RootFingerprint | None:
+    """Return the physical root identity without hiding access failures."""
+    try:
+        root_stat = path.stat()
+    except OSError as e:
+        if health is not None:
+            health.complete = False
+        logger.warning(
+            "Could not fingerprint model root %s: %s: %s",
+            path,
+            type(e).__name__,
+            e,
+        )
+        return None
+    return int(root_stat.st_dev), int(root_stat.st_ino)
 
 
 @dataclass(frozen=True)
@@ -953,14 +1008,35 @@ def estimate_model_size(model_path: Path) -> int:
     return int(total_size * overhead_factor)
 
 
-def _is_adapter_dir(path: Path) -> bool:
+def _path_exists(path: Path, *, health: _DiscoveryHealth | None = None) -> bool:
+    """Check path existence without hiding an access failure as absence."""
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        if health is not None:
+            health.complete = False
+        logger.warning(
+            "Skipping inaccessible model metadata %s: %s: %s",
+            path,
+            type(e).__name__,
+            e,
+        )
+        return False
+    return True
+
+
+def _is_adapter_dir(path: Path, *, health: _DiscoveryHealth | None = None) -> bool:
     """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
-    return (path / "adapter_config.json").exists()
+    return _path_exists(path / "adapter_config.json", health=health)
 
 
-def _is_model_dir(path: Path) -> bool:
+def _is_model_dir(path: Path, *, health: _DiscoveryHealth | None = None) -> bool:
     """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    return _path_exists(path / "config.json", health=health) and not _is_adapter_dir(
+        path, health=health
+    )
 
 
 def model_directory_access_error(path: Path) -> str | None:
@@ -1016,11 +1092,18 @@ def model_directory_write_error(path: Path, *, create: bool = False) -> str | No
     return None
 
 
-def _iter_readable_entries(path: Path, context: str) -> list[Path]:
+def _iter_readable_entries(
+    path: Path,
+    context: str,
+    *,
+    health: _DiscoveryHealth | None = None,
+) -> list[Path]:
     """Return sorted directory entries, or an empty list when scanning fails."""
     try:
         return sorted(path.iterdir())
     except OSError as e:
+        if health is not None:
+            health.complete = False
         logger.warning(
             "Skipping unreadable %s %s: %s: %s",
             context,
@@ -1031,10 +1114,17 @@ def _iter_readable_entries(path: Path, context: str) -> list[Path]:
         return []
 
 
-def _is_readable_dir(path: Path, context: str) -> bool:
+def _is_readable_dir(
+    path: Path,
+    context: str,
+    *,
+    health: _DiscoveryHealth | None = None,
+) -> bool:
     try:
-        return path.is_dir()
+        return stat.S_ISDIR(path.stat().st_mode)
     except OSError as e:
+        if health is not None:
+            health.complete = False
         logger.warning(
             "Skipping inaccessible %s %s: %s: %s",
             context,
@@ -1063,7 +1153,11 @@ def _decode_hf_cache_model_id(path: Path) -> tuple[str, str] | None:
     return f"{parts[0]}--{repo_name}", f"{parts[0]}/{repo_name}"
 
 
-def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
+def _resolve_hf_cache_entry(
+    path: Path,
+    *,
+    health: _DiscoveryHealth | None = None,
+) -> HfCacheEntry | None:
     """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
 
     Returns an HfCacheEntry or None if not a valid HF model cache entry.
@@ -1074,7 +1168,11 @@ def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     model_id, source_repo_id = decoded
 
     snapshots_dir = path / "snapshots"
-    if not snapshots_dir.is_dir():
+    if not _is_readable_dir(
+        snapshots_dir,
+        "HF cache snapshots directory",
+        health=health,
+    ):
         return None
 
     for ref_name in ("main", "master"):
@@ -1083,24 +1181,51 @@ def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
         except OSError:
             continue
         snapshot = snapshots_dir / commit_hash
-        if snapshot.is_dir():
+        if _is_readable_dir(snapshot, "HF cache referenced snapshot", health=health):
             return HfCacheEntry(snapshot, model_id, source_repo_id)
 
     snapshots = [
         p
-        for p in _iter_readable_entries(snapshots_dir, "HF cache snapshots")
-        if _is_readable_dir(p, "HF cache snapshot")
+        for p in _iter_readable_entries(
+            snapshots_dir,
+            "HF cache snapshots",
+            health=health,
+        )
+        if _is_readable_dir(p, "HF cache snapshot", health=health)
     ]
     if not snapshots:
         return None
     if len(snapshots) == 1:
         return HfCacheEntry(snapshots[0], model_id, source_repo_id)
 
-    snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
-    return HfCacheEntry(snapshot, model_id, source_repo_id)
+    latest_snapshot: Path | None = None
+    latest_mtime = float("-inf")
+    for snapshot in snapshots:
+        try:
+            mtime = snapshot.stat().st_mtime
+        except OSError as e:
+            if health is not None:
+                health.complete = False
+            logger.warning(
+                "Skipping inaccessible HF cache snapshot %s: %s: %s",
+                snapshot,
+                type(e).__name__,
+                e,
+            )
+            continue
+        if mtime > latest_mtime:
+            latest_snapshot = snapshot
+            latest_mtime = mtime
+    if latest_snapshot is None:
+        return None
+    return HfCacheEntry(latest_snapshot, model_id, source_repo_id)
 
 
-def _safetensors_has_mlx_metadata(path: Path) -> bool:
+def _safetensors_has_mlx_metadata(
+    path: Path,
+    *,
+    shards: list[Path] | None = None,
+) -> bool:
     """Return True if any model safetensors shard declares MLX format."""
     try:
         from safetensors import safe_open
@@ -1108,7 +1233,8 @@ def _safetensors_has_mlx_metadata(path: Path) -> bool:
         logger.debug(f"safetensors import failed while checking {path}: {e}")
         return False
 
-    for shard in sorted(path.glob("model*.safetensors")):
+    candidates = shards if shards is not None else list(path.glob("model*.safetensors"))
+    for shard in sorted(candidates):
         try:
             with safe_open(str(shard), framework="numpy") as f:
                 metadata = f.metadata() or {}
@@ -1148,14 +1274,30 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
     return is_helper_model_config(config)
 
 
-def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+def _is_hf_cache_mlx_compatible(
+    model_dir: Path,
+    source_repo_id: str,
+    *,
+    health: _DiscoveryHealth | None = None,
+) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
-    if not _is_model_dir(model_dir):
+    if not _is_model_dir(model_dir, health=health):
         return False
-    if not list(model_dir.glob("model*.safetensors")):
-        logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
+    shards = [
+        entry
+        for entry in _iter_readable_entries(
+            model_dir,
+            "HF cache snapshot",
+            health=health,
+        )
+        if entry.name.startswith("model") and entry.suffix == ".safetensors"
+    ]
+    if not shards:
+        logger.debug(
+            f"Skipping HF cache model without model*.safetensors: {source_repo_id}"
+        )
         return False
-    if _safetensors_has_mlx_metadata(model_dir):
+    if _safetensors_has_mlx_metadata(model_dir, shards=shards):
         return True
 
     repo_lower = source_repo_id.lower()
@@ -1284,34 +1426,83 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     Returns:
         Dictionary mapping model_id to DiscoveredModel
     """
+    return discover_models_with_status(model_dir).models
+
+
+def discover_models_with_status(
+    model_dir: Path,
+    *,
+    hf_cache_entries_only: bool = False,
+) -> ModelDiscoveryResult:
+    """Discover models and report whether the root was scanned completely.
+
+    Discovery remains best-effort for normal serving: unreadable entries and
+    malformed/incomplete model directories are skipped. Callers making
+    destructive persistence decisions can combine ``root_complete`` with
+    ``root_model_entries`` so access failures defer cleanup while a skipped but
+    structurally present folder protects only its own state.
+    ``hf_cache_entries_only`` records cache-entry presence without loading
+    model metadata; it protects persisted state while HF visibility is disabled.
+    """
+    root_key = _model_root_key(model_dir)
     access_error = model_directory_access_error(model_dir)
     if access_error is not None:
         if "not readable" in access_error:
             logger.warning("Skipping directory %s: %s", model_dir, access_error)
-            return {}
+            return ModelDiscoveryResult(
+                {},
+                {root_key: False},
+                {root_key: frozenset()},
+                {root_key: frozenset()},
+                {root_key: None},
+            )
         raise ValueError(access_error)
 
     models: dict[str, DiscoveredModel] = {}
+    model_entries: set[str] = set()
+    root_has_model_artifact = False
+    health = _DiscoveryHealth()
+    start_fingerprint = _root_fingerprint(model_dir, health=health)
 
-    for subdir in _iter_readable_entries(model_dir, "model directory"):
-        if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
+    for subdir in _iter_readable_entries(model_dir, "model directory", health=health):
+        if subdir.name.startswith("."):
+            continue
+        if not _is_readable_dir(subdir, "model entry", health=health):
+            root_has_model_artifact |= subdir.suffix in {".safetensors", ".bin"}
             continue
 
-        if _is_adapter_dir(subdir):
+        if hf_cache_entries_only:
+            hf_decoded = _decode_hf_cache_model_id(subdir)
+            if hf_decoded is not None:
+                model_entries.add(hf_decoded[0])
+            continue
+
+        if _is_adapter_dir(subdir, health=health):
+            model_entries.add(subdir.name)
             logger.info(
                 f"Skipping LoRA adapter: {subdir.name} "
                 "(oMLX does not support LoRA/PEFT adapters)"
             )
-        elif _is_model_dir(subdir):
+        elif _is_model_dir(subdir, health=health):
             # Level 1: direct model folder
+            model_entries.add(subdir.name)
             _register_model(models, subdir, subdir.name)
         else:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
-            hf_resolved = _resolve_hf_cache_entry(subdir)
-            if hf_resolved is not None:
+            hf_decoded = _decode_hf_cache_model_id(subdir)
+            if hf_decoded is not None:
+                # The cache entry itself is still present even when it has no
+                # resolvable snapshot yet. Keep this separate from successfully
+                # discovered models so reconciliation can protect prior state
+                # without exposing a non-loadable model.
+                model_entries.add(hf_decoded[0])
+                hf_resolved = _resolve_hf_cache_entry(subdir, health=health)
+                if hf_resolved is None:
+                    continue
                 if _is_hf_cache_mlx_compatible(
                     hf_resolved.snapshot_path,
                     hf_resolved.source_repo_id,
+                    health=health,
                 ):
                     _register_model(
                         models,
@@ -1323,19 +1514,24 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                 continue
 
             # Level 2: organization folder — scan children
+            # Keep the top-level folder name as conservative structural
+            # evidence too. It is harmless for ordinary organization folders,
+            # and protects a formerly loadable direct model while its metadata
+            # is temporarily absent.
+            model_entries.add(subdir.name)
             has_children = False
-            for child in _iter_readable_entries(subdir, "model group"):
-                if (
-                    not _is_readable_dir(child, "model group entry")
-                    or child.name.startswith(".")
-                ):
+            for child in _iter_readable_entries(subdir, "model group", health=health):
+                if not _is_readable_dir(
+                    child, "model group entry", health=health
+                ) or child.name.startswith("."):
                     continue
-                if _is_adapter_dir(child):
+                model_entries.add(child.name)
+                if _is_adapter_dir(child, health=health):
                     logger.info(
                         f"Skipping LoRA adapter: {child.name} "
                         "(oMLX does not support LoRA/PEFT adapters)"
                     )
-                elif _is_model_dir(child):
+                elif _is_model_dir(child, health=health):
                     has_children = True
                     _register_model(models, child, child.name)
 
@@ -1348,10 +1544,37 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     # Fallback: if no models found and the directory itself is a model, register it.
     # This supports pointing directly at a single model folder, e.g.:
     #   /Models/Qwen3.5-9B-MLX-4bit/  (contains config.json and weight files)
-    if not models and _is_model_dir(model_dir):
+    root_is_model = (
+        not hf_cache_entries_only
+        and not models
+        and _is_model_dir(model_dir, health=health)
+    )
+    if root_is_model:
+        model_entries.add(model_dir.name)
         _register_model(models, model_dir, model_dir.name)
+    elif not hf_cache_entries_only and not models and root_has_model_artifact:
+        # A directly configured single-model root may temporarily lose its
+        # config while weight files are still present.
+        model_entries.add(model_dir.name)
 
-    return models
+    end_fingerprint = _root_fingerprint(model_dir, health=health)
+    stable_fingerprint = start_fingerprint
+    if start_fingerprint != end_fingerprint:
+        health.complete = False
+        stable_fingerprint = None
+        logger.warning(
+            "Model root identity changed during discovery; treating scan as "
+            "incomplete: %s",
+            model_dir,
+        )
+
+    return ModelDiscoveryResult(
+        models,
+        {root_key: health.complete},
+        {root_key: frozenset(models)},
+        {root_key: frozenset(set(models) | model_entries)},
+        {root_key: stable_fingerprint},
+    )
 
 
 def discover_models_from_dirs(
@@ -1369,21 +1592,37 @@ def discover_models_from_dirs(
     Returns:
         Dictionary mapping model_id to DiscoveredModel
     """
+    return discover_models_from_dirs_with_status(model_dirs).models
+
+
+def discover_models_from_dirs_with_status(
+    model_dirs: list[Path],
+) -> ModelDiscoveryResult:
+    """Discover from multiple roots and retain per-root scan completeness."""
     merged: dict[str, DiscoveredModel] = {}
+    root_complete: dict[Path, bool] = {}
+    root_models: dict[Path, frozenset[str]] = {}
+    root_model_entries: dict[Path, frozenset[str]] = {}
+    root_fingerprints: dict[Path, RootFingerprint | None] = {}
 
     for model_dir in model_dirs:
-        access_error = model_directory_access_error(model_dir)
-        if access_error is not None:
-            logger.warning(f"Skipping directory {model_dir}: {access_error}")
-            continue
-
         try:
-            discovered = discover_models(model_dir)
+            result = discover_models_with_status(model_dir)
         except ValueError as e:
             logger.warning(f"Skipping directory {model_dir}: {e}")
+            root_key = _model_root_key(model_dir)
+            root_complete[root_key] = False
+            root_models[root_key] = frozenset()
+            root_model_entries[root_key] = frozenset()
+            root_fingerprints[root_key] = None
             continue
 
-        for model_id, info in discovered.items():
+        root_complete.update(result.root_complete)
+        root_models.update(result.root_models)
+        root_model_entries.update(result.root_model_entries)
+        root_fingerprints.update(result.root_fingerprints)
+
+        for model_id, info in result.models.items():
             if model_id in merged:
                 logger.warning(
                     f"Duplicate model_id '{model_id}' found in {model_dir}, "
@@ -1392,7 +1631,13 @@ def discover_models_from_dirs(
                 continue
             merged[model_id] = info
 
-    return merged
+    return ModelDiscoveryResult(
+        merged,
+        root_complete,
+        root_models,
+        root_model_entries,
+        root_fingerprints,
+    )
 
 
 def format_size(size_bytes: int) -> str:

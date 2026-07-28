@@ -9,9 +9,10 @@ import copy
 import json
 import logging
 import threading
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
@@ -19,8 +20,8 @@ from .model_profiles import (
     filter_profile_fields,
     filter_universal_fields,
     slugify_profile_api_name,
-    validate_profile_name,
     utcnow,
+    validate_profile_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,28 @@ class ModelSettings:
         return cls(**filtered_data)
 
 
+@dataclass(frozen=True)
+class ModelRootObservation:
+    """Scan evidence for one configured model-storage root.
+
+    ``configured_path`` deliberately preserves the user-facing path (including
+    a symlink) while ``scanned_path`` is the physical directory that was
+    inspected.  This lets reconciliation detect a symlink or mount changing
+    target without treating it as an unrelated new root. ``present_model_ids``
+    carries structural evidence for temporarily non-loadable local/cache entries.
+    ``fingerprint`` is captured by discovery while the reported IDs are scanned,
+    avoiding a later mount change from being paired with stale scan contents.
+    """
+
+    configured_path: Path
+    scanned_path: Path
+    status: Literal["complete", "incomplete", "optional_missing"]
+    model_ids: frozenset[str]
+    fingerprint: tuple[int, int] | None
+    present_model_ids: frozenset[str] = frozenset()
+    source: Literal["configured", "hf_cache"] = "configured"
+
+
 class ModelSettingsManager:
     """Manager for per-model settings with file persistence.
 
@@ -312,6 +335,7 @@ class ModelSettingsManager:
         self._lock = threading.Lock()
         self._settings: Dict[str, ModelSettings] = {}
         self._profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._model_root_inventory: dict[str, dict[str, Any]] = {}
         self._templates: Dict[str, Dict[str, Any]] = {}
 
         # Ensure base directory exists
@@ -330,6 +354,7 @@ class ModelSettingsManager:
         if not self.settings_file.exists():
             logger.debug(f"Settings file not found: {self.settings_file}")
             self._settings = {}
+            self._model_root_inventory = {}
             return
 
         try:
@@ -355,14 +380,45 @@ class ModelSettingsManager:
                         f"Failed to load settings for model '{model_id}': {e}"
                     )
 
+            root_inventory = data.get("model_root_inventory", {})
+            self._model_root_inventory = {}
+            if isinstance(root_inventory, dict):
+                for root, inventory in root_inventory.items():
+                    if not isinstance(root, str) or not isinstance(inventory, dict):
+                        continue
+                    source = inventory.get("source", "configured")
+                    if source not in {"configured", "hf_cache"}:
+                        source = "configured"
+                    model_ids = inventory.get("model_ids", [])
+                    if not isinstance(model_ids, list):
+                        model_ids = []
+                    entry: dict[str, Any] = {
+                        "source": source,
+                        "model_ids": sorted(
+                            model_id
+                            for model_id in model_ids
+                            if isinstance(model_id, str)
+                        ),
+                    }
+                    st_dev = inventory.get("st_dev")
+                    st_ino = inventory.get("st_ino")
+                    if isinstance(st_dev, int) and isinstance(st_ino, int):
+                        entry["st_dev"] = st_dev
+                        entry["st_ino"] = st_ino
+                    if inventory.get("pending_retirement") is True:
+                        entry["pending_retirement"] = True
+                    self._model_root_inventory[root] = entry
+
             logger.info(f"Loaded settings for {len(self._settings)} models")
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in settings file: {e}")
             self._settings = {}
+            self._model_root_inventory = {}
         except Exception as e:
             logger.error(f"Failed to load settings file: {e}")
             self._settings = {}
+            self._model_root_inventory = {}
 
     def _save(self) -> None:
         """Save settings to the JSON file.
@@ -376,6 +432,8 @@ class ModelSettingsManager:
                 for model_id, settings in self._settings.items()
             },
         }
+        if self._model_root_inventory:
+            data["model_root_inventory"] = self._model_root_inventory
 
         try:
             # Write to temp file first, then rename for atomicity
@@ -486,6 +544,307 @@ class ModelSettingsManager:
             if removed:
                 logger.info(f"Deleted settings for model '{model_id}'")
             return removed
+
+    def reconcile_discovered_models(
+        self,
+        active_model_ids: Collection[str],
+        root_observations: Collection[ModelRootObservation],
+        *,
+        retire_unobserved_configured: bool = False,
+        prune_missing: bool = True,
+    ) -> list[str]:
+        """Reconcile state independently for each observed model root.
+
+        A model becomes a deletion candidate only when it disappeared from a
+        root whose scan is complete and whose physical identity is stable.
+        Unavailable, newly empty, replaced, or unobserved roots protect their
+        own last-known models without blocking cleanup for healthy roots.
+        Model state is never restored after it has been removed.
+
+        Args:
+            active_model_ids: IDs returned by the complete discovery pass.
+            root_observations: Scan evidence for configured model-storage roots.
+            retire_unobserved_configured: Mark configured roots omitted by an
+                explicit directory change for retirement once the replacement
+                configured roots are trustworthy.
+            prune_missing: Remove state confirmed absent by this observation.
+                Set to False for non-destructive inventory refreshes such as a
+                completed model download or an HF-cache visibility change.
+
+        Returns:
+            Sorted IDs whose settings and/or profiles were removed.
+        """
+        observations = tuple(root_observations)
+        if not observations:
+            logger.warning(
+                "Skipping persisted model-settings reconciliation because no "
+                "configured model roots were supplied"
+            )
+            return []
+
+        active_ids = set(active_model_ids)
+        with self._lock:
+            inventory_changed = False
+            deletion_candidates: set[str] = set()
+            protected_ids: set[str] = set()
+            observed_keys: set[str] = set()
+            state_ids = set(self._settings) | set(self._profiles)
+            known_before = {
+                model_id
+                for entry in self._model_root_inventory.values()
+                for model_id in self._inventory_model_ids(entry)
+            }
+            configured_observations = [
+                observation
+                for observation in observations
+                if observation.source == "configured"
+            ]
+            configured_roots_trusted = bool(configured_observations)
+            legacy_cleanup_safe = True
+
+            for observation in observations:
+                logical_root = observation.configured_path.expanduser().absolute()
+                root_key = str(logical_root)
+                observed_keys.add(root_key)
+                current_ids = set(observation.model_ids)
+                present_ids = current_ids | set(observation.present_model_ids)
+                previous = self._model_root_inventory.get(root_key)
+
+                # A local/cache entry may be physically present without being
+                # active (for example, while incomplete or when HF visibility
+                # is disabled). Presence still prevents destructive cleanup of
+                # matching persisted state.
+                protected_ids.update(present_ids - active_ids)
+
+                if (
+                    previous is not None
+                    and previous.pop("pending_retirement", None) is not None
+                ):
+                    inventory_changed = True
+
+                if observation.status != "complete":
+                    if (
+                        observation.status == "optional_missing"
+                        and observation.source == "hf_cache"
+                        and previous is None
+                    ):
+                        # The optional HF cache may not have been created yet.
+                        # A missing cache with no prior inventory has no
+                        # last-known state to protect, so it must not block
+                        # migration cleanup for trustworthy configured roots.
+                        continue
+                    logger.warning(
+                        "Deferring model-root reconciliation because the scan "
+                        "was incomplete: %s",
+                        logical_root,
+                    )
+                    configured_roots_trusted &= observation.source != "configured"
+                    legacy_cleanup_safe = False
+                    if previous is None:
+                        self._model_root_inventory[root_key] = {
+                            "source": observation.source,
+                            "model_ids": [],
+                        }
+                        inventory_changed = True
+                    else:
+                        protected_ids.update(self._inventory_model_ids(previous))
+                    continue
+
+                if observation.fingerprint is None:
+                    logger.warning(
+                        "Deferring model-root reconciliation because discovery "
+                        "did not capture a stable identity: %s",
+                        logical_root,
+                    )
+                    configured_roots_trusted &= observation.source != "configured"
+                    legacy_cleanup_safe = False
+                    if previous is None:
+                        self._model_root_inventory[root_key] = {
+                            "source": observation.source,
+                            "model_ids": [],
+                        }
+                        inventory_changed = True
+                    else:
+                        protected_ids.update(self._inventory_model_ids(previous))
+                    continue
+
+                fingerprint = {
+                    "st_dev": observation.fingerprint[0],
+                    "st_ino": observation.fingerprint[1],
+                }
+                previous_fingerprint = self._inventory_fingerprint(previous)
+
+                if previous_fingerprint is None:
+                    if not present_ids:
+                        previous_ids = self._inventory_model_ids(previous)
+                        if observation.source == "hf_cache" and not previous_ids:
+                            # An observed empty optional cache is trustworthy
+                            # when it has no last-known models. Recording its
+                            # identity avoids treating it like a newly mounted
+                            # user-configured model root.
+                            entry = {
+                                **fingerprint,
+                                "source": observation.source,
+                                "model_ids": [],
+                            }
+                            if previous != entry:
+                                self._model_root_inventory[root_key] = entry
+                                inventory_changed = True
+                            continue
+                        logger.info(
+                            "Deferring model-root reconciliation for a new or "
+                            "previously unavailable empty root: %s",
+                            logical_root,
+                        )
+                        configured_roots_trusted &= observation.source != "configured"
+                        legacy_cleanup_safe = False
+                        entry = {
+                            "source": observation.source,
+                            "model_ids": sorted(previous_ids),
+                        }
+                        if previous != entry:
+                            self._model_root_inventory[root_key] = entry
+                            inventory_changed = True
+                        continue
+
+                    previous_ids = self._inventory_model_ids(previous)
+                    entry = {
+                        **fingerprint,
+                        "source": observation.source,
+                        "model_ids": sorted(
+                            current_ids | (previous_ids if not prune_missing else set())
+                        ),
+                    }
+                    if previous != entry:
+                        self._model_root_inventory[root_key] = entry
+                        inventory_changed = True
+                    continue
+
+                previous_ids = self._inventory_model_ids(previous)
+                if previous_fingerprint != fingerprint:
+                    logger.warning(
+                        "Deferring model-root reconciliation because physical "
+                        "identity changed: %s",
+                        logical_root,
+                    )
+                    configured_roots_trusted &= observation.source != "configured"
+                    legacy_cleanup_safe = False
+                    protected_ids.update(previous_ids)
+                    if present_ids:
+                        # Retain the previous IDs for exactly one stable scan.
+                        # Structural model evidence is enough to accept the new
+                        # identity; a later stable scan can then distinguish
+                        # removal from a transient mount change.
+                        entry = {
+                            **fingerprint,
+                            "source": observation.source,
+                            "model_ids": sorted(previous_ids | current_ids),
+                        }
+                        if previous != entry:
+                            self._model_root_inventory[root_key] = entry
+                            inventory_changed = True
+                    continue
+
+                if prune_missing:
+                    retained_ids = current_ids | (previous_ids & present_ids)
+                    deletion_candidates.update(previous_ids - retained_ids)
+                else:
+                    retained_ids = previous_ids | current_ids
+                entry = {
+                    **fingerprint,
+                    "source": observation.source,
+                    "model_ids": sorted(retained_ids),
+                }
+                if previous != entry:
+                    self._model_root_inventory[root_key] = entry
+                    inventory_changed = True
+
+            for root_key in list(self._model_root_inventory):
+                if root_key in observed_keys:
+                    continue
+                entry = self._model_root_inventory[root_key]
+                entry_ids = self._inventory_model_ids(entry)
+                if (
+                    retire_unobserved_configured
+                    and entry.get("source", "configured") == "configured"
+                    and entry.get("pending_retirement") is not True
+                ):
+                    entry["pending_retirement"] = True
+                    inventory_changed = True
+
+                if (
+                    prune_missing
+                    and entry.get("pending_retirement") is True
+                    and configured_roots_trusted
+                ):
+                    deletion_candidates.update(entry_ids)
+                    del self._model_root_inventory[root_key]
+                    inventory_changed = True
+                    continue
+
+                protected_ids.update(entry_ids)
+                legacy_cleanup_safe = False
+
+            if prune_missing and legacy_cleanup_safe:
+                deletion_candidates.update(state_ids - known_before)
+
+            deletion_candidates.difference_update(active_ids)
+            deletion_candidates.difference_update(protected_ids)
+            removed_ids = self._remove_model_state_locked(
+                deletion_candidates,
+                save_inventory=inventory_changed,
+            )
+            if removed_ids:
+                logger.info(
+                    "Pruned persisted state for %d missing model(s): %s",
+                    len(removed_ids),
+                    ", ".join(removed_ids),
+                )
+            return removed_ids
+
+    @staticmethod
+    def _inventory_model_ids(entry: dict[str, Any] | None) -> set[str]:
+        if not entry:
+            return set()
+        model_ids = entry.get("model_ids", [])
+        if not isinstance(model_ids, list):
+            return set()
+        return {model_id for model_id in model_ids if isinstance(model_id, str)}
+
+    @staticmethod
+    def _inventory_fingerprint(
+        entry: dict[str, Any] | None,
+    ) -> dict[str, int] | None:
+        if not entry:
+            return None
+        st_dev = entry.get("st_dev")
+        st_ino = entry.get("st_ino")
+        if not isinstance(st_dev, int) or not isinstance(st_ino, int):
+            return None
+        return {"st_dev": st_dev, "st_ino": st_ino}
+
+    def _remove_model_state_locked(
+        self,
+        model_ids: Collection[str],
+        *,
+        save_inventory: bool = False,
+    ) -> list[str]:
+        """Remove selected model state while the manager lock is held."""
+        candidates = set(model_ids)
+        stale_settings = set(self._settings) & candidates
+        stale_profiles = set(self._profiles) & candidates
+        removed_ids = sorted(stale_settings | stale_profiles)
+
+        for model_id in stale_settings:
+            del self._settings[model_id]
+        for model_id in stale_profiles:
+            del self._profiles[model_id]
+
+        if save_inventory or stale_settings:
+            self._save()
+        if stale_profiles:
+            self._save_profiles()
+        return removed_ids
 
     def get_default_model_id(self) -> Optional[str]:
         """Get the ID of the default model.
