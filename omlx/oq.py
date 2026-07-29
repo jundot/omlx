@@ -2442,6 +2442,38 @@ def _sensitivity_lm_config_override(config: dict) -> dict | None:
     return None
 
 
+def _is_ministral3_encoder_config(config: dict) -> bool:
+    """Return True for the bidirectional Ministral3 encoder checkpoint layout."""
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    return (
+        str(config.get("model_type", "")).lower().replace("-", "_") == "ministral3"
+        and "Ministral3Model" in architectures
+        and config.get("is_causal") is False
+    )
+
+
+def _load_ministral3_encoder_for_sensitivity(
+    model_path: str,
+    *,
+    lazy: bool = True,
+    model_config: dict | None = None,
+):
+    """Load a bare Ministral3 encoder without MLX-LM's causal-LM wrapper."""
+    from mlx_lm.models.ministral3 import LanguageModel, ModelArgs
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+    from mlx_lm.utils import load_model
+
+    model, _ = load_model(
+        Path(model_path),
+        lazy=lazy,
+        model_config=model_config,
+        get_model_classes=lambda config: (LanguageModel, ModelArgs),
+    )
+    return model, load_tokenizer(Path(model_path))
+
+
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     """Create a quant_predicate closure for mlx-lm's quantize_model."""
 
@@ -5535,6 +5567,24 @@ def _find_model_layers(model):
 
 def _forward_layer_result(block, inputs, mask, position_ids):
     """Forward pass through a transformer layer, returning output and aux."""
+    if isinstance(position_ids, dict) and position_ids.get("kind") == "ministral3":
+        try:
+            result = block(
+                inputs,
+                position_ids["attn_scale"],
+                mask,
+                None,
+            )
+            if isinstance(result, tuple):
+                return result[0], result[1] if len(result) > 1 else None
+            return result, None
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            logger.debug(
+                f"_forward_layer: Ministral3 signature failed for "
+                f"{type(block).__name__}: {e}"
+            )
+            return None, None
+
     if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
         try:
             result = block(
@@ -5664,7 +5714,7 @@ def _restore_saved_weights(block, saved):
             modules_by_path[path].weight = weight
 
 
-def _prepare_layer_inputs(model, layers, calib_data, inputs):
+def _prepare_layer_inputs(model, layers, calib_data, inputs, config=None):
     """Model-specific (inputs, per-layer masks, 4th forward arg) for
     block-level sensitivity forwards.
 
@@ -5700,6 +5750,27 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
         mask = create_attention_mask(inputs, None, return_array=True)
         state = {"kind": "glm_moe_dsa", "prev_topk_indices": None}
         return inputs, [mask] * len(layers), state
+    if model_type == "ministral3":
+        from mlx_lm.models.ministral3 import _get_llama_4_attn_scale
+
+        args = getattr(getattr(model, "model", None), "args", None)
+        if args is None:
+            args = getattr(model, "args", None)
+        rope = getattr(args, "rope_parameters", {}) or {}
+        attn_scale = _get_llama_4_attn_scale(
+            calib_data.shape[1],
+            0,
+            rope.get("llama_4_scaling_beta", 0.1),
+            rope.get("original_max_position_embeddings", 16384),
+        ).astype(inputs.dtype)
+        is_causal = True if config is None else config.get("is_causal", True)
+        masks = (
+            _layer_masks_for_model(model, layers, inputs)
+            if is_causal
+            else [None] * len(layers)
+        )
+        state = {"kind": "ministral3", "attn_scale": attn_scale}
+        return inputs, masks, state
     masks = _layer_masks_for_model(model, layers, inputs)
     position_ids = mx.arange(calib_data.shape[1])[None, :]
     return inputs, masks, position_ids
@@ -6031,7 +6102,7 @@ def _collect_imatrix_from_model(
 
                 inputs = embed_fn(batch)
                 inputs, layer_masks, position_ids = _prepare_layer_inputs(
-                    model, layers, batch, inputs
+                    model, layers, batch, inputs, config
                 )
 
                 for layer_idx, block in enumerate(layers):
@@ -6249,14 +6320,21 @@ def _collect_imatrix(
 
             tokenizer = load_tokenizer(Path(model_path))
         else:
-            from omlx.utils.model_loading import lm_load_compat as lm_load
+            if _is_ministral3_encoder_config(config):
+                model, tokenizer = _load_ministral3_encoder_for_sensitivity(
+                    model_path,
+                    lazy=True,
+                    model_config=_sensitivity_lm_config_override(config),
+                )
+            else:
+                from omlx.utils.model_loading import lm_load_compat as lm_load
 
-            model, tokenizer = lm_load(
-                model_path,
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config),
-            )
+                model, tokenizer = lm_load(
+                    model_path,
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                    model_config=_sensitivity_lm_config_override(config),
+                )
     except Exception as e:
         logger.error("oQe imatrix: model load failed (%s)", e)
         return {}, {"dataset": calib_dataset, "processed_samples": 0}
@@ -6432,7 +6510,7 @@ def _measure_sensitivity_from_model(
 
     inputs = embed_fn(calib_data)
     inputs, layer_masks, position_ids = _prepare_layer_inputs(
-        model, layers, calib_data, inputs
+        model, layers, calib_data, inputs, config
     )
     sensitivity = {}
 
@@ -6566,14 +6644,21 @@ def _measure_sensitivity(
 
             tokenizer = load_tokenizer(Path(model_path))
         else:
-            from omlx.utils.model_loading import lm_load_compat as lm_load
+            if _is_ministral3_encoder_config(config):
+                model, tokenizer = _load_ministral3_encoder_for_sensitivity(
+                    model_path,
+                    lazy=True,
+                    model_config=_sensitivity_lm_config_override(config),
+                )
+            else:
+                from omlx.utils.model_loading import lm_load_compat as lm_load
 
-            model, tokenizer = lm_load(
-                model_path,
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config),
-            )
+                model, tokenizer = lm_load(
+                    model_path,
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                    model_config=_sensitivity_lm_config_override(config),
+                )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
         return {}
@@ -6943,11 +7028,17 @@ def _measure_sensitivity_from_quantized_model(
                 set_mtp_active(True)
                 restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
 
-            model, tokenizer = lm_load(
-                model_path,
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-            )
+            if _is_ministral3_encoder_config(config):
+                model, tokenizer = _load_ministral3_encoder_for_sensitivity(
+                    model_path,
+                    lazy=True,
+                )
+            else:
+                model, tokenizer = lm_load(
+                    model_path,
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                )
     except Exception as e:
         logger.error(f"Sensitivity proxy load failed ({e})")
         return {}
@@ -6987,7 +7078,7 @@ def _measure_sensitivity_from_quantized_model(
 
     inputs = embed_fn(calib_data)
     inputs, layer_masks, position_ids = _prepare_layer_inputs(
-        model, layers, calib_data, inputs
+        model, layers, calib_data, inputs, config
     )
     sensitivity = {}
 

@@ -48,6 +48,7 @@ from omlx.oq import (
     _imatrix_requires_expert_counts,
     _ImatrixCaptureWrapper,
     _is_audio_tensor,
+    _is_ministral3_encoder_config,
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
@@ -58,6 +59,7 @@ from omlx.oq import (
     _normalize_sensitivity_map_override,
     _oqe_calibration_batch_plan,
     _perturb_bits_for,
+    _prepare_layer_inputs,
     _progress_total_bytes,
     _quantize_chunked,
     _sensitivity_lm_config_override,
@@ -664,6 +666,40 @@ class TestOqDtypeModelSupport:
             quantize_oq_streaming(str(src), str(out), oq_level=4, dtype="float16")
 
         assert not out.exists()
+
+
+class TestMinistral3EncoderSupport:
+    def test_detects_bidirectional_encoder_layout(self):
+        assert _is_ministral3_encoder_config(
+            {
+                "model_type": "ministral3",
+                "architectures": ["Ministral3Model"],
+                "is_causal": False,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {
+                "model_type": "ministral3",
+                "architectures": ["Ministral3ForCausalLM"],
+                "is_causal": True,
+            },
+            {
+                "model_type": "ministral3",
+                "architectures": ["Ministral3Model"],
+                "is_causal": True,
+            },
+            {
+                "model_type": "mistral3",
+                "architectures": ["Mistral3Model"],
+                "is_causal": False,
+            },
+        ],
+    )
+    def test_rejects_non_encoder_layouts(self, config):
+        assert not _is_ministral3_encoder_config(config)
 
 
 class TestShouldSkipTensor:
@@ -1578,6 +1614,53 @@ class TestForwardLayer:
         assert isinstance(result, mx.array)
         assert aux == "next_topk"
         assert seen == [("mask", None, "prev_topk")]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_ministral3_state_uses_embedding_signature(self):
+        tensor = mx.ones((2, 4, 8))
+        attn_scale = mx.ones((1, 1, 4, 1))
+        seen = []
+
+        def ministral_block(x, scale, mask, cache):
+            seen.append((scale, mask, cache))
+            return x + 1
+
+        state = {"kind": "ministral3", "attn_scale": attn_scale}
+        result, aux = _forward_layer_result(ministral_block, tensor, None, state)
+
+        assert isinstance(result, mx.array)
+        assert aux is None
+        assert seen == [(attn_scale, None, None)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_ministral3_embedding_calibration_is_bidirectional(self):
+        class Args:
+            rope_parameters = {
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 16384,
+            }
+
+        class Inner:
+            args = Args()
+
+        class Model:
+            model_type = "ministral3"
+            model = Inner()
+
+        calib_data = mx.ones((2, 4), dtype=mx.int32)
+        inputs = mx.ones((2, 4, 8))
+        prepared, masks, state = _prepare_layer_inputs(
+            Model(),
+            [object(), object()],
+            calib_data,
+            inputs,
+            {"is_causal": False},
+        )
+
+        assert prepared is inputs
+        assert masks == [None, None]
+        assert state["kind"] == "ministral3"
+        assert state["attn_scale"].shape == (4, 1)
 
 
 # =============================================================================
