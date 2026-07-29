@@ -115,11 +115,11 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.1 (1011d0d) - jundot fork of bstnxbt 0.1.10 (9ca0028).
-    # Carries the trimmed-sidecar prefix cache fix: upstream rejects every
-    # collected sidecar because the coverage check contradicts the sink+window
-    # hidden trim, so repeat-prompt L1 hits never fire.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@1011d0df95b77df1003b67138e595827894d3408",
+    # dflash-mlx v0.1.10+omlx.2 (cb5cd28) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
+    # fired upstream) and the single-host-sync decode cycle (one D2H transfer
+    # per cycle instead of four syncs plus a hard eval).
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@cb5cd2888b31d31214e221f2be7101bd125c4122",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 

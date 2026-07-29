@@ -82,6 +82,32 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _format_phase_timings(phase_timings_us: object) -> str:
+    """Compact per-phase summary for the completion log, in milliseconds.
+
+    The dflash SummaryEvent reports where each cycle's time went
+    (prefill / draft / verify / replay / commit); without surfacing it the
+    server log gives no way to tell which phase dominates a slow request.
+    """
+    if not isinstance(phase_timings_us, dict) or not phase_timings_us:
+        return ""
+
+    def _ms(key: str) -> str:
+        try:
+            return f"{float(phase_timings_us.get(key, 0.0)) / 1000.0:.1f}"
+        except (TypeError, ValueError):
+            return "0.0"
+
+    return (
+        f", phases[prefill={_ms('prefill')}ms"
+        f" draft={_ms('draft')}ms"
+        f"(first={_ms('draft_prefill')}/incr={_ms('draft_incremental')})"
+        f" verify={_ms('verify')}ms"
+        f" replay={_ms('replay')}ms"
+        f" commit={_ms('commit')}ms]"
+    )
+
+
 class _DFlashPrefillGuard:
     """Prefill-memory guard target for DFlash's primary (speculative) path,
     which bypasses the Scheduler entirely.
@@ -1113,6 +1139,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     elapsed_s = elapsed_us / 1e6 if elapsed_us else 0
                     gen_tps = gen_tokens / elapsed_s if elapsed_s > 0 else 0
                     fallback = bool(event.fallback_ar)
+                    phase_summary = _format_phase_timings(
+                        getattr(event, "phase_timings_us", None)
+                    )
                     logger.info(
                         f"DFlash generation complete: "
                         f"{gen_tokens} tokens, "
@@ -1120,6 +1149,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"acceptance={accept_ratio:.1%}, "
                         f"cycles={cycles}"
                         f"{', fallback=AR' if fallback else ''}"
+                        f"{phase_summary}"
                     )
                     metrics = {
                         "prompt_tokens": int(event.prompt_token_count),
