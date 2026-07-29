@@ -695,7 +695,7 @@ class UISettings:
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
-    autocompact_threshold_pct: int = 85
+    autocompact_threshold_pct: int = 80
     # Mode: "cloud" = native claude.ai subscription, "local" = route through omlx.
     # Default is "cloud" so upgrades don't silently route traffic to omlx.
     mode: str = "cloud"
@@ -717,7 +717,7 @@ class ClaudeCodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
         return cls(
-            autocompact_threshold_pct=data.get("autocompact_threshold_pct", 85),
+            autocompact_threshold_pct=data.get("autocompact_threshold_pct", 80),
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),

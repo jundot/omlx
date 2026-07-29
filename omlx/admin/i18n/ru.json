@@ -953,5 +953,5 @@
   "js.success.download_started": "Загрузка начата: {repo_id}",
   "js.success.settings_saved": "Настройки успешно сохранены",
   "status.claude_code.autocompact_threshold_pct": "Порог автосжатия",
-  "status.claude_code.autocompact_threshold_pct_description": "Процент реального максимального размера контекста модели, при котором Claude Code запускает автоматическое сжатие (по умолчанию 85%)."
+  "status.claude_code.autocompact_threshold_pct_description": "Процент реального максимального размера контекста модели, при котором Claude Code запускает автоматическое сжатие (по умолчанию 80%)."
 }

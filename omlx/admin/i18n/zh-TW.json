@@ -953,5 +953,5 @@
   "js.success.download_started": "已開始下載：{repo_id}",
   "js.success.settings_saved": "設定儲存成功",
   "status.claude_code.autocompact_threshold_pct": "自動壓縮閾值",
-  "status.claude_code.autocompact_threshold_pct_description": "模型真實最大情境窗口中觸發 Claude Code 自動壓縮的百分比（預設 85%）。"
+  "status.claude_code.autocompact_threshold_pct_description": "模型真實最大情境窗口中觸發 Claude Code 自動壓縮的百分比（預設 80%）。"
 }

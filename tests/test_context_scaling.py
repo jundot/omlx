@@ -27,4 +27,4 @@ class TestScalingMechanismRemoved:
 
     def test_claude_code_settings_has_threshold_pct(self):
         settings = ClaudeCodeSettings()
-        assert settings.autocompact_threshold_pct == 85
+        assert settings.autocompact_threshold_pct == 80

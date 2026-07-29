@@ -4469,7 +4469,7 @@ async def get_server_stats(
         "claude_code_autocompact_threshold_pct": (
             global_settings.claude_code.autocompact_threshold_pct
             if global_settings
-            else 85
+            else 80
         ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,

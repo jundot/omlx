@@ -953,5 +953,5 @@
   "js.success.download_started": "Download started: {repo_id}",
   "js.success.settings_saved": "Settings saved successfully",
   "status.claude_code.autocompact_threshold_pct": "Auto-compact Threshold",
-  "status.claude_code.autocompact_threshold_pct_description": "Percentage of the model's real max context window at which Claude Code triggers auto-compact (default 85%)."
+  "status.claude_code.autocompact_threshold_pct_description": "Percentage of the model's real max context window at which Claude Code triggers auto-compact (default 80%)."
 }

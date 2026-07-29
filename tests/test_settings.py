@@ -1924,7 +1924,7 @@ class TestClaudeCodeSettings:
     def test_defaults(self):
         """Test default values."""
         settings = ClaudeCodeSettings()
-        assert settings.autocompact_threshold_pct == 85
+        assert settings.autocompact_threshold_pct == 80
 
     def test_custom_values(self):
         """Test custom values."""
@@ -1950,7 +1950,7 @@ class TestClaudeCodeSettings:
     def test_from_dict_defaults(self):
         """Test from_dict uses defaults for missing fields."""
         settings = ClaudeCodeSettings.from_dict({})
-        assert settings.autocompact_threshold_pct == 85
+        assert settings.autocompact_threshold_pct == 80
 
     def test_from_dict_ignores_legacy_scaling_keys(self):
         """Old settings.json with context_scaling_enabled/target_context_size
@@ -1963,7 +1963,7 @@ class TestClaudeCodeSettings:
             "mode": "local",
         }
         settings = ClaudeCodeSettings.from_dict(data)
-        assert settings.autocompact_threshold_pct == 85
+        assert settings.autocompact_threshold_pct == 80
         assert settings.mode == "local"
         assert not hasattr(settings, "context_scaling_enabled")
         assert not hasattr(settings, "target_context_size")

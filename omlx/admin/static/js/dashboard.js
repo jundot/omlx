@@ -101,7 +101,7 @@
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { autocompact_threshold_pct: 85, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { autocompact_threshold_pct: 80, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,

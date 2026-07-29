@@ -953,5 +953,5 @@
   "js.success.download_started": "Descarga iniciada: {repo_id}",
   "js.success.settings_saved": "Configuración guardada correctamente",
   "status.claude_code.autocompact_threshold_pct": "Umbral de Auto-compact",
-  "status.claude_code.autocompact_threshold_pct_description": "Porcentaje de la ventana de contexto máxima real del modelo en el que Claude Code activa el auto-compact (85% por defecto)."
+  "status.claude_code.autocompact_threshold_pct_description": "Porcentaje de la ventana de contexto máxima real del modelo en el que Claude Code activa el auto-compact (80% por defecto)."
 }

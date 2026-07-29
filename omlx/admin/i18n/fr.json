@@ -953,5 +953,5 @@
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "status.claude_code.autocompact_threshold_pct": "Seuil de compactage automatique",
-  "status.claude_code.autocompact_threshold_pct_description": "Pourcentage de la fenêtre de contexte maximale réelle du modèle à partir duquel Claude Code déclenche le compactage automatique (85 % par défaut)."
+  "status.claude_code.autocompact_threshold_pct_description": "Pourcentage de la fenêtre de contexte maximale réelle du modèle à partir duquel Claude Code déclenche le compactage automatique (80 % par défaut)."
 }

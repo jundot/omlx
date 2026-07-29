@@ -953,5 +953,5 @@
   "js.success.download_started": "다운로드 시작: {repo_id}",
   "js.success.settings_saved": "설정이 저장되었습니다",
   "status.claude_code.autocompact_threshold_pct": "자동 압축 임계값",
-  "status.claude_code.autocompact_threshold_pct_description": "모델의 실제 최대 컨텍스트 윈도우 중 Claude Code가 자동 압축을 시작하는 비율입니다(기본값 85%)."
+  "status.claude_code.autocompact_threshold_pct_description": "모델의 실제 최대 컨텍스트 윈도우 중 Claude Code가 자동 압축을 시작하는 비율입니다(기본값 80%)."
 }

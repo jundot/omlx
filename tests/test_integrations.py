@@ -1366,13 +1366,13 @@ class TestClaudeCodeIntegration:
                     api_key="secret",
                     model="qwen3.5",
                     context_window=128000,
-                    autocompact_threshold_pct=85,
+                    autocompact_threshold_pct=80,
                 )
             )
 
         env = captured["env"]
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
-        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "0.85"
+        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "0.8"
 
     def test_launch_sets_autocompact_pct_override_custom(self):
         cc = ClaudeCodeIntegration()

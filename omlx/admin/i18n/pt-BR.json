@@ -953,5 +953,5 @@
   "js.success.download_started": "Download iniciado: {repo_id}",
   "js.success.settings_saved": "Configurações salvas com sucesso",
   "status.claude_code.autocompact_threshold_pct": "Limite de Auto-compactação",
-  "status.claude_code.autocompact_threshold_pct_description": "Porcentagem da janela de contexto máxima real do modelo na qual o Claude Code aciona a compactação automática (85% por padrão)."
+  "status.claude_code.autocompact_threshold_pct_description": "Porcentagem da janela de contexto máxima real do modelo na qual o Claude Code aciona a compactação automática (80% por padrão)."
 }
