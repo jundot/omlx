@@ -127,6 +127,25 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
         )
 
 
+def _is_vlm_load(config: dict) -> bool:
+    """VLM routing predicate for oQ's model-load helpers.
+
+    Mirrors the VLM decision in :func:`_build_model_sanitizer`, but for the
+    sensitivity / imatrix / proxy load paths: route a checkpoint through
+    mlx-vlm only when it carries a vision sub-config *and* its model_type is
+    not one mlx-lm serves text-only (e.g. ``mimo_v2``). Without the text-only
+    exclusion these paths send a text-only-supported multimodal base -- which
+    still ships a ``vision_config`` -- to mlx-vlm, where ``get_model_and_args``
+    cannot resolve the model_type and falls through to the
+    ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
+    """
+    model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    return (
+        _has_vision_subconfig(config)
+        and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    )
+
+
 def _uses_quantized_source_sensitivity(config: dict) -> bool:
     """Return whether source sensitivity must perturb quantized modules."""
     quantization_config = config.get("quantization_config") or {}
@@ -6076,7 +6095,7 @@ def _collect_imatrix(
         maybe_apply_pre_load_patches,
     )
 
-    is_vlm = _has_vision_subconfig(config)
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 
@@ -6378,10 +6397,11 @@ def _measure_sensitivity(
         maybe_apply_pre_load_patches,
     )
 
-    # Treat any model with a vision sub-config (vision_config / vit_config /
-    # mm_vision_tower) as a VLM for the MTP attach decision. The classifier
-    # in model_discovery._has_vision_subconfig owns the canonical predicate.
-    is_vlm = _has_vision_subconfig(config)
+    # Route the MTP attach / load decision via _is_vlm_load: a vision
+    # sub-config (vision_config / vit_config / mm_vision_tower) means VLM,
+    # except for model types mlx-lm serves text-only (e.g. mimo_v2), which
+    # ship a vision_config but must load through the patched mlx-lm class.
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
 
     # Reuse the centralised pre-load dispatch so every current and future
@@ -6763,7 +6783,7 @@ def _measure_sensitivity_from_quantized_model(
     # load_model replacement for F8_E8M0 checkpoints, MTP sanitize, ...)
     # so the quantized source/proxy loads exactly as in production.
     # Idempotent; harmless for plain mlx-lm proxies.
-    is_vlm = _has_vision_subconfig(config)
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 
