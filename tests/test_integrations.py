@@ -1372,7 +1372,7 @@ class TestClaudeCodeIntegration:
 
         env = captured["env"]
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
-        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "0.8"
+        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "80"
 
     def test_launch_sets_autocompact_pct_override_custom(self):
         cc = ClaudeCodeIntegration()
@@ -1399,7 +1399,7 @@ class TestClaudeCodeIntegration:
 
         env = captured["env"]
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
-        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "0.9"
+        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "90"
 
     def test_launch_omits_pct_override_when_not_configured(self):
         cc = ClaudeCodeIntegration()

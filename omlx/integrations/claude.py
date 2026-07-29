@@ -65,8 +65,15 @@ class ClaudeCodeIntegration(Integration):
         if ctx.context_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
         if ctx.autocompact_threshold_pct is not None:
+            # Claude Code's CLI parses this as a plain 0-100 percentage
+            # (`n>0 && n<=100`, then divides by 100 internally) — not a
+            # 0-1 fraction. Sending "0.8" for 80% is silently accepted
+            # (0.8 <= 100) but interpreted as 0.8%, firing compaction
+            # almost immediately. Confirmed via decompiled CLI strings
+            # (2.1.220) after live testing showed early auto-compact
+            # around 11-13% of the real window instead of 80%.
             env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(
-                ctx.autocompact_threshold_pct / 100
+                ctx.autocompact_threshold_pct
             )
 
         binary = self._find_claude_binary()
