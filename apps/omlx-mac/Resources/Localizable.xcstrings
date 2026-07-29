@@ -263,6 +263,60 @@
         }
       }
     },
+    "appearance.row.menubar_icon" : {
+      "comment" : "Appearance row label for the menu bar icon restore action",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Menu Bar Icon"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Значок в строке меню"
+          }
+        }
+      }
+    },
+    "appearance.row.menubar_icon.restore" : {
+      "comment" : "Appearance button title that restores the menu bar icon",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Restore"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Восстановить"
+          }
+        }
+      }
+    },
+    "appearance.row.menubar_icon.sub" : {
+      "comment" : "Appearance row sublabel for the menu bar icon restore action",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bring the oMLX icon back if it was removed from the menu bar. Separate from the Dock icon."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вернуть значок oMLX, если он был удалён из строки меню. Не связано со значком в Dock."
+          }
+        }
+      }
+    },
     "appearance.row.refresh_interval" : {
       "comment" : "Appearance row label for the menubar refresh cadence picker",
       "extractionState" : "manual",
@@ -1530,7 +1584,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CMMLU (Chinese)"
+            "value" : "CMMLU (китайский)"
           }
         }
       }
@@ -1548,7 +1602,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "JMMLU (Japanese)"
+            "value" : "JMMLU (японский)"
           }
         }
       }
@@ -1566,7 +1620,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "KMMLU (Korean)"
+            "value" : "KMMLU (корейский)"
           }
         }
       }
@@ -2215,6 +2269,366 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Показать текстовый дамп"
+          }
+        }
+      }
+    },
+    "bench.context.button.run" : {
+      "comment" : "Context Bench primary button that starts the measurement",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start Benchmark"
+          }
+        }
+      }
+    },
+    "bench.context.capped.memory" : {
+      "comment" : "Limited-by value when free memory bounded the result",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Available memory"
+          }
+        }
+      }
+    },
+    "bench.context.capped.native" : {
+      "comment" : "Limited-by value when the model's own context length bounded the result",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model's native context length"
+          }
+        }
+      }
+    },
+    "bench.context.capped.target" : {
+      "comment" : "Limited-by value when the selected target bounded the result",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Selected target"
+          }
+        }
+      }
+    },
+    "bench.context.header.eyebrow" : {
+      "comment" : "Eyebrow label above the Context Bench screen header",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Context Benchmark"
+          }
+        }
+      }
+    },
+    "bench.context.header.subtitle" : {
+      "comment" : "Context Bench screen subtitle describing what the benchmark measures",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Finds the largest context window this machine can actually prefill for a model, then applies it to the model's Context Window setting."
+          }
+        }
+      }
+    },
+    "bench.context.header.title" : {
+      "comment" : "Context Bench screen primary header",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Measure usable context"
+          }
+        }
+      }
+    },
+    "bench.context.model.loaded_badge" : {
+      "comment" : "Model picker entry for a loaded model; placeholder is the model id",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%@ • loaded"
+          }
+        }
+      }
+    },
+    "bench.context.model.placeholder" : {
+      "comment" : "Placeholder option in the Context Bench model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select a model…"
+          }
+        }
+      }
+    },
+    "bench.context.progress.starting" : {
+      "comment" : "Context Bench progress label before the first server update arrives",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Starting…"
+          }
+        }
+      }
+    },
+    "bench.context.result.applied_note" : {
+      "comment" : "Hint under the Context Bench result confirming the setting was written",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The value has been applied to this model's Context Window setting."
+          }
+        }
+      }
+    },
+    "bench.context.result.capped_by" : {
+      "comment" : "Result row label for what bounded the measurement",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limited by"
+          }
+        }
+      }
+    },
+    "bench.context.result.duration" : {
+      "comment" : "Result row label for how long the benchmark took",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Duration"
+          }
+        }
+      }
+    },
+    "bench.context.result.measured" : {
+      "comment" : "Result row label for the raw measured admission boundary",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Admission boundary"
+          }
+        }
+      }
+    },
+    "bench.context.result.prefill_tps" : {
+      "comment" : "Result row label for the verify prefill's tokens per second",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill speed"
+          }
+        }
+      }
+    },
+    "bench.context.result.snapshot_note" : {
+      "comment" : "Hint under the Context Bench result explaining the measurement is a snapshot",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The result reflects free memory and the Memory Guard tier at benchmark time; rerun after major changes to either."
+          }
+        }
+      }
+    },
+    "bench.context.result.tokens_label" : {
+      "comment" : "Unit caption next to the applied context window headline number",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tokens applied to Context Window"
+          }
+        }
+      }
+    },
+    "bench.context.result.verified" : {
+      "comment" : "Result row label for the prompt size the verification prefill completed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verified prefill"
+          }
+        }
+      }
+    },
+    "bench.context.row.model.label" : {
+      "comment" : "Row label for the Context Bench model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model"
+          }
+        }
+      }
+    },
+    "bench.context.row.model.sub" : {
+      "comment" : "Sublabel under the Context Bench model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loaded or unloaded — server will load on demand"
+          }
+        }
+      }
+    },
+    "bench.context.row.priority.label" : {
+      "comment" : "Row label for the prefill priority segmented control on the Context Bench screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill Priority"
+          }
+        }
+      }
+    },
+    "bench.context.row.priority.sub" : {
+      "comment" : "Sublabel explaining the Context Bench prefill priority control mirrors the global setting",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mirrors the global setting and saves immediately — serving uses the same mode, so the measured value stays valid"
+          }
+        }
+      }
+    },
+    "bench.context.row.target.label" : {
+      "comment" : "Row label for the Context Bench target selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum context to test"
+          }
+        }
+      }
+    },
+    "bench.context.row.target.sub" : {
+      "comment" : "Sublabel under the Context Bench target selector",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The search stops at this size; larger targets take longer to verify"
+          }
+        }
+      }
+    },
+    "bench.context.section.configuration" : {
+      "comment" : "Section header for the Context Bench configuration block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Configuration"
+          }
+        }
+      }
+    },
+    "bench.context.section.result" : {
+      "comment" : "Section header for the Context Bench result block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Result"
+          }
+        }
+      }
+    },
+    "bench.context.subtitle.loading_models" : {
+      "comment" : "Context Bench section subtitle while models are loading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading models…"
+          }
+        }
+      }
+    },
+    "bench.context.subtitle.model_count" : {
+      "comment" : "Context Bench section subtitle showing how many models are available; placeholder is the count",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Models available: %lld"
+          }
+        }
+      }
+    },
+    "bench.context.warning.body" : {
+      "comment" : "Body of the warning callout above the Context Bench start button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This benchmark can take a long time — verification prefills a real prompt at the measured size, which may take many minutes for large models. All loaded models are unloaded when it starts, interrupting active requests. When it finishes, the result is automatically applied to the model's Context Window setting."
+          }
+        }
+      }
+    },
+    "bench.context.warning.title" : {
+      "comment" : "Heading of the warning callout above the Context Bench start button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Before you start"
           }
         }
       }
@@ -5089,7 +5503,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "server.log (current)"
+            "value" : "server.log (текущий)"
           }
         }
       }
@@ -6457,7 +6871,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CA bundle"
+            "value" : "Набор CA-сертификатов"
           }
         }
       }
@@ -6475,7 +6889,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Абсолютный путь к PEM-encoded CA bundle. Пусто = системное хранилище доверия."
+            "value" : "Абсолютный путь к набору CA-сертификатов в формате PEM. Пусто = системное хранилище доверия."
           }
         }
       }
@@ -7169,7 +7583,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Самый консервативный. Оставляет больше запаса перед планированием memory-heavy prefill."
+            "value" : "Самый консервативный. Оставляет больше запаса перед планированием ресурсоёмкого префилла."
           }
         }
       }
@@ -7367,7 +7781,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Защита памяти prefill"
+            "value" : "Защита памяти префилла"
           }
         }
       }
@@ -7385,7 +7799,55 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Проверять память для prefill перед запуском движка. Отбрасывает запросы, которые привели бы к OOM."
+            "value" : "Проверять память для префилла перед запуском движка. Отбрасывает запросы, которые привели бы к OOM."
+          }
+        }
+      }
+    },
+    "performance.scheduler.prefill_priority" : {
+      "comment" : "Row label for the prefill priority segmented control",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill Priority"
+          }
+        }
+      }
+    },
+    "performance.scheduler.prefill_priority.sub" : {
+      "comment" : "Sublabel for the prefill priority segmented control",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit."
+          }
+        }
+      }
+    },
+    "prefill_priority.option.max_context" : {
+      "comment" : "Prefill priority option that favors the largest context",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max Context"
+          }
+        }
+      }
+    },
+    "prefill_priority.option.speed" : {
+      "comment" : "Prefill priority option that favors prefill speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speed"
           }
         }
       }
@@ -7403,7 +7865,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chunked prefill"
+            "value" : "Порционный префилл"
           }
         }
       }
@@ -7421,7 +7883,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Разбивать длинные промпты по тикам scheduler, чтобы другие запросы могли чередоваться."
+            "value" : "Разбивать длинные промпты по тикам планировщика, чтобы другие запросы могли чередоваться."
           }
         }
       }
@@ -12069,7 +12531,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chunk"
+            "value" : "Фрагмент"
           }
         }
       }
@@ -12087,7 +12549,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Comment"
+            "value" : "Комментарий"
           }
         }
       }
@@ -12123,7 +12585,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Как сервер удерживает долгоживущие SSE-потоки открытыми. \"chunk\" отправляет пустую data-строку, \"comment\" отправляет `: ping`, \"off\" отключает."
+            "value" : "Как сервер удерживает открытыми долгоживущие SSE-потоки. \"chunk\" отправляет пустую data-строку, \"comment\" отправляет `: ping`, \"off\" отключает режим."
           }
         }
       }
@@ -12660,7 +13122,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Debug"
+            "value" : "Отладка"
           }
         }
       }
@@ -12678,7 +13140,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Error"
+            "value" : "Ошибка"
           }
         }
       }
@@ -12696,7 +13158,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Info"
+            "value" : "Информация"
           }
         }
       }
@@ -12714,7 +13176,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Trace"
+            "value" : "Трассировка"
           }
         }
       }
@@ -12732,7 +13194,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Warning"
+            "value" : "Предупреждение"
           }
         }
       }
@@ -14292,7 +14754,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Reasoning parser"
+            "value" : "Парсер рассуждений"
           }
         }
       }
@@ -14310,7 +14772,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Переопределить parser chain-of-thought. Оставьте пустым, чтобы использовать значение модели по умолчанию."
+            "value" : "Переопределяет парсер chain-of-thought. Оставьте пустым, чтобы использовать значение модели по умолчанию."
           }
         }
       }
@@ -14562,7 +15024,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Лимит сгенерированных токенов (пусто = default)"
+            "value" : "Лимит сгенерированных токенов (пусто = значение по умолчанию)"
           }
         }
       }
@@ -15372,7 +15834,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Максимум prefix snapshots в RAM. Каждая запись хранит KV + состояние draft GDN."
+            "value" : "Максимум префиксных снимков в оперативной памяти. Каждая запись хранит KV и состояние draft GDN."
           }
         }
       }
@@ -15408,7 +15870,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "L1 prefix snapshot cache DFlash в RAM."
+            "value" : "L1-кэш префиксных снимков DFlash в оперативной памяти."
           }
         }
       }
@@ -15426,7 +15888,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Draft sink size"
+            "value" : "Размер attention sink"
           }
         }
       }
@@ -15444,7 +15906,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-sink токены, всегда сохраняемые в окне. Пусто = default DFlash (64)."
+            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение DFlash по умолчанию (64)."
           }
         }
       }
@@ -15516,7 +15978,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "L2 spill вытесненных L1-записей на диск."
+            "value" : "L2-хранилище для вытесненных L1-записей на диске."
           }
         }
       }
@@ -15588,7 +16050,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Режим verifier"
+            "value" : "Режим верификатора"
           }
         }
       }
@@ -15606,7 +16068,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Алгоритм verifier. \"adaptive\" уменьшает размер блока при падении acceptance; \"off\" отключает speculative verify."
+            "value" : "Алгоритм верификатора. \"adaptive\" уменьшает размер блока при снижении доли принятых токенов; \"off\" отключает спекулятивную проверку."
           }
         }
       }
@@ -15642,7 +16104,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sliding-attention окно draft-модели. Пусто = default DFlash (1024)."
+            "value" : "Sliding-attention-окно draft-модели. Пусто = значение DFlash по умолчанию (1024)."
           }
         }
       }
@@ -15732,7 +16194,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Keep rate"
+            "value" : "Доля сохранения"
           }
         }
       }
@@ -15768,7 +16230,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-based sparse prefill для MoE/hybrid моделей."
+            "value" : "Разреженный префилл на основе attention для MoE- и гибридных моделей."
           }
         }
       }
@@ -15804,7 +16266,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Минимум токенов промпта для срабатывания (короткие промпты используют полный prefill)."
+            "value" : "Минимум токенов промпта для срабатывания (короткие промпты используют полный префилл)."
           }
         }
       }
@@ -15840,7 +16302,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Квантовать KV-кэш во время prefill. Экономит память с небольшой потерей качества."
+            "value" : "Квантовать KV-кэш во время префилла. Экономит память с небольшой потерей качества."
           }
         }
       }
@@ -15876,7 +16338,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Токены, draft-ируемые за раунд. Пусто использует default mlx-vlm."
+            "value" : "Количество draft-токенов за раунд. Пусто = значение mlx-vlm по умолчанию."
           }
         }
       }
@@ -17001,6 +17463,47 @@
         }
       }
     },
+    "sidebar.contextBench" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Context"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コンテキスト"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컨텍스트"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上下文"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上下文"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Контекст"
+          }
+        }
+      }
+    },
     "sidebar.downloads" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -17705,7 +18208,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Очистить все файлы SSD-кэша? Загруженные модели перестроят KV-кэш при следующем prefill."
+            "value" : "Очистить все файлы SSD-кэша? Загруженные модели перестроят KV-кэш при следующем префилле."
           }
         }
       }
@@ -18472,7 +18975,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Всего prefill-токенов"
+            "value" : "Всего токенов префилла"
           }
         }
       }
@@ -18490,7 +18993,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "prompt + completion"
+            "value" : "промпт + ответ"
           }
         }
       }
@@ -18634,7 +19137,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stable получает проверенные релизы. Beta раньше получает новые функции."
+            "value" : "Стабильный канал получает проверенные релизы. Бета-канал раньше получает новые функции."
           }
         }
       }
@@ -18937,7 +19440,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Beta"
+            "value" : "Бета"
           }
         }
       }
@@ -18973,7 +19476,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Nightly"
+            "value" : "Ночная сборка"
           }
         }
       }
@@ -18991,7 +19494,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Release Candidate"
+            "value" : "Релиз-кандидат"
           }
         }
       }
@@ -19009,7 +19512,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stable"
+            "value" : "Стабильный"
           }
         }
       }

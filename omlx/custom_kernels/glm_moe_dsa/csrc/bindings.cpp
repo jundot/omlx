@@ -47,6 +47,15 @@ NB_MODULE(_ext, m) {
       "causal_valid_prefix"_a = false,
       "stream"_a = nb::none());
   m.def(
+      "dsa_decode_scores",
+      &omlx::glm_kernels::dsa_decode_scores,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "fp32_scores"_a = false,
+      "stream"_a = nb::none());
+
+  m.def(
       "glm_dsa_sparse_mla_attention",
       &omlx::glm_kernels::glm_dsa_sparse_mla_attention,
       "q_latent"_a,

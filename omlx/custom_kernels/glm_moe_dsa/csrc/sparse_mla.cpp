@@ -165,7 +165,21 @@ class GlmDsaSparseMlaAttentionPrimitive : public Primitive {
     const array& topk_length = has_topk_length ? inputs[5] : topk;
     auto& o = outputs[0];
 
-    constexpr int bk = 256;
+    // BK sets the key-tile size AND the threadgroup-memory footprint (KV slab
+    // ~= BK*(DC+pad)*2B). At BK=256 the 32-head variant uses ~24KB -> only ONE
+    // threadgroup resident per core on Apple GPUs, so its ~500 barrier-separated
+    // staging phases serialize with nothing to hide behind. BK=128 halves the
+    // slab -> 2 resident threadgroups -> measured 100.3 -> 83.2 ms per layer-call
+    // at S=131k (real top-k index patterns, M3 Ultra), 85.4 ms at S=303k; output
+    // differs from BK=256 only in bf16 summation-order rounding (identical error
+    // vs fp32 ground-truth attention). BK=64 over-fragments (102 ms). The 64-head
+    // variant keeps BK=256, and not because its slab is smaller: at ~26KB it is
+    // in the same one-threadgroup-per-core situation. It just runs wm=8, so a
+    // single threadgroup already holds 256 threads and fills the core, and
+    // halving BK only fragments the K tile into more barrier-separated phases
+    // (measured 2-9% slower at BK=128 and 10-29% slower at BK=64, across
+    // qL=512..8192 and four top-k index layouts on an M3 Ultra).
+    const int bk = (q_latent.shape(1) == 32) ? 128 : 256;
     constexpr int dc = 32;
     constexpr int d_latent = 512;
     constexpr int d_pe = 64;

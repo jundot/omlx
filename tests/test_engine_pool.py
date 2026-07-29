@@ -365,6 +365,52 @@ class TestEnginePoolErrors:
         assert exc_info.value.model_id == "model-a"
         assert exc_info.value.ceiling == 100
 
+    def test_text_only_size_admits_force_lm(self, small_mock_model_dir):
+        """A VLM checkpoint too large by full size must admit by the
+        text-only estimate when force_lm serves it on the text engine, and
+        still refuse on the VLM engine (#2385)."""
+        pool = _make_pool(ceiling=1500)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.estimated_size = 2000
+        entry.text_only_size = 1200
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        ):
+            with pytest.raises(ModelTooLargeError):
+                asyncio.run(pool.get_engine("model-a"))
+
+            mock_engine = MagicMock()
+            mock_engine.start = AsyncMock()
+            with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+                asyncio.run(pool.get_engine("model-a", force_lm=True))
+            assert pool._entries["model-a"].engine is mock_engine
+
+    def test_text_only_size_admits_override_to_batched(self, small_mock_model_dir):
+        """model_type_override flips engine_type to batched before admission;
+        the text-only estimate must drive the memory check then too."""
+        pool = _make_pool(ceiling=1500)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "llm"
+        entry.engine_type = "batched"
+        entry.estimated_size = 2000
+        entry.text_only_size = 1200
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+        ):
+            asyncio.run(pool.get_engine("model-a"))
+        assert pool._entries["model-a"].engine is mock_engine
+
     def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
         """A deleted model directory is removed and reported as not found."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -3321,3 +3367,131 @@ class TestSchedulerConfigModelId:
 
         assert pool._scheduler_config.model_name == "model-a"
         assert pool._scheduler_config.model_path == str(small_mock_model_dir / "model-a")
+
+
+class _StubEnforcer:
+    """Minimal stand-in for the ProcessMemoryEnforcer read surface the pool uses."""
+
+    def __init__(self, *, static: int, dynamic: int, metal_cap: int, tier: str):
+        self._breakdown = {
+            "static": static,
+            "dynamic": dynamic,
+            "metal_cap": metal_cap,
+            "hard_limit": min(v for v in (static, dynamic, metal_cap) if v > 0),
+        }
+        self.memory_guard_tier = tier
+
+    def get_ceiling_breakdown(self) -> dict[str, int]:
+        return dict(self._breakdown)
+
+    def wake(self, *, active: bool = False) -> None:
+        return None
+
+
+class TestLoadRefusalNamesBindingCeiling:
+    """A refused load must name the ceiling that refused it.
+
+    Field report: a 16 GB Mac refused an 8.3 GB model at a 6.96 GB ceiling
+    while static and metal_cap both had 12 GB of room. The message said
+    "free system memory or lower memory_guard_tier", the admin banner said
+    to raise `iogpu.wired_limit_mb`, and neither touches the dynamic
+    ceiling that was actually binding. The user lowered the tier (which
+    shrinks the ceiling further), raised the sysctl, and eventually
+    deleted `~/.omlx`.
+    """
+
+    def _pool_with_enforcer(
+        self, model_dir, *, static: int, dynamic: int, metal_cap: int, tier: str
+    ) -> EnginePool:
+        ceiling = min(v for v in (static, dynamic, metal_cap) if v > 0)
+        pool = _make_pool(ceiling=ceiling)
+        pool._process_memory_enforcer = _StubEnforcer(
+            static=static, dynamic=dynamic, metal_cap=metal_cap, tier=tier
+        )
+        pool.discover_models(str(model_dir))
+        return pool
+
+    def test_dynamic_bound_refusal_points_at_apps_and_tier(self, small_mock_model_dir):
+        pool = self._pool_with_enforcer(
+            small_mock_model_dir,
+            static=12_000,
+            dynamic=700,
+            metal_cap=12_000,
+            tier="safe",
+        )
+
+        with pytest.raises(ModelTooLargeError) as exc_info:
+            asyncio.run(pool.get_engine("model-a"))
+
+        message = str(exc_info.value)
+        assert exc_info.value.binding == "dynamic"
+        assert "dynamic memory ceiling" in message
+        assert "close other apps" in message.lower()
+        assert "raise memory_guard_tier (safe → balanced → aggressive)" in message
+        assert "lower memory_guard_tier" not in message
+        # The sysctl knob cannot move a dynamic-bound ceiling; suggesting it
+        # here is what sent the reporter into a multi-hour loop.
+        assert "iogpu.wired_limit_mb" not in message
+
+    def test_metal_cap_bound_refusal_points_at_sysctl(self, small_mock_model_dir):
+        pool = self._pool_with_enforcer(
+            small_mock_model_dir,
+            static=12_000,
+            dynamic=12_000,
+            metal_cap=700,
+            tier="balanced",
+        )
+
+        with pytest.raises(ModelTooLargeError) as exc_info:
+            asyncio.run(pool.get_engine("model-a"))
+
+        message = str(exc_info.value)
+        assert exc_info.value.binding == "metal_cap"
+        assert "iogpu.wired_limit_mb" in message
+        assert "close other apps" not in message.lower()
+
+    def test_refusal_without_enforcer_still_points_up_the_ladder(
+        self, small_mock_model_dir
+    ):
+        """Standalone pools have no enforcer; the generic advice must still
+        send the user up the tier ladder, not down it."""
+        pool = _make_pool(ceiling=700)
+        pool.discover_models(str(small_mock_model_dir))
+
+        with pytest.raises(ModelTooLargeError) as exc_info:
+            asyncio.run(pool.get_engine("model-a"))
+
+        message = str(exc_info.value)
+        assert exc_info.value.binding is None
+        assert "raise memory_guard_tier (safe → balanced → aggressive)" in message
+        assert "lower memory_guard_tier" not in message
+
+    @pytest.mark.asyncio
+    async def test_insufficient_memory_refusal_names_binding_ceiling(
+        self, small_mock_model_dir
+    ):
+        """The model fits alone but current usage leaves no room: same
+        breakdown, different exception."""
+        pool = self._pool_with_enforcer(
+            small_mock_model_dir,
+            static=12_000,
+            dynamic=2_500,
+            metal_cap=12_000,
+            tier="safe",
+        )
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=2000),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            pytest.raises(InsufficientMemoryError) as exc_info,
+        ):
+            await pool.get_engine("model-a")
+
+        message = str(exc_info.value)
+        assert "dynamic memory ceiling" in message
+        assert "close other apps" in message.lower()
+        assert "lower memory_guard_tier" not in message

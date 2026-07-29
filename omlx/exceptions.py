@@ -18,7 +18,107 @@ Usage:
         logger.error(f"Scheduler error: {e}")
 """
 
-from typing import Any, Optional
+from collections.abc import Callable
+from typing import Any, Optional, Union
+
+# Direction of the memory_guard_tier knob. Spelled out everywhere a message
+# names the tier: the admin popup lists Safe first, so "lower the tier" reads
+# as "move toward Safe" — the opposite of what a user hitting a ceiling needs.
+MEMORY_GUARD_TIER_LADDER = "safe → balanced → aggressive"
+
+# Used when the component breakdown is unavailable (standalone engine pool,
+# enforcer not wired up yet) and we cannot name the binding ceiling.
+DEFAULT_CEILING_ADVICE = (
+    f"Free system memory or raise memory_guard_tier ({MEMORY_GUARD_TIER_LADDER})"
+)
+
+
+def _join_remedies(remedies: list[str]) -> str:
+    """Join remedies as "a, b, or c"."""
+    if len(remedies) == 1:
+        return remedies[0]
+    return f"{', '.join(remedies[:-1])}, or {remedies[-1]}"
+
+
+def describe_ceiling_binding(
+    *,
+    static: int,
+    dynamic: int,
+    metal_cap: int,
+    tier: str,
+    current: int,
+    fmt: Callable[[int], str],
+    tail: Optional[Union[str, list[str]]] = None,
+) -> tuple[str, str]:
+    """Name the binding component ceiling and the remedy that actually moves it.
+
+    The process ceiling is ``min(static, dynamic, metal_cap)`` and each
+    component answers to a different knob, so a message that does not say
+    which one is binding sends users to the wrong knob. The field case: a
+    16 GB Mac on the ``safe`` tier is dynamic-bound near 7 GB while static
+    and metal_cap both sit at 12 GB, so raising ``iogpu.wired_limit_mb``
+    (the only advice the admin banner gives) changes nothing.
+
+    Binding is the argmin over the components the caller passes, so it does
+    not depend on the caller's own ceiling value being sampled at the same
+    instant, nor on whether that ceiling has a hot-cache reservation
+    subtracted. Pass 0 for a component a given cap never used — the
+    prefill abort limit is min(static, metal_cap) by design, so it passes
+    ``dynamic=0``.
+
+    Returns ``(binding, advice)``, where ``binding`` is "effective" when no
+    component was supplied. ``advice`` is capitalized and carries no
+    trailing punctuation; ``tail`` appends one or more call-site remedies
+    ("reduce context length" for prefill, "use a smaller model" for a load).
+    """
+    components = {
+        name: value
+        for name, value in (
+            ("static", static),
+            ("dynamic", dynamic),
+            ("metal_cap", metal_cap),
+        )
+        if value > 0
+    }
+    effective = min(components.values()) if components else 0
+    binding = [name for name, value in components.items() if value == effective]
+    binding_str = "/".join(binding) if binding else "effective"
+
+    # Order remedies by likelihood of helping for the binding cause.
+    # Dynamic-bound on a reclaim tier (safe/balanced/aggressive) means
+    # reclaimable memory is low right now even though the static cap has
+    # room — closing apps raises ``free`` / ``inactive`` and a more
+    # aggressive ``memory_guard_tier`` raises the active-reclaim ratio.
+    # Dynamic-bound under ``custom`` means the user pinned the ceiling
+    # there; the only knob that helps is raising ``custom_ceiling_bytes``
+    # itself. Metal-cap bound means the kernel sysctl is the ceiling.
+    # Static-bound (or no breakdown available) leaves the tier as the lever.
+    remedies: list[str] = []
+    is_custom = (tier or "").strip().lower() == "custom"
+    if "dynamic" in binding and is_custom:
+        remedies.append(
+            f"raise custom_ceiling_bytes in admin Memory settings "
+            f"(currently pinned at {fmt(dynamic)})"
+        )
+    elif "dynamic" in binding and static and static > dynamic:
+        headroom = max(0, dynamic - current)
+        remedies.append(
+            f"close other apps to free RAM (static cap is {fmt(static)} but "
+            f"only {fmt(headroom)} is reclaimable right now)"
+        )
+        remedies.append(f"raise memory_guard_tier ({MEMORY_GUARD_TIER_LADDER})")
+    elif "metal_cap" in binding:
+        remedies.append(
+            f"raise kernel iogpu.wired_limit_mb in Terminal "
+            f"(currently caps Metal at {fmt(metal_cap)})"
+        )
+    else:
+        remedies.append(f"raise memory_guard_tier ({MEMORY_GUARD_TIER_LADDER})")
+    if tail:
+        remedies.extend([tail] if isinstance(tail, str) else tail)
+
+    advice = _join_remedies(remedies)
+    return binding_str, advice[:1].upper() + advice[1:]
 
 
 class OMLXError(Exception):
@@ -368,6 +468,19 @@ class PrefillMemoryExceededError(OMLXMemoryError):
         self.limit_bytes = limit_bytes
 
 
+class PrefillMemoryAbortedError(PrefillMemoryExceededError):
+    """
+    An admitted request was aborted mid-prefill by the memory enforcer.
+
+    The pre-flight guard let this request in, but process usage crossed the
+    hard watermark while it was prefilling, so the enforcer aborted it to
+    keep the server alive. Subclassing PrefillMemoryExceededError is what
+    routes this to the same HTTP 400 mapping and the JSON keepalive body;
+    the separate type only exists so the wording can say "aborted
+    mid-prefill" instead of "rejected this prompt".
+    """
+
+
 # =============================================================================
 # Engine Pool Exceptions
 # =============================================================================
@@ -395,17 +508,27 @@ class ModelNotFoundError(EnginePoolError):
 class ModelTooLargeError(EnginePoolError):
     """Raised when a model cannot fit under the current memory ceiling."""
 
-    def __init__(self, model_id: str, model_size: int, ceiling: int):
+    def __init__(
+        self,
+        model_id: str,
+        model_size: int,
+        ceiling: int,
+        *,
+        binding: Optional[str] = None,
+        advice: Optional[str] = None,
+    ):
         self.model_id = model_id
         self.model_size = model_size
         self.ceiling = ceiling
+        self.binding = binding
         # Import here to avoid circular dependency
         from .model_discovery import format_size
 
+        label = f"{binding} memory ceiling" if binding else "memory ceiling"
         message = (
             f"Model '{model_id}' ({format_size(model_size)}) "
-            f"does not fit under the memory ceiling ({format_size(ceiling)}). "
-            f"Free system memory or lower memory_guard_tier."
+            f"does not fit under the {label} ({format_size(ceiling)}). "
+            f"{advice or DEFAULT_CEILING_ADVICE}."
         )
         super().__init__(message)
 

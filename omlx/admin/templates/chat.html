@@ -994,7 +994,8 @@
         document.documentElement.setAttribute('data-theme', theme);
     })();
 </script>
-<div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()">
+<div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()"
+    @keydown.window="handleGlobalKeydown($event)">
     <!-- API Key Modal -->
     <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
         :class="{ 'hidden': apiKeySet }" x-cloak>
@@ -1048,32 +1049,50 @@
                 </div>
                 <button @click="sidebarOpen = false"
                     class="p-1 hover:bg-surface-alt rounded-lg transition-colors"
-                    :title="window.t('chat.close_sidebar') || 'Close sidebar'">
+                    :title="window.t('chat.close_sidebar')">
                     <i data-lucide="panel-left-close" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                 </button>
             </div>
         </div>
 
         <!-- New Chat Button -->
-        <div class="p-3 flex-shrink-0">
+        <div class="p-3 flex-shrink-0 space-y-2">
             <button @click="startNewChat()"
                 class="w-full flex items-center gap-2 px-3 py-2 bg-surface-muted hover:bg-surface-alt rounded-lg text-sm font-medium transition-colors"
                 style="color: var(--text-primary);">
                 <i data-lucide="plus" class="w-4 h-4"></i>
                 {{ t('chat.new_chat') }}
             </button>
+            <!-- Search chats -->
+            <div x-show="chatHistory.length > 0" class="relative">
+                <i data-lucide="search" class="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style="color: var(--text-tertiary);"></i>
+                <input type="text" x-model="chatSearchQuery" :placeholder="window.t('chat.search_chats_placeholder')"
+                    x-ref="chatSearchInput"
+                    class="w-full pl-9 pr-9 py-1.5 text-xs border border-line rounded-lg bg-surface-muted focus:outline-none focus:border-line-strong"
+                    style="color: var(--text-primary);">
+                <button x-show="chatSearchQuery" @click="chatSearchQuery = ''"
+                    class="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-surface-alt"
+                    :title="window.t('chat.clear_search')">
+                    <i data-lucide="x" class="w-3 h-3" style="color: var(--text-tertiary);"></i>
+                </button>
+            </div>
         </div>
 
         <!-- Chat History -->
         <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-3">
-            <template x-for="chat in chatHistory" :key="chat.id">
+            <div x-show="chatSearchQuery && filteredChatHistory().length === 0"
+                class="px-3 py-4 text-center text-xs" style="color: var(--text-tertiary);">
+                <span x-text="window.t('chat.no_chats_match')"></span>
+                "<span x-text="chatSearchQuery"></span>"
+            </div>
+            <template x-for="chat in filteredChatHistory()" :key="chat.id">
                 <div @click="if (renamingChatId !== chat.id) loadChat(chat.id)"
                     class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-surface-muted mb-1"
                     :class="{ 'bg-surface-muted': currentChatId === chat.id }">
                     <i data-lucide="message-square" class="w-4 h-4 flex-shrink-0" style="color: var(--text-muted);"></i>
                     <button type="button" x-show="isChatStreaming(chat.id)" @click.stop="stopChatStreaming(chat.id)"
                         class="w-2 h-2 rounded-full flex-shrink-0 animate-pulse p-0 border-0 cursor-pointer"
-                        style="background: var(--timeline-accent);" title="Stop generating"></button>
+                        style="background: var(--timeline-accent);" title="{{ t('chat.stop_generating_tooltip') }}"></button>
                     <template x-if="renamingChatId === chat.id">
                         <div class="flex items-center gap-1 flex-1 min-w-0">
                             <input x-model="renameDraft" x-ref="renameInput" @click.stop
@@ -1096,9 +1115,18 @@
                     </template>
                     <template x-if="renamingChatId !== chat.id">
                         <div class="flex items-center gap-0 flex-1 min-w-0">
+                            <i x-show="chat.pinned" data-lucide="pin" class="w-3 h-3 flex-shrink-0 mr-1"
+                                style="color: var(--timeline-accent);"></i>
                             <span class="text-sm truncate flex-1" style="color: var(--text-primary);"
                                 :title="displayChatTitle(chat)"
                                 x-text="displayChatTitle(chat)"></span>
+                            <button @click.stop="togglePinChat(chat.id)"
+                                class="p-1 hover:bg-surface-alt rounded transition-opacity"
+                                :class="chat.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'"
+                                :title="chat.pinned ? window.t('chat.unpin_chat') : window.t('chat.pin_chat')">
+                                <i x-show="!chat.pinned" data-lucide="pin" class="w-3 h-3" style="color: var(--text-muted);"></i>
+                                <i x-show="chat.pinned" data-lucide="pin-off" class="w-3 h-3" style="color: var(--text-muted);"></i>
+                            </button>
                             <button @click.stop="startRenamingChat(chat)"
                                 class="opacity-0 group-hover:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
                                 title="{{ t('chat.rename_tooltip') }}">
@@ -1137,13 +1165,47 @@
 
         <button @click="rightSidebarOpen = true" class="absolute p-1.5 bg-surface hover:bg-surface-muted rounded-lg border border-line z-[100] shadow-sm"
             style="top: 1rem; right: 1rem; color: var(--text-primary);"
-            :title="'Show settings'"
+            :title="window.t('chat.show_settings_tooltip')"
             x-show="showRightToggle">
             <i data-lucide="settings" class="w-5 h-5"></i>
         </button>
 
         <!-- Messages area with rail -->
         <div class="flex-1 min-h-0 relative">
+            <!-- Floating model selector capsule (top-center; mirrors the sidebar model picker) -->
+            <div x-show="currentModel && availableModels.length > 0" x-cloak
+                class="absolute top-3 left-1/2 -translate-x-1/2 z-20"
+                x-data="{ modelMenuOpen: false }" @click.outside="modelMenuOpen = false"
+                @keydown.escape="modelMenuOpen = false">
+                <button @click="modelMenuOpen = !modelMenuOpen" :title="window.t('chat.switch_model')"
+                    class="flex items-center gap-2 px-3 py-1.5 rounded-full border border-line bg-surface shadow-md text-xs font-medium hover:bg-surface-muted transition-colors"
+                    style="color: var(--text-primary); max-width: 18rem;">
+                    <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                    <span class="truncate min-w-0" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
+                    <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0 transition-transform"
+                        :style="modelMenuOpen ? 'color: var(--text-tertiary);' : 'color: var(--text-tertiary); transform: rotate(180deg);'"></i>
+                </button>
+                <!-- Static centered anchor: transform lives here (never animated), so the
+                     dropdown's own x-transition can't fight the -translate-x-1/2 centering. -->
+                <div class="absolute top-full left-1/2 mt-1.5" style="transform: translateX(-50%); z-index: 30;">
+                <div x-show="modelMenuOpen" x-transition.opacity x-cloak
+                    class="overflow-y-auto rounded-xl border border-line bg-surface shadow-lg py-1"
+                    style="min-width: 15rem; max-height: 18rem;">
+                    <template x-for="model in availableModels" :key="model.id">
+                        <button @click="selectModel(model.id); modelMenuOpen = false"
+                            class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted transition-colors"
+                            :class="model.id === currentModel ? 'font-semibold' : ''"
+                            style="color: var(--text-primary);">
+                            <i data-lucide="check" class="w-3 h-3 flex-shrink-0"
+                                :style="'color: var(--timeline-accent); visibility:' + (model.id === currentModel ? 'visible' : 'hidden')"></i>
+                            <span class="flex-1 min-w-0 truncate" x-text="model.name"></span>
+                            <i data-lucide="star" class="w-3 h-3 flex-shrink-0" x-show="model.is_favorite"
+                                style="color: var(--timeline-accent);"></i>
+                        </button>
+                    </template>
+                </div>
+                </div>
+            </div>
             <!-- Messages Container -->
             <div class="absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
             <!-- Welcome Screen -->
@@ -1183,7 +1245,7 @@
                                     </button>
                                     <div class="relative">
                                         <button @click="contextOpen = !contextOpen" @click.outside="contextOpen = false"
-                                            class="user-message-action-btn" title="More actions">
+                                            class="user-message-action-btn" title="{{ t('chat.more_actions_tooltip') }}">
                                             <i data-lucide="more-vertical" class="w-4 h-4"></i>
                                         </button>
                                         <div x-show="contextOpen" x-transition
@@ -1193,18 +1255,18 @@
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="git-branch" class="w-3.5 h-3.5"></i>
-                                                Branch Here
+                                                {{ t('chat.branch_here') }}
                                             </button>
                                             <button @click="deleteMessage(index); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-danger hover:bg-danger-bg">
                                                 <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
-                                                Delete
+                                                {{ t('chat.delete_message') }}
                                             </button>
                                             <button @click="copyMarkdown(msg); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
-                                                Copy Markdown
+                                                {{ t('chat.copy_markdown') }}
                                             </button>
                                         </div>
                                     </div>
@@ -1229,7 +1291,7 @@
                                                         class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-[10px] gap-0.5">
                                                         <i data-lucide="image" class="w-5 h-5"></i>
                                                         <span
-                                                            x-text="window.t('chat.image_not_available') || 'Image'"></span>
+                                                            x-text="window.t('chat.image_not_available')"></span>
                                                     </div>
                                                 </template>
                                             </div>
@@ -1257,7 +1319,7 @@
                                         <div x-show="editImages.length > 0" class="edit-images-preview">
                                             <template x-for="(img, idx) in editImages" :key="img.substring(0, 50)">
                                                 <div class="edit-image-item">
-                                                    <img :src="img" :alt="window.t('chat.image_preview') || 'Image'">
+                                                    <img :src="img" :alt="window.t('chat.image_preview')">
                                                 </div>
                                             </template>
                                         </div>
@@ -1288,13 +1350,13 @@
                                                 }">
                                                 <span x-show="isVariantTabStreaming(index, variant.id)"
                                                     class="response-tab-streaming-dot ml-1"
-                                                    title="Generating"></span>
+                                                    title="{{ t('chat.generating_tooltip') }}"></span>
                                                 <button type="button" class="response-tab text-xs"
                                                     :class="{ 'response-tab--active': isActiveVariantForUser(index, variant.id) }"
                                                     @click="selectVariant(index, variant.id)"
                                                     x-text="variantTabLabel(variant, vi)"></button>
                                                 <button type="button" class="response-tab-delete"
-                                                    title="Delete this response"
+                                                    title="{{ t('chat.delete_response_tooltip') }}"
                                                     @click="deleteVariant(index, variant.id, $event)">
                                                     <i data-lucide="trash-2" class="w-3 h-3"></i>
                                                 </button>
@@ -1323,7 +1385,9 @@
                                         @click="msg._perfVisible = !msg._perfVisible"
                                         class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                         :style="msg._perfVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                        :title="msg._perfVisible ? 'Hide info' : 'Show info (' + msg._perfTotal + ')'">
+                                        :title="msg._perfVisible
+                                            ? window.t('chat.hide_info_tooltip')
+                                            : window.t('chat.show_info_tooltip').replace('{count}', msg._perfTotal)">
                                         <i data-lucide="activity" class="w-4 h-4"></i>
                                     </button>
                                     <button @click="copyMarkdown(msg)"
@@ -1338,7 +1402,8 @@
                                     </button>
                                     <div class="relative flex-shrink-0">
                                         <button @click="contextOpen = !contextOpen" @click.outside="contextOpen = false"
-                                            class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary">
+                                            class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
+                                            title="{{ t('chat.more_actions_tooltip') }}">
                                             <i data-lucide="more-vertical" class="w-4 h-4"></i>
                                         </button>
                                         <div x-show="contextOpen" x-transition
@@ -1348,19 +1413,42 @@
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="git-branch" class="w-3.5 h-3.5"></i>
-                                                Branch here
+                                                {{ t('chat.branch_here') }}
                                             </button>
                                             <button @click="deleteMessage(index); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-danger hover:bg-danger-bg">
                                                 <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
-                                                Delete
+                                                {{ t('chat.delete_message') }}
                                             </button>
                                             <button @click="copyMarkdown(msg); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
-                                                Copy markdown
+                                                {{ t('chat.copy_markdown') }}
                                             </button>
+                                            <div class="my-1 border-t" style="border-color: var(--border-normal);"></div>
+                                            <button @click="regenerateMessage(index, { creative: true }); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                                <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                                                <span x-text="window.t('chat.regenerate_creative')"></span>
+                                            </button>
+                                            <template x-if="availableModels.length > 1">
+                                                <div class="max-h-40 overflow-y-auto custom-scrollbar">
+                                                    <div class="px-3 pt-1 pb-0.5 text-[10px] font-bold uppercase tracking-wider"
+                                                        style="color: var(--text-tertiary);"
+                                                        x-text="window.t('chat.regenerate_with')"></div>
+                                                    <template x-for="m in availableModels" :key="m.id">
+                                                        <button x-show="m.id !== currentModel"
+                                                            @click="regenerateMessage(index, { model: m.id }); contextOpen = false"
+                                                            class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                            style="color: var(--text-primary);">
+                                                            <i data-lucide="refresh-cw" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                                            <span class="truncate" x-text="m.name"></span>
+                                                        </button>
+                                                    </template>
+                                                </div>
+                                            </template>
                                         </div>
                </div>
             </div>
@@ -1387,7 +1475,7 @@
                                     x-text="msg._perfTotal"></p>
                             </div>
                             <!-- Thinking bubble (collapsed by default) -->
-                            <template x-if="msg._thinking">
+                            <template x-if="hasVisibleThinking(msg._thinking)">
                                 <div class="thinking-container mt-2">
                                     <div class="thinking-header" @click="msg._thinkingOpen = !msg._thinkingOpen">
                                         <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1395,7 +1483,7 @@
                                             <circle cx="12" cy="12" r="10" />
                                             <path d="M12 8v4M12 16h.01" />
                                         </svg>
-                                        <span class="thinking-text">Thinking</span>
+                                        <span class="thinking-text">{{ t('chat.thinking_label') }}</span>
                                         <svg class="thinking-toggle" :class="{ collapsed: !msg._thinkingOpen }"
                                             viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                             <polyline points="18 15 12 9 6 15" />
@@ -1431,7 +1519,7 @@
                             <button @click="toggleCurrentStreamTimeline()"
                                 class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                 :style="currentStream()?.statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                title="Toggle info">
+                                title="{{ t('chat.toggle_info_tooltip') }}">
                                 <i data-lucide="activity" class="w-4 h-4"></i>
                             </button>
                             <button @click="stopStreaming()"
@@ -1488,7 +1576,7 @@
                                         d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
                                 </svg>
                             </span>
-                            <span x-text="currentStream()?.engineStatus?.text || 'Starting'"></span>
+                            <span x-text="currentStream()?.engineStatus?.text || window.t('chat.status.starting')"></span>
                             <span class="loading-dots" style="display:inline-flex;gap:2px;margin:0;">
                                 <span class="loading-dot" style="width:4px;height:4px;"></span>
                                 <span class="loading-dot" style="width:4px;height:4px;"></span>
@@ -1497,7 +1585,8 @@
                         </div>
                         <!-- Streaming content (thinking block + final answer) -->
                         <!-- Live thinking bubble — shown while reasoning_content is arriving -->
-                        <div x-show="currentStream()?.streamingThinking" class="thinking-container mb-2">
+                        <div x-show="hasVisibleThinking(currentStream()?.streamingThinking)"
+                            class="thinking-container mb-2">
                             <div class="thinking-header" @click="toggleCurrentStreamThinking()">
                                 <svg class="thinking-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                     stroke-width="2">
@@ -1505,7 +1594,7 @@
                                     <path d="M12 8v4M12 16h.01" />
                                 </svg>
                                 <span class="thinking-text"
-                                    x-text="currentStream()?.finalContent ? 'Thinking' : 'Thinking...' "></span>
+                                    x-text="currentStream()?.finalContent ? window.t('chat.thinking_label') : window.t('chat.thinking_progress')"></span>
                                 <svg class="thinking-toggle"
                                     :class="{ collapsed: !currentStream()?.streamingThinkingOpen }" viewBox="0 0 24 24"
                                     fill="none" stroke="currentColor" stroke-width="2">
@@ -1550,7 +1639,19 @@
         </div>
 
         <!-- Input Area -->
-        <div class="p-4 bg-surface flex-shrink-0">
+        <div class="p-4 bg-surface flex-shrink-0 relative">
+            <!-- Jump to latest (shows when auto-scroll paused mid-stream) -->
+            <!-- Wrapper handles centering (flex) so the button's own transform is free for x-transition -->
+            <div class="absolute left-0 right-0 z-20 flex justify-center pointer-events-none" style="top: -2.75rem;">
+                <button x-show="chatSettings.showScrollButton && !autoScrollEnabled && isCurrentChatStreaming()"
+                    x-transition.opacity @click="forceScrollToBottom()" x-cloak
+                    class="pointer-events-auto flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-line bg-surface shadow-md text-xs font-medium hover:bg-surface-muted transition-colors"
+                    style="color: var(--text-primary);"
+                    :title="window.t('chat.jump_to_latest')">
+                    <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>
+                    <span x-text="window.t('chat.jump_to_latest')"></span>
+                </button>
+            </div>
             <div class="max-w-4xl mx-auto">
                 <div class="input-container" :class="{ 'drag-over': isDragOver }" @dragover.prevent="isDragOver = true"
                     @dragleave.prevent="isDragOver = false" @drop.prevent="isDragOver = false; handleDrop($event)">
@@ -1559,6 +1660,14 @@
                         @change="handleImageSelect($event)" class="hidden">
                     <input type="file" id="documentInput" accept=".pdf,.docx,.pptx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/markdown,text/x-markdown" multiple x-ref="documentInput"
                         @change="handleDocumentSelect($event)" class="hidden">
+
+                    <!-- Many-images context warning (non-blocking) -->
+                    <div x-show="uploadImages.length >= 12" x-cloak
+                        class="mx-2 mt-2 px-2.5 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 border"
+                        style="color: var(--text-secondary); background-color: var(--bg-tertiary); border-color: var(--border-faint);">
+                        <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                        <span><span x-text="uploadImages.length"></span> <span x-text="window.t('chat.many_images_warning')"></span></span>
+                    </div>
 
                     <!-- Image preview area (multi-image) -->
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
@@ -1594,7 +1703,7 @@
                     <div class="flex items-end">
                         <!-- Image upload button (only for VLM models) -->
                         <button x-show="hasVisionSupport()" @click="$refs.imageInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadImages.length >= 10"
+                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || imageLimitReached()"
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
@@ -1607,7 +1716,8 @@
                         </button>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
-                            @keydown.enter="if (!isMobile && !$event.shiftKey && !$event.isComposing && $event.keyCode !== 229) { $event.preventDefault(); sendMessage(); }"
+                            autocomplete="off" autocorrect="off"
+                            @keydown.enter="onComposerEnter($event)"
                             @input="autoResize($event.target)" @paste="handlePaste($event)"
                             :placeholder="isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder')"
                             :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming()" rows="1"
@@ -1633,6 +1743,48 @@
                         </div>
                     </div>
                 </div>
+                <!-- Context usage: status line — active model on the left, a capsule holding
+                     tokens · % + a ring on the right. Hover the capsule for the exact count. -->
+                <div x-show="currentModel && contextTokensUsed() > 0" x-cloak
+                    class="flex items-center justify-between gap-3 mt-1.5 px-1">
+                    <!-- Active model -->
+                    <span class="flex items-center gap-1.5 min-w-0" style="font-size: 11px; color: var(--text-secondary);">
+                        <span class="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                            style="background-color: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,0.22);"></span>
+                        <span class="truncate" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
+                    </span>
+                    <!-- Context capsule -->
+                    <div class="relative flex-shrink-0" x-data="{ ctxHover: false }"
+                        @mouseenter="ctxHover = true" @mouseleave="ctxHover = false">
+                        <span class="flex items-center gap-2 rounded-full border border-line bg-surface-muted"
+                            style="padding: 4px 6px 4px 11px;">
+                            <span class="tabular-nums" style="font-size: 11px; color: var(--text-secondary);"
+                                x-text="contextTokensUsed().toLocaleString() + ' ' + window.t('chat.tokens_unit')"></span>
+                            <span style="font-size: 11px; color: var(--text-tertiary);">·</span>
+                            <span class="tabular-nums" style="font-size: 11px; color: var(--text-secondary);"
+                                x-text="contextUsagePercent() + '%'"></span>
+                            <svg width="15" height="15" viewBox="0 0 36 36" style="transform: rotate(-90deg); display: block;">
+                                <!-- track -->
+                                <circle cx="18" cy="18" r="15.5" fill="none" stroke="var(--border-normal)" stroke-width="5"></circle>
+                                <!-- progress arc -->
+                                <circle cx="18" cy="18" r="15.5" fill="none" stroke-width="5" stroke-linecap="round"
+                                    :stroke="contextUsagePercent() >= 85 ? 'var(--text-danger)' : 'var(--timeline-accent)'"
+                                    stroke-dasharray="97.39"
+                                    :stroke-dashoffset="(97.39 * (1 - Math.min(100, contextUsagePercent()) / 100)).toFixed(2)"
+                                    style="transition: stroke-dashoffset 0.3s ease;"></circle>
+                            </svg>
+                        </span>
+                        <!-- Hover tooltip with exact usage -->
+                        <div x-show="ctxHover" x-transition.opacity x-cloak
+                            class="absolute right-0 mb-1.5 whitespace-nowrap px-2 py-1 rounded-lg text-[10px] tabular-nums shadow-lg border border-line bg-surface pointer-events-none"
+                            style="bottom: 100%; z-index: 40; color: var(--text-primary);"
+                            x-text="contextTokensUsed().toLocaleString() + ' / ' + contextWindowForCurrentModel().toLocaleString() + ' ' + window.t('chat.context_abbr') + ' (' + contextUsagePercent() + '%)'"></div>
+                    </div>
+                </div>
+                <!-- Placeholder when no token count exists yet (new chat, or cut off mid-prefill) -->
+                <div x-show="currentModel && contextTokensUsed() === 0 && !isCurrentChatStreaming()" x-cloak
+                    class="mt-1.5 px-1 text-[10px]" style="color: var(--text-tertiary);"
+                    x-text="window.t('chat.context_pending')"></div>
             </div>
         </div>
     </div>
@@ -1655,7 +1807,7 @@
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
                             : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
                         <i data-lucide="settings" class="w-3 h-3"></i>
-                        <span>MODEL</span>
+                        <span>{{ t('chat.model_tab') }}</span>
                     </button>
                     <button @click="rightSidebarTab = 'profile'"
                         class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
@@ -1663,12 +1815,20 @@
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
                             : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
                         <i data-lucide="user" class="w-3 h-3"></i>
-                        <span>PROFILE</span>
+                        <span>{{ t('chat.profile_tab') }}</span>
+                    </button>
+                    <button @click="rightSidebarTab = 'chat'"
+                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+                        :class="rightSidebarTab === 'chat'
+                            ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
+                            : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
+                        <i data-lucide="sliders" class="w-3 h-3"></i>
+                        <span>{{ t('chat.chat_tab') }}</span>
                     </button>
                 </div>
                 <button @click="rightSidebarOpen = false"
                     class="p-1 hover:bg-surface-alt rounded-lg transition-colors"
-                    title="Close settings">
+                    title="{{ t('chat.close_settings_tooltip') }}">
                     <i data-lucide="panel-right-close" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                 </button>
             </div>
@@ -1696,12 +1856,12 @@
                                     <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                                         :class="{'!opacity-100': activePromptProfile === p.name}">
                                         <button x-show="p.name !== 'System Default'" @click.stop="startRenamingPromptProfile()"
-                                            class="p-1 rounded hover:bg-surface-alt transition-colors" title="Rename">
+                                            class="p-1 rounded hover:bg-surface-alt transition-colors" title="{{ t('chat.profile_rename_tooltip') }}">
                                             <i data-lucide="pencil" class="w-3 h-3" style="color: var(--text-tertiary);"></i>
                                         </button>
                                         <template x-if="profileDeleteConfirm !== p.name && p.name !== 'System Default'">
                                             <button @click.stop="profileDeleteConfirm = p.name"
-                                                class="p-1 rounded hover:bg-red-50 transition-colors" title="Delete">
+                                                class="p-1 rounded hover:bg-red-50 transition-colors" title="{{ t('chat.profile_delete_tooltip') }}">
                                                 <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
                                             </button>
                                         </template>
@@ -1729,7 +1889,7 @@
                                         @click.stop
                                         class="flex-1 px-2 py-1 text-xs border border-line rounded-md bg-surface-muted"
                                         style="color: var(--text-primary);"
-                                        placeholder="Profile name..."
+                                        placeholder="{{ t('chat.profile_name_placeholder') }}"
                                         autofocus>
                                     <button @click.stop="commitRenamingPromptProfile()"
                                         class="p-1 text-green-600 hover:bg-surface-muted rounded">
@@ -1749,16 +1909,16 @@
                     class="w-full flex items-center gap-2 px-3 py-2 mt-2 rounded-lg text-xs transition-colors hover:bg-surface-muted"
                     style="color: var(--text-tertiary);">
                     <i data-lucide="plus" class="w-3.5 h-3.5"></i>
-                    <span>Add Profile</span>
+                    <span>{{ t('chat.add_profile') }}</span>
                 </button>
 
                 <!-- Prompt textarea -->
                 <div class="space-y-1">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
-                        style="color: var(--text-secondary);">Prompt Content</label>
+                        style="color: var(--text-secondary);">{{ t('chat.prompt_content_label') }}</label>
                     <textarea x-model="systemPrompt" rows="5"
                         @input="promptDirty = (activePromptProfile && systemPrompt !== promptProfiles.find(p => p.name === activePromptProfile)?.content); const s = getChatSession(currentChatId, true); if (s) s.systemPrompt = systemPrompt;"
-                        placeholder="Enter instructions for this session..."
+                        placeholder="{{ t('chat.prompt_content_placeholder') }}"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong transition-all resize-y bg-surface-muted"
                         style="color: var(--text-primary);"></textarea>
                 </div>
@@ -1772,7 +1932,7 @@
                             ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
                             : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'">
                         <i data-lucide="save" class="w-3 h-3"></i>
-                        <span>Save Setting</span>
+                        <span>{{ t('chat.save_settings') }}</span>
                     </button>
                 </div>
             </div>
@@ -1785,7 +1945,7 @@
                     <div class="flex items-center gap-1.5 mb-1">
                         <i data-lucide="user" class="w-3 h-3" style="color: var(--text-secondary);"></i>
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Active Profile</label>
+                            style="color: var(--text-secondary);">{{ t('chat.active_profile') }}</label>
                     </div>
                     <div class="relative">
                         <select
@@ -1806,7 +1966,7 @@
                 <!-- Active Model Selector -->
                 <div class="space-y-1">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
-                        style="color: var(--text-secondary);">Active Model</label>
+                        style="color: var(--text-secondary);">{{ t('chat.active_model') }}</label>
                     <div class="relative">
                         <select x-model="currentModel"
                             @change="selectModel($event.target.value)"
@@ -1829,17 +1989,17 @@
                 <div class="grid grid-cols-2 gap-3">
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Temperature</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.temperature') }}</label>
                         <input type="number" x-model.number="modelSettings.temperature" @input="onModelSettingsChange()"
-                            step="0.1" min="0" max="2" placeholder="Default"
+                            step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Max Tokens</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.max_tokens') }}</label>
                         <input type="number" x-model.number="modelSettings.max_tokens" @input="onModelSettingsChange()"
-                            min="1" placeholder="Default"
+                            min="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
@@ -1849,7 +2009,7 @@
                 <div class="grid grid-cols-3 gap-2">
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Top P</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.top_p') }}</label>
                         <input type="number" x-model.number="modelSettings.top_p" @input="onModelSettingsChange()"
                             step="0.05" min="0" max="1" placeholder="—"
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
@@ -1857,7 +2017,7 @@
                     </div>
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Top K</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.top_k') }}</label>
                         <input type="number" x-model.number="modelSettings.top_k" @input="onModelSettingsChange()" min="0"
                             placeholder="—"
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
@@ -1865,7 +2025,7 @@
                     </div>
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Min P</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.min_p') }}</label>
                         <input type="number" x-model.number="modelSettings.min_p" @input="onModelSettingsChange()"
                             step="0.01" min="0" max="1" placeholder="—"
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
@@ -1877,17 +2037,17 @@
                 <div class="grid grid-cols-2 gap-3">
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Rep Penalty</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.repetition_penalty_short') }}</label>
                         <input type="number" x-model.number="modelSettings.repetition_penalty"
-                            @input="onModelSettingsChange()" step="0.05" min="0" placeholder="Default"
+                            @input="onModelSettingsChange()" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Pres Penalty</label>
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.presence_penalty') }}</label>
                         <input type="number" x-model.number="modelSettings.presence_penalty"
-                            @input="onModelSettingsChange()" step="0.05" min="-2" max="2" placeholder="Default"
+                            @input="onModelSettingsChange()" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
@@ -1896,18 +2056,18 @@
                 <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
                 <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
-                        style="color: var(--text-secondary);">Thinking</label>
+                        style="color: var(--text-secondary);">{{ t('chat.thinking_label') }}</label>
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
-                        <option value="auto">Auto</option>
-                        <option value="on_unlimit">On (Unlimit)</option>
-                        <option value="on_limit">On (Limit)</option>
-                        <option value="off">Off</option>
+                        <option value="auto">{{ t('chat.thinking_mode.auto') }}</option>
+                        <option value="on_unlimit">{{ t('chat.thinking_mode.on_unlimited') }}</option>
+                        <option value="on_limit">{{ t('chat.thinking_mode.on_limited') }}</option>
+                        <option value="off">{{ t('chat.thinking_mode.off') }}</option>
                     </select>
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
-                            style="color: var(--text-secondary);">Thinking tokens</label>
+                            style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
                         <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
                             @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
                             @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
@@ -1919,8 +2079,95 @@
                             style="color: var(--text-primary);">
                     </div>
                     <p class="text-[10px]" style="color: var(--text-tertiary);">
-                        KV cache quantization and speculative decoding are configured in Admin → Model Settings (requires model reload).
+                        {{ t('chat.model_settings_advanced_hint') }}
                     </p>
+                </div>
+
+            </div>
+
+            <!-- ==================== SETTINGS TAB ==================== -->
+            <div x-show="rightSidebarTab === 'chat'" class="px-4 py-3 space-y-3">
+
+                <!-- Attachments -->
+                <div class="space-y-2">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('chat.attachments') }}</label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="space-y-1">
+                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                                style="color: var(--text-secondary);">{{ t('chat.max_images') }}</label>
+                            <input type="number" min="0" step="1" x-model.number="chatSettings.maxImages"
+                                @change="saveChatSettings()"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                                style="color: var(--text-primary);">
+                            <p class="text-[10px]" style="color: var(--text-tertiary);">{{ t('chat.unlimited_hint') }}</p>
+                        </div>
+                        <div class="space-y-1">
+                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                                style="color: var(--text-secondary);">{{ t('chat.max_image_size') }}</label>
+                            <input type="number" min="1" step="1" x-model.number="chatSettings.maxImageSizeMb"
+                                @change="saveChatSettings()"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                                style="color: var(--text-primary);">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Appearance -->
+                <div class="space-y-2">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('chat.appearance') }}</label>
+                    <div class="p-3 bg-surface-muted rounded-xl border border-line">
+                        <div class="svg-allow-row">
+                            <div class="svg-allow-label">
+                                <i data-lucide="wand-sparkles" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span class="text-xs font-medium truncate" style="color: var(--text-primary);"
+                                    x-text="window.t('chat.allow_svg')"></span>
+                            </div>
+                            <button type="button" role="switch" class="svg-allow-switch"
+                                :class="{ 'is-on': allowSvg }"
+                                :aria-checked="allowSvg ? 'true' : 'false'"
+                                :aria-label="window.t('chat.allow_svg')"
+                                @click="setAllowSvg(!allowSvg)">
+                                <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                            </button>
+                        </div>
+                        <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
+                    </div>
+                </div>
+
+                <!-- Behavior -->
+                <div class="space-y-2">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('chat.behavior') }}</label>
+                    <div class="p-3 bg-surface-muted rounded-xl border border-line">
+                        <div class="svg-allow-row">
+                            <div class="svg-allow-label">
+                                <i data-lucide="arrow-down-to-line" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span class="text-xs font-medium truncate" style="color: var(--text-primary);" x-text="window.t('chat.show_jump_button')"></span>
+                            </div>
+                            <button type="button" role="switch" class="svg-allow-switch"
+                                :class="{ 'is-on': chatSettings.showScrollButton }"
+                                :aria-checked="chatSettings.showScrollButton ? 'true' : 'false'"
+                                :aria-label="window.t('chat.show_jump_button')"
+                                @click="chatSettings.showScrollButton = !chatSettings.showScrollButton; saveChatSettings()">
+                                <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                            </button>
+                        </div>
+                        <p class="svg-allow-warning" x-text="window.t('chat.scroll_behavior_hint')"></p>
+                    </div>
+                </div>
+
+                <!-- Keyboard shortcuts -->
+                <div class="space-y-1">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('chat.shortcuts') }}</label>
+                    <button @click="showShortcutsHelp = true"
+                        class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium bg-surface-muted hover:bg-surface-alt transition-colors flex items-center justify-center gap-2"
+                        style="color: var(--text-primary);">
+                        <i data-lucide="keyboard" class="w-3.5 h-3.5"></i>
+                        <span>{{ t('chat.view_shortcuts') }}</span>
+                    </button>
                 </div>
 
             </div>
@@ -1932,41 +2179,41 @@
             <div class="grid grid-cols-2 gap-2">
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
                     <span class="text-[9px] font-bold uppercase tracking-wider"
-                        style="color: var(--text-tertiary);">Prefill (t/s)</span>
+                        style="color: var(--text-tertiary);">{{ t('chat.stats.prefill') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.avg_prefill_tps ? Number(recentStats.avg_prefill_tps).toFixed(1) : '0.0'">
                         </div>
                         <div class="text-[10px]" style="color: var(--text-primary);"
-                            x-show="recentStats?.prompt_tokens > 0" x-text="recentStats.prompt_tokens + ' tok'"></div>
+                            x-show="recentStats?.prompt_tokens > 0" x-text="recentStats.prompt_tokens + ' ' + window.t('chat.stats.token_suffix')"></div>
                     </div>
                 </div>
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
                     <span class="text-[9px] font-bold uppercase tracking-wider"
-                        style="color: var(--text-tertiary);">Token Gen (t/s)</span>
+                        style="color: var(--text-tertiary);">{{ t('chat.stats.token_generation') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.avg_generation_tps ? Number(recentStats.avg_generation_tps).toFixed(1) : '0.0'">
                         </div>
                         <div class="text-[10px]" style="color: var(--text-primary);"
-                            x-show="recentStats?.total_tokens > 0" x-text="recentStats.total_tokens + ' tok'"></div>
+                            x-show="recentStats?.total_tokens > 0" x-text="recentStats.total_tokens + ' ' + window.t('chat.stats.token_suffix')"></div>
                     </div>
                 </div>
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
                     <span class="text-[9px] font-bold uppercase tracking-wider"
-                        style="color: var(--text-tertiary);">Thinking (s)</span>
+                        style="color: var(--text-tertiary);">{{ t('chat.stats.thinking') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.thinking_time ? Number(recentStats.thinking_time).toFixed(1) : '-'">
                         </div>
                         <div class="text-[10px]" style="color: var(--text-primary);"
-                            x-show="recentStats?.thinking_tokens > 0" x-text="recentStats.thinking_tokens + ' tok'">
+                            x-show="recentStats?.thinking_tokens > 0" x-text="recentStats.thinking_tokens + ' ' + window.t('chat.stats.token_suffix')">
                         </div>
                     </div>
                 </div>
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
                     <span class="text-[9px] font-bold uppercase tracking-wider"
-                        style="color: var(--text-tertiary);">Duration (s)</span>
+                        style="color: var(--text-tertiary);">{{ t('chat.stats.duration') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.total_time ? Number(recentStats.total_time).toFixed(1) : '-'"></div>
@@ -1982,7 +2229,7 @@
         <button class="image-modal-close" @click="closeImageModal()">
             <i data-lucide="x" class="w-5 h-5"></i>
         </button>
-        <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
+        <img :src="imageModal.src" @click.stop :alt="window.t('chat.image_preview')" x-show="imageModal.src">
     </div>
 
     <!-- Chat Settings Modal -->
@@ -2017,23 +2264,6 @@
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
                     </select>
                 </div>
-                <div class="mb-6">
-                    <div class="svg-allow-row">
-                        <div class="svg-allow-label">
-                            <i data-lucide="wand-sparkles" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
-                            <span class="text-sm truncate" style="color: var(--text-primary);"
-                                x-text="window.t('chat.allow_svg')"></span>
-                        </div>
-                        <button type="button" role="switch" class="svg-allow-switch"
-                            :class="{ 'is-on': allowSvg }"
-                            :aria-checked="allowSvg ? 'true' : 'false'"
-                            :aria-label="window.t('chat.allow_svg')"
-                            @click="setAllowSvg(!allowSvg)">
-                            <span class="svg-allow-switch-knob" aria-hidden="true"></span>
-                        </button>
-                    </div>
-                    <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
-                </div>
                 <div class="pt-4 border-t border-line">
                     <h4 class="text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.chat_history_label') }}</h4>
                     <div class="space-y-1">
@@ -2057,6 +2287,38 @@
                             {{ t('chat.clear_all_history') }}
                         </button>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Keyboard Shortcuts Help -->
+    <div x-show="showShortcutsHelp" x-cloak x-transition.opacity
+        class="fixed inset-0 z-[200] flex items-center justify-center px-4"
+        style="background-color: rgba(0,0,0,0.6);" @click="showShortcutsHelp = false">
+        <div class="w-full max-w-sm rounded-2xl border border-line bg-surface shadow-2xl overflow-hidden" @click.stop>
+            <div class="flex items-center justify-between px-5 py-3.5 border-b border-line">
+                <h3 class="text-sm font-bold" style="color: var(--text-primary);">{{ t('chat.keyboard_shortcuts') }}</h3>
+                <button @click="showShortcutsHelp = false" class="p-1.5 -mr-1.5 hover:bg-surface-muted rounded-lg transition-colors">
+                    <i data-lucide="x" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                </button>
+            </div>
+            <div class="px-5 py-4 space-y-3 text-sm" style="color: var(--text-primary);">
+                <div class="flex items-center justify-between gap-4">
+                    <span>{{ t('chat.shortcut_send') }}</span>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">Enter</kbd>
+                </div>
+                <div class="flex items-center justify-between gap-4">
+                    <span>{{ t('chat.shortcut_newline') }}</span>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">Shift + Enter</kbd>
+                </div>
+                <div class="flex items-center justify-between gap-4">
+                    <span>{{ t('chat.shortcut_stop') }}</span>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">Esc</kbd>
+                </div>
+                <div class="flex items-center justify-between gap-4">
+                    <span>{{ t('chat.shortcut_help') }}</span>
+                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">?</kbd>
                 </div>
             </div>
         </div>
@@ -2111,12 +2373,21 @@
             apiKeyInput: '',
 
             // UI State
-            isMobile: window.innerWidth < 768,
+            // Touch/coarse-pointer devices (phones, tablets) — NOT just narrow windows.
+            // Governs Enter-to-send vs newline, so a narrow desktop window still sends on Enter.
+            isMobile: !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches),
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
             showChatSettingsModal: false,
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
+            chatSettings: (() => {
+                const d = { maxImages: 10, maxImageSizeMb: 10, showScrollButton: true };
+                try { return { ...d, ...JSON.parse(localStorage.getItem('omlx-chat-settings') || '{}') }; }
+                catch { return d; }
+            })(),
+            chatSearchQuery: '',
+            showShortcutsHelp: false,
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
 
@@ -2155,7 +2426,7 @@
             renameDraft: '',
 
             // Image Upload State
-            uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
+            uploadImages: [],            // Array of { id, base64 } for pending images (limit via chatSettings.maxImages; 0 = unlimited)
             uploadDocuments: [],         // Array of { id, filename, mimeType, base64 }
             markitdownSettings: {
                 enabled: true,
@@ -2891,8 +3162,12 @@
                 return msg;
             },
 
+            hasVisibleThinking(thinking) {
+                return typeof thinking === 'string' && thinking.trim().length > 0;
+            },
+
             attachThinkingToAssistantMessage(msg, thinking) {
-                const content = thinking || null;
+                const content = this.hasVisibleThinking(thinking) ? thinking : null;
                 msg._thinking = content;
                 msg.reasoning_content = content;
                 return msg;
@@ -2919,18 +3194,22 @@
                 return Object.keys(gen).length ? gen : null;
             },
 
-            captureGenerationContext(modelId, systemPrompt, profile) {
+            captureGenerationContext(modelId, systemPrompt, profile, generationOverride = null) {
                 const gatewayId = this.resolveGatewayModelId(modelId || this.currentModel);
                 const displayModel = this.availableModels.find(m => m.id === gatewayId)
                     || this.availableModels.find(m => m.name === modelId);
                 const profileName = this.normalizeProfileName(profile)
                     || this.normalizeProfileName(this.activePromptProfile);
+                const generation = {
+                    ...(this.snapshotGenerationSettings() || {}),
+                    ...(generationOverride || {}),
+                };
                 return {
                     modelId: gatewayId,
                     modelDisplay: displayModel?.name || modelId || gatewayId,
                     profileName,
                     systemPrompt: systemPrompt ?? '',
-                    generation: this.snapshotGenerationSettings(),
+                    generation: Object.keys(generation).length ? generation : null,
                     capturedAt: new Date().toISOString(),
                 };
             },
@@ -3049,10 +3328,11 @@
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
                         const m = { role: msg.role, content: this.buildContentForApi(msg.content) };
-                        if (msg.reasoning_content) {
+                        if (this.hasVisibleThinking(msg.reasoning_content)) {
                             m.reasoning_content = msg.reasoning_content;
                         }
-                        if (!m.reasoning_content && msg.role === 'assistant' && msg._thinking) {
+                        if (!m.reasoning_content && msg.role === 'assistant'
+                            && this.hasVisibleThinking(msg._thinking)) {
                             m.reasoning_content = msg._thinking;
                         }
                         if (msg.tool_calls) m.tool_calls = msg.tool_calls;
@@ -3071,7 +3351,9 @@
                 const regenChainId = excludeVariantsAtUserIndex != null && depth > 0
                     ? (context._apiVariantChainId ?? null)
                     : null;
-                const model = this.resolveApiModel(messages, context.model, variantUserIndex);
+                const model = context._modelOverride
+                    ? this.resolveGatewayModelId(context._modelOverride)
+                    : this.resolveApiModel(messages, context.model, variantUserIndex);
                 const generation = this.resolveApiGenerationOverrides(messages, variantUserIndex);
                 return {
                     model,
@@ -3083,6 +3365,9 @@
                     stream: true,
                     stream_options: { include_usage: true },
                     ...generation,
+                    // One-off per-call overrides (e.g. "regenerate creative") without
+                    // mutating the session's saved settings.
+                    ...(context._generationOverride || {}),
                     ...(this.mcpTools.length > 0 && { tools: this.mcpTools }),
                 };
             },
@@ -3267,6 +3552,7 @@
                         speculativeDraftModel: historyChat?.speculativeDraftModel ?? null,
                         modelSettingsByModel: historyChat?.modelSettingsByModel
                             ? this.cloneData(historyChat.modelSettingsByModel) : {},
+                        contextTokens: historyChat?.contextTokens ?? 0,
                     };
                 }
                 return this.chatSessions[chatId] || null;
@@ -3580,7 +3866,7 @@
             const model = models.find(m => m.id === gatewayId || m.id === modelId);
             if (stream.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
             if (model?.is_loading || (!model && models.some(m => m.is_loading))) {
-                this.setEngineStatus(chatId, { text: 'Loading model' });
+                this.setEngineStatus(chatId, { text: window.t('chat.status.loading_model') });
             } else if (model?.prefilling?.length > 0) {
                 const p = (stream._statsRequestId
                     ? model.prefilling.find(entry => entry.request_id === stream._statsRequestId)
@@ -3588,16 +3874,20 @@
                 if (p.total > 0) {
                     const pct = Math.round(p.processed / p.total * 100);
                     if (pct >= 100) {
-                        stream.engineStatus = { text: 'Generating' }; // prefill done, now generating
+                        stream.engineStatus = { text: window.t('chat.status.generating') }; // prefill done, now generating
                     } else {
-                        const speed = p.speed > 0 ? ` · ${Math.round(p.speed)} tok/s` : '';
-                        stream.engineStatus = { text: `Prefilling ${pct}%${speed}` };
+                        const speed = p.speed > 0 ? ` · ${Math.round(p.speed)} ${window.t('chat.stats.tokens_per_second_suffix')}` : '';
+                        stream.engineStatus = {
+                            text: window.t('chat.status.prefilling_percent')
+                                .replace('{percent}', pct)
+                                .replace('{speed}', speed)
+                        };
                     }
                 } else {
-                    stream.engineStatus = { text: 'Prefilling' };
+                    stream.engineStatus = { text: window.t('chat.status.prefilling') };
                 }
             } else if (model?.generating?.length > 0) {
-                this.setEngineStatus(chatId, { text: 'Generating' });
+                this.setEngineStatus(chatId, { text: window.t('chat.status.generating') });
             }
         } catch (e) { /* ignore poll errors */ }
     },
@@ -3642,13 +3932,14 @@
             return;
         }
 
-        const maxSize = 10 * 1024 * 1024;
+        const maxSize = (this.chatSettings.maxImageSizeMb || 10) * 1024 * 1024;
         if (file.size > maxSize) {
-            alert(window.t('chat.error.image_too_large'));
+            alert(window.t('chat.error.image_too_large')
+                .replace('{max}', this.chatSettings.maxImageSizeMb || 10));
             return;
         }
 
-        if (this.uploadImages.length >= 10) return;
+        if (this.imageLimitReached()) return;
 
         const id = `img_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         this.uploadImages.push({ id, base64: null, _pending: true });
@@ -3829,22 +4120,33 @@
         if (!container) return;
 
         let lastScrollTop = container.scrollTop;
+        container.addEventListener('wheel', (event) => {
+            if (event.deltaY < 0) {
+                this.autoScrollEnabled = false;
+            }
+        }, { passive: true });
+
         container.addEventListener('scroll', () => {
             // Detect if user is manually scrolling
             clearTimeout(this.scrollTimeout);
             this.isUserScrolling = true;
 
             // Check if at bottom (with threshold)
-            const threshold = 50;
-            const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
-            const scrolledUp = container.scrollTop < lastScrollTop;
-            lastScrollTop = container.scrollTop;
+            const threshold = 25;
+            const st = container.scrollTop;
+            const isAtBottom = container.scrollHeight - st - container.clientHeight <= threshold;
+            // Auto-follow only ever scrolls DOWN (toward the bottom), so any upward
+            // movement is the user deliberately scrolling away — the small tolerance
+            // avoids sub-pixel/momentum jitter being read as an intentional scroll-up.
+            const scrolledUp = st < lastScrollTop - 2;
+            lastScrollTop = st;
 
             if (isAtBottom) {
-                // User scrolled to bottom, re-enable auto-scroll
+                // Back at the bottom — re-enable auto-scroll (follow new tokens).
                 this.autoScrollEnabled = true;
             } else if (scrolledUp) {
-                // User scrolled up - disable auto-scroll until they reach the bottom again
+                // User scrolled up while away from the bottom — pause auto-scroll
+                // until they return to the bottom.
                 this.autoScrollEnabled = false;
             }
 
@@ -4040,6 +4342,7 @@
                     max_file_size_mb: integrations.markitdown_max_file_size_mb || 25,
                     max_files_per_request: integrations.markitdown_max_files_per_request || 5,
                 };
+                this._globalMaxContextWindow = settingsData.sampling?.max_context_window || 32768;
             }
             this._mirrorAliasModelTypes();
 
@@ -4210,6 +4513,10 @@
             for (const [chatId, stream] of Object.entries(this.streamSessions)) {
                 if (!stream?.isStreaming) continue;
                 stream._liveFooterStats = this.computeLiveFooterStats(chatId, stream, data);
+                // Cache the context-token count against the correct chat as soon as it
+                // is known (i.e. once prefill lands), so a chat cut off mid-stream keeps it.
+                const lf = stream._liveFooterStats;
+                this.rememberContextTokens(chatId, Number(lf?.prompt_tokens + lf?.total_tokens || 0));
             }
 
             const stream = this.getStreamSession(this.currentChatId, false);
@@ -4425,11 +4732,7 @@
         if (history) {
             try {
                 this.chatHistory = JSON.parse(history);
-                this.chatHistory.sort((a, b) => {
-                    const ta = a.updatedAt ? Date.parse(a.updatedAt) : 0;
-                    const tb = b.updatedAt ? Date.parse(b.updatedAt) : 0;
-                    return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta);
-                });
+                this.sortChatHistory();
                 let migrated = false;
                 for (const chat of this.chatHistory) {
                     if (chat.title && /^chat\.untitled/.test(String(chat.title))) {
@@ -4480,7 +4783,13 @@
             const prevSession = this.getChatSession(prevChatId, false);
             if (prevSession) {
                 prevSession.messages = this.messages;
-                this.saveCurrentChat(prevChatId);
+                this.saveCurrentChat(
+                    prevChatId,
+                    null,
+                    null,
+                    null,
+                    { touchUpdatedAt: false }
+                );
             }
         }
 
@@ -4497,7 +4806,7 @@
         this.editContent = '';
         this.editImages = [];
         this.renamingChatId = null;
-        this.isMobile = window.innerWidth < 768;
+        this.isMobile = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
         this.sidebarOpen = window.innerWidth >= 768;
 
         const session = {
@@ -4545,7 +4854,13 @@
             const prevSession = this.getChatSession(this.currentChatId, false);
             if (prevSession) {
                 prevSession.messages = this.messages;
-                this.saveCurrentChat(this.currentChatId);
+                this.saveCurrentChat(
+                    this.currentChatId,
+                    null,
+                    null,
+                    null,
+                    { touchUpdatedAt: false }
+                );
             }
         }
 
@@ -4587,11 +4902,17 @@
             this.scheduleEnhanceMessages();
             this.ensureStatsPollingForCurrentChat();
         }
-        this.isMobile = window.innerWidth < 768;
+        this.isMobile = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
         this.sidebarOpen = window.innerWidth >= 768;
     },
 
-    saveCurrentChat(chatId = this.currentChatId, messages = null, model = null, systemPrompt = null) {
+    saveCurrentChat(
+        chatId = this.currentChatId,
+        messages = null,
+        model = null,
+        systemPrompt = null,
+        options = {}
+    ) {
         const session = this.getChatSession(chatId, false);
         const messagesToSave = messages ?? session?.messages ?? (chatId === this.currentChatId ? this.messages : []);
         if (!chatId) return;
@@ -4642,6 +4963,7 @@
             id: chatId,
             title,
             manualTitle: existingChat?.manualTitle || false,
+            pinned: existingChat?.pinned || false,
             messages: messagesForStorage,
             model: chatModel,
             systemPrompt: chatSystemPrompt,
@@ -4652,7 +4974,10 @@
             modelSettingsByModel: session
                 ? this.cloneData(session.modelSettingsByModel || {})
                 : {},
-            updatedAt: new Date().toISOString()
+            contextTokens: session?.contextTokens ?? existingChat?.contextTokens ?? 0,
+            updatedAt: options.touchUpdatedAt === false && existingChat?.updatedAt
+                ? existingChat.updatedAt
+                : new Date().toISOString()
         };
 
         if (session) {
@@ -4673,6 +4998,7 @@
             this.chatHistory.unshift(chatData);
         }
 
+        this.sortChatHistory();
         // Keep only last MAX_CHAT_HISTORY_SIZE chats
         this.chatHistory = this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE);
         this.saveChatHistory();
@@ -4780,16 +5106,23 @@
             _variantUserIndex: streamContext?._variantUserIndex ?? null,
             _excludeVariantsAtUserIndex: streamContext?._excludeVariantsAtUserIndex ?? null,
             _apiVariantChainId: streamContext?._apiVariantChainId ?? null,
+            _modelOverride: streamContext?._modelOverride ?? null,
+            _generationOverride: streamContext?._generationOverride ?? null,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
         context._profile = this.resolveStreamProfile(streamContext, chatSession);
         context.model = context.model || chatSession?.model || this.currentModel;
         context.systemPrompt = context.systemPrompt ?? chatSession?.systemPrompt ?? '';
+        const requestModel = this.resolveGatewayModelId(
+            context._modelOverride || context.model
+        );
         if (context.chatId === this.currentChatId && context.systemPrompt !== this.systemPrompt) {
             this.systemPrompt = context.systemPrompt;
         }
-        chatSession.model = context.model;
+        if (!context._modelOverride) {
+            chatSession.model = context.model;
+        }
         chatSession.systemPrompt = context.systemPrompt;
 
         if (depth > this.MAX_TOOL_DEPTH) {
@@ -4797,11 +5130,11 @@
                 id: this.newMessageId(),
                 role: 'assistant',
                 content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
-                model: context.model,
+                model: requestModel,
                 _profile: context._profile,
                 _perfVisible: false,
             });
-            this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+            this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
             this.resetStreamSession(stream);
             return;
         }
@@ -4810,7 +5143,7 @@
             this.resetStreamSession(stream);
             stream._statusStart = Date.now();
             stream.targetMessageId = this.newMessageId();
-            stream.sourceModel = context.model;
+            stream.sourceModel = requestModel;
             stream.sourceSystemPrompt = context.systemPrompt;
             stream.sourceProfile = context._profile;
             if (context._variantUserIndex == null) {
@@ -4824,12 +5157,12 @@
             this.startStatsPolling(context.chatId);
         }
         stream.isStreaming = true;
-            stream.sourceModel = context.model;
-            stream.sourceSystemPrompt = context.systemPrompt;
-            stream.sourceProfile = context._profile;
-            stream.streamingContent = '';
-            stream.streamingThinking = '';
-            stream.streamingThinkingOpen = false;
+        stream.sourceModel = requestModel;
+        stream.sourceSystemPrompt = context.systemPrompt;
+        stream.sourceProfile = context._profile;
+        stream.streamingContent = '';
+        stream.streamingThinking = '';
+        stream.streamingThinkingOpen = false;
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
               
@@ -4838,7 +5171,7 @@
         }
         
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
-        this.setEngineStatus(context.chatId, { text: 'Starting' });
+        this.setEngineStatus(context.chatId, { text: window.t('chat.status.starting') });
         this.startPrefillPolling(context.chatId);
 
         try {
@@ -4915,8 +5248,11 @@
                                 if (names.length > 0) {
                                     const unique = [...new Set(names)];
                                     const liveLabel = unique.length > 3
-                                        ? `Calling ${unique.slice(0, 2).join(', ')} +${unique.length - 2} more`
-                                        : `Calling ${unique.join(', ')}`;
+                                        ? window.t('chat.status.calling_tools_more')
+                                            .replace('{tools}', unique.slice(0, 2).join(', '))
+                                            .replace('{count}', unique.length - 2)
+                                        : window.t('chat.status.calling_tools')
+                                            .replace('{tools}', unique.join(', '));
                                     stream.engineStatus = { text: liveLabel, icon: 'wrench' };
                                 }
                             }
@@ -4927,13 +5263,15 @@
                                     stream._ttft = (Date.now() - stream._statusStart) / 1000;
                                     this.stopPrefillPolling(context.chatId);
                                 }
-                                if (!stream.thinkingState.isInThinking) {
+                                // Keep leading whitespace for real reasoning, but do not
+                                // treat a whitespace-only delta as a thinking phase.
+                                stream.streamingThinking += delta.reasoning_content;
+                                if (!stream.thinkingState.isInThinking
+                                    && this.hasVisibleThinking(stream.streamingThinking)) {
                                     stream.thinkingState.isInThinking = true;
                                     stream.thinkingState.thinkingStartTime = Date.now();
-                                    this.setEngineStatus(context.chatId, { text: 'Thinking' });
+                                    this.setEngineStatus(context.chatId, { text: window.t('chat.thinking_label') });
                                 }
-                                // Accumulate into live thinking bubble
-                                stream.streamingThinking += delta.reasoning_content;
                             }
 
                             if (delta?.content) {
@@ -4945,7 +5283,9 @@
                                 // Log thinking duration to timeline when content starts
                                 if (stream.thinkingState.isInThinking) {
                                     const thinkSecs = ((Date.now() - stream.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                                    this.setEngineStatus(context.chatId, { text: `Thought for ${thinkSecs}s` });
+                                    this.setEngineStatus(context.chatId, {
+                                        text: window.t('chat.status.thought_for_seconds').replace('{seconds}', thinkSecs)
+                                    });
                                     stream.thinkingState.isInThinking = false;
                                     stream.thinkingState.thinkingStartTime = null;
                                     stream._thinkSecs = thinkSecs;
@@ -4970,7 +5310,9 @@
             // If model ended while still thinking (tool-call turn or manual stop), log elapsed and reset
             if (stream.thinkingState.isInThinking) {
                 const thinkSecs = ((Date.now() - stream.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                this.setEngineStatus(context.chatId, { text: `Thought for ${thinkSecs}s` });
+                this.setEngineStatus(context.chatId, {
+                    text: window.t('chat.status.thought_for_seconds').replace('{seconds}', thinkSecs)
+                });
                 stream.thinkingState.isInThinking = false;
                 stream.thinkingState.thinkingStartTime = null;
                 stream._thinkSecs = thinkSecs;
@@ -4983,11 +5325,11 @@
                     prompt_tokens_per_second: ptps, generation_tokens_per_second: gtps,
                     time_to_first_token: ttft } = lastUsage;
                 const parts = [];
-                if (pt != null) parts.push(`${pt}t prompt`);
-                if (ct != null) parts.push(`${ct}t generated`);
-                if (ptps != null) parts.push(`prefill ${Math.round(ptps)} tok/s`);
-                if (gtps != null) parts.push(`gen ${Math.round(gtps)} tok/s`);
-                if (ttft != null) parts.push(`ttft ${ttft}s`);
+                if (pt != null) parts.push(window.t('chat.status.prompt_tokens').replace('{count}', pt));
+                if (ct != null) parts.push(window.t('chat.status.generated_tokens').replace('{count}', ct));
+                if (ptps != null) parts.push(window.t('chat.status.prefill_speed').replace('{speed}', Math.round(ptps)));
+                if (gtps != null) parts.push(window.t('chat.status.generation_speed').replace('{speed}', Math.round(gtps)));
+                if (ttft != null) parts.push(window.t('chat.status.ttft').replace('{seconds}', ttft));
                 if (parts.length) this.setEngineStatus(context.chatId, { text: parts.join(' · ') });
 
                 // Sync exact final timings to the performance panel
@@ -5006,8 +5348,10 @@
                 const names = toolCalls.map(t => t.function.name).filter(Boolean);
                 const uniqueNames = [...new Set(names)];
                 const label = toolCalls.length > 3
-                    ? `Calling ${uniqueNames.slice(0, 2).join(', ')} +${toolCalls.length - 2} more`
-                    : `Calling ${names.join(', ')}`;
+                    ? window.t('chat.status.calling_tools_more')
+                        .replace('{tools}', uniqueNames.slice(0, 2).join(', '))
+                        .replace('{count}', toolCalls.length - 2)
+                    : window.t('chat.status.calling_tools').replace('{tools}', names.join(', '));
                 if (names.length) this.setEngineStatus(context.chatId, { text: label, icon: 'wrench' });
 
                 // Store the assistant tool_calls turn (hidden from chat UI)
@@ -5015,8 +5359,9 @@
                     id: this.newMessageId(),
                     role: 'assistant',
                     content: stream.streamingContent || null,
-                    reasoning_content: stream.streamingThinking || null,
-                    model: context.model,
+                    reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
+                        ? stream.streamingThinking : null,
+                    model: requestModel,
                     tool_calls: toolCalls,
                     _profile: context._profile,
                     _ui: false,
@@ -5084,7 +5429,7 @@
                     });
                 });
 
-                this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+                this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                 if (stream.abortController?.signal.aborted) {
                     return;
                 }
@@ -5108,9 +5453,15 @@
                 id: assistantId,
                 role: 'assistant',
                 content: stream.streamingContent || '',
-                reasoning_content: stream.streamingThinking || null,
-                model: context.model,
-                meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
+                reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
+                    ? stream.streamingThinking : null,
+                model: requestModel,
+                meta: this.captureGenerationContext(
+                    requestModel,
+                    context.systemPrompt,
+                    context._profile,
+                    context._generationOverride
+                ),
                 _perfVisible: false,
                 _thinkingOpen: false,
             };
@@ -5118,7 +5469,7 @@
             this.attachProfileToAssistantMessage(assistantMsg, context._profile);
             chatSession.messages.push(assistantMsg);
             this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
-            this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+            this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
             if (this.currentChatId === context.chatId) {
                 this.scheduleEnhanceMessages();
             }
@@ -5139,9 +5490,15 @@
                         id: assistantId,
                         role: 'assistant',
                         content: stream.streamingContent,
-                        reasoning_content: stream.streamingThinking || null,
-                        model: context.model,
-                        meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
+                        reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
+                            ? stream.streamingThinking : null,
+                        model: requestModel,
+                        meta: this.captureGenerationContext(
+                            requestModel,
+                            context.systemPrompt,
+                            context._profile,
+                            context._generationOverride
+                        ),
                         _perfVisible: false,
                         _thinkingOpen: false,
                     };
@@ -5149,7 +5506,7 @@
                     this.attachProfileToAssistantMessage(assistantMsg, context._profile);
                     chatSession.messages.push(assistantMsg);
                     this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
-                    this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+                    this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                     if (this.currentChatId === context.chatId) {
                         this.scheduleEnhanceMessages();
                     }
@@ -5161,14 +5518,19 @@
                     id: assistantId,
                     role: 'assistant',
                     content: `Error: ${error.message}`,
-                    model: context.model,
-                    meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
+                    model: requestModel,
+                    meta: this.captureGenerationContext(
+                        requestModel,
+                        context.systemPrompt,
+                        context._profile,
+                        context._generationOverride
+                    ),
                     _perfVisible: false,
                 };
                 this.attachProfileToAssistantMessage(errorMsg, context._profile);
                 chatSession.messages.push(errorMsg);
                 this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
-                this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+                this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {
                     this.scheduleEnhanceMessages();
                 }
@@ -5212,9 +5574,9 @@
                         }
                         if (gen.thinking_budget != null) parts.push(`think_budget=${gen.thinking_budget}`);
                         const modelLabel = meta.modelDisplay
-                            || this.availableModels.find(m => m.id === (stream.sourceModel || context.model))?.name
+                            || this.availableModels.find(m => m.id === (stream.sourceModel || requestModel))?.name
                             || stream.sourceModel
-                            || context.model
+                            || requestModel
                             || '?';
                         const summary = parts.length ? `${modelLabel} · ${parts.join(', ')}` : modelLabel;
                         perfEntries.push({ t: '', text: summary, icon: null });
@@ -5225,6 +5587,8 @@
                         }
                         const msgStats = this.buildStreamRecentStats(stream, totalTime);
                         msg._recentStats = msgStats;
+                        this.rememberContextTokens(context.chatId,
+                            Number(msgStats.prompt_tokens + msgStats.total_tokens || 0));
                         if (this.currentChatId === context.chatId) {
                             this.recentStats = { ...msgStats };
                         }
@@ -5234,9 +5598,10 @@
                         if (stream._lastUsage) {
                             if (!msg.meta) {
                                 msg.meta = this.captureGenerationContext(
-                                    msg.model || context.model,
+                                    msg.model || requestModel,
                                     context.systemPrompt,
-                                    context._profile
+                                    context._profile,
+                                    context._generationOverride
                                 );
                             }
                             msg.meta.usage = this.cloneData(stream._lastUsage);
@@ -5246,7 +5611,7 @@
                         }
                 }
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
-                this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+                this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
             }
             this.resetStreamSession(stream, { preserveFinalContent: true });
             this.thinkingAutoScroll = true;
@@ -5263,7 +5628,7 @@
         }
     },
 
-            async regenerateMessage(index) {
+    async regenerateMessage(index, opts = {}) {
         if (this.isCurrentChatStreaming()) return;
 
         const session = this.getChatSession(this.currentChatId, true);
@@ -5277,11 +5642,22 @@
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
+        // Optional one-off overrides from the regenerate dropdown. These apply to
+        // this single call only and never mutate the session's saved settings.
+        let generationOverride = null;
+        if (opts.creative) {
+            const base = Number(this.modelSettings?.temperature);
+            const temp = Number.isFinite(base) && base > 0 ? Math.min(2, base + 0.4) : 1.2;
+            generationOverride = { temperature: temp };
+        }
+
         await this.streamResponse({
             chatId: this.currentChatId,
             model: this.currentModel,
             systemPrompt: this.systemPrompt,
             _profile: profileToUse,
+            _modelOverride: opts.model || null,
+            _generationOverride: generationOverride,
             _variantUserIndex: userIdx,
             _excludeVariantsAtUserIndex: this.getTurnVariantsAt(session.messages, userIdx).length > 0
                 ? userIdx : null,
@@ -5466,6 +5842,7 @@
             id: branchId,
             title: branchName,
             manualTitle: true,
+            pinned: false,
             messages: messagesForStorage,
             model: branchSession.model,
             systemPrompt: branchSession.systemPrompt,
@@ -5697,11 +6074,14 @@
         let match;
 
         while ((match = thinkingRegex.exec(text)) !== null) {
-            thinkingBlocks.push({
-                content: match[1].trim(),
-                elapsed: match[2] ? parseInt(match[2]) : null,
-                placeholder: `THINKINGPLACEHOLDER${thinkingBlocks.length}`
-            });
+            const content = match[1].trim();
+            if (content) {
+                thinkingBlocks.push({
+                    content,
+                    elapsed: match[2] ? parseInt(match[2]) : null,
+                    placeholder: `THINKINGPLACEHOLDER${thinkingBlocks.length}`
+                });
+            }
         }
 
         // Remove thinking tags from the main text
@@ -5711,6 +6091,8 @@
     },
 
     renderThinkingBlock(content, index, messageId, elapsed) {
+        if (!this.hasVisibleThinking(content)) return '';
+
         let thinkingTime;
         if (elapsed != null) {
             thinkingTime = (elapsed / 1000).toFixed(1);
@@ -5730,7 +6112,7 @@
                                 <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
                                 <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                             </svg>
-                            <span class="thinking-text">Thought for ${thinkingTime} seconds</span>
+                            <span class="thinking-text">${window.t('chat.status.thought_for_seconds').replace('{seconds}', thinkingTime)}</span>
                             <svg class="thinking-toggle" id="thinking-toggle-${uniqueId}" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
                                 <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
@@ -5785,7 +6167,10 @@
                     html += DOMPurify.sanitize(marked.parse(beforeContent));
                 }
                 const elapsed = match[2] ? parseInt(match[2]) : null;
-                html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming', elapsed);
+                const thinkingContent = match[1].trim();
+                if (thinkingContent) {
+                    html += this.renderThinkingBlock(thinkingContent, blockIndex++, 'streaming', elapsed);
+                }
                 lastIndex = match.index + match[0].length;
             }
 
@@ -5799,16 +6184,17 @@
                 }
 
                 const thinkingContent = remaining.substring(incompleteThinkIndex + '<think>'.length);
-                const streamThinkId = `think_${++this._thinkingDomSeq}`;
+                if (this.hasVisibleThinking(thinkingContent)) {
+                    const streamThinkId = `think_${++this._thinkingDomSeq}`;
 
-                html += `
+                    html += `
                             <div class="thinking-container" id="streaming-thinking-container">
                                 <div class="thinking-header" onclick="document.getElementById('thinking-content-${streamThinkId}').classList.toggle('collapsed'); document.getElementById('thinking-toggle-${streamThinkId}').classList.toggle('collapsed');">
                                     <svg class="thinking-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                                         <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
                                         <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                                     </svg>
-                                    <span class="thinking-text">Thinking...</span>
+                                    <span class="thinking-text">${window.t('chat.thinking_progress')}</span>
                                     <svg class="thinking-toggle collapsed" id="thinking-toggle-${streamThinkId}" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
                                         <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                                     </svg>
@@ -5818,6 +6204,7 @@
                                 </div>
                             </div>
                         `;
+                }
             } else if (remaining.trim()) {
                 html += DOMPurify.sanitize(marked.parse(remaining));
             }
@@ -5924,6 +6311,134 @@
         this.allowSvg = !!enabled;
         localStorage.setItem(ALLOW_SVG_STORAGE_KEY, this.allowSvg ? 'true' : 'false');
         this.refreshCodeBlockButtons();
+    },
+
+    saveChatSettings() {
+        localStorage.setItem('omlx-chat-settings', JSON.stringify(this.chatSettings));
+    },
+
+    // ===== Keyboard shortcuts =====
+
+    _isTypingTarget(e) {
+        const el = e.target;
+        if (!el) return false;
+        const tag = el.tagName;
+        return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+    },
+
+    handleGlobalKeydown(e) {
+        const mod = e.metaKey || e.ctrlKey;
+        if (e.key === 'Escape') {
+            if (this.showShortcutsHelp) { this.showShortcutsHelp = false; return; }
+            if (!this._isTypingTarget(e) && this.isCurrentChatStreaming()) {
+                this.stopStreaming();
+            }
+            return;
+        }
+        // "?" opens shortcuts help (only when not typing)
+        if (e.key === '?' && !this._isTypingTarget(e) && !mod) {
+            e.preventDefault();
+            this.showShortcutsHelp = true;
+        }
+    },
+
+    // Enter sends; Shift+Enter makes a newline. On touch devices Enter always makes a
+    // newline (send via the button). Skip while an IME is composing (isComposing / keyCode 229).
+    onComposerEnter(e) {
+        if (this.isMobile || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+        e.preventDefault();
+        this.sendMessage();
+    },
+
+    // Sort chat list: pinned first, then most-recently-updated.
+    sortChatHistory() {
+        this.chatHistory.sort((a, b) => {
+            if (!!b.pinned !== !!a.pinned) return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0);
+            const ta = a.updatedAt ? Date.parse(a.updatedAt) : 0;
+            const tb = b.updatedAt ? Date.parse(b.updatedAt) : 0;
+            return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta);
+        });
+    },
+
+    togglePinChat(chatId) {
+        const chat = this.chatHistory.find(c => c.id === chatId);
+        if (!chat) return;
+        chat.pinned = !chat.pinned;
+        this.sortChatHistory();
+        this.saveChatHistory();
+    },
+
+    imageLimitReached() {
+        const m = this.chatSettings.maxImages;
+        return m > 0 && this.uploadImages.length >= m;   // 0 = unlimited
+    },
+
+    contextWindowForCurrentModel() {
+        // Per-model max_context_window from admin settings, then global fallback, then 32768.
+        try {
+            const list = this._adminModelsList || [];
+            const gw = this.aliasToGateway?.[this.currentModel] || this.currentModel;
+            const m = list.find(x => x.id === gw || x.id === this.currentModel);
+            const perModel = m?.settings?.max_context_window ?? m?.max_context_window;
+            if (perModel) return perModel;
+        } catch (e) { /* ignore */ }
+        return this._globalMaxContextWindow || 32768;
+    },
+
+    // Cache the latest known context-token count on the conversation so the meter
+    // survives recentStats being reset to 0 (idle, prefill before first token, etc.).
+    rememberContextTokens(chatId, tokens) {
+        if (!chatId || !(tokens > 0)) return;
+        const s = this.chatSessions[chatId];
+        if (s) s.contextTokens = tokens;
+    },
+
+    contextTokensUsed() {
+        const chatId = this.currentChatId;
+        // Only trust the shared live-stats object while THIS chat is streaming — otherwise
+        // it can still hold another chat's numbers mid-switch and leak across conversations.
+        if (this.isCurrentChatStreaming()) {
+            const live = Number(this.recentStats?.prompt_tokens + this.recentStats?.total_tokens || 0);
+            if (live > 0) return live;
+        }
+        // Idle: use per-chat data only. Most recent stored turn's saved stats first.
+        const msgs = this.messages || [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role !== 'user') continue;
+            const v = this.getActiveVariantForUser(msgs, i);
+            const s = v?._recentStats;
+            if (s && s.prompt_tokens > 0) {
+                return Number(s.prompt_tokens + (s.total_tokens || 0));
+            }
+        }
+        // Then the number cached on the conversation (persists across reloads/idle/prefill).
+        return Number(this.chatSessions?.[chatId]?.contextTokens || 0);
+    },
+
+    contextUsagePercent() {
+        const used = this.contextTokensUsed();
+        const win = this.contextWindowForCurrentModel();
+        if (!win || !used) return 0;
+        return Math.min(100, Math.round((used / win) * 100));
+    },
+
+    filteredChatHistory() {
+        const q = (this.chatSearchQuery || '').trim().toLowerCase();
+        let list = this.chatHistory;
+        if (q) {
+            list = list.filter(chat => {
+                if ((chat.title || '').toLowerCase().includes(q)) return true;
+                const session = this.getChatSession(chat.id, false);
+                const msgs = (session?.messages) || chat.messages || [];
+                return msgs.some(msg => {
+                    const c = msg?.content;
+                    if (typeof c === 'string') return c.toLowerCase().includes(q);
+                    if (Array.isArray(c)) return c.some(p => (p?.text || '').toLowerCase().includes(q));
+                    return false;
+                });
+            });
+        }
+        return list;
     },
 
     refreshCodeBlockButtons() {
@@ -6186,7 +6701,12 @@
 
             container.scrollTo({
                 top: container.scrollHeight,
-                behavior: force ? 'auto' : 'smooth'
+                // Instant while streaming (force=false) so rapid token-by-token
+                // scrolls don't animate and fight a user scrolling away; the scroll
+                // listener distinguishes this downward auto-follow from a user
+                // scrolling up by direction. Smooth only for explicit "jump to
+                // latest" (force=true).
+                behavior: force ? 'smooth' : 'auto'
             });
         });
     },

@@ -717,7 +717,9 @@ class TestServeCommandFunctions:
             get_model_dirs=lambda base_path: [tmp_path / "models"],
         )
         settings.get_effective_model_dirs = lambda: [tmp_path / "models"]
-        settings.memory = SimpleNamespace(memory_guard_tier="balanced")
+        settings.memory = SimpleNamespace(
+            memory_guard_tier="balanced", prefill_memory_guard=True
+        )
         settings.mcp = SimpleNamespace(config_path=None)
         settings.cache = SimpleNamespace(
             enabled=False,

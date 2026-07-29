@@ -97,6 +97,22 @@ final class MenubarMetricItemsController: NSObject, NSPopoverDelegate {
         }
     }
 
+    /// Drops every live metric item and builds fresh ones, forcing them
+    /// visible. Driven by the menu bar icon restore (#2368): these items
+    /// carry autosaveNames, so once their visibility is off AppKit remembers
+    /// that across launches and `sync()` alone never brings them back.
+    func rebuild() {
+        for entry in entries.values {
+            entry.popover.performClose(nil)
+            NSStatusBar.system.removeStatusItem(entry.item)
+        }
+        entries.removeAll()
+        sync()
+        for entry in entries.values {
+            entry.item.isVisible = true
+        }
+    }
+
     /// Closes every open metric popover, optionally keeping one. Also called
     /// when the main oMLX menu opens so dropdowns never stack.
     func closeAllPopovers(except kept: MenubarMetricsStore.Kind? = nil) {

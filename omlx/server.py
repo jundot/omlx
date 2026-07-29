@@ -187,6 +187,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
@@ -697,6 +698,12 @@ async def scheduler_queue_full_handler(
 
 
 def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
+    if isinstance(exc, PrefillMemoryAbortedError):
+        # This request was admitted and then killed mid-prefill, so "rejected
+        # this prompt" would be wrong. The message already names usage, the
+        # watermark and the binding ceiling with its own advice, so the
+        # generic ladder below is not appended.
+        return f"oMLX memory guard aborted this request mid-prefill: {str(exc)}"
     return (
         "oMLX prefill memory guard rejected this prompt: "
         f"{str(exc)} "
@@ -710,13 +717,18 @@ def _prefill_memory_openai_error_body(
     *,
     status_code: int = 400,
 ) -> dict:
+    code = (
+        "prefill_memory_aborted"
+        if isinstance(exc, PrefillMemoryAbortedError)
+        else "prefill_memory_exceeded"
+    )
     content = _openai_error_body(
         _prefill_memory_error_detail(exc),
         status_code,
-        code="prefill_memory_exceeded",
+        code=code,
     )
     content["type"] = "error"
-    content["error"]["omlx_code"] = "prefill_memory_exceeded"
+    content["error"]["omlx_code"] = code
     if exc.estimated_bytes is not None:
         content["error"]["estimated_bytes"] = exc.estimated_bytes
     if exc.limit_bytes is not None:

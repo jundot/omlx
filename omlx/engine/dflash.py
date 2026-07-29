@@ -2,8 +2,8 @@
 """
 DFlash engine for block diffusion speculative decoding.
 
-This engine wraps dflash-mlx (>= 0.1.5) to provide 3-4x faster decoding on
-Apple Silicon for Qwen and Gemma4 model families. By default it serves all
+This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
+Silicon for Qwen, Gemma4, and Laguna model families. By default it serves all
 requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
 evicting the dflash models and delegating long-context requests to omlx's
 BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
@@ -25,6 +25,7 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..cache.observability import CacheRateTracker
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -34,7 +35,12 @@ from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
 from ..utils.tokenizer import create_streaming_detokenizer
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    ActivityTrackingMixin,
+    BaseEngine,
+    GenerationOutput,
+    _warn_scheduler_unreachable_once,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +48,9 @@ logger = logging.getLogger(__name__)
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.5 registers QwenGdnTargetOps and Gemma4TargetOps. The
-    top-level ``model_type`` is the canonical discriminator: Gemma4 multimodal
+    DFlash 0.1.10 registers QwenGdnTargetOps and Gemma4TargetOps; oMLX adds a
+    Laguna target/draft adapter. The top-level ``model_type`` is the canonical
+    discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
     though their nested ``text_config.model_type`` is still ``gemma4_text``.
@@ -66,9 +73,10 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
 
     is_qwen = "qwen" in model_type
     is_gemma4 = model_type in ("gemma4", "gemma4_text")
-    if not (is_qwen or is_gemma4):
+    is_laguna = model_type == "laguna"
+    if not (is_qwen or is_gemma4 or is_laguna):
         return False, (
-            f"DFlash supports only Qwen and Gemma4 models "
+            f"DFlash supports only Qwen, Gemma4, and Laguna models "
             f"(model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
@@ -95,6 +103,12 @@ class _DFlashPrefillGuard:
         self._prefill_memory_guard: bool = False
         self._memory_hard_limit_bytes: int = 0
         self._memory_hot_cache_used_bytes: int = 0
+        # Component breakdown behind the ceiling above, so a rejection can
+        # name the binding constraint instead of generic tier advice.
+        self._memory_static_ceiling_bytes: int = 0
+        self._memory_dynamic_ceiling_bytes: int = 0
+        self._memory_metal_cap_bytes: int = 0
+        self._memory_guard_tier: str = ""
 
     def record_mlx_active_memory(self, active_bytes: int) -> None:
         self._last_mlx_active_memory_bytes = max(0, int(active_bytes))
@@ -127,10 +141,14 @@ class _DFlashPrefillGuard:
             prefill_step_size=self._prefill_step_size,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
+            static_ceiling_bytes=self._memory_static_ceiling_bytes,
+            dynamic_ceiling_bytes=self._memory_dynamic_ceiling_bytes,
+            metal_cap_bytes=self._memory_metal_cap_bytes,
+            memory_guard_tier=self._memory_guard_tier,
         )
 
 
-class DFlashEngine(BaseEngine):
+class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     """
     DFlash speculative decoding engine with optional batched fallback.
 
@@ -155,6 +173,7 @@ class DFlashEngine(BaseEngine):
         scheduler_config: Any | None = None,
         omlx_ssd_cache_dir: str | Path | None = None,
     ):
+        super().__init__()
         self._model_name = model_name
         self._draft_model_path = draft_model_path
         self._draft_quant_enabled = draft_quant_enabled
@@ -196,6 +215,9 @@ class DFlashEngine(BaseEngine):
         # Detected once in start() after the target model is loaded; None means
         # the streaming detokenizer is used as-is (qwen, llama, etc.).
         self._output_parser_factory: Any | None = None
+        # Session-scope hit/eviction rates for the admin cache observability
+        # panel, fed from the dflash-mlx runtime cache manager counters.
+        self._cache_rate_tracker = CacheRateTracker()
 
         self._max_dflash_ctx = (
             getattr(model_settings, "dflash_max_ctx", None) if model_settings else None
@@ -272,18 +294,26 @@ class DFlashEngine(BaseEngine):
         gs = group_size if group_size is not None else 64
         return f"w{wb}a{ab}:gs{gs}"
 
-    def _resolve_dflash_l2_dir(self) -> Path | None:
-        """Compute the dflash L2 cache directory under the omlx SSD cache root."""
+    def _resolve_dflash_l2_dir(self, quiet: bool = False) -> Path | None:
+        """Compute the dflash L2 cache directory under the omlx SSD cache root.
+
+        ``quiet`` suppresses the misconfiguration warnings for callers that
+        poll (the admin stats path); the load-time callers keep them.
+        """
         if not self._ssd_cache_requested:
             return None
         if self._omlx_ssd_cache_dir is None:
-            logger.warning(
-                "DFlash SSD cache requested but omlx paged SSD cache directory is "
-                "not configured; disabling L2."
-            )
+            if not quiet:
+                logger.warning(
+                    "DFlash SSD cache requested but omlx paged SSD cache directory "
+                    "is not configured; disabling L2."
+                )
             return None
         if not self._in_memory_cache_enabled:
-            logger.warning("DFlash SSD cache requires in-memory cache; disabling L2.")
+            if not quiet:
+                logger.warning(
+                    "DFlash SSD cache requires in-memory cache; disabling L2."
+                )
             return None
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
@@ -321,6 +351,7 @@ class DFlashEngine(BaseEngine):
 
         def _load_models():
             from dflash_mlx.draft_backend import EagerDraftBackend
+            from dflash_mlx.engine.target_ops import bind_draft_to_target
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
                 load_target_bundle,
@@ -336,14 +367,32 @@ class DFlashEngine(BaseEngine):
                 self._model_name, model_settings=self._model_settings
             )
 
+            # dflash-mlx 0.1.10 has no Laguna backend. Register oMLX's strict
+            # TargetOps plus the official gated Laguna drafter specialization
+            # before load_target_bundle resolves either architecture.
+            from ..patches.dflash_laguna import install_dflash_laguna_backend
+
+            install_dflash_laguna_backend()
+
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
             # Native MTP load on the same process would see leftover dflash
             # hooks and crash with TypeError on n_confirmed (issue #1388).
             # Idempotent — only wraps once per process.
+            from ..patches.dflash_draft_config import (
+                install_dflash_draft_config_normalizer,
+            )
             from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
 
             install_dflash_lifecycle_wrap()
+            # Newer z-lab drafts ship transformers 5.x-style configs that nest
+            # rope_theta under rope_parameters and block_size under
+            # dflash_config, but DFlashDraftModelArgs requires both at the
+            # config root with no defaults. Without this, load_draft_bundle
+            # crashes with a missing-positional-argument TypeError and
+            # engine_pool falls back to the vlm engine (issue #2317).
+            # Idempotent — only wraps once per process.
+            install_dflash_draft_config_normalizer()
 
             target_bundle = load_target_bundle(
                 self._model_name,
@@ -352,6 +401,30 @@ class DFlashEngine(BaseEngine):
                 ),
                 verify_config=getattr(runtime_context, "verify", None),
             )
+
+            # Keep DFlash targets on the same post-load MoE fast path as the
+            # regular batched engine.  Laguna uses mlx-lm's SwitchGLU for its
+            # routed experts, so fusing gate+up removes one gather_qmm launch
+            # per MoE layer in both target prefill and block verification.
+            if (
+                getattr(
+                    self._model_settings,
+                    "moe_gate_up_fusion_enabled",
+                    True,
+                )
+                is not False
+            ):
+                try:
+                    from ..patches.qwen35_moe_gate_up import (
+                        apply_qwen35_moe_gate_up_fusion,
+                    )
+
+                    apply_qwen35_moe_gate_up_fusion(target_bundle.model)
+                except Exception:
+                    logger.debug(
+                        "DFlash target MoE gate+up fusion not applied",
+                        exc_info=True,
+                    )
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=(
@@ -363,6 +436,11 @@ class DFlashEngine(BaseEngine):
                     if self._draft_quant_enabled
                     else None
                 ),
+            )
+            bind_draft_to_target(
+                draft,
+                target_bundle.model,
+                target_ops=target_bundle.target_ops,
             )
             draft_backend = EagerDraftBackend()
             return target_bundle, draft, draft_backend
@@ -1085,9 +1163,15 @@ class DFlashEngine(BaseEngine):
             )
             self._active_request = False
 
+    def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
+        """Return prompt IDs without re-tokenizing an already-tokenized prompt."""
+        if isinstance(prompt, list):
+            return list(prompt)
+        return list(self._tokenizer_obj.encode(prompt))
+
     async def generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -1101,7 +1185,7 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt_tokens = self._tokenizer_obj.encode(prompt)
+        prompt_tokens = self._tokenize_prompt(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
@@ -1145,6 +1229,9 @@ class DFlashEngine(BaseEngine):
 
         loop = asyncio.get_running_loop()
         stop_event = threading.Event()
+        # Admin visibility: DFlash bypasses the scheduler, so the Active
+        # Models card reads this activity instead of a scheduler snapshot.
+        activity_id = self._begin_activity("generate", detail="generating")
 
         def _run():
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
@@ -1182,6 +1269,7 @@ class DFlashEngine(BaseEngine):
                         if token_id in stop_ids:
                             continue
                         tokens.append(token_id)
+                        self._update_activity(activity_id, token_count=len(tokens))
                         if parser_session is not None:
                             result = parser_session.process_token(token_id)
                             if result.visible_text:
@@ -1215,24 +1303,29 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            (
-                summary,
-                generated,
-                parser_session,
-                parsed_visible_parts,
-                prefix_flow,
-                first_token_at,
-            ) = await asyncio.shield(asyncio.wrap_future(future))
-        except asyncio.CancelledError:
-            stop_event.set()
-            logger.info("DFlash generate cancelled, waiting for executor to drain")
             try:
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except TimeoutError:
-                logger.warning("DFlash executor did not exit within 10s after abort")
-            except Exception:
-                pass
-            raise
+                (
+                    summary,
+                    generated,
+                    parser_session,
+                    parsed_visible_parts,
+                    prefix_flow,
+                    first_token_at,
+                ) = await asyncio.shield(asyncio.wrap_future(future))
+            except asyncio.CancelledError:
+                stop_event.set()
+                logger.info("DFlash generate cancelled, waiting for executor to drain")
+                try:
+                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
+                except TimeoutError:
+                    logger.warning(
+                        "DFlash executor did not exit within 10s after abort"
+                    )
+                except Exception:
+                    pass
+                raise
+        finally:
+            self._end_activity(activity_id)
 
         if parser_session is not None:
             # Parser already converted protocol markers to <think>...</think>
@@ -1276,7 +1369,7 @@ class DFlashEngine(BaseEngine):
 
     async def stream_generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -1290,7 +1383,7 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt_tokens = self._tokenizer_obj.encode(prompt)
+        prompt_tokens = self._tokenize_prompt(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
@@ -1354,6 +1447,9 @@ class DFlashEngine(BaseEngine):
 
         from ..engine_core import get_mlx_executor
 
+        # Admin visibility: DFlash bypasses the scheduler, so the Active
+        # Models card reads this activity instead of a scheduler snapshot.
+        activity_id = self._begin_activity("generate", detail="generating")
         self._active_request = True
         future = loop.run_in_executor(
             get_mlx_executor(),
@@ -1380,6 +1476,7 @@ class DFlashEngine(BaseEngine):
 
                 total_text += new_text
                 total_completion += len(new_tokens)
+                self._update_activity(activity_id, token_count=total_completion)
 
                 finish_reason = None
                 if finished:
@@ -1404,6 +1501,10 @@ class DFlashEngine(BaseEngine):
                 if finished:
                     break
         finally:
+            # End the admin activity before the drain await below: a second
+            # cancellation delivered during that await would skip anything
+            # placed after it and leak a phantom active count.
+            self._end_activity(activity_id)
             # Signal the executor to stop so the next request isn't blocked
             # behind a cancelled generation. Wait briefly for the dflash loop
             # to break out at its next event boundary; the timeout caps how
@@ -1600,7 +1701,10 @@ class DFlashEngine(BaseEngine):
             and self._fallback_engine.has_active_requests()
         ):
             return True
-        return self._active_request
+        if self._active_request:
+            return True
+        with self._active_lock:
+            return self._active_count > 0
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -1619,3 +1723,128 @@ class DFlashEngine(BaseEngine):
         if self._fallback_engine is not None:
             return self._fallback_engine.get_cache_stats()
         return None
+
+    def _scan_dflash_l2_files(self) -> tuple[int, int]:
+        """Count L2 snapshot files and their total bytes on disk.
+
+        The dflash-mlx L2 stats only track bytes written this session, so the
+        directory scan is the source of truth — it also covers snapshots
+        persisted by previous runs. Dot-prefixed temp files from in-flight
+        writes are skipped.
+        """
+        l2_dir = self._resolve_dflash_l2_dir(quiet=True)
+        if l2_dir is None:
+            return 0, 0
+        num_files = 0
+        total_bytes = 0
+        try:
+            if not l2_dir.exists():
+                return 0, 0
+            for path in l2_dir.rglob("*.safetensors"):
+                if path.name.startswith("."):
+                    continue
+                try:
+                    total_bytes += path.stat().st_size
+                except OSError:
+                    continue
+                num_files += 1
+        except OSError as exc:
+            logger.debug(f"DFlash L2 cache scan failed: {exc}")
+        return num_files, total_bytes
+
+    def get_runtime_cache_stats(self) -> dict[str, Any] | None:
+        """Runtime cache stats for the admin observability panel.
+
+        Returns the same shape as ``Scheduler.get_ssd_cache_stats()`` so the
+        admin route can render DFlash models with the existing pipeline: the
+        dflash-mlx L1 in-memory cache maps to the hot tier and the L2
+        snapshot directory to the SSD tier. Block fields are omitted because
+        the dflash cache is snapshot-based, not block-based.
+        """
+        if self._in_fallback_mode:
+            # The fallback engine's scheduler owns the caches in this mode;
+            # the admin route reads it through the ``scheduler`` property.
+            return None
+        if not self._in_memory_cache_enabled:
+            return None
+
+        manager_stats: dict[str, Any] | None = None
+        try:
+            from dflash_mlx.cache.manager import (
+                RuntimeCacheManagerClosed,
+                current_runtime_cache_manager,
+            )
+
+            manager = current_runtime_cache_manager()
+            if manager is not None:
+                try:
+                    manager_stats = manager.stats()
+                except RuntimeCacheManagerClosed:
+                    manager_stats = None
+        except ImportError:
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"DFlash runtime cache stats unavailable: {exc}")
+
+        num_files, total_size_bytes = self._scan_dflash_l2_files()
+        l2_enabled = self._resolve_dflash_l2_dir(quiet=True) is not None
+
+        # The manager is created lazily on the first request; before that,
+        # fall back to the configured budgets so the panel shows real caps.
+        hot_max = self._in_memory_cache_max_bytes
+        hot_size = 0
+        hot_entries = 0
+        stats: dict[str, Any] = {}
+        if manager_stats is not None:
+            hot_max = int(manager_stats.get("max_bytes", hot_max) or 0)
+            hot_size = int(manager_stats.get("current_bytes", 0) or 0)
+            hot_entries = int(manager_stats.get("current_entries", 0) or 0)
+            stats["cache_rates"] = self._cache_rate_tracker.snapshot_and_get_rates(
+                self._map_cache_counters(manager_stats)
+            )
+        stats["ssd_cache"] = {
+            "num_files": num_files,
+            "total_size_bytes": total_size_bytes,
+            "max_size_bytes": self._ssd_cache_max_bytes if l2_enabled else 0,
+            "hot_cache_max_bytes": hot_max,
+            "hot_cache_size_bytes": hot_size,
+            "hot_cache_entries": hot_entries,
+        }
+        return stats
+
+    @staticmethod
+    def _map_cache_counters(manager_stats: dict[str, Any]) -> dict[str, int]:
+        """Map dflash-mlx runtime cache counters onto the scheduler's
+        CacheRateTracker keys: L1 acts as the hot tier and L2 as the disk
+        tier. ``exact_hits``/``prefix_hits``/``misses`` are already merged
+        across both tiers by the dflash-mlx snapshot store, so the L1-only
+        hit count is recovered by subtracting ``l2_hits``.
+        """
+
+        def _int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        l2 = manager_stats.get("l2")
+        if not isinstance(l2, dict):
+            l2 = {}
+        merged_hits = _int(manager_stats.get("exact_hits")) + _int(
+            manager_stats.get("prefix_hits")
+        )
+        misses = _int(manager_stats.get("misses"))
+        l1_evictions = _int(manager_stats.get("evictions"))
+        l2_hits = _int(manager_stats.get("l2_hits"))
+        l2_evictions = _int(l2.get("evictions"))
+        return {
+            "prefix_hits": merged_hits,
+            "prefix_misses": misses,
+            "prefix_tokens_saved": _int(manager_stats.get("prefill_tokens_saved")),
+            "evictions": l1_evictions + l2_evictions,
+            "ssd_hot_hits": max(0, merged_hits - l2_hits),
+            "ssd_disk_loads": l2_hits,
+            "ssd_saves": _int(l2.get("writes")),
+            "hot_cache_evictions": l1_evictions,
+            "hot_cache_promotions": l2_hits,
+        }

@@ -1,6 +1,7 @@
 """Tests for the integrations module."""
 
 import json
+import plistlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +11,7 @@ from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.base import IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
-from omlx.integrations.codex_app import CodexAppIntegration
+from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
@@ -243,6 +244,23 @@ name = "old-omlx"
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
 
+def make_app_bundle(
+    root: Path, name: str, bundle_id: str, with_cli: bool = True
+) -> Path:
+    """Create a fake macOS app bundle with an Info.plist and optional CLI."""
+    contents = root / name / "Contents"
+    contents.mkdir(parents=True)
+    with (contents / "Info.plist").open("wb") as f:
+        plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+    if with_cli:
+        resources = contents / "Resources"
+        resources.mkdir()
+        cli = resources / "codex"
+        cli.write_text("#!/bin/sh\n")
+        cli.chmod(0o755)
+    return root / name
+
+
 class TestCodexAppIntegration:
     def test_get_command(self):
         codex_app = CodexAppIntegration()
@@ -282,6 +300,10 @@ class TestCodexAppIntegration:
             patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
             patch("omlx.integrations.codex_app.os.environ", base_env),
             patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
+            patch(
+                "omlx.integrations.codex_app.resolve_codex_binary",
+                return_value="/opt/homebrew/bin/codex",
+            ),
         ):
             codex_app.launch(
                 ctx(
@@ -293,11 +315,68 @@ class TestCodexAppIntegration:
             )
 
         # Codex App should launch with "app" subcommand, not "-m <model>"
-        assert captured["argv"] == ["codex", "app"]
+        assert captured["argv"] == ["/opt/homebrew/bin/codex", "app"]
         assert captured["env"]["OMLX_API_KEY"] == "key"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+    def test_is_installed_with_app_bundle_only(self, tmp_path):
+        # DMG-only install: no codex CLI on PATH, old bundle folder name
+        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert find_codex_app_bundle() == bundle
+            assert CodexAppIntegration().is_installed()
+
+    def test_is_installed_with_renamed_chatgpt_bundle(self, tmp_path):
+        # Post-rename fresh install: ChatGPT.app folder, codex bundle id
+        make_app_bundle(tmp_path, "ChatGPT.app", "com.openai.codex")
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert CodexAppIntegration().is_installed()
+
+    def test_legacy_chatgpt_chat_app_not_matched(self, tmp_path):
+        # The old ChatGPT chat app has a different bundle id and no codex CLI
+        make_app_bundle(tmp_path, "ChatGPT.app", "com.openai.chat")
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert find_codex_app_bundle() is None
+            assert not CodexAppIntegration().is_installed()
+
+    def test_not_installed_without_cli_or_bundle(self, tmp_path):
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert not CodexAppIntegration().is_installed()
+
+    def test_launch_falls_back_to_bundled_cli(self, tmp_path):
+        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
+        config_path = tmp_path / "codex" / "config.toml"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+
+        with (
+            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+            patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
+        ):
+            CodexAppIntegration().launch(ctx(port=8000, api_key="key", model="q"))
+
+        bundled = str(bundle / "Contents" / "Resources" / "codex")
+        assert captured["binary"] == bundled
+        assert captured["argv"] == [bundled, "app"]
 
     def test_type(self):
         codex_app = CodexAppIntegration()

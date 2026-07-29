@@ -26,6 +26,12 @@ import SwiftUI
 @MainActor
 final class MenubarController: NSObject {
 
+    /// Posted by Appearance > Menu Bar Icon > Restore. The screen has no
+    /// handle on this controller, and the status item can only be rebuilt
+    /// from here, so the request travels as a notification like the rest of
+    /// the settings → menubar plumbing.
+    static let restoreIconRequestNotification = Notification.Name("OMLXMenubarRestoreIconRequest")
+
     // MARK: - Inputs / state
 
     private let server: ServerProcess?
@@ -180,6 +186,13 @@ final class MenubarController: NSObject {
             selector: #selector(defaultsDidChange(_:)),
             name: UserDefaults.didChangeNotification,
             object: UserDefaults.standard
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(restoreIconRequested(_:)),
+            name: MenubarController.restoreIconRequestNotification,
+            object: nil
         )
 
         if let server {
@@ -751,6 +764,7 @@ final class MenubarController: NSObject {
         NSStatusBar.system.removeStatusItem(statusItem)
         let newStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         newStatusItem.behavior = []
+        newStatusItem.isVisible = true
         newStatusItem.menu = menu
         newStatusItem.button?.setAccessibilityLabel("oMLX")
         newStatusItem.button?.toolTip = "oMLX"
@@ -831,6 +845,19 @@ final class MenubarController: NSObject {
 
     @objc private func updateStateChanged(_ note: Notification) {
         refreshUpdateMenuItem()
+    }
+
+    /// Appearance > Menu Bar Icon > Restore. Repairs the StatusKit approval
+    /// and rebuilds the status item in one shot — the launch-time watcher
+    /// only ever offers this once per process, and a menu bar manager or a
+    /// probe that reads the item as visible suppresses it entirely, so this
+    /// is the reachable path once the icon is already gone (#2368).
+    @objc private func restoreIconRequested(_ note: Notification) {
+        MenubarIconRecovery.restore { [weak self] in
+            _ = self?.recreateStatusItem()
+            self?.metricItemsController.rebuild()
+            self?.systemItemsController.rebuild()
+        }
     }
 
     /// UserDefaults writes can come from any thread; hop to the main actor

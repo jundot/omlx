@@ -12,6 +12,10 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class PrefillTransientTracker:
     """EWMA estimator of MLX prefill chunk transient bytes per token.
@@ -22,6 +26,12 @@ class PrefillTransientTracker:
     """
 
     _EWMA_ALPHA = 0.3  # weight on the most recent chunk
+    # Candidates above this are rejected from the running max: a one-off
+    # Metal/pool spike this large is not a repeatable chunk transient, and
+    # charging it at admission would refuse prompts that always fit. A
+    # genuinely recurring giant transient still reaches the guard through
+    # the last-delta/EWMA terms of _predicted_chunk_transient.
+    _OBSERVED_MAX_CLAMP_BYTES = 4 * 1024**3
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -30,18 +40,49 @@ class PrefillTransientTracker:
         # Last observed delta for debug log inspection.
         self._last_delta_bytes: int = 0
         self._last_n_tokens: int = 0
+        # Largest floor-size chunk transient seen this session: a stable
+        # flat bound for admission and the pre-chunk guard's pass/abort
+        # gates, matching the floor-chunk charge they price. Never used
+        # for chunk sizing.
+        self._observed_max_bytes: int = 0
 
-    def update(self, n_tokens: int, transient_bytes: int) -> None:
+    def update(
+        self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
+    ) -> None:
         """Record one chunk observation.
 
         Negative deltas (MLX cache pool reclaim larger than this chunk's
         allocation) are skipped — they would bias the EWMA toward zero
         and underestimate the next chunk's footprint.
+
+        ``floor_sample`` marks a chunk at the throttle's floor size. Only
+        those feed the running max: admission charges the floor chunk, and
+        chunk-transient maxima are NOT size-invariant across models
+        (Qwen3.6 measured ~3.0GB at 2048-token chunks vs far less at the
+        floor; charging the big-chunk max at admission rejected every
+        prompt at a 21GB ceiling). Big-chunk transients stay the throttle's
+        domain via the EWMA/last-delta terms.
         """
         if n_tokens <= 0:
             return
         if transient_bytes <= 0:
             return
+
+        # The very first sample after a model load carries weight page-fault
+        # and load-residue noise, so it seeds the EWMA but is excluded from
+        # the running max.
+        if floor_sample and self._samples > 0:
+            if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
+                if transient_bytes > self._observed_max_bytes:
+                    self._observed_max_bytes = transient_bytes
+            else:
+                logger.debug(
+                    "PrefillTransientTracker(%s): rejected %d-byte outlier "
+                    "from observed max (clamp %d)",
+                    self._model_id,
+                    transient_bytes,
+                    self._OBSERVED_MAX_CLAMP_BYTES,
+                )
 
         per_token = transient_bytes / n_tokens
         if self._samples == 0:
@@ -85,9 +126,15 @@ class PrefillTransientTracker:
         """Token count of the most recently measured chunk."""
         return self._last_n_tokens
 
+    @property
+    def observed_max_bytes(self) -> int:
+        """Largest accepted chunk transient this session (0 if none yet)."""
+        return self._observed_max_bytes
+
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
         self._ewma_per_token = 0.0
         self._samples = 0
         self._last_delta_bytes = 0
         self._last_n_tokens = 0
+        self._observed_max_bytes = 0

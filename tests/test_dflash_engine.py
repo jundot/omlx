@@ -3,6 +3,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -422,7 +423,7 @@ class TestDFlashEngineInit:
 
             from omlx.engine import dflash as dflash_mod
             from omlx.engine.dflash import DFlashEngine
-            from omlx.patches import dflash_lifecycle
+            from omlx.patches import dflash_lifecycle, qwen35_moe_gate_up
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
@@ -445,7 +446,13 @@ class TestDFlashEngineInit:
         def fake_load_draft_bundle(model_ref, **kwargs):
             captured["draft_model_ref"] = model_ref
             captured["draft_kwargs"] = kwargs
-            return SimpleNamespace(), {}
+
+            class FakeDraft:
+                def bind_target_model(self, target_model, *, target_ops):
+                    captured["bound_target"] = target_model
+                    captured["bound_target_ops"] = target_ops
+
+            return FakeDraft(), {}
 
         monkeypatch.setattr(
             dflash_loading, "load_target_bundle", fake_load_target_bundle
@@ -460,6 +467,11 @@ class TestDFlashEngineInit:
             dflash_lifecycle,
             "install_dflash_lifecycle_wrap",
             lambda: True,
+        )
+        monkeypatch.setattr(
+            qwen35_moe_gate_up,
+            "apply_qwen35_moe_gate_up_fusion",
+            lambda model: captured.setdefault("fused_target", model),
         )
         monkeypatch.setattr(
             dflash_mod,
@@ -484,6 +496,9 @@ class TestDFlashEngineInit:
             assert captured["draft_model_ref"] == "test-draft"
             assert verify_config.mode == "off"
             assert captured["quantize_kv_cache"] is False
+            assert captured["fused_target"] is engine._target_model
+            assert captured["bound_target"] is engine._target_model
+            assert captured["bound_target_ops"] is engine._target_ops
         finally:
             await engine.stop()
 
@@ -640,7 +655,7 @@ class TestDFlashEngineInit:
             ),
         )
         ctx = engine._build_runtime_context()
-        runtime = getattr(ctx, "runtime")
+        runtime = ctx.runtime
         assert runtime.draft_window_size == 512
         assert runtime.draft_sink_size == 16
         assert runtime.verify_mode == "dflash"
@@ -657,7 +672,7 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
         )
         ctx = engine._build_runtime_context()
-        runtime = getattr(ctx, "runtime")
+        runtime = ctx.runtime
         assert runtime.draft_window_size == 1024
         assert runtime.draft_sink_size == 64
         assert runtime.verify_mode == "adaptive"
@@ -681,7 +696,7 @@ class TestDFlashEngineInit:
             omlx_ssd_cache_dir=tmp_path,
         )
         ctx = engine._build_runtime_context()
-        runtime = getattr(ctx, "runtime")
+        runtime = ctx.runtime
         assert runtime.prefix_cache_l2_max_bytes == 5 * 1024**3
 
     def test_l2_max_bytes_defaults_to_20gib(self, tmp_path):
@@ -701,7 +716,7 @@ class TestDFlashEngineInit:
             omlx_ssd_cache_dir=tmp_path,
         )
         ctx = engine._build_runtime_context()
-        runtime = getattr(ctx, "runtime")
+        runtime = ctx.runtime
         assert runtime.prefix_cache_l2_max_bytes == 20 * 1024**3
 
 
@@ -780,6 +795,17 @@ class TestDFlashCompatibility:
         assert compatible is True
         assert reason == ""
 
+    def test_laguna_is_compatible(self, tmp_path):
+        """oMLX supplies the target and gated-drafter adapters for Laguna."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "laguna")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
     def test_gemma4_assistant_is_incompatible(self, tmp_path):
         """MTP -assistant variants declare gemma4_assistant at the top level
         even though their text_config.model_type is gemma4_text. The toggle
@@ -821,6 +847,7 @@ class TestDFlashCompatibility:
         assert compatible is False
         assert "Qwen" in reason
         assert "Gemma4" in reason
+        assert "Laguna" in reason
 
 
 class TestDFlashEnginePoolRouting:
@@ -1184,3 +1211,196 @@ class TestDFlashCachedTokensWiring:
 
         out = await engine.generate("hello", max_tokens=4)
         assert out.cached_tokens == 4273
+
+
+class TestDFlashPretokenizedPrompt:
+    def test_token_ids_bypass_tokenizer(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine.__new__(DFlashEngine)
+        engine._tokenizer_obj = MagicMock()
+
+        prompt = [11, 22, 33]
+        result = engine._tokenize_prompt(prompt)
+
+        assert result == prompt
+        assert result is not prompt
+        engine._tokenizer_obj.encode.assert_not_called()
+
+    def test_text_prompt_uses_tokenizer(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine.__new__(DFlashEngine)
+        engine._tokenizer_obj = MagicMock()
+        engine._tokenizer_obj.encode.return_value = [1, 2, 3]
+
+        assert engine._tokenize_prompt("hello") == [1, 2, 3]
+        engine._tokenizer_obj.encode.assert_called_once_with("hello")
+
+
+class TestDFlashActivityTracking:
+    """DFlash bypasses the scheduler, so the admin Active Models card reads
+    the engine's own activity snapshot (#2396)."""
+
+    def _engine(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        return DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+
+    def test_activity_snapshot_reflects_in_flight_request(self):
+        engine = self._engine()
+        assert engine.get_activity_snapshot()["active_requests"] == 0
+        assert engine.has_active_requests() is False
+
+        activity_id = engine._begin_activity("generate", detail="generating")
+        snapshot = engine.get_activity_snapshot()
+        assert snapshot["active_requests"] == 1
+        assert snapshot["activities"][0]["detail"] == "generating"
+        assert engine.has_active_requests() is True
+
+        engine._update_activity(activity_id, token_count=42)
+        assert engine.get_activity_snapshot()["activities"][0]["token_count"] == 42
+
+        engine._end_activity(activity_id)
+        assert engine.get_activity_snapshot()["active_requests"] == 0
+        assert engine.has_active_requests() is False
+
+    def test_reset_activity_tracking_clears_phantom_counts(self):
+        engine = self._engine()
+        engine._begin_activity("generate", detail="generating")
+        engine._reset_activity_tracking()
+        assert engine.get_activity_snapshot()["active_requests"] == 0
+        assert engine.has_active_requests() is False
+
+
+class TestDFlashRuntimeCacheStats:
+    """DFlash adapts its dflash-mlx runtime cache to the scheduler stats
+    shape so the admin cache observability panel can render it (#2396)."""
+
+    def _engine(self, model_settings=None, omlx_ssd_cache_dir=None):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        return DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=model_settings,
+            omlx_ssd_cache_dir=omlx_ssd_cache_dir,
+        )
+
+    def test_returns_none_when_memory_cache_disabled(self):
+        settings = ModelSettings(dflash_in_memory_cache=False)
+        engine = self._engine(model_settings=settings)
+        assert engine.get_runtime_cache_stats() is None
+
+    def test_returns_none_in_fallback_mode(self):
+        engine = self._engine()
+        engine._in_fallback_mode = True
+        assert engine.get_runtime_cache_stats() is None
+
+    def test_budget_fallback_before_first_request(self, monkeypatch):
+        engine = self._engine()
+        import dflash_mlx.cache.manager as manager_mod
+
+        monkeypatch.setattr(manager_mod, "current_runtime_cache_manager", lambda: None)
+
+        stats = engine.get_runtime_cache_stats()
+        assert stats is not None
+        assert "cache_rates" not in stats
+        ssd = stats["ssd_cache"]
+        assert ssd["hot_cache_max_bytes"] == 8 * 1024**3
+        assert ssd["hot_cache_size_bytes"] == 0
+        assert ssd["hot_cache_entries"] == 0
+        assert ssd["num_files"] == 0
+        assert ssd["total_size_bytes"] == 0
+        assert ssd["max_size_bytes"] == 0  # SSD cache not requested
+
+    def test_manager_stats_mapped_to_panel_shape(self, monkeypatch):
+        engine = self._engine()
+        import dflash_mlx.cache.manager as manager_mod
+
+        manager = SimpleNamespace(
+            stats=lambda: {
+                "exact_hits": 3,
+                "prefix_hits": 2,
+                "misses": 4,
+                "evictions": 1,
+                "prefill_tokens_saved": 999,
+                "current_entries": 2,
+                "current_bytes": 1234,
+                "max_bytes": 5678,
+                "l2_hits": 2,
+                "l2_misses": 3,
+                "l2": {
+                    "current_bytes": 10,
+                    "max_bytes": 100,
+                    "writes": 7,
+                    "evictions": 5,
+                },
+            }
+        )
+        monkeypatch.setattr(
+            manager_mod, "current_runtime_cache_manager", lambda: manager
+        )
+
+        stats = engine.get_runtime_cache_stats()
+        ssd = stats["ssd_cache"]
+        assert ssd["hot_cache_entries"] == 2
+        assert ssd["hot_cache_size_bytes"] == 1234
+        assert ssd["hot_cache_max_bytes"] == 5678
+
+        cumulative = stats["cache_rates"]["cumulative"]
+        assert cumulative["prefix_hits"] == 5
+        assert cumulative["prefix_misses"] == 4
+        assert cumulative["prefix_tokens_saved"] == 999
+        assert cumulative["evictions"] == 6
+        assert cumulative["ssd_hot_hits"] == 3
+        assert cumulative["ssd_disk_loads"] == 2
+        assert cumulative["ssd_saves"] == 7
+        assert cumulative["hot_cache_evictions"] == 1
+
+    def test_closed_manager_falls_back_to_budgets(self, monkeypatch):
+        engine = self._engine()
+        import dflash_mlx.cache.manager as manager_mod
+
+        def _raise():
+            raise manager_mod.RuntimeCacheManagerClosed("retired")
+
+        manager = SimpleNamespace(stats=_raise)
+        monkeypatch.setattr(
+            manager_mod, "current_runtime_cache_manager", lambda: manager
+        )
+
+        stats = engine.get_runtime_cache_stats()
+        assert stats is not None
+        assert "cache_rates" not in stats
+        assert stats["ssd_cache"]["hot_cache_max_bytes"] == 8 * 1024**3
+
+    def test_l2_scan_counts_snapshot_files(self, tmp_path, monkeypatch):
+        settings = ModelSettings(dflash_ssd_cache=True)
+        engine = self._engine(model_settings=settings, omlx_ssd_cache_dir=tmp_path)
+        import dflash_mlx.cache.manager as manager_mod
+
+        monkeypatch.setattr(manager_mod, "current_runtime_cache_manager", lambda: None)
+
+        bucket = tmp_path / "dflash_l2" / "ab"
+        bucket.mkdir(parents=True)
+        (bucket / "snap1.safetensors").write_bytes(b"x" * 128)
+        (bucket / ".snap1.tmp123.safetensors").write_bytes(b"y" * 64)
+
+        stats = engine.get_runtime_cache_stats()
+        ssd = stats["ssd_cache"]
+        assert ssd["num_files"] == 1
+        assert ssd["total_size_bytes"] == 128
+        assert ssd["max_size_bytes"] == 20 * 1024**3
+
+    def test_map_cache_counters_clamps_hot_hits(self):
+        engine = self._engine()
+        counters = engine._map_cache_counters(
+            {"exact_hits": 1, "prefix_hits": 0, "l2_hits": 5, "l2": {}}
+        )
+        assert counters["ssd_hot_hits"] == 0
+        assert counters["ssd_disk_loads"] == 5

@@ -21,6 +21,15 @@ from .base import BaseNonStreamingEngine
 logger = logging.getLogger(__name__)
 
 
+def _input_length(item: Union[str, Dict[str, str]]) -> int:
+    """Approximate token cost of one embedding input, used only to group similar sizes."""
+    if isinstance(item, str):
+        return len(item)
+    if isinstance(item, dict):
+        return sum(len(v) for v in item.values() if isinstance(v, str))
+    return 0
+
+
 class EmbeddingEngine(BaseNonStreamingEngine):
     """
     Engine for generating text embeddings.
@@ -151,8 +160,14 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             total_tokens = 0
             dimensions = 0
 
-            for start in range(0, len(input_items), batch_size):
-                batch = input_items[start:start + batch_size]
+            # A batch pads every input to its longest member, so a batch of mixed lengths spends
+            # most of its compute on padding. Group similar lengths together and restore the
+            # caller's order before returning, which leaves the response contract unchanged.
+            order = sorted(range(len(input_items)), key=lambda i: _input_length(input_items[i]))
+            ordered_items = [input_items[i] for i in order]
+
+            for start in range(0, len(ordered_items), batch_size):
+                batch = ordered_items[start:start + batch_size]
 
                 def _embed_sync():
                     try:
@@ -177,6 +192,12 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                     token_count=total_tokens,
                     dimensions=dimensions,
                 )
+
+            if len(embeddings) == len(order):
+                restored: List[List[float]] = [[]] * len(order)
+                for position, original_index in enumerate(order):
+                    restored[original_index] = embeddings[position]
+                embeddings = restored
 
             output = EmbeddingOutput(
                 embeddings=embeddings,

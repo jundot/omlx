@@ -94,11 +94,35 @@ private struct SchedulerSection: View {
                               comment: "Row label for chunked prefill toggle"),
                 sublabel: String(localized: "performance.scheduler.chunked_prefill.sub",
                                  defaultValue: "Split long prompts across scheduler ticks so other requests can interleave.",
-                                 comment: "Sublabel for chunked prefill toggle"),
-                isLast: true
+                                 comment: "Sublabel for chunked prefill toggle")
             ) {
                 Toggle("", isOn: $vm.chunkedPrefill)
                     .labelsHidden().toggleStyle(.switch)
+            }
+            Row(
+                label: String(localized: "performance.scheduler.prefill_priority",
+                              defaultValue: "Prefill Priority",
+                              comment: "Row label for the prefill priority segmented control"),
+                sublabel: String(localized: "performance.scheduler.prefill_priority.sub",
+                                 defaultValue: "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit.",
+                                 comment: "Sublabel for the prefill priority segmented control"),
+                isLast: true
+            ) {
+                Segmented(
+                    selection: $vm.prefillPriority,
+                    options: [
+                        (value: "context",
+                         label: String(localized: "prefill_priority.option.max_context",
+                                       defaultValue: "Max Context",
+                                       comment: "Prefill priority option that favors the largest context")),
+                        (value: "speed",
+                         label: String(localized: "prefill_priority.option.speed",
+                                       defaultValue: "Speed",
+                                       comment: "Prefill priority option that favors prefill speed")),
+                    ],
+                    icons: ["arrow.up.left.and.arrow.down.right", "speedometer"]
+                )
+                .frame(width: 240)
             }
         }
     }
@@ -108,6 +132,7 @@ private struct SchedulerSection: View {
 
 private struct MemoryLifecycleSection: View {
     @Bindable var vm: PerformanceScreenVM
+    @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         SectionHeader(
@@ -181,6 +206,9 @@ private struct MemoryLifecycleSection: View {
                     )
                 }
             }
+            if vm.memoryGuardBreakdown != nil || vm.wiredLimitWarningText != nil {
+                ceilingPreviewRow
+            }
             Row(
                 label: String(localized: "performance.memory.idle_timeout",
                               defaultValue: "Idle Timeout",
@@ -210,6 +238,46 @@ private struct MemoryLifecycleSection: View {
             ) {
                 Toggle("", isOn: $vm.modelFallback)
                     .labelsHidden().toggleStyle(.switch)
+            }
+        }
+    }
+
+    /// Effective-ceiling preview + kernel Metal limit warning. Mirrors the
+    /// web dashboard's breakdown under the guard tier dropdown: without it
+    /// a Custom ceiling above the Metal cap looks accepted while the guard
+    /// silently enforces the clamped value (#1463).
+    private var ceilingPreviewRow: some View {
+        FreeRow {
+            VStack(alignment: .leading, spacing: 8) {
+                if let breakdown = vm.memoryGuardBreakdown {
+                    Text(breakdown)
+                        .font(.omlxText(11.5))
+                        .foregroundStyle(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let warning = vm.wiredLimitWarningText {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(theme.warningText)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(warning)
+                                .font(.omlxText(11))
+                                .foregroundStyle(theme.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                            CodeChip(value: vm.wiredLimitCommand)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(theme.warningBg)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(theme.warningText.opacity(0.25), lineWidth: 0.5)
+                    )
+                }
             }
         }
     }

@@ -152,7 +152,12 @@ For large models (70B+), the streaming path processes tensors one at a time via 
 - No full model instantiation.
 - Shards flushed at 5 GB boundary.
 - Non-quantized float32 weights cast to bfloat16 for inference parity.
-- Sensitivity measurement requires temporary model load (peak memory ≈ model size).
+- Calibration uses the smaller of live system memory and the recommended Metal
+  working set. Checkpoints above 75% of that capacity use a temporary uniform
+  4-bit proxy; the remaining 25% is reserved proportionally on 16/32/64 GB
+  systems for model execution and imatrix capture.
+- The proxy is validated against the same live limit before calibration, and
+  oQe micro-batches shrink to one sample when headroom is limited.
 
 ## Calibration Data
 

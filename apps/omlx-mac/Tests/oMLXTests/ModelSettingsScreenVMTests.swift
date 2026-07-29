@@ -77,6 +77,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             engineType: nil,
             modelType: nil,
             configModelType: configModelType,
+            modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,
             dflashCompatibilityReason: nil,

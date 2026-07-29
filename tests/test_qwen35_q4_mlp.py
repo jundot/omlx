@@ -279,6 +279,96 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
     assert calls["count"] == 0
 
 
+def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch):
+    """The patch must not freeze the SDPA it saw at install time (issue #2372).
+
+    TurboQuant installs its own dispatcher when a TQ-enabled model loads, which
+    happens after this patch whenever any earlier load ran without TurboQuant.
+    A frozen reference kept routing TurboQuant caches into the plain mlx-lm SDPA,
+    which raised 'TurboQuantKVCache' object has no attribute 'group_size'.
+    """
+    _require_q4_kernel()
+    import importlib
+
+    import mlx_lm.models.qwen3_5 as qwen35
+
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "1")
+    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+
+    args = qwen35.TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        rope_parameters={
+            "type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 1.0,
+        },
+    )
+
+    attn = qwen35.Attention(args)
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        setattr(attn, name, _quantized_bf16(getattr(attn, name)))
+
+    orig_attn_call = qwen35.Attention.__call__
+    orig_lm_patched = q4patch._LM_LINEAR_PATCHED
+    saved_attrs = {}
+    for attr in (
+        "_omlx_q4_lm_attention_patched",
+        "_omlx_q4_lm_attention_original_call",
+    ):
+        existed = hasattr(qwen35.Attention, attr)
+        saved_attrs[attr] = (
+            getattr(qwen35.Attention, attr) if existed else None,
+            existed,
+        )
+        if hasattr(qwen35.Attention, attr):
+            delattr(qwen35.Attention, attr)
+
+    x = mx.random.normal((1, 32, 256)).astype(mx.bfloat16)
+    calls = {"count": 0}
+
+    def sentinel_sdpa(queries, keys, values, cache=None, **kwargs):
+        calls["count"] += 1
+        return mx.zeros_like(queries)
+
+    try:
+        q4patch._LM_LINEAR_PATCHED = False
+        assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
+
+        # Install the replacement dispatcher only after the patch is in place,
+        # the way a later TurboQuant-enabled model load does.
+        attn_module = importlib.import_module(qwen35.Attention.__module__)
+        monkeypatch.setattr(
+            attn_module, "scaled_dot_product_attention", sentinel_sdpa
+        )
+
+        y = attn(x)
+        mx.eval(y)
+        assert calls["count"] == 1
+        assert y.shape == x.shape
+    finally:
+        qwen35.Attention.__call__ = orig_attn_call
+        q4patch._LM_LINEAR_PATCHED = orig_lm_patched
+        for attr, (value, existed) in saved_attrs.items():
+            if existed:
+                setattr(qwen35.Attention, attr, value)
+            elif hasattr(qwen35.Attention, attr):
+                delattr(qwen35.Attention, attr)
+
+
 def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
     monkeypatch,
 ):

@@ -3,6 +3,19 @@
 // Ports the three-signal visibility check from app.py:355-410 plus the
 // one-shot recreate + escalation alert. Tahoe-aware recovery includes
 // System Settings plus the StatusKit Auto-Fix flow from the pre-Swift app.
+//
+// The repair itself lives in `MenubarIconRecovery` at the bottom of this
+// file so the Appearance screen can drive it on demand. The launch alert is
+// one-shot and has three ways to never reach the user (a running menu bar
+// manager, a dismissed alert, a probe that reads the item as visible), and
+// the main status item carries no autosaveName — so nothing on our side
+// records the removal, and a relaunch can't undo it either. On Tahoe the
+// removal lives in ControlCenter's own prefs as isAllowed=false. See #2368.
+//
+// `MenubarLog` is the third type here: the alert's View Log button and
+// `omlx diagnose menubar` both point at menubar.log, so the probe has to
+// actually write it. server.log is not an option — that file is the raw
+// stdout/stderr handle the Python child owns.
 
 import AppKit
 
@@ -13,24 +26,6 @@ final class MenubarVisibilityWatcher {
     private var didCheckOnce = false
     private var didRecreate = false
     private var didAlertOnce = false
-    private let statusKitPlistURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(
-            "Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist"
-        )
-    private let logURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/oMLX/logs/menubar.log")
-
-    private struct AutoFixOutcome {
-        let success: Bool
-        let message: String
-        let needsFullDiskAccess: Bool
-
-        init(success: Bool, message: String, needsFullDiskAccess: Bool = false) {
-            self.success = success
-            self.message = message
-            self.needsFullDiskAccess = needsFullDiskAccess
-        }
-    }
 
     init(initial: NSStatusItem, recreate: @escaping () -> NSStatusItem) {
         self.statusItem = initial
@@ -51,15 +46,19 @@ final class MenubarVisibilityWatcher {
         guard !didCheckOnce else { return }
         didCheckOnce = true
 
+        MenubarLog.write("visibility probe: \(probeDescription())")
         if !isHidden() { return }
 
         if !didRecreate {
             didRecreate = true
             statusItem = recreate()
+            MenubarLog.write("visibility probe: recreated NSStatusItem, re-probing in 1s")
             // Re-probe after 1 s to give the new item time to register.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(1.0))
-                guard let self, self.isHidden() else { return }
+                guard let self else { return }
+                MenubarLog.write("visibility probe: after recreate: \(self.probeDescription())")
+                guard self.isHidden() else { return }
                 self.showHiddenAlert()
             }
             return
@@ -81,25 +80,49 @@ final class MenubarVisibilityWatcher {
         return !(api && visible && occlusion)
     }
 
+    /// One line carrying every signal the probe decides on, plus the button
+    /// window frame. #1497 turned on that frame: the item reported itself
+    /// visible while ControlCenter had parked it at y=-17, and nothing in
+    /// the app recorded that anywhere the reporter could send back.
+    private func probeDescription() -> String {
+        guard let item = statusItem, let button = item.button else {
+            return "hidden=true (no status item)"
+        }
+        guard let window = button.window else {
+            return "hidden=true api=\(item.isVisible) (no button window)"
+        }
+        let frame = window.frame
+        let frameText = String(
+            format: "(%.1f,%.1f %.1fx%.1f)",
+            frame.origin.x, frame.origin.y, frame.width, frame.height
+        )
+        let screenText = window.screen.map {
+            String(format: "%.0fx%.0f", $0.frame.width, $0.frame.height)
+        } ?? "none"
+        return """
+        hidden=\(isHidden()) api=\(item.isVisible) window=\(window.isVisible) \
+        occlusion=\(window.occlusionState.contains(.visible)) frame=\(frameText) screen=\(screenText)
+        """
+    }
+
     private func showHiddenAlert() {
         guard !didAlertOnce else { return }
 
         // Bring our process forward so the alert isn't behind another window.
         NSApp.activate(ignoringOtherApps: true)
 
-        let mac = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
-        let isTahoeOrNewer = mac >= 26
-
-        if isTahoeOrNewer, isKnownMenuBarManagerRunning() {
+        if MenubarIconRecovery.isTahoeOrNewer, let manager = runningMenuBarManager() {
+            MenubarLog.write("hidden alert suppressed: menu bar manager running (\(manager))")
             return
         }
 
         didAlertOnce = true
+        MenubarLog.write("hidden alert shown")
 
         let alert = NSAlert()
         alert.messageText = "oMLX Menubar Icon Hidden"
 
-        if isTahoeOrNewer {
+        if MenubarIconRecovery.isTahoeOrNewer {
             alert.informativeText = """
             The oMLX menubar icon isn't showing up.
 
@@ -107,7 +130,8 @@ final class MenubarVisibilityWatcher {
             flag being false in system preferences. Auto-Fix will approve \
             oMLX and restart ControlCenter. It needs Full Disk Access.
 
-            You can also enable oMLX manually in System Settings > Menu Bar.
+            You can also enable oMLX manually in System Settings > Menu Bar, \
+            or run this again later from Settings > Appearance > Menu Bar Icon.
             """
             alert.addButton(withTitle: "Auto-Fix")
             alert.addButton(withTitle: "Open Menu Bar Settings…")
@@ -129,26 +153,152 @@ final class MenubarVisibilityWatcher {
         alert.window.level = .floating
         let response = alert.runModal()
 
-        if isTahoeOrNewer {
+        if MenubarIconRecovery.isTahoeOrNewer {
             switch response {
             case .alertFirstButtonReturn:
-                runAutofixFlow()
+                MenubarIconRecovery.runAutofixFlow()
             case .alertSecondButtonReturn:
-                openMenuBarSettings()
+                MenubarIconRecovery.openMenuBarSettings()
             case .alertThirdButtonReturn:
-                NSWorkspace.shared.open(logURL)
+                MenubarLog.open()
             default:
                 break
             }
         } else if response == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(logURL)
+            MenubarLog.open()
         }
     }
 
-    // MARK: - StatusKit Auto-Fix
+    /// Bundle id of the first known menu bar manager that's running, if any.
+    /// Named in the log so a suppressed alert isn't a silent branch.
+    private func runningMenuBarManager() -> String? {
+        let bundleIDs = [
+            "com.surteesstudios.Bartender",
+            "com.jordanbaird.Ice",
+            "com.jordanbaird.ice",
+            "com.stonerl.Thaw"
+        ]
+        return bundleIDs.first { bundleID in
+            !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+        }
+    }
+}
 
-    private func runAutofixFlow() {
+/// Append-only diagnostic log for the menu bar item, at
+/// `~/Library/Application Support/oMLX/logs/menubar.log`. The pre-Swift app
+/// wrote this file and both the hidden-icon alert and `omlx diagnose
+/// menubar` still send people to it, so the Swift port owes it the same
+/// content. Kept separate from server.log, which is the Python child's own
+/// stdout/stderr handle.
+@MainActor
+enum MenubarLog {
+    /// Settable so tests can redirect the writer at a temp file instead of
+    /// appending to (and trimming) the user's real log.
+    static var url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/oMLX/logs/menubar.log")
+
+    /// Trim threshold and the tail we keep when we cross it. The file only
+    /// takes a handful of lines per launch, so this is a runaway guard
+    /// rather than real rotation.
+    static let maxBytes = 256 * 1024
+    static let keepBytes = 64 * 1024
+
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+
+    static func write(_ message: String) {
+        let line = "\(timestampFormatter.string(from: Date())) \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return
+        }
+        if !fileManager.fileExists(atPath: url.path) {
+            fileManager.createFile(atPath: url.path, contents: nil)
+        }
+
+        trimIfNeeded()
+
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+    }
+
+    /// Opens the log for the alert's View Log button. Writes a line first so
+    /// a first-ever click never lands on a missing file.
+    static func open() {
+        if !FileManager.default.fileExists(atPath: url.path) {
+            write("log opened before any probe ran")
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    private static func trimIfNeeded() {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        guard let size = (attributes?[.size] as? NSNumber)?.intValue, size > maxBytes else {
+            return
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        try? handle.seek(toOffset: UInt64(max(0, size - keepBytes)))
+        var tail = (try? handle.readToEnd()) ?? Data()
+        try? handle.close()
+        // The cut lands mid-line; drop the fragment so every line in the
+        // file stays complete and parseable by `omlx diagnose menubar`.
+        if let newline = tail.firstIndex(of: UInt8(ascii: "\n")) {
+            tail = tail[tail.index(after: newline)...]
+        }
+        try? tail.write(to: url, options: [.atomic])
+    }
+}
+
+/// StatusKit repair shared by the launch-time hidden-icon alert and the
+/// Appearance screen's "Restore" button. Everything here is best-effort and
+/// user-triggered: on Tahoe the menu bar belongs to ControlCenter, so the
+/// only thing the app can do is flip its own approval flag back on and let
+/// the user finish in System Settings.
+@MainActor
+enum MenubarIconRecovery {
+
+    static var isTahoeOrNewer: Bool {
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
+    }
+
+    struct AutoFixOutcome {
+        let success: Bool
+        let message: String
+        let needsFullDiskAccess: Bool
+
+        init(success: Bool, message: String, needsFullDiskAccess: Bool = false) {
+            self.success = success
+            self.message = message
+            self.needsFullDiskAccess = needsFullDiskAccess
+        }
+    }
+
+    private static let statusKitPlistURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(
+            "Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist"
+        )
+
+    // MARK: - Entry points
+
+    /// Auto-Fix button of the launch-time alert.
+    static func runAutofixFlow() {
+        MenubarLog.write("auto-fix requested from hidden-icon alert")
         let result = fixStatusKitPermission()
+        MenubarLog.write(
+            "auto-fix result: success=\(result.success) fda=\(result.needsFullDiskAccess) — \(oneLine(result.message))"
+        )
         if result.needsFullDiskAccess {
             showStatusKitAccessDeniedAlert()
             return
@@ -156,7 +306,66 @@ final class MenubarVisibilityWatcher {
         showAutofixResultAlert(success: result.success, message: result.message)
     }
 
-    private func fixStatusKitPermission() -> AutoFixOutcome {
+    /// Appearance > Menu Bar Icon > Restore. Repairs the StatusKit approval
+    /// first so the rebuilt status item registers against an already-approved
+    /// bundle id, then hands the caller the rebuild, then reports back with a
+    /// way into System Settings (which owns the final say on Tahoe).
+    static func restore(rebuild: () -> Void) {
+        NSApp.activate(ignoringOtherApps: true)
+        MenubarLog.write("restore requested from Appearance settings")
+
+        guard isTahoeOrNewer else {
+            rebuild()
+            MenubarLog.write("restore: rebuilt status items (pre-Tahoe, no StatusKit repair)")
+            showRestoreResultAlert(
+                message: """
+                oMLX rebuilt its menu bar item.
+
+                macOS before Tahoe doesn't offer a System Settings toggle for \
+                third-party menubar apps. If the icon still doesn't appear, \
+                quit and relaunch oMLX, and check menubar manager tools like \
+                Bartender or Ice if you use them.
+                """,
+                offerSettings: false
+            )
+            return
+        }
+
+        let result = fixStatusKitPermission()
+        rebuild()
+        MenubarLog.write(
+            "restore result: success=\(result.success) fda=\(result.needsFullDiskAccess) — \(oneLine(result.message))"
+        )
+
+        if result.needsFullDiskAccess {
+            showStatusKitAccessDeniedAlert()
+            return
+        }
+        showRestoreResultAlert(
+            message: "oMLX rebuilt its menu bar item.\n\n\(result.message)",
+            offerSettings: true
+        )
+    }
+
+    static func openMenuBarSettings() {
+        if let url = URL(
+            string: "x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar"
+        ) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Alert copy is written as a wrapped paragraph; the log wants one line.
+    private static func oneLine(_ message: String) -> String {
+        message
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - StatusKit Auto-Fix
+
+    private static func fixStatusKitPermission() -> AutoFixOutcome {
         let fileManager = FileManager.default
 
         guard fileManager.fileExists(atPath: statusKitPlistURL.path) else {
@@ -381,7 +590,7 @@ final class MenubarVisibilityWatcher {
         )
     }
 
-    private func backupStatusKitPlist() -> URL? {
+    private static func backupStatusKitPlist() -> URL? {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: statusKitPlistURL.path) else {
             return nil
@@ -406,7 +615,7 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    private func writeStatusKitPlist(_ data: Data, backup: URL?) throws {
+    private static func writeStatusKitPlist(_ data: Data, backup: URL?) throws {
         let fileManager = FileManager.default
         let temporaryURL = statusKitPlistURL
             .deletingLastPathComponent()
@@ -427,7 +636,7 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    private func validateStatusKitPlist() throws {
+    private static func validateStatusKitPlist() throws {
         var format = PropertyListSerialization.PropertyListFormat.binary
         let data = try Data(contentsOf: statusKitPlistURL)
         _ = try PropertyListSerialization.propertyList(
@@ -437,7 +646,7 @@ final class MenubarVisibilityWatcher {
         )
     }
 
-    private func restoreStatusKitPlist(from backup: URL?) {
+    private static func restoreStatusKitPlist(from backup: URL?) {
         guard let backup else { return }
         let fileManager = FileManager.default
         do {
@@ -450,17 +659,17 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    private func restartControlCenter() -> Bool {
+    private static func restartControlCenter() -> Bool {
         _ = runKillall("cfprefsd")
         return runKillall("ControlCenter")
     }
 
-    private func prepareStatusKitPreferenceWrite() {
+    private static func prepareStatusKitPreferenceWrite() {
         _ = runKillall("ControlCenter")
         _ = runKillall("cfprefsd")
     }
 
-    private func runKillall(_ processName: String) -> Bool {
+    private static func runKillall(_ processName: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         process.arguments = [processName]
@@ -474,7 +683,7 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    private func bareBundleIdentifier(in entry: [String: Any]) -> String? {
+    private static func bareBundleIdentifier(in entry: [String: Any]) -> String? {
         guard entry["location"] == nil,
               entry["menuItemLocations"] == nil,
               let bundle = entry["bundle"] as? [String: Any] else {
@@ -483,7 +692,7 @@ final class MenubarVisibilityWatcher {
         return bundle["_0"] as? String
     }
 
-    private func locationBundleIdentifier(in entry: [String: Any]) -> String? {
+    private static func locationBundleIdentifier(in entry: [String: Any]) -> String? {
         guard let location = entry["location"] as? [String: Any],
               let bundle = location["bundle"] as? [String: Any] else {
             return nil
@@ -491,7 +700,7 @@ final class MenubarVisibilityWatcher {
         return bundle["_0"] as? String
     }
 
-    private func menuItemBundleIdentifiers(in entry: [String: Any]) -> [String] {
+    private static func menuItemBundleIdentifiers(in entry: [String: Any]) -> [String] {
         guard let locations = entry["menuItemLocations"] as? [[String: Any]] else {
             return []
         }
@@ -504,11 +713,11 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    private func statusKitBundleMarker(bundleID: String) -> [String: Any] {
+    private static func statusKitBundleMarker(bundleID: String) -> [String: Any] {
         ["bundle": ["_0": bundleID]]
     }
 
-    private func statusKitApprovalEntry(bundleID: String) -> [String: Any] {
+    private static func statusKitApprovalEntry(bundleID: String) -> [String: Any] {
         [
             "location": ["bundle": ["_0": bundleID]],
             "menuItemLocations": [["bundle": ["_0": bundleID]]],
@@ -516,7 +725,7 @@ final class MenubarVisibilityWatcher {
         ]
     }
 
-    private func isPermissionError(_ error: Error) -> Bool {
+    private static func isPermissionError(_ error: Error) -> Bool {
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain,
            nsError.code == NSFileReadNoPermissionError
@@ -533,29 +742,9 @@ final class MenubarVisibilityWatcher {
         return false
     }
 
-    private func isKnownMenuBarManagerRunning() -> Bool {
-        let bundleIDs = [
-            "com.surteesstudios.Bartender",
-            "com.jordanbaird.Ice",
-            "com.jordanbaird.ice",
-            "com.stonerl.Thaw"
-        ]
-        return bundleIDs.contains { bundleID in
-            !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
-        }
-    }
-
     // MARK: - Recovery Alerts
 
-    private func openMenuBarSettings() {
-        if let url = URL(
-            string: "x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar"
-        ) {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    private func openFullDiskAccessSettings() {
+    private static func openFullDiskAccessSettings() {
         if let url = URL(
             string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"
         ) {
@@ -563,7 +752,7 @@ final class MenubarVisibilityWatcher {
         }
     }
 
-    private func showStatusKitAccessDeniedAlert() {
+    private static func showStatusKitAccessDeniedAlert() {
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
@@ -573,18 +762,25 @@ final class MenubarVisibilityWatcher {
         in your Group Containers folder.
 
         Enable oMLX in System Settings > Privacy & Security > Full Disk \
-        Access, then run Auto-Fix again.
+        Access, then run Auto-Fix again. You can also turn oMLX back on \
+        yourself in System Settings > Menu Bar.
         """
         alert.addButton(withTitle: "Open Full Disk Access")
+        alert.addButton(withTitle: "Open Menu Bar Settings…")
         alert.addButton(withTitle: "Dismiss")
         alert.window.level = .floating
 
-        if alert.runModal() == .alertFirstButtonReturn {
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
             openFullDiskAccessSettings()
+        case .alertSecondButtonReturn:
+            openMenuBarSettings()
+        default:
+            break
         }
     }
 
-    private func showAutofixResultAlert(success: Bool, message: String) {
+    private static func showAutofixResultAlert(success: Bool, message: String) {
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
@@ -593,5 +789,22 @@ final class MenubarVisibilityWatcher {
         alert.addButton(withTitle: "OK")
         alert.window.level = .floating
         alert.runModal()
+    }
+
+    private static func showRestoreResultAlert(message: String, offerSettings: Bool) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Restore Menu Bar Icon"
+        alert.informativeText = message
+        if offerSettings {
+            alert.addButton(withTitle: "Open Menu Bar Settings…")
+        }
+        alert.addButton(withTitle: "Done")
+        alert.window.level = .floating
+
+        if alert.runModal() == .alertFirstButtonReturn, offerSettings {
+            openMenuBarSettings()
+        }
     }
 }

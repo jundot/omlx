@@ -24,9 +24,12 @@ The formula and workflow use Ruby and shell syntax, so these are text-level
 assertions that the guards stay present.
 """
 
+import re
 from pathlib import Path
 
 import pytest
+
+from omlx.custom_kernels import NATIVE_KERNEL_PACKAGES
 
 FORMULA_PATH = Path(__file__).resolve().parents[1] / "Formula" / "omlx.rb"
 WORKFLOW_PATH = (
@@ -114,6 +117,17 @@ class TestSharedPipFlags:
 
 
 class TestCustomKernelBuild:
+    def test_formula_covers_every_native_kernel_package(self, formula):
+        """Source checks and import verification must cover every extension."""
+        match = re.search(
+            r"^\s*CUSTOM_KERNELS = %w\[([^]]+)\]\.freeze$", formula, re.MULTILINE
+        )
+
+        assert match is not None
+        assert tuple(match.group(1).split()) == NATIVE_KERNEL_PACKAGES
+        assert "kernel_sources = CUSTOM_KERNELS.map" in formula
+        assert "for package in #{CUSTOM_KERNELS.inspect}:" in formula
+
     def test_cmake_pinned_to_venv_python(self, formula):
         """CMake must not discover a stray system Python for kernel builds."""
         assert "-DPython_EXECUTABLE=#{libexec}/bin/python" in formula

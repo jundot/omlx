@@ -70,6 +70,7 @@ _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
 NATIVE_SYMBOLS = (
+    "dsa_decode_scores",
     "dsa_indexer_scores",
     "dsa_topk_indices",
     "glm_dsa_sparse_mla_attention",
@@ -146,6 +147,27 @@ def dsa_indexer_scores(
         skip_causal_future_store=skip_causal_future_store,
         causal_q_offset=causal_q_offset,
         stream=stream or mx.gpu,
+    )
+
+
+def dsa_decode_scores(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    fp32_scores: bool = False,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None:
+        raise RuntimeError(
+            "dsa_decode_scores requires the native glm_moe_dsa extension"
+        )
+    return _ext.dsa_decode_scores(
+        queries,
+        keys,
+        weights,
+        fp32_scores=fp32_scores,
+        **_native_stream_kwargs(stream),
     )
 
 

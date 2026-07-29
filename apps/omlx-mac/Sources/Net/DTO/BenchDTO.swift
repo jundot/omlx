@@ -222,3 +222,55 @@ struct AccuracyResultsResponse: Codable, Sendable {
     let currentModel: String
     let currentBenchId: String
 }
+
+// =============================================================================
+// MARK: - Context bench
+// =============================================================================
+
+/// Body for `POST /admin/api/bench/context/start`. `target_tokens` is
+/// server-validated against {16384, 32768, 65536, 131072, 262144, 524288}.
+struct ContextBenchStartRequest: Encodable, Sendable {
+    let modelId: String
+    let targetTokens: Int
+}
+
+struct ContextBenchStartResponse: Codable, Sendable {
+    let benchId: String
+    let status: String
+    let targetTokens: Int
+}
+
+/// Final measurement emitted by the context bench's `result` event and
+/// mirrored on `GET /api/bench/context/{id}/results`.
+struct ContextBenchResultDTO: Codable, Equatable, Sendable {
+    let modelId: String
+    let targetTokens: Int
+    let nativeContextLength: Int?
+    /// Raw admission boundary (token-exact bisection result).
+    let measuredTokens: Int
+    /// The prompt size the verification prefill actually completed.
+    let verifiedTokens: Int
+    let verifiedPromptTokens: Int?
+    /// Final 2k-floored value written to `max_context_window`.
+    let appliedTokens: Int
+    let applied: Bool
+    /// "memory" | "target" | "native"
+    let cappedBy: String
+    let attempts: Int
+    /// Prefill tok/s of the successful verify run (0 when unmeasured).
+    let prefillTps: Double?
+    let durationS: Double
+}
+
+/// Poll surface for the Swift screen: status + mirrored progress fields
+/// (`phase` / `progress` 0-100 / `message`) + the final result.
+struct ContextBenchStatusResponse: Codable, Sendable {
+    let benchId: String
+    /// "running" | "completed" | "cancelled" | "error"
+    let status: String
+    let phase: String
+    let progress: Double
+    let message: String
+    let result: ContextBenchResultDTO?
+    let error: String?
+}

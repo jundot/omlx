@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from omlx.exceptions import PrefillMemoryExceededError
+from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
 
 
 def _build_test_app():
@@ -35,6 +35,19 @@ def _build_test_app():
             request_id="req-abc",
             estimated_bytes=46_775_000_000,
             limit_bytes=42_949_672_960,
+        )
+
+    @app.get("/v1/raise-abort")
+    def raise_prefill_aborted():
+        raise PrefillMemoryAbortedError(
+            message=(
+                "Request aborted: process memory limit exceeded "
+                "(usage 4.4 GB, abort threshold (hard watermark) 4.1 GB, "
+                "dynamic ceiling 4.3 GB). "
+                "Raise custom_ceiling_bytes in admin Memory settings."
+            ),
+            request_id="req-abort",
+            limit_bytes=4_100_000_000,
         )
 
     @app.get("/health/raise")
@@ -85,6 +98,30 @@ class TestPrefillMemoryHandler:
         body = resp.json()
         assert body["error"]["estimated_bytes"] == 46_775_000_000
         assert body["error"]["limit_bytes"] == 42_949_672_960
+
+    def test_mid_prefill_abort_reuses_the_400_mapping(self):
+        """The enforcer's mid-prefill abort is the same memory condition as
+        the pre-flight rejection and must reach the client the same way.
+        Before the subclass existed it escaped as a bare RuntimeError, so
+        the client got a truncated body and a 500 traceback instead."""
+        with TestClient(_build_test_app()) as client:
+            resp = client.get("/v1/raise-abort")
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "prefill_memory_aborted"
+        assert body["error"]["omlx_code"] == "prefill_memory_aborted"
+        assert body["error"]["limit_bytes"] == 4_100_000_000
+
+    def test_abort_wording_does_not_claim_the_prompt_was_rejected(self):
+        """This request was admitted and then killed, so the pre-flight
+        wording would misdescribe it — and its message already carries the
+        binding ceiling plus advice, so the generic ladder is not appended."""
+        with TestClient(_build_test_app()) as client:
+            resp = client.get("/v1/raise-abort")
+        msg = resp.json()["error"]["message"]
+        assert "aborted this request mid-prefill" in msg
+        assert "rejected this prompt" not in msg
+        assert "Memory Guard to aggressive" not in msg
 
     def test_non_api_route_uses_plain_detail(self):
         with TestClient(_build_test_app()) as client:

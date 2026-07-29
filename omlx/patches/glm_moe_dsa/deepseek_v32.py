@@ -306,6 +306,25 @@ class Indexer(nn.Module):
             return finish_topk_indices(indices, prefix_rows)
 
         if s == 1:
+            # Fused decode scan: one strided pass over the (capacity-backed)
+            # K cache view computes the head-summed scores with fp32
+            # accumulation — no ensure_row_contiguous copy, no [B,H,1,S]
+            # intermediates. Scores come out in the cache dtype and feed the
+            # existing select_topk (native radix) unchanged.
+            if (
+                mask is None
+                and glm_fast.has("dsa_decode_scores")
+                and self.n_heads == 32
+                and self.head_dim == 128
+                and q.dtype in (mx.float16, mx.bfloat16)
+                and k.dtype == q.dtype
+                and k.shape[2] >= 4096
+            ):
+                w_dec = (weights_lh * self.weight_scale).astype(q.dtype)
+                scores = glm_fast.dsa_decode_scores(
+                    q, k, w_dec.reshape(b, self.n_heads)
+                )
+                return select_topk(scores)
             scores = q @ k.swapaxes(-1, -2)
             scores = mx.maximum(scores, 0)
             weights = weights_lh * self.weight_scale

@@ -304,23 +304,59 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
     import sys
 
     for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        if not (
-            mod_name.startswith("mlx_lm.models.")
-            or mod_name.startswith("mlx_vlm.models.")
-        ):
+        if mod is None or not mod_name.startswith("mlx_lm.models."):
             continue
         if getattr(mod, "scaled_dot_product_attention", None) is original_sdpa:
             mod.scaled_dot_product_attention = patched_sdpa
 
+    # mlx-vlm carries its own base SDPA (a distinct function, TurboQuant-aware
+    # cache handling included), and model modules like qwen3_5.language copy
+    # the reference at import time. It needs its own capture + wrapper +
+    # submodule rebind, mirroring qwen35_fa256_attention: checking mlx-vlm
+    # modules against the mlx-lm original can never match, which left the VLM
+    # engine on the unfused O(L^2) path and — because this patch installs
+    # first — polluted the fa256 patch's "original" capture so its rebind
+    # missed the VLM submodules too.
     try:
         from mlx_vlm.models import base as vlm_base
-
-        if hasattr(vlm_base, "scaled_dot_product_attention"):
-            vlm_base.scaled_dot_product_attention = patched_sdpa
     except ImportError:
-        pass
+        vlm_base = None
+
+    if vlm_base is not None:
+        original_vlm_sdpa = getattr(vlm_base, "scaled_dot_product_attention", None)
+        if original_vlm_sdpa is not None:
+
+            def patched_vlm_sdpa(
+                queries,
+                keys,
+                values,
+                cache,
+                scale: float,
+                mask=None,
+                sinks=None,
+            ) -> mx.array:
+                if _should_route(queries, keys, cache, mask, sinks):
+                    try:
+                        return _flash_sdpa256(queries, keys, values, scale, mask)
+                    except Exception:
+                        logger.warning(
+                            "sdpa256 prefill kernel failed; falling back to "
+                            "MLX SDPA",
+                            exc_info=True,
+                        )
+                return original_vlm_sdpa(
+                    queries, keys, values, cache, scale, mask, sinks
+                )
+
+            vlm_base.scaled_dot_product_attention = patched_vlm_sdpa
+            for mod_name, mod in list(sys.modules.items()):
+                if mod is None or not mod_name.startswith("mlx_vlm.models."):
+                    continue
+                if (
+                    getattr(mod, "scaled_dot_product_attention", None)
+                    is original_vlm_sdpa
+                ):
+                    mod.scaled_dot_product_attention = patched_vlm_sdpa
 
     # Keep the prefill memory guard in lockstep: tell the monitor head_dim 256
     # prefill is now O(L), so it stops charging the O(L^2) score matrix.

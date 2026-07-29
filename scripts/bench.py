@@ -91,6 +91,18 @@ def _fmt_mem(peak_bytes: int) -> str:
     return f"{peak_bytes / 1e9:.1f}G"
 
 
+def _fmt_metric(value: float | None, decimals: int = 1, width: int = 0) -> str:
+    """Format a metric, rendering unmeasured (None) values as an em dash.
+
+    Timing-derived metrics come back as None when the run could not observe
+    the phase they describe, e.g. an endpoint that never streamed a content
+    delta (omlx/admin/benchmark.py::_compute_single_metrics).
+    """
+    if value is None:
+        return f"{'—':>{width}}"
+    return f"{value:>{width}.{decimals}f}"
+
+
 def _short_name(path: str) -> str:
     """Return a short display label for a model path."""
     p = Path(path)
@@ -142,7 +154,10 @@ async def _bench_model(
         print(f"  pp={pp} gen={gen_tokens} …", end="", flush=True)
         r = await _run_single_test(engine, prompts[pp], gen_tokens, pp)
         single_results.append(r)
-        print(f"  ttft={r['ttft_ms']:.0f}ms  {r['gen_tps']:.1f} t/s")
+        print(
+            f"  ttft={_fmt_metric(r['ttft_ms'], 0)}ms  "
+            f"{_fmt_metric(r['gen_tps'])} t/s"
+        )
 
     batch_results: list[dict] = []
     batch_pp = sorted(pp_lengths)[0] if pp_lengths else 1024
@@ -151,7 +166,10 @@ async def _bench_model(
         print(f"  batch={bs} pp={batch_pp} gen={gen_tokens} …", end="", flush=True)
         r = await _run_batch_test(engine, batch_prompts, batch_pp, gen_tokens, bs)
         batch_results.append(r)
-        print(f"  pp={r['pp_tps']:.0f}/s  tg={r['tg_tps']:.0f}/s")
+        print(
+            f"  pp={_fmt_metric(r['pp_tps'], 0)}/s  "
+            f"tg={_fmt_metric(r['tg_tps'], 0)}/s"
+        )
 
     await engine.stop()
     return single_results, batch_results
@@ -201,9 +219,9 @@ def _print_single_comparison(
                 row += f"{'—':>{col}} {'—':>{col}} {'—':>{col}} {'—':>{col}}  "
             else:
                 row += (
-                    f"{r['ttft_ms']:>{col-2}.0f}ms "
-                    f"{r['gen_tps']:>{col-2}.1f}/s "
-                    f"{r['processing_tps']:>{col-2}.0f}/s "
+                    f"{_fmt_metric(r['ttft_ms'], 0, col - 2)}ms "
+                    f"{_fmt_metric(r['gen_tps'], 1, col - 2)}/s "
+                    f"{_fmt_metric(r['processing_tps'], 0, col - 2)}/s "
                     f"{_fmt_mem(r['peak_memory_bytes']):>{col}}  "
                 )
         print(row.rstrip())
@@ -246,9 +264,9 @@ def _print_batch_comparison(
                 row += f"{'—':>{col}} {'—':>{col}} {'—':>{col}}  "
             else:
                 row += (
-                    f"{r['pp_tps']:>{col-2}.0f}/s "
-                    f"{r['tg_tps']:>{col-2}.0f}/s "
-                    f"{r['avg_ttft_ms']:>{col-2}.0f}ms  "
+                    f"{_fmt_metric(r['pp_tps'], 0, col - 2)}/s "
+                    f"{_fmt_metric(r['tg_tps'], 0, col - 2)}/s "
+                    f"{_fmt_metric(r['avg_ttft_ms'], 0, col - 2)}ms  "
                 )
         print(row.rstrip())
 

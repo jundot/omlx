@@ -27,6 +27,49 @@ logger = logging.getLogger(__name__)
 
 # Current settings file format version
 SETTINGS_VERSION = 1
+
+
+def vlm_mtp_processor_conflicts(data: dict) -> list:
+    """Names of settings that need per-request logits processors and
+    therefore cannot combine with ``vlm_mtp_enabled``.
+
+    The vlm_mtp decode path bypasses mlx-lm BatchGenerator, where logits
+    processors are applied; with any of these set, every request would fall
+    back to BatchGenerator and the toggle would never engage (#2399).
+    Neutral values (repetition 1.0, presence 0.0) build no processor and do
+    not conflict.
+    """
+    conflicts = []
+    rep = data.get("repetition_penalty")
+    if rep is not None and rep != 1.0:
+        conflicts.append("repetition_penalty")
+    pres = data.get("presence_penalty")
+    if pres is not None and pres != 0.0:
+        conflicts.append("presence_penalty")
+    if data.get("thinking_budget_enabled"):
+        conflicts.append("thinking_budget_enabled")
+    if data.get("guided_grammar_enabled"):
+        conflicts.append("guided_grammar_enabled")
+    return conflicts
+
+
+def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
+    """Clear ``vlm_mtp_enabled`` from ``data`` when it conflicts with
+    processor-backed settings; returns ``(data, conflict_names)``.
+
+    The sampling / grammar side wins because those settings shape output
+    content while vlm_mtp only affects speed. Used for settings dicts that
+    predate the exclusivity rule (persisted files, profile merges) so
+    ``ModelSettings.__post_init__`` does not reject the whole blob.
+    """
+    if not data.get("vlm_mtp_enabled"):
+        return data, []
+    conflicts = vlm_mtp_processor_conflicts(data)
+    if not conflicts:
+        return data, []
+    resolved = dict(data)
+    resolved["vlm_mtp_enabled"] = False
+    return resolved, conflicts
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -93,7 +136,10 @@ class ModelSettings:
             dflash_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
-            "gemma4_assistant" model.
+            "gemma4_assistant" model. Mutually exclusive with processor-backed
+            settings (guided grammar, thinking budget, repetition/presence
+            penalties); requests carrying such per-request parameters fall back
+            to BatchGenerator so the constraints stay enforced (#2399).
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
@@ -203,7 +249,9 @@ class ModelSettings:
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
     # Mutually exclusive with all other speculative paths because the wrapper
-    # bypasses mlx-lm BatchGenerator at decode time.
+    # bypasses mlx-lm BatchGenerator at decode time. Also exclusive with
+    # processor-backed settings (guided grammar, thinking budget, penalties)
+    # — see vlm_mtp_processor_conflicts().
     vlm_mtp_enabled: bool = False
     vlm_mtp_draft_model: Optional[str] = (
         None  # Path / model id of the assistant drafter
@@ -255,6 +303,20 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
+            # Grammar / thinking budget / penalty defaults materialize as
+            # per-request logits processors, which the vlm_mtp decode path
+            # cannot apply — every request would fall back to
+            # BatchGenerator and the toggle would silently never engage
+            # (#2399). Reject the combo at construction time like the
+            # speculative-path conflicts above.
+            processor_conflicts = vlm_mtp_processor_conflicts(self.to_dict())
+            if processor_conflicts:
+                raise ValueError(
+                    "vlm_mtp_enabled cannot be combined with "
+                    f"{', '.join(processor_conflicts)}; these settings "
+                    "require per-request logits processors, which the "
+                    "vlm_mtp decode path does not apply"
+                )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -348,6 +410,20 @@ class ModelSettingsManager:
             self._settings = {}
 
             for model_id, model_data in models_data.items():
+                # Settings saved before the vlm_mtp exclusivity rule may
+                # combine vlm_mtp_enabled with processor-backed settings;
+                # __post_init__ would raise and the except below would drop
+                # the model's entire settings blob. Keep the content-shaping
+                # settings and turn vlm_mtp off instead.
+                model_data, conflicts = resolve_vlm_mtp_conflicts(model_data)
+                if conflicts:
+                    logger.warning(
+                        "Model '%s': vlm_mtp_enabled disabled on load; it "
+                        "cannot be combined with %s. Unset those settings "
+                        "to re-enable vlm_mtp.",
+                        model_id,
+                        ", ".join(conflicts),
+                    )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
                 except Exception as e:
@@ -682,6 +758,10 @@ class ModelSettingsManager:
         # get_exposed_profile_runtime_settings_for_request(), which can
         # trigger an engine variant reload without persisting base settings.
         merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        # A profile overriding penalties / grammar / thinking budget on a
+        # vlm_mtp base model would make __post_init__ raise on this
+        # request-time merge; drop vlm_mtp for the merged view instead.
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def _runtime_settings_with_profile_locked(
@@ -690,6 +770,7 @@ class ModelSettingsManager:
         base = self._settings.get(model_id)
         merged = base.to_dict() if base is not None else {}
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:

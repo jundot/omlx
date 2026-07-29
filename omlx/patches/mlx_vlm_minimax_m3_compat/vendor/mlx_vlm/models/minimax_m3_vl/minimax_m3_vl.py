@@ -37,8 +37,12 @@ def _pack_uint8_weight(weight: mx.array) -> mx.array:
 def _sanitize_moe_weights(weights: dict, args):
     num_experts = args.num_local_experts
     pack_shared = (
-        args.n_shared_experts == 1
-        and args.shared_intermediate_size == args.intermediate_size
+        (
+            args.n_shared_experts == 1
+            and args.shared_intermediate_size == args.intermediate_size
+        )
+        if getattr(args, "pack_shared_expert", None) is None
+        else args.pack_shared_expert
     )
 
     def expert_keys(prefix, name, suffix):

@@ -3,6 +3,7 @@
 
 import json
 import logging
+import struct
 from pathlib import Path
 
 import pytest
@@ -15,15 +16,40 @@ from omlx.model_discovery import (
     _read_model_context_length,
     _register_model,
     _resolve_hf_cache_entry,
+    _vision_weight_bytes,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
     estimate_model_size,
+    estimate_text_only_model_size,
     format_size,
     is_helper_config_model_type,
     is_helper_model_config,
     model_directory_access_error,
 )
+
+
+def _write_safetensors(path, tensors):
+    """Write a minimal valid safetensors file: name -> (dtype, shape)."""
+    dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4, "U32": 4}
+    header = {}
+    offset = 0
+    for name, (dtype, shape) in tensors.items():
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        nbytes = numel * dtype_bytes[dtype]
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+    blob = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)))
+        f.write(blob)
+        f.write(b"\x00" * offset)
 
 
 class TestIsHelperConfigModelType:
@@ -454,6 +480,49 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_qwen3_5_moe_with_empty_vision_stub_as_llm(self, tmp_path):
+        """Vision-stripped quant keeping an empty ``vision_config: {}`` stub is LLM (#2385)."""
+        config = {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": {"hidden_size": 4096},
+            "vision_config": {},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_dense_qwen3_5_with_empty_vision_stub_as_llm(self, tmp_path):
+        """Dense qwen3_5 is not in VLM_MODEL_TYPES — an empty stub must not trip the catch-all."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"hidden_size": 1024},
+            "vision_config": {},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_dense_qwen3_5_stripped_as_llm(self, tmp_path):
+        """Vision-stripped dense qwen3_5 (no vision keys at all) stays LLM."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"hidden_size": 1024},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_dense_qwen3_5_with_real_vision_as_vlm(self, tmp_path):
+        """Unified dense qwen3_5 with a populated vision_config classifies as VLM."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"hidden_size": 1024},
+            "vision_config": {"depth": 24, "hidden_size": 1152},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
@@ -1653,3 +1722,71 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 1
         assert "mlx-community--Qwen3-8B-4bit" in models
+
+
+class TestTextOnlySizeEstimation:
+    """Language-only size estimate for VLM-shaped checkpoints (#2385).
+
+    Serving such a checkpoint via the text engine (force_lm or a
+    model_type_override) drops the vision tower, so admission by the full
+    file size over-charges by the vision weights."""
+
+    _TENSORS = {
+        "language_model.layers.0.w": ("F16", [1000, 256]),  # 512000 bytes
+        "model.visual.blocks.0.w": ("F16", [100, 256]),  # 51200 bytes
+        "vision_tower.patch.w": ("F16", [10, 256]),  # 5120 bytes
+    }
+
+    def test_vision_weight_bytes_from_headers(self, tmp_path):
+        _write_safetensors(tmp_path / "model.safetensors", self._TENSORS)
+        assert _vision_weight_bytes(tmp_path) == 51200 + 5120
+
+    def test_text_only_estimate_subtracts_vision(self, tmp_path):
+        _write_safetensors(tmp_path / "model.safetensors", self._TENSORS)
+        full = estimate_model_size(tmp_path)
+        text_only = estimate_text_only_model_size(tmp_path)
+        assert text_only == full - int((51200 + 5120) * 1.05)
+        assert 0 < text_only < full
+
+    def test_no_vision_weights_returns_zero(self, tmp_path):
+        _write_safetensors(
+            tmp_path / "model.safetensors",
+            {"language_model.layers.0.w": ("F16", [1000, 256])},
+        )
+        assert estimate_text_only_model_size(tmp_path) == 0
+
+    def test_corrupt_shard_returns_zero(self, tmp_path):
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1024)
+        assert estimate_text_only_model_size(tmp_path) == 0
+
+    def test_discovery_populates_text_only_size_for_vlm(self, tmp_path):
+        model = tmp_path / "qwen-vlm"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5_moe",
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"depth": 2, "hidden_size": 64},
+                    "text_config": {"hidden_size": 64},
+                }
+            )
+        )
+        _write_safetensors(model / "model.safetensors", self._TENSORS)
+
+        models = discover_models(tmp_path)
+        entry = models["qwen-vlm"]
+        assert entry.model_type == "vlm"
+        assert 0 < entry.text_only_size < entry.estimated_size
+
+    def test_discovery_skips_text_only_size_for_llm(self, tmp_path):
+        model = tmp_path / "plain-llm"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        _write_safetensors(
+            model / "model.safetensors",
+            {"model.layers.0.w": ("F16", [1000, 256])},
+        )
+
+        models = discover_models(tmp_path)
+        assert models["plain-llm"].text_only_size == 0

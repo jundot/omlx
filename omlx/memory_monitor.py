@@ -15,12 +15,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
+from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -177,6 +180,14 @@ class MemoryMonitor:
         self._score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         self._num_attention_heads: Optional[int] = None
         self._num_kv_cache_layers: Optional[int] = None
+        # Sliding-window (RotatingKVCache-family) layers as (count, window)
+        # groups. Their resident KV is bounded at window + chunk - 1 tokens
+        # per layer, so they need a capped term instead of the linear
+        # full-attention formula. Empty for non-hybrid models.
+        self._rotating_layer_specs: tuple[tuple[int, int], ...] = ()
+        # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
+        # measured once from a live cache after the first prefill chunk.
+        self._fixed_state_bytes: int = 0
 
         # PagedCacheManager for KV cache memory measurement
         self._paged_cache_manager: Optional["PagedCacheManager"] = None
@@ -355,6 +366,7 @@ class MemoryMonitor:
         num_kv_cache_layers: Optional[int] = None,
         compute_dtype_size: Optional[float] = None,
         kv_bytes_per_token: Optional[float] = None,
+        rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -379,6 +391,10 @@ class MemoryMonitor:
                 per token. Use for compressed-cache architectures such as MLA
                 where stored cache tensors are not representable as uniform
                 ``num_kv_heads * head_dim * 2`` K/V tensors.
+            rotating_layer_specs: Sliding-window layer groups as
+                ``(layer_count, window_tokens)`` pairs, used by
+                ``estimate_resident_kv_bytes`` for the window-capped KV term.
+                These layers are excluded from ``num_kv_cache_layers``.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -395,7 +411,20 @@ class MemoryMonitor:
             else None
         )
         self._num_attention_heads = num_attention_heads or num_kv_heads
-        self._num_kv_cache_layers = num_kv_cache_layers or num_layers
+        # ``is not None`` (not truthiness): a genuine 0 means "no
+        # full-attention layers" for rotating-only hybrids, and coercing it
+        # to num_layers would double-count on top of the rotating term.
+        self._num_kv_cache_layers = (
+            num_kv_cache_layers if num_kv_cache_layers is not None else num_layers
+        )
+        self._rotating_layer_specs = tuple(
+            (int(count), int(window))
+            for count, window in (rotating_layer_specs or ())
+            if count > 0 and window > 0
+        )
+        # A new model's fixed state must be re-measured; a stale value from
+        # the previous model would silently mis-charge admission.
+        self._fixed_state_bytes = 0
 
         # Log estimated memory per block
         if num_layers and num_kv_heads and head_dim:
@@ -406,14 +435,37 @@ class MemoryMonitor:
                 if self._kv_bytes_per_token_override
                 else ""
             )
+            rotating_note = (
+                ", rotating "
+                + "+".join(
+                    f"{count}x@{window}" for count, window in self._rotating_layer_specs
+                )
+                if self._rotating_layer_specs
+                else ""
+            )
             logger.info(
                 f"Model info set: {num_layers} layers "
-                f"({self._num_kv_cache_layers} KVCache), "
+                f"({self._num_kv_cache_layers} KVCache{rotating_note}), "
                 f"{num_kv_heads} KV heads, "
                 f"{self._num_attention_heads} Q heads, "
                 f"{head_dim} head_dim. Estimated memory per 64-token block: "
                 f"{format_bytes(sample_block_mem)}{override_note}"
             )
+
+    def set_fixed_state_bytes(self, n: int) -> None:
+        """Record the per-sequence fixed recurrent-state footprint.
+
+        Measured once from live ArraysCache-family caches after the first
+        prefill chunk (state shapes are unknown before the first forward).
+        Cleared by ``set_model_info`` so a model swap never inherits the
+        previous model's measurement.
+        """
+        self._fixed_state_bytes = max(0, int(n))
+
+    @property
+    def fixed_state_bytes(self) -> int:
+        """Measured per-sequence recurrent state bytes (0 until measured)."""
+        return self._fixed_state_bytes
 
     def has_model_info(self) -> bool:
         """Whether ``set_model_info`` has been called with real dims.
@@ -504,6 +556,44 @@ class MemoryMonitor:
         # KVCache layers: memory grows with num_tokens
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
         return num_tokens * per_token
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> float:
+        """Exact-shape resident KV bytes a prefill of ``num_tokens`` adds.
+
+        Extends ``estimate_prompt_kv_bytes`` (full-attention layers only,
+        linear in tokens) with the two layer groups that formula cannot see:
+
+        - Sliding-window layers: each holds at most ``window + chunk - 1``
+          tokens (``RotatingKVCache._update_concat`` concatenates the chunk
+          before ``_trim``), so their term saturates instead of growing
+          linearly. Priced at the base/compute dtype: rotating layers are
+          pass-through for TurboQuant KV compression, so the fractional
+          ``_dtype_size`` would under-count them ~4x in TQ configurations.
+        - Fixed recurrent state (GDN/Mamba): a per-sequence constant,
+          measured after the first chunk (0 before that — same as today).
+
+        Admission-only: charge this once per request. Never call it from
+        per-chunk sizing paths — the fixed-state term would be re-charged
+        every chunk, and chunk sizing must stay on the frozen
+        ``_predicted_chunk_transient`` signal.
+        """
+        if num_tokens <= 0:
+            return 0
+        total = self.estimate_prompt_kv_bytes(num_tokens)
+
+        if self._rotating_layer_specs:
+            kv_heads = self._num_kv_heads or 0
+            dim = self._head_dim or 0
+            if kv_heads and dim:
+                chunk = max(int(chunk_tokens), 1)
+                per_token = kv_heads * dim * self._score_dtype_size * 2
+                for count, window in self._rotating_layer_specs:
+                    resident = min(num_tokens, window + chunk - 1)
+                    total += count * resident * per_token
+
+        return total + self._fixed_state_bytes
 
     def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
         hd = self._head_dim or 0
@@ -617,8 +707,9 @@ class MemoryMonitor:
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted in the caller's current-usage
-        # baseline.
-        kv = self.estimate_prompt_kv_bytes(new_tokens)
+        # baseline. Resident math includes window-capped sliding-window
+        # layers and measured fixed state, not just full-attention KVCache.
+        kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
         return attn + kv
 
     def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
@@ -720,6 +811,80 @@ def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
 
 def _pos_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+# Known rotating-cache class names, matching the scheduler-side sets
+# (Scheduler._collect_rotating_window_sizes and the TurboQuant eligibility
+# walk). Backstop only — duck-typing on (positive int max_size, keep attr)
+# is the primary test so renamed omlx subclasses still classify.
+_ROTATING_CACHE_CLASS_NAMES = frozenset(
+    {
+        "RotatingKVCache",
+        "BatchRotatingKVCache",
+        "PrefillReadyRotatingKVCache",
+        "BufferedRotatingKVCache",
+    }
+)
+# Fixed-state recurrent caches (GDN/Mamba). Matches
+# Scheduler._cache_tree_has_arrays_cache plus mlx-lm's MambaCache.
+_ARRAYS_CACHE_CLASS_NAMES = frozenset(
+    {"ArraysCache", "SizedArraysCache", "MambaCache"}
+)
+
+
+def collect_kv_layer_specs(
+    cache_list: Any,
+) -> tuple[int, list[tuple[int, int]], int]:
+    """Classify a ``model.make_cache()`` result into KV-layer groups.
+
+    Returns ``(full_kv_layers, rotating_specs, arrays_layers)`` where
+    ``rotating_specs`` groups sliding-window layers as
+    ``(layer_count, window_tokens)`` pairs. Full-attention layers keep the
+    strict ``type(c) is KVCache`` test the hybrid-layer counting has always
+    used; rotating layers are duck-typed (positive int ``max_size`` plus a
+    ``keep`` attribute) with a class-name backstop, avoiding a dependency on
+    scheduler-side registries. Returns all-zero on any failure so callers
+    degrade to today's behavior.
+    """
+    if cache_list is None:
+        return 0, [], 0
+    try:
+        from mlx_lm.models.cache import CacheList, KVCache
+    except ImportError:
+        return 0, [], 0
+
+    full = 0
+    arrays = 0
+    windows: Counter[int] = Counter()
+
+    def _walk(c: Any) -> None:
+        nonlocal full, arrays
+        if type(c) is KVCache:
+            full += 1
+            return
+        if isinstance(c, CacheList):
+            for inner in c.caches:
+                _walk(inner)
+            return
+        name = type(c).__name__
+        max_size = getattr(c, "max_size", None)
+        if (_pos_int(max_size) and hasattr(c, "keep")) or (
+            name in _ROTATING_CACHE_CLASS_NAMES
+        ):
+            if _pos_int(max_size):
+                windows[max_size] += 1
+            return
+        if name in _ARRAYS_CACHE_CLASS_NAMES:
+            arrays += 1
+
+    try:
+        for c in cache_list:
+            _walk(c)
+    except Exception:
+        return 0, [], 0
+
+    specs = [(count, window) for window, count in sorted(windows.items())]
+    return full, specs, arrays
 
 
 def estimate_mla_kv_bytes_per_token(
@@ -850,26 +1015,25 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             or num_kv_heads
         )
 
-        # Count KVCache layers for hybrid models. Mirrors
-        # Scheduler._set_model_info_for_monitor: recurse into CacheList so
-        # wrapped full-attention layers are counted, not just bare KVCache.
+        # Classify layer cache types for hybrid models. Mirrors
+        # Scheduler._set_model_info_for_monitor via the shared helper so the
+        # DFlash guard and the scheduler guard price the same layer groups.
         cache_list = None
         num_kv_cache_layers = num_layers
+        rotating_layer_specs: list[tuple[int, int]] = []
         if hasattr(model, "make_cache"):
             try:
                 cache_list = model.make_cache()
-                from mlx_lm.models.cache import CacheList, KVCache
-
-                def _count_kv(c: Any) -> int:
-                    if type(c) is KVCache:
-                        return 1
-                    if isinstance(c, CacheList):
-                        return sum(_count_kv(inner) for inner in c.caches)
-                    return 0
-
-                num_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
-                if num_kv_cache_layers == 0:
-                    num_kv_cache_layers = num_layers  # fallback
+                full_layers, rotating_layer_specs, arrays_layers = (
+                    collect_kv_layer_specs(cache_list)
+                )
+                num_kv_cache_layers = full_layers
+                # Fall back to charging every layer only when classification
+                # found nothing at all. A genuine 0 full-attention count next
+                # to rotating/arrays layers must stay 0, or the rotating term
+                # would be double-counted on top of a linear all-layers term.
+                if full_layers == 0 and not rotating_layer_specs and not arrays_layers:
+                    num_kv_cache_layers = num_layers
             except Exception:
                 pass
 
@@ -893,6 +1057,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 # dtype_size already equals the compute/activation dtype.
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
+                rotating_layer_specs=rotating_layer_specs,
             )
             logger.debug(
                 f"Model info for memory estimation: "
@@ -920,6 +1085,10 @@ def raise_if_prefill_exceeds(
     num_prompt_tokens: int,
     cached_tokens: int = 0,
     request_id: str | None = None,
+    static_ceiling_bytes: int = 0,
+    dynamic_ceiling_bytes: int = 0,
+    metal_cap_bytes: int = 0,
+    memory_guard_tier: str = "",
 ) -> None:
     """Raise ``PrefillMemoryExceededError`` if a prompt's prefill peak would
     push memory past ``hard_limit_bytes``.
@@ -937,6 +1106,11 @@ def raise_if_prefill_exceeds(
     (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
     a cache". A cache whose hits re-allocate KV (DFlash prefix snapshots)
     must pass 0.
+
+    The component ceilings are optional: callers that receive the
+    enforcer's breakdown (the DFlash prefill guard) pass them so the
+    rejection names the binding constraint the same way the scheduler's
+    does. Callers that do not fall back to generic advice.
     """
     if not prefill_memory_guard:
         return
@@ -959,17 +1133,23 @@ def raise_if_prefill_exceeds(
     if current + peak <= hard_limit_bytes:
         return
 
-    from omlx.exceptions import PrefillMemoryExceededError
-
     usage_gb = current / (1024**3)
     ceiling_gb = hard_limit_bytes / (1024**3)
+    binding, advice = describe_ceiling_binding(
+        static=static_ceiling_bytes,
+        dynamic=dynamic_ceiling_bytes,
+        metal_cap=metal_cap_bytes,
+        tier=memory_guard_tier,
+        current=current,
+        fmt=format_bytes,
+        tail="reduce context length",
+    )
     message = (
         f"Prefill would require ~{format_bytes(current + peak)} peak "
         f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-        f"but ceiling is {format_bytes(hard_limit_bytes)} "
+        f"but {binding} ceiling is {format_bytes(hard_limit_bytes)} "
         f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-        f"Reduce context length, free system memory, or loosen "
-        f"memory_guard_tier (safe → balanced → aggressive)."
+        f"{advice}."
     )
 
     if not request_id:

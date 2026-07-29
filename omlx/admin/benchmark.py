@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -179,41 +180,74 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
 
 
 
-def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
-    """Generate a prompt with exactly target_tokens tokens.
+# Natural-language corpus for benchmark prompts (public-domain text of
+# Project Gutenberg eBook #2701, boilerplate stripped). Prompts must not be
+# built from repeated filler: speculative decoders (Lightning MTP, DFlash)
+# reach ~99% draft acceptance on repetitive text versus ~55-80% on natural
+# text, which inflates benchmark tg by roughly 2x over anything real
+# requests can achieve on those models.
+_BENCH_CORPUS_PATH = Path(__file__).parent / "bench_corpus.txt"
+_BENCH_CORPUS_START = "Call me Ishmael."
+
+# Approximate characters per token for natural English prose in common BPE
+# vocabularies; used only by the tokenizer-less external path, which reports
+# the endpoint's actual usage.prompt_tokens anyway.
+_CORPUS_CHARS_PER_TOKEN = 4
+_PROMPT_BUILD_MAX_ATTEMPTS = 16
+
+
+@lru_cache(maxsize=1)
+def _load_bench_corpus() -> str:
+    corpus = _BENCH_CORPUS_PATH.read_text(encoding="utf-8")
+    start = corpus.find(_BENCH_CORPUS_START)
+    if start < 0:
+        raise RuntimeError(
+            f"Benchmark corpus at {_BENCH_CORPUS_PATH} is missing "
+            f"the prose start marker"
+        )
+    return corpus[start:]
+
+
+def _generate_prompt(tokenizer: Any, target_tokens: int) -> list[int]:
+    """Generate exactly ``target_tokens`` natural-text token IDs.
 
     Uses a unique UUID prefix to prevent SSD cache hits from previous sessions.
+    The prefix and corpus are encoded together so tokenizer boundary merges and
+    special-token insertion happen exactly once. The token IDs are passed to the
+    engine directly; decoding them back to text would make exact length depend
+    on tokenizer round-trip behavior.
     """
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be positive")
+
     unique_prefix = f"BENCH-{uuid.uuid4().hex} "
-    filler = (
-        "The quick brown fox jumps over the lazy dog. "
-        "In the realm of artificial intelligence, large language models "
-        "have demonstrated remarkable capabilities across diverse tasks. "
+    corpus = _load_bench_corpus()
+    if not corpus:
+        raise RuntimeError(f"Benchmark corpus at {_BENCH_CORPUS_PATH} is empty")
+
+    target_chars = max(target_tokens * _CORPUS_CHARS_PER_TOKEN, 1)
+    for _ in range(_PROMPT_BUILD_MAX_ATTEMPTS):
+        repeats = (target_chars + len(corpus) - 1) // len(corpus)
+        body = (corpus * repeats)[:target_chars]
+        tokens = [int(token) for token in tokenizer.encode(unique_prefix + body)]
+        if len(tokens) >= target_tokens:
+            return tokens[:target_tokens]
+        if not tokens:
+            raise RuntimeError(
+                f"Benchmark corpus at {_BENCH_CORPUS_PATH} tokenized to 0 tokens"
+            )
+
+        # Scale by the observed tokenizer ratio, rounding up. The +1 guarantees
+        # progress even for tokenizers with coarse or unusual segmentation.
+        target_chars = max(
+            target_chars + 1,
+            (target_chars * target_tokens + len(tokens) - 1) // len(tokens) + 1,
+        )
+
+    raise RuntimeError(
+        f"Could not build an exact {target_tokens}-token benchmark prompt "
+        f"after {_PROMPT_BUILD_MAX_ATTEMPTS} attempts"
     )
-
-    # Build a large enough text
-    text = unique_prefix + filler * (target_tokens // 10 + 1)
-    tokens = tokenizer.encode(text)
-
-    if len(tokens) < target_tokens:
-        # Need more tokens, repeat more
-        text = unique_prefix + filler * (target_tokens // 5 + 1)
-        tokens = tokenizer.encode(text)
-
-    # Truncate to exact target length
-    tokens = tokens[:target_tokens]
-    return tokenizer.decode(tokens)
-
-
-# The external path has no tokenizer, so prompt lengths are approximated by
-# repeating this filler (~30 tokens per repetition in common BPE vocabs).
-# Results report the endpoint's actual usage.prompt_tokens.
-_EXTERNAL_FILLER = (
-    "The quick brown fox jumps over the lazy dog. "
-    "In the realm of artificial intelligence, large language models "
-    "have demonstrated remarkable capabilities across diverse tasks. "
-)
-_EXTERNAL_FILLER_TOKENS = 30
 
 
 def _generate_external_prompt(target_tokens: int) -> str:
@@ -222,8 +256,15 @@ def _generate_external_prompt(target_tokens: int) -> str:
     Uses a unique UUID prefix so remote prefix caches cannot skew results.
     """
     unique_prefix = f"BENCH-{uuid.uuid4().hex} "
-    repeats = max(1, target_tokens // _EXTERNAL_FILLER_TOKENS)
-    return unique_prefix + _EXTERNAL_FILLER * repeats
+    corpus = _load_bench_corpus()
+    if not corpus:
+        raise RuntimeError(f"Benchmark corpus at {_BENCH_CORPUS_PATH} is empty")
+    target_chars = max(
+        0,
+        target_tokens * _CORPUS_CHARS_PER_TOKEN - len(unique_prefix),
+    )
+    repeats = (target_chars + len(corpus) - 1) // len(corpus)
+    return unique_prefix + (corpus * repeats)[:target_chars]
 
 
 def _compute_single_metrics(
@@ -237,6 +278,7 @@ def _compute_single_metrics(
     prefill_duration_s: float | None = None,
     generation_duration_s: float | None = None,
     generation_measured: bool = True,
+    timing_observed: bool = True,
 ) -> dict:
     """Compute all metrics for a single request benchmark."""
     ttft_s = first_token_time - start_time
@@ -250,21 +292,34 @@ def _compute_single_metrics(
     )
     e2e_duration = end_time - start_time
 
-    ttft_ms = ttft_s * 1000
+    ttft_ms: float | None = ttft_s * 1000
     if generation_measured and completion_tokens > 1 and gen_duration > 0:
-        tpot_ms = (gen_duration / (completion_tokens - 1)) * 1000
-        gen_tps = completion_tokens / gen_duration
+        tpot_ms: float | None = (gen_duration / (completion_tokens - 1)) * 1000
+        gen_tps: float | None = completion_tokens / gen_duration
     else:
-        tpot_ms = 0.0
-        gen_tps = 0.0
-    processing_tps = prompt_tokens / max(prefill_duration, 1e-9)
+        # Generation timing could not be measured (e.g. all content arrived
+        # in a single burst with no measurable inter-token span) — report
+        # unmeasured rather than a misleading 0.0.
+        tpot_ms = None
+        gen_tps = None
+    processing_tps: float | None = prompt_tokens / max(prefill_duration, 1e-9)
     total_throughput = (prompt_tokens + completion_tokens) / max(e2e_duration, 1e-9)
 
+    if not timing_observed:
+        # The first-token timestamp was never observed and fell back to the
+        # end of the response, so TTFT covers the whole response and the
+        # prefill rate derived from it is not a prefill rate at all. Only
+        # e2e latency and total throughput survive.
+        ttft_ms = None
+        processing_tps = None
+
     return {
-        "ttft_ms": round(ttft_ms, 1),
-        "tpot_ms": round(tpot_ms, 2),
-        "gen_tps": round(gen_tps, 1),
-        "processing_tps": round(processing_tps, 1),
+        "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+        "tpot_ms": round(tpot_ms, 2) if tpot_ms is not None else None,
+        "gen_tps": round(gen_tps, 1) if gen_tps is not None else None,
+        "processing_tps": (
+            round(processing_tps, 1) if processing_tps is not None else None
+        ),
         "e2e_latency_s": round(e2e_duration, 3),
         "total_throughput": round(total_throughput, 1),
         "peak_memory_bytes": peak_memory,
@@ -272,6 +327,33 @@ def _compute_single_metrics(
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
     }
+
+
+def _pin_speed_priority(engine_pool: Any) -> bool | None:
+    """Force prefill speed priority for the benchmark's duration.
+
+    Throughput numbers measured while the memory-guard throttle shrinks
+    prefill chunks are not comparable, so the bench always runs in speed
+    mode. The pin lands on the pool's stored scheduler config — the bench
+    model is loaded fresh after unload-all, so that is where its Scheduler
+    reads the flag from. Returns the previous value for restoration, or
+    None when the pool exposes no config (nothing to restore).
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is None:
+        return None
+    previous = bool(getattr(config, "prefill_speed_priority", False))
+    config.prefill_speed_priority = True
+    return previous
+
+
+def _restore_speed_priority(engine_pool: Any, previous: bool | None) -> None:
+    """Undo _pin_speed_priority (no-op when the pin never landed)."""
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is not None:
+        config.prefill_speed_priority = previous
 
 
 def _get_batch_benchmark_core(engine: Any) -> Any | None:
@@ -301,11 +383,17 @@ async def _send_event(run: BenchmarkRun, event: dict) -> None:
 
 async def _run_single_test(
     engine: Any,
-    prompt: str,
+    prompt: list[int],
     max_tokens: int,
     pp_len: int,
 ) -> dict:
     """Run a single request benchmark test and return metrics."""
+    if len(prompt) != pp_len:
+        raise RuntimeError(
+            f"Benchmark prompt length mismatch before pp{pp_len}: "
+            f"built {len(prompt)} tokens"
+        )
+
     # Reset peak memory tracking
     try:
         mx.reset_peak_memory()
@@ -354,9 +442,18 @@ async def _run_single_test(
     except Exception:
         peak_memory = 0
 
-    prompt_tokens = last_output.prompt_tokens if last_output else 0
-    completion_tokens = last_output.completion_tokens if last_output else 0
-    cached_tokens = last_output.cached_tokens if last_output else 0
+    if last_output is None:
+        raise RuntimeError(f"Benchmark pp{pp_len} produced no engine output")
+
+    prompt_tokens = last_output.prompt_tokens
+    if prompt_tokens != pp_len:
+        raise RuntimeError(
+            f"Benchmark prompt length mismatch after pp{pp_len}: "
+            f"engine reported {prompt_tokens} tokens"
+        )
+
+    completion_tokens = last_output.completion_tokens
+    cached_tokens = last_output.cached_tokens
 
     if cached_tokens > 0:
         logger.warning(
@@ -408,7 +505,7 @@ async def _run_single_test(
 
 async def _run_batch_test(
     engine: Any,
-    prompts: list[str],
+    prompts: list[list[int]],
     prompt_tokens: int,
     max_tokens: int,
     batch_size: int,
@@ -429,6 +526,20 @@ async def _run_batch_test(
     engine_core = _get_batch_benchmark_core(engine)
     if engine_core is None:
         raise ValueError("Engine does not support batch benchmarks")
+    if len(prompts) < batch_size:
+        raise RuntimeError(
+            f"Benchmark batch requires {batch_size} prompts, got {len(prompts)}"
+        )
+    invalid_lengths = [
+        len(prompt)
+        for prompt in prompts[:batch_size]
+        if len(prompt) != prompt_tokens
+    ]
+    if invalid_lengths:
+        raise RuntimeError(
+            f"Benchmark batch prompt length mismatch: expected {prompt_tokens}, "
+            f"got {invalid_lengths}"
+        )
 
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -436,12 +547,13 @@ async def _run_batch_test(
         top_p=1.0,
     )
 
-    async def _single_request(prompt: str) -> dict:
+    async def _single_request(prompt: list[int]) -> dict:
         """Run a single request within the batch."""
         start = time.perf_counter()
         first_token = None
         tokens = 0
         prev_tokens = 0
+        reported_prompt_tokens = 0
 
         request_id = await engine_core.add_request(
             prompt=prompt,
@@ -454,10 +566,17 @@ async def _run_batch_test(
             prev_tokens = output.completion_tokens
             if output.finished:
                 tokens = output.completion_tokens
+                reported_prompt_tokens = output.prompt_tokens
 
         end = time.perf_counter()
         if first_token is None:
             first_token = end
+        if reported_prompt_tokens != prompt_tokens:
+            raise RuntimeError(
+                f"Benchmark batch prompt length mismatch after submission: "
+                f"expected {prompt_tokens}, engine reported "
+                f"{reported_prompt_tokens}"
+            )
 
         return {
             "ttft_s": first_token - start,
@@ -529,6 +648,7 @@ async def _run_external_single_test(
         prefill_duration_s=None,
         generation_duration_s=gen_duration if gen_duration > 0 else None,
         generation_measured=gen_duration > 0,
+        timing_observed=stats.content_observed,
     )
     metrics["peak_memory_bytes"] = None
     return metrics
@@ -557,25 +677,49 @@ async def _run_external_batch_test(
     wall_end = time.perf_counter()
 
     total_gen_tokens = sum(s.completion_tokens for s in stats_list)
-    total_prompt_tokens = sum(s.prompt_tokens for s in stats_list)
+    prompt_tokens_per_request = [s.prompt_tokens for s in stats_list]
+    total_prompt_tokens = sum(prompt_tokens_per_request)
     wall_time = wall_end - wall_start
-    avg_ttft_ms = (
-        sum(s.first_content_time - s.start_time for s in stats_list) / batch_size
-    ) * 1000
 
-    # pp TPS: total prompt tokens / time until ALL requests emit content
+    # Every aggregate below is derived from the per-request content
+    # timestamps, so a single stream that never reported content poisons all
+    # of them: its fallback timestamp sits at the end of the response and
+    # drags max_first_token along with it.
+    timing_observed = all(s.content_observed for s in stats_list)
+    decode_observed = all(
+        s.last_content_time > s.first_content_time for s in stats_list
+    )
+
     max_first_token = max(s.first_content_time for s in stats_list)
-    pp_tps = total_prompt_tokens / max(max_first_token - wall_start, 1e-9)
+    gen_window = wall_end - max_first_token
 
-    # tg TPS: total generated tokens / generation wall time
-    tg_tps = total_gen_tokens / max(wall_end - max_first_token, 1e-9)
+    avg_ttft_ms: float | None = None
+    pp_tps: float | None = None
+    tg_tps: float | None = None
+    if timing_observed:
+        total_ttft_s = sum(s.first_content_time - s.start_time for s in stats_list)
+        avg_ttft_ms = round((total_ttft_s / batch_size) * 1000, 1)
+        # pp TPS: total prompt tokens / time until ALL requests emit content
+        prefill_window = max(max_first_token - wall_start, 1e-9)
+        pp_tps = round(total_prompt_tokens / prefill_window, 1)
+        # tg TPS needs a real decode span. wall_end is sampled after
+        # asyncio.gather returns, so gen_window stays positive even when
+        # every per-request timestamp collapsed onto the end of the
+        # response, and the window alone cannot tell a genuine decode phase
+        # from a single-chunk dump.
+        if decode_observed and gen_window > 0:
+            tg_tps = round(total_gen_tokens / gen_window, 1)
 
     return {
-        "pp_tps": round(pp_tps, 1),
-        "tg_tps": round(tg_tps, 1),
-        "avg_ttft_ms": round(avg_ttft_ms, 1),
+        "pp_tps": pp_tps,
+        "tg_tps": tg_tps,
+        "avg_ttft_ms": avg_ttft_ms,
         "e2e_latency_s": round(wall_time, 3),
         "total_gen_tokens": total_gen_tokens,
+        "total_prompt_tokens": total_prompt_tokens,
+        "prompt_tokens": round(total_prompt_tokens / batch_size),
+        "prompt_tokens_min": min(prompt_tokens_per_request),
+        "prompt_tokens_max": max(prompt_tokens_per_request),
         "batch_size": batch_size,
     }
 
@@ -935,6 +1079,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     current_test = 0
     overall_start = time.perf_counter()
 
+    # Throughput measurements must not be skewed by the memory-guard
+    # throttle shrinking chunks; pin speed priority for the run.
+    previous_speed_priority = _pin_speed_priority(engine_pool)
+
     try:
         # Snapshot experimental flags at run start. Settings can change mid-run,
         # and the produced numbers are tied to whatever was active when
@@ -994,7 +1142,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
         # Generate prompts for all needed lengths
         tokenizer = engine.tokenizer
-        prompts: dict[int, str] = {}
+        prompts: dict[int, list[int]] = {}
         for pp_len in request.prompt_lengths:
             prompts[pp_len] = _generate_prompt(tokenizer, pp_len)
 
@@ -1167,6 +1315,9 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         except Exception:
             pass
 
+    finally:
+        _restore_speed_priority(engine_pool, previous_speed_priority)
+
 
 async def _run_external_benchmark(run: BenchmarkRun) -> None:
     """Execute a benchmark run against an external OpenAI-compatible endpoint.
@@ -1217,7 +1368,8 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
 
             result = {
                 "test_type": "single",
-                "pp": pp_len,
+                "pp": metrics["prompt_tokens"],
+                "requested_pp": pp_len,
                 "tg": request.generation_length,
                 **metrics,
             }
@@ -1244,7 +1396,8 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
 
             result = {
                 "test_type": "batch",
-                "pp": 1024,
+                "pp": batch_metrics["prompt_tokens"],
+                "requested_pp": 1024,
                 "tg": request.generation_length,
                 **batch_metrics,
             }

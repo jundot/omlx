@@ -404,13 +404,12 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         orig_attn = attn_cls.__call__
         try:
             attn_module = importlib.import_module(attn_cls.__module__)
-            sdpa = attn_module.scaled_dot_product_attention
         except Exception:
-            sdpa = None
+            attn_module = None
 
         def patched_attention(self, x, mask=None, cache=None):
             if (
-                sdpa is None
+                attn_module is None
                 or x.ndim != 3
                 or x.shape[-2] < min_tokens
                 or not all(
@@ -418,6 +417,16 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                     for linear in (self.q_proj, self.k_proj, self.v_proj)
                 )
             ):
+                return orig_attn(self, x, mask=mask, cache=cache)
+
+            # Resolve SDPA per call, never at patch time. TurboQuant installs
+            # its own dispatcher when a TQ-enabled model loads, which can be
+            # after this patch is already in place (any earlier non-TQ load
+            # installs it). A snapshot taken here would keep routing TurboQuant
+            # caches into the plain mlx-lm SDPA, which then reads the
+            # group_size that only quantized caches carry (issue #2372).
+            sdpa = getattr(attn_module, "scaled_dot_product_attention", None)
+            if sdpa is None:
                 return orig_attn(self, x, mask=mask, cache=cache)
 
             B, L, _ = x.shape

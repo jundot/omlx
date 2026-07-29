@@ -33,6 +33,9 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Lower-level config-derived model class (e.g. `deepseek_v32`,
     /// `glm_moe_dsa`). Used to gate the IndexCache row to DSA models.
     let configModelType: String?
+    /// Native context window from the model's config.json. The Context
+    /// Bench target selector hides presets beyond it.
+    let modelContextLength: Int?
     /// Server-side default for `enable_thinking` derived from the model
     /// (chat template, config). UI shows it as the inherited value when
     /// `enable_thinking` is unset and offers a one-click reset to it.

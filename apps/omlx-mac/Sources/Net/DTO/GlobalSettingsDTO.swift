@@ -51,6 +51,9 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let maxConcurrentRequests: Int
         let embeddingBatchSize: Int?
         let chunkedPrefill: Bool?
+        /// "context" (default) | "speed" — what the prefill memory guard
+        /// optimizes under pressure.
+        let prefillPriority: String?
     }
 
     struct CacheSettings: Codable, Equatable, Sendable {
@@ -85,9 +88,25 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let subKeys: [SubKeyDTO]?
     }
 
+    /// Slice of the `system.*` block. The memory-layer fields feed the
+    /// Performance screen's effective-ceiling preview (min(static, dynamic,
+    /// metal cap)) so a clamped Custom ceiling is visible before the guard
+    /// aborts anything — same data the web dashboard breakdown uses.
     struct SystemInfo: Codable, Equatable, Sendable {
         let totalMemoryBytes: Int64?
         let totalMemory: String?
+        /// oMLX process phys_footprint at fetch time.
+        let omlxPhysFootprintBytes: Int64?
+        /// macOS vm_stat layers; zero on read failure.
+        let freeMemoryBytes: Int64?
+        let inactiveMemoryBytes: Int64?
+        let activeMemoryBytes: Int64?
+        /// Effective Metal cap: kernel iogpu.wired_limit_mb when set,
+        /// else Apple's max_recommended_working_set_size.
+        let iogpuWiredLimitBytes: Int64?
+        /// What oMLX asked Metal to allow at start (static ceiling clamped
+        /// below physical RAM). Kernel cap below this = red warning.
+        let omlxWiredLimitRequestBytes: Int64?
     }
 
     /// Mirrors `omlx.settings.HuggingFaceSettings`. Empty string means
@@ -258,6 +277,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
 
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil
+    var prefillPriority: String? = nil
 
     var cacheEnabled: Bool? = nil
     var hotCacheOnly: Bool? = nil

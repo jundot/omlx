@@ -94,6 +94,10 @@ class TextConfig(BaseModelConfig):
     index_local_blocks: Optional[int] = None
     attention_output_gate: bool = False
     architectures: Optional[List[str]] = None
+    # None = derive from dims (pack when shared_intermediate_size ==
+    # intermediate_size). False forces the unpacked layout so the shared
+    # expert can carry different (higher) quantization bits than the bank.
+    pack_shared_expert: Optional[bool] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

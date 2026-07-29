@@ -6,14 +6,23 @@ struct Segmented<Value: Hashable>: View {
     @Binding var selection: Value
     let titleKey: LocalizedStringKey = ""
     let options: [(value: Value, label: String)]
+    /// Optional SF Symbol per option, matched by index. When present the
+    /// segment renders `Label(label, systemImage:)` instead of plain text.
+    var icons: [String]? = nil
 
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         Picker(titleKey, selection: $selection) {
-            ForEach(options, id: \.value) { opt in
-                Text(opt.label)
-                    .tag(opt.value)
+            ForEach(Array(options.enumerated()), id: \.element.value) { index, opt in
+                if let icons, index < icons.count {
+                    Label(opt.label, systemImage: icons[index])
+                        .labelStyle(.titleAndIcon)
+                        .tag(opt.value)
+                } else {
+                    Text(opt.label)
+                        .tag(opt.value)
+                }
             }
         }
         .pickerStyle(.segmented)

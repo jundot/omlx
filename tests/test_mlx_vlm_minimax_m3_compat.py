@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+
+import pytest
 
 
 def test_minimax_m3_compat_installs_vendor_modules():
@@ -181,3 +184,119 @@ def test_ignored_layer_matching_covers_children():
     assert _is_ignored_layer("vision_tower", ("vision_tower",))
     assert _is_ignored_layer("vision_tower.block", ("vision_tower",))
     assert not _is_ignored_layer("language_model.block", ("vision_tower",))
+
+
+def _tiny_text_config(*, pack_shared_expert):
+    from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+
+    return TextConfig(
+        hidden_size=64,
+        intermediate_size=32,
+        shared_intermediate_size=32,
+        dense_intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        n_shared_experts=1,
+        moe_layer_freq=[1],
+        use_routing_bias=False,
+        pack_shared_expert=pack_shared_expert,
+    )
+
+
+def test_minimax_unpack_sanitizer_keeps_shared_expert_separate():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.minimax_m3_vl import _sanitize_moe_weights
+
+    args = _tiny_text_config(pack_shared_expert=False)
+    prefix = "language_model.model.layers.0.block_sparse_moe"
+    weights = {}
+    for expert in range(args.num_local_experts):
+        weights[f"{prefix}.experts.{expert}.w1.weight"] = mx.zeros((32, 64))
+        weights[f"{prefix}.experts.{expert}.w2.weight"] = mx.zeros((64, 32))
+        weights[f"{prefix}.experts.{expert}.w3.weight"] = mx.zeros((32, 64))
+    for name, shape in (
+        ("gate_proj", (32, 64)),
+        ("down_proj", (64, 32)),
+        ("up_proj", (32, 64)),
+    ):
+        weights[f"{prefix}.shared_experts.{name}.weight"] = mx.zeros(shape)
+
+    _sanitize_moe_weights(weights, args)
+    sanitized = weights
+
+    assert sanitized[f"{prefix}.switch_mlp.gate_proj.weight"].shape == (2, 32, 64)
+    assert sanitized[f"{prefix}.switch_mlp.down_proj.weight"].shape == (2, 64, 32)
+    assert sanitized[f"{prefix}.switch_mlp.up_proj.weight"].shape == (2, 32, 64)
+    for name in ("gate_proj", "down_proj", "up_proj"):
+        assert f"{prefix}.shared_experts.{name}.weight" in sanitized
+    assert f"{prefix}.switch_mlp.gate_up_proj.weight" not in sanitized
+
+
+def test_minimax_unpacked_mixed_bit_moe_forward():
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+    block = MiniMaxSparseMoeBlock(_tiny_text_config(pack_shared_expert=False))
+
+    def predicate(path, module):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if path.startswith("switch_mlp"):
+            return {"bits": 4, "group_size": 32, "mode": "affine"}
+        if path.startswith("shared_experts"):
+            return {"bits": 8, "group_size": 32, "mode": "affine"}
+        return False
+
+    nn.quantize(
+        block,
+        group_size=32,
+        bits=4,
+        mode="affine",
+        class_predicate=predicate,
+    )
+
+    assert block.pack_shared_expert is False
+    assert isinstance(block.switch_mlp.gate_proj, QuantizedSwitchLinear)
+    assert block.switch_mlp.gate_proj.bits == 4
+    assert isinstance(block.shared_experts.gate_proj, nn.QuantizedLinear)
+    assert block.shared_experts.gate_proj.bits == 8
+
+    output = block(mx.random.normal((1, 1, 64)).astype(mx.bfloat16))
+    mx.eval(output)
+    assert output.shape == (1, 1, 64)
+    assert bool(mx.all(mx.isfinite(output)).item())
+
+
+def test_omlx_loader_respects_minimax_shared_expert_layout_override():
+    from omlx.engine.vlm import _should_pack_minimax_m3_shared_expert
+
+    base = {
+        "n_shared_experts": 1,
+        "shared_intermediate_size": 32,
+        "intermediate_size": 32,
+    }
+    assert _should_pack_minimax_m3_shared_expert(SimpleNamespace(**base))
+    assert not _should_pack_minimax_m3_shared_expert(
+        SimpleNamespace(**base, pack_shared_expert=False)
+    )
+    assert _should_pack_minimax_m3_shared_expert(
+        SimpleNamespace(**base, pack_shared_expert=True)
+    )

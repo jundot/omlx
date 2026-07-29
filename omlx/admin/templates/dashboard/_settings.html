@@ -530,6 +530,29 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <!-- Prefill Priority -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_priority.label') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_priority.description') }}</p>
+                                    </div>
+                                    <div class="flex rounded-lg border border-neutral-200 overflow-hidden flex-shrink-0">
+                                        <button type="button"
+                                                @click="globalSettings.scheduler.prefill_priority = 'context'"
+                                                :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                class="px-3 py-1.5 text-xs font-medium transition-all flex items-center gap-1.5">
+                                            <i data-lucide="maximize-2" class="w-3.5 h-3.5"></i>
+                                            {{ t('settings.resource.prefill_priority.max_context') }}
+                                        </button>
+                                        <button type="button"
+                                                @click="globalSettings.scheduler.prefill_priority = 'speed'"
+                                                :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200 flex items-center gap-1.5">
+                                            <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
+                                            {{ t('settings.resource.prefill_priority.speed') }}
+                                        </button>
+                                    </div>
+                                </div>
                                 <!-- Idle Timeout -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>

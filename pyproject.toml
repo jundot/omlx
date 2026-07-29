@@ -56,8 +56,11 @@ dependencies = [
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     # Keep <5.13 until the broader dependency set gets a dedicated resolver
     # smoke test with transformers 5.13+. The mlx-lm pin above includes the
-    # known NewlineTokenizer registration fix.
-    "transformers>=5.7.0,<5.13",
+    # known NewlineTokenizer registration fix. Floor 5.12.1: AutoTokenizer's
+    # fix_mistral_regex backend gate (used by get_tokenizer_config for
+    # mistral-common models) first shipped in 5.12.1 — on older 5.x the kwarg
+    # is silently swallowed and Tekken prompts stay corrupted.
+    "transformers>=5.12.1,<5.13",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -188,7 +191,7 @@ dev = [
     # in the dev environment so the test actually runs.
     #
     # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
-    # which conflicts with our transformers>=5.7.0 pin and makes
+    # which conflicts with our transformers>=5.12.1 pin and makes
     # pip/uv dev installs unresolvable (#2289). Bump again once
     # upstream lifts the cap.
     "xgrammar==0.2.3",
@@ -227,7 +230,7 @@ include = ["omlx*"]
 
 [tool.setuptools.package-data]
 "omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
-"omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
+"omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json", "bench_corpus.txt"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]

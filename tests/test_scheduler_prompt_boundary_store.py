@@ -165,3 +165,48 @@ def test_cleanup_finished_stores_prompt_boundary_without_extracted_cache(
     assert args[1] == boundary_tokens
     assert args[2] == boundary_cache
     assert kwargs["model_cache_config"] == "boundary-config"
+
+
+def test_cleanup_finished_skip_cache_store_takes_leak_guard_branch(
+    mock_model,
+    mock_tokenizer,
+):
+    """A skip_cache_store request must not prep or submit a store, but its
+    blocks still go through the leak-guard release path."""
+    scheduler = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(paged_cache_block_size=4),
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler.paged_cache_manager = None
+
+    request = Request(
+        request_id="req-ctx-probe",
+        prompt="prompt",
+        sampling_params=SamplingParams(),
+        skip_cache_store=True,
+    )
+    request.prompt_token_ids = list(range(10))
+    request.num_prompt_tokens = 10
+    request.output_token_ids = [100]
+    request._extracted_cache = ["kv-live"]
+
+    scheduler.running[request.request_id] = request
+    scheduler.requests[request.request_id] = request
+    scheduler.request_id_to_uid[request.request_id] = 7
+    scheduler.uid_to_request_id[7] = request.request_id
+
+    with (
+        patch.object(scheduler, "_prepare_prompt_boundary_cache_store") as prepare,
+        patch.object(scheduler, "_remove_uid_from_active_batch"),
+    ):
+        scheduler._cleanup_finished({request.request_id})
+
+    prepare.assert_not_called()
+    scheduler.block_aware_cache.store_cache.assert_not_called()
+    scheduler.block_aware_cache.clear_request_entry.assert_called_once_with(
+        request.request_id
+    )
+    assert request.request_id not in scheduler.running
+    assert request.request_id not in scheduler.requests

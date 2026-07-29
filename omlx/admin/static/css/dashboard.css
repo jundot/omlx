@@ -180,6 +180,9 @@
     [data-theme="dark"] .bg-amber-50 { background-color: rgba(245, 158, 11, 0.15) !important; }
     [data-theme="dark"] .border-amber-200 { border-color: rgba(245, 158, 11, 0.3) !important; }
     [data-theme="dark"] .text-amber-600 { color: #fbbf24 !important; }
+    [data-theme="dark"] .text-amber-700 { color: #fbbf24 !important; }
+    [data-theme="dark"] .text-amber-800 { color: #fcd34d !important; }
+    [data-theme="dark"] .text-amber-900 { color: #fcd34d !important; }
     [data-theme="dark"] .bg-blue-50 { background-color: rgba(59, 130, 246, 0.15) !important; }
     [data-theme="dark"] .border-blue-200 { border-color: rgba(59, 130, 246, 0.3) !important; }
     [data-theme="dark"] .text-blue-700 { color: #93c5fd !important; }

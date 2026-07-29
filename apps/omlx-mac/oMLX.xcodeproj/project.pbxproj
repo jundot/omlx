@@ -94,6 +94,8 @@
 		AAD9D5272FE2849800FAEA05 /* QuantizationScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */; };
 		AAD9D5292FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5282FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift */; };
 		AAD9D52B2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D52A2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift */; };
+		AAD9D5312FE2850000FAEA05 /* ContextBenchScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5302FE2850000FAEA05 /* ContextBenchScreenVM.swift */; };
+		6BB000000000000000000012 /* ContextBenchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000012 /* ContextBenchScreen.swift */; };
 		AAD9D52D2FE284D100FAEA05 /* NetworkScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D52C2FE284D100FAEA05 /* NetworkScreenVM.swift */; };
 		AAD9D52F2FE284E200FAEA05 /* PerformanceScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D52E2FE284E200FAEA05 /* PerformanceScreenVM.swift */; };
 		ABB000000000000000000001 /* WelcomeWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC000000000000000000001 /* WelcomeWindow.swift */; };
@@ -127,6 +129,7 @@
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
 		DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000110 /* MenubarControllerModelsTests.swift */; };
 		DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */; };
+		DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000113 /* PerformanceScreenVMTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
@@ -231,6 +234,8 @@
 		AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizationScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D5282FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThroughputBenchScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D52A2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccuracyBenchScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5302FE2850000FAEA05 /* ContextBenchScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextBenchScreenVM.swift; sourceTree = "<group>"; };
+		6CC000000000000000000012 /* ContextBenchScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextBenchScreen.swift; sourceTree = "<group>"; };
 		AAD9D52C2FE284D100FAEA05 /* NetworkScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D52E2FE284E200FAEA05 /* PerformanceScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVM.swift; sourceTree = "<group>"; };
 		ACC000000000000000000001 /* WelcomeWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeWindow.swift; sourceTree = "<group>"; };
@@ -265,6 +270,7 @@
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000110 /* MenubarControllerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerModelsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVMTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000113 /* PerformanceScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVMTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -332,6 +338,7 @@
 				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
 				DCC000000000000000000110 /* MenubarControllerModelsTests.swift */,
 				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
+				DCC000000000000000000113 /* PerformanceScreenVMTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -480,6 +487,7 @@
 				6CC00000000000000000000C /* QuantizationScreen.swift */,
 				6CC00000000000000000000D /* ThroughputBenchScreen.swift */,
 				6CC00000000000000000000E /* AccuracyBenchScreen.swift */,
+				6CC000000000000000000012 /* ContextBenchScreen.swift */,
 				6CC00000000000000000000F /* NetworkScreen.swift */,
 				6CC000000000000000000010 /* PerformanceScreen.swift */,
 				DCC000000000000000000102 /* ModelCardSheet.swift */,
@@ -554,6 +562,7 @@
 				AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */,
 				AAD9D5282FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift */,
 				AAD9D52A2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift */,
+				AAD9D5302FE2850000FAEA05 /* ContextBenchScreenVM.swift */,
 				AAD9D52C2FE284D100FAEA05 /* NetworkScreenVM.swift */,
 				AAD9D52E2FE284E200FAEA05 /* PerformanceScreenVM.swift */,
 			);
@@ -722,6 +731,8 @@
 				6BB00000000000000000000D /* ThroughputBenchScreen.swift in Sources */,
 				AAD9D52F2FE284E200FAEA05 /* PerformanceScreenVM.swift in Sources */,
 				6BB00000000000000000000E /* AccuracyBenchScreen.swift in Sources */,
+				6BB000000000000000000012 /* ContextBenchScreen.swift in Sources */,
+				AAD9D5312FE2850000FAEA05 /* ContextBenchScreenVM.swift in Sources */,
 				6BB00000000000000000000F /* NetworkScreen.swift in Sources */,
 				6BB000000000000000000010 /* PerformanceScreen.swift in Sources */,
 				AAD9D5212FE2845300FAEA05 /* ModelSettingsScreenVM.swift in Sources */,
@@ -791,6 +802,7 @@
 				DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */,
 				DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */,
 				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
+				DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

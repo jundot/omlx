@@ -508,3 +508,218 @@ class TestEstimatePrefillPeakBytes:
         assert m.estimate_chunk_transient_bytes(1, 10_000) == (
             self._expected_fallback_sdpa(64, 1, 10_000, 256)
         )
+
+
+class TestCollectKvLayerSpecs:
+    """collect_kv_layer_specs classifies make_cache() results into the
+    full / rotating / arrays layer groups admission math prices."""
+
+    def test_mixed_hybrid_model(self):
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            CacheList,
+            KVCache,
+            RotatingKVCache,
+        )
+
+        from omlx.memory_monitor import collect_kv_layer_specs
+
+        cache_list = [
+            KVCache(),
+            KVCache(),
+            RotatingKVCache(max_size=1024),
+            RotatingKVCache(max_size=1024),
+            RotatingKVCache(max_size=1024),
+            RotatingKVCache(max_size=512),
+            ArraysCache(size=2),
+            ArraysCache(size=2),
+            CacheList(KVCache(), RotatingKVCache(max_size=1024)),
+        ]
+        full, specs, arrays = collect_kv_layer_specs(cache_list)
+        assert full == 3, "CacheList-wrapped KVCache must be counted"
+        assert specs == [(1, 512), (4, 1024)]
+        assert arrays == 2
+
+    def test_duck_typed_rotating_subclass_counts(self):
+        from omlx.memory_monitor import collect_kv_layer_specs
+
+        class _CustomRotating:
+            def __init__(self, max_size):
+                self.max_size = max_size
+                self.keep = 4
+
+        full, specs, arrays = collect_kv_layer_specs(
+            [_CustomRotating(2048), _CustomRotating(2048)]
+        )
+        assert full == 0
+        assert specs == [(2, 2048)]
+        assert arrays == 0
+
+    def test_kvcache_subclass_not_counted_as_full(self):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.memory_monitor import collect_kv_layer_specs
+
+        class _Sub(KVCache):
+            pass
+
+        full, specs, arrays = collect_kv_layer_specs([_Sub()])
+        assert (full, specs, arrays) == (0, [], 0)
+
+    def test_none_and_failure_degrade_to_zero(self):
+        from omlx.memory_monitor import collect_kv_layer_specs
+
+        assert collect_kv_layer_specs(None) == (0, [], 0)
+        assert collect_kv_layer_specs(object()) == (0, [], 0)
+
+
+class TestEstimateResidentKvBytes:
+    """Exact-shape resident KV: full linear + window-capped rotating +
+    measured fixed state."""
+
+    def _make(self, **kwargs):
+        monitor = MemoryMonitor(max_kv_cache_memory=2 * 1024**3)
+        defaults = dict(
+            num_layers=30,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=16,
+            compute_dtype_size=2,
+        )
+        defaults.update(kwargs)
+        monitor.set_model_info(**defaults)
+        return monitor
+
+    def test_full_only_matches_prompt_kv_bytes(self):
+        m = self._make(num_kv_cache_layers=30)
+        for n in (1, 512, 100_000):
+            assert m.estimate_resident_kv_bytes(n) == m.estimate_prompt_kv_bytes(n)
+            assert m.estimate_resident_kv_bytes(
+                n, chunk_tokens=256
+            ) == m.estimate_prompt_kv_bytes(n)
+
+    def test_hybrid_rotating_term_below_window_grows_linearly(self):
+        m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
+        n = 512
+        per_layer_token = 8 * 128 * 2 * 2  # kv_heads * dim * dtype * K+V
+        expected = (
+            n * 5 * per_layer_token  # full layers
+            + 25 * n * per_layer_token  # rotating, below window: n tokens
+        )
+        assert m.estimate_resident_kv_bytes(n, chunk_tokens=1) == expected
+
+    def test_hybrid_rotating_term_saturates_at_window_plus_chunk(self):
+        m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
+        n = 100_000
+        per_layer_token = 8 * 128 * 2 * 2
+        for chunk in (1, 32, 256):
+            expected = (
+                n * 5 * per_layer_token
+                + 25 * (1024 + chunk - 1) * per_layer_token
+            )
+            assert m.estimate_resident_kv_bytes(n, chunk_tokens=chunk) == expected
+
+    def test_rotating_priced_at_compute_dtype_not_tq_kv_width(self):
+        # TurboQuant KV: fractional stored width, but rotating layers are
+        # pass-through and stay at the base/compute dtype.
+        tq_width = 0.515625
+        m = self._make(
+            num_kv_cache_layers=5,
+            dtype_size=tq_width,
+            compute_dtype_size=2,
+            rotating_layer_specs=[(25, 1024)],
+        )
+        n = 100_000
+        full_term = n * 5 * 8 * 128 * tq_width * 2
+        rotating_term = 25 * 1024 * 8 * 128 * 2 * 2  # chunk_tokens=1
+        assert m.estimate_resident_kv_bytes(n) == full_term + rotating_term
+
+    def test_mla_override_short_circuits_full_term_only(self):
+        m = self._make(kv_bytes_per_token=1000, rotating_layer_specs=[(2, 64)])
+        n = 10_000
+        rotating_term = 2 * (64 + 31) * 8 * 128 * 2 * 2
+        assert (
+            m.estimate_resident_kv_bytes(n, chunk_tokens=32)
+            == n * 1000 + rotating_term
+        )
+
+    def test_fixed_state_added_and_reset_by_set_model_info(self):
+        m = self._make(num_kv_cache_layers=30)
+        base = m.estimate_resident_kv_bytes(100)
+        m.set_fixed_state_bytes(123_456)
+        assert m.fixed_state_bytes == 123_456
+        assert m.estimate_resident_kv_bytes(100) == base + 123_456
+        # Model swap clears the measurement.
+        m.set_model_info(
+            num_layers=30,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=16,
+            compute_dtype_size=2,
+            num_kv_cache_layers=30,
+        )
+        assert m.fixed_state_bytes == 0
+        assert m.estimate_resident_kv_bytes(100) == base
+
+    def test_zero_tokens_returns_zero(self):
+        m = self._make(num_kv_cache_layers=30)
+        m.set_fixed_state_bytes(999)
+        assert m.estimate_resident_kv_bytes(0) == 0
+
+    def test_prompt_kv_and_block_memory_bytes_unchanged(self):
+        """Regression pin: the throttle static term and the paged-SSD
+        writer-cap input must not move with the resident-KV extension."""
+        m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
+        per_layer_token = 8 * 128 * 2 * 2
+        # estimate_prompt_kv_bytes: full (num_kv_cache_layers) only.
+        assert m.estimate_prompt_kv_bytes(1000) == 1000 * 5 * per_layer_token
+        # estimate_block_memory: all num_layers, ignores layer classes.
+        assert m.estimate_block_memory(1) == 30 * 8 * 128 * 2 * 2
+
+
+class TestSetModelInfoFromModelRotating:
+    """DFlash mirror: set_model_info_from_model classifies via the shared
+    helper so rotating specs reach the monitor."""
+
+    def _fake_model(self, cache_list, num_layers=30):
+        class _Cfg:
+            num_hidden_layers = num_layers
+            num_key_value_heads = 8
+            num_attention_heads = 16
+            head_dim = 128
+
+        class _Model:
+            config = _Cfg()
+
+            def make_cache(self):
+                return cache_list
+
+        return _Model()
+
+    def test_hybrid_model_populates_rotating_specs(self):
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        from omlx.memory_monitor import set_model_info_from_model
+
+        cache_list = [KVCache() for _ in range(5)] + [
+            RotatingKVCache(max_size=1024) for _ in range(25)
+        ]
+        monitor = MemoryMonitor(max_kv_cache_memory=2 * 1024**3)
+        set_model_info_from_model(monitor, self._fake_model(cache_list))
+        assert monitor._num_kv_cache_layers == 5
+        assert monitor._rotating_layer_specs == ((25, 1024),)
+
+    def test_rotating_only_model_keeps_zero_full_layers(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        from omlx.memory_monitor import set_model_info_from_model
+
+        cache_list = [RotatingKVCache(max_size=512) for _ in range(30)]
+        monitor = MemoryMonitor(max_kv_cache_memory=2 * 1024**3)
+        set_model_info_from_model(monitor, self._fake_model(cache_list))
+        # No all-layers fallback: charging 30 linear layers on top of the
+        # rotating term would double-count.
+        assert monitor._num_kv_cache_layers == 0
+        assert monitor._rotating_layer_specs == ((30, 512),)

@@ -98,4 +98,9 @@ enum AdminAPI {
     static let accuracyResults     = "\(prefix)/bench/accuracy/results"
     static let accuracyReset       = "\(prefix)/bench/accuracy/results/reset"
     static let accuracyCancel      = "\(prefix)/bench/accuracy/cancel"
+
+    // Context bench
+    static let contextBenchStart   = "\(prefix)/bench/context/start"
+    static func contextBenchResults(_ benchId: String) -> String { "\(prefix)/bench/context/\(benchId)/results" }
+    static func contextBenchCancel(_ benchId: String) -> String  { "\(prefix)/bench/context/\(benchId)/cancel" }
 }

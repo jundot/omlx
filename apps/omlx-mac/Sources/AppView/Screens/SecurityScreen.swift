@@ -275,11 +275,30 @@ private struct SubKeysSection: View {
                 Row(label: String(localized: "security.sub_keys.key_label",
                                   defaultValue: "Key",
                                   comment: "Row label for sub-key value input")) {
-                    TextInput(text: $newKey,
-                              placeholder: String(localized: "security.sub_keys.key_placeholder",
-                                                  defaultValue: "sk-omlx-sub-…",
-                                                  comment: "Placeholder text inside the sub-key value input"),
-                              mono: true, width: 220)
+                    HStack(spacing: 6) {
+                        TextInput(text: $newKey,
+                                  placeholder: String(localized: "security.sub_keys.key_placeholder",
+                                                      defaultValue: "sk-omlx-sub-…",
+                                                      comment: "Placeholder text inside the sub-key value input"),
+                                  mono: true, width: 220)
+                        Button {
+                            newKey = APIKeyGenerator.random()
+                        } label: {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .buttonStyle(.omlx(.plain, size: .small))
+                        .help(String(localized: "security.api_key.generate",
+                                     defaultValue: "Generate a random key",
+                                     comment: "Tooltip on the API key regenerate button"))
+                        CopyIconButton(
+                            value: newKey,
+                            helpText: String(localized: "security.api_key.copy",
+                                             defaultValue: "Copy to clipboard",
+                                             comment: "Tooltip on the API key copy button")
+                        )
+                        .disabled(newKey.isEmpty)
+                    }
                 }
                 FreeRow {
                     HStack(spacing: 6) {

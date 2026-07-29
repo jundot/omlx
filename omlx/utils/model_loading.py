@@ -80,6 +80,17 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 variant = _VLM_TEXT_PREFIX + key
             if variant not in quant and variant not in extras:
                 extras[variant] = val
+            # Laguna router overrides: published checkpoints key the
+            # per-layer quantization spec by ``mlp.gate``, but the model's
+            # actual module-tree path is ``mlp.gate.proj`` (the router is
+            # ``LagunaTopKRouter.proj``, not ``gate`` itself).  Without the
+            # matching key, ``nn.quantize`` falls back to the global bits
+            # and builds the router at the wrong width, causing a shape
+            # mismatch during strict weight loading.
+            if key.endswith(".mlp.gate"):
+                proj_variant = key + ".proj"
+                if proj_variant not in quant and proj_variant not in extras:
+                    extras[proj_variant] = val
         if extras:
             quant.update(extras)
     return cfg
@@ -205,6 +216,9 @@ def maybe_apply_pre_load_patches(
       ``deepseek_v4*`` model_type.
     - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
       declares ``model_type == "step3p7"``.
+    - MiMo V2.5 text backbone (PR 1219) when ``config.json`` declares
+      ``model_type == "mimo_v2"``. The vendored model intentionally ignores
+      the base checkpoint's vision, audio, speech, and MTP weights.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -311,6 +325,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
+
+    if model_type == "mimo_v2":
+        from ..patches.mimo_v2 import apply_mimo_v2_patch
+
+        if apply_mimo_v2_patch():
+            logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured

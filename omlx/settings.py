@@ -268,6 +268,12 @@ class SchedulerSettings:
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
+    # What the prefill memory guard optimizes under pressure:
+    #   "context" (default) — shrink prefill steps down to the floor so the
+    #     largest possible prompt still completes (slower near the ceiling).
+    #   "speed" — never shrink; keep full-size steps and only admit prompts
+    #     that fit at full speed (smaller effective context limit).
+    prefill_priority: str = "context"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -285,10 +291,14 @@ class SchedulerSettings:
         if value is None:
             value = 8
         embedding_batch_size = data.get("embedding_batch_size", 32)
+        prefill_priority = data.get("prefill_priority", "context")
+        if prefill_priority not in ("context", "speed"):
+            prefill_priority = "context"
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            prefill_priority=prefill_priority,
         )
 
 
@@ -1066,12 +1076,21 @@ class GlobalSettings:
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
 
-        # Memory guard settings
+        # Memory guard settings. Naming a tier or a ceiling on the command
+        # line also turns the guard on. With a saved
+        # ``prefill_memory_guard: false`` these flags used to be a silent
+        # no-op — the enforcer reports a ceiling of 0 with the guard off, so
+        # the tier the user asked for governed nothing.
         if hasattr(args, "memory_guard") and args.memory_guard is not None:
-            self.memory.memory_guard_tier = args.memory_guard
+            if args.memory_guard == "off":
+                self.memory.prefill_memory_guard = False
+            else:
+                self.memory.memory_guard_tier = args.memory_guard
+                self.memory.prefill_memory_guard = True
         if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
             self.memory.memory_guard_tier = "custom"
             self.memory.memory_guard_custom_ceiling_gb = float(args.memory_guard_gb)
+            self.memory.prefill_memory_guard = True
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -1430,6 +1449,7 @@ class GlobalSettings:
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
+            prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

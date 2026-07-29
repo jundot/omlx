@@ -585,6 +585,36 @@ class TestExpandPerLayerQuantKeys:
         assert swapped in cfg["quantization"]
         assert cfg["quantization"][swapped]["bits"] == 8
 
+    def test_adds_gate_proj_variant_for_laguna_router_overrides(self):
+        """Laguna checkpoints key router quant overrides as ``mlp.gate``.
+
+        The model's runtime module path is ``mlp.gate.proj`` (the router
+        ``nn.Linear`` is ``LagunaTopKRouter.proj``).  Without the ``.proj``
+        variant, ``nn.quantize`` falls back to the global bits and builds
+        the router at the wrong width, causing a shape mismatch on load.
+        """
+        cfg = {
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "model.layers.1.mlp.gate": {"bits": 8, "group_size": 64},
+                "model.layers.2.mlp.gate": {"bits": 8, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert (
+            cfg["quantization"]["model.layers.1.mlp.gate.proj"]
+            == {"bits": 8, "group_size": 64}
+        )
+        assert (
+            cfg["quantization"]["model.layers.2.mlp.gate.proj"]
+            == {"bits": 8, "group_size": 64}
+        )
+        # The original key is preserved (other code paths may still use it)
+        assert "model.layers.1.mlp.gate" in cfg["quantization"]
+
 
 class TestMaterializeLazyState:
     def test_covers_arrays_in_plain_helper_objects(self):

@@ -1366,8 +1366,12 @@ class MiniMaxSparseMoeBlock(nn.Module):
         self.scoring_func = args.scoring_func
         self.shared_expert_index = args.num_local_experts
         self.pack_shared_expert = (
-            args.n_shared_experts == 1
-            and args.shared_intermediate_size == args.intermediate_size
+            (
+                args.n_shared_experts == 1
+                and args.shared_intermediate_size == args.intermediate_size
+            )
+            if getattr(args, "pack_shared_expert", None) is None
+            else args.pack_shared_expert
         )
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)

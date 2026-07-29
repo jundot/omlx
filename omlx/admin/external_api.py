@@ -117,6 +117,11 @@ class StreamStats:
     last_content_time: float
     end_time: float
     text: str
+    # False when the stream carried no content or reasoning delta at all.
+    # first/last_content_time then fall back to end_time, so every timing
+    # derived from them (TTFT, prefill rate, decode rate) describes the
+    # whole response instead of the phase it claims to measure.
+    content_observed: bool = True
 
 
 @dataclass
@@ -398,7 +403,10 @@ class ExternalAPIClient:
                     content = delta.get("content")
                     if content:
                         text_parts.append(content)
-                    if content or delta.get("reasoning_content"):
+                    has_reasoning = any(
+                        delta.get(name) for name in _REASONING_FIELD_NAMES
+                    )
+                    if content or has_reasoning:
                         now = time.perf_counter()
                         if first_content_time is None:
                             first_content_time = now
@@ -417,6 +425,7 @@ class ExternalAPIClient:
                 "External endpoint does not support stream usage "
                 "(stream_options.include_usage); cannot measure token counts"
             )
+        content_observed = first_content_time is not None
         if first_content_time is None:
             first_content_time = end_time
         if last_content_time is None:
@@ -431,6 +440,7 @@ class ExternalAPIClient:
             last_content_time=last_content_time,
             end_time=end_time,
             text="".join(text_parts),
+            content_observed=content_observed,
         )
 
 

@@ -784,7 +784,29 @@ final class ModelSettingsScreenVM {
                           defaultValue: "Disable TurboQuant KV before enabling VLM MTP.",
                           comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on")
         }
+        if vlmMtpProcessorConflict {
+            return String(localized: "settings.vlm_mtp.conflict.processors",
+                          defaultValue: "Unset repetition / presence penalty and thinking budget before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty or thinking-budget settings are set")
+        }
         return nil
+    }
+
+    /// Settings that materialize as per-request logits processors, which the
+    /// vlm_mtp decode path cannot apply (#2399). Mirrors
+    /// vlm_mtp_processor_conflicts() in model_settings.py; neutral values
+    /// (repetition 1.0, presence 0.0) do not conflict.
+    var vlmMtpProcessorConflict: Bool {
+        if let rep = Double(repetitionPenalty), rep != 1.0 { return true }
+        if let pres = Double(presencePenalty), pres != 0.0 { return true }
+        return thinkingBudgetEnabled
+    }
+
+    /// Sublabel / tooltip for the sampling rows locked while VLM MTP is on.
+    var vlmMtpProcessorLockedReason: String {
+        String(localized: "settings.sampling.locked.vlm_mtp",
+               defaultValue: "Disable VLM MTP to edit this setting.",
+               comment: "Tooltip / sublabel shown when a penalty or thinking-budget row is locked because VLM MTP is on")
     }
 
     // MARK: - Working profile dict assembly

@@ -16,12 +16,9 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models import base as mlx_lm_base
 from mlx_lm.models.activations import swiglu
-from mlx_lm.models.base import (
-    BaseModelArgs,
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
+from mlx_lm.models.base import BaseModelArgs, create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
@@ -338,7 +335,12 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
+        # Resolved through the module, not bound at import. This module is
+        # imported from maybe_apply_pre_load_patches, before the engine installs
+        # the TurboQuant dispatcher, and the dispatcher's rebinding sweep only
+        # covers mlx_lm/mlx_vlm model modules, so an import-time binding here
+        # would never see TurboQuant at all (issue #2372).
+        output = mlx_lm_base.scaled_dot_product_attention(
             queries,
             keys,
             values,
@@ -619,15 +621,33 @@ class Model(nn.Module):
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
-            gate_weight = f"{prefix}.gate.weight"
-            if gate_weight in weights:
-                weights[f"{prefix}.gate.proj.weight"] = weights.pop(gate_weight)
 
-            legacy_bias = f"{prefix}.experts.e_score_correction_bias"
-            if legacy_bias in weights:
-                weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(
-                    legacy_bias
-                )
+            # Remap the router weight and all quantization sidecars from
+            # ``gate.<suffix>`` to ``gate.proj.<suffix>``.  Quantized
+            # checkpoints produced by oQ / mlx-vlm carry ``gate.scales`` and
+            # ``gate.biases`` alongside ``gate.weight``; remapping only
+            # ``.weight`` leaves the sidecars orphaned and triggers
+            # ``ValueError: Received N parameters not in model`` during
+            # strict weight loading.
+            for suffix in ("weight", "scales", "biases"):
+                old_key = f"{prefix}.gate.{suffix}"
+                if old_key in weights:
+                    weights[f"{prefix}.gate.proj.{suffix}"] = weights.pop(old_key)
+
+            # ``e_score_correction_bias`` appears under two checkpoint
+            # conventions: the legacy ``experts.e_score_correction_bias``
+            # path (referenced in the original upstream PR) and the bare
+            # ``mlp.e_score_correction_bias`` path used by the published
+            # pipenetwork/Laguna-S-2.1 MLX conversions.  Map both to the
+            # module-tree path the model expects.
+            for bias_key in (
+                f"{prefix}.experts.e_score_correction_bias",
+                f"{prefix}.e_score_correction_bias",
+            ):
+                if bias_key in weights:
+                    weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(
+                        bias_key
+                    )
         return weights
 
     def _stack_experts(self, weights):

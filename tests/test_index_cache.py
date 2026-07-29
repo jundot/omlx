@@ -194,3 +194,20 @@ class TestApplyPostLoadTransforms:
         result = apply_post_load_transforms(model, settings)
         mock_apply.assert_not_called()
         assert result is model
+
+
+class TestPatchedAttentionSdpaBinding:
+    """The patched attention must not freeze the SDPA it saw at patch time."""
+
+    def test_sdpa_resolved_through_module_at_call_time(self):
+        from omlx.patches.index_cache import _make_patched_attention_call
+
+        patched = _make_patched_attention_call(MagicMock())
+        code = patched.__code__
+
+        # apply_post_load_transforms runs this patch before the engine installs
+        # the TurboQuant dispatcher, so a frozen binding would route TurboQuant
+        # caches into the plain mlx-lm SDPA for the rest of the process (#2372).
+        assert "scaled_dot_product_attention" not in code.co_freevars
+        assert "mlx_lm_base" in code.co_names
+        assert "scaled_dot_product_attention" in code.co_names

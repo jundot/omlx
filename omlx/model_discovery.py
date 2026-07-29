@@ -75,6 +75,14 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     "minimax_m3",
 }
 
+# Multimodal checkpoints whose currently vendored mlx-lm implementation only
+# exposes the text backbone. Route them directly to BatchedEngine instead of
+# deliberately failing an mlx-vlm load and relying on the engine-pool fallback.
+# Remove a family once mlx-vlm provides its multimodal implementation.
+MLX_LM_TEXT_ONLY_MODEL_TYPES = {
+    "mimo_v2",
+}
+
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
 # distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
@@ -347,6 +355,7 @@ class DiscoveredModel:
     model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
+    text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -528,16 +537,19 @@ def _has_vision_subconfig(config: dict) -> bool:
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
-      ``llava_qwen2``. The check is non-empty-only: a config-stub text-only
-      quant could in principle declare a tower path it doesn't ship weights
-      for, but in practice bf16 FastVLM ships a real path string.
+      ``llava_qwen2``.
+
+    All three are non-empty checks: text-only quants of VLM families can
+    leave an empty ``vision_config: {}`` stub behind after stripping the
+    vision tower (#2385), and key presence alone would misclassify them
+    as VLM.
 
     Used by the VLM classifier in :func:`detect_model_type` and by other
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        "vision_config" in config
-        or "vit_config" in config
+        bool(config.get("vision_config"))
+        or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
 
@@ -643,6 +655,15 @@ def detect_model_type(model_path: Path) -> ModelType:
             f"but architecture {architectures} is not an embedding architecture "
             "— treating as LLM"
         )
+
+    if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        if _has_vision_subconfig(config):
+            logger.warning(
+                "%s carries multimodal configuration, but the available mlx-lm "
+                "implementation is text-only; using the LLM engine",
+                model_type,
+            )
+        return "llm"
 
     if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
         logger.info(
@@ -953,6 +974,87 @@ def estimate_model_size(model_path: Path) -> int:
     return int(total_size * overhead_factor)
 
 
+# Weight-name prefixes that the text-only (mlx-lm) loaders drop when serving a
+# VLM-shaped checkpoint: qwen3_5(_moe) sanitize strips ``vision_tower.*`` and
+# ``model.visual.*``; the projector/vision-model spellings cover the other
+# families that ship text-only loadable checkpoints.
+_VISION_WEIGHT_PREFIXES = (
+    "vision_tower.",
+    "model.vision_tower.",
+    "visual.",
+    "model.visual.",
+    "vision_model.",
+    "model.vision_model.",
+    "multi_modal_projector.",
+    "model.multi_modal_projector.",
+)
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "I64": 8, "U64": 8,
+    "F32": 4, "I32": 4, "U32": 4,
+    "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+}
+
+
+def _vision_weight_bytes(model_path: Path) -> int:
+    """Sum tensor bytes under known vision prefixes from safetensors headers.
+
+    Reads only each shard's JSON header (dtype x shape per tensor), never the
+    weight data. Returns 0 when no shard parses or nothing matches.
+    """
+    import struct
+
+    total = 0
+    for shard in model_path.glob("*.safetensors"):
+        try:
+            with open(shard, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > 512 * 1024 * 1024:  # corrupt / not safetensors
+                    continue
+                header = json.loads(f.read(header_len))
+        except (OSError, ValueError, struct.error):
+            continue
+        for name, meta in header.items():
+            if name == "__metadata__" or not name.startswith(
+                _VISION_WEIGHT_PREFIXES
+            ):
+                continue
+            try:
+                dtype_size = _SAFETENSORS_DTYPE_BYTES.get(meta["dtype"], 0)
+                numel = 1
+                for dim in meta["shape"]:
+                    numel *= dim
+                total += numel * dtype_size
+            except (KeyError, TypeError):
+                continue
+    return total
+
+
+def estimate_text_only_model_size(model_path: Path) -> int:
+    """
+    Estimate memory usage when only the language part of a VLM-shaped
+    checkpoint is loaded (force_lm / model_type_override): the text loaders
+    drop the vision tower, so admission by the full file size over-charges by
+    the vision weights (#2385).
+
+    Returns 0 when there are no vision weights to subtract (plain text
+    checkpoints, unreadable shards) — callers fall back to
+    :func:`estimate_model_size`.
+    """
+    try:
+        vision_bytes = _vision_weight_bytes(model_path)
+        if vision_bytes <= 0:
+            return 0
+        full = estimate_model_size(model_path)
+    except (OSError, ValueError):
+        return 0
+    text_only = full - int(vision_bytes * 1.05)
+    if 0 < text_only < full:
+        return text_only
+    return 0
+
+
 def _is_adapter_dir(path: Path) -> bool:
     """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
     return (path / "adapter_config.json").exists()
@@ -1212,6 +1314,9 @@ def _register_model(
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
+        text_only_size = (
+            estimate_text_only_model_size(model_dir) if model_type == "vlm" else 0
+        )
 
         # Read raw config model_type for sub-type detection (e.g., OCR models)
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
@@ -1236,6 +1341,7 @@ def _register_model(
             model_type=model_type,
             engine_type=engine_type,
             estimated_size=estimated_size,
+            text_only_size=text_only_size,
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
@@ -1246,9 +1352,15 @@ def _register_model(
         )
 
         size_gb = estimated_size / (1024**3)
+        text_only_note = (
+            f", text-only: {text_only_size / (1024 ** 3):.2f}GB"
+            if text_only_size
+            else ""
+        )
         logger.info(
             f"Discovered model: {model_id} "
-            f"(type: {model_type}, engine: {engine_type}, size: {size_gb:.2f}GB)"
+            f"(type: {model_type}, engine: {engine_type}, "
+            f"size: {size_gb:.2f}GB{text_only_note})"
         )
     except Exception as e:
         logger.error(f"Failed to discover model {model_id}: {e}")

@@ -239,7 +239,12 @@ def serve_command(args):
         model_dirs = settings.get_effective_model_dirs()
         print(f"Base path: {settings.base_path}")
         print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
-        print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
+        # State first: a bare tier line reads as "this is enforced" even when
+        # the guard is off, and with it off the tier governs nothing.
+        if settings.memory.prefill_memory_guard:
+            print(f"Memory guard: on (tier: {settings.memory.memory_guard_tier})")
+        else:
+            print("Memory guard: off")
 
         # Store MCP config path for FastAPI startup
         # Priority: CLI arg > settings.json
@@ -693,15 +698,15 @@ def diagnose_menubar() -> int:
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         print(f"Menubar app:    check failed ({e})")
 
-    # The Swift app writes `server.log` (stdout/stderr of the Python child).
-    # No separate menubar.log — visibility-probe lines are logged into the
-    # same file via OSLog.
+    # `menubar.log` is the Swift app's own visibility-probe log — every line
+    # in it is relevant. `server.log` is the Python child's stdout/stderr, so
+    # only lines that mention the menubar are worth pulling out of it.
     log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
-    log_candidates = [log_dir / "server.log"]
+    log_candidates = [(log_dir / "menubar.log", False), (log_dir / "server.log", True)]
     print(f"Log dir:        {log_dir}")
 
     hits: list[tuple[str, str]] = []
-    for path in log_candidates:
+    for path, needs_filter in log_candidates:
         if not path.exists():
             continue
         try:
@@ -714,13 +719,16 @@ def diagnose_menubar() -> int:
             print(f"Could not read {path.name}: {e}")
             continue
         for ln in tail.splitlines():
-            if (
+            if not ln.strip():
+                continue
+            if needs_filter and not (
                 "menubar visibility probe" in ln
                 or "NSStatusItem" in ln
                 or "ControlCenter" in ln
                 or "Menu Bar" in ln
             ):
-                hits.append((path.name, ln))
+                continue
+            hits.append((path.name, ln))
 
     if hits:
         print("\nRecent visibility log entries (last 10):")
@@ -731,15 +739,15 @@ def diagnose_menubar() -> int:
 
     print()
     print("If the icon is missing on macOS Tahoe (26.x):")
-    print("  1. Open System Settings > Menu Bar")
+    print("  1. In the oMLX app: Settings > Appearance > Menu Bar Icon > Restore")
+    print("  2. Or turn it back on in System Settings > Menu Bar")
     print(
         "     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'"
     )
-    print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
     print("  3. If oMLX isn't in the list, quit the app and relaunch oMLX.app")
     print()
-    print("Note: Apple's sandbox policy prevents third-party apps from")
-    print("programmatically re-enabling their own menubar visibility on Tahoe.")
+    print("Note: Restore edits ControlCenter's own StatusKit approval, which")
+    print("needs Full Disk Access. Without it, use the System Settings toggle.")
     return 0
 
 
@@ -865,15 +873,15 @@ Example directory structure:
     serve_parser.add_argument(
         "--memory-guard",
         type=str,
-        choices=["safe", "balanced", "aggressive"],
+        choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier. safe reserves more system memory; aggressive allows more oMLX memory use. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. safe reserves more system memory; aggressive allows more oMLX memory use. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
         type=_positive_float,
         default=None,
-        help="Custom memory guard ceiling in GB. Sets memory guard tier to custom.",
+        help="Custom memory guard ceiling in GB. Sets memory guard tier to custom and turns the guard on.",
     )
 
     # paged SSD cache options
@@ -1085,6 +1093,14 @@ Example directory structure:
         if extra_args:
             parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
         if args.command == "serve":
+            if (
+                getattr(args, "memory_guard", None) == "off"
+                and getattr(args, "memory_guard_gb", None) is not None
+            ):
+                parser.error(
+                    "--memory-guard off cannot be combined with "
+                    "--memory-guard-gb (a custom ceiling needs the guard on)"
+                )
             serve_command(args)
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))

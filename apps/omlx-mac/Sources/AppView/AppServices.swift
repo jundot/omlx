@@ -47,6 +47,7 @@ final class AppServices: NSObject {
     /// app-scoped store; SwiftUI needs the lifetime promoted manually.
     let throughputBench = ThroughputBenchScreenVM()
     let accuracyBench   = AccuracyBenchScreenVM()
+    let contextBench    = ContextBenchScreenVM()
 
     @ObservationIgnored
     private weak var server: ServerProcess?

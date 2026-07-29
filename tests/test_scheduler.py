@@ -3838,6 +3838,122 @@ class TestCacheCorruptionRecovery:
         for req in scheduler.waiting:
             assert req.cache_corruption_retries == 0
 
+    def _add_prefilling_request(self, scheduler, request_id="req-prefill"):
+        req = Request(
+            request_id=request_id,
+            prompt="chunked prompt",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1, 2, 3, 4],
+            num_prompt_tokens=4,
+            status=RequestStatus.RUNNING,
+            remaining_tokens=[1, 2, 3, 4],
+        )
+        scheduler.requests[request_id] = req
+        scheduler.prefilling.append(req)
+        scheduler._prefill_states[request_id] = MagicMock()
+        return req
+
+    def _add_inflight_request(self, scheduler, request_id="req-inflight"):
+        """A request being prefilled inside _schedule_waiting: in no queue."""
+        req = Request(
+            request_id=request_id,
+            prompt="in-flight prompt",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[5, 6, 7],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            remaining_tokens=[5, 6, 7],
+        )
+        scheduler.requests[request_id] = req
+        return req
+
+    def test_corruption_reschedule_drains_prefilling(
+        self, mock_model, mock_tokenizer
+    ):
+        """Chunked prefills hold cache state and must be requeued (issue #2372)."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = self._add_prefilling_request(scheduler)
+
+        failed = scheduler._reschedule_running_requests(is_corruption=True)
+
+        assert failed == []
+        assert not scheduler.prefilling
+        assert "req-prefill" not in scheduler._prefill_states
+        assert req in scheduler.waiting
+        assert req.status == RequestStatus.WAITING
+        assert req.cache_corruption_retries == 1
+
+    def test_corruption_reschedule_drains_inflight_request(
+        self, mock_model, mock_tokenizer
+    ):
+        """A request mid-prefill sits in no queue at all and was orphaned."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = self._add_inflight_request(scheduler)
+
+        failed = scheduler._reschedule_running_requests(is_corruption=True)
+
+        assert failed == []
+        assert req in scheduler.waiting
+        assert req.status == RequestStatus.WAITING
+        assert req.cache_corruption_retries == 1
+
+    def test_corruption_reschedule_skips_waiting_and_inflight_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """Waiting requests hold no cache state; store_cache futures own theirs."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        waiting_req = Request(
+            request_id="req-waiting",
+            prompt="queued",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.WAITING,
+            remaining_tokens=[1],
+        )
+        scheduler.requests["req-waiting"] = waiting_req
+        scheduler.waiting.append(waiting_req)
+        storing_req = self._add_inflight_request(scheduler, "req-storing")
+        scheduler._inflight_store_futures["req-storing"] = MagicMock()
+
+        scheduler._reschedule_running_requests(is_corruption=True)
+
+        assert waiting_req.cache_corruption_retries == 0
+        assert storing_req.cache_corruption_retries == 0
+        assert [r for r in scheduler.waiting if r.request_id == "req-waiting"] == [
+            waiting_req
+        ]
+
+    def test_corruption_reschedule_fails_prefilling_after_max_retries(
+        self, mock_model, mock_tokenizer
+    ):
+        """A prefilling request over the retry limit is failed, not left behind."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = self._add_prefilling_request(scheduler)
+        req.cache_corruption_retries = 3
+
+        failed = scheduler._reschedule_running_requests(
+            is_corruption=True, max_corruption_retries=3
+        )
+
+        assert "req-prefill" in failed
+        assert not scheduler.prefilling
+        assert "req-prefill" not in scheduler._prefill_states
+        assert "req-prefill" not in scheduler.requests
+
+    def test_non_corruption_reschedule_leaves_prefilling_alone(
+        self, mock_model, mock_tokenizer
+    ):
+        """PrefillAborted recovery keeps its running-only scope."""
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        req = self._add_prefilling_request(scheduler)
+
+        scheduler._reschedule_running_requests(is_corruption=False)
+
+        assert list(scheduler.prefilling) == [req]
+        assert "req-prefill" in scheduler._prefill_states
+        assert req not in scheduler.waiting
+
     def test_fail_all_requests_clears_everything(self, mock_model, mock_tokenizer):
         """fail_all_requests removes all running and waiting requests."""
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
@@ -4179,6 +4295,13 @@ class TestStoreCacheAdmissionBackpressure:
         assert rejected[0].request_id == request.request_id
         assert rejected[0].finish_reason == "error"
         assert rejected[0].error_code == "memory_admission_stalled"
+        # The remedy has to point up the tier ladder; lowering the tier
+        # shrinks the ceiling that caused the stall.
+        assert "Raise memory_guard_tier (safe → balanced → aggressive)" in (
+            rejected[0].error
+        )
+        assert "lower hot_cache_max_size" in rejected[0].error
+        assert "lower memory_guard_tier" not in rejected[0].error
         assert request.request_id not in scheduler.requests
         assert list(scheduler.waiting) == []
         assert scheduler.running[running.request_id] is running
@@ -5208,6 +5331,237 @@ class TestBuildStateMachineStopStrings:
                 assert tok in node
                 node = node[tok]
             assert "__match__" in node
+
+
+class _StopSequenceDetokenizer:
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+        self.reset()
+
+    def reset(self):
+        self.text = ""
+        self.offset = 0
+
+    def add_token(self, token):
+        self.text += self._tokenizer.pieces.get(token, "")
+
+    @property
+    def last_segment(self):
+        segment = self.text[self.offset :]
+        self.offset = len(self.text)
+        return segment
+
+    def finalize(self):
+        pass
+
+
+class _SplitUTF8StopSequenceDetokenizer(_StopSequenceDetokenizer):
+    """Completes a split Korean character in the following token chunk."""
+
+    def reset(self):
+        super().reset()
+        self._pending_utf8 = False
+
+    def add_token(self, token):
+        if token == 20:
+            self._pending_utf8 = True
+            return
+        if self._pending_utf8:
+            self.text += "잠"
+            self._pending_utf8 = False
+        self.text += self._tokenizer.pieces.get(token, "")
+
+
+class _StopSequenceTokenizer:
+    eos_token_id = 2
+    stop_tokens = (51183, 64205, 57169, 27599)
+    pieces = {
+        2: "",
+        10: "body\n",
+        20: "",
+        21: "",
+        88: "x",
+        51183: ">>>>",
+        64205: ">>>",
+        57169: " UPD",
+        27599: "ATED",
+        326: "\n",
+    }
+
+    def encode(self, text, add_special_tokens=False):
+        if text == ">>>>>>> UPDATED":
+            return list(self.stop_tokens)
+        if text == ">>>>>>> UPDATED\n":
+            return [*self.stop_tokens, 326]
+        if text == "\n":
+            return [326]
+        return [99]
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        text = ""
+        pending_utf8 = False
+        for token in token_ids:
+            if token == 20:
+                pending_utf8 = True
+                continue
+            if pending_utf8:
+                text += "잠"
+                pending_utf8 = False
+            text += self.pieces.get(token, "")
+        return text
+
+
+class TestStopStringOutputBuffer:
+    """Regression coverage for partially emitted multi-token stops (#2386)."""
+
+    @staticmethod
+    def _response(token, finish_reason=None, match_sequence=None):
+        return SimpleNamespace(
+            uid=99,
+            token=token,
+            finish_reason=finish_reason,
+            match_sequence=match_sequence,
+            logprobs=None,
+            prompt_cache=None,
+        )
+
+    def _setup(self, mock_model):
+        tokenizer = _StopSequenceTokenizer()
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        scheduler._get_detokenizer = lambda request_id: (
+            scheduler._request_detokenizers.setdefault(
+                request_id,
+                _StopSequenceDetokenizer(tokenizer),
+            )
+        )
+        request = Request(
+            request_id="stop-output",
+            prompt="prompt",
+            sampling_params=SamplingParams(
+                max_tokens=16,
+                stop=[">>>>>>> UPDATED", ">>>>>>> UPDATED\n"],
+            ),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler._build_state_machine(request)
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+        return scheduler
+
+    def test_matched_stop_sequence_is_absent_from_stream_and_final_text(
+        self, mock_model
+    ):
+        scheduler = self._setup(mock_model)
+        stop_tokens = _StopSequenceTokenizer.stop_tokens
+        responses = [
+            self._response(10),
+            *(self._response(token) for token in stop_tokens[:-1]),
+            self._response(
+                stop_tokens[-1],
+                finish_reason="stop",
+                match_sequence=stop_tokens,
+            ),
+        ]
+
+        outputs = []
+        finished_ids = set()
+        for response in responses:
+            step_outputs, step_finished_ids = scheduler._process_batch_responses(
+                [response]
+            )
+            outputs.extend(step_outputs)
+            finished_ids.update(step_finished_ids)
+
+        assert finished_ids == {"stop-output"}
+        assert "".join(output.new_text for output in outputs) == "body\n"
+        assert outputs[-1].output_text == "body\n"
+        assert outputs[-1].finish_reason == "stop"
+        assert outputs[-1].output_token_ids == [10, *stop_tokens[:-1]]
+
+    def test_regular_tokens_are_not_delayed(self, mock_model):
+        scheduler = self._setup(mock_model)
+
+        outputs, _ = scheduler._process_batch_responses([self._response(10)])
+
+        assert len(outputs) == 1
+        assert outputs[0].new_text == "body\n"
+
+    def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
+        scheduler = self._setup(mock_model)
+        responses = [
+            self._response(51183),
+            self._response(2, finish_reason="stop", match_sequence=(2,)),
+        ]
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        assert "".join(output.new_text for output in outputs) == ">>>>"
+        assert outputs[-1].output_text == ">>>>"
+
+    def test_diverged_stop_prefix_is_released(self, mock_model):
+        scheduler = self._setup(mock_model)
+        responses = [self._response(51183), self._response(88)]
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        assert "".join(output.new_text for output in outputs) == ">>>>x"
+
+    def test_split_utf8_text_is_unchanged_without_stop_match(self, mock_model):
+        scheduler = self._setup(mock_model)
+        tokenizer = scheduler.tokenizer
+        scheduler._get_detokenizer = lambda request_id: (
+            scheduler._request_detokenizers.setdefault(
+                request_id,
+                _SplitUTF8StopSequenceDetokenizer(tokenizer),
+            )
+        )
+        responses = [
+            self._response(20),
+            self._response(21),
+            self._response(2, finish_reason="stop", match_sequence=(2,)),
+        ]
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        streamed_text = "".join(output.new_text for output in outputs)
+        assert streamed_text == "잠"
+        assert outputs[-1].output_text == "잠"
+        assert "�" not in streamed_text
+
+    def test_split_utf8_before_matched_stop_is_preserved(self, mock_model):
+        scheduler = self._setup(mock_model)
+        tokenizer = scheduler.tokenizer
+        scheduler._get_detokenizer = lambda request_id: (
+            scheduler._request_detokenizers.setdefault(
+                request_id,
+                _SplitUTF8StopSequenceDetokenizer(tokenizer),
+            )
+        )
+        stop_tokens = _StopSequenceTokenizer.stop_tokens
+        responses = [
+            self._response(20),
+            *(self._response(token) for token in stop_tokens[:-1]),
+            self._response(
+                stop_tokens[-1],
+                finish_reason="stop",
+                match_sequence=stop_tokens,
+            ),
+        ]
+
+        outputs = []
+        for response in responses:
+            step_outputs, _ = scheduler._process_batch_responses([response])
+            outputs.extend(step_outputs)
+
+        streamed_text = "".join(output.new_text for output in outputs)
+        assert streamed_text == "잠"
+        assert outputs[-1].output_text == "잠"
+        assert "�" not in streamed_text
 
 
 class TestTurboQuantMLAGuard:

@@ -63,12 +63,42 @@ struct AppearanceScreen: View {
                         localized: "appearance.row.show_dock_icon.sub",
                         defaultValue: "Keep the Dock icon visible even when no window is open.",
                         comment: "Appearance row sublabel for the permanent Dock icon toggle"
-                    ),
-                    isLast: true
+                    )
                 ) {
                     Toggle("", isOn: $showDockIcon)
                         .labelsHidden()
                         .toggleStyle(.switch)
+                }
+                // Sits right under the Dock toggle because that's where people
+                // look for it — the Dock icon and the menu bar icon read as one
+                // pair, and "Show Dock Icon" was being clicked in the hope it
+                // would bring the menu bar icon back (#2368).
+                Row(
+                    label: String(
+                        localized: "appearance.row.menubar_icon",
+                        defaultValue: "Menu Bar Icon",
+                        comment: "Appearance row label for the menu bar icon restore action"
+                    ),
+                    sublabel: String(
+                        localized: "appearance.row.menubar_icon.sub",
+                        defaultValue: "Bring the oMLX icon back if it was removed from the menu bar. Separate from the Dock icon.",
+                        comment: "Appearance row sublabel for the menu bar icon restore action"
+                    ),
+                    isLast: true
+                ) {
+                    Button {
+                        NotificationCenter.default.post(
+                            name: MenubarController.restoreIconRequestNotification,
+                            object: nil
+                        )
+                    } label: {
+                        Text(String(
+                            localized: "appearance.row.menubar_icon.restore",
+                            defaultValue: "Restore",
+                            comment: "Appearance button title that restores the menu bar icon"
+                        ))
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
                 }
             }
 

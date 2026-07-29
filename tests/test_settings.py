@@ -322,7 +322,20 @@ class TestSchedulerSettings:
             "max_concurrent_requests": 8,
             "embedding_batch_size": 32,
             "chunked_prefill": False,
+            "prefill_priority": "context",
         }
+
+    def test_prefill_priority_from_dict(self):
+        """Valid values pass through; anything else falls back to context."""
+        assert SchedulerSettings.from_dict({}).prefill_priority == "context"
+        assert (
+            SchedulerSettings.from_dict({"prefill_priority": "speed"}).prefill_priority
+            == "speed"
+        )
+        assert (
+            SchedulerSettings.from_dict({"prefill_priority": "bogus"}).prefill_priority
+            == "context"
+        )
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -821,6 +834,48 @@ class TestGlobalSettings:
 
         assert settings.memory.memory_guard_tier == "custom"
         assert settings.memory.memory_guard_custom_ceiling_gb == 48.0
+
+    def test_cli_memory_guard_off_disables_the_guard(self, tmp_path):
+        args = Namespace(memory_guard="off", memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is False
+        # The tier is left alone so turning the guard back on restores it.
+        assert settings.memory.memory_guard_tier == "balanced"
+
+    def test_cli_tier_turns_a_disabled_guard_back_on(self, tmp_path):
+        """A saved prefill_memory_guard=false used to make --memory-guard a
+        silent no-op: the enforcer reports a ceiling of 0 with the guard off,
+        so the requested tier governed nothing."""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"memory": {"prefill_memory_guard": False}})
+        )
+        args = Namespace(memory_guard="aggressive", memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is True
+        assert settings.memory.memory_guard_tier == "aggressive"
+
+    def test_cli_memory_guard_gb_turns_a_disabled_guard_back_on(self, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"memory": {"prefill_memory_guard": False}})
+        )
+        args = Namespace(memory_guard=None, memory_guard_gb=20.0)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is True
+        assert settings.memory.memory_guard_tier == "custom"
+        assert settings.memory.memory_guard_custom_ceiling_gb == 20.0
+
+    def test_cli_memory_guard_absent_leaves_saved_state(self, tmp_path):
+        """No flag means "use settings.json", both ways."""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"memory": {"prefill_memory_guard": False}})
+        )
+        args = Namespace(memory_guard=None, memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is False
 
     def test_load_from_file(self):
         """Test loading settings from JSON file."""

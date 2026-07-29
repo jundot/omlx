@@ -349,6 +349,131 @@ class DSATopKIndicesPrimitive : public Primitive {
   bool causal_valid_prefix_;
 };
 
+// ── DC-1: fused decode indexer scan ─────────────────────────────────────────
+// One kernel computes the head-summed indexer scores for a single query position
+// (s == 1) directly into [B,1,1,S] with fp32 accumulation, replacing the decode
+// chain q@k^T -> relu -> *w -> head-sum that materializes four S-sized tensors
+// per layer per token. K is addressed by STRIDES: capacity-backed cache slices
+// are consumed in place (no ensure_row_contiguous copy). Scores come out in the
+// input dtype by default (feeding the native 16-bit radix top-k) or fp32 when
+// fp32_scores is set (selection then matches fp32 ground truth exactly).
+struct OMLXDSADecodeParamsHost {
+  int S;
+  int64_t k_batch_stride;
+  int64_t k_row_stride;
+};
+
+class DSADecodeScoresPrimitive : public Primitive {
+ public:
+  DSADecodeScoresPrimitive(Stream stream, bool fp32_scores)
+      : Primitive(stream), fp32_scores_(fp32_scores) {}
+
+  static bool unsupported(
+      const array& q,
+      const array& k,
+      const array& w,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (q.dtype() != k.dtype() || q.dtype() != w.dtype()) {
+      return true;
+    }
+    if (q.dtype() != float16 && q.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(w)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4 || w.ndim() != 2) {
+      return true;
+    }
+    // q [B,32,1,128] contiguous; k [B,1,S,128] with contiguous rows only
+    // (capacity-backed slices allowed); rows must stay 16B-aligned for the
+    // vec4 loads: row stride % 8 elements == 0.
+    if (q.shape(1) != 32 || q.shape(2) != 1 || q.shape(3) != 128) {
+      return true;
+    }
+    if (k.shape(0) != q.shape(0) || k.shape(1) != 1 || k.shape(3) != 128) {
+      return true;
+    }
+    if (k.strides(3) != 1 || (k.strides(2) % 8) != 0) {
+      return true;
+    }
+    if (w.shape(0) != q.shape(0) || w.shape(1) != 32) {
+      return true;
+    }
+    return k.shape(2) < 1024;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("DSADecodeScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+    const auto& w = inputs[2];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int threads = 256;
+    const int B = q.shape(0);
+    const int S = k.shape(2);
+    const int blocks = (S + threads - 1) / threads;
+
+    std::string base_name;
+    concatenate(
+        base_name,
+        "dsa_decode_scores_",
+        type_to_name(q),
+        fp32_scores_ ? "_of32" : "_osame",
+        "_h32_d128_t",
+        threads);
+
+    OMLXDSADecodeParamsHost params{
+        /* int S = */ S,
+        /* int64_t k_batch_stride = */ k.shape(0) == 1 ? 0 : k.strides(0),
+        /* int64_t k_row_stride = */ k.strides(2)};
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto kernel = d.get_kernel(base_name, lib);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(w, 2);
+    compute_encoder.set_output_array(out, 3);
+    compute_encoder.set_bytes(params, 4);
+
+    MTL::Size group_dims = MTL::Size(threads, 1, 1);
+    MTL::Size grid_dims = MTL::Size(blocks, 1, B);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(OMLXDSADecodeScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const DSADecodeScoresPrimitive&>(other);
+    return fp32_scores_ == rhs.fp32_scores_;
+  }
+  auto state() const {
+    return std::make_tuple(fp32_scores_);
+  }
+
+ private:
+  bool fp32_scores_;
+};
+
 array dsa_topk_indices_impl(
     const array& scores,
     int topk,
@@ -482,6 +607,61 @@ array dsa_topk_indices(
     bool causal_valid_prefix,
     StreamOrDevice s) {
   return dsa_topk_indices_impl(scores, topk, bucketed, causal_valid_prefix, s);
+}
+
+array dsa_decode_scores(
+    const array& queries,
+    const array& keys,
+    const array& weights,
+    bool fp32_scores,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4 ||
+      (weights.ndim() != 2 && weights.ndim() != 3)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_decode_scores] expected q/k rank 4 and "
+        << "weights rank 2 or 3, got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(2) != 1) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_decode_scores] decode kernel expects a single "
+        "query position (q shape [B,H,1,D]).");
+  }
+
+  auto final_type = result_type(queries, keys, weights);
+  if (final_type != float16 && final_type != bfloat16) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_decode_scores] expected float16 or bfloat16 "
+        << "inputs, got " << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(astype(queries, final_type, stream), stream);
+  // K is consumed via strides — capacity-backed cache slices stay in place.
+  // (astype is a no-op on the cache's native dtype; a dtype-mismatched call
+  // would still copy, which the row-stride guard then re-checks.)
+  auto k = astype(keys, final_type, stream);
+  auto w = astype(weights, final_type, stream);
+  if (w.ndim() == 3) {
+    // accept [B, 1, H]
+    w = reshape(w, {w.shape(0), w.shape(2)}, stream);
+  }
+  w = ensure_row_contiguous(w, stream);
+
+  std::vector<array> inputs = {q, k, w};
+  if (DSADecodeScoresPrimitive::unsupported(q, k, w, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_decode_scores] unsupported shape/dtype/layout.");
+  }
+
+  Shape out_shape{q.shape(0), 1, 1, k.shape(2)};
+  return array(
+      std::move(out_shape),
+      fp32_scores ? float32 : final_type,
+      std::make_shared<DSADecodeScoresPrimitive>(stream, fp32_scores),
+      std::move(inputs));
 }
 
 } // namespace omlx::glm_kernels

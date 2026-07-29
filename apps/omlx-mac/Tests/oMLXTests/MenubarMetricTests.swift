@@ -192,3 +192,81 @@ final class MenubarMetricTests: XCTestCase {
         ))
     }
 }
+
+/// Coverage for the menubar diagnostic log the hidden-icon alert's View Log
+/// button and `omlx diagnose menubar` both read. Every case redirects
+/// `MenubarLog.url` at a temp file so the user's real log is never touched.
+@MainActor
+final class MenubarLogTests: XCTestCase {
+
+    private var tempDirectory: URL!
+    private var originalURL: URL!
+
+    override func setUp() {
+        super.setUp()
+        originalURL = MenubarLog.url
+        tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MenubarLogTests-\(UUID().uuidString)", isDirectory: true)
+        MenubarLog.url = tempDirectory.appendingPathComponent("menubar.log")
+    }
+
+    override func tearDown() {
+        MenubarLog.url = originalURL
+        try? FileManager.default.removeItem(at: tempDirectory)
+        super.tearDown()
+    }
+
+    private func contents() throws -> String {
+        try String(contentsOf: MenubarLog.url, encoding: .utf8)
+    }
+
+    func testWriteCreatesTheFileAndAppends() throws {
+        MenubarLog.write("first")
+        MenubarLog.write("second")
+
+        let lines = try contents().split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertTrue(lines[0].hasSuffix(" first"), "unexpected line: \(lines[0])")
+        XCTAssertTrue(lines[1].hasSuffix(" second"), "unexpected line: \(lines[1])")
+        // Timestamp prefix is what makes a shared log readable — assert the
+        // shape rather than a literal date.
+        XCTAssertNotNil(
+            lines[0].range(of: #"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} "#, options: .regularExpression)
+        )
+    }
+
+    func testWriteTrimsRunawayFileAndKeepsWholeLines() throws {
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        // One long line, then filler past the trim threshold: the tail cut
+        // lands mid-line, so the partial fragment has to be dropped.
+        let filler = String(repeating: "x", count: 511) + "\n"
+        var seed = "STALE-HEAD " + filler
+        while seed.utf8.count < MenubarLog.maxBytes + 4096 {
+            seed += filler
+        }
+        try seed.write(to: MenubarLog.url, atomically: true, encoding: .utf8)
+
+        MenubarLog.write("after trim")
+
+        let text = try contents()
+        let size = text.utf8.count
+        XCTAssertLessThanOrEqual(size, MenubarLog.keepBytes + 256)
+        XCTAssertFalse(text.contains("STALE-HEAD"), "trim kept the head instead of the tail")
+        XCTAssertTrue(text.hasSuffix("after trim\n"))
+        for line in text.split(separator: "\n").dropLast() {
+            XCTAssertEqual(line.count, 511, "trim left a partial line: \(line.prefix(32))…")
+        }
+    }
+
+    func testOpenSeedsTheFileWhenMissing() throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: MenubarLog.url.path))
+        // Only the seeding half is asserted; `open` also hands the URL to
+        // NSWorkspace, which is a no-op worth nothing in a test run.
+        MenubarLog.write("log opened before any probe ran")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: MenubarLog.url.path))
+        XCTAssertTrue(try contents().hasSuffix("log opened before any probe ran\n"))
+    }
+}

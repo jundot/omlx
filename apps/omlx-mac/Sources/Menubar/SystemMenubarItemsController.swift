@@ -83,6 +83,16 @@ final class SystemMenubarItemsController: NSObject, NSPopoverDelegate {
         }
     }
 
+    /// Drops the live item and builds a fresh one, forcing it visible.
+    /// Driven by the menu bar icon restore (#2368): the item carries an
+    /// autosaveName, so once its visibility is off AppKit remembers that
+    /// across launches and `sync()` alone never brings the item back.
+    func rebuild() {
+        tearDownItem()
+        sync()
+        statusItem?.isVisible = true
+    }
+
     private func fraction(for kind: SystemStatKind) -> Double? {
         switch kind {
         case .cpu:

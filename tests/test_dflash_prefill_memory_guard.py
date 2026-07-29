@@ -131,6 +131,40 @@ def test_preflight_raises_when_oversized():
     assert "KV+SDPA" in err.message
 
 
+def test_preflight_rejection_names_binding_ceiling():
+    """The enforcer propagates the component breakdown onto this guard the
+    same way it does onto a Scheduler, so DFlash's rejection has to steer
+    the user at the binding constraint instead of generic tier advice."""
+    guard = _make_guard()
+    guard._prefill_memory_guard = True
+    guard._memory_hard_limit_bytes = 1
+    guard._memory_static_ceiling_bytes = 120 * 1024**3
+    guard._memory_dynamic_ceiling_bytes = 16 * 1024**3
+    guard._memory_metal_cap_bytes = 96 * 1024**3
+    guard._memory_guard_tier = "safe"
+    p1, p2 = _zero_mem()
+    with p1, p2, pytest.raises(PrefillMemoryExceededError) as exc:
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r1")
+    message = exc.value.message
+    assert "but dynamic ceiling is" in message
+    assert "close other apps" in message.lower()
+    assert "raise memory_guard_tier (safe → balanced → aggressive)" in message
+    assert "lower memory_guard_tier" not in message
+
+
+def test_preflight_rejection_without_breakdown_stays_generic():
+    """Callers that never receive a breakdown keep the old generic advice."""
+    guard = _make_guard()
+    guard._prefill_memory_guard = True
+    guard._memory_hard_limit_bytes = 1
+    p1, p2 = _zero_mem()
+    with p1, p2, pytest.raises(PrefillMemoryExceededError) as exc:
+        guard.preflight_or_raise(num_prompt_tokens=65536)
+    message = exc.value.message
+    assert "but effective ceiling is" in message
+    assert "Raise memory_guard_tier (safe → balanced → aggressive)" in message
+
+
 def test_preflight_noop_when_guard_disabled():
     guard = _make_guard()
     guard._prefill_memory_guard = False
