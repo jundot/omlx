@@ -189,7 +189,7 @@ def apply() -> bool:
             # its head cache now instead of riding the merged decode.
             uids = getattr(self, "uids", None)
             if not uids or len(uids) != 1:
-                _prompt_priming.drop_ctx(getattr(self, "prompt_cache", None))
+                _prompt_priming.drop_ctx(getattr(self, "model", None))
             return result
 
         def patched_filter(self, keep, *args, **kwargs):
@@ -1894,7 +1894,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     # that the *next* verify cycle will check against forward([next_main, draft]).
     # The legacy depth-1 cycle rebuilds head history per cycle and never
     # consumes a primed cache; release any capture leftovers.
-    _prompt_priming.drop_ctx(gen_batch.prompt_cache)
+    _prompt_priming.drop_ctx(gen_batch.model)
     mtp_cache = gen_batch.model.make_mtp_cache()
     hidden_at_main = hidden[:, -1:, :]  # (1, 1, H)
     next_ids = next_main_tok.reshape(1, 1)

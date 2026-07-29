@@ -12,29 +12,39 @@ available for free. Each chunk is folded into a head cache immediately and
 the chunk hidden is discarded — only a single (1, 1, H) pending row carries
 across chunks.
 
-Transport: the priming context is attached as an attribute on the first
-prompt-cache entry that exposes an integer ``offset`` (the first
-full-attention ``KVCache``). The scheduler's singleton merge passthrough
-preserves cache-entry identity from external prefill through
-``GenerationBatch.prompt_cache``, so ``_post_init_mtp`` can pop the primed
-cache at MTP activation with no registry and no lifetime bookkeeping — the
-context dies with the request's cache.
+Transport: the context lives in a single slot on the patched language-model
+instance (the ``host``). Cache-entry attributes cannot carry it — mlx-lm's
+insert merge rebuilds every layer cache that lacks filter/extract support
+(all of DeepSeek-V4's and GLM-5.2's CacheList entries, and TurboQuant
+replaces KVCache entries at end of prefill) — while the model instance is
+the one object every forward and the activation both see. The engine thread
+serializes forwards, and the offset-contiguity invariant below makes the
+single slot safe across interleaved requests: a chunk from a different
+request can never look contiguous with another request's timeline (its
+first forward starts at offset 0), so it invalidates or restarts the slot,
+and the activating request is always the slot's last writer.
 
 Fail-safe invariant: every capture verifies the anchor offset advanced
 contiguously since the previous capture (``expected_offset``). Any rewind,
-trim, or unknown cache path breaks the equality and invalidates the context,
-degrading to the current unprimed behaviour — never to a wrong history.
+trim, request switch, or unknown cache path breaks the equality and
+invalidates the context, degrading to the current unprimed behaviour —
+never to a wrong history.
 
-Capture sites (both call :func:`maybe_capture` after the backbone forward):
+Capture sites (each calls :func:`maybe_capture` after the backbone forward):
 
-- mlx-lm text path: the patched ``qwen3_5.TextModel.__call__``
-  (``qwen35_model._patch_text_model``), which computes the trunk-normed
-  hidden inline.
-- mlx-vlm path: a wrap on the inner ``Qwen3_5Model.__call__``
-  (``qwen35_vlm_runtime``), whose return value *is* the trunk-normed hidden.
-  The outer ``LanguageModel`` is reached via a weakref stamped at init.
+- mlx-lm qwen3_5 text path: the patched ``TextModel.__call__``
+  (``qwen35_model``), which computes the trunk-normed hidden inline.
+- mlx-vlm qwen3_5 path: a wrap on the inner ``Qwen3_5Model.__call__``
+  (``qwen35_vlm_runtime``), whose return value *is* the trunk-normed
+  hidden; the MoE inner model inherits it. The outer ``LanguageModel`` is
+  reached via a weakref stamped at init.
+- DeepSeek-V4 (``deepseek_v4_model``): the patched ``Model.__call__``
+  requests ``return_raw_hidden`` and passes the raw 4D Hyper-stream hidden
+  (the head input variant; no trunk norm).
+- GLM-5.2 (``glm_moe_dsa_model``): the patched ``Model.__call__`` passes
+  the post-final-norm hidden it already computes.
 
-Both sites skip ``return_hidden=True`` forwards (MTP verify cycles and the
+All sites skip ``return_hidden=True`` forwards (MTP verify cycles and the
 activation forward in ``_post_init_mtp``); the final (hidden[prompt[-1]],
 main_tok) pair is folded by :func:`take_primed` at activation instead.
 """
@@ -102,11 +112,11 @@ def _suppressed() -> bool:
 
 @dataclass
 class _PrimeCtx:
-    """Streaming priming state riding a request's prompt cache."""
+    """Streaming priming state in the host model's single slot."""
 
     mtp_cache: List[Any] = field(default_factory=list)
-    # Trunk-normed hidden of the newest seen token, (1, 1, H) — pairs with
-    # the first token of the next chunk (or with main_tok at activation).
+    # Head-input hidden of the newest seen token, (1, 1, ..., H) — pairs
+    # with the first token of the next chunk (or main_tok at activation).
     pending_hidden: Optional[Any] = None
     # Folded (hidden, next_token) pairs == head-cache offset.
     folded: int = 0
@@ -115,23 +125,22 @@ class _PrimeCtx:
     expected_offset: int = 0
     valid: bool = True
 
-    def __deepcopy__(self, memo):
-        # PromptProcessingBatch._copy() deep-copies caches for partial prompt
-        # splits; a duplicated priming timeline cannot stay contiguous with
-        # either copy, so the clone starts over (invalid, no tensors).
-        clone = _PrimeCtx()
-        clone.valid = False
-        memo[id(self)] = clone
-        return clone
-
 
 def _anchor(cache: Optional[List[Any]]) -> Optional[Any]:
-    """First cache entry with a plain-int offset (first full-attention KVCache)."""
+    """First cache entry with a plain-int offset.
+
+    Container layers (``CacheList``-style, exposing ``.caches`` — DeepSeek-V4
+    and GLM-5.2 backbones) are searched one level deep: the container itself
+    has no offset but its first sub-cache (RotatingKVCache / KVCache) does.
+    """
     if not cache:
         return None
     for c in cache:
         if type(getattr(c, "offset", None)) is int:
             return c
+        for sub in getattr(c, "caches", ()) or ():
+            if type(getattr(sub, "offset", None)) is int:
+                return sub
     return None
 
 
@@ -145,64 +154,59 @@ def _activation_offset(cache: Optional[List[Any]]) -> Optional[int]:
     """
     if not cache:
         return None
-    for c in cache:
-        offset = getattr(c, "offset", None)
+
+    def _read(entry: Any) -> Optional[int]:
+        offset = getattr(entry, "offset", None)
         if type(offset) is int:
             return offset
         if offset is not None and getattr(offset, "size", 0) == 1:
             try:
                 return int(offset.reshape(()).item())
             except Exception:
-                continue
+                return None
+        return None
+
+    for c in cache:
+        got = _read(c)
+        if got is not None:
+            return got
+        for sub in getattr(c, "caches", ()) or ():
+            got = _read(sub)
+            if got is not None:
+                return got
     return None
 
 
-def _attach_target(cache: List[Any]) -> Any:
-    """Cache entry the context rides on.
+def _host_candidates(model: Any):
+    """The model itself plus the wrapped language model, if any.
 
-    Must survive the request's whole prefill→insert lifetime. The int-offset
-    KVCache entries do NOT qualify: TurboQuant conversion replaces them
-    (``prompt_cache[i] = TurboQuantKVCache.from_cache(...)``) at the end of
-    prefill, which would silently discard the context. The recurrent-layer
-    entries (ArraysCache family, no int offset) are never replaced, so prefer
-    the first of those; an all-attention model falls back to the first entry
-    and degrades to unprimed if that entry gets swapped.
+    Mirrors ``batch_generator._resolve_mtp_chain_depth``: the host that
+    carries the slot is the patched language-model instance — the outer
+    adapter / VLM wrapper for qwen paths, the Model itself for DeepSeek/GLM.
     """
-    for c in cache:
-        if type(getattr(c, "offset", None)) is not int:
-            return c
-    return cache[0]
+    yield model
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            yield inner
 
 
-def _store_ctx(cache: List[Any], ctx: _PrimeCtx) -> None:
-    target = _attach_target(cache)
-    for c in cache:
-        if c is not target and getattr(c, _CTX_ATTR, None) is not None:
-            try:
-                delattr(c, _CTX_ATTR)
-            except AttributeError:
-                pass
-    setattr(target, _CTX_ATTR, ctx)
-
-
-def _find_ctx(cache: Optional[List[Any]]) -> Optional[_PrimeCtx]:
-    if not cache:
-        return None
-    for c in cache:
-        ctx = getattr(c, _CTX_ATTR, None)
+def _find_ctx(model: Any) -> Optional[_PrimeCtx]:
+    for host in _host_candidates(model):
+        ctx = getattr(host, _CTX_ATTR, None)
         if ctx is not None:
             return ctx
     return None
 
 
-def drop_ctx(cache: Optional[List[Any]]) -> None:
-    """Remove any priming context from a request's prompt cache."""
-    if not cache:
+def drop_ctx(model: Any) -> None:
+    """Remove any priming context from the model's host slot."""
+    if model is None:
         return
-    for c in cache:
-        if getattr(c, _CTX_ATTR, None) is not None:
+    for host in _host_candidates(model):
+        if getattr(host, _CTX_ATTR, None) is not None:
             try:
-                delattr(c, _CTX_ATTR)
+                delattr(host, _CTX_ATTR)
             except AttributeError:
                 pass
 
@@ -212,6 +216,23 @@ def _host_eligible(host: Any) -> bool:
         getattr(host, "_omlx_mtp_decode_enabled", False)
         and getattr(host, "_omlx_mtp_chain", False)
         and getattr(host, "mtp", None) is not None
+    )
+
+
+def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
+    """Cheap pre-check for capture sites that must decide the forward shape.
+
+    The DeepSeek/GLM backbones only expose the head-input hidden when asked
+    (``return_raw_hidden``), so their patched ``__call__`` consults this
+    before choosing the call form. Everything here is re-checked inside
+    :func:`maybe_capture`; this exists purely to keep the ineligible path
+    identical to stock.
+    """
+    return (
+        not _suppressed()
+        and priming_enabled()
+        and cache is not None
+        and _host_eligible(host)
     )
 
 
@@ -245,17 +266,17 @@ def maybe_capture(
     seq_len = int(inputs.shape[1])
     offset_after = anchor.offset  # forward already ran; offset includes S
 
-    ctx = _find_ctx(cache)
+    ctx = getattr(host, _CTX_ATTR, None)
     if ctx is not None and (
         not ctx.valid or ctx.expected_offset != offset_after - seq_len
     ):
-        # Rewind / trim / unknown path between captures: never guess.
-        drop_ctx(cache)
+        # Rewind / trim / request switch / unknown path: never guess.
+        drop_ctx(host)
         ctx = None
     window = prime_window()
     if window and offset_after > window:
         if ctx is not None:
-            drop_ctx(cache)
+            drop_ctx(host)
         return
     if ctx is None:
         if seq_len <= 1:
@@ -264,7 +285,7 @@ def maybe_capture(
         ctx = _PrimeCtx(mtp_cache=host.make_mtp_cache())
         if not ctx.mtp_cache:
             return
-        _store_ctx(cache, ctx)
+        setattr(host, _CTX_ATTR, ctx)
 
     if ctx.pending_hidden is not None:
         if seq_len > 1:
@@ -282,7 +303,11 @@ def maybe_capture(
         pairs_hidden = normed[:, :-1]
         pairs_tokens = inputs[:, 1:]
 
-    host.mtp(pairs_hidden, pairs_tokens, host.model.embed_tokens, ctx.mtp_cache)
+    # Fold through the public mtp_forward so every family's head layout
+    # (module, block list, CacheList head caches) is handled by its own
+    # model patch. The returned logits are never evaluated — nothing pulls
+    # on them, so the lm_head tail costs nothing.
+    host.mtp_forward(pairs_hidden, pairs_tokens, ctx.mtp_cache, logits_keep=1)
     ctx.folded += int(pairs_tokens.shape[1])
     ctx.pending_hidden = normed[:, -1:]
     ctx.expected_offset = offset_after
@@ -290,7 +315,11 @@ def maybe_capture(
     # accumulates across a long prefill; the (1,1,H) pending row is evaluated
     # alongside so the chunk's full hidden can be freed.
     evals = [ctx.pending_hidden]
+    flat = []
     for c in ctx.mtp_cache:
+        subs = getattr(c, "caches", None)
+        flat.extend(subs if subs else (c,))
+    for c in flat:
         keys = getattr(c, "keys", None)
         values = getattr(c, "values", None)
         if keys is not None:
@@ -315,10 +344,10 @@ def take_primed(
     ``(mtp_cache, hist_offset)`` — or None, in which case the caller keeps
     the current unprimed behaviour.
     """
-    ctx = _find_ctx(cache)
+    ctx = _find_ctx(model)
     if ctx is None:
         return None
-    drop_ctx(cache)
+    drop_ctx(model)
     if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
         return None
     offset = _activation_offset(cache)
@@ -342,9 +371,9 @@ def take_primed(
     return ctx.mtp_cache, ctx.folded + 1
 
 
-def prime_ctx_stats(cache: Optional[List[Any]]) -> Optional[int]:
+def prime_ctx_stats(model: Any) -> Optional[int]:
     """Folded pair count of a live context (introspection / tests)."""
-    ctx = _find_ctx(cache)
+    ctx = _find_ctx(model)
     return ctx.folded if ctx is not None else None
 
 

@@ -43,6 +43,8 @@ import logging
 import sys
 from typing import Any, Dict
 
+from . import prompt_priming
+
 logger = logging.getLogger(__name__)
 
 
@@ -375,6 +377,13 @@ def _patch_model(glm: Any) -> None:
             out, h_raw = self.model(inputs, cache, return_raw_hidden=True)
             return self.lm_head(out), h_raw
         out = self.model(inputs, cache)
+        if not n_confirmed:
+            # ``out`` is the post-final-norm hidden — exactly the variant the
+            # GLM head consumes — so capture rides the stock forward free.
+            try:
+                prompt_priming.maybe_capture(self, inputs, out, cache)
+            except Exception:
+                logger.debug("MTP prompt-priming capture failed", exc_info=True)
         return self.lm_head(out)
 
     def make_mtp_cache(self):

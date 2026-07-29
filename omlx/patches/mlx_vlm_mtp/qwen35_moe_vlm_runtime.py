@@ -36,6 +36,7 @@ in ``maybe_apply_pre_load_patches`` which satisfies that requirement.
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
 import mlx.core as mx
@@ -235,6 +236,10 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            # Qwen3_5MoeModel inherits the dense Qwen3_5Model.__call__, so
+            # the prompt-priming capture wrap installed by the dense runtime
+            # already runs here — it only needs the host backref to engage.
+            self.model._omlx_mtp_prime_host = weakref.ref(self)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.

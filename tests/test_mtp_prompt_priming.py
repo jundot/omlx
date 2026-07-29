@@ -129,10 +129,10 @@ class TestCaptureFold:
         cache = _make_cache(model)
         _chunked_prefill(model, cache, tokens, [5, 5, 3])
 
-        folded = prompt_priming.prime_ctx_stats(cache)
+        folded = prompt_priming.prime_ctx_stats(model)
         assert folded == n - 1
 
-        ctx = prompt_priming._find_ctx(cache)
+        ctx = prompt_priming._find_ctx(model)
         assert ctx is not None and ctx.valid
         assert ctx.mtp_cache[0].offset == n - 1
         mx.eval([c.state for c in ctx.mtp_cache])
@@ -150,7 +150,7 @@ class TestCaptureFold:
         tokens = _tokens(n, seed=1)
         cache = _make_cache(model)
         _chunked_prefill(model, cache, tokens, [4, 3, 1])
-        assert prompt_priming.prime_ctx_stats(cache) == n - 1
+        assert prompt_priming.prime_ctx_stats(model) == n - 1
 
     def test_take_primed_completes_seam(self, model):
         n = 9
@@ -166,7 +166,7 @@ class TestCaptureFold:
         mtp_cache, hist_offset = primed
         assert hist_offset == n
         assert mtp_cache[0].offset == n
-        assert prompt_priming._find_ctx(cache) is None
+        assert prompt_priming._find_ctx(model) is None
 
         ref_cache = _reference_head_cache(model, tokens, extra_tok=main_tok)
         mx.eval([c.state for c in mtp_cache])
@@ -180,23 +180,23 @@ class TestCaptureSkips:
         monkeypatch.setenv("OMLX_MTP_PROMPT_PRIMING", "0")
         cache = _make_cache(model)
         _chunked_prefill(model, cache, _tokens(6), [6])
-        assert prompt_priming.prime_ctx_stats(cache) is None
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_suppress_capture(self, model):
         cache = _make_cache(model)
         with prompt_priming.suppress_capture():
             _chunked_prefill(model, cache, _tokens(6), [6])
-        assert prompt_priming.prime_ctx_stats(cache) is None
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_single_token_forward_does_not_start_ctx(self, model):
         cache = _make_cache(model)
         _chunked_prefill(model, cache, _tokens(1), [1])
-        assert prompt_priming.prime_ctx_stats(cache) is None
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_return_hidden_forward_skipped(self, model):
         cache = _make_cache(model)
         model(_tokens(6)[None, :], cache=cache, return_hidden=True)
-        assert prompt_priming.prime_ctx_stats(cache) is None
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_batch_forward_skipped(self, model):
         cache = _make_cache(model)
@@ -206,26 +206,26 @@ class TestCaptureSkips:
             model(toks, cache=cache)
         except Exception:
             pass
-        assert prompt_priming.prime_ctx_stats(cache) is None
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_offset_rewind_invalidates_and_restarts(self, model):
         tokens = _tokens(12, seed=4)
         cache = _make_cache(model)
         _chunked_prefill(model, cache, tokens[:8], [8])
-        assert prompt_priming.prime_ctx_stats(cache) == 7
+        assert prompt_priming.prime_ctx_stats(model) == 7
         # External trim breaks contiguity: the old timeline must not survive.
         for c in cache:
             if hasattr(c, "trim") and type(getattr(c, "offset", None)) is int:
                 c.trim(2)
         _chunked_prefill(model, cache, tokens[8:], [4])
         # Restarted mid-prompt: only the new chunk's internal pairs.
-        assert prompt_priming.prime_ctx_stats(cache) == 3
+        assert prompt_priming.prime_ctx_stats(model) == 3
 
     def test_window_cap_disables_long_prompts(self, model, monkeypatch):
         monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
         cache = _make_cache(model)
         _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
-        assert prompt_priming.prime_ctx_stats(cache) is None
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""
@@ -233,20 +233,33 @@ class TestCaptureSkips:
         cache = _make_cache(model)
         _chunked_prefill(model, cache, tokens, [7])
         assert prompt_priming.take_primed(model, cache, _tokens(1, seed=7)) is None
-        assert prompt_priming._find_ctx(cache) is None
+        assert prompt_priming._find_ctx(model) is None
 
-    def test_ctx_attaches_to_non_kv_entry(self, model):
-        """TurboQuant replaces int-offset KVCache entries at end of prefill;
-        the ctx must ride an entry conversion never touches (issue found in
-        the first real-server smoke: primed=0 with turboquant_kv on)."""
+    def test_ctx_lives_on_host_not_cache(self, model):
+        """The slot rides the model instance: cache entries are rebuilt by
+        the insert merge (and TurboQuant conversion) on several families, so
+        cache-attribute transport silently loses the context (found in the
+        first real-server smokes: primed=0 with turboquant_kv / DeepSeek)."""
         cache = _make_cache(model)
         _chunked_prefill(model, cache, _tokens(6, seed=20), [6])
-        target = None
-        for c in cache:
-            if getattr(c, "_omlx_mtp_prime_ctx", None) is not None:
-                target = c
-        assert target is not None
-        assert type(getattr(target, "offset", None)) is not int
+        assert getattr(model, "_omlx_mtp_prime_ctx", None) is not None
+        assert all(
+            getattr(c, "_omlx_mtp_prime_ctx", None) is None for c in cache
+        )
+
+    def test_interleaved_request_restarts_slot(self, model):
+        """A second request's prefill on the same model can never continue
+        the first request's timeline: its offsets restart at zero, which
+        breaks contiguity and restarts the slot."""
+        cache_a = _make_cache(model)
+        _chunked_prefill(model, cache_a, _tokens(10, seed=23), [10])
+        assert prompt_priming.prime_ctx_stats(model) == 9
+        cache_b = _make_cache(model)
+        _chunked_prefill(model, cache_b, _tokens(6, seed=24), [6])
+        assert prompt_priming.prime_ctx_stats(model) == 5
+        # Request A activating now must not see B's history.
+        model(_tokens(1, seed=25)[None, :], cache=cache_a, return_hidden=True)
+        assert prompt_priming.take_primed(model, cache_a, _tokens(1, seed=25)) is None
 
     def test_ctx_survives_kv_entry_replacement(self, model):
         """Simulate the TurboQuant convert: swap every KVCache entry for a
@@ -271,19 +284,9 @@ class TestCaptureSkips:
     def test_drop_ctx(self, model):
         cache = _make_cache(model)
         _chunked_prefill(model, cache, _tokens(6, seed=8), [6])
-        assert prompt_priming.prime_ctx_stats(cache) is not None
-        prompt_priming.drop_ctx(cache)
-        assert prompt_priming.prime_ctx_stats(cache) is None
-
-    def test_deepcopy_clone_is_invalid(self, model):
-        import copy
-
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(6, seed=9), [6])
-        ctx = prompt_priming._find_ctx(cache)
-        clone = copy.deepcopy(ctx)
-        assert clone.valid is False
-        assert clone.folded == 0
+        assert prompt_priming.prime_ctx_stats(model) is not None
+        prompt_priming.drop_ctx(model)
+        assert prompt_priming.prime_ctx_stats(model) is None
 
 
 class TestActivationHandoff:
@@ -328,7 +331,7 @@ class TestActivationHandoff:
         # n prompt-pair folds via capture+seam, +1 from _chain_next_drafts.
         assert state.hist_offset == n + 1
         assert state.mtp_cache[0].offset >= n
-        assert prompt_priming._find_ctx(cache) is None
+        assert prompt_priming._find_ctx(model) is None
 
     def test_post_init_without_ctx_is_unprimed(self, model):
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
