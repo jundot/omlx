@@ -180,10 +180,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
 
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
+        cached_tokens=0,
         request_id="req-evict",
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
+        cached_tokens=0,
         request_id="req-evict",
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
@@ -212,6 +214,64 @@ async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_batched_engine_preflight_credits_resident_prefix(monkeypatch):
+    """A prompt sharing a long prefix with a stored reference sequence must
+    have preflight's peak estimate charge only the new tokens, not the
+    full prompt length (issue: preflight always assumed cached_tokens=0,
+    even when the scheduler's own paged cache already held most of the
+    prompt — see ``estimate_cached_prefix_length``)."""
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = _make_scheduler()
+    engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+    engine._preprocess_messages = lambda m: m
+
+    stored = list(range(80_000))
+    scheduler._cache_probe_seqs.append(("req-old", stored))
+    # Prompt shares the first 80,000 tokens, then has 2,000 genuinely new.
+    prompt_tokens = stored + list(range(500_000, 502_000))
+    engine._tokenizer.encode = MagicMock(return_value=prompt_tokens)
+
+    seen: dict = {}
+
+    def _capture(num_prompt_tokens, **kwargs):
+        seen["num_prompt_tokens"] = num_prompt_tokens
+        seen.update(kwargs)
+
+    scheduler.preflight_or_raise = _capture  # type: ignore[assignment]
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    assert seen["num_prompt_tokens"] == len(prompt_tokens)
+    assert seen["cached_tokens"] == 80_000
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_cold_start_unchanged(monkeypatch):
+    """No matching stored sequence: cached_tokens stays 0, identical to
+    today's behavior — the fix must not weaken a genuine cold start."""
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = _make_scheduler()
+    engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+    engine._preprocess_messages = lambda m: m
+    engine._tokenizer.encode = MagicMock(return_value=list(range(50_000)))
+
+    seen: dict = {}
+
+    def _capture(num_prompt_tokens, **kwargs):
+        seen["num_prompt_tokens"] = num_prompt_tokens
+        seen.update(kwargs)
+
+    scheduler.preflight_or_raise = _capture  # type: ignore[assignment]
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    assert seen["num_prompt_tokens"] == 50_000
+    assert seen["cached_tokens"] == 0
+
+
+@pytest.mark.asyncio
 async def test_vlm_engine_preflight_chat_raises_for_oversize_prompt(monkeypatch):
     from omlx.engine.vlm import VLMBatchedEngine
 
@@ -228,6 +288,59 @@ async def test_vlm_engine_preflight_chat_raises_for_oversize_prompt(monkeypatch)
 
     with pytest.raises(PrefillMemoryExceededError):
         await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+
+@pytest.mark.asyncio
+async def test_vlm_engine_preflight_credits_resident_prefix(monkeypatch):
+    """Mirrors the BatchedEngine cache-credit contract for the VLM preflight
+    path (the text-only encoded prompt, before the image-token budget is
+    added, is what gets compared against stored reference sequences)."""
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = _make_scheduler()
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+
+    stored = list(range(40_000))
+    scheduler._cache_probe_seqs.append(("req-old", stored))
+    prompt_tokens = stored + list(range(500_000, 501_000))
+    engine._tokenizer.encode = MagicMock(return_value=prompt_tokens)
+
+    seen: dict = {}
+
+    def _capture(num_prompt_tokens, **kwargs):
+        seen["num_prompt_tokens"] = num_prompt_tokens
+        seen.update(kwargs)
+
+    scheduler.preflight_or_raise = _capture  # type: ignore[assignment]
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    assert seen["num_prompt_tokens"] == len(prompt_tokens)
+    assert seen["cached_tokens"] == 40_000
+
+
+@pytest.mark.asyncio
+async def test_vlm_engine_preflight_cold_start_unchanged(monkeypatch):
+    """No matching stored sequence: cached_tokens stays 0 for the VLM path
+    too, identical to today's behavior."""
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = _make_scheduler()
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+    engine._tokenizer.encode = MagicMock(return_value=list(range(30_000)))
+
+    seen: dict = {}
+
+    def _capture(num_prompt_tokens, **kwargs):
+        seen["num_prompt_tokens"] = num_prompt_tokens
+        seen.update(kwargs)
+
+    scheduler.preflight_or_raise = _capture  # type: ignore[assignment]
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    assert seen["num_prompt_tokens"] == 30_000
+    assert seen["cached_tokens"] == 0
 
 
 @pytest.mark.asyncio

@@ -1289,9 +1289,11 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        cached_tokens: int = 0,
     ) -> None:
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
         if eviction_request is not None and self._prefill_eviction_callback is not None:
@@ -1302,6 +1304,7 @@ class VLMBatchedEngine(BaseEngine):
             await self._prefill_eviction_callback(eviction_request)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
 
@@ -3334,7 +3337,8 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            encoded = self._tokenizer.encode(prompt)
+            num_tokens = len(encoded)
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -3356,8 +3360,18 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
+        # Cache-credit estimate uses the text-only encoded prompt (before
+        # the image-token budget is added above): image placeholders are
+        # not part of this cheap text tokenization, so comparing only the
+        # text prefix against stored sequences stays a safe, conservative
+        # match — it can only find a shorter shared prefix than reality,
+        # never a longer one.
+        cached_tokens = scheduler.estimate_cached_prefix_length(encoded)
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            cached_tokens=cached_tokens,
+            request_id=request_id,
         )
 
     async def preflight_completion(
@@ -3376,7 +3390,8 @@ class VLMBatchedEngine(BaseEngine):
             )
             return
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            encoded = self._tokenizer.encode(prompt)
+            num_tokens = len(encoded)
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_completion: tokenizer.encode "
@@ -3389,8 +3404,12 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
+        cached_tokens = scheduler.estimate_cached_prefix_length(encoded)
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            cached_tokens=cached_tokens,
+            request_id=request_id,
         )
 
     async def stream_chat(

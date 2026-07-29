@@ -174,3 +174,49 @@ class TestDivergenceProbe:
 
         assert "first divergence at token 1" in caplog.text
         assert "<decode failed>" in caplog.text
+
+
+class TestEstimateCachedPrefixLength:
+    """Cheap, conservative resident-cache estimate consumed by preflight
+    (see engine/batched.py and engine/vlm.py) — shares the exact same
+    scan as ``_log_prefix_divergence`` via ``_best_matching_probe_seq``.
+    """
+
+    def test_exact_common_prefix_against_stored_sequence(self):
+        sched = _make_scheduler()
+        sched._cache_probe_seqs.append(("req-old", list(range(100))))
+        prompt = list(range(60)) + [999] * 20
+
+        assert sched.estimate_cached_prefix_length(prompt) == 60
+
+    def test_zero_when_no_probe_history(self):
+        sched = _make_scheduler()
+        assert sched.estimate_cached_prefix_length([1, 2, 3]) == 0
+
+    def test_zero_when_no_shared_prefix(self):
+        sched = _make_scheduler()
+        sched._cache_probe_seqs.append(("req-old", [1, 2, 3]))
+        assert sched.estimate_cached_prefix_length([9, 9, 9]) == 0
+
+    def test_zero_for_empty_prompt(self):
+        sched = _make_scheduler()
+        sched._cache_probe_seqs.append(("req-old", [1, 2, 3]))
+        assert sched.estimate_cached_prefix_length([]) == 0
+
+    def test_picks_best_matching_stored_sequence(self):
+        sched = _make_scheduler()
+        sched._cache_probe_seqs.append(("req-a", [9, 9, 9]))
+        sched._cache_probe_seqs.append(("req-b", [1, 2, 3, 4, 5]))
+        prompt = [1, 2, 3, 7, 7]
+
+        assert sched.estimate_cached_prefix_length(prompt) == 3
+
+    def test_never_exceeds_exact_prefix_match(self):
+        """The credited length is exactly the token-level common prefix —
+        no rounding up, no heuristics."""
+        sched = _make_scheduler()
+        sched._cache_probe_seqs.append(("req-old", list(range(20000))))
+        prompt = list(range(20000))
+        prompt[20000 - 1] = -1  # last token diverges
+
+        assert sched.estimate_cached_prefix_length(prompt) == 19999

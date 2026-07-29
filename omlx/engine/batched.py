@@ -84,9 +84,11 @@ class BatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        cached_tokens: int = 0,
     ) -> None:
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
         if eviction_request is not None and self._prefill_eviction_callback is not None:
@@ -97,6 +99,7 @@ class BatchedEngine(BaseEngine):
             await self._prefill_eviction_callback(eviction_request)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
 
@@ -971,7 +974,8 @@ class BatchedEngine(BaseEngine):
         # through the existing handler chain so the response shape stays
         # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            encoded = self._tokenizer.encode(prompt)
+            num_tokens = len(encoded)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -984,8 +988,12 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
+        cached_tokens = scheduler.estimate_cached_prefix_length(encoded)
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            cached_tokens=cached_tokens,
+            request_id=request_id,
         )
 
     async def preflight_completion(
@@ -1001,7 +1009,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            encoded = self._tokenizer.encode(prompt)
+            num_tokens = len(encoded)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_completion: tokenizer.encode raised "
@@ -1014,8 +1023,12 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
+        cached_tokens = scheduler.estimate_cached_prefix_length(encoded)
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            cached_tokens=cached_tokens,
+            request_id=request_id,
         )
 
     async def stream_chat(

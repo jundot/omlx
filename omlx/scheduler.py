@@ -6562,6 +6562,44 @@ class Scheduler:
     # prompt (i.e. the cache was relevant but could not cover the request).
     _REPREFILL_INFO_MIN_TOKENS = 4096
 
+    def _best_matching_probe_seq(
+        self, prompt_token_ids: list[int]
+    ) -> tuple[str | None, array | list[int] | None, int]:
+        """Find the stored reference sequence sharing the longest prefix.
+
+        Scans ``self._cache_probe_seqs`` (deque, maxlen=4) via
+        ``_common_prefix_len``. Shared by ``estimate_cached_prefix_length``
+        (preflight's memory estimate) and ``_log_prefix_divergence``
+        (diagnostics) so there is exactly one implementation of the scan.
+        Returns ``(None, None, -1)`` when there is nothing to compare
+        against.
+        """
+        best_id, best_seq, best_p = None, None, -1
+        for ref_id, seq in list(self._cache_probe_seqs):
+            p = self._common_prefix_len(prompt_token_ids, seq)
+            if p > best_p:
+                best_id, best_seq, best_p = ref_id, seq, p
+        return best_id, best_seq, best_p
+
+    def estimate_cached_prefix_length(self, prompt_token_ids: list[int]) -> int:
+        """Cheap, conservative resident-cache estimate for preflight.
+
+        Returns the exact token-level common-prefix length between
+        ``prompt_token_ids`` and the best-matching stored reference
+        sequence in ``self._cache_probe_seqs``, or 0 when there is no
+        probe history or no shared prefix. This is deliberately the same
+        comparison ``_log_prefix_divergence`` already performs for
+        diagnostics — no heuristics, no similarity scoring, just an exact
+        prefix match — so preflight's peak-memory estimate can credit
+        tokens that are actually likely to be resident instead of always
+        assuming a cold start (see ``engine/batched.py`` and
+        ``engine/vlm.py`` preflight callers).
+        """
+        if not prompt_token_ids or not self._cache_probe_seqs:
+            return 0
+        _, _, best_p = self._best_matching_probe_seq(prompt_token_ids)
+        return max(0, best_p)
+
     def _log_prefix_divergence(self, request: Request) -> None:
         """Prefix-cache miss diagnostics (issues #1003, #2333, #2349).
 
@@ -6578,11 +6616,7 @@ class Scheduler:
         prompt = request.prompt_token_ids or []
         if not prompt or not self._cache_probe_seqs:
             return
-        best_id, best_seq, best_p = None, None, -1
-        for ref_id, seq in list(self._cache_probe_seqs):
-            p = self._common_prefix_len(prompt, seq)
-            if p > best_p:
-                best_id, best_seq, best_p = ref_id, seq, p
+        best_id, best_seq, best_p = self._best_matching_probe_seq(prompt)
         if best_seq is None:
             return
         cached = request.cached_tokens or 0
