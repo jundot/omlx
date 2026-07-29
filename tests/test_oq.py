@@ -5001,3 +5001,56 @@ class TestQuantizeOqStreamingOq25:
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.up_proj.scales" in tensors
+
+
+class TestCalibrationFootprint:
+    """fp8/mxfp8 sources dequantize to bf16 for calibration, so the proxy
+    budget must size on the doubled footprint, not the on-disk bytes."""
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            ({"quantization_config": {"quant_method": "fp8"}}, True),
+            ({"quantization_config": {"quant_method": "mxfp8"}}, True),
+            ({"text_config": {"quantization_config": {"quant_method": "fp8"}}}, True),
+            ({"quantization_config": {"quant_method": "gptq"}}, False),
+            ({"quantization_config": {}}, False),
+            ({"model_type": "llama"}, False),
+        ],
+        ids=[
+            "fp8",
+            "mxfp8",
+            "nested_text_config_fp8",
+            "gptq_not_float8",
+            "empty_quant_config",
+            "unquantized",
+        ],
+    )
+    def test_config_is_native_float8(self, config, expected):
+        from omlx.oq import _config_is_native_float8
+
+        assert _config_is_native_float8(config) is expected
+
+    def test_footprint_doubles_for_fp8_only(self):
+        from omlx.oq import _calibration_footprint_bytes
+
+        fp8 = {"quantization_config": {"quant_method": "fp8"}}
+        bf16 = {"model_type": "llama"}
+        assert _calibration_footprint_bytes(1000, fp8) == 2000
+        assert _calibration_footprint_bytes(1000, bf16) == 1000
+
+    def test_fp8_footprint_flips_requires_proxy(self, monkeypatch):
+        import omlx.oq as oq
+
+        # Fixed capacity 400 -> model_limit = int(0.75 * 400) = 300.
+        monkeypatch.setattr(oq, "_system_available_memory_bytes", lambda: 400)
+        monkeypatch.setattr(oq, "_metal_available_memory_bytes", lambda: 400)
+
+        on_disk = 200  # < 300 raw -> the old heuristic skipped the proxy
+        assert oq._calibration_memory_budget(on_disk)["requires_proxy"] is False
+
+        footprint = oq._calibration_footprint_bytes(
+            on_disk, {"quantization_config": {"quant_method": "fp8"}}
+        )
+        assert footprint == 400  # doubled -> now over the 300 limit
+        assert oq._calibration_memory_budget(footprint)["requires_proxy"] is True

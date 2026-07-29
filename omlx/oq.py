@@ -138,6 +138,46 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     return quant_method == "fp8" and _is_deepseek_v4_config(config)
 
 
+# Native fp8/mxfp8 weights (1 byte) dequantize to bf16 (2 bytes) for the
+# full-model calibration forward, so the live footprint roughly doubles.
+_NATIVE_FLOAT8_BF16_EXPANSION = 2
+
+
+def _config_is_native_float8(config: dict) -> bool:
+    """True when the source stores weights in a native fp8/mxfp8 format.
+
+    Such checkpoints dequantize to bf16 for the calibration forward pass, so
+    their live footprint is ~2x the on-disk size. The proxy budget must size
+    on that; otherwise a large fp8 source (e.g. MiMo-V2.5: 293 GB fp8 ->
+    ~586 GB bf16) slips under the budget, the proxy is skipped, and the
+    full-model calibration is OOM-killed.
+    """
+    configs = [config]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        configs.append(text_config)
+    for cfg in configs:
+        qc = cfg.get("quantization_config")
+        if not isinstance(qc, dict):
+            continue
+        if str(qc.get("quant_method", "")).lower() in _NATIVE_FLOAT8_QUANT_METHODS:
+            return True
+    return False
+
+
+def _calibration_footprint_bytes(on_disk_bytes: int, config: dict) -> int:
+    """Live full-model calibration footprint of a checkpoint, in bytes.
+
+    Native fp8/mxfp8 sources materialize bf16 weights for the calibration
+    forward (~2x on-disk); other formats already sit at or above their
+    calibration precision, so the on-disk size is used unchanged.
+    """
+    on_disk_bytes = max(0, int(on_disk_bytes))
+    if _config_is_native_float8(config):
+        return on_disk_bytes * _NATIVE_FLOAT8_BF16_EXPANSION
+    return on_disk_bytes
+
+
 def _is_minimax_m3_config(config: dict) -> bool:
     """Return whether a config resolves to the MiniMax M3 model family."""
     text_config = config.get("text_config")
@@ -4408,16 +4448,18 @@ def quantize_oq_streaming(
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
     from omlx.settings import get_system_memory as _get_system_memory
 
-    _model_bytes = _checkpoint_storage_bytes(weight_files)
+    _calibration_bytes = _calibration_footprint_bytes(
+        _checkpoint_storage_bytes(weight_files), config
+    )
     _system_ram = _get_system_memory()
     _calibration_budget = _calibration_memory_budget(
-        _model_bytes,
+        _calibration_bytes,
         fallback_system_bytes=_system_ram,
     )
     _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
     if _model_requires_proxy and static_sensitivity_map is None:
         logger.info(
-            f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+            f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
             f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
             f"capacity ({_format_size(int(_calibration_budget['capacity_bytes']))}; "
             f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
@@ -4444,7 +4486,7 @@ def quantize_oq_streaming(
         nonlocal _ram_safe_proxy_dir
         if _ram_safe_proxy_dir is None:
             logger.warning(
-                f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+                f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                 "full-model calibration limit. Building a uniform "
@@ -4602,7 +4644,7 @@ def quantize_oq_streaming(
             )
         elif _model_requires_proxy and auto_proxy_sensitivity:
             logger.warning(
-                f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+                f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                 "full-model calibration limit. Auto-building a uniform "
@@ -4697,7 +4739,8 @@ def quantize_oq_streaming(
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
                     f"failed ({e}) and the eager fallback is unsafe with "
-                    f"checkpoint size {_format_size(_model_bytes)} exceeding "
+                    f"calibration footprint {_format_size(_calibration_bytes)} "
+                    "exceeding "
                     "the "
                     f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                     "full-model calibration limit. Run on a machine with "
