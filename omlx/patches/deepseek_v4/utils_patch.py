@@ -148,6 +148,7 @@ def _build_patched_load_model() -> Callable:
 
         model_args = model_args_class.from_dict(config)
         model = model_class(model_args)
+        model.model_path = model_path
 
         if hasattr(model, "sanitize"):
             weights = model.sanitize(weights)
@@ -158,7 +159,11 @@ def _build_patched_load_model() -> Callable:
                     return config["quantization"][p]
                 if not hasattr(m, "to_quantized"):
                     return False
-                return f"{p}.scales" in weights
+                return (
+                    f"{p}.scales" in weights
+                    or f"{p}.tq_norms" in weights
+                    or f"{p}.tq_packed" in weights
+                )
 
             nn.quantize(
                 model,
@@ -247,6 +252,7 @@ def apply_utils_patch() -> bool:
         return False
 
     patched = _build_patched_load_model()
+    original_load = _utils.load_model
 
     _utils.SAFETENSORS_DTYPE_FALLBACKS = SAFETENSORS_DTYPE_FALLBACKS
     _utils._load_safetensors = _load_safetensors
@@ -254,14 +260,15 @@ def apply_utils_patch() -> bool:
 
     # Update any module that has a stale binding to the original load_model.
     for mod_name, mod in list(sys.modules.items()):
-        if mod is None or not mod_name.startswith("mlx_lm"):
+        if mod is None:
             continue
-        if mod_name == "mlx_lm.utils":
+        if not (mod_name.startswith("mlx_lm") or mod_name.startswith("omlx")):
             continue
-        existing = getattr(mod, "load_model", None)
-        if existing is not None and existing is not patched:
+        for attr in list(dir(mod)):
             try:
-                mod.load_model = patched
+                existing = getattr(mod, attr, None)
+                if existing is original_load:
+                    setattr(mod, attr, patched)
             except Exception:
                 pass
 
