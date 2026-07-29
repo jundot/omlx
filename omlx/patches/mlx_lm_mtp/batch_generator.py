@@ -78,6 +78,7 @@ from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from . import cache_rollback as _rollback_mod
+from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,12 @@ def apply() -> bool:
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
             _drop_invalid_mtp_batch_state(self, "extend")
+            # Priming only serves a singleton timeline: once this batch
+            # holds >1 rows, the context can never be consumed — release
+            # its head cache now instead of riding the merged decode.
+            uids = getattr(self, "uids", None)
+            if not uids or len(uids) != 1:
+                _prompt_priming.drop_ctx(getattr(self, "prompt_cache", None))
             return result
 
         def patched_filter(self, keep, *args, **kwargs):
@@ -703,7 +710,15 @@ def _drop_mtp_state(
     *,
     log_stats: bool = False,
 ) -> Optional[_MtpState]:
-    """Delete attached MTP state, optionally surfacing stats for external finish."""
+    """Delete attached MTP state, optionally surfacing stats for external finish.
+
+    Deliberately does NOT drop the prompt-priming context: mlx-lm's insert
+    flow routes every fresh singleton through ``extend()`` (donor merge),
+    which drops MTP state defensively — but the priming context must survive
+    that hop or activation always sees an unprimed cache. The context is
+    released at activation (``take_primed``), on real multi-row merges
+    (``patched_extend``), or with the cache itself at request end.
+    """
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if state is None:
         return None
@@ -998,8 +1013,9 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
         return None
 
     logger.info(
-        "MTP path activated for uid=%s (model has mtp_forward, batch=1)",
+        "MTP path activated for uid=%s (model has mtp_forward, batch=1, primed=%d)",
         state.uid,
+        max(0, int(getattr(state, "hist_offset", 0)) - 1),
     )
     return state
 
@@ -1399,11 +1415,10 @@ def _trunk_norm_module(model: Any):
     return inner.model.norm
 
 
-# The MTP head is fed the trunk's *post-norm* hidden and chains on its own
-# post-norm output. Measured on Qwen3.6-27B this accepts a few points higher
-# than PR 990's pre-norm at every depth. Draft-side only, so output identity
-# is unaffected regardless.
-_HEAD_HIDDEN_POST_NORM = True
+# Single source of truth lives in prompt_priming: the prefill-time priming
+# folds and the decode-time history folds here must use the same hidden
+# variant or the primed history would be inconsistent with the chained one.
+_HEAD_HIDDEN_POST_NORM = _prompt_priming.HEAD_HIDDEN_POST_NORM
 
 
 def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
@@ -1853,7 +1868,13 @@ def _post_init_mtp(gen_batch: Any) -> None:
                     gen_batch.model, "_omlx_mtp_marginal_ms", None
                 ),
             )
-        state.mtp_cache = gen_batch.model.make_mtp_cache()
+        primed = _prompt_priming.take_primed(
+            gen_batch.model, gen_batch.prompt_cache, main_tok
+        )
+        if primed is not None:
+            state.mtp_cache, state.hist_offset = primed
+        else:
+            state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
         state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
         state.queue.append(
@@ -1871,6 +1892,9 @@ def _post_init_mtp(gen_batch: Any) -> None:
 
     # MTP head sees (hidden_at_main, next_main_tok) and proposes the draft
     # that the *next* verify cycle will check against forward([next_main, draft]).
+    # The legacy depth-1 cycle rebuilds head history per cycle and never
+    # consumes a primed cache; release any capture leftovers.
+    _prompt_priming.drop_ctx(gen_batch.prompt_cache)
     mtp_cache = gen_batch.model.make_mtp_cache()
     hidden_at_main = hidden[:, -1:, :]  # (1, 1, H)
     next_ids = next_main_tok.reshape(1, 1)
