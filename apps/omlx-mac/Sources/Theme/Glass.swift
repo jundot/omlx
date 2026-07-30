@@ -21,6 +21,7 @@ private struct AppGlassModifier<S: Shape>: ViewModifier {
     let tint: Color?
 
     func body(content: Content) -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             // Bake the tint into the glass material so the surface composites
             // in a single pass — separate `.background(tint)` + `.glassEffect`
@@ -34,16 +35,25 @@ private struct AppGlassModifier<S: Shape>: ViewModifier {
                 .glassEffect(glass, in: shape)
                 .glassEffectTransition(.identity)
         } else {
-            // macOS 15 fallback path. No native tinted-material API here, so
-            // composite the tint and material separately. This path isn't on
-            // the perf-critical track for the macOS 26 sidebar stutter.
-            if let tint {
-                content
-                    .background(material, in: shape)
-                    .background(tint, in: shape)
-            } else {
-                content.background(material, in: shape)
-            }
+            fallbackBody(content: content)
+        }
+        #else
+        fallbackBody(content: content)
+        #endif
+    }
+
+    @inline(__always)
+    @ViewBuilder
+    private func fallbackBody(content: Content) -> some View {
+        // macOS 15 fallback path. No native tinted-material API here, so
+        // composite the tint and material separately. This path isn't on
+        // the perf-critical track for the macOS 26 sidebar stutter.
+        if let tint {
+            content
+                .background(material, in: shape)
+                .background(tint, in: shape)
+        } else {
+            content.background(material, in: shape)
         }
     }
 
