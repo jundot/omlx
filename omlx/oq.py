@@ -2965,6 +2965,35 @@ def _normalize_mtp_in_config(config: dict) -> None:
                 text_cfg[key] = 0
 
 
+def _normalize_text_only_in_config(config: dict) -> None:
+    """Drop multimodal metadata from a text-only output config (in place).
+
+    Same rationale as :func:`_normalize_mtp_in_config`: a text-only
+    conversion strips the vision / audio / speech tensors, so the output
+    config must not keep advertising modalities whose weights are gone.
+
+    Covers several spellings because families differ. Most VLMs nest a
+    ``vision_config``, while MiMo V2.5 instead carries a top-level
+    ``vision_model_type`` and ``processor_config``, which earlier revisions
+    of this list did not remove.
+    """
+    for key in (
+        "vision_config",
+        "vision_model_type",
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "audio_config",
+        "audio_token_id",
+        "boa_token_id",
+        "eoa_token_id",
+        "eoa_token_index",
+        "processor_config",
+    ):
+        config.pop(key, None)
+
+
 def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     """Check if a tensor should be quantized based on name and shape."""
     if not name.endswith(".weight"):
@@ -3244,22 +3273,41 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
     return None
 
 
-def _copy_model_sidecars(source: Path, output: Path) -> None:
-    """Copy tokenizer/processor sidecar files needed to load the output."""
-    for pattern in (
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",
-        "generation_config.json",
-        "chat_template.json",
-        "chat_template.jinja",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "added_tokens.json",
-        "merges.txt",
-        "vocab.json",
-    ):
+_SIDECAR_PATTERNS = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "generation_config.json",
+    "chat_template.json",
+    "chat_template.jinja",
+    "added_tokens.json",
+    "merges.txt",
+    "vocab.json",
+)
+
+# Processor configs describe image / audio preprocessing. A text-only
+# conversion has no vision or audio weights, so copying these advertises an
+# input the artifact cannot accept.
+_MULTIMODAL_SIDECAR_PATTERNS = (
+    "preprocessor_config.json",
+    "processor_config.json",
+)
+
+
+def _copy_model_sidecars(
+    source: Path, output: Path, *, text_only: bool = False
+) -> None:
+    """Copy tokenizer/processor sidecar files needed to load the output.
+
+    ``text_only`` skips the multimodal processor configs, matching the
+    modality metadata that :func:`_normalize_text_only_in_config` drops from
+    the output config.
+    """
+    patterns = _SIDECAR_PATTERNS
+    if not text_only:
+        patterns += _MULTIMODAL_SIDECAR_PATTERNS
+    for pattern in patterns:
         for src_file in source.glob(pattern):
             shutil.copy2(src_file, output / src_file.name)
 
@@ -5197,19 +5245,7 @@ def quantize_oq_streaming(
     ):
         output_config.pop(temp_key, None)
     if text_only:
-        for key in (
-            "vision_config",
-            "image_token_id",
-            "video_token_id",
-            "vision_start_token_id",
-            "vision_end_token_id",
-            "audio_config",
-            "audio_token_id",
-            "boa_token_id",
-            "eoa_token_id",
-            "eoa_token_index",
-        ):
-            output_config.pop(key, None)
+        _normalize_text_only_in_config(output_config)
     if not preserve_mtp:
         # Default path: zero out MTP layer counts so the quantized model
         # doesn't claim to have an MTP head while its weights have been
@@ -5259,25 +5295,7 @@ def quantize_oq_streaming(
         with open(output / "oq_imatrix_report.json", "w") as f:
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
-    for pattern in (
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",
-        "generation_config.json",
-        "chat_template.json",
-        "chat_template.jinja",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "added_tokens.json",
-        "merges.txt",
-        "vocab.json",
-    ):
-        for src_file in source.glob(pattern):
-            shutil.copy2(src_file, output / src_file.name)
-
-    for py_file in source.glob("*.py"):
-        shutil.copy2(py_file, output / py_file.name)
+    _copy_model_sidecars(source, output, text_only=text_only)
 
     cb("saving", 100.0, "Quantized model saved")
     logger.info(

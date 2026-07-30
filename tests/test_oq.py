@@ -5265,3 +5265,131 @@ class TestQuantizeOqStreamingOq25:
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.up_proj.scales" in tensors
+
+
+class TestTextOnlyMultimodalMetadata:
+    """A text-only output must not advertise the modalities it dropped.
+
+    Text-only conversions strip the vision / audio / speech tensors, so the
+    output config and the copied sidecars must not keep claiming those
+    inputs. MiMo V2.5 spells two of them differently from the families oQ
+    saw first, carrying a top-level ``vision_model_type`` and
+    ``processor_config`` rather than only a nested ``vision_config``.
+    """
+
+    MIMO_LIKE_CONFIG = {
+        "model_type": "mimo_v2",
+        "hidden_size": 4096,
+        "num_hidden_layers": 48,
+        "vision_config": {"depth": 28},
+        "vision_model_type": "mimovl",
+        "processor_config": {"patch_size": 14},
+        "image_token_id": 151655,
+        "video_token_id": 151656,
+        "vision_start_token_id": 151652,
+        "vision_end_token_id": 151653,
+        "audio_config": {"num_layers": 24},
+    }
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "vision_config",
+            "vision_model_type",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+            "audio_config",
+            "processor_config",
+        ],
+    )
+    def test_multimodal_key_is_dropped(self, key):
+        from omlx.oq import _normalize_text_only_in_config
+
+        config = dict(self.MIMO_LIKE_CONFIG)
+        assert key in config, "fixture must actually carry the key under test"
+
+        _normalize_text_only_in_config(config)
+
+        assert key not in config
+
+    def test_text_keys_survive(self):
+        from omlx.oq import _normalize_text_only_in_config
+
+        config = dict(self.MIMO_LIKE_CONFIG)
+
+        _normalize_text_only_in_config(config)
+
+        assert config["model_type"] == "mimo_v2"
+        assert config["hidden_size"] == 4096
+        assert config["num_hidden_layers"] == 48
+
+    def test_absent_keys_are_not_an_error(self):
+        from omlx.oq import _normalize_text_only_in_config
+
+        config = {"model_type": "qwen3", "hidden_size": 1024}
+
+        _normalize_text_only_in_config(config)
+
+        assert config == {"model_type": "qwen3", "hidden_size": 1024}
+
+    @staticmethod
+    def _make_source(tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+        ):
+            (src / name).write_text("{}")
+        return src
+
+    def test_text_only_skips_processor_sidecars(self, tmp_path):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert (out / "tokenizer.json").exists()
+        assert (out / "tokenizer_config.json").exists()
+        assert not (out / "preprocessor_config.json").exists()
+        assert not (out / "processor_config.json").exists()
+
+    def test_multimodal_keeps_processor_sidecars(self, tmp_path):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out)
+
+        assert (out / "preprocessor_config.json").exists()
+        assert (out / "processor_config.json").exists()
+
+    def test_pattern_constant_survives_repeated_calls(self, tmp_path):
+        """A list instead of a tuple would make ``+=`` mutate the constant.
+
+        The multimodal patterns are appended per call, so if the module
+        constant were ever refactored to a list it would grow in place and
+        the text-only skip would silently stop working after the first
+        multimodal conversion in the same process.
+        """
+        from omlx.oq import _SIDECAR_PATTERNS, _copy_model_sidecars
+
+        before = tuple(_SIDECAR_PATTERNS)
+        src = self._make_source(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out)
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert tuple(_SIDECAR_PATTERNS) == before
+        assert "preprocessor_config.json" not in _SIDECAR_PATTERNS
