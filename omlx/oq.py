@@ -1882,6 +1882,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 for i in range(n):
                     sh = list(tensor.shape)
                     sh[axis] = sz
+                    if tensor.transform == "nested_unreplayable":
+                        parts.append(tensor._unreplayable(shape=sh))
+                        continue
                     parts.append(
                         _TrackedTensor(
                             sh,
@@ -1899,6 +1902,10 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             for i, idx in enumerate(idxs):
                 sh = list(tensor.shape)
                 sh[axis] = idx - prev
+                if tensor.transform == "nested_unreplayable":
+                    parts.append(tensor._unreplayable(shape=sh))
+                    prev = idx
+                    continue
                 parts.append(
                     _TrackedTensor(
                         sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis
@@ -2023,6 +2030,11 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "axis": v.axis,
                 "recipe": list(v.recipe),
             }
+            if t not in ("stack", "concatenate", "expr") and len(v.sources) != 1:
+                raise ValueError(
+                    f"single-source transform {t!r} has {len(v.sources)} sources "
+                    f"for {k!r} — falling back to eager sanitize"
+                )
             if v.transform == "expr":
                 if v.expr is None:
                     raise ValueError(
@@ -4027,15 +4039,15 @@ def _tensor_shape_nbytes(shape, bytes_per_element: int) -> int:
 
 
 def _logical_footprint_bytes(index) -> int:
-    """Bytes a full-model calibration forward materializes from ``index``.
+    """Bytes in the dequantized logical view exposed by ``index``.
 
     The lazy index's logical view already reports every tensor at its
     post-dequantization shape and dtype: native fp8 weights as bf16, packed
     fp4 experts at two values per stored byte, virtual tensors at the shape
     they will be produced in, and folded-away scale companions not at all.
-    Summing it is exact, where scaling the on-disk size by a per-format
-    constant is only ever approximately right and silently wrong for any
-    format that expands by something other than that constant.
+    This is the resident calibration footprint for sources whose model
+    sanitizer materializes that view. Sources calibrated as quantized modules
+    remain packed and are handled by :func:`_calibration_footprint_bytes`.
     """
     if not hasattr(index, "logical_metadata"):
         return 0
@@ -4045,6 +4057,20 @@ def _logical_footprint_bytes(index) -> int:
             shape, _LazyTensorIndex._DTYPE_BYTES.get(dtype, 2)
         )
     return total
+
+
+def _calibration_footprint_bytes(index, storage_bytes: int, config: dict) -> int:
+    """Estimate resident model bytes for the selected calibration load path.
+
+    MiMo-style native FP8 sources are dequantized by model sanitize, so their
+    logical BF16 view determines admission. MiniMax MXFP8 and DeepSeek V4 FP4
+    sources take the quantized-source sensitivity path and remain packed in
+    quantized modules; pricing those as BF16 would force an unnecessary proxy.
+    """
+    storage_bytes = max(0, int(storage_bytes))
+    if _uses_quantized_source_sensitivity(config):
+        return storage_bytes
+    return max(storage_bytes, _logical_footprint_bytes(index))
 
 
 def _progress_total_bytes(all_weights, source: Path) -> int:
@@ -4758,12 +4784,13 @@ def quantize_oq_streaming(
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
     from omlx.settings import get_system_memory as _get_system_memory
 
-    # The calibration forward materializes the logical (dequantized) view, so
-    # size the budget on that rather than on file bytes. On-disk size stays a
-    # floor: it covers sidecars and any tensor the logical view folds away.
-    _calibration_bytes = max(
+    # Size admission for the representation used by the calibration loader:
+    # dequantized logical weights for ordinary native-FP8 sources, or packed
+    # storage for sources measured through quantized modules.
+    _calibration_bytes = _calibration_footprint_bytes(
+        all_weights,
         _checkpoint_storage_bytes(weight_files),
-        _logical_footprint_bytes(all_weights),
+        config,
     )
     _system_ram = _get_system_memory()
     _calibration_budget = _calibration_memory_budget(

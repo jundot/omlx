@@ -5305,7 +5305,22 @@ class TestRecorderRefusesUnreplayableOps:
             w = w * weights["s"][:, None, None]
             return {"out": w.reshape(256, 128).astype(mx.bfloat16)}
 
-        with pytest.raises(Exception):
+        with pytest.raises(
+            ValueError, match="non-replayable transform|single-source transform"
+        ):
+            self._discover(sanitize, logical)
+
+    def test_scale_multiply_is_not_laundered_by_split(self):
+        """A split must not turn a poisoned multi-source result replayable."""
+        logical = {"w": ((256, 128), "BF16"), "s": ((256, 1), "F32")}
+
+        def sanitize(weights):
+            scaled = weights["w"] * weights["s"]
+            return {"out": mx.split(scaled, 2, axis=0)[0]}
+
+        with pytest.raises(
+            ValueError, match="non-replayable transform|single-source transform"
+        ):
             self._discover(sanitize, logical)
 
     def test_scalar_multiply_still_records(self):
@@ -5411,3 +5426,32 @@ class TestCalibrationFootprint:
         footprint = max(on_disk, oq._logical_footprint_bytes(index))
         assert footprint == 400  # over the 300 limit
         assert oq._calibration_memory_budget(footprint)["requires_proxy"] is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"quantization_config": {"quant_method": "mxfp8"}},
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+        ],
+        ids=["minimax_mxfp8", "deepseek_v4_fp4"],
+    )
+    def test_quantized_source_calibration_keeps_packed_footprint(self, config):
+        from omlx.oq import _calibration_footprint_bytes
+
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+
+        assert _calibration_footprint_bytes(index, 100, config) == 100
+
+    def test_native_fp8_calibration_uses_dequantized_footprint(self):
+        from omlx.oq import _calibration_footprint_bytes
+
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+        config = {
+            "model_type": "mimo_v2",
+            "quantization_config": {"quant_method": "fp8"},
+        }
+
+        assert _calibration_footprint_bytes(index, 100, config) == 400
