@@ -64,17 +64,18 @@ class ClaudeCodeIntegration(Integration):
 
         if ctx.context_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
-        if ctx.autocompact_threshold_pct is not None:
-            # Claude Code's CLI parses this as a plain 0-100 percentage
-            # (`n>0 && n<=100`, then divides by 100 internally) — not a
-            # 0-1 fraction. Sending "0.8" for 80% is silently accepted
-            # (0.8 <= 100) but interpreted as 0.8%, firing compaction
-            # almost immediately. Confirmed via decompiled CLI strings
-            # (2.1.220) after live testing showed early auto-compact
-            # around 11-13% of the real window instead of 80%.
-            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(
-                ctx.autocompact_threshold_pct
-            )
+            # Claude Code (2.1.220+) reads CLAUDE_CODE_MAX_CONTEXT_TOKENS to
+            # set the *detected* context window for custom model IDs that
+            # don't canonicalize to "claude-*"; auto-compact then fires at
+            # min(detected_window, CLAUDE_CODE_AUTO_COMPACT_WINDOW). Setting
+            # both to the same real, operator-configured max_context_window
+            # keeps reported usage and the auto-compact denominator on the
+            # same scale with no scaling math and no reliance on the
+            # internal/undocumented CLAUDE_AUTOCOMPACT_PCT_OVERRIDE test hook.
+            # Caveat (confirmed live): this is ignored for model IDs that
+            # canonicalize to "claude-*" — Claude Code trusts its own
+            # built-in context window for those regardless of this variable.
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(ctx.context_window)
 
         binary = self._find_claude_binary()
         # Deny the LSP tool. Claude Code attaches its full schema to the tools
@@ -93,12 +94,5 @@ class ClaudeCodeIntegration(Integration):
         argv = [binary, *extra_args]
         print(f"Launching Claude Code with model {ctx.model}...")
         if ctx.context_window:
-            window_msg = f"Auto-compact window: {ctx.context_window:,} tokens"
-            if ctx.autocompact_threshold_pct is not None:
-                trigger_at = int(ctx.context_window * ctx.autocompact_threshold_pct / 100)
-                window_msg += (
-                    f" (compacts at {ctx.autocompact_threshold_pct}% "
-                    f"≈ {trigger_at:,} tokens)"
-                )
-            print(window_msg)
+            print(f"Auto-compact window: {ctx.context_window:,} tokens")
         os.execvpe(binary, argv, env)

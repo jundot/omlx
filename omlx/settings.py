@@ -695,7 +695,6 @@ class UISettings:
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
-    autocompact_threshold_pct: int = 80
     # Mode: "cloud" = native claude.ai subscription, "local" = route through omlx.
     # Default is "cloud" so upgrades don't silently route traffic to omlx.
     mode: str = "cloud"
@@ -706,7 +705,6 @@ class ClaudeCodeSettings:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "autocompact_threshold_pct": self.autocompact_threshold_pct,
             "mode": self.mode,
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
@@ -717,7 +715,6 @@ class ClaudeCodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
         return cls(
-            autocompact_threshold_pct=data.get("autocompact_threshold_pct", 80),
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
@@ -1362,11 +1359,6 @@ class GlobalSettings:
             )
 
         # Claude Code validation
-        if not 50 <= self.claude_code.autocompact_threshold_pct <= 95:
-            errors.append(
-                f"Invalid autocompact_threshold_pct: "
-                f"{self.claude_code.autocompact_threshold_pct} (must be 50-95)"
-            )
         valid_modes = {"local", "cloud"}
         if self.claude_code.mode not in valid_modes:
             errors.append(

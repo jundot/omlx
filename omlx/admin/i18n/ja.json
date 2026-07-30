@@ -951,7 +951,5 @@
   "js.error.delete_model_failed": "モデルの削除に失敗しました",
   "js.error.delete_model_connection": "モデルの削除に失敗しました。サーバー接続を確認してください。",
   "js.success.download_started": "ダウンロード開始: {repo_id}",
-  "js.success.settings_saved": "設定が保存されました",
-  "status.claude_code.autocompact_threshold_pct": "自動圧縮のしきい値",
-  "status.claude_code.autocompact_threshold_pct_description": "モデルの実際の最大コンテキストウィンドウのうち、Claude Codeが自動圧縮を開始する割合（デフォルト80%）。"
+  "js.success.settings_saved": "設定が保存されました"
 }

@@ -951,7 +951,5 @@
   "js.error.delete_model_failed": "Error al eliminar el modelo",
   "js.error.delete_model_connection": "Error al eliminar el modelo. Verifica la conexión con el servidor.",
   "js.success.download_started": "Descarga iniciada: {repo_id}",
-  "js.success.settings_saved": "Configuración guardada correctamente",
-  "status.claude_code.autocompact_threshold_pct": "Umbral de Auto-compact",
-  "status.claude_code.autocompact_threshold_pct_description": "Porcentaje de la ventana de contexto máxima real del modelo en el que Claude Code activa el auto-compact (80% por defecto)."
+  "js.success.settings_saved": "Configuración guardada correctamente"
 }

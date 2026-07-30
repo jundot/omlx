@@ -277,9 +277,6 @@ class GlobalSettingsRequest(BaseModel):
     sampling_repetition_penalty: float | None = None
 
     # Claude Code settings
-    claude_code_autocompact_threshold_pct: int | None = Field(
-        default=None, ge=50, le=95
-    )
     claude_code_mode: str | None = None
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
@@ -3248,9 +3245,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
-            "autocompact_threshold_pct": (
-                global_settings.claude_code.autocompact_threshold_pct
-            ),
             "mode": global_settings.claude_code.mode,
             "opus_model": global_settings.claude_code.opus_model,
             "sonnet_model": global_settings.claude_code.sonnet_model,
@@ -3756,11 +3750,6 @@ async def update_global_settings(
 
     # Apply Claude Code settings (Live - immediately applied)
     claude_code_changed = False
-    if request.claude_code_autocompact_threshold_pct is not None:
-        global_settings.claude_code.autocompact_threshold_pct = (
-            request.claude_code_autocompact_threshold_pct
-        )
-        claude_code_changed = True
     # mode: standard is-not-None check is correct — mode must never be null
     if request.claude_code_mode is not None:
         global_settings.claude_code.mode = request.claude_code_mode
@@ -3782,8 +3771,6 @@ async def update_global_settings(
         runtime_applied.append("claude_code")
         logger.info(
             f"Claude Code settings updated: "
-            f"autocompact_threshold_pct="
-            f"{global_settings.claude_code.autocompact_threshold_pct}, "
             f"mode={global_settings.claude_code.mode}, "
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
@@ -4466,11 +4453,6 @@ async def get_server_stats(
         "port": port,
         "api_key": api_key or "",
         "cli_prefix": get_cli_prefix(),
-        "claude_code_autocompact_threshold_pct": (
-            global_settings.claude_code.autocompact_threshold_pct
-            if global_settings
-            else 80
-        ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
         "runtime_cache": runtime_cache_data,

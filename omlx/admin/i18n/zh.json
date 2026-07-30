@@ -951,7 +951,5 @@
   "js.error.delete_model_failed": "删除模型失败",
   "js.error.delete_model_connection": "删除模型失败，请检查服务器连接。",
   "js.success.download_started": "已开始下载：{repo_id}",
-  "js.success.settings_saved": "设置已成功保存",
-  "status.claude_code.autocompact_threshold_pct": "自动压缩阈值",
-  "status.claude_code.autocompact_threshold_pct_description": "模型真实最大上下文窗口中触发 Claude Code 自动压缩的百分比（默认 80%）。"
+  "js.success.settings_saved": "设置已成功保存"
 }

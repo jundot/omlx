@@ -28,7 +28,6 @@ class IntegrationContext:
     reasoning: bool | None = None
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
-    autocompact_threshold_pct: int | None = None
 
     @property
     def base_url(self) -> str:

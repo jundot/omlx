@@ -24,7 +24,4 @@ class TestScalingMechanismRemoved:
         settings = ClaudeCodeSettings()
         assert not hasattr(settings, "context_scaling_enabled")
         assert not hasattr(settings, "target_context_size")
-
-    def test_claude_code_settings_has_threshold_pct(self):
-        settings = ClaudeCodeSettings()
-        assert settings.autocompact_threshold_pct == 80
+        assert not hasattr(settings, "autocompact_threshold_pct")

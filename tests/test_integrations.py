@@ -1341,13 +1341,14 @@ class TestClaudeCodeIntegration:
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
         # Bundled-python vars must be stripped so claude code subprocess hooks
         # don't inherit our cpython-3.11 stack.
         assert "PYTHONHOME" not in env
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
 
-    def test_launch_sets_autocompact_pct_override_default(self):
+    def test_launch_sets_max_context_tokens_32k(self):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1365,16 +1366,16 @@ class TestClaudeCodeIntegration:
                     port=8000,
                     api_key="secret",
                     model="qwen3.5",
-                    context_window=128000,
-                    autocompact_threshold_pct=80,
+                    sonnet_model="mlx-community/Qwen3-30B-A3B-4bit",
+                    context_window=32768,
                 )
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
-        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "80"
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "32768"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "32768"
 
-    def test_launch_sets_autocompact_pct_override_custom(self):
+    def test_launch_sets_max_context_tokens_64k(self):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1392,16 +1393,50 @@ class TestClaudeCodeIntegration:
                     port=8000,
                     api_key="secret",
                     model="qwen3.5",
-                    context_window=128000,
-                    autocompact_threshold_pct=90,
+                    sonnet_model="mlx-community/Qwen3-30B-A3B-4bit",
+                    context_window=65536,
                 )
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
-        assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "90"
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "65536"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
 
-    def test_launch_omits_pct_override_when_not_configured(self):
+    def test_launch_sets_max_context_tokens_for_canonical_claude_alias(self):
+        """oMLX always sets CLAUDE_CODE_MAX_CONTEXT_TOKENS the same way
+        regardless of the configured model name — whether Claude Code's own
+        CLI then honors it for a "claude-*"-canonicalized model name is that
+        binary's internal behavior (confirmed live: it does not, for names
+        that canonicalize to "claude-*"), not something this integration can
+        special-case. This only guards that oMLX's side of the contract is
+        unconditional."""
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="claude-3-5-sonnet-20241022",
+                    sonnet_model="claude-3-5-sonnet-20241022",
+                    context_window=131072,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+
+    def test_launch_omits_max_context_tokens_when_context_window_unset(self):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1419,13 +1454,12 @@ class TestClaudeCodeIntegration:
                     port=8000,
                     api_key="secret",
                     model="qwen3.5",
-                    context_window=128000,
                 )
             )
 
         env = captured["env"]
-        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in env
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
+        assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env
 
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()

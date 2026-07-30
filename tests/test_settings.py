@@ -1924,49 +1924,35 @@ class TestClaudeCodeSettings:
     def test_defaults(self):
         """Test default values."""
         settings = ClaudeCodeSettings()
-        assert settings.autocompact_threshold_pct == 80
-
-    def test_custom_values(self):
-        """Test custom values."""
-        settings = ClaudeCodeSettings(autocompact_threshold_pct=90)
-        assert settings.autocompact_threshold_pct == 90
+        assert settings.mode == "cloud"
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = ClaudeCodeSettings(autocompact_threshold_pct=70)
+        settings = ClaudeCodeSettings(mode="cloud")
         result = settings.to_dict()
-        assert result["autocompact_threshold_pct"] == 70
         assert result["mode"] == "cloud"
         assert result["opus_model"] is None
         assert result["sonnet_model"] is None
         assert result["haiku_model"] is None
 
-    def test_from_dict(self):
-        """Test creation from dictionary."""
-        data = {"autocompact_threshold_pct": 90}
-        settings = ClaudeCodeSettings.from_dict(data)
-        assert settings.autocompact_threshold_pct == 90
-
-    def test_from_dict_defaults(self):
-        """Test from_dict uses defaults for missing fields."""
-        settings = ClaudeCodeSettings.from_dict({})
-        assert settings.autocompact_threshold_pct == 80
-
     def test_from_dict_ignores_legacy_scaling_keys(self):
         """Old settings.json with context_scaling_enabled/target_context_size
-        must load without error; the removed keys are silently dropped and
-        autocompact_threshold_pct takes its default (no automatic mapping
-        from the old token target — see design.md Decision 5)."""
+        (or the later autocompact_threshold_pct) must load without error;
+        the removed keys are silently dropped — no cache-credit-adjacent
+        setting replaces them, since auto-compact is now driven entirely by
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS / CLAUDE_CODE_AUTO_COMPACT_WINDOW
+        (see fix-claude-code-autocompact-threshold's follow-up design)."""
         data = {
             "context_scaling_enabled": True,
             "target_context_size": 1000000,
+            "autocompact_threshold_pct": 90,
             "mode": "local",
         }
         settings = ClaudeCodeSettings.from_dict(data)
-        assert settings.autocompact_threshold_pct == 80
         assert settings.mode == "local"
         assert not hasattr(settings, "context_scaling_enabled")
         assert not hasattr(settings, "target_context_size")
+        assert not hasattr(settings, "autocompact_threshold_pct")
 
     def test_new_fields_defaults(self):
         """Test that the four new fields have correct defaults."""
@@ -2175,34 +2161,13 @@ class TestClaudeCodeValidation:
         mode_errors = [e for e in errors if "claude_code mode" in e]
         assert len(mode_errors) == 1
 
-    def test_validate_autocompact_threshold_pct_out_of_range(self):
-        """autocompact_threshold_pct outside 50-95 produces a validation error."""
-        gs = GlobalSettings.__new__(GlobalSettings)
-        real = GlobalSettings()
-        gs.__dict__.update(real.__dict__)
-        gs.claude_code = ClaudeCodeSettings(autocompact_threshold_pct=10)
-        errors = gs.validate()
-        pct_errors = [e for e in errors if "autocompact_threshold_pct" in e]
-        assert len(pct_errors) == 1
-
-    def test_validate_autocompact_threshold_pct_in_range(self):
-        """autocompact_threshold_pct within 50-95 produces no validation error."""
-        gs = GlobalSettings.__new__(GlobalSettings)
-        real = GlobalSettings()
-        gs.__dict__.update(real.__dict__)
-        gs.claude_code = ClaudeCodeSettings(autocompact_threshold_pct=85)
-        errors = gs.validate()
-        pct_errors = [e for e in errors if "autocompact_threshold_pct" in e]
-        assert pct_errors == []
-
 
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
-    def test_claude_code_to_dict_has_five_keys(self):
-        """to_dict must include all five keys so GlobalSettings.save() persists them."""
+    def test_claude_code_to_dict_has_four_keys(self):
+        """to_dict must include all four keys so GlobalSettings.save() persists them."""
         s = ClaudeCodeSettings(
-            autocompact_threshold_pct=70,
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
             sonnet_model="mlx-community/Qwen3-14B-4bit",
@@ -2210,7 +2175,6 @@ class TestClaudeCodeRouteIntegration:
         )
         d = s.to_dict()
         expected_keys = {
-            "autocompact_threshold_pct",
             "mode",
             "opus_model",
             "sonnet_model",

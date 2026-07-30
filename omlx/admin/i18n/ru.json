@@ -951,7 +951,5 @@
   "js.error.delete_model_failed": "Не удалось удалить модель",
   "js.error.delete_model_connection": "Не удалось удалить модель. Проверьте соединение с сервером.",
   "js.success.download_started": "Загрузка начата: {repo_id}",
-  "js.success.settings_saved": "Настройки успешно сохранены",
-  "status.claude_code.autocompact_threshold_pct": "Порог автосжатия",
-  "status.claude_code.autocompact_threshold_pct_description": "Процент реального максимального размера контекста модели, при котором Claude Code запускает автоматическое сжатие (по умолчанию 80%)."
+  "js.success.settings_saved": "Настройки успешно сохранены"
 }

@@ -739,20 +739,6 @@
                                     </div>
                                 </div>
                             </div>
-
-                            <!-- Auto-compact threshold for Claude Code -->
-                            <div class="mt-4 pt-4 border-t border-neutral-100">
-                                <div class="flex items-center gap-2">
-                                    <label class="text-xs font-bold uppercase tracking-wider text-neutral-500 whitespace-nowrap">{{ t('status.claude_code.autocompact_threshold_pct') }}</label>
-                                    <input type="number"
-                                           x-model.number="globalSettings.claude_code.autocompact_threshold_pct"
-                                           @change="saveClaudeCodeSettings()"
-                                           min="50" max="95" step="1"
-                                           class="w-24 px-3 py-1.5 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                    <span class="text-xs text-neutral-400">%</span>
-                                </div>
-                                <p class="mt-2 text-xs text-neutral-400 leading-relaxed">{{ t('status.claude_code.autocompact_threshold_pct_description') }}</p>
-                            </div>
                         </div>
                     </div>
 
