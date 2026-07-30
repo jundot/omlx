@@ -23,8 +23,10 @@ formula. Tests that exercise only an SWA layer therefore prove nothing, which
 ``test_trailing_pad_dequant_*`` pins down explicitly.
 """
 
+import gc
 import json
 import struct
+import weakref
 
 import mlx.core as mx
 import numpy as np
@@ -377,3 +379,71 @@ def test_geometry_mismatch_refuses(tmp_path):
     bad = _config(head_dim=FULL["hd"] + 64)
     with pytest.raises(ValueError):
         _LazyTensorIndex([shard], config=bad)
+
+
+def _splitter_behind(index, key):
+    """The splitter a virtual key's materializer closes over.
+
+    The materializer is a closure rather than a bound method, so the object
+    is reachable only through the closure's free variables.
+    """
+    fn = index._virtual[key].materialize
+    cells = dict(zip(fn.__code__.co_freevars, fn.__closure__))
+    return cells["self"].cell_contents
+
+
+def test_index_is_freed_without_the_garbage_collector(tmp_path):
+    """The splitter must not form a cycle back to the index.
+
+    The streaming loop ends with an explicit ``del all_weights`` followed by
+    ``mx.clear_cache()`` to hand memory back. A strong reference from the
+    materializer closures to the index would defer that to an arbitrary gc
+    pass, so the release has to survive with the collector switched off.
+    """
+    shard, _ = _build_checkpoint(tmp_path)
+    idx = _LazyTensorIndex([shard], config=_config())
+    # Warm the splitter so it is holding a dequantized layer.
+    idx["model.layers.0.self_attn.q_proj.weight"]
+    ref = weakref.ref(idx)
+
+    gc.disable()
+    try:
+        del idx
+        assert ref() is None, "index survived del; a reference cycle is back"
+    finally:
+        gc.enable()
+
+
+def test_served_slices_are_not_retained(tmp_path):
+    """Each slice is released as it is handed over.
+
+    Otherwise the splitter holds q while the consumer quantizes k and v,
+    keeping a layer's largest tensor alive across two more allocation peaks.
+    """
+    shard, _ = _build_checkpoint(tmp_path)
+    idx = _LazyTensorIndex([shard], config=_config())
+    prefix = "model.layers.0.self_attn"
+
+    idx[f"{prefix}.q_proj.weight"]
+    splitter = _splitter_behind(idx, f"{prefix}.q_proj.weight")
+    assert splitter._parts[0] is None, "q was kept after being served"
+    assert splitter._parts[1] is not None, "k should still be cached"
+
+    idx[f"{prefix}.k_proj.weight"]
+    idx[f"{prefix}.v_proj.weight"]
+    assert splitter._parts is None, "entry not dropped after all three served"
+
+
+def test_deleting_a_virtual_key_unhides_its_sources(tmp_path):
+    """Removal has to undo hiding, or the source vanishes from every view."""
+    shard, _ = _build_checkpoint(tmp_path)
+    idx = _LazyTensorIndex([shard], config=_config())
+    prefix = "model.layers.0.self_attn"
+    qkv_key = f"{prefix}.qkv_proj.weight"
+
+    assert qkv_key not in idx
+    for part in PARTS:
+        del idx[f"{prefix}.{part}.weight"]
+    # With no virtual tensor claiming it, the fused source is visible again
+    # rather than being readable-but-unlistable.
+    assert qkv_key in idx

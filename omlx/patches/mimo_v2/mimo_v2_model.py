@@ -15,6 +15,13 @@ from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from omlx.patches.mimo_v2.fused_qkv_layout import (
+    FUSED_QKV_BLOCK_SIZE,
+    detect_fused_qkv_tp,
+    fused_qkv_keys,
+    layer_head_geometry,
+    split_fused_qkv,
+)
 
 
 @dataclass
@@ -61,149 +68,6 @@ class ModelArgs(BaseModelArgs):
             raise ValueError("hybrid_layer_pattern length must match num_hidden_layers")
         if len(self.moe_layer_freq) != n:
             raise ValueError("moe_layer_freq length must match num_hidden_layers")
-
-
-# ── Fused-QKV FP8 layout ───────────────────────────────────────────────────
-#
-# MiMo V2.5 FP8 checkpoints ship a fused ``qkv_proj.weight`` that is already
-# sharded for tensor parallelism, alongside a block-128 ``weight_scale_inv``
-# companion. Each shard is padded to a block boundary *individually*, so the
-# padding is interleaved through the tensor rather than trailing it. Treating
-# the fused tensor as one block grid straddles shard boundaries and silently
-# yields wrong weights, so the scale must be applied per shard before q/k/v
-# are sliced apart.
-#
-# These helpers sit at module level (rather than nested inside ``sanitize``)
-# so oMLX's streaming quantizer can reuse this exact geometry and math
-# instead of reimplementing it. Second implementations of this layout have
-# been the source of silent corruption; keep this the only one.
-# See omlx/patches/mimo_v2/virtual_qkv.py for the streaming consumer.
-
-FUSED_QKV_BLOCK_SIZE = 128
-
-# Modalities this text backbone intentionally drops during sanitize. The
-# streaming quantizer must skip the same prefixes: their tensors are present
-# in the checkpoint but carry geometry that does not match
-# ``hybrid_layer_pattern`` (the MTP head reuses the SWA shape while sitting
-# at ``layers.0``), so any geometry check applied to them will misfire.
-SANITIZE_SKIP_PREFIXES = (
-    "model.mtp.",
-    "visual.",
-    "audio_encoder.",
-    "speech_embeddings.",
-)
-
-
-def layer_head_geometry(args, layer_idx):
-    """Return ``(n_heads, n_kv_heads, head_dim, v_head_dim)`` for one layer."""
-    if bool(args.hybrid_layer_pattern[layer_idx]):
-        return (
-            args.swa_num_attention_heads,
-            args.swa_num_key_value_heads,
-            args.swa_head_dim,
-            args.swa_v_head_dim,
-        )
-    return (
-        args.num_attention_heads,
-        args.num_key_value_heads,
-        args.head_dim,
-        args.v_head_dim,
-    )
-
-
-def fused_qkv_shard_rows(n_h, n_kv, hd, vhd, tp):
-    """Per-shard ``(actual_rows, padded_rows)`` for one fused-qkv shard."""
-    pr = (n_h // tp) * hd + (n_kv // tp) * (hd + vhd)
-    return pr, -(-pr // FUSED_QKV_BLOCK_SIZE) * FUSED_QKV_BLOCK_SIZE
-
-
-def fused_qkv_split_shapes(n_h, n_kv, hd, vhd, tp, n_cols):
-    """Output shapes of :func:`split_fused_qkv`, as ``(q, k, v)``."""
-    return (
-        (tp * (n_h // tp) * hd, n_cols),
-        (tp * (n_kv // tp) * hd, n_cols),
-        (tp * (n_kv // tp) * vhd, n_cols),
-    )
-
-
-def detect_fused_qkv_tp(args, shape_of):
-    """Resolve the tensor-parallel degree the fused qkv was sharded for.
-
-    ``shape_of(key)`` returns that tensor's shape, or None when it is absent,
-    so both the eager sanitize (a dict of arrays) and the streaming
-    quantizer (a safetensors header index) can drive this without
-    materializing any data.
-
-    Only full-attention layers are consulted: SWA geometry happens to be
-    block-aligned, which makes its TP degree ambiguous.
-    """
-    for layer_idx in range(args.num_hidden_layers):
-        if bool(args.hybrid_layer_pattern[layer_idx]):
-            continue
-        qkv_key = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
-        qkv_shape = shape_of(qkv_key)
-        scale_shape = shape_of(f"{qkv_key}_scale_inv")
-        if qkv_shape is None or scale_shape is None:
-            continue
-        actual = qkv_shape[0]
-        padded = scale_shape[0] * FUSED_QKV_BLOCK_SIZE
-        n_h, n_kv, hd, vhd = layer_head_geometry(args, layer_idx)
-        for tp in (1, 2, 4, 8, 16, 32):
-            if n_h % tp or n_kv % tp:
-                continue
-            pr, pr_padded = fused_qkv_shard_rows(n_h, n_kv, hd, vhd, tp)
-            if pr * tp == actual and pr_padded * tp == padded:
-                return tp
-        raise ValueError(
-            f"unable to determine fused-qkv TP layout from layer {layer_idx} "
-            f"(actual={actual}, padded={padded})"
-        )
-    # No fused qkv with a scale companion anywhere: nothing to shard-aware
-    # dequantize, so the split path is inert and TP is irrelevant.
-    return 1
-
-
-def split_fused_qkv(qkv_fp8, scale_inv, *, tp, n_h, n_kv, hd, vhd):
-    """Dequantize a pre-sharded fused qkv FP8 tensor and split it into q/k/v.
-
-    The block scale is applied per tensor-parallel shard, because each shard
-    was padded to a block boundary on its own. Returns ``(q, k, v)`` in
-    bfloat16.
-    """
-    BS = FUSED_QKV_BLOCK_SIZE
-    bf16 = mx.bfloat16
-    q_pr = (n_h // tp) * hd
-    k_pr = (n_kv // tp) * hd
-    v_pr = (n_kv // tp) * vhd
-    actual_pr = q_pr + k_pr + v_pr
-    padded_pr = -(-actual_pr // BS) * BS
-    n = qkv_fp8.shape[-1]
-
-    qkv = mx.from_fp8(qkv_fp8, dtype=bf16).reshape(tp, actual_pr, n)
-    if padded_pr > actual_pr:
-        qkv = mx.pad(qkv, ((0, 0), (0, padded_pr - actual_pr), (0, 0)))
-    n_col_blocks = scale_inv.shape[1]
-    pad_side = BS * n_col_blocks - n
-    if pad_side > 0:
-        qkv = mx.pad(qkv, ((0, 0), (0, 0), (0, pad_side)))
-
-    blocked = qkv.reshape(tp * padded_pr // BS, BS, n_col_blocks, BS)
-    qkv = (blocked * scale_inv[:, None, :, None]).reshape(
-        tp, padded_pr, n_col_blocks * BS
-    )[:, :actual_pr, :n]
-
-    q = mx.contiguous(qkv[:, :q_pr, :]).reshape(tp * q_pr, n).astype(bf16)
-    k = (
-        mx.contiguous(qkv[:, q_pr : q_pr + k_pr, :])
-        .reshape(tp * k_pr, n)
-        .astype(bf16)
-    )
-    v = (
-        mx.contiguous(qkv[:, q_pr + k_pr :, :])
-        .reshape(tp * v_pr, n)
-        .astype(bf16)
-    )
-    return q, k, v
 
 
 class Attention(nn.Module):
@@ -497,11 +361,13 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        weights = {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith(SANITIZE_SKIP_PREFIXES)
-        }
+        skip_prefixes = (
+            "model.mtp.",
+            "visual.",
+            "audio_encoder.",
+            "speech_embeddings.",
+        )
+        weights = {k: v for k, v in weights.items() if not k.startswith(skip_prefixes)}
 
         BS = FUSED_QKV_BLOCK_SIZE
         bf16 = mx.bfloat16
@@ -525,9 +391,7 @@ class Model(nn.Module):
             return weight[:m, :n].astype(bf16)
 
         for layer_idx in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_idx}.self_attn"
-            qkv_key = f"{prefix}.qkv_proj.weight"
-            scale_key = f"{qkv_key}_scale_inv"
+            prefix, qkv_key, scale_key = fused_qkv_keys(layer_idx)
             if qkv_key not in weights or scale_key not in weights:
                 continue
 

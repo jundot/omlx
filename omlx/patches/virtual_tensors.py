@@ -27,10 +27,6 @@ Registrars must be conservative:
 
 from __future__ import annotations
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 def register_virtual_tensors(index, config) -> int:
     """Give every known registrar a chance to claim tensors on ``index``.
@@ -39,15 +35,10 @@ def register_virtual_tensors(index, config) -> int:
     fatal by design: a checkpoint whose layout we half-understand must not be
     quantized silently.
     """
-    if not config:
-        return 0
+    from .mimo_v2.virtual_qkv import register as register_mimo_v2_qkv
 
-    total = 0
-    try:
-        from .mimo_v2.virtual_qkv import register as register_mimo_v2_qkv
-    except ImportError:
-        logger.debug("mimo_v2 virtual-qkv registrar unavailable", exc_info=True)
-    else:
-        total += register_mimo_v2_qkv(index, config)
-
-    return total
+    # Import errors are deliberately not caught. A registrar that fails to
+    # load leaves its checkpoint in the layout the quantizer cannot read, so
+    # swallowing that would turn a packaging fault into a silently wrong
+    # quantization.
+    return register_mimo_v2_qkv(index, config)

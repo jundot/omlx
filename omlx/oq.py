@@ -18,7 +18,7 @@ import tempfile
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 import numpy as np
 
@@ -136,46 +136,6 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     if quant_method == "mxfp8":
         return True
     return quant_method == "fp8" and _is_deepseek_v4_config(config)
-
-
-# Native fp8/mxfp8 weights (1 byte) dequantize to bf16 (2 bytes) for the
-# full-model calibration forward, so the live footprint roughly doubles.
-_NATIVE_FLOAT8_BF16_EXPANSION = 2
-
-
-def _config_is_native_float8(config: dict) -> bool:
-    """True when the source stores weights in a native fp8/mxfp8 format.
-
-    Such checkpoints dequantize to bf16 for the calibration forward pass, so
-    their live footprint is ~2x the on-disk size. The proxy budget must size
-    on that; otherwise a large fp8 source (e.g. MiMo-V2.5: 293 GB fp8 ->
-    ~586 GB bf16) slips under the budget, the proxy is skipped, and the
-    full-model calibration is OOM-killed.
-    """
-    configs = [config]
-    text_config = config.get("text_config")
-    if isinstance(text_config, dict):
-        configs.append(text_config)
-    for cfg in configs:
-        qc = cfg.get("quantization_config")
-        if not isinstance(qc, dict):
-            continue
-        if str(qc.get("quant_method", "")).lower() in _NATIVE_FLOAT8_QUANT_METHODS:
-            return True
-    return False
-
-
-def _calibration_footprint_bytes(on_disk_bytes: int, config: dict) -> int:
-    """Live full-model calibration footprint of a checkpoint, in bytes.
-
-    Native fp8/mxfp8 sources materialize bf16 weights for the calibration
-    forward (~2x on-disk); other formats already sit at or above their
-    calibration precision, so the on-disk size is used unchanged.
-    """
-    on_disk_bytes = max(0, int(on_disk_bytes))
-    if _config_is_native_float8(config):
-        return on_disk_bytes * _NATIVE_FLOAT8_BF16_EXPANSION
-    return on_disk_bytes
 
 
 def _is_minimax_m3_config(config: dict) -> bool:
@@ -1388,6 +1348,8 @@ class _TrackedTensor:
         self.expr = expr
 
     def _clone(self, shape=None, dtype=None, transform=None):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape, dtype=dtype)
         new_transform = transform if transform is not None else self.transform
         return _TrackedTensor(
             shape if shape is not None else self.shape,
@@ -1398,24 +1360,53 @@ class _TrackedTensor:
             expr=self.expr if new_transform == self.transform else None,
         )
 
-    # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
+    def _unreplayable(self, shape=None, dtype=None, extra_sources=()):
+        """A tensor whose lineage the replay engine cannot reproduce.
+
+        Sticky by construction: it carries no recipe and no expr, and
+        :meth:`_clone` / :meth:`_with_recipe` funnel back here, so a later
+        replayable op cannot launder the plan into looking sound. Discovery
+        then rejects it and the caller falls back to eager sanitize.
+        """
+        sources = list(self.sources)
+        sources.extend(s for s in extra_sources if s not in sources)
+        return _TrackedTensor(
+            shape if shape is not None else self.shape,
+            dtype if dtype is not None else self.dtype,
+            sources,
+            "nested_unreplayable",
+        )
+
+    def _binary(self, other, transform):
+        """Record an elementwise op against ``other``.
+
+        When ``other`` is another tracked tensor the result depends on two
+        live sources, which the replay engine cannot express: it applies a
+        list of single-source unary ops. Recording only this side would
+        silently drop the operand -- a scale multiply would vanish and the
+        plan would ship unscaled weights -- so poison instead.
+        """
+        if isinstance(other, _TrackedTensor):
+            return self._unreplayable(extra_sources=other.sources)
+        return self._clone(transform=transform)
+
     def __add__(self, other):
-        return self._clone(transform="add")
+        return self._binary(other, "add")
 
     def __radd__(self, other):
         return self.__add__(other)
 
     def __sub__(self, other):
-        return self._clone(transform="sub")
+        return self._binary(other, "sub")
 
     def __mul__(self, other):
-        return self._clone(transform="mul")
+        return self._binary(other, "mul")
 
     def __rmul__(self, other):
         return self.__mul__(other)
 
     def __truediv__(self, other):
-        return self._clone(transform="div")
+        return self._binary(other, "div")
 
     @staticmethod
     def _slice_length(dim, sl):
@@ -1457,6 +1448,8 @@ class _TrackedTensor:
         return tuple(expanded)
 
     def _with_recipe(self, shape, transform, op, axis=None):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape)
         expr = self.as_expr()
         if expr is not None:
             expr = self._wrap_expr_op(expr, op)
@@ -1620,6 +1613,8 @@ class _TrackedTensor:
         if unknown_idx >= 0 and known_prod > 0:
             resolved[unknown_idx] = total // known_prod
         shape = tuple(resolved)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape)
         return _TrackedTensor(
             shape,
             self.dtype,
@@ -1629,6 +1624,8 @@ class _TrackedTensor:
         )
 
     def astype(self, dtype):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(dtype=dtype)
         return _TrackedTensor(
             self.shape,
             dtype,
@@ -1643,6 +1640,8 @@ class _TrackedTensor:
         dims = list(range(self.ndim))
         dims.insert(dst_ax, dims.pop(src_ax))
         new_shape = tuple(self.shape[d] for d in dims)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=new_shape)
         return _TrackedTensor(
             new_shape,
             self.dtype,
@@ -1660,6 +1659,8 @@ class _TrackedTensor:
             axes_list = list(axes)
         axes_list = [a % self.ndim if a < 0 else a for a in axes_list]
         new_shape = tuple(self.shape[a] for a in axes_list)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=new_shape)
         return _TrackedTensor(
             new_shape,
             self.dtype,
@@ -1953,9 +1954,10 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
-            return _TrackedTensor(
-                x.shape, dtype or x.dtype, list(x.sources), "from_fp8"
-            )
+            # No replay op decodes fp8, and constructing a fresh tracked
+            # tensor here would reset the accumulated recipe, so anything
+            # recorded before this point would silently vanish.
+            return x._unreplayable(dtype=dtype or x.dtype)
         return _orig["from_fp8"](x, dtype=dtype, **kw) if _orig["from_fp8"] else x
 
     def _fake_pad(x, pad_width, **kw):
@@ -1971,7 +1973,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                     new_shape.append(d + lo + hi)
                 else:
                     new_shape.append(d)
-            return _TrackedTensor(new_shape, x.dtype, list(x.sources), "pad")
+            # Same reasoning as _fake_from_fp8: no replay op pads, and a
+            # fresh tensor here would drop the recipe recorded so far.
+            return x._unreplayable(shape=new_shape)
         return _orig["pad"](x, pad_width, **kw) if _orig["pad"] else x
 
     if _orig["from_fp8"] is not None:
@@ -3463,6 +3467,15 @@ _QUANTIZE_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 4)
 _LOAD_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 2)
 
 
+class _VirtualTensor(NamedTuple):
+    """A logical tensor produced on demand from hidden on-disk sources."""
+
+    shape: tuple
+    dtype: str
+    materialize: Callable
+    hides: tuple
+
+
 class _LazyTensorIndex:
     _DTYPE_BYTES = {
         "BF16": 2,
@@ -3515,8 +3528,11 @@ class _LazyTensorIndex:
         # on-disk tensors, for layouts the model's sanitize would otherwise
         # have to restructure (see patches/virtual_tensors.py). ``_hidden``
         # holds the source keys they consume; those leave the logical view.
-        self._virtual = {}
+        self._virtual: dict[str, _VirtualTensor] = {}
         self._hidden = set()
+        # Eager replacements written back by a caller (e.g. an eager
+        # sanitize). Always present so the view methods need no guards.
+        self._overrides: dict = {}
         self._discover_fp8_pairs()
         self._register_virtual_tensors(config)
 
@@ -3543,12 +3559,31 @@ class _LazyTensorIndex:
         stay readable via :meth:`load_source` but disappear from the logical
         view so sanitize never sees the pre-restructure layout.
         """
-        self._virtual[key] = (tuple(shape), dtype, materializer)
+        self._virtual[key] = _VirtualTensor(
+            tuple(shape), dtype, materializer, tuple(hides)
+        )
         self._hidden.update(hides)
 
     def materialize_virtual(self, key):
         """Produce a virtual tensor's value."""
-        return self._virtual[key][2]()
+        return self._virtual[key].materialize()
+
+    def _forget_virtual(self, key) -> None:
+        """Drop a virtual tensor, and un-hide sources nothing else claims.
+
+        Removal has to undo the hiding too, or a deleted virtual key would
+        leave its sources permanently invisible: they would be readable via
+        :meth:`load_source` but absent from every enumeration.
+        """
+        entry = self._virtual.pop(key, None)
+        if entry is None:
+            return
+        still_hidden = set()
+        for other in self._virtual.values():
+            still_hidden.update(other.hides)
+        for src in entry.hides:
+            if src not in still_hidden:
+                self._hidden.discard(src)
 
     def source_shape(self, key):
         """On-disk shape of ``key``, or None when absent.
@@ -3741,42 +3776,41 @@ class _LazyTensorIndex:
                     # FP4-packed bytes: logical width is 2 values per byte.
                     shape = (shape[0], shape[1] * 2)
             result[k] = (shape, dtype)
-        for k, (shape, dtype, _) in self._virtual.items():
-            result[k] = (shape, dtype)
+        for k, entry in self._virtual.items():
+            result[k] = (entry.shape, entry.dtype)
         return result
 
+    def __iter__(self):
+        """The logical key set: visible on-disk keys, then virtual, then
+        overrides, each name yielded once.
+
+        The single statement of that rule. ``keys``, ``__len__`` and
+        ``items`` all derive from it so a new logical-key source cannot be
+        added to some enumerations and forgotten in others.
+        """
+        seen = set()
+        for k in self._index:
+            if self._is_visible(k):
+                seen.add(k)
+                yield k
+        for k in self._virtual:
+            if k not in seen:
+                seen.add(k)
+                yield k
+        for k in self._overrides:
+            if k not in seen:
+                yield k
+
     def keys(self):
-        base = [k for k in self._index if self._is_visible(k)]
-        base.extend(k for k in self._virtual if k not in self._index)
-        if hasattr(self, "_overrides"):
-            base.extend(self._overrides.keys())
-        return base
+        return list(self)
 
     def __len__(self):
-        n = sum(1 for k in self._index if self._is_visible(k))
-        n += sum(1 for k in self._virtual if k not in self._index)
-        if hasattr(self, "_overrides"):
-            n += len(self._overrides)
-        return n
+        return sum(1 for _ in self)
 
     def __contains__(self, k):
         if k in self._index and self._is_visible(k):
             return True
-        if k in self._virtual:
-            return True
-        return hasattr(self, "_overrides") and k in self._overrides
-
-    def __iter__(self):
-        for k in self._index:
-            if self._is_visible(k):
-                yield k
-        for k in self._virtual:
-            if k not in self._index:
-                yield k
-        if hasattr(self, "_overrides"):
-            for k in self._overrides:
-                if k not in self._index:
-                    yield k
+        return k in self._virtual or k in self._overrides
 
     def nbytes(self):
         # Bytes we will actually read off disk. Hidden keys still count —
@@ -3794,7 +3828,7 @@ class _LazyTensorIndex:
         return lt[:]
 
     def __getitem__(self, key):
-        if hasattr(self, "_overrides") and key in self._overrides:
+        if key in self._overrides:
             return self._overrides[key]
         if key in self._virtual:
             return self.materialize_virtual(key)
@@ -3805,19 +3839,11 @@ class _LazyTensorIndex:
         return self._load_raw(key)
 
     def items(self):
-        for k in list(self._index.keys()):
-            if not self._is_visible(k):
-                continue
+        # Snapshot the key set: consumers (eager sanitize) mutate while
+        # iterating, and materializing is what makes this worth streaming.
+        for k in list(self):
             yield k, self[k]
             mx.clear_cache()
-        for k in list(self._virtual.keys()):
-            if k in self._index:
-                continue
-            yield k, self.materialize_virtual(k)
-            mx.clear_cache()
-        if hasattr(self, "_overrides"):
-            for k, v in self._overrides.items():
-                yield k, v
 
     def get(self, key, default=None):
         if key in self:
@@ -3825,24 +3851,21 @@ class _LazyTensorIndex:
         return default
 
     def __setitem__(self, key, value):
-        if not hasattr(self, "_overrides"):
-            self._overrides = {}
         self._overrides[key] = value
         self._index.pop(key, None)
         self._fp8_pairs.pop(key, None)
         self._src_quant.pop(key, None)
-        self._virtual.pop(key, None)
+        self._forget_virtual(key)
 
     def __delitem__(self, key):
         if key in self._fp8_pairs:
             sk = self._fp8_pairs.pop(key)
             self._fp8_scale_keys.discard(sk)
             self._index.pop(sk, None)
-        self._virtual.pop(key, None)
+        self._forget_virtual(key)
         self._index.pop(key, None)
         self._src_quant.pop(key, None)
-        if hasattr(self, "_overrides"):
-            self._overrides.pop(key, None)
+        self._overrides.pop(key, None)
 
     def update(self, other):
         if hasattr(other, "items"):
@@ -3853,10 +3876,12 @@ class _LazyTensorIndex:
                 self[k] = v
 
     def pop(self, key, *default):
-        if hasattr(self, "_overrides") and key in self._overrides:
+        if key in self._overrides:
             return self._overrides.pop(key)
         if key in self._virtual:
-            return self.materialize_virtual(key)
+            result = self.materialize_virtual(key)
+            self._forget_virtual(key)
+            return result
         if key not in self._index:
             if default:
                 return default[0]
@@ -3999,6 +4024,27 @@ def _tensor_shape_nbytes(shape, bytes_per_element: int) -> int:
     for dim in shape:
         n *= int(dim)
     return n * bytes_per_element
+
+
+def _logical_footprint_bytes(index) -> int:
+    """Bytes a full-model calibration forward materializes from ``index``.
+
+    The lazy index's logical view already reports every tensor at its
+    post-dequantization shape and dtype: native fp8 weights as bf16, packed
+    fp4 experts at two values per stored byte, virtual tensors at the shape
+    they will be produced in, and folded-away scale companions not at all.
+    Summing it is exact, where scaling the on-disk size by a per-format
+    constant is only ever approximately right and silently wrong for any
+    format that expands by something other than that constant.
+    """
+    if not hasattr(index, "logical_metadata"):
+        return 0
+    total = 0
+    for shape, dtype in index.logical_metadata().values():
+        total += _tensor_shape_nbytes(
+            shape, _LazyTensorIndex._DTYPE_BYTES.get(dtype, 2)
+        )
+    return total
 
 
 def _progress_total_bytes(all_weights, source: Path) -> int:
@@ -4712,8 +4758,12 @@ def quantize_oq_streaming(
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
     from omlx.settings import get_system_memory as _get_system_memory
 
-    _calibration_bytes = _calibration_footprint_bytes(
-        _checkpoint_storage_bytes(weight_files), config
+    # The calibration forward materializes the logical (dequantized) view, so
+    # size the budget on that rather than on file bytes. On-disk size stays a
+    # floor: it covers sidecars and any tensor the logical view folds away.
+    _calibration_bytes = max(
+        _checkpoint_storage_bytes(weight_files),
+        _logical_footprint_bytes(all_weights),
     )
     _system_ram = _get_system_memory()
     _calibration_budget = _calibration_memory_budget(
