@@ -17,6 +17,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from ...utils.metal_sync import _sync_and_clear_cache
+
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
@@ -193,7 +195,12 @@ def apply_glm_moe_dsa_generate_patch() -> bool:
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
             if self._steps_counter % 512 == 0:
-                mx.clear_cache()
+                # GenerationBatch.next() submits the decode step with
+                # mx.async_eval, so the periodic clear has to drain that work
+                # first. self._stream is the stream it rode: BatchGenerator
+                # runs _next() inside ``with mx.stream(self._stream)`` and
+                # oMLX constructs the generator with the per-engine stream.
+                _sync_and_clear_cache(self._stream)
 
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses

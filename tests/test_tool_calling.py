@@ -842,6 +842,7 @@ class TestToolCallStreamFilter:
         r1 = f.feed("<tool")
         r2 = f.finish()
         assert r1 + r2 == ""
+        assert f.take_recovery_candidate() == ""
 
     def test_suppressing_blocks_finish(self):
         """An unresolved open envelope keeps buffered control text suppressed at finish()."""
@@ -1131,6 +1132,94 @@ def _make_tokenizer_with_end(tool_call_start="", tool_call_end=""):
     return tok
 
 
+def _paired_envelope_cases():
+    return [
+        ("<tool_call>", "</tool_call>", _make_tokenizer()),
+        (
+            "<|tool_call_start|>",
+            "<|tool_call_end|>",
+            _make_tokenizer(),
+        ),
+        (
+            "<|tool_call>",
+            "<tool_call|>",
+            _make_tokenizer_with_end("<|tool_call>", "<tool_call|>"),
+        ),
+        (
+            "]<]minimax[>[<tool_call>",
+            "]<]minimax[>[</tool_call>",
+            _make_tokenizer(),
+        ),
+        (
+            "<vendor-x:tool_call>",
+            "</vendor-x:tool_call>",
+            _make_tokenizer(),
+        ),
+        (
+            "<custom-call>",
+            "</custom-call>",
+            _make_tokenizer_with_end("<custom-call>", "</custom-call>"),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+def test_unclosed_paired_envelope_is_available_for_conditional_recovery(
+    start_marker, end_marker, tokenizer, caplog
+):
+    """Every recognized paired format preserves its exact withheld EOF suffix."""
+    f = ToolCallStreamFilter(tokenizer)
+    suffix = start_marker + "payload" + end_marker[:-1]
+    text = "Before " + suffix
+
+    with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+        visible = "".join(f.feed(ch) for ch in text)
+        visible += f.finish()
+
+    assert visible == "Before "
+    assert f.take_recovery_candidate() == suffix
+    assert f.take_recovery_candidate() == ""
+    assert caplog.text.count("Unclosed tool-call envelope at end of stream") == 1
+
+
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+def test_closed_paired_envelope_never_creates_recovery_candidate(
+    start_marker, end_marker, tokenizer, caplog
+):
+    """Completed envelopes retain the existing clean streaming behavior."""
+    f = ToolCallStreamFilter(tokenizer)
+    text = "Before " + start_marker + "payload" + end_marker + " After"
+
+    with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+        visible = "".join(f.feed(ch) for ch in text)
+        visible += f.finish()
+
+    assert visible == "Before  After"
+    assert f.take_recovery_candidate() == ""
+    assert "Unclosed tool-call envelope" not in caplog.text
+
+
+def test_only_last_unclosed_envelope_becomes_recovery_candidate():
+    """Completed earlier calls stay hidden when a later call is unterminated."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        "Before <tool_call>first</tool_call> middle "
+        "<tool_call>second</tool_"
+    )
+
+    visible = "".join(f.feed(ch) for ch in text)
+    visible += f.finish()
+
+    assert visible == "Before  middle "
+    assert f.take_recovery_candidate() == "<tool_call>second</tool_"
+
+
 class TestToolCallStreamFilterSuppressAfterMarker:
     """Tests for one-sided markers (e.g. Mistral [TOOL_CALLS] with no end marker)."""
 
@@ -1140,6 +1229,7 @@ class TestToolCallStreamFilterSuppressAfterMarker:
         result = f.feed('[TOOL_CALLS]func_name[ARGS]{"key":"val"}')
         result += f.finish()
         assert result == ""
+        assert f.take_recovery_candidate() == ""
 
     def test_suppress_after_marker_with_preceding_text(self):
         """Text before one-sided marker should pass through."""

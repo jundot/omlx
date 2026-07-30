@@ -1643,6 +1643,9 @@ class ToolCallStreamFilter:
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
+        self._pending_envelope_parts: List[str] = []
+        self._pending_start_marker: Optional[str] = None
+        self._recovery_candidate = ""
 
     @staticmethod
     def _is_xml_close_marker(marker: str) -> bool:
@@ -1652,6 +1655,21 @@ class ToolCallStreamFilter:
     def active(self) -> bool:
         """Whether this filter should run for tool-enabled streams."""
         return True
+
+    def take_recovery_candidate(self) -> str:
+        """Return and clear an unterminated paired envelope captured at EOF.
+
+        The caller must only surface this text after final tool parsing confirms
+        that no structured tool call was recovered. This keeps valid tool calls
+        hidden even when another parser can recover malformed outer markup.
+        """
+        candidate = self._recovery_candidate
+        self._recovery_candidate = ""
+        return candidate
+
+    def _clear_pending_envelope(self) -> None:
+        self._pending_envelope_parts = []
+        self._pending_start_marker = None
 
     def _find_start_envelope(
         self, text: str
@@ -1878,15 +1896,22 @@ class ToolCallStreamFilter:
                     keep = self._partial_prefix_len(
                         self._buffer, self._suppressing_until
                     )
-                    self._buffer = self._buffer[-keep:] if keep else ""
+                    if keep:
+                        self._pending_envelope_parts.append(self._buffer[:-keep])
+                        self._buffer = self._buffer[-keep:]
+                    else:
+                        self._pending_envelope_parts.append(self._buffer)
+                        self._buffer = ""
                     break
                 self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
                 self._suppressing_until = None
+                self._clear_pending_envelope()
                 continue
 
             start = self._find_start_envelope(self._buffer)
             if start:
                 idx, consume_len, close_marker = start
+                opening_marker = self._buffer[idx : idx + consume_len]
                 if idx > 0:
                     out.append(
                         self._sanitize_prefix_before_suppression(self._buffer[:idx])
@@ -1894,6 +1919,11 @@ class ToolCallStreamFilter:
                 self._buffer = self._buffer[idx + consume_len :]
                 if close_marker is not None:
                     self._suppressing_until = close_marker
+                    if close_marker != "__suppress_permanently__":
+                        # Recover the exact opening bytes, including dynamic
+                        # namespace markers, if the matching close never arrives.
+                        self._pending_envelope_parts = [opening_marker]
+                        self._pending_start_marker = opening_marker
                 continue
 
             keep = self._partial_suffix_len(self._buffer)
@@ -1918,9 +1948,28 @@ class ToolCallStreamFilter:
         In clean-output strict mode, unresolved marker-like suffixes are dropped
         so partial control markup does not leak into user-visible text.
         """
-        if self._suppressing or self._suppressing_until is not None:
+        if self._suppressing:
             self._buffer = ""
             self._suppressing_until = None
+            self._clear_pending_envelope()
+            return ""
+
+        if self._suppressing_until is not None:
+            self._pending_envelope_parts.append(self._buffer)
+            candidate = "".join(self._pending_envelope_parts)
+            start_marker = self._pending_start_marker or "<unknown>"
+            self._buffer = ""
+            self._suppressing_until = None
+            self._clear_pending_envelope()
+            if candidate:
+                self._recovery_candidate = candidate
+                logger.warning(
+                    "Unclosed tool-call envelope at end of stream; "
+                    "withheld %d characters are available for content recovery "
+                    "(start_marker=%.80r)",
+                    len(candidate),
+                    start_marker,
+                )
             return ""
 
         keep = self._partial_suffix_len(self._buffer)

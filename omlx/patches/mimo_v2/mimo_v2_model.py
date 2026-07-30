@@ -15,6 +15,13 @@ from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from omlx.patches.mimo_v2.fused_qkv_layout import (
+    FUSED_QKV_BLOCK_SIZE,
+    detect_fused_qkv_tp,
+    fused_qkv_keys,
+    layer_head_geometry,
+    split_fused_qkv,
+)
 
 
 @dataclass
@@ -362,37 +369,14 @@ class Model(nn.Module):
         )
         weights = {k: v for k, v in weights.items() if not k.startswith(skip_prefixes)}
 
-        BS = 128
+        BS = FUSED_QKV_BLOCK_SIZE
         bf16 = mx.bfloat16
 
-        def detect_tp():
-            n_h = self.args.num_attention_heads
-            n_kv = self.args.num_key_value_heads
-            hd = self.args.head_dim
-            vhd = self.args.v_head_dim
-            for layer_idx in range(self.args.num_hidden_layers):
-                if bool(self.args.hybrid_layer_pattern[layer_idx]):
-                    continue
-                qkv_key = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
-                scale_key = f"{qkv_key}_scale_inv"
-                if qkv_key not in weights or scale_key not in weights:
-                    continue
-                actual = weights[qkv_key].shape[0]
-                padded = weights[scale_key].shape[0] * BS
-                for tp in (1, 2, 4, 8, 16, 32):
-                    if n_h % tp or n_kv % tp:
-                        continue
-                    pr = (n_h // tp) * hd + (n_kv // tp) * (hd + vhd)
-                    pr_padded = -(-pr // BS) * BS
-                    if pr * tp == actual and pr_padded * tp == padded:
-                        return tp
-                raise ValueError(
-                    f"unable to determine fused-qkv TP layout from layer {layer_idx} "
-                    f"(actual={actual}, padded={padded})"
-                )
-            return 1
+        def shape_of(key):
+            tensor = weights.get(key)
+            return None if tensor is None else tensor.shape
 
-        TP = detect_tp()
+        TP = detect_fused_qkv_tp(self.args, shape_of)
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
@@ -406,61 +390,21 @@ class Model(nn.Module):
             )
             return weight[:m, :n].astype(bf16)
 
-        def split_qkv(qkv_fp8, scale_inv, n_h, n_kv, hd, vhd):
-            q_pr = (n_h // TP) * hd
-            k_pr = (n_kv // TP) * hd
-            v_pr = (n_kv // TP) * vhd
-            actual_pr = q_pr + k_pr + v_pr
-            padded_pr = -(-actual_pr // BS) * BS
-            n = qkv_fp8.shape[-1]
-
-            qkv = mx.from_fp8(qkv_fp8, dtype=bf16).reshape(TP, actual_pr, n)
-            if padded_pr > actual_pr:
-                qkv = mx.pad(qkv, ((0, 0), (0, padded_pr - actual_pr), (0, 0)))
-            n_col_blocks = scale_inv.shape[1]
-            pad_side = BS * n_col_blocks - n
-            if pad_side > 0:
-                qkv = mx.pad(qkv, ((0, 0), (0, 0), (0, pad_side)))
-
-            blocked = qkv.reshape(TP * padded_pr // BS, BS, n_col_blocks, BS)
-            qkv = (blocked * scale_inv[:, None, :, None]).reshape(
-                TP, padded_pr, n_col_blocks * BS
-            )[:, :actual_pr, :n]
-
-            q = mx.contiguous(qkv[:, :q_pr, :]).reshape(TP * q_pr, n).astype(bf16)
-            k = (
-                mx.contiguous(qkv[:, q_pr : q_pr + k_pr, :])
-                .reshape(TP * k_pr, n)
-                .astype(bf16)
-            )
-            v = (
-                mx.contiguous(qkv[:, q_pr + k_pr :, :])
-                .reshape(TP * v_pr, n)
-                .astype(bf16)
-            )
-            return q, k, v
-
         for layer_idx in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_idx}.self_attn"
-            qkv_key = f"{prefix}.qkv_proj.weight"
-            scale_key = f"{qkv_key}_scale_inv"
+            prefix, qkv_key, scale_key = fused_qkv_keys(layer_idx)
             if qkv_key not in weights or scale_key not in weights:
                 continue
 
-            is_swa = bool(self.args.hybrid_layer_pattern[layer_idx])
-            if is_swa:
-                n_h = self.args.swa_num_attention_heads
-                n_kv = self.args.swa_num_key_value_heads
-                hd = self.args.swa_head_dim
-                vhd = self.args.swa_v_head_dim
-            else:
-                n_h = self.args.num_attention_heads
-                n_kv = self.args.num_key_value_heads
-                hd = self.args.head_dim
-                vhd = self.args.v_head_dim
+            n_h, n_kv, hd, vhd = layer_head_geometry(self.args, layer_idx)
 
-            q, k, v = split_qkv(
-                weights.pop(qkv_key), weights.pop(scale_key), n_h, n_kv, hd, vhd
+            q, k, v = split_fused_qkv(
+                weights.pop(qkv_key),
+                weights.pop(scale_key),
+                tp=TP,
+                n_h=n_h,
+                n_kv=n_kv,
+                hd=hd,
+                vhd=vhd,
             )
             weights[f"{prefix}.q_proj.weight"] = q
             weights[f"{prefix}.k_proj.weight"] = k

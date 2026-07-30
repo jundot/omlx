@@ -72,6 +72,10 @@ class Integration:
         """Check if the tool binary is available."""
         return shutil.which(self.install_check) is not None
 
+    def model_disabled_reason(self, model_info: dict) -> str | None:
+        """Return why a model cannot be selected for this integration."""
+        return None
+
     def _scrubbed_env(self) -> dict[str, str]:
         """Return an os.environ copy with bundled-Python vars removed.
 
@@ -98,7 +102,20 @@ class Integration:
         if not models_info:
             return ""
 
+        annotated_models = []
+        for model_info in models_info:
+            model_info = dict(model_info)
+            reason = self.model_disabled_reason(model_info)
+            if reason:
+                model_info["disabled_reason"] = reason
+            annotated_models.append(model_info)
+        models_info = annotated_models
+
         if len(models_info) == 1:
+            reason = models_info[0].get("disabled_reason")
+            if reason:
+                print(f"Cannot select {models_info[0]['id']}: {reason}")
+                sys.exit(1)
             return models_info[0]["id"]
 
         name = tool_name or "Tool"
@@ -119,12 +136,18 @@ class Integration:
         for i, m in enumerate(models_info, 1):
             ctx = m.get("max_context_window")
             ctx_str = f"  [{ctx:,} ctx]" if ctx else ""
-            print(f"  {i}. {m['id']}{ctx_str}")
+            reason = m.get("disabled_reason")
+            unavailable = f"  [unavailable: {reason}]" if reason else ""
+            print(f"  {i}. {m['id']}{ctx_str}{unavailable}")
         while True:
             try:
                 choice = input("Select model number: ").strip()
                 idx = int(choice) - 1
                 if 0 <= idx < len(models_info):
+                    reason = models_info[idx].get("disabled_reason")
+                    if reason:
+                        print(f"Cannot select {models_info[idx]['id']}: {reason}")
+                        continue
                     return models_info[idx]["id"]
                 print(f"Please enter 1-{len(models_info)}")
             except (ValueError, EOFError):
@@ -199,6 +222,7 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
         idx = 0
         scroll = 0
         hint = "↑↓ navigate   PgUp/PgDn page   Enter launch   q cancel"
+        warning = ""
         while True:
             max_y, max_x = stdscr.getmaxyx()
             # Layout: row 0 title, row 1 blank, rows [items_top, items_bottom)
@@ -226,17 +250,21 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
                     bullet = "●" if m.get("loaded", False) else "○"
                     ctx = m.get("max_context_window")
                     ctx_str = f"  {ctx // 1000}k" if ctx else ""
-                    line = f"  {bullet}  {m['id']}{ctx_str}"
+                    unavailable = "  unavailable" if m.get("disabled_reason") else ""
+                    line = f"  {bullet}  {m['id']}{ctx_str}{unavailable}"
                     # Leave 2 cols on the right for scroll indicators.
                     line = line[: max(0, max_x - 4)]
                     attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+                    if m.get("disabled_reason"):
+                        attr |= curses.A_DIM
                     stdscr.addstr(items_top + row_offset, 1, line, attr)
                 # Scroll indicators on the right edge.
                 if scroll > 0:
                     stdscr.addstr(items_top, max_x - 2, "▲", curses.A_DIM)
                 if visible_end < len(ordered):
                     stdscr.addstr(items_bottom - 1, max_x - 2, "▼", curses.A_DIM)
-                stdscr.addstr(max_y - 1, 1, hint[: max_x - 2], curses.A_DIM)
+                footer = warning or hint
+                stdscr.addstr(max_y - 1, 1, footer[: max_x - 2], curses.A_DIM)
             except curses.error:
                 # Window too small to render the full picker; keep going so
                 # the user can resize and the next loop redraws cleanly.
@@ -245,18 +273,28 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
 
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
+                warning = ""
                 idx = (idx - 1) % len(ordered)
             elif key in (curses.KEY_DOWN, ord("j")):
+                warning = ""
                 idx = (idx + 1) % len(ordered)
             elif key == curses.KEY_PPAGE:
+                warning = ""
                 idx = max(0, idx - max(1, visible_count - 1))
             elif key == curses.KEY_NPAGE:
+                warning = ""
                 idx = min(len(ordered) - 1, idx + max(1, visible_count - 1))
             elif key == curses.KEY_HOME:
+                warning = ""
                 idx = 0
             elif key == curses.KEY_END:
+                warning = ""
                 idx = len(ordered) - 1
             elif key in (curses.KEY_ENTER, 10, 13):
+                reason = ordered[idx].get("disabled_reason")
+                if reason:
+                    warning = f"Cannot select {ordered[idx]['id']}: {reason}"
+                    continue
                 selected.append(ordered[idx]["id"])
                 return
             elif key in (ord("q"), 27):  # q or ESC

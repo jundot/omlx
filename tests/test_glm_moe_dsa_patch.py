@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1163,3 +1165,139 @@ def test_glm_indexer_decode_rows_skip_fused_scores_kernel(monkeypatch):
     for row in range(s1):
         row_pos = total - s1 + row
         assert max(idx[0, 0, row].tolist()) <= row_pos
+
+
+@contextmanager
+def _glm_generate_patch_installed():
+    """Install the adaptive-prefill generate patch, restore mlx-lm afterwards.
+
+    ``apply_glm_moe_dsa_generate_patch`` rebinds methods on mlx-lm's
+    BatchGenerator / PromptProcessingBatch classes process-wide, so the test
+    restores the originals (and the applied markers) to keep the monkey patch
+    out of other tests. Re-entry is safe: when the patch is already installed
+    the apply call is a no-op and the saved originals are the patched ones.
+    """
+    from omlx.patches.glm_moe_dsa import generate_patch as patch_mod
+
+    gen = importlib.import_module("mlx_lm.generate")
+    saved_methods = {
+        (gen.PromptProcessingBatch, "__init__"): gen.PromptProcessingBatch.__init__,
+        (gen.PromptProcessingBatch, "_copy"): gen.PromptProcessingBatch._copy,
+        (gen.PromptProcessingBatch, "split"): gen.PromptProcessingBatch.split,
+        (gen.PromptProcessingBatch, "prompt"): gen.PromptProcessingBatch.prompt,
+        (gen.BatchGenerator, "__init__"): gen.BatchGenerator.__init__,
+        (gen.BatchGenerator, "_next"): gen.BatchGenerator._next,
+    }
+    saved_step = gen.generate_step
+    saved_applied = patch_mod._APPLIED
+    marker = "_omlx_glm_dsa_adaptive_patched"
+    had_marker = {
+        cls: marker in cls.__dict__
+        for cls in (gen.PromptProcessingBatch, gen.BatchGenerator)
+    }
+
+    patch_mod._APPLIED = False
+    try:
+        patch_mod.apply_glm_moe_dsa_generate_patch()
+        assert getattr(gen.BatchGenerator, marker, False)
+        yield gen
+    finally:
+        for (cls, name), method in saved_methods.items():
+            setattr(cls, name, method)
+        gen.generate_step = saved_step
+        patch_mod._APPLIED = saved_applied
+        for cls, present in had_marker.items():
+            if not present and marker in cls.__dict__:
+                delattr(cls, marker)
+
+
+def _decode_only_batch_generator(stream) -> SimpleNamespace:
+    """Duck-typed BatchGenerator self for the decode branch of ``_next``.
+
+    ``completion_batch_size == 1`` with a one-sequence generation batch makes
+    ``_next`` return right after the decode step, so the probe covers the
+    periodic-clear branch and nothing else.
+    """
+
+    class _GenerationBatch:
+        def __len__(self):
+            return 1
+
+        def next(self):
+            return ["generation"]
+
+    from omlx.patches.glm_moe_dsa.generate_patch import _AdaptivePrefillConfig
+
+    return SimpleNamespace(
+        _omlx_glm_dsa_adaptive_prefill=_AdaptivePrefillConfig(
+            step_size=8192, after=0, min_remaining=0
+        ),
+        _generation_batch=_GenerationBatch(),
+        _gen_tokens_counter=0,
+        _steps_counter=511,
+        completion_batch_size=1,
+        _stream=stream,
+    )
+
+
+def test_glm_adaptive_decode_periodic_clear_drains_generator_stream():
+    """The every-512-steps clear inside the patched decode loop must drain the
+    stream the decode step ran on first.
+
+    ``GenerationBatch.next()`` submits the step with mx.async_eval, so a bare
+    mx.clear_cache() can release Metal buffers an in-flight command buffer
+    still references (issue #300). ``self._stream`` is the stream that work
+    rode: BatchGenerator runs ``_next`` inside ``with mx.stream(self._stream)``
+    and oMLX constructs the generator with the per-engine stream, which
+    resolves to a different concrete mx.Stream than mlx-lm's module-level
+    generation_stream.
+    """
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.glm_moe_dsa import generate_patch as patch_mod
+
+    engine_stream = mx.new_thread_local_stream(mx.default_device())
+    bg = _decode_only_batch_generator(engine_stream)
+
+    streams: list = []
+    with (
+        _glm_generate_patch_installed() as gen,
+        patch.object(
+            patch_mod,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: streams.append(stream),
+        ),
+    ):
+        prompt_responses, generation_responses = gen.BatchGenerator._next(bg)
+
+    assert generation_responses == ["generation"]
+    assert prompt_responses == []
+    assert bg._steps_counter == 512
+    assert streams, "periodic decode clear did not drain any stream"
+    assert streams == [engine_stream], (
+        "periodic decode clear released Metal buffers without draining the "
+        f"generator's stream: {streams!r} != {engine_stream!r}"
+    )
+
+
+def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
+    """Off-cadence steps must not clear at all — the fix keeps the cadence the
+    memory-bounding commit chose, it only adds the drain."""
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.glm_moe_dsa import generate_patch as patch_mod
+
+    bg = _decode_only_batch_generator(mx.new_thread_local_stream(mx.default_device()))
+    bg._steps_counter = 0
+
+    streams: list = []
+    with (
+        _glm_generate_patch_installed() as gen,
+        patch.object(
+            patch_mod,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: streams.append(stream),
+        ),
+    ):
+        gen.BatchGenerator._next(bg)
+
+    assert bg._steps_counter == 1
+    assert streams == []

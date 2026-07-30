@@ -1149,6 +1149,14 @@ async def get_engine_for_model(
     return engine
 
 
+def _serving_model_id(
+    lease: _LLMEngineLease,
+    requested_model: str | None,
+) -> str | None:
+    """Return the exact pool model selected for an LLM request."""
+    return lease.model_id or resolve_model_id(requested_model) or requested_model
+
+
 async def get_embedding_engine(model: str) -> EmbeddingEngine:
     """
     Get embedding engine for the specified model.
@@ -1605,38 +1613,6 @@ def get_embedding_max_length(
         return request_max_length
 
     return get_max_context_window(model_id)
-
-
-def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
-    """
-    Scale token count for Anthropic API response if context scaling is enabled.
-
-    Adjusts reported token counts so that Claude Code's auto-compact
-    triggers at the correct timing when using models with smaller context
-    windows than the target (default 200k).
-
-    Formula: scaled = token_count * (target_context_size / actual_context_size)
-
-    Args:
-        token_count: Original token count to scale.
-        model_id: Model ID to get context window for.
-
-    Returns:
-        Scaled token count, or original if scaling not applicable.
-    """
-    global_settings = _server_state.global_settings
-    if global_settings is None:
-        return token_count
-
-    cc = global_settings.claude_code
-    if not cc.context_scaling_enabled:
-        return token_count
-
-    actual = get_max_context_window(model_id)
-    if not actual or actual >= cc.target_context_size:
-        return token_count
-
-    return int(token_count * cc.target_context_size / actual)
 
 
 def validate_context_window(
@@ -2801,8 +2777,10 @@ async def create_embeddings(
             raise HTTPException(status_code=400, detail=str(e))
 
         elapsed = time.perf_counter() - start_time
+        resolved_model = resolve_model_id(request.model) or request.model
         logger.info(
-            f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
+            f"Embedding: model={resolved_model}, "
+            f"{len(embedding_inputs)} inputs, {output.dimensions} dims, "
             f"{output.total_tokens} tokens, max_length={max_length}, "
             f"truncation={request.truncation} in {elapsed:.3f}s"
         )
@@ -2811,7 +2789,7 @@ async def create_embeddings(
             completion_tokens=0,
             cached_tokens=0,
             prefill_duration=elapsed,
-            model_id=resolve_model_id(request.model) or request.model,
+            model_id=resolved_model,
         )
 
         data = []
@@ -2926,8 +2904,9 @@ async def create_rerank(
         )
 
     elapsed = time.perf_counter() - start_time
+    resolved_model = resolve_model_id(request.model) or request.model
     logger.info(
-        f"Rerank: {len(documents_raw)} docs, "
+        f"Rerank: model={resolved_model}, {len(documents_raw)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
     get_server_metrics().record_request_complete(
@@ -2935,7 +2914,7 @@ async def create_rerank(
         completion_tokens=0,
         cached_tokens=0,
         prefill_duration=elapsed,
-        model_id=resolve_model_id(request.model) or request.model,
+        model_id=resolved_model,
     )
 
     # Format response - results sorted by score (descending). Strings wrap
@@ -2984,6 +2963,7 @@ async def create_completion(
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+        resolved_model = _serving_model_id(lease, request.model)
 
         # Handle single prompt or list of prompts
         prompts = (
@@ -3018,6 +2998,7 @@ async def create_completion(
                             request,
                             model_load_duration=model_load_duration,
                             prompt_token_ids=prompt_token_ids_by_prompt[0],
+                            resolved_model=resolved_model,
                         ),
                         http_request=http_request,
                         keepalive_chunk=_resolve_keepalive("openai_completion"),
@@ -3105,7 +3086,9 @@ async def create_completion(
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
             logger.info(
-                f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
+                f"Completion: model={resolved_model}, "
+                f"{total_completion_tokens} tokens in {elapsed:.2f}s "
+                f"({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
             prefill_duration = (
@@ -3120,7 +3103,7 @@ async def create_completion(
                 cached_tokens=total_cached_tokens,
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
-                model_id=resolve_model_id(request.model) or request.model,
+                model_id=resolved_model,
             )
 
             return CompletionResponse(
@@ -3210,8 +3193,8 @@ async def create_chat_completion(
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
 
-        # Resolve alias to real model ID for settings lookups
-        resolved_model = resolve_model_id(request.model) or request.model
+        # Use the exact model selected by the pool, including fallback.
+        resolved_model = _serving_model_id(lease, request.model)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -3564,7 +3547,8 @@ async def create_chat_completion(
                 is_diffusion=is_diffusion,
             )
             logger.info(
-                f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s "
+                f"Chat completion: model={resolved_model}, "
+                f"{output.completion_tokens} tokens in {elapsed:.2f}s "
                 f"({speed_text}), prompt: {output.prompt_tokens}, "
                 f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
                 f"request_max_tokens={request.max_tokens}"
@@ -4097,6 +4081,7 @@ async def stream_completion(
     request: CompletionRequest,
     model_load_duration: float = 0.0,
     prompt_token_ids: list[int] | None = None,
+    resolved_model: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
@@ -4202,13 +4187,16 @@ async def stream_completion(
             prefill_duration=ttft,
             generation_duration=gen_duration,
         )
+        serving_model = (
+            resolved_model or resolve_model_id(request.model) or request.model
+        )
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
-            model_id=resolve_model_id(request.model) or request.model,
+            model_id=serving_model,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -4220,7 +4208,8 @@ async def stream_completion(
             is_diffusion=is_diffusion,
         )
         logger.info(
-            f"Completion: {last_output.completion_tokens} tokens in "
+            f"Completion: model={serving_model}, "
+            f"{last_output.completion_tokens} tokens in "
             f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}"
         )
@@ -4581,6 +4570,41 @@ async def stream_chat_completion(
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
+    # Surface an unterminated paired envelope only when final parsing could not
+    # recover a structured tool call. The candidate begins at the opening marker,
+    # so prose already streamed before it is never duplicated.
+    recovered_thinking = (
+        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    )
+    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if not tool_calls:
+        if recovered_thinking:
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            reasoning_content=recovered_thinking
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        if recovered_content:
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(content=recovered_content),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
     # Reverse Gemma 4 parameter renaming for streaming path
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
         for tc in tool_calls:
@@ -4670,7 +4694,8 @@ async def stream_chat_completion(
             is_diffusion=is_diffusion,
         )
         logger.info(
-            f"Chat completion: {last_output.completion_tokens} tokens in "
+            f"Chat completion: model={resolved_model or request.model}, "
+            f"{last_output.completion_tokens} tokens in "
             f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
@@ -4817,11 +4842,7 @@ async def stream_anthropic_messages(
     yield create_message_start_event(
         message_id=message_id,
         model=request.model,
-        input_tokens=(
-            0
-            if uses_cache_control
-            else scale_anthropic_tokens(estimated_input_tokens, request.model)
-        ),
+        input_tokens=(0 if uses_cache_control else estimated_input_tokens),
     )
 
     # 3. Stream content with thinking/content separation
@@ -4986,6 +5007,36 @@ async def stream_anthropic_messages(
         )
         tool_calls = extraction.tool_calls
 
+    recovered_thinking = (
+        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    )
+    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if not tool_calls:
+        if recovered_thinking:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
+            if not thinking_block_started:
+                yield create_content_block_start_event(
+                    index=block_index, block_type="thinking"
+                )
+                thinking_block_started = True
+            yield create_thinking_delta_event(
+                index=block_index, thinking=recovered_thinking
+            )
+        if recovered_content:
+            if thinking_block_started and not text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                thinking_block_started = False
+            if not text_block_started:
+                yield create_content_block_start_event(
+                    index=block_index, block_type="text"
+                )
+                text_block_started = True
+            yield create_text_delta_event(index=block_index, text=recovered_content)
+
     # 4. Close open blocks
     if thinking_block_started and not text_block_started:
         # Only thinking was emitted. Keep block_index on the just-closed
@@ -5043,15 +5094,9 @@ async def stream_anthropic_messages(
         output.finish_reason if output else "stop", bool(tool_calls)
     )
     # Use actual token counts from the last output
-    actual_input_tokens = scale_anthropic_tokens(
-        last_output.prompt_tokens if last_output else 0, request.model
-    )
-    actual_output_tokens = scale_anthropic_tokens(
-        last_output.completion_tokens if last_output else 0, request.model
-    )
-    actual_cached_tokens = scale_anthropic_tokens(
-        last_output.cached_tokens if last_output else 0, request.model
-    )
+    actual_input_tokens = last_output.prompt_tokens if last_output else 0
+    actual_output_tokens = last_output.completion_tokens if last_output else 0
+    actual_cached_tokens = last_output.cached_tokens if last_output else 0
     yield create_message_delta_event(
         stop_reason=stop_reason,
         output_tokens=actual_output_tokens,
@@ -5069,13 +5114,22 @@ async def stream_anthropic_messages(
             gen_duration = total_duration
         else:
             gen_duration = end_time - (first_token_time or start_time)
+        serving_model = resolved_model or request.model
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=resolved_model or request.model,
+            model_id=serving_model,
+        )
+        tokens_per_sec = (
+            last_output.completion_tokens / total_duration if total_duration > 0 else 0
+        )
+        logger.info(
+            f"Anthropic message: model={serving_model}, "
+            f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s)"
         )
 
     # 7. Send message_stop
@@ -5123,8 +5177,8 @@ async def create_anthropic_message(
     try:
         engine = await get_engine_for_model(request.model, lease=lease)
 
-        # Resolve alias to real model ID for settings lookups
-        resolved_model = resolve_model_id(request.model) or request.model
+        # Use the exact model selected by the pool, including fallback.
+        resolved_model = _serving_model_id(lease, request.model)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5386,7 +5440,8 @@ async def create_anthropic_message(
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
             logger.info(
-                f"Anthropic message: {output.completion_tokens} tokens in {elapsed:.2f}s "
+                f"Anthropic message: model={resolved_model}, "
+                f"{output.completion_tokens} tokens in {elapsed:.2f}s "
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
@@ -5442,18 +5497,12 @@ async def create_anthropic_message(
             response = convert_internal_to_anthropic_response(
                 text=cleaned_text.strip() if cleaned_text else "",
                 model=request.model,
-                prompt_tokens=scale_anthropic_tokens(
-                    output.prompt_tokens, request.model
-                ),
-                completion_tokens=scale_anthropic_tokens(
-                    output.completion_tokens, request.model
-                ),
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
                 tool_calls=tool_calls,
                 thinking=cleaned_thinking if cleaned_thinking else None,
-                cached_tokens=scale_anthropic_tokens(
-                    output.cached_tokens, request.model
-                ),
+                cached_tokens=output.cached_tokens,
                 request_uses_cache_control=request_has_cache_control(request),
             )
 
@@ -5539,7 +5588,7 @@ async def count_anthropic_tokens(
         else:
             token_ids = prompt  # Already tokenized
 
-        input_tokens = scale_anthropic_tokens(len(token_ids), request.model)
+        input_tokens = len(token_ids)
         logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
         return TokenCountResponse(input_tokens=input_tokens)
@@ -5621,7 +5670,7 @@ async def create_response(
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
 
-        resolved_model = resolve_model_id(request.model) or request.model
+        resolved_model = _serving_model_id(lease, request.model)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,
@@ -5877,7 +5926,8 @@ async def create_response(
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
             logger.info(
-                f"Responses API: {output.completion_tokens} tokens in {elapsed:.2f}s "
+                f"Responses API: model={resolved_model}, "
+                f"{output.completion_tokens} tokens in {elapsed:.2f}s "
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
@@ -6417,6 +6467,32 @@ async def stream_responses_api(
         thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
+    recovered_thinking = (
+        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    )
+    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if not tool_calls:
+        for ev in _emit_reasoning_delta(recovered_thinking):
+            yield ev
+        if recovered_content:
+            if reasoning_opened and not reasoning_closed:
+                for ev in _close_reasoning():
+                    yield ev
+            for ev in _open_message():
+                yield ev
+            seq += 1
+            yield format_sse_event(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
+                    "output_index": msg_output_index,
+                    "content_index": 0,
+                    "delta": recovered_content,
+                    "sequence_number": seq,
+                },
+            )
+
     # Reverse Gemma 4 parameter renaming
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
         for tc in tool_calls:
@@ -6616,13 +6692,22 @@ async def stream_responses_api(
             gen_duration = total_duration
         else:
             gen_duration = end_time - (first_token_time or start_time)
+        serving_model = resolved_model or request.model
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=resolved_model or request.model,
+            model_id=serving_model,
+        )
+        tokens_per_sec = (
+            last_output.completion_tokens / total_duration if total_duration > 0 else 0
+        )
+        logger.info(
+            f"Responses API: model={serving_model}, "
+            f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s)"
         )
         reasoning_token_count = (
             len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0

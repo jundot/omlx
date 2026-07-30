@@ -386,7 +386,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     # for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind targets
     # but not connectable — fall back to localhost in that case.
     first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
-    connect_host = first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    connect_host = (
+        first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    )
 
     # Check if oMLX server is running
     base_url = f"http://{connect_host}:{port}"
@@ -473,10 +475,45 @@ def launch_command(args, extra_args: list[str] | None = None):
     # If the model was chosen interactively (no --model and no explicit tier flags),
     # use the picked model for all tiers instead of letting settings-based tier
     # models override the user's selection.
-    if args.model is None and not (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+    if args.model is None and not (
+        cli_opus_model or cli_sonnet_model or cli_haiku_model
+    ):
         opus_model = None
         sonnet_model = None
         haiku_model = None
+
+    # Enforce Claude Code's model requirements after all interactive,
+    # automatic, and explicit model paths have resolved. The picker also marks
+    # disabled models, but this central check prevents --model and tier flags
+    # from bypassing the same restriction.
+    if tool_name == "claude":
+        from .integrations.claude import claude_code_model_disabled_reason
+
+        models_to_validate = [
+            ("", model),
+            ("Opus tier ", opus_model),
+            ("Sonnet tier ", sonnet_model),
+            ("Haiku tier ", haiku_model),
+        ]
+        validated_models: set[str] = set()
+        for role, model_id in models_to_validate:
+            if not model_id or model_id in validated_models:
+                continue
+            validated_models.add(model_id)
+            disabled_reason = claude_code_model_disabled_reason(
+                {"id": model_id, **models_status_map.get(model_id, {})}
+            )
+            if disabled_reason:
+                print(
+                    f"Cannot launch {integration.display_name} with "
+                    f"{role}model '{model_id}'."
+                )
+                print(disabled_reason)
+                print(
+                    "Choose a model with at least 48K context or increase its "
+                    "configured max_context_window."
+                )
+                sys.exit(1)
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})

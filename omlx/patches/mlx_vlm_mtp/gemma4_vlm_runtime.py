@@ -76,6 +76,13 @@ def apply() -> bool:
 
     _patch_vlm_model_adapter()
 
+    # Small-L verify forwards otherwise pay gemma4's unfused multi-token
+    # attention (head_dim 256/512 has no fused SDPA above L=1); the
+    # decomposed route keeps shallow-depth speculation profitable.
+    from ..gemma4_verify_attention import apply as apply_verify_attention
+
+    apply_verify_attention()
+
     _APPLIED = True
     logger.info("mlx-vlm Gemma 4 runtime MTP patch applied")
     return True

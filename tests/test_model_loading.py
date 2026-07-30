@@ -409,6 +409,39 @@ class TestVlmMtpPreLoadDispatch:
         attach_mock.assert_called_once_with(True)
         assert calls == ["attach=True", "sanitize", "runtime"]
 
+    def test_gemma4_default_depth_is_eight(self, tmp_path, monkeypatch):
+        # The fused multi-row verify kernel keeps gemma4 verify forwards
+        # near-flat in L, so the default depth ceiling is 8 there; the
+        # adaptive controller still settles shallow when accept is low.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(8)
+
+    def test_gemma4_explicit_depth_overrides_default(self, tmp_path, monkeypatch):
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_num_draft_tokens=2)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(2)
+
     def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
         # Plain gemma4 VLMs (no merged assistant) must stay untouched by
         # the MTP dispatch — no declared heads, no runtime patch.

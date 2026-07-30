@@ -5415,6 +5415,19 @@ class TestTextOnlyMultimodalMetadata:
 
         assert (out / "preprocessor_config.json").exists()
 
+    @pytest.mark.parametrize("body", ["[]", "null", '"processor"'])
+    def test_text_only_keeps_non_mapping_processor_config(self, tmp_path, body):
+        """Valid JSON with a non-object root must be preserved, not crash."""
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path, **{"processor_config.json": body})
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert (out / "processor_config.json").exists()
+
     def test_processor_configs_stay_out_of_the_base_pattern_list(self):
         """The chat-template guard only runs for the multimodal patterns.
 
@@ -5426,3 +5439,193 @@ class TestTextOnlyMultimodalMetadata:
         assert not set(_SIDECAR_PATTERNS) & set(_MULTIMODAL_SIDECAR_PATTERNS)
         assert "preprocessor_config.json" in _MULTIMODAL_SIDECAR_PATTERNS
         assert "processor_config.json" in _MULTIMODAL_SIDECAR_PATTERNS
+
+
+class TestRecorderRefusesUnreplayableOps:
+    """Discovery must refuse what replay cannot reproduce.
+
+    ``_DiscoveredPlan`` replays a list of single-source unary ops. An op
+    against a second live tensor cannot be expressed, and recording only one
+    side would silently drop the other: a block-scale multiply would vanish
+    and the plan would ship unscaled weights. The recorder therefore poisons
+    the result so discovery raises and the caller falls back to eager
+    sanitize.
+    """
+
+    class _Index:
+        def __init__(self, logical):
+            self._logical = logical
+            self._index = {}
+
+        def logical_metadata(self):
+            return self._logical
+
+    def _discover(self, sanitize_fn, logical):
+        from omlx.oq import _discover_sanitize_plan
+
+        return _discover_sanitize_plan(sanitize_fn, self._Index(logical))
+
+    def test_scale_multiply_is_not_laundered_by_later_unary_ops(self):
+        """The regression that motivated the guard.
+
+        Block-aligned shapes keep every reshape consistent, so nothing fails
+        on shape grounds and the trailing ``astype`` used to make the plan
+        look replayable while the multiply had silently disappeared.
+        """
+        logical = {"w": ((256, 128), "BF16"), "s": ((2, 1), "F32")}
+
+        def sanitize(weights):
+            w = weights["w"].reshape(2, 128, 128)
+            w = w * weights["s"][:, None, None]
+            return {"out": w.reshape(256, 128).astype(mx.bfloat16)}
+
+        with pytest.raises(
+            ValueError, match="non-replayable transform|single-source transform"
+        ):
+            self._discover(sanitize, logical)
+
+    def test_scale_multiply_is_not_laundered_by_split(self):
+        """A split must not turn a poisoned multi-source result replayable."""
+        logical = {"w": ((256, 128), "BF16"), "s": ((256, 1), "F32")}
+
+        def sanitize(weights):
+            scaled = weights["w"] * weights["s"]
+            return {"out": mx.split(scaled, 2, axis=0)[0]}
+
+        with pytest.raises(
+            ValueError, match="non-replayable transform|single-source transform"
+        ):
+            self._discover(sanitize, logical)
+
+    def test_scalar_multiply_still_records(self):
+        """Only a second tracked tensor poisons; scalars are unaffected."""
+        from omlx.oq import _TrackedTensor
+
+        tracked = _TrackedTensor((8, 4), "BF16", sources=["w"])
+        assert (tracked * 2.0).transform != "nested_unreplayable"
+        assert (tracked * tracked).transform == "nested_unreplayable"
+
+    def test_binary_op_records_both_operands_as_sources(self):
+        from omlx.oq import _TrackedTensor
+
+        left = _TrackedTensor((8, 4), "BF16", sources=["w"])
+        right = _TrackedTensor((8, 1), "F32", sources=["s"])
+
+        assert set((left * right).sources) == {"w", "s"}
+
+    @pytest.mark.parametrize("op", ["from_fp8", "pad"])
+    def test_ops_that_reset_the_recipe_poison_instead(self, op):
+        """These built a fresh tensor with an empty recipe, discarding any
+        lineage recorded before them."""
+        from omlx.oq import _TrackedTensor
+
+        tracked = _TrackedTensor((256, 128), "BF16", sources=["w"])
+        reshaped = tracked.reshape(2, 128, 128)
+        assert reshaped.recipe, "precondition: something was recorded"
+
+        if op == "from_fp8":
+            result = reshaped._unreplayable(dtype="BF16")
+        else:
+            result = reshaped._unreplayable(shape=(2, 130, 128))
+
+        assert result.transform == "nested_unreplayable"
+        assert not result.recipe
+
+    def test_poison_survives_a_following_replayable_op(self):
+        from omlx.oq import _TrackedTensor
+
+        tracked = _TrackedTensor((8, 4), "BF16", sources=["w"])
+        poisoned = tracked * _TrackedTensor((8, 1), "F32", sources=["s"])
+
+        assert poisoned.reshape(4, 8).transform == "nested_unreplayable"
+        assert poisoned.astype(mx.bfloat16).transform == "nested_unreplayable"
+
+
+class TestCalibrationFootprint:
+    """Calibration materializes the dequantized view, so the proxy budget
+    must size on that rather than on the checkpoint's file bytes."""
+
+    class _FakeIndex:
+        def __init__(self, logical):
+            self._logical = logical
+
+        def logical_metadata(self):
+            return self._logical
+
+    def test_fp8_weights_are_counted_as_bf16(self):
+        from omlx.oq import _logical_footprint_bytes
+
+        # An fp8 weight occupies one byte on disk; the logical view reports
+        # it as BF16, which is what the calibration forward allocates.
+        index = self._FakeIndex({"w": ((1000, 1000), "BF16")})
+        assert _logical_footprint_bytes(index) == 1000 * 1000 * 2
+
+    def test_packed_fp4_expands_fourfold_not_twofold(self):
+        """The case a flat 2x multiplier gets wrong.
+
+        DeepSeek-V4 style experts store two fp4 values per byte and declare
+        ``quant_method: "fp8"``. The logical view already reports the
+        unpacked column count, so one stored byte becomes two bf16 values,
+        i.e. 4 bytes -- double what a per-format constant would predict.
+        """
+        from omlx.oq import _logical_footprint_bytes
+
+        on_disk_bytes = 512 * 256
+        index = self._FakeIndex({"w": ((512, 256 * 2), "BF16")})
+        assert _logical_footprint_bytes(index) == on_disk_bytes * 4
+
+    def test_unquantized_source_is_unchanged(self):
+        from omlx.oq import _logical_footprint_bytes
+
+        index = self._FakeIndex({"w": ((10, 10), "BF16"), "b": ((10,), "F32")})
+        assert _logical_footprint_bytes(index) == 10 * 10 * 2 + 10 * 4
+
+    def test_index_without_logical_view_contributes_nothing(self):
+        from omlx.oq import _logical_footprint_bytes
+
+        assert _logical_footprint_bytes(object()) == 0
+
+    def test_dequantized_footprint_flips_requires_proxy(self, monkeypatch):
+        import omlx.oq as oq
+
+        # Fixed capacity 400 -> model_limit = int(0.75 * 400) = 300.
+        monkeypatch.setattr(oq, "_system_available_memory_bytes", lambda: 400)
+        monkeypatch.setattr(oq, "_metal_available_memory_bytes", lambda: 400)
+
+        on_disk = 200  # < 300 -> sizing on file bytes would skip the proxy
+        assert oq._calibration_memory_budget(on_disk)["requires_proxy"] is False
+
+        # Same tensors, reported at their dequantized size.
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+        footprint = max(on_disk, oq._logical_footprint_bytes(index))
+        assert footprint == 400  # over the 300 limit
+        assert oq._calibration_memory_budget(footprint)["requires_proxy"] is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"quantization_config": {"quant_method": "mxfp8"}},
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+        ],
+        ids=["minimax_mxfp8", "deepseek_v4_fp4"],
+    )
+    def test_quantized_source_calibration_keeps_packed_footprint(self, config):
+        from omlx.oq import _calibration_footprint_bytes
+
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+
+        assert _calibration_footprint_bytes(index, 100, config) == 100
+
+    def test_native_fp8_calibration_uses_dequantized_footprint(self):
+        from omlx.oq import _calibration_footprint_bytes
+
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+        config = {
+            "model_type": "mimo_v2",
+            "quantization_config": {"quant_method": "fp8"},
+        }
+
+        assert _calibration_footprint_bytes(index, 100, config) == 400

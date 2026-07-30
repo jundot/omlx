@@ -18,7 +18,7 @@ import tempfile
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 import numpy as np
 
@@ -125,6 +125,25 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
             "DeepSeek V4 fp16 oQ can collapse to repeated BOS tokens during "
             "generation; use dtype='bfloat16' instead."
         )
+
+
+def _is_vlm_load(config: dict) -> bool:
+    """VLM routing predicate for oQ's model-load helpers.
+
+    Mirrors the VLM decision in :func:`_build_model_sanitizer`, but for the
+    sensitivity / imatrix / proxy load paths: route a checkpoint through
+    mlx-vlm only when it carries a vision sub-config *and* its model_type is
+    not one mlx-lm serves text-only (e.g. ``mimo_v2``). Without the text-only
+    exclusion these paths send a text-only-supported multimodal base -- which
+    still ships a ``vision_config`` -- to mlx-vlm, where ``get_model_and_args``
+    cannot resolve the model_type and falls through to the
+    ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
+    """
+    model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    return (
+        _has_vision_subconfig(config)
+        and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    )
 
 
 def _uses_quantized_source_sensitivity(config: dict) -> bool:
@@ -1348,6 +1367,8 @@ class _TrackedTensor:
         self.expr = expr
 
     def _clone(self, shape=None, dtype=None, transform=None):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape, dtype=dtype)
         new_transform = transform if transform is not None else self.transform
         return _TrackedTensor(
             shape if shape is not None else self.shape,
@@ -1358,24 +1379,53 @@ class _TrackedTensor:
             expr=self.expr if new_transform == self.transform else None,
         )
 
-    # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
+    def _unreplayable(self, shape=None, dtype=None, extra_sources=()):
+        """A tensor whose lineage the replay engine cannot reproduce.
+
+        Sticky by construction: it carries no recipe and no expr, and
+        :meth:`_clone` / :meth:`_with_recipe` funnel back here, so a later
+        replayable op cannot launder the plan into looking sound. Discovery
+        then rejects it and the caller falls back to eager sanitize.
+        """
+        sources = list(self.sources)
+        sources.extend(s for s in extra_sources if s not in sources)
+        return _TrackedTensor(
+            shape if shape is not None else self.shape,
+            dtype if dtype is not None else self.dtype,
+            sources,
+            "nested_unreplayable",
+        )
+
+    def _binary(self, other, transform):
+        """Record an elementwise op against ``other``.
+
+        When ``other`` is another tracked tensor the result depends on two
+        live sources, which the replay engine cannot express: it applies a
+        list of single-source unary ops. Recording only this side would
+        silently drop the operand -- a scale multiply would vanish and the
+        plan would ship unscaled weights -- so poison instead.
+        """
+        if isinstance(other, _TrackedTensor):
+            return self._unreplayable(extra_sources=other.sources)
+        return self._clone(transform=transform)
+
     def __add__(self, other):
-        return self._clone(transform="add")
+        return self._binary(other, "add")
 
     def __radd__(self, other):
         return self.__add__(other)
 
     def __sub__(self, other):
-        return self._clone(transform="sub")
+        return self._binary(other, "sub")
 
     def __mul__(self, other):
-        return self._clone(transform="mul")
+        return self._binary(other, "mul")
 
     def __rmul__(self, other):
         return self.__mul__(other)
 
     def __truediv__(self, other):
-        return self._clone(transform="div")
+        return self._binary(other, "div")
 
     @staticmethod
     def _slice_length(dim, sl):
@@ -1417,6 +1467,8 @@ class _TrackedTensor:
         return tuple(expanded)
 
     def _with_recipe(self, shape, transform, op, axis=None):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape)
         expr = self.as_expr()
         if expr is not None:
             expr = self._wrap_expr_op(expr, op)
@@ -1580,6 +1632,8 @@ class _TrackedTensor:
         if unknown_idx >= 0 and known_prod > 0:
             resolved[unknown_idx] = total // known_prod
         shape = tuple(resolved)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape)
         return _TrackedTensor(
             shape,
             self.dtype,
@@ -1589,6 +1643,8 @@ class _TrackedTensor:
         )
 
     def astype(self, dtype):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(dtype=dtype)
         return _TrackedTensor(
             self.shape,
             dtype,
@@ -1603,6 +1659,8 @@ class _TrackedTensor:
         dims = list(range(self.ndim))
         dims.insert(dst_ax, dims.pop(src_ax))
         new_shape = tuple(self.shape[d] for d in dims)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=new_shape)
         return _TrackedTensor(
             new_shape,
             self.dtype,
@@ -1620,6 +1678,8 @@ class _TrackedTensor:
             axes_list = list(axes)
         axes_list = [a % self.ndim if a < 0 else a for a in axes_list]
         new_shape = tuple(self.shape[a] for a in axes_list)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=new_shape)
         return _TrackedTensor(
             new_shape,
             self.dtype,
@@ -1841,6 +1901,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 for i in range(n):
                     sh = list(tensor.shape)
                     sh[axis] = sz
+                    if tensor.transform == "nested_unreplayable":
+                        parts.append(tensor._unreplayable(shape=sh))
+                        continue
                     parts.append(
                         _TrackedTensor(
                             sh,
@@ -1858,6 +1921,10 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             for i, idx in enumerate(idxs):
                 sh = list(tensor.shape)
                 sh[axis] = idx - prev
+                if tensor.transform == "nested_unreplayable":
+                    parts.append(tensor._unreplayable(shape=sh))
+                    prev = idx
+                    continue
                 parts.append(
                     _TrackedTensor(
                         sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis
@@ -1913,9 +1980,10 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
-            return _TrackedTensor(
-                x.shape, dtype or x.dtype, list(x.sources), "from_fp8"
-            )
+            # No replay op decodes fp8, and constructing a fresh tracked
+            # tensor here would reset the accumulated recipe, so anything
+            # recorded before this point would silently vanish.
+            return x._unreplayable(dtype=dtype or x.dtype)
         return _orig["from_fp8"](x, dtype=dtype, **kw) if _orig["from_fp8"] else x
 
     def _fake_pad(x, pad_width, **kw):
@@ -1931,7 +1999,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                     new_shape.append(d + lo + hi)
                 else:
                     new_shape.append(d)
-            return _TrackedTensor(new_shape, x.dtype, list(x.sources), "pad")
+            # Same reasoning as _fake_from_fp8: no replay op pads, and a
+            # fresh tensor here would drop the recipe recorded so far.
+            return x._unreplayable(shape=new_shape)
         return _orig["pad"](x, pad_width, **kw) if _orig["pad"] else x
 
     if _orig["from_fp8"] is not None:
@@ -1979,6 +2049,11 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "axis": v.axis,
                 "recipe": list(v.recipe),
             }
+            if t not in ("stack", "concatenate", "expr") and len(v.sources) != 1:
+                raise ValueError(
+                    f"single-source transform {t!r} has {len(v.sources)} sources "
+                    f"for {k!r} — falling back to eager sanitize"
+                )
             if v.transform == "expr":
                 if v.expr is None:
                     raise ValueError(
@@ -2152,6 +2227,9 @@ class _DiscoveredPlan:
 
     def _materialize_source(self, src_key):
         """Load a single source tensor from the lazy index."""
+        virtual = getattr(self._lazy, "_virtual", None)
+        if virtual and src_key in virtual:
+            return self._lazy.materialize_virtual(src_key)
         if hasattr(self._lazy, "_fp8_pairs") and src_key in self._lazy._fp8_pairs:
             return self._lazy._dequant_one(src_key)
         meta = self._lazy._index.get(src_key)
@@ -2501,6 +2579,7 @@ def estimate_bpw_and_size(
         allow_mxfp8_scale_inv_passthrough=(
             _uses_minimax_mxfp8_scale_inv_source(config)
         ),
+        config=config,
     )
     logical = idx.logical_metadata()
 
@@ -3310,7 +3389,10 @@ def _holds_chat_template(path: Path) -> bool:
     """
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f).get("chat_template") is not None
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return True
+        return data.get("chat_template") is not None
     except (OSError, ValueError):
         return True
 
@@ -3492,6 +3574,15 @@ _QUANTIZE_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 4)
 _LOAD_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 2)
 
 
+class _VirtualTensor(NamedTuple):
+    """A logical tensor produced on demand from hidden on-disk sources."""
+
+    shape: tuple
+    dtype: str
+    materialize: Callable
+    hides: tuple
+
+
 class _LazyTensorIndex:
     _DTYPE_BYTES = {
         "BF16": 2,
@@ -3517,6 +3608,7 @@ class _LazyTensorIndex:
         weight_files,
         *,
         allow_mxfp8_scale_inv_passthrough: bool = False,
+        config: dict | None = None,
     ):
         self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
         self._index = {}
@@ -3539,7 +3631,79 @@ class _LazyTensorIndex:
         self._fp8_pairs = {}
         self._fp8_scale_keys = set()
         self._src_quant = {}
+        # Virtual tensors: logical keys computed on demand from one or more
+        # on-disk tensors, for layouts the model's sanitize would otherwise
+        # have to restructure (see patches/virtual_tensors.py). ``_hidden``
+        # holds the source keys they consume; those leave the logical view.
+        self._virtual: dict[str, _VirtualTensor] = {}
+        self._hidden = set()
+        # Eager replacements written back by a caller (e.g. an eager
+        # sanitize). Always present so the view methods need no guards.
+        self._overrides: dict = {}
         self._discover_fp8_pairs()
+        self._register_virtual_tensors(config)
+
+    def _register_virtual_tensors(self, config):
+        """Let model-specific registrars declare virtual tensors.
+
+        Deliberately not guarded: a registrar that recognises this checkpoint
+        but cannot make sense of its geometry must abort the run rather than
+        leave the original layout in place, which would quantize silently
+        wrong weights.
+        """
+        if not config:
+            return
+        from .patches.virtual_tensors import register_virtual_tensors
+
+        register_virtual_tensors(self, config)
+
+    def register_virtual(self, key, shape, dtype, materializer, *, hides=()):
+        """Declare ``key`` as produced on demand by ``materializer``.
+
+        ``shape``/``dtype`` describe the logical tensor as sanitize and the
+        quantization planner should see it (safetensors dtype spelling, e.g.
+        ``"BF16"``). ``hides`` lists the on-disk keys it is derived from; they
+        stay readable via :meth:`load_source` but disappear from the logical
+        view so sanitize never sees the pre-restructure layout.
+        """
+        self._virtual[key] = _VirtualTensor(
+            tuple(shape), dtype, materializer, tuple(hides)
+        )
+        self._hidden.update(hides)
+
+    def materialize_virtual(self, key):
+        """Produce a virtual tensor's value."""
+        return self._virtual[key].materialize()
+
+    def _forget_virtual(self, key) -> None:
+        """Drop a virtual tensor, and un-hide sources nothing else claims.
+
+        Removal has to undo the hiding too, or a deleted virtual key would
+        leave its sources permanently invisible: they would be readable via
+        :meth:`load_source` but absent from every enumeration.
+        """
+        entry = self._virtual.pop(key, None)
+        if entry is None:
+            return
+        still_hidden = set()
+        for other in self._virtual.values():
+            still_hidden.update(other.hides)
+        for src in entry.hides:
+            if src not in still_hidden:
+                self._hidden.discard(src)
+
+    def source_shape(self, key):
+        """On-disk shape of ``key``, or None when absent.
+
+        Reads the safetensors header only — visibility and pairing are
+        ignored, so registrars can inspect keys they are about to hide.
+        """
+        meta = self._index.get(key)
+        return None if meta is None else meta[4]
+
+    def load_source(self, key):
+        """Load an on-disk tensor verbatim, bypassing fp8 pairing."""
+        return self._load_raw(key)
 
     def _discover_fp8_pairs(self):
         seen = set()
@@ -3703,13 +3867,13 @@ class _LazyTensorIndex:
         return self._src_quant.get(key)
 
     def _is_visible(self, k):
-        return k not in self._fp8_scale_keys
+        return k not in self._fp8_scale_keys and k not in self._hidden
 
     def logical_metadata(self):
         """Metadata for plan discovery: FP8 weights report as BF16, scale keys hidden."""
         result = {}
         for k, meta in self._index.items():
-            if k in self._fp8_scale_keys:
+            if not self._is_visible(k):
                 continue
             shape, dtype = meta[4], meta[5]
             if k in self._fp8_pairs:
@@ -3719,39 +3883,50 @@ class _LazyTensorIndex:
                     # FP4-packed bytes: logical width is 2 values per byte.
                     shape = (shape[0], shape[1] * 2)
             result[k] = (shape, dtype)
+        for k, entry in self._virtual.items():
+            result[k] = (entry.shape, entry.dtype)
         return result
 
+    def __iter__(self):
+        """The logical key set: visible on-disk keys, then virtual, then
+        overrides, each name yielded once.
+
+        The single statement of that rule. ``keys``, ``__len__`` and
+        ``items`` all derive from it so a new logical-key source cannot be
+        added to some enumerations and forgotten in others.
+        """
+        seen = set()
+        for k in self._index:
+            if self._is_visible(k):
+                seen.add(k)
+                yield k
+        for k in self._virtual:
+            if k not in seen:
+                seen.add(k)
+                yield k
+        for k in self._overrides:
+            if k not in seen:
+                yield k
+
     def keys(self):
-        base = [k for k in self._index if self._is_visible(k)]
-        if hasattr(self, "_overrides"):
-            base.extend(self._overrides.keys())
-        return base
+        return list(self)
 
     def __len__(self):
-        n = sum(1 for k in self._index if self._is_visible(k))
-        if hasattr(self, "_overrides"):
-            n += len(self._overrides)
-        return n
+        return sum(1 for _ in self)
 
     def __contains__(self, k):
         if k in self._index and self._is_visible(k):
             return True
-        return hasattr(self, "_overrides") and k in self._overrides
-
-    def __iter__(self):
-        for k in self._index:
-            if self._is_visible(k):
-                yield k
-        if hasattr(self, "_overrides"):
-            for k in self._overrides:
-                if k not in self._index:
-                    yield k
+        return k in self._virtual or k in self._overrides
 
     def nbytes(self):
+        # Bytes we will actually read off disk. Hidden keys still count —
+        # they back virtual tensors and are read on demand — while scale
+        # keys stay excluded because they fold into their weight.
         return sum(
             e - s
             for k, (_, _, s, e, _, _) in self._index.items()
-            if self._is_visible(k)
+            if k not in self._fp8_scale_keys
         )
 
     def _load_raw(self, key):
@@ -3760,8 +3935,10 @@ class _LazyTensorIndex:
         return lt[:]
 
     def __getitem__(self, key):
-        if hasattr(self, "_overrides") and key in self._overrides:
+        if key in self._overrides:
             return self._overrides[key]
+        if key in self._virtual:
+            return self.materialize_virtual(key)
         if key not in self._index:
             raise KeyError(key)
         if key in self._fp8_pairs:
@@ -3769,14 +3946,11 @@ class _LazyTensorIndex:
         return self._load_raw(key)
 
     def items(self):
-        for k in list(self._index.keys()):
-            if not self._is_visible(k):
-                continue
+        # Snapshot the key set: consumers (eager sanitize) mutate while
+        # iterating, and materializing is what makes this worth streaming.
+        for k in list(self):
             yield k, self[k]
             mx.clear_cache()
-        if hasattr(self, "_overrides"):
-            for k, v in self._overrides.items():
-                yield k, v
 
     def get(self, key, default=None):
         if key in self:
@@ -3784,22 +3958,21 @@ class _LazyTensorIndex:
         return default
 
     def __setitem__(self, key, value):
-        if not hasattr(self, "_overrides"):
-            self._overrides = {}
         self._overrides[key] = value
         self._index.pop(key, None)
         self._fp8_pairs.pop(key, None)
         self._src_quant.pop(key, None)
+        self._forget_virtual(key)
 
     def __delitem__(self, key):
         if key in self._fp8_pairs:
             sk = self._fp8_pairs.pop(key)
             self._fp8_scale_keys.discard(sk)
             self._index.pop(sk, None)
+        self._forget_virtual(key)
         self._index.pop(key, None)
         self._src_quant.pop(key, None)
-        if hasattr(self, "_overrides"):
-            self._overrides.pop(key, None)
+        self._overrides.pop(key, None)
 
     def update(self, other):
         if hasattr(other, "items"):
@@ -3810,8 +3983,12 @@ class _LazyTensorIndex:
                 self[k] = v
 
     def pop(self, key, *default):
-        if hasattr(self, "_overrides") and key in self._overrides:
+        if key in self._overrides:
             return self._overrides.pop(key)
+        if key in self._virtual:
+            result = self.materialize_virtual(key)
+            self._forget_virtual(key)
+            return result
         if key not in self._index:
             if default:
                 return default[0]
@@ -3954,6 +4131,41 @@ def _tensor_shape_nbytes(shape, bytes_per_element: int) -> int:
     for dim in shape:
         n *= int(dim)
     return n * bytes_per_element
+
+
+def _logical_footprint_bytes(index) -> int:
+    """Bytes in the dequantized logical view exposed by ``index``.
+
+    The lazy index's logical view already reports every tensor at its
+    post-dequantization shape and dtype: native fp8 weights as bf16, packed
+    fp4 experts at two values per stored byte, virtual tensors at the shape
+    they will be produced in, and folded-away scale companions not at all.
+    This is the resident calibration footprint for sources whose model
+    sanitizer materializes that view. Sources calibrated as quantized modules
+    remain packed and are handled by :func:`_calibration_footprint_bytes`.
+    """
+    if not hasattr(index, "logical_metadata"):
+        return 0
+    total = 0
+    for shape, dtype in index.logical_metadata().values():
+        total += _tensor_shape_nbytes(
+            shape, _LazyTensorIndex._DTYPE_BYTES.get(dtype, 2)
+        )
+    return total
+
+
+def _calibration_footprint_bytes(index, storage_bytes: int, config: dict) -> int:
+    """Estimate resident model bytes for the selected calibration load path.
+
+    MiMo-style native FP8 sources are dequantized by model sanitize, so their
+    logical BF16 view determines admission. MiniMax MXFP8 and DeepSeek V4 FP4
+    sources take the quantized-source sensitivity path and remain packed in
+    quantized modules; pricing those as BF16 would force an unnecessary proxy.
+    """
+    storage_bytes = max(0, int(storage_bytes))
+    if _uses_quantized_source_sensitivity(config):
+        return storage_bytes
+    return max(storage_bytes, _logical_footprint_bytes(index))
 
 
 def _progress_total_bytes(all_weights, source: Path) -> int:
@@ -4645,6 +4857,7 @@ def quantize_oq_streaming(
         allow_mxfp8_scale_inv_passthrough=(
             _uses_minimax_mxfp8_scale_inv_source(config)
         ),
+        config=config,
     )
     if (
         preserve_mtp
@@ -4666,16 +4879,23 @@ def quantize_oq_streaming(
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
     from omlx.settings import get_system_memory as _get_system_memory
 
-    _model_bytes = _checkpoint_storage_bytes(weight_files)
+    # Size admission for the representation used by the calibration loader:
+    # dequantized logical weights for ordinary native-FP8 sources, or packed
+    # storage for sources measured through quantized modules.
+    _calibration_bytes = _calibration_footprint_bytes(
+        all_weights,
+        _checkpoint_storage_bytes(weight_files),
+        config,
+    )
     _system_ram = _get_system_memory()
     _calibration_budget = _calibration_memory_budget(
-        _model_bytes,
+        _calibration_bytes,
         fallback_system_bytes=_system_ram,
     )
     _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
     if _model_requires_proxy and static_sensitivity_map is None:
         logger.info(
-            f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+            f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
             f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
             f"capacity ({_format_size(int(_calibration_budget['capacity_bytes']))}; "
             f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
@@ -4702,7 +4922,7 @@ def quantize_oq_streaming(
         nonlocal _ram_safe_proxy_dir
         if _ram_safe_proxy_dir is None:
             logger.warning(
-                f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+                f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                 "full-model calibration limit. Building a uniform "
@@ -4860,7 +5080,7 @@ def quantize_oq_streaming(
             )
         elif _model_requires_proxy and auto_proxy_sensitivity:
             logger.warning(
-                f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+                f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                 "full-model calibration limit. Auto-building a uniform "
@@ -4955,7 +5175,8 @@ def quantize_oq_streaming(
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
                     f"failed ({e}) and the eager fallback is unsafe with "
-                    f"checkpoint size {_format_size(_model_bytes)} exceeding "
+                    f"calibration footprint {_format_size(_calibration_bytes)} "
+                    "exceeding "
                     "the "
                     f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                     "full-model calibration limit. Run on a machine with "
@@ -6504,7 +6725,7 @@ def _collect_imatrix(
         maybe_apply_pre_load_patches,
     )
 
-    is_vlm = _has_vision_subconfig(config)
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 
@@ -6819,10 +7040,11 @@ def _measure_sensitivity(
         maybe_apply_pre_load_patches,
     )
 
-    # Treat any model with a vision sub-config (vision_config / vit_config /
-    # mm_vision_tower) as a VLM for the MTP attach decision. The classifier
-    # in model_discovery._has_vision_subconfig owns the canonical predicate.
-    is_vlm = _has_vision_subconfig(config)
+    # Route the MTP attach / load decision via _is_vlm_load: a vision
+    # sub-config (vision_config / vit_config / mm_vision_tower) means VLM,
+    # except for model types mlx-lm serves text-only (e.g. mimo_v2), which
+    # ship a vision_config but must load through the patched mlx-lm class.
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
 
     # Reuse the centralised pre-load dispatch so every current and future
@@ -7002,7 +7224,7 @@ def _build_streaming_proxy_for_sensitivity(
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
-    all_weights = _LazyTensorIndex(weight_files)
+    all_weights = _LazyTensorIndex(weight_files, config=config)
     sanitize_fn = _build_model_sanitizer(config, text_only=False)
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     if sanitize_fn is not None:
@@ -7204,7 +7426,7 @@ def _measure_sensitivity_from_quantized_model(
     # load_model replacement for F8_E8M0 checkpoints, MTP sanitize, ...)
     # so the quantized source/proxy loads exactly as in production.
     # Idempotent; harmless for plain mlx-lm proxies.
-    is_vlm = _has_vision_subconfig(config)
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 

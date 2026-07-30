@@ -439,6 +439,13 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
+            elif model_type == "gemma4":
+                # The fused multi-row verify kernel keeps gemma4 global-layer
+                # attention near-flat in L, so depths 4..8 are genuinely
+                # competitive on predictable text (26B code hit 1.89x at d4+
+                # vs 1.53x capped at 3); the controller still settles shallow
+                # on low-accept content.
+                set_mtp_depth(8)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:

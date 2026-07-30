@@ -6,6 +6,7 @@ import json
 import sys
 
 import mlx.core as mx
+import pytest
 
 
 def _minimal_config(**overrides):
@@ -235,3 +236,107 @@ def test_oq_uses_mlx_lm_sanitizer_for_multimodal_mimo(monkeypatch):
 
     assert sanitize is not None
     assert sanitize({"visual.ignored": mx.ones((1,))}) == {}
+
+
+def _neutralize_sensitivity_deps(monkeypatch):
+    """Stub _measure_sensitivity's non-routing dependencies.
+
+    Leaves the ``is_vlm``-driven loader selection intact so a test can assert
+    which load path a config takes, without loading a real model or running
+    calibration.
+    """
+    import omlx.oq as oq
+    import omlx.utils.model_loading as ml
+
+    monkeypatch.setattr(ml, "_checkpoint_has_mtp_weights", lambda *_a, **_k: False)
+    monkeypatch.setattr(ml, "_has_mtp_heads", lambda *_a, **_k: False)
+    monkeypatch.setattr(ml, "maybe_apply_pre_load_patches", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        oq,
+        "_measure_sensitivity_from_model",
+        lambda *_a, **_k: {"model.layers.0": 1.0},
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"model_type": "qwen2_vl", "vision_config": {"hidden_size": 32}}, True),
+        ({"model_type": "mimo_v2", "vision_config": {"hidden_size": 32}}, False),
+        ({"model_type": "mimo-v2", "vision_config": {"hidden_size": 32}}, False),
+        ({"model_type": "llama"}, False),
+        ({"model_type": "mimo_v2"}, False),
+    ],
+    ids=[
+        "genuine_vlm_is_vlm",
+        "text_only_mimo_with_vision_is_not_vlm",
+        "dashed_model_type_normalizes",
+        "plain_llm_is_not_vlm",
+        "mimo_text_only_quant_is_not_vlm",
+    ],
+)
+def test_is_vlm_load_predicate(config, expected):
+    from omlx.oq import _is_vlm_load
+
+    assert _is_vlm_load(config) is expected
+
+
+def test_measure_sensitivity_routes_multimodal_mimo_to_mlx_lm(monkeypatch):
+    # Exception path: a text-only-served mimo base ships a vision_config but must
+    # load via mlx-lm, not fall through to the mlx-vlm drafter lookup.
+    # _measure_sensitivity wraps the load in try/except -> {}, so record the
+    # loader calls rather than raising (a raise would be swallowed).
+    import mlx_vlm.utils as vlm_utils
+
+    import omlx.utils.model_loading as ml
+    from omlx.oq import _measure_sensitivity
+
+    _neutralize_sensitivity_deps(monkeypatch)
+    vlm_calls, lm_calls = [], []
+    monkeypatch.setattr(
+        vlm_utils, "load_model", lambda *_a, **_k: vlm_calls.append(True) or object()
+    )
+    monkeypatch.setattr(
+        ml,
+        "lm_load_compat",
+        lambda *_a, **_k: lm_calls.append(True) or (object(), object()),
+    )
+
+    config = _minimal_config(
+        vision_config={"hidden_size": 32},
+        audio_config={"hidden_size": 16},
+    )
+    result = _measure_sensitivity("/unused/path", config, oq_level=4)
+
+    assert vlm_calls == []
+    assert lm_calls == [True]
+    assert result == {"model.layers.0": 1.0}
+
+
+def test_measure_sensitivity_routes_genuine_vlm_to_mlx_vlm(monkeypatch):
+    # Happy path: a real VLM (vision_config + non-text-only model_type) still
+    # loads through mlx-vlm.
+    import mlx_lm.tokenizer_utils as tok_utils
+    import mlx_vlm.utils as vlm_utils
+
+    import omlx.utils.model_loading as ml
+    from omlx.oq import _measure_sensitivity
+
+    _neutralize_sensitivity_deps(monkeypatch)
+    vlm_calls, lm_calls = [], []
+    monkeypatch.setattr(
+        vlm_utils, "load_model", lambda *_a, **_k: vlm_calls.append(True) or object()
+    )
+    monkeypatch.setattr(tok_utils, "load", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        ml,
+        "lm_load_compat",
+        lambda *_a, **_k: lm_calls.append(True) or (object(), object()),
+    )
+
+    config = {"model_type": "qwen2_vl", "vision_config": {"hidden_size": 32}}
+    result = _measure_sensitivity("/unused/path", config, oq_level=4)
+
+    assert vlm_calls == [True]
+    assert lm_calls == []
+    assert result == {"model.layers.0": 1.0}

@@ -193,6 +193,129 @@ def _find_tokenizer_json(
 
 
 @lru_cache(maxsize=128)
+def _is_misconverted_unlimited_ocr_tokenizer(tokenizer_file: str) -> bool:
+    """Detect Unlimited-OCR exports re-saved through LlamaTokenizer.
+
+    Some converted checkpoints retain Unlimited-OCR's byte-level BPE
+    vocabulary but replace its pre-tokenizer and decoder with Llama's
+    Metaspace/SentencePiece pipeline.  The resulting tokenizer emits literal
+    GPT-2 byte glyphs (``Ġ``, ``Ċ``) and mojibake for UTF-8 text.
+    """
+    tokenizer_path = Path(tokenizer_file)
+    config = _read_json_file(tokenizer_path.parent / "config.json")
+    if config is None:
+        return False
+    model_type = str(config.get("model_type") or "").lower().replace("_", "-")
+    if model_type != "unlimited-ocr":
+        return False
+
+    tokenizer_content = _read_json_file(tokenizer_path)
+    if tokenizer_content is None:
+        return False
+
+    pre_tokenizer = tokenizer_content.get("pre_tokenizer")
+    decoder = tokenizer_content.get("decoder")
+    model = tokenizer_content.get("model")
+    vocab = model.get("vocab") if isinstance(model, dict) else None
+    decoder_steps = decoder.get("decoders") if isinstance(decoder, dict) else None
+    replace_step = decoder_steps[0] if isinstance(decoder_steps, list) else None
+    return (
+        isinstance(pre_tokenizer, dict)
+        and pre_tokenizer.get("type") == "Metaspace"
+        and pre_tokenizer.get("replacement") == "▁"
+        and pre_tokenizer.get("split") is False
+        and isinstance(decoder, dict)
+        and decoder.get("type") == "Sequence"
+        and isinstance(decoder_steps, list)
+        and len(decoder_steps) >= 3
+        and isinstance(replace_step, dict)
+        and isinstance(decoder_steps[1], dict)
+        and isinstance(decoder_steps[2], dict)
+        and replace_step.get("type") == "Replace"
+        and replace_step.get("pattern") == {"String": "▁"}
+        and replace_step.get("content") == " "
+        and decoder_steps[1].get("type") == "ByteFallback"
+        and decoder_steps[2].get("type") == "Fuse"
+        and isinstance(model, dict)
+        and model.get("type") == "BPE"
+        and model.get("fuse_unk") is True
+        and model.get("byte_fallback") is True
+        and isinstance(vocab, dict)
+        and "Ġ" in vocab
+        and "Ċ" in vocab
+    )
+
+
+def _tokenizer_backend(tokenizer: Any) -> Any | None:
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is not None:
+        return backend
+
+    inner = getattr(tokenizer, "_tokenizer", None)
+    if inner is None:
+        return None
+    return getattr(inner, "backend_tokenizer", inner)
+
+
+def repair_misconverted_unlimited_ocr_tokenizer(
+    tokenizer: Any,
+    model_path: str | Path | None = None,
+) -> bool:
+    """Restore Unlimited-OCR's byte-level tokenizer pipeline in memory.
+
+    Returns ``True`` only when the known misconverted checkpoint signature was
+    detected and repaired.  Canonical Unlimited-OCR checkpoints and unrelated
+    tokenizer families are left untouched.
+    """
+    tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
+    if tokenizer_file is None or not _is_misconverted_unlimited_ocr_tokenizer(
+        str(tokenizer_file)
+    ):
+        return False
+
+    backend = _tokenizer_backend(tokenizer)
+    if backend is None:
+        raise RuntimeError(
+            "Cannot repair the misconverted Unlimited-OCR tokenizer: "
+            "no tokenizers backend is available."
+        )
+
+    from tokenizers import Regex, decoders, normalizers, pre_tokenizers
+
+    # Match baidu/Unlimited-OCR's canonical tokenizer.json exactly.  The
+    # converted model keeps the original vocab and merges; only these runtime
+    # pipeline components and BPE flags were rewritten by LlamaTokenizer.
+    backend.model.fuse_unk = False
+    backend.model.byte_fallback = False
+    backend.normalizer = normalizers.Sequence([])
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(
+                Regex(r"\p{N}{1,3}"), behavior="isolated", invert=False
+            ),
+            pre_tokenizers.Split(
+                Regex(r"[一-龥぀-ゟ゠-ヿ]+"),
+                behavior="isolated",
+                invert=False,
+            ),
+            pre_tokenizers.Split(
+                Regex(
+                    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+                    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+                    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+"
+                    r"|\s+(?!\S)|\s+"
+                ),
+                behavior="isolated",
+                invert=False,
+            ),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    backend.decoder = decoders.ByteLevel()
+    return True
+
+
+@lru_cache(maxsize=128)
 def _detokenizer_factory_from_tokenizer_json(
     tokenizer_file: str,
 ) -> Callable[[Any], Any] | None:
@@ -309,6 +432,22 @@ def create_streaming_detokenizer(
     raw VLM/DFlash tokenizers may not.  In that case, mirror mlx-lm's
     tokenizer.json decoder detection before falling back to the naive decoder.
     """
+    tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
+    if tokenizer_file is not None and _is_misconverted_unlimited_ocr_tokenizer(
+        str(tokenizer_file)
+    ):
+        # The file incorrectly declares an SPM decoder even though its vocab
+        # contains byte-level BPE tokens.  Always create a fresh request-local
+        # BPE detokenizer so concurrent streams cannot share mutable state.
+        try:
+            from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+            return BPEStreamingDetokenizer(tokenizer)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to create a byte-level Unlimited-OCR detokenizer."
+            ) from exc
+
     has_existing_attr = True
     try:
         detokenizer = tokenizer.detokenizer
@@ -322,7 +461,6 @@ def create_streaming_detokenizer(
 
     if detokenizer is not None:
         if _is_unsafe_mlx_vlm_bpe_detokenizer(detokenizer):
-            tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
             decoder_aware_detokenizer = _create_decoder_aware_detokenizer(
                 tokenizer,
                 tokenizer_file,
@@ -335,7 +473,6 @@ def create_streaming_detokenizer(
             )
         return detokenizer
 
-    tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
     decoder_aware_detokenizer = _create_decoder_aware_detokenizer(
         tokenizer,
         tokenizer_file,

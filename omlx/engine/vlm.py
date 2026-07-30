@@ -1524,6 +1524,30 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        if self.model_type == "unlimited-ocr":
+            from ..utils.tokenizer import (
+                create_streaming_detokenizer,
+                repair_misconverted_unlimited_ocr_tokenizer,
+            )
+
+            tokenizer_obj = getattr(self._processor, "tokenizer", self._processor)
+            if repair_misconverted_unlimited_ocr_tokenizer(
+                tokenizer_obj,
+                model_path=self._model_name,
+            ):
+                # mlx-vlm also keeps a processor-level detokenizer for its own
+                # generation helpers.  Replace that stale SPM instance even
+                # though oMLX's scheduler creates fresh request-local copies.
+                self._processor.detokenizer = create_streaming_detokenizer(
+                    tokenizer_obj,
+                    model_path=self._model_name,
+                )
+                logger.warning(
+                    "Repaired misconverted Unlimited-OCR tokenizer metadata "
+                    "in memory for %s",
+                    self._model_name,
+                )
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state

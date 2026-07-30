@@ -553,6 +553,22 @@ class TestResponsesEndpoint:
         usage = completed["response"]["usage"]
         assert usage["output_tokens_details"]["reasoning_tokens"] == 3
 
+    def test_response_stream_summary_log_names_model(self, client, caplog):
+        with caplog.at_level("INFO", logger="omlx.server"):
+            response = client.post(
+                "/v1/responses",
+                json={"model": "test-model", "input": "Hello", "stream": True},
+            )
+
+        assert response.status_code == 200
+        summaries = [
+            record.message
+            for record in caplog.records
+            if "Responses API: " in record.message
+        ]
+        assert summaries, "no Responses API summary was logged"
+        assert "model=test-model" in summaries[-1]
+
     def test_response_endpoint_recovers_tool_call_from_thinking(self, tmp_path):
         from omlx.server import app, _server_state
 
@@ -968,6 +984,76 @@ class TestChatCompletionEndpoint:
         assert mock_engine_pool.get_engine_calls[-1]["_lease"] is True
         assert mock_engine_pool.release_calls == ["test-model"]
 
+    def test_chat_completion_summary_log_names_the_model(self, client, caplog):
+        """The per-request summary must identify the serving model.
+
+        With several models loaded, interleaved summaries are otherwise
+        unattributable.
+        """
+        with caplog.at_level("INFO", logger="omlx.server"):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
+        assert response.status_code == 200
+        summaries = [
+            r.message for r in caplog.records if "Chat completion: " in r.message
+        ]
+        assert summaries, "no chat completion summary was logged"
+        assert "model=test-model" in summaries[-1]
+
+    def test_chat_completion_summary_uses_fallback_model(
+        self,
+        client,
+        caplog,
+        mock_engine_pool,
+        monkeypatch,
+    ):
+        from omlx.exceptions import ModelNotFoundError
+        from omlx.server import _server_state
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings()
+        settings.model.model_fallback = True
+        monkeypatch.setattr(_server_state, "global_settings", settings)
+
+        original_get_engine = mock_engine_pool.get_engine
+
+        async def get_engine(model_id, _lease=False, runtime_settings=None):
+            if model_id == "missing-model":
+                raise ModelNotFoundError(model_id, ["test-model"])
+            return await original_get_engine(
+                model_id,
+                _lease=_lease,
+                runtime_settings=runtime_settings,
+            )
+
+        monkeypatch.setattr(mock_engine_pool, "get_engine", get_engine)
+
+        with caplog.at_level("INFO", logger="omlx.server"):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "missing-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
+        assert response.status_code == 200
+        summaries = [
+            record.message
+            for record in caplog.records
+            if "Chat completion: " in record.message
+        ]
+        assert summaries, "no chat completion summary was logged"
+        assert "model=test-model" in summaries[-1]
+        assert "model=missing-model" not in summaries[-1]
+        assert mock_engine_pool.release_calls == ["test-model"]
+
     def test_chat_completion_basic(self, client):
         """Test basic chat completion request."""
         response = client.post(
@@ -1238,6 +1324,27 @@ class TestAnthropicMessagesEndpoint:
         data = response.json()
         assert data["type"] == "message"
         assert data["role"] == "assistant"
+
+    def test_anthropic_stream_summary_log_names_model(self, client, caplog):
+        with caplog.at_level("INFO", logger="omlx.server"):
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "test-model",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 200
+        summaries = [
+            record.message
+            for record in caplog.records
+            if "Anthropic message: " in record.message
+        ]
+        assert summaries, "no Anthropic message summary was logged"
+        assert "model=test-model" in summaries[-1]
 
     def test_anthropic_messages_response_format(self, client):
         """Test Anthropic messages response format."""

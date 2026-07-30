@@ -1993,42 +1993,35 @@ class TestClaudeCodeSettings:
     def test_defaults(self):
         """Test default values."""
         settings = ClaudeCodeSettings()
-        assert settings.context_scaling_enabled is False
-        assert settings.target_context_size == 200000
-
-    def test_custom_values(self):
-        """Test custom values."""
-        settings = ClaudeCodeSettings(
-            context_scaling_enabled=True, target_context_size=131072
-        )
-        assert settings.context_scaling_enabled is True
-        assert settings.target_context_size == 131072
+        assert settings.mode == "cloud"
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = ClaudeCodeSettings(
-            context_scaling_enabled=True, target_context_size=100000
-        )
+        settings = ClaudeCodeSettings(mode="cloud")
         result = settings.to_dict()
-        assert result["context_scaling_enabled"] is True
-        assert result["target_context_size"] == 100000
         assert result["mode"] == "cloud"
         assert result["opus_model"] is None
         assert result["sonnet_model"] is None
         assert result["haiku_model"] is None
 
-    def test_from_dict(self):
-        """Test creation from dictionary."""
-        data = {"context_scaling_enabled": True, "target_context_size": 131072}
+    def test_from_dict_ignores_legacy_scaling_keys(self):
+        """Old settings.json with context_scaling_enabled/target_context_size
+        (or the later autocompact_threshold_pct) must load without error;
+        the removed keys are silently dropped — no cache-credit-adjacent
+        setting replaces them, since auto-compact is now driven entirely by
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS / CLAUDE_CODE_AUTO_COMPACT_WINDOW
+        (see fix-claude-code-autocompact-threshold's follow-up design)."""
+        data = {
+            "context_scaling_enabled": True,
+            "target_context_size": 1000000,
+            "autocompact_threshold_pct": 90,
+            "mode": "local",
+        }
         settings = ClaudeCodeSettings.from_dict(data)
-        assert settings.context_scaling_enabled is True
-        assert settings.target_context_size == 131072
-
-    def test_from_dict_defaults(self):
-        """Test from_dict uses defaults for missing fields."""
-        settings = ClaudeCodeSettings.from_dict({})
-        assert settings.context_scaling_enabled is False
-        assert settings.target_context_size == 200000
+        assert settings.mode == "local"
+        assert not hasattr(settings, "context_scaling_enabled")
+        assert not hasattr(settings, "target_context_size")
+        assert not hasattr(settings, "autocompact_threshold_pct")
 
     def test_new_fields_defaults(self):
         """Test that the four new fields have correct defaults."""
@@ -2241,11 +2234,9 @@ class TestClaudeCodeValidation:
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
-    def test_claude_code_to_dict_has_six_keys(self):
-        """to_dict must include all six keys so GlobalSettings.save() persists them."""
+    def test_claude_code_to_dict_has_four_keys(self):
+        """to_dict must include all four keys so GlobalSettings.save() persists them."""
         s = ClaudeCodeSettings(
-            context_scaling_enabled=True,
-            target_context_size=100000,
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
             sonnet_model="mlx-community/Qwen3-14B-4bit",
@@ -2253,8 +2244,6 @@ class TestClaudeCodeRouteIntegration:
         )
         d = s.to_dict()
         expected_keys = {
-            "context_scaling_enabled",
-            "target_context_size",
             "mode",
             "opus_model",
             "sonnet_model",

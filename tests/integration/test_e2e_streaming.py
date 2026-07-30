@@ -7,10 +7,11 @@ using mock AsyncIterator without loading actual models.
 """
 
 import json
-import pytest
+import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from omlx.engine.base import BaseEngine
 
@@ -574,6 +575,67 @@ class TestStreamingHelperFunctions:
         json_str = first_event[6:-2]
         data = json.loads(json_str)
         assert data["choices"][0]["delta"].get("role") == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_summary_log_names_the_model(self, caplog):
+        """The per-request summary must identify the serving model.
+
+        With several models loaded, interleaved summaries are otherwise
+        unattributable.
+        """
+        from omlx.api.openai_models import CompletionRequest
+        from omlx.server import stream_completion
+
+        engine = MockBaseEngine()
+        request = CompletionRequest(model="my-alias", prompt="Hello", stream=True)
+
+        with caplog.at_level("INFO", logger="omlx.server"):
+            async for _ in stream_completion(
+                engine,
+                "Hello",
+                request,
+                resolved_model="real-model-id",
+            ):
+                pass
+
+        summaries = [r.message for r in caplog.records if "Completion: " in r.message]
+        assert summaries, "no completion summary was logged"
+        assert "model=real-model-id" in summaries[-1]
+        assert "model=my-alias" not in summaries[-1]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_summary_log_names_resolved_model(self, caplog):
+        """The summary reports the resolved model, not the requested alias."""
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        request = ChatCompletionRequest(
+            model="my-alias",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+        )
+
+        messages = [{"role": "user", "content": "Hi"}]
+        with caplog.at_level("INFO", logger="omlx.server"):
+            async for _ in stream_chat_completion(
+                engine,
+                messages,
+                request,
+                max_tokens=256,
+                temperature=0.7,
+                top_p=0.9,
+                top_k=40,
+                resolved_model="real-model-id",
+            ):
+                pass
+
+        summaries = [
+            r.message for r in caplog.records if "Chat completion: " in r.message
+        ]
+        assert summaries, "no chat completion summary was logged"
+        assert "model=real-model-id" in summaries[-1]
+        assert "model=my-alias" not in summaries[-1]
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_prompt_opened_thinking_streams_as_reasoning(self):
@@ -2959,6 +3021,316 @@ class TestStreamingHelperFunctions:
         assert streamed_content == "Use <alpha"
         assert tool_call_deltas == []
         assert "stop" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_recovers_unclosed_paired_envelope(
+        self, caplog
+    ):
+        """OpenAI streaming should recover only the withheld malformed suffix."""
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        first = "Before <tool_"
+        second = "call><function=write><parameter=content>cut"
+        raw = first + second
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=first,
+                    new_text=first,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=second,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="length",
+                    tool_calls=None,
+                ),
+            ]
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            events = [
+                event
+                async for event in stream_chat_completion(
+                    engine,
+                    [{"role": "user", "content": "Hi"}],
+                    request,
+                    max_tokens=2,
+                    tools=tools,
+                )
+            ]
+
+        payloads = [
+            json.loads(event[6:-2]) for event in events if event.startswith("data: {")
+        ]
+        content = "".join(
+            payload["choices"][0].get("delta", {}).get("content", "")
+            for payload in payloads
+            if payload.get("choices")
+        )
+        tool_calls = [
+            tool_call
+            for payload in payloads
+            if payload.get("choices")
+            for tool_call in payload["choices"][0]
+            .get("delta", {})
+            .get("tool_calls", [])
+        ]
+        finish_reasons = [
+            payload["choices"][0].get("finish_reason")
+            for payload in payloads
+            if payload.get("choices") and payload["choices"][0].get("finish_reason")
+        ]
+
+        assert content == raw
+        assert tool_calls == []
+        assert finish_reasons == ["length"]
+        assert caplog.text.count("Unclosed tool-call envelope at end of stream") == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_discards_candidate_when_parser_recovers_call(
+        self, caplog
+    ):
+        """A structured call must win over raw malformed-envelope recovery."""
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        raw = "Before <tool_call>malformed"
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                    tool_calls=[{"name": "write", "arguments": "{}"}],
+                )
+            ]
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            events = [
+                event
+                async for event in stream_chat_completion(
+                    engine,
+                    [{"role": "user", "content": "Hi"}],
+                    request,
+                    max_tokens=8,
+                    tools=tools,
+                )
+            ]
+
+        payloads = [
+            json.loads(event[6:-2]) for event in events if event.startswith("data: {")
+        ]
+        content = "".join(
+            payload["choices"][0].get("delta", {}).get("content", "")
+            for payload in payloads
+            if payload.get("choices")
+        )
+        tool_calls = [
+            tool_call
+            for payload in payloads
+            if payload.get("choices")
+            for tool_call in payload["choices"][0]
+            .get("delta", {})
+            .get("tool_calls", [])
+        ]
+
+        assert content == "Before "
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == "write"
+        assert caplog.text.count("Unclosed tool-call envelope at end of stream") == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_recovers_unclosed_paired_envelope(
+        self, caplog
+    ):
+        """Anthropic streaming should emit recovered text instead of an empty block."""
+        from omlx.api.anthropic_models import MessagesRequest
+        from omlx.server import stream_anthropic_messages
+
+        engine = MockBaseEngine()
+        raw = "Before <tool_call><function=write><parameter=content>cut"
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                    tool_calls=None,
+                )
+            ]
+        )
+        internal_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=8,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=[
+                {
+                    "name": "write",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            events = [
+                event
+                async for event in stream_anthropic_messages(
+                    engine,
+                    [{"role": "user", "content": "Hi"}],
+                    request,
+                    max_tokens=8,
+                    tools=internal_tools,
+                )
+            ]
+
+        parsed_events = []
+        for event in events:
+            for line in event.splitlines():
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+        streamed_text = "".join(
+            event.get("delta", {}).get("text", "")
+            for event in parsed_events
+            if event.get("type") == "content_block_delta"
+        )
+        block_types = [
+            event["content_block"]["type"]
+            for event in parsed_events
+            if event.get("type") == "content_block_start"
+        ]
+
+        assert streamed_text == raw
+        assert block_types == ["text"]
+        assert caplog.text.count("Unclosed tool-call envelope at end of stream") == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_responses_api_recovers_unclosed_paired_envelope(self, caplog):
+        """Responses deltas and terminal text should agree after recovery."""
+        from omlx.api.responses_models import ResponsesRequest
+        from omlx.server import stream_responses_api
+
+        engine = MockBaseEngine()
+        raw = "Before <tool_call><function=write><parameter=content>cut"
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                    tool_calls=None,
+                )
+            ]
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        request = ResponsesRequest(model="test-model", input="Hi", stream=True)
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            events = [
+                event
+                async for event in stream_responses_api(
+                    engine,
+                    [{"role": "user", "content": "Hi"}],
+                    request,
+                    store_response=False,
+                    max_tokens=8,
+                    tools=tools,
+                )
+            ]
+
+        parsed_events = []
+        for event in events:
+            for line in event.splitlines():
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+        streamed_text = "".join(
+            event.get("delta", "")
+            for event in parsed_events
+            if event.get("type") == "response.output_text.delta"
+        )
+        done_text = next(
+            event["text"]
+            for event in parsed_events
+            if event.get("type") == "response.output_text.done"
+        )
+
+        assert streamed_text == raw
+        assert done_text == raw
+        assert caplog.text.count("Unclosed tool-call envelope at end of stream") == 1
+
 
 class TestStreamingEdgeCases:
     """Tests for edge cases in streaming responses."""

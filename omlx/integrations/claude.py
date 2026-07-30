@@ -9,6 +9,20 @@ from pathlib import Path
 from omlx.integrations.base import Integration, IntegrationContext
 from omlx.utils.install import get_cli_command_prefix
 
+CLAUDE_CODE_MIN_CONTEXT_WINDOW = 48 * 1024
+
+
+def claude_code_model_disabled_reason(model_info: dict) -> str | None:
+    context_window = model_info.get("max_context_window")
+    if not isinstance(context_window, int):
+        return None
+    if context_window >= CLAUDE_CODE_MIN_CONTEXT_WINDOW:
+        return None
+    return (
+        "Claude Code requires at least 48K context "
+        f"(configured: {context_window:,} tokens)"
+    )
+
 
 class ClaudeCodeIntegration(Integration):
     """Claude Code integration using ANTHROPIC_BASE_URL env vars."""
@@ -25,6 +39,9 @@ class ClaudeCodeIntegration(Integration):
     def get_command(self, ctx: IntegrationContext) -> str:
         return f"{get_cli_command_prefix()} launch claude"
 
+    def model_disabled_reason(self, model_info: dict) -> str | None:
+        return claude_code_model_disabled_reason(model_info)
+
     def _find_claude_binary(self) -> str:
         """Find the claude binary in PATH or ~/.claude/local/."""
         if shutil.which("claude"):
@@ -35,6 +52,14 @@ class ClaudeCodeIntegration(Integration):
         return "claude"
 
     def launch(self, ctx: IntegrationContext) -> None:
+        disabled_reason = self.model_disabled_reason(
+            {"id": ctx.model, "max_context_window": ctx.context_window}
+        )
+        if disabled_reason:
+            print(f"Cannot launch Claude Code with model '{ctx.model}'.")
+            print(disabled_reason)
+            raise SystemExit(1)
+
         env = self._scrubbed_env()
         env["ANTHROPIC_BASE_URL"] = ctx.base_url
         # Use the actual omlx API key so Claude Code authenticates correctly.
@@ -64,6 +89,18 @@ class ClaudeCodeIntegration(Integration):
 
         if ctx.context_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)
+            # Claude Code (2.1.220+) reads CLAUDE_CODE_MAX_CONTEXT_TOKENS to
+            # set the *detected* context window for custom model IDs that
+            # don't canonicalize to "claude-*"; auto-compact then fires at
+            # min(detected_window, CLAUDE_CODE_AUTO_COMPACT_WINDOW). Setting
+            # both to the same real, operator-configured max_context_window
+            # keeps reported usage and the auto-compact denominator on the
+            # same scale with no scaling math and no reliance on the
+            # internal/undocumented CLAUDE_AUTOCOMPACT_PCT_OVERRIDE test hook.
+            # Caveat (confirmed live): this is ignored for model IDs that
+            # canonicalize to "claude-*" — Claude Code trusts its own
+            # built-in context window for those regardless of this variable.
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(ctx.context_window)
 
         binary = self._find_claude_binary()
         # Deny the LSP tool. Claude Code attaches its full schema to the tools
