@@ -2951,6 +2951,42 @@ class TestExtractTextContentPreservesNamePartial:
         result = extract_text_content(messages)
         assert result[0].get("partial") is True
 
+    def test_partial_survives_empty_assistant_not_dropped(self):
+        """An empty partial assistant is not void-dropped, so the flag survives
+        the extraction tail and detect_and_strip_partial still sees it (#2357)."""
+        messages = [
+            Message(role="user", content="Continue"),
+            Message(role="assistant", content="", partial=True),
+        ]
+        result = extract_text_content(messages)
+        assert detect_and_strip_partial(result) is True
+
+    def test_partial_survives_merge_into_prior_assistant(self):
+        """A trailing partial assistant merged into a preceding assistant carries
+        the flag onto the merged turn, so partial mode is not lost (#2357)."""
+        messages = [
+            Message(role="user", content="hi"),
+            Message(role="assistant", content="prev"),
+            Message(role="assistant", content="start", partial=True),
+        ]
+        result = extract_text_content(messages)
+        # The two assistant turns collapse to one (strict-template alternation),
+        # and that single final turn keeps partial=True.
+        assert result[-1]["role"] == "assistant"
+        assert detect_and_strip_partial(result) is True
+
+    def test_non_partial_consecutive_assistants_still_merge(self):
+        """Regression guard: preserving partial must not change ordinary merging
+        of consecutive non-partial assistant messages."""
+        messages = [
+            Message(role="user", content="hi"),
+            Message(role="assistant", content="a"),
+            Message(role="assistant", content="b"),
+        ]
+        result = extract_text_content(messages)
+        assert detect_and_strip_partial(result) is False
+        assert result[-1]["content"] == "a\n\nb"
+
     def test_no_name_when_absent(self):
         """name key is absent when not set on source message."""
         messages = [

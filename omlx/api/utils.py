@@ -711,6 +711,11 @@ def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
     Messages with ``tool_responses`` (Gemma 4 format) or ``reasoning_content``
     (Qwen 3.6+ native reasoning field) are never dropped even when content is
     empty — they carry their own payload the template renders.
+
+    A ``partial`` assistant message is also never dropped: partial mode is an
+    explicit request to continue from this turn (add_generation_prompt off), so
+    dropping an empty prefill would silently lose that intent and the caller
+    would get a fresh turn instead (#2357).
     """
     return [
         msg
@@ -721,6 +726,7 @@ def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
             and not msg.get("tool_calls")
             and not msg.get("tool_responses")
             and not msg.get("reasoning_content")
+            and not msg.get("partial")
         )
     ]
 
@@ -796,6 +802,13 @@ def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
                     prev["content"] = prev_content + "\n\n" + new_content
             elif new_content:
                 prev["content"] = new_content
+            # Carry partial mode onto the merged turn. Without this, merging a
+            # trailing ``partial`` assistant into a preceding assistant drops
+            # the flag, and the prefill-continuation request is silently lost
+            # (#2357). partial is only meaningful on the final message, which
+            # is exactly what prev becomes here.
+            if msg.get("partial"):
+                prev["partial"] = True
         else:
             merged.append(msg.copy())
 
