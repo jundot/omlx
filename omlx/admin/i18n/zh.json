@@ -883,7 +883,7 @@
   "chat.stop_generating_tooltip": "停止生成",
   "chat.show_settings_tooltip": "显示设置",
   "chat.more_actions_tooltip": "更多操作",
-  "chat.branch_here": "在此分支",
+  "chat.branch_here": "从此处创建分支",
   "chat.delete_message": "删除",
   "chat.copy_markdown": "复制 Markdown",
   "chat.generating_tooltip": "生成中",
