@@ -138,7 +138,7 @@ final class QuantizationScreenVM {
         } catch {
             self.modelsLoaded = true
             self.lastError = String(localized: "quant.error.load_models",
-                                    defaultValue: "Failed to load models: \(error)",
+                                    defaultValue: "Failed to load models: \(error.localizedDescription)",
                                     comment: "Banner error message when listing OQ models fails. Placeholder is the underlying error")
         }
     }
@@ -298,7 +298,7 @@ final class QuantizationScreenVM {
             } catch {
                 await MainActor.run {
                     self?.lastError = String(localized: "quant.error.start_failed",
-                                             defaultValue: "Failed to start: \(error)",
+                                             defaultValue: "Failed to start: \(error.localizedDescription)",
                                              comment: "Banner error when starting a quant job throws. Placeholder is the underlying error")
                 }
             }
@@ -313,7 +313,7 @@ final class QuantizationScreenVM {
             } catch {
                 await MainActor.run {
                     self?.lastError = String(localized: "quant.error.cancel_failed",
-                                             defaultValue: "Cancel failed: \(error)",
+                                             defaultValue: "Cancel failed: \(error.localizedDescription)",
                                              comment: "Banner error when cancelling a quant task throws. Placeholder is the underlying error")
                 }
             }
@@ -328,7 +328,7 @@ final class QuantizationScreenVM {
             } catch {
                 await MainActor.run {
                     self?.lastError = String(localized: "quant.error.remove_failed",
-                                             defaultValue: "Remove failed: \(error)",
+                                             defaultValue: "Remove failed: \(error.localizedDescription)",
                                              comment: "Banner error when removing a quant task throws. Placeholder is the underlying error")
                 }
             }
@@ -409,7 +409,7 @@ final class QuantizationScreenVM {
             } catch {
                 await MainActor.run {
                     self?.lastUploadError = String(localized: "quant.upload.error.cancel_failed",
-                                                   defaultValue: "Cancel failed: \(error)",
+                                                   defaultValue: "Cancel failed: \(error.localizedDescription)",
                                                    comment: "Error when cancelling an upload task throws. Placeholder is the underlying error")
                 }
             }
@@ -424,7 +424,7 @@ final class QuantizationScreenVM {
             } catch {
                 await MainActor.run {
                     self?.lastUploadError = String(localized: "quant.upload.error.remove_failed",
-                                                   defaultValue: "Remove failed: \(error)",
+                                                   defaultValue: "Remove failed: \(error.localizedDescription)",
                                                    comment: "Error when removing an upload task throws. Placeholder is the underlying error")
                 }
             }
