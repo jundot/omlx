@@ -2766,6 +2766,124 @@ class TestPreloadMatchedBlocks:
         manager2.close()
 
 
+class TestIsHotCached:
+    """Tests for PagedSSDCacheManager.is_hot_cached() (scope-cache-credit-live-resident)."""
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def _save_test_blocks(self, manager, mx, count=4, layers=2):
+        """Save test blocks and flush them to SSD (not hot cache)."""
+        hashes = []
+        for i in range(count):
+            block_hash = f"is_hot_cached_test_block_{i:04d}".encode()
+            cache_data = [
+                (mx.zeros((1, 4, 64, 64)), mx.zeros((1, 4, 64, 64)))
+                for _ in range(layers)
+            ]
+            manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=64,
+                model_name="test-model",
+                layer_cache_types=["KVCache"] * layers,
+            )
+            hashes.append(block_hash)
+
+        # Flush writer to ensure blocks are on SSD, then reopen cold
+        # (hot cache empty, SSD index populated).
+        manager.close()
+        new_manager = PagedSSDCacheManager(
+            cache_dir=manager._cache_dir,
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        return new_manager, hashes
+
+    def test_true_when_promoted_via_preload(self, tmp_path, mx):
+        """Blocks preloaded into hot cache are reported as hot-cached."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        for h in hashes:
+            assert manager2.is_hot_cached(h) is False
+
+        loaded = manager2.preload_matched_blocks(hashes)
+        assert loaded == 4
+
+        for h in hashes:
+            assert manager2.is_hot_cached(h) is True
+
+        manager2.close()
+
+    def test_false_for_ssd_index_only_block(self, tmp_path, mx):
+        """A block present only in the SSD index (not preloaded) is not hot-cached."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=1)
+
+        # SSD index has the block, hot cache does not.
+        assert manager2.has_block(hashes[0]) is True
+        assert manager2.is_hot_cached(hashes[0]) is False
+
+        manager2.close()
+
+    def test_false_for_unknown_hash(self, tmp_path, mx):
+        """A hash never seen by this cache is not hot-cached."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        assert manager.is_hot_cached(b"never_seen_hash") is False
+        manager.close()
+
+    def test_no_lru_or_budget_side_effects(self, tmp_path, mx):
+        """Unlike _hot_cache_get, is_hot_cached must not reorder LRU or touch budget."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=2)
+
+        # Promote both, deterministically, in order (single-threaded via
+        # load_block, not the concurrent preload pool).
+        assert manager2.load_block(hashes[0]) is not None
+        assert manager2.load_block(hashes[1]) is not None
+
+        order_before = list(manager2._hot_cache.keys())
+        assert order_before == [hashes[0], hashes[1]]
+
+        # Repeated is_hot_cached() calls on the LRU-oldest entry must not
+        # move it to MRU position.
+        for _ in range(3):
+            assert manager2.is_hot_cached(hashes[0]) is True
+
+        order_after = list(manager2._hot_cache.keys())
+        assert order_after == order_before
+
+        # Contrast: _hot_cache_get() DOES move it to MRU, proving the
+        # ordering above wasn't already a no-op for this cache.
+        manager2._hot_cache_get(hashes[0])
+        assert list(manager2._hot_cache.keys()) == [hashes[1], hashes[0]]
+
+        manager2.close()
+
+
 class TestPreloadBlocks:
     """Tests for BlockAwarePrefixCache.preload_blocks()."""
 

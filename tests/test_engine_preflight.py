@@ -180,10 +180,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
 
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
+        cached_tokens=0,
         request_id="req-evict",
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
+        cached_tokens=0,
         request_id="req-evict",
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
@@ -483,6 +485,161 @@ async def test_vlm_preflight_chat_swallows_tokenizer_errors(caplog):
 
     assert not raise_called["yes"]
     assert any("tokenizer.encode raised" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# scope-cache-credit-live-resident: hot-cache-verified cached_tokens
+# propagation through preflight_chat / preflight_completion.
+# ---------------------------------------------------------------------------
+
+
+def _build_engine_with_mock_scheduler(engine_cls, encoded_tokens):
+    """Like ``_build_engine_with_stub_scheduler`` but with a fully mocked
+    scheduler, so we can assert exactly what cached_tokens value reaches
+    ``preflight_or_raise`` without a real Scheduler/PagedCacheManager.
+    """
+    scheduler = MagicMock()
+    engine = _build_engine_with_stub_scheduler(engine_cls, scheduler)
+    engine._tokenizer.encode = MagicMock(return_value=encoded_tokens)
+    return engine, scheduler
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_chat_credits_live_resident_tokens():
+    """cached_tokens on the early check now comes from
+    live_resident_prefix_length(token_ids), not a hardcoded 0."""
+    from omlx.engine.batched import BatchedEngine
+
+    tokens = list(range(500))
+    engine, scheduler = _build_engine_with_mock_scheduler(BatchedEngine, tokens)
+    engine._preprocess_messages = lambda m: m
+    scheduler.live_resident_prefix_length.return_value = 320
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    scheduler.live_resident_prefix_length.assert_called_once_with(tokens)
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=500, cached_tokens=320, request_id=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_chat_zero_credit_for_ssd_only_match():
+    """A find_shared_prefix() content match that isn't hot-cache-verified
+    must NOT be credited here -- restoring it costs real memory
+    (model-ssd-kv-restoration-cost)."""
+    from omlx.engine.batched import BatchedEngine
+
+    tokens = list(range(500))
+    engine, scheduler = _build_engine_with_mock_scheduler(BatchedEngine, tokens)
+    engine._preprocess_messages = lambda m: m
+    scheduler.live_resident_prefix_length.return_value = 0
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=500, cached_tokens=0, request_id=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_completion_credits_live_resident_tokens():
+    from omlx.engine.batched import BatchedEngine
+
+    tokens = list(range(200))
+    engine, scheduler = _build_engine_with_mock_scheduler(BatchedEngine, tokens)
+    scheduler.live_resident_prefix_length.return_value = 128
+
+    await engine.preflight_completion(prompt="hello")
+
+    scheduler.live_resident_prefix_length.assert_called_once_with(tokens)
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=200, cached_tokens=128, request_id=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_vlm_engine_preflight_chat_credits_text_only_tokens():
+    """VLM's early check credits only the text-token match -- image content
+    is stripped before templating, so the live_resident_prefix_length probe
+    must run on text tokens only, while num_prompt_tokens still includes the
+    separate image-token budget on top."""
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    text_tokens = list(range(300))
+    engine, scheduler = _build_engine_with_mock_scheduler(VLMBatchedEngine, text_tokens)
+    scheduler.live_resident_prefix_length.return_value = 256
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    scheduler.live_resident_prefix_length.assert_called_once_with(text_tokens)
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=300, cached_tokens=256, request_id=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_vlm_engine_preflight_chat_credit_excludes_image_token_budget():
+    """The image-token upper-bound budget must never be credited as
+    cached -- only real text tokens are checked against the hot cache."""
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    text_tokens = list(range(300))
+    engine, scheduler = _build_engine_with_mock_scheduler(VLMBatchedEngine, text_tokens)
+    scheduler.live_resident_prefix_length.return_value = 256
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": _TINY_PNG_DATA_URI}},
+                {"type": "text", "text": "describe this"},
+            ],
+        }
+    ]
+    await engine.preflight_chat(messages=messages)
+
+    # num_prompt_tokens = 300 text tokens + image budget (> 0); cached_tokens
+    # stays exactly what the text-only probe returned, never inflated by
+    # the image budget.
+    args, kwargs = scheduler.preflight_or_raise.call_args
+    assert kwargs["cached_tokens"] == 256
+    assert kwargs["num_prompt_tokens"] > 300
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_cold_start_still_gets_full_charge(
+    monkeypatch,
+):
+    """Regression guard: a prompt with no cache configured at all (the
+    _make_scheduler() real-scheduler case) still gets cached_tokens=0,
+    i.e. today's full-charge behavior for a genuine cold start."""
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18  # effectively unbounded
+
+    import omlx.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+
+    calls = []
+    real_preflight = scheduler.preflight_or_raise
+
+    def _spy(**kwargs):
+        calls.append(kwargs)
+        return real_preflight(**kwargs)
+
+    scheduler.preflight_or_raise = _spy  # type: ignore[assignment]
+
+    engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+    engine._preprocess_messages = lambda m: m
+
+    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    assert calls and calls[0]["cached_tokens"] == 0
 
 
 # ---------------------------------------------------------------------------
