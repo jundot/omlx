@@ -7,10 +7,10 @@ using mock AsyncIterator without loading actual models.
 """
 
 import json
-import pytest
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from omlx.engine.base import BaseEngine
 
@@ -574,6 +574,67 @@ class TestStreamingHelperFunctions:
         json_str = first_event[6:-2]
         data = json.loads(json_str)
         assert data["choices"][0]["delta"].get("role") == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_summary_log_names_the_model(self, caplog):
+        """The per-request summary must identify the serving model.
+
+        With several models loaded, interleaved summaries are otherwise
+        unattributable.
+        """
+        from omlx.api.openai_models import CompletionRequest
+        from omlx.server import stream_completion
+
+        engine = MockBaseEngine()
+        request = CompletionRequest(model="my-alias", prompt="Hello", stream=True)
+
+        with caplog.at_level("INFO", logger="omlx.server"):
+            async for _ in stream_completion(
+                engine,
+                "Hello",
+                request,
+                resolved_model="real-model-id",
+            ):
+                pass
+
+        summaries = [r.message for r in caplog.records if "Completion: " in r.message]
+        assert summaries, "no completion summary was logged"
+        assert "model=real-model-id" in summaries[-1]
+        assert "model=my-alias" not in summaries[-1]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_summary_log_names_resolved_model(self, caplog):
+        """The summary reports the resolved model, not the requested alias."""
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        request = ChatCompletionRequest(
+            model="my-alias",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+        )
+
+        messages = [{"role": "user", "content": "Hi"}]
+        with caplog.at_level("INFO", logger="omlx.server"):
+            async for _ in stream_chat_completion(
+                engine,
+                messages,
+                request,
+                max_tokens=256,
+                temperature=0.7,
+                top_p=0.9,
+                top_k=40,
+                resolved_model="real-model-id",
+            ):
+                pass
+
+        summaries = [
+            r.message for r in caplog.records if "Chat completion: " in r.message
+        ]
+        assert summaries, "no chat completion summary was logged"
+        assert "model=real-model-id" in summaries[-1]
+        assert "model=my-alias" not in summaries[-1]
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_prompt_opened_thinking_streams_as_reasoning(self):

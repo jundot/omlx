@@ -76,7 +76,7 @@ def test_wheel_listener_is_registered_only_during_scroll_setup():
 def test_chat_history_is_sorted_before_it_is_trimmed():
     save = _section(
         _template(),
-        "    saveCurrentChat(chatId = this.currentChatId",
+        "    saveCurrentChat(",
         "    startRenamingChat(chat)",
     )
 
@@ -84,6 +84,26 @@ def test_chat_history_is_sorted_before_it_is_trimmed():
         "this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE)"
     )
     assert "this.saveChatHistory()" in save
+
+
+def test_chat_navigation_preserves_the_previous_chat_timestamp():
+    html = _template()
+    start_new = _section(html, "    async startNewChat()", "    async loadChat(chatId)")
+    load = _section(
+        html,
+        "    async loadChat(chatId)",
+        "    saveCurrentChat(",
+    )
+    save = _section(
+        html,
+        "    saveCurrentChat(",
+        "    startRenamingChat(chat)",
+    )
+
+    assert "{ touchUpdatedAt: false }" in start_new
+    assert "{ touchUpdatedAt: false }" in load
+    assert "options.touchUpdatedAt === false && existingChat?.updatedAt" in save
+    assert "? existingChat.updatedAt" in save
 
 
 def test_new_chat_strings_exist_in_every_locale():

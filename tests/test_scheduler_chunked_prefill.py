@@ -20,6 +20,7 @@ from omlx.scheduler import (
     PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
+    _default_generation_stream,
     _PrefillAbortedError,
     _PrefillEvictionNeeded,
     _PrefillState,
@@ -1191,3 +1192,182 @@ class TestScheduleWaitingSpecPrefillGuard:
         assert scheduled == []
         assert rejected == []
         assert req in sched.waiting
+
+
+# ---------------------------------------------------------------------------
+# Prefill error paths must drain the ENGINE stream before clearing the cache
+# ---------------------------------------------------------------------------
+
+
+class TestPrefillCleanupUsesEngineStream:
+    """Every prefill error/rejection path must pass the per-engine stream to
+    _sync_and_clear_cache, like its sibling success/abort branches do.
+
+    mx.clear_cache() can release Metal buffers that in-flight command buffers
+    still reference (#300), so the clear must be preceded by a drain of the
+    stream that carried the work. The drain only covers the stream it is given:
+    an mlx ThreadLocalStream resolves to a *different* concrete mx.Stream per
+    calling thread, so a no-argument call drains mlx-lm's generation_stream and
+    the calling thread's default stream -- never the engine stream the prefill
+    forward and the BatchGenerator's async_eval actually ran on.
+    """
+
+    @staticmethod
+    def _engine_scheduler(**kwargs) -> Scheduler:
+        """Scheduler with a per-engine stream, the way EngineCore builds it."""
+        sched = _make_scheduler(**kwargs)
+        sched._stream = mx.new_thread_local_stream(mx.default_device())
+        assert sched._stream is not _default_generation_stream
+        return sched
+
+    @staticmethod
+    def _capacity_error(request_id: str) -> PrefillMemoryExceededError:
+        return PrefillMemoryExceededError(
+            message="Prefill context too large for available memory",
+            request_id=request_id,
+            estimated_bytes=123,
+            limit_bytes=100,
+        )
+
+    @staticmethod
+    def _recorder() -> tuple[list, object]:
+        """Patch the module-level helper so calls record the stream argument."""
+        streams: list = []
+        return streams, patch(
+            "omlx.scheduler._sync_and_clear_cache",
+            side_effect=lambda stream=None: streams.append(stream),
+        )
+
+    def _assert_engine_stream(self, streams: list, sched: Scheduler) -> None:
+        assert streams, "prefill cleanup did not clear the Metal buffer cache"
+        assert all(s is sched._stream for s in streams), (
+            "prefill cleanup cleared the cache without draining the engine "
+            f"stream: {streams!r} != {sched._stream!r}"
+        )
+
+    def _queued_chunked_request(self, sched: Scheduler) -> Request:
+        req = _make_request("r1")
+        sched.requests[req.request_id] = req
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = _make_prefill_state(sched, req)
+        return req
+
+    # _advance_chunked_prefills(): in-flight chunk
+
+    def test_advance_chunked_capacity_rejection_drains_engine_stream(self):
+        sched = self._engine_scheduler()
+        req = self._queued_chunked_request(sched)
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                sched,
+                "_step_prefill_chunk",
+                side_effect=self._capacity_error(req.request_id),
+            ),
+        ):
+            rejected: list = []
+            sched._advance_chunked_prefills([], rejected)
+
+        assert len(rejected) == 1
+        self._assert_engine_stream(streams, sched)
+
+    def test_advance_chunked_runtime_error_drains_engine_stream(self):
+        sched = self._engine_scheduler()
+        self._queued_chunked_request(sched)
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                sched, "_step_prefill_chunk", side_effect=RuntimeError("kernel panic")
+            ),
+        ):
+            rejected: list = []
+            sched._advance_chunked_prefills([], rejected)
+
+        assert len(rejected) == 1
+        self._assert_engine_stream(streams, sched)
+
+    # _schedule_waiting(): first chunk of a chunked prefill
+
+    def test_first_chunk_capacity_rejection_drains_engine_stream(self):
+        sched = self._engine_scheduler()
+        req = _make_request("r1", n_tokens=10)  # > step_size + 1 → chunked fork
+        sched.add_request(req)
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                sched, "_begin_prefill", return_value=_make_prefill_state(sched, req)
+            ),
+            patch.object(
+                sched,
+                "_step_prefill_chunk",
+                side_effect=self._capacity_error(req.request_id),
+            ),
+        ):
+            _, rejected = sched._schedule_waiting()
+
+        assert len(rejected) == 1
+        self._assert_engine_stream(streams, sched)
+
+    def test_first_chunk_runtime_error_drains_engine_stream(self):
+        sched = self._engine_scheduler()
+        req = _make_request("r1", n_tokens=10)
+        sched.add_request(req)
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                sched, "_begin_prefill", return_value=_make_prefill_state(sched, req)
+            ),
+            patch.object(
+                sched, "_step_prefill_chunk", side_effect=RuntimeError("kernel panic")
+            ),
+        ):
+            _, rejected = sched._schedule_waiting()
+
+        assert len(rejected) == 1
+        self._assert_engine_stream(streams, sched)
+
+    # _schedule_waiting(): non-chunked full prefill
+
+    def test_non_chunked_capacity_rejection_drains_engine_stream(self):
+        sched = self._engine_scheduler()
+        req = _make_request("r1", n_tokens=3)  # short → normal prefill path
+        sched.add_request(req)
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                sched,
+                "_do_external_prefill",
+                side_effect=self._capacity_error(req.request_id),
+            ),
+        ):
+            _, rejected = sched._schedule_waiting()
+
+        assert len(rejected) == 1
+        self._assert_engine_stream(streams, sched)
+
+    def test_non_chunked_runtime_error_drains_engine_stream(self):
+        sched = self._engine_scheduler()
+        req = _make_request("r1", n_tokens=3)
+        sched.add_request(req)
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                sched, "_do_external_prefill", side_effect=RuntimeError("kernel panic")
+            ),
+        ):
+            _, rejected = sched._schedule_waiting()
+
+        assert len(rejected) == 1
+        self._assert_engine_stream(streams, sched)

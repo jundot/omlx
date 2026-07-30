@@ -34,7 +34,6 @@ from mlx_lm.generate import (
     GenerationBatch,
     PromptProcessingBatch,
     SequenceStateMachine,
-    generation_stream,
 )
 from mlx_lm.models.cache import (
     KVCache as _MLXKVCache,
@@ -63,13 +62,14 @@ from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
+from .utils.metal_sync import (
+    _default_generation_stream,
+    _mx_buffer_access_lock,
+    _sync_and_clear_cache,
+)
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
-
-# Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
-# stream when no per-engine stream is provided.
-_default_generation_stream = generation_stream
 
 
 def _apply_suppress_token_ids(logits: Any, suppress_token_ids: tuple[int, ...]) -> Any:
@@ -87,6 +87,11 @@ def _make_suppress_logits_processor(
 
     def _suppress_logits(tokens: Any, logits: Any) -> Any:
         return _apply_suppress_token_ids(logits, suppress_tuple)
+
+    # Marker for _route_to_vlm_mtp: this model-level processor is the one
+    # kind the vlm_mtp path reproduces on its own (folded into the sampler
+    # via _make_suppressing_sampler), so it must not block routing.
+    _suppress_logits._omlx_suppress_processor = True  # type: ignore[attr-defined]
 
     return _suppress_logits
 
@@ -185,45 +190,6 @@ class _StopOutputState:
 
     strings: dict[tuple[int, ...], str]
     pending: deque[tuple[int, RequestOutput]] = field(default_factory=deque)
-
-
-# Serializes Metal buffer-protocol access from the async store-cache worker
-# against inference-thread mx.clear_cache / mx.synchronize calls that can
-# invalidate the underlying buffer pool. Closes a SIGABRT path where
-# _async_store_cache_worker reads tensor bytes via memoryview while the
-# inference thread concurrently issues a reclaim-triggering mx op.
-# See: https://github.com/jundot/omlx/issues/1106
-_mx_buffer_access_lock = threading.RLock()
-
-
-def _sync_and_clear_cache(stream=None):
-    """Synchronize in-flight GPU work before clearing the Metal buffer cache.
-
-    Without synchronization, mx.clear_cache() can release Metal buffers that
-    are still referenced by in-flight command buffers submitted via
-    mx.async_eval(). This causes the GPU driver to hit a
-    'completeMemory() prepare count underflow' kernel panic on M4 hardware
-    (and SIGSEGV/SIGABRT on M3).
-
-    Held under _mx_buffer_access_lock so the async store-cache worker cannot
-    observe a half-reclaimed Metal buffer pool while it is in the middle of
-    reading tensor bytes via the Python buffer protocol (#1106).
-
-    See: https://github.com/jundot/omlx/issues/300, #888, #1106
-    """
-    with _mx_buffer_access_lock:
-        # The engine stream may not have in-flight work on the current thread
-        # (for example, during teardown before that thread submits work). On
-        # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
-        # current thread" in that case; swallow it since there is nothing to
-        # drain.
-        target = stream if stream is not None else _default_generation_stream
-        try:
-            mx.synchronize(target)
-        except RuntimeError:
-            pass
-        mx.synchronize()  # default stream
-        mx.clear_cache()
 
 
 def _safe_sync_stream(stream=None):
@@ -4598,7 +4564,12 @@ class Scheduler:
         # through to BatchGenerator, matching short-prompt behaviour.
         if self._vlm_mtp_drafter is not None and state.cache is not None:
             vlm_mtp_uid = self._route_to_vlm_mtp(
-                request, state.cache, state.last_token, state.sampler, state.sm
+                request,
+                state.cache,
+                state.last_token,
+                state.sampler,
+                state.sm,
+                logits_processors=state.per_row_lps,
             )
             if vlm_mtp_uid is not None:
                 self.request_id_to_uid[request.request_id] = vlm_mtp_uid
@@ -4723,7 +4694,7 @@ class Scheduler:
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
-                _sync_and_clear_cache()
+                _sync_and_clear_cache(self._stream)
                 rejected.append(_prefill_memory_exception_output(rid, e))
                 continue
             except RuntimeError as e:
@@ -4736,7 +4707,7 @@ class Scheduler:
                 # Drop Metal cache pool buffers held by the aborted chunk's
                 # forward / mx.eval transients. Without this, enforcer keeps
                 # seeing the burst footprint until the next mx.clear_cache().
-                _sync_and_clear_cache()
+                _sync_and_clear_cache(self._stream)
                 # Try a bounded requeue before surfacing the failure: a
                 # memory-pressure prefill gets a fresh, better-throttled
                 # attempt. Only after the retry budget is exhausted (or for
@@ -7084,6 +7055,7 @@ class Scheduler:
         last_tokens: list[int],
         sampler: Callable[[Any], Any],
         state_machine: Any,
+        logits_processors: list[Any] | None = None,
     ) -> int | None:
         """Bypass BatchGenerator and stand up a vlm_mtp generator instead.
 
@@ -7098,6 +7070,28 @@ class Scheduler:
         """
         drafter = self._vlm_mtp_drafter
         if drafter is None:
+            return None
+
+        # Per-request logits processors (grammar constraints, thinking
+        # budget, repetition/presence/frequency penalties) have no
+        # application point on this path: run_vlm_mtp_decode threads only a
+        # sampler into mlx-vlm's _mtp_rounds, and a sampler sees logits
+        # without the token history processors need. Model-level suppress
+        # tokens are the one exception, reproduced below via
+        # _make_suppressing_sampler. Same convention as Lightning MTP,
+        # which declines activation when grammar processors are present:
+        # fall back to BatchGenerator so every processor is enforced
+        # (#2399).
+        if logits_processors and any(
+            not getattr(proc, "_omlx_suppress_processor", False)
+            for proc in logits_processors
+        ):
+            logger.info(
+                "vlm_mtp routing skipped for %s: request carries per-request "
+                "logits processors (grammar / thinking budget / penalties); "
+                "falling back to BatchGenerator",
+                request.request_id,
+            )
             return None
 
         # Gemma4AssistantDraftModel keeps ``_shared_kv`` / ``_input_embed`` on
@@ -8870,7 +8864,7 @@ class Scheduler:
                         self.requests.pop(request.request_id, None)
                         self._clear_request_admission_bookkeeping(request.request_id)
                         get_prefill_tracker().remove(request.request_id)
-                        _sync_and_clear_cache()
+                        _sync_and_clear_cache(self._stream)
                         rejected_outputs.append(
                             _prefill_memory_exception_output(request.request_id, e)
                         )
@@ -8893,7 +8887,7 @@ class Scheduler:
                         get_prefill_tracker().remove(request.request_id)
                         # Drop Metal cache pool buffers held by the aborted
                         # first chunk's forward / mx.eval transients.
-                        _sync_and_clear_cache()
+                        _sync_and_clear_cache(self._stream)
                         if self._requeue_or_fail_prefill(request, e):
                             continue
                         rejected_outputs.append(
@@ -8953,7 +8947,7 @@ class Scheduler:
                     self.requests.pop(request.request_id, None)
                     self._clear_request_admission_bookkeeping(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
-                    _sync_and_clear_cache()
+                    _sync_and_clear_cache(self._stream)
                     rejected_outputs.append(
                         _prefill_memory_exception_output(request.request_id, e)
                     )
@@ -8975,7 +8969,7 @@ class Scheduler:
                     get_prefill_tracker().remove(request.request_id)
                     # Drop Metal cache pool buffers held by the aborted
                     # chunk's forward / mx.eval transients.
-                    _sync_and_clear_cache()
+                    _sync_and_clear_cache(self._stream)
                     if self._requeue_or_fail_prefill(request, e):
                         continue
                     rejected_outputs.append(
@@ -9034,7 +9028,12 @@ class Scheduler:
             # eligibility issue so other speculative paths stay intact.
             if self._vlm_mtp_drafter is not None and cache_to_use is not None:
                 vlm_mtp_uid = self._route_to_vlm_mtp(
-                    request, cache_to_use, tokens_to_process, sampler, sm
+                    request,
+                    cache_to_use,
+                    tokens_to_process,
+                    sampler,
+                    sm,
+                    logits_processors=logits_processors,
                 )
                 if vlm_mtp_uid is not None:
                     self.request_id_to_uid[request.request_id] = vlm_mtp_uid

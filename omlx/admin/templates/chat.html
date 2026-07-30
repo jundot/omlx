@@ -4783,7 +4783,13 @@
             const prevSession = this.getChatSession(prevChatId, false);
             if (prevSession) {
                 prevSession.messages = this.messages;
-                this.saveCurrentChat(prevChatId);
+                this.saveCurrentChat(
+                    prevChatId,
+                    null,
+                    null,
+                    null,
+                    { touchUpdatedAt: false }
+                );
             }
         }
 
@@ -4848,7 +4854,13 @@
             const prevSession = this.getChatSession(this.currentChatId, false);
             if (prevSession) {
                 prevSession.messages = this.messages;
-                this.saveCurrentChat(this.currentChatId);
+                this.saveCurrentChat(
+                    this.currentChatId,
+                    null,
+                    null,
+                    null,
+                    { touchUpdatedAt: false }
+                );
             }
         }
 
@@ -4894,7 +4906,13 @@
         this.sidebarOpen = window.innerWidth >= 768;
     },
 
-    saveCurrentChat(chatId = this.currentChatId, messages = null, model = null, systemPrompt = null) {
+    saveCurrentChat(
+        chatId = this.currentChatId,
+        messages = null,
+        model = null,
+        systemPrompt = null,
+        options = {}
+    ) {
         const session = this.getChatSession(chatId, false);
         const messagesToSave = messages ?? session?.messages ?? (chatId === this.currentChatId ? this.messages : []);
         if (!chatId) return;
@@ -4957,7 +4975,9 @@
                 ? this.cloneData(session.modelSettingsByModel || {})
                 : {},
             contextTokens: session?.contextTokens ?? existingChat?.contextTokens ?? 0,
-            updatedAt: new Date().toISOString()
+            updatedAt: options.touchUpdatedAt === false && existingChat?.updatedAt
+                ? existingChat.updatedAt
+                : new Date().toISOString()
         };
 
         if (session) {

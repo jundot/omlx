@@ -352,6 +352,7 @@ class OQStartRequest(BaseModel):
     imatrix_strict: bool = False
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
+    mtp_assistant_model_path: str = ""
 
 
 class HFUploadRequest(BaseModel):
@@ -4265,12 +4266,28 @@ def _build_runtime_cache_observability(
         async_core = getattr(entry.engine, "_engine", None)
         core = getattr(async_core, "engine", None) if async_core is not None else None
         scheduler = getattr(core, "scheduler", None) if core is not None else None
+        if scheduler is None and async_core is None:
+            # Engines without an AsyncEngineCore (DFlash) expose a scheduler
+            # through their fallback engine once it is active.
+            scheduler = getattr(entry.engine, "scheduler", None)
 
         runtime_stats = None
         if scheduler is not None and hasattr(scheduler, "get_ssd_cache_stats"):
             try:
                 runtime_stats = scheduler.get_ssd_cache_stats()
             except Exception as exc:
+                logger.warning(
+                    "Failed to collect runtime cache stats for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                continue
+        elif hasattr(entry.engine, "get_runtime_cache_stats"):
+            # DFlash primary mode: the engine adapts its dflash-mlx runtime
+            # cache (L1 in-memory + L2 snapshot dir) to the same shape.
+            try:
+                runtime_stats = entry.engine.get_runtime_cache_stats()
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Failed to collect runtime cache stats for model '%s': %s",
                     model_id,
@@ -4526,8 +4543,10 @@ def _build_active_models_data() -> dict:
         # Follow the same pattern as server.py /api/status endpoint.
         collector_request_ids: set = set()
         active_request_ids: set = set()
+        activity_requests = 0
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
+            sched = None
             async_core = getattr(entry.engine, "_engine", None)
             if async_core is not None:
                 core = getattr(async_core, "engine", None)
@@ -4542,25 +4561,32 @@ def _build_active_models_data() -> dict:
                         collector_request_ids = set()
 
                     sched = getattr(core, "scheduler", None)
-                    if sched is not None and hasattr(sched, "snapshot_for_admin"):
-                        snap = sched.snapshot_for_admin()
-                        has_scheduler_snapshot = True
-                        running_by_id = snap["running_by_id"]
-                        waiting_queue = snap["waiting"]
-                        waiting_requests = len(waiting_queue)
-                        waiting_ids = {req.request_id for req in waiting_queue}
-                        waiting = [
-                            {
-                                "request_id": req.request_id,
-                                "queue_position": idx,
-                                "elapsed_seconds": max(0.0, now - req.arrival_time),
-                                "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
-                            }
-                            for idx, req in enumerate(waiting_queue, start=1)
-                        ]
-            elif hasattr(entry.engine, "get_activity_snapshot"):
+            else:
+                # Engines without an AsyncEngineCore (DFlash) still expose a
+                # scheduler once their fallback engine is active.
+                sched = getattr(entry.engine, "scheduler", None)
+            if sched is not None and hasattr(sched, "snapshot_for_admin"):
+                snap = sched.snapshot_for_admin()
+                has_scheduler_snapshot = True
+                running_by_id = snap["running_by_id"]
+                waiting_queue = snap["waiting"]
+                waiting_requests = len(waiting_queue)
+                waiting_ids = {req.request_id for req in waiting_queue}
+                waiting = [
+                    {
+                        "request_id": req.request_id,
+                        "queue_position": idx,
+                        "elapsed_seconds": max(0.0, now - req.arrival_time),
+                        "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                    }
+                    for idx, req in enumerate(waiting_queue, start=1)
+                ]
+            if hasattr(entry.engine, "get_activity_snapshot"):
+                # Requests the engine tracks itself (non-streaming engines,
+                # DFlash primary mode). Counted on top of any scheduler
+                # snapshot; the two sources never overlap.
                 snapshot = entry.engine.get_activity_snapshot()
-                active_requests = snapshot.get("active_requests", 0)
+                activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
@@ -4571,6 +4597,7 @@ def _build_active_models_data() -> dict:
             active_request_ids = collector_request_ids - waiting_ids
         if has_scheduler_snapshot or collector_request_ids:
             active_requests = len(active_request_ids)
+        active_requests += activity_requests
 
         # Generating = active requests that finished prefill.
         generating = []
@@ -6621,6 +6648,7 @@ async def start_oq_quantization(
             imatrix_strict=request.imatrix_strict,
             imatrix_num_samples=request.imatrix_num_samples,
             imatrix_seq_length=request.imatrix_seq_length,
+            mtp_assistant_model_path=request.mtp_assistant_model_path,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

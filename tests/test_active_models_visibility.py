@@ -435,3 +435,107 @@ def test_idle_and_ttl_not_computed_for_loading_model():
     assert model["is_loading"] is True
     assert model["idle_seconds"] is None
     assert model["ttl_remaining_seconds"] is None
+
+
+# ── DFlash engine visibility (#2396) ──────────────────────────────────────
+
+
+class FakeDFlashPool:
+    """Pool whose engine has no AsyncEngineCore, mirroring DFlashEngine.
+
+    ``scheduler`` stands in for DFlashEngine's property that surfaces the
+    fallback engine's scheduler (None while in primary mode).
+    """
+
+    def __init__(self, engine):
+        self._entries = {"dflash-model": SimpleNamespace(engine=engine)}
+
+    def get_status(self):
+        return {
+            "current_model_memory": 1024,
+            "final_ceiling": 2048,
+            "models": [
+                {
+                    "id": "dflash-model",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 1024,
+                    "pinned": False,
+                }
+            ],
+        }
+
+
+def _build_with_pool(pool):
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch(
+            "omlx.prefill_progress.get_prefill_tracker",
+            return_value=EmptyPrefillTracker(),
+        ),
+        patch("time.monotonic", return_value=110.0),
+    ):
+        return admin_routes._build_active_models_data()
+
+
+def test_active_models_dflash_primary_counts_activity():
+    """Primary mode: no scheduler anywhere, activity snapshot drives the count."""
+
+    class Engine:
+        scheduler = None
+
+        def get_activity_snapshot(self):
+            return {
+                "active_requests": 1,
+                "activities": [
+                    {
+                        "request_id": "req-1",
+                        "kind": "generate",
+                        "detail": "generating",
+                        "elapsed_seconds": 3.0,
+                        "token_count": 42,
+                    }
+                ],
+            }
+
+    data = _build_with_pool(FakeDFlashPool(Engine()))
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 1
+    assert model["active_requests"] == 1
+    assert model["activities"][0]["detail"] == "generating"
+
+
+def test_active_models_resolves_scheduler_property_without_async_core():
+    """Fallback mode: the engine exposes a scheduler property instead of an
+    AsyncEngineCore, and the snapshot path must still be taken."""
+    running_request = SimpleNamespace(
+        request_id="gen-1",
+        generation_started_at=100.0,
+        last_activity_at=109.5,
+        num_output_tokens=20,
+        num_prompt_tokens=12,
+        max_tokens=64,
+    )
+
+    class Engine:
+        scheduler = SimpleNamespace(
+            snapshot_for_admin=lambda: {
+                "running_by_id": {"gen-1": running_request},
+                "waiting": [],
+            }
+        )
+
+        def get_activity_snapshot(self):
+            return {"active_requests": 0, "activities": []}
+
+    data = _build_with_pool(FakeDFlashPool(Engine()))
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 1
+    assert model["active_requests"] == 1
+    assert model["generating"][0]["request_id"] == "gen-1"
+    assert model["activities"] == []

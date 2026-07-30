@@ -18,6 +18,7 @@ decision is tested in isolation.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -30,9 +31,10 @@ from omlx.scheduler import Scheduler
 def _make_fixture(monkeypatch, drafter_returns_uid):
     calls = {"route": 0, "bg_insert": 0, "events": []}
 
-    def fake_route(request, cache, last_tokens, sampler, sm):
+    def fake_route(request, cache, last_tokens, sampler, sm, logits_processors=None):
         calls["route"] += 1
         calls["events"].append("route")
+        calls["route_lps"] = logits_processors
         return -7 if drafter_returns_uid else None  # negative uid, or ineligible
 
     def fake_bg_insert(*args, **kwargs):
@@ -143,3 +145,105 @@ def test_routed_request_is_scheduled_exactly_once(monkeypatch):
 
     assert len(scheduled) == 1
     assert calls["route"] + calls["bg_insert"] == 1  # exactly one path taken
+
+
+def test_insert_prefilled_forwards_logits_processors_to_route(monkeypatch):
+    """#2399: routing must see the per-row logits processors so the gate in
+    _route_to_vlm_mtp can decline requests it cannot serve."""
+    sched, request, state, scheduled, calls = _make_fixture(
+        monkeypatch, drafter_returns_uid=True
+    )
+    sentinel = [lambda toks, logits: logits]
+    state.per_row_lps = sentinel
+
+    Scheduler._insert_prefilled_request(sched, request, state, scheduled)
+
+    assert calls["route_lps"] is sentinel
+
+
+# ---------------------------------------------------------------------------
+# #2399: _route_to_vlm_mtp gate on per-request logits processors
+# ---------------------------------------------------------------------------
+
+
+def _make_route_request():
+    return SimpleNamespace(
+        request_id="req-grammar",
+        sampling_params=SimpleNamespace(max_tokens=64, stop_token_ids=None),
+        rope_deltas=0.0,
+    )
+
+
+def test_route_declines_per_request_processors(caplog):
+    """Grammar / thinking budget / penalty processors have no application
+    point on the vlm_mtp path; routing must decline so BatchGenerator
+    enforces them. The fake self has no attributes past the gate, so
+    reaching further would raise AttributeError."""
+    sched = SimpleNamespace(_vlm_mtp_drafter=object())
+
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        uid = Scheduler._route_to_vlm_mtp(
+            sched,
+            _make_route_request(),
+            [object()],
+            [42],
+            lambda x: x,
+            object(),
+            logits_processors=[lambda toks, logits: logits],
+        )
+
+    assert uid is None
+    assert "per-request logits processors" in caplog.text
+
+
+def test_route_passes_gate_with_suppress_only_processors(caplog):
+    """The model-level suppress processor is reproduced via the sampler wrap,
+    so it alone must not decline routing. The fake model lacks
+    _language_model, so passing the gate surfaces as the later
+    rollback-hook decline, not the processor one."""
+    suppress = scheduler_mod._make_suppress_logits_processor({5})
+    assert getattr(suppress, "_omlx_suppress_processor", False)
+
+    sched = SimpleNamespace(
+        _vlm_mtp_drafter=object(),
+        _vlm_mtp_active={},
+        model=SimpleNamespace(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        uid = Scheduler._route_to_vlm_mtp(
+            sched,
+            _make_route_request(),
+            [object()],
+            [42],
+            lambda x: x,
+            object(),
+            logits_processors=[suppress],
+        )
+
+    assert uid is None
+    assert "per-request logits processors" not in caplog.text
+    assert "rollback_speculative_cache" in caplog.text
+
+
+def test_route_passes_gate_with_empty_processors(caplog):
+    """No processors at all (None or empty list) must not trigger the gate."""
+    for lps in (None, []):
+        sched = SimpleNamespace(
+            _vlm_mtp_drafter=object(),
+            _vlm_mtp_active={},
+            model=SimpleNamespace(),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            uid = Scheduler._route_to_vlm_mtp(
+                sched,
+                _make_route_request(),
+                [object()],
+                [42],
+                lambda x: x,
+                object(),
+                logits_processors=lps,
+            )
+        assert uid is None
+        assert "per-request logits processors" not in caplog.text

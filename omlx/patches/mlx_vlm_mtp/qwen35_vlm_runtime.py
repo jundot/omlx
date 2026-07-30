@@ -36,10 +36,13 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ..mlx_lm_mtp import prompt_priming
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,7 @@ def apply() -> bool:
     _patch_text_config(q35_config)
     _register_mtp_classes_for_vlm(q35_lang)
     _patch_vlm_language_model(q35_lang)
+    _patch_inner_model_capture(q35_lang)
     # VLMModelAdapter pass-throughs are installed by the MoE runtime patch
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
@@ -252,6 +256,11 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            # Prompt-priming capture runs inside the inner Qwen3_5Model
+            # forward, which has no reference back to this LanguageModel
+            # (the mtp module / make_mtp_cache live here). A weakref avoids
+            # a tracked module cycle in the nn.Module tree.
+            self.model._omlx_mtp_prime_host = weakref.ref(self)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.
@@ -331,6 +340,60 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls._omlx_mtp_runtime_patched = True
+
+
+# ---------------------------------------------------------------------------
+# Inner Qwen3_5Model — prompt-priming capture on prefill/decode forwards.
+# ---------------------------------------------------------------------------
+
+def _patch_inner_model_capture(q35_lang: Any) -> None:
+    """Wrap ``Qwen3_5Model.__call__`` to fold prompt chunks into the MTP head.
+
+    The inner model's return value is the trunk-normed hidden for every
+    position of the forward — exactly what the head history fold needs — and
+    scheduler prefill reaches it via the outer ``LanguageModel.__call__``
+    delegate, so this single wrap covers external prefill, chunked prefill
+    and the seam decode steps.
+
+    Skips: image/recursive calls (``inputs_embeds``), MTP verify and other
+    capture forwards (any of ``capture_layer_ids`` / ``hidden_sink`` /
+    ``gdn_sink``), unknown extra positional call shapes, and hosts without
+    an MTP head (weakref unset). All real gating lives in
+    ``prompt_priming.maybe_capture`` and fails safe to unprimed.
+    """
+    cls = q35_lang.Qwen3_5Model
+    if getattr(cls, "_omlx_mtp_prime_capture_patched", False):
+        return
+
+    original_call = cls.__call__
+
+    def __call__(
+        self, inputs, inputs_embeds=None, mask=None, cache=None, *args, **kwargs
+    ):
+        out = original_call(
+            self, inputs, inputs_embeds, mask, cache, *args, **kwargs
+        )
+        if (
+            inputs_embeds is None
+            and cache is not None
+            and not args
+            and kwargs.get("capture_layer_ids") is None
+            and kwargs.get("hidden_sink") is None
+            and kwargs.get("gdn_sink") is None
+        ):
+            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+            host = host_ref() if host_ref is not None else None
+            if host is not None:
+                try:
+                    prompt_priming.maybe_capture(host, inputs, out, cache)
+                except Exception:
+                    logger.debug(
+                        "MTP prompt-priming capture failed", exc_info=True
+                    )
+        return out
+
+    cls.__call__ = __call__
+    cls._omlx_mtp_prime_capture_patched = True
 
 
 # ---------------------------------------------------------------------------

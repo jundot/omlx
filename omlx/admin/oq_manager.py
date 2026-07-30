@@ -87,6 +87,7 @@ class QuantTask:
     imatrix_strict: bool = False
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
+    mtp_assistant_model_path: str = ""
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -259,6 +260,7 @@ class OQManager:
         imatrix_strict: bool = False,
         imatrix_num_samples: int = 128,
         imatrix_seq_length: int = 512,
+        mtp_assistant_model_path: str = "",
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -267,6 +269,10 @@ class OQManager:
             oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
+            mtp_assistant_model_path: Optional gemma4_assistant checkpoint
+                to merge into the output as a Lightning MTP head
+                (language_model.mtp.*). Validated against the base config
+                at submission.
 
         Returns:
             The created QuantTask.
@@ -279,6 +285,7 @@ class OQManager:
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
             resolve_output_name,
+            validate_gemma4_assistant_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
 
@@ -305,6 +312,16 @@ class OQManager:
             )
             preserve_mtp = False
 
+        if mtp_assistant_model_path:
+            assistant = Path(mtp_assistant_model_path)
+            if not assistant.exists() or not (assistant / "config.json").exists():
+                raise ValueError(
+                    f"Assistant model not found: {mtp_assistant_model_path}"
+                )
+            with open(assistant / "config.json") as f:
+                assistant_config = json.load(f)
+            validate_gemma4_assistant_pair(config, assistant_config)
+
         model_name = source.name
         output_name = resolve_output_name(
             model_name,
@@ -313,6 +330,8 @@ class OQManager:
             preserve_mtp=preserve_mtp,
             enhanced=enhanced,
         )
+        if mtp_assistant_model_path and not output_name.endswith("-mtp"):
+            output_name += "-mtp"
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -377,6 +396,7 @@ class OQManager:
             imatrix_strict=imatrix_strict,
             imatrix_num_samples=imatrix_num_samples,
             imatrix_seq_length=imatrix_seq_length,
+            mtp_assistant_model_path=mtp_assistant_model_path,
         )
         self._tasks[task_id] = task
 
@@ -557,6 +577,19 @@ class OQManager:
                     imatrix_num_samples=task.imatrix_num_samples,
                     imatrix_seq_length=task.imatrix_seq_length,
                 )
+
+                if task_id in self._cancelled:
+                    return
+
+                if task.mtp_assistant_model_path:
+                    from ..oq import combine_gemma4_assistant_mtp
+
+                    _progress_cb("saving", 97.0, "Merging assistant MTP head...")
+                    await asyncio.to_thread(
+                        combine_gemma4_assistant_mtp,
+                        task.output_path,
+                        task.mtp_assistant_model_path,
+                    )
 
                 if task_id in self._cancelled:
                     return

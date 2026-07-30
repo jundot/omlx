@@ -341,14 +341,17 @@ class BaseEngine(ABC):
         return None
 
 
-class BaseNonStreamingEngine(ABC):
-    """Base class for non-streaming engines (embedding, reranker).
+class ActivityTrackingMixin:
+    """In-flight operation tracking for admin visibility.
 
-    These engines compute outputs in a single forward pass and don't
-    support streaming or chat completion interfaces.
+    Engines that don't run requests through a Scheduler (non-streaming
+    engines, DFlashEngine) have no scheduler snapshot for the admin
+    Active Models card to read, so they track their own operations here
+    and expose them via get_activity_snapshot().
     """
 
     def __init__(self):
+        super().__init__()
         self._active_count = 0
         self._active_lock = threading.Lock()
         self._activities: Dict[str, Dict[str, Any]] = {}
@@ -479,6 +482,14 @@ class BaseNonStreamingEngine(ABC):
                 "active_requests": self._active_count,
                 "activities": activities,
             }
+
+
+class BaseNonStreamingEngine(ActivityTrackingMixin, ABC):
+    """Base class for non-streaming engines (embedding, reranker).
+
+    These engines compute outputs in a single forward pass and don't
+    support streaming or chat completion interfaces.
+    """
 
     @property
     @abstractmethod

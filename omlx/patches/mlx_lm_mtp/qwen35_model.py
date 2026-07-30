@@ -51,6 +51,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from . import prompt_priming
+
 logger = logging.getLogger(__name__)
 
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
@@ -490,6 +492,15 @@ def _patch_text_model(q35: Any) -> None:
             n_confirmed=n_confirmed,
         )
         normed = self.model.norm(hidden)
+        if not return_hidden and not n_confirmed and input_embeddings is None:
+            # Prompt-priming capture rides prefill/decode forwards; verify
+            # cycles (return_hidden) and confirmed-split forwards are the MTP
+            # cycle's own and must not double-fold head history. A capture
+            # failure must never break the forward itself.
+            try:
+                prompt_priming.maybe_capture(self, inputs, normed, cache)
+            except Exception:
+                logger.debug("MTP prompt-priming capture failed", exc_info=True)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(normed)
         else:

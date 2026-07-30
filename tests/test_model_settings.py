@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.model_settings import (
+    ModelSettings,
+    ModelSettingsManager,
+    resolve_vlm_mtp_conflicts,
+)
 
 
 class TestModelSettings:
@@ -660,3 +664,82 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+class TestVlmMtpProcessorExclusivity:
+    """#2399: vlm_mtp_enabled is mutually exclusive with settings that
+    materialize as per-request logits processors."""
+
+    def test_neutral_values_do_not_conflict(self):
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+        )
+        assert settings.vlm_mtp_enabled is True
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("repetition_penalty", 1.2),
+            ("presence_penalty", 0.5),
+            ("thinking_budget_enabled", True),
+            ("guided_grammar_enabled", True),
+        ],
+    )
+    def test_conflicting_setting_raises(self, field, value):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled cannot be combined"):
+            ModelSettings(vlm_mtp_enabled=True, **{field: value})
+
+    def test_conflicts_ignored_when_vlm_mtp_off(self):
+        settings = ModelSettings(
+            repetition_penalty=1.2,
+            thinking_budget_enabled=True,
+            guided_grammar_enabled=True,
+        )
+        assert settings.vlm_mtp_enabled is False
+
+    def test_resolve_helper_clears_vlm_mtp(self):
+        data, conflicts = resolve_vlm_mtp_conflicts(
+            {"vlm_mtp_enabled": True, "guided_grammar_enabled": True}
+        )
+        assert data["vlm_mtp_enabled"] is False
+        assert conflicts == ["guided_grammar_enabled"]
+
+    def test_resolve_helper_no_conflict_passthrough(self):
+        original = {"vlm_mtp_enabled": True, "repetition_penalty": 1.0}
+        data, conflicts = resolve_vlm_mtp_conflicts(original)
+        assert data is original
+        assert conflicts == []
+
+    def test_load_migrates_legacy_conflict_preserving_settings(self):
+        """A pre-rule settings file combining vlm_mtp with a penalty must load
+        with vlm_mtp disabled and every other field intact, instead of the
+        whole blob being dropped by the load-time except."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "models": {
+                            "legacy-model": {
+                                "vlm_mtp_enabled": True,
+                                "vlm_mtp_draft_model": "gemma-assistant",
+                                "repetition_penalty": 1.3,
+                                "max_context_window": 8192,
+                                "is_pinned": True,
+                            }
+                        },
+                    }
+                )
+            )
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            loaded = manager.get_settings("legacy-model")
+
+            assert loaded.vlm_mtp_enabled is False
+            assert loaded.repetition_penalty == 1.3
+            assert loaded.max_context_window == 8192
+            assert loaded.is_pinned is True
+            assert loaded.vlm_mtp_draft_model == "gemma-assistant"

@@ -196,6 +196,102 @@ def test_run_vlm_mtp_decode_single_scalar_array_unwraps_to_int():
     assert m_single.call_args.kwargs["first_bonus"] == 42
 
 
+class TestMTPRoundClearDrainsGPUWork:
+    """The per-token cache clear must drain the round's GPU work first.
+
+    mlx-vlm submits the MTP verify hidden state and the drafter's state
+    arrays with mx.async_eval, so mx.clear_cache() at the yield boundary can
+    release Metal buffers an in-flight command buffer still references (#300).
+    The drain has to name mlx-vlm's own thread-local stream: that is the
+    stream ``_mtp_rounds`` dispatches the verify/rollback forwards on
+    (``with mx.stream(generation_stream)``), and it is a different object from
+    mlx-lm's generation_stream. The helper's second, no-argument
+    mx.synchronize() covers the engine stream the scheduler advances the
+    generator under.
+    """
+
+    @staticmethod
+    def _recorder() -> tuple[list, object]:
+        streams: list = []
+        return streams, patch.object(
+            vlm_mtp,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: streams.append(stream),
+        )
+
+    def _assert_vlm_stream(self, streams: list, expected_calls: int) -> None:
+        from mlx_lm.generate import generation_stream as mlx_lm_stream
+
+        assert len(streams) == expected_calls, (
+            f"expected {expected_calls} synchronized clear(s), got {streams!r}"
+        )
+        assert all(s is vlm_mtp._vlm_generation_stream for s in streams), (
+            "MTP round cleared the Metal buffer cache without draining "
+            f"mlx-vlm's stream: {streams!r}"
+        )
+        assert vlm_mtp._vlm_generation_stream is not mlx_lm_stream
+
+    def test_single_round_loop_drains_before_every_token_yield(self):
+        """Each token yielded by ``_mtp_rounds`` is preceded by a synchronized
+        clear; the wrapper's own first_bonus yield needs none (no round has
+        run yet)."""
+        drafter = vlm_mtp.VLMMTPDrafter(
+            _fake_drafter_model("gemma4_assistant"), "mtp", "/p"
+        )
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                vlm_mtp, "_mtp_rounds", return_value=iter([(11, None), (22, None)])
+            ),
+            patch.object(vlm_mtp, "_buffer_mtp_target_cache"),
+        ):
+            gen = vlm_mtp.run_vlm_mtp_decode(
+                target_language_model=MagicMock(),
+                drafter=drafter,
+                prompt_cache=[],
+                hidden=mx.zeros((1, 1, 8)),
+                shared_kv_states={},
+                first_bonus=7,
+                max_tokens=4,
+                sampler=MagicMock(),
+            )
+            assert next(gen) == 7
+            assert streams == [], "first_bonus yield must not clear the cache"
+            assert next(gen) == 11
+            self._assert_vlm_stream(streams, 1)
+            assert next(gen) == 22
+            self._assert_vlm_stream(streams, 2)
+
+    def test_batch_round_loop_drains_before_every_round_yield(self):
+        drafter = vlm_mtp.VLMMTPDrafter(
+            _fake_drafter_model("gemma4_assistant"), "mtp", "/p"
+        )
+        streams, recording = self._recorder()
+        yielded = [([1, None, 3], None), ([None, None, None], None)]
+
+        with (
+            recording,
+            patch.object(vlm_mtp, "_mtp_rounds_batch", return_value=iter(yielded)),
+        ):
+            out = list(
+                vlm_mtp.run_vlm_mtp_decode(
+                    target_language_model=MagicMock(),
+                    drafter=drafter,
+                    prompt_cache=[],
+                    hidden=mx.zeros((3, 1, 8)),
+                    shared_kv_states={},
+                    first_bonus=mx.array([1, 2, 3]),
+                    max_tokens=4,
+                    sampler=MagicMock(),
+                )
+            )
+
+        assert out == [[1, 2, 3], [1, None, 3], [None, None, None]]
+        self._assert_vlm_stream(streams, 2)
+
+
 @pytest.mark.parametrize(
     "vlm_mtp_kw, other_kw",
     [

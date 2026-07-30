@@ -44,6 +44,13 @@ import mlx.nn as nn
 
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 
+# The round loops dispatch their target-verify and cache-rollback forwards
+# inside ``with mx.stream(generation_stream)``, using mlx-vlm's own
+# thread-local stream — a different object from mlx-lm's generation_stream
+# and from the per-engine stream. Draining the MTP work means draining this
+# one, resolved on the thread that advances the round loop.
+from mlx_vlm.speculative.common import generation_stream as _vlm_generation_stream
+
 # PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
 # into ``mlx_vlm.speculative.utils``. Import directly from the new location —
 # the symbols are still ``_``-prefixed but this is now their canonical home.
@@ -55,6 +62,7 @@ except Exception:  # pragma: no cover - compatibility with older mlx-vlm
     def _buffer_mtp_target_cache(*_args: Any, **_kwargs: Any) -> None:
         return None
 
+from ..utils.metal_sync import _sync_and_clear_cache
 from ..utils.model_loading import materialize_lazy_state
 
 logger = logging.getLogger(__name__)
@@ -362,7 +370,15 @@ def run_vlm_mtp_decode(
             # _mtp_rounds_batch in mlx_vlm/speculative/utils.py). On large
             # targets like Gemma 4 31B the buffer pool balloons between
             # those flushes (issue #1416). Clearing per round bounds it.
-            mx.clear_cache()
+            #
+            # The round leaves work in flight on two streams at this yield
+            # boundary: mlx-vlm async_evals the verify hidden state and the
+            # drafter's state arrays. The helper drains the stream it is
+            # given plus the current default stream, so passing mlx-vlm's
+            # stream covers the verify forwards while the default-stream
+            # drain covers the engine stream the scheduler advances this
+            # generator under (``with mx.stream(self._stream)``).
+            _sync_and_clear_cache(_vlm_generation_stream)
             yield tokens
         return
 
@@ -387,5 +403,6 @@ def run_vlm_mtp_decode(
         draft_block_size=draft_block_size,
         token_dtype=token_dtype,
     ):
-        mx.clear_cache()
+        # Same two-stream drain as the batched branch above.
+        _sync_and_clear_cache(_vlm_generation_stream)
         yield tok

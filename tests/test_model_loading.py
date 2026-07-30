@@ -387,6 +387,46 @@ class TestVlmMtpPreLoadDispatch:
         runtime_mock.assert_not_called()
         assert calls == []
 
+    def test_gemma4_merged_assistant_dispatch(self, tmp_path, monkeypatch):
+        # Gemma 4 merged-assistant checkpoints (assistant weights under
+        # language_model.mtp.* + text_config.mtp_assistant_config) route
+        # through the same VLM MTP pre-load dispatch as Qwen3.5/3.6.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
+        # Plain gemma4 VLMs (no merged assistant) must stay untouched by
+        # the MTP dispatch — no declared heads, no runtime patch.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, "text_config": {}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        runtime_mock.assert_not_called()
+        attach_mock.assert_not_called()
+        assert "runtime" not in calls
+
     def test_qwen36_moe_vlm_sanitize_when_no_mtp_heads(self, tmp_path, monkeypatch):
         # mlx-lm Qwen3.6 MoE VLMs without MTP heads still need the mlx-vlm
         # sanitize replacement so pre-converted switch_mlp weights load.

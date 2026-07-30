@@ -416,6 +416,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
@@ -1428,6 +1429,22 @@
                     (model) => this.isVlmMtpDraftModel(model),
                     { fallbackToBase: false },
                 );
+            },
+
+            // Settings that materialize as per-request logits processors,
+            // which the VLM MTP decode path cannot apply (#2399). Mirrors
+            // vlm_mtp_processor_conflicts() in model_settings.py; neutral
+            // values (repetition 1.0, presence 0.0) do not conflict.
+            vlmMtpProcessorConflict() {
+                const ms = this.modelSettings;
+                if (!ms) return false;
+                const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+                const rep = num(ms.repetition_penalty);
+                const pres = num(ms.presence_penalty);
+                return (rep !== null && rep !== 1.0)
+                    || (pres !== null && pres !== 0.0)
+                    || !!ms.enableThinkingBudget
+                    || !!ms.guided_grammar_enabled;
             },
 
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
@@ -4852,6 +4869,8 @@
                         text_only: this.oqTextOnly,
                         dtype: this.oqDtype,
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                        mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
+                            ? this.oqMtpAssistantPath : '',
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -4960,6 +4979,15 @@
                     m.is_quantized &&
                     m.model_type === source.model_type
                 );
+            },
+
+            oqMtpAssistantCandidates() {
+                // Gemma 4 ships its MTP head as a separate gemma4_assistant
+                // checkpoint; offer to merge it into the quantized output.
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source || source.model_type !== 'gemma4') return [];
+                return this.oqAllModels.filter(m => m.model_type === 'gemma4_assistant');
             },
 
             oqLevelLabel(level) {

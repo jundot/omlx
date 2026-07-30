@@ -107,6 +107,9 @@ class EngineEntry:
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
+    # Requested load-time variant. This deliberately tracks the settings that
+    # produced the engine, even when an optional accelerator fails soft and the
+    # engine falls back, so identical requests keep reusing that fallback.
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
@@ -287,8 +290,6 @@ class EnginePool:
         self,
         model_id: str,
         runtime_settings: object | None = None,
-        *,
-        loaded_engine: object | None = None,
     ) -> tuple[tuple[str, str], ...] | None:
         settings = runtime_settings
         if settings is None and self._settings_manager is not None:
@@ -302,9 +303,6 @@ class EnginePool:
         data = to_dict() if callable(to_dict) else {}
         entry = self._entries.get(model_id)
         is_diffusion = bool(entry and self._entry_is_diffusion_model(entry))
-        loaded_engine_name = (
-            type(loaded_engine).__name__ if loaded_engine is not None else None
-        )
 
         def has_value(key: str) -> bool:
             value = data.get(key)
@@ -353,8 +351,6 @@ class EnginePool:
             and has_value("dflash_draft_model")
             and not is_diffusion
         )
-        if loaded_engine_name is not None:
-            dflash_active = loaded_engine_name == "DFlashEngine"
         add("dflash_enabled", dflash_active)
         if dflash_active:
             add("dflash_draft_model", data.get("dflash_draft_model"))
@@ -397,11 +393,6 @@ class EnginePool:
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"
         )
-        if loaded_engine is not None and vlm_mtp_active:
-            drafter = getattr(loaded_engine, "vlm_mtp_drafter", None)
-            if callable(drafter):
-                drafter = drafter()
-            vlm_mtp_active = drafter is not None
         add("vlm_mtp_enabled", vlm_mtp_active)
         if vlm_mtp_active:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
@@ -2014,10 +2005,13 @@ class EnginePool:
                         f"load failed; toggle ignored"
                     )
 
+            # Keep the requested construction variant as the reuse key. DFlash
+            # and VLM MTP are fail-soft: either can leave a normal engine in
+            # place. Recording that effective engine as a different variant
+            # makes the next identical concurrent request attempt a reload and
+            # fail with ModelBusyError before it reaches the scheduler (#2406).
             entry.runtime_settings_signature = self._engine_runtime_signature(
-                model_id,
-                model_settings,
-                loaded_engine=engine,
+                model_id, model_settings
             )
 
             # Propagate memory limit to new engine's scheduler

@@ -100,6 +100,7 @@ def apply_mlx_lm_mtp_patch() -> bool:
         batch_generator,
         cache_rollback,
         deepseek_v4_model,
+        gemma4_text_model,
         glm_moe_dsa_model,
         nemotron_h_chain,
         nemotron_h_model,
@@ -108,6 +109,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
 
     if not cache_rollback.apply():
         return False
+    if not gemma4_text_model.apply():
+        logger.debug("gemma4 text sanitize patch did not apply (likely import error)")
     if not qwen35_model.apply():
         # Qwen models are the main target; if the qwen patch refuses we
         # still continue so DeepSeek-V4 users aren't blocked.

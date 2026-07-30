@@ -1034,6 +1034,113 @@ class TestEnginePoolAsync:
         base_engine.stop.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_dflash_start_fallback_reuses_requested_variant_while_leased(
+        self, pool_with_mock_engines
+    ):
+        """Identical DFlash requests must reuse a fail-soft fallback (#2406)."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        settings = ModelSettings(
+            dflash_enabled=True,
+            dflash_draft_model="/draft",
+        )
+
+        class DFlashEngine:
+            pass
+
+        dflash_engine = DFlashEngine()
+        dflash_engine.start = AsyncMock(side_effect=RuntimeError("draft load failed"))
+        dflash_engine.stop = AsyncMock()
+
+        fallback_engine = MagicMock()
+        fallback_engine.start = AsyncMock()
+        fallback_engine.stop = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine.dflash.DFlashEngine",
+                return_value=dflash_engine,
+            ),
+            patch("omlx.engine_pool.BatchedEngine", return_value=fallback_engine),
+        ):
+            first = await pool.get_engine(
+                "model-a",
+                runtime_settings=settings,
+                _lease=True,
+            )
+            second = await pool.get_engine(
+                "model-a",
+                runtime_settings=settings,
+                _lease=True,
+            )
+
+        entry = pool.get_entry("model-a")
+        assert first is fallback_engine
+        assert second is fallback_engine
+        assert entry.in_use == 2
+        assert entry.runtime_settings_signature == pool._engine_runtime_signature(
+            "model-a", settings
+        )
+        dflash_engine.start.assert_awaited_once()
+        dflash_engine.stop.assert_awaited_once()
+        fallback_engine.start.assert_awaited_once()
+        fallback_engine.stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vlm_mtp_fallback_reuses_requested_variant_while_leased(
+        self, pool_with_mock_engines
+    ):
+        """A failed optional VLM MTP drafter must not create a reload loop."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model="/assistant",
+        )
+
+        class VlmMtpFallbackEngine:
+            def __init__(self):
+                self.start = AsyncMock()
+                self.stop = AsyncMock()
+                self.set_vlm_mtp_drafter = MagicMock()
+
+            def vlm_mtp_drafter(self):
+                return None
+
+        fallback_engine = VlmMtpFallbackEngine()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=fallback_engine),
+            patch(
+                "omlx.speculative.vlm_mtp.load_vlm_mtp_drafter",
+                return_value=None,
+            ),
+        ):
+            first = await pool.get_engine(
+                "model-a",
+                runtime_settings=settings,
+                _lease=True,
+            )
+            second = await pool.get_engine(
+                "model-a",
+                runtime_settings=settings,
+                _lease=True,
+            )
+
+        entry = pool.get_entry("model-a")
+        assert first is fallback_engine
+        assert second is fallback_engine
+        assert entry.in_use == 2
+        assert entry.runtime_settings_signature == pool._engine_runtime_signature(
+            "model-a", settings
+        )
+        fallback_engine.start.assert_awaited_once()
+        fallback_engine.stop.assert_not_awaited()
+        fallback_engine.set_vlm_mtp_drafter.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_runtime_sampling_only_profile_reuses_loaded_engine(
         self, pool_with_mock_engines
     ):

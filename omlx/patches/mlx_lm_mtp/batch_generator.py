@@ -72,12 +72,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from . import cache_rollback as _rollback_mod
+from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,13 @@ def apply() -> bool:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
+            if getattr(self, "_omlx_mtp_tax_probe", None) is not None:
+                step_t0 = time.perf_counter()
+                result = original_next(self, *args, **kwargs)
+                _record_std_tax_sample(
+                    self, (time.perf_counter() - step_t0) * 1000.0
+                )
+                return result
             return original_next(self, *args, **kwargs)
 
         def patched_extend(self, batch, *args, **kwargs):
@@ -183,6 +192,12 @@ def apply() -> bool:
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
             _drop_invalid_mtp_batch_state(self, "extend")
+            # Priming only serves a singleton timeline: once this batch
+            # holds >1 rows, the context can never be consumed — release
+            # its head cache now instead of riding the merged decode.
+            uids = getattr(self, "uids", None)
+            if not uids or len(uids) != 1:
+                _prompt_priming.drop_ctx(getattr(self, "model", None))
             return result
 
         def patched_filter(self, keep, *args, **kwargs):
@@ -304,6 +319,10 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
 
 
 def _mtp_common_eligible(gen_batch: Any) -> bool:
+    if getattr(gen_batch, "_omlx_mtp_parked", False):
+        # This batch already proved speculation loses to plain decoding
+        # (depth controller parked and handed off); do not re-activate.
+        return False
     if not hasattr(gen_batch, "model"):
         return False
     if not hasattr(gen_batch.model, "mtp_forward"):
@@ -562,6 +581,8 @@ class _MtpStats:
     # of those were verified. Depth-1 legacy path fills index 0 only.
     depth_drafted: List[int] = field(default_factory=list)
     depth_accepted: List[int] = field(default_factory=list)
+    # Cycles the depth controller parked at 0 (plain steps, no speculation).
+    zero_cycles: int = 0
     # Component-level timings. Help diagnose where MTP overhead comes from
     # when accept rate is healthy but wall-clock throughput isn't.
     backbone_ms: float = 0.0  # cumulative time inside the 2-token verify forward
@@ -703,7 +724,15 @@ def _drop_mtp_state(
     *,
     log_stats: bool = False,
 ) -> Optional[_MtpState]:
-    """Delete attached MTP state, optionally surfacing stats for external finish."""
+    """Delete attached MTP state, optionally surfacing stats for external finish.
+
+    Deliberately does NOT drop the prompt-priming context: mlx-lm's insert
+    flow routes every fresh singleton through ``extend()`` (donor merge),
+    which drops MTP state defensively — but the priming context must survive
+    that hop or activation always sees an unprimed cache. The context is
+    released at activation (``take_primed``), on real multi-row merges
+    (``patched_extend``), or with the cache itself at request end.
+    """
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if state is None:
         return None
@@ -998,8 +1027,9 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
         return None
 
     logger.info(
-        "MTP path activated for uid=%s (model has mtp_forward, batch=1)",
+        "MTP path activated for uid=%s (model has mtp_forward, batch=1, primed=%d)",
         state.uid,
+        max(0, int(getattr(state, "hist_offset", 0)) - 1),
     )
     return state
 
@@ -1399,11 +1429,10 @@ def _trunk_norm_module(model: Any):
     return inner.model.norm
 
 
-# The MTP head is fed the trunk's *post-norm* hidden and chains on its own
-# post-norm output. Measured on Qwen3.6-27B this accepts a few points higher
-# than PR 990's pre-norm at every depth. Draft-side only, so output identity
-# is unaffected regardless.
-_HEAD_HIDDEN_POST_NORM = True
+# Single source of truth lives in prompt_priming: the prefill-time priming
+# folds and the decode-time history folds here must use the same hidden
+# variant or the primed history would be inconsistent with the chained one.
+_HEAD_HIDDEN_POST_NORM = _prompt_priming.HEAD_HIDDEN_POST_NORM
 
 
 def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
@@ -1413,6 +1442,64 @@ def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
         extra = current - offset
         if extra > 0:
             c.trim(extra)
+
+
+# Loop-tax measurement (feeds _DepthController.EXIT_MARGIN): right after a
+# hand-off the standard decoder runs on the same model, machine, and
+# context, so the ratio of the exit-time t[0] to the measured standard-step
+# time IS the MTP loop's synchronous-cycle tax. Stored on the model
+# instance so later sequences exit against a measured margin instead of
+# the fallback prior.
+_STD_TAX_SKIP = 2  # first post-hand-off steps still carry transition costs
+_STD_TAX_SAMPLES = 8
+_STD_TAX_EMA = 0.5
+_STD_TAX_MAX = 1.5
+
+
+def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float]) -> None:
+    if t0_ms and t0_ms > 0.0:
+        gen_batch._omlx_mtp_tax_probe = {
+            "t0": float(t0_ms),
+            "skip": _STD_TAX_SKIP,
+            "samples": [],
+        }
+
+
+def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
+    probe = getattr(gen_batch, "_omlx_mtp_tax_probe", None)
+    if probe is None:
+        return
+    if probe["skip"] > 0:
+        probe["skip"] -= 1
+        return
+    probe["samples"].append(float(duration_ms))
+    if len(probe["samples"]) < _STD_TAX_SAMPLES:
+        return
+    try:
+        delattr(gen_batch, "_omlx_mtp_tax_probe")
+    except AttributeError:
+        pass
+    samples = sorted(probe["samples"])
+    t_std = samples[len(samples) // 2]
+    if t_std <= 0.0:
+        return
+    tax = min(_STD_TAX_MAX, max(1.0, probe["t0"] / t_std))
+    model = getattr(gen_batch, "model", None)
+    if model is None:
+        return
+    prev = getattr(model, "_omlx_mtp_loop_tax", None)
+    if prev:
+        tax = (1.0 - _STD_TAX_EMA) * float(prev) + _STD_TAX_EMA * tax
+    try:
+        model._omlx_mtp_loop_tax = tax
+    except Exception:
+        return
+    logger.debug(
+        "MTP loop tax measured: %.3f (parked t0=%.1fms, std step=%.1fms)",
+        tax,
+        probe["t0"],
+        t_std,
+    )
 
 
 class _DepthController:
@@ -1449,6 +1536,24 @@ class _DepthController:
       large share of cycles probing, so probing is duty-bounded to
       ~``PROBE_DUTY`` of cycles — a scale-free ratio, not a per-model tuning.
 
+    Depth 0 — the escape hatch: speculation is only profitable while the
+    multi-token verify forward is cheap relative to a plain decode step.
+    On models with a large L=1 -> L=2 forward-cost jump (gemma4 head_dim
+    256/512 leaves the single-token attention kernel; MoE expert loads
+    scale with verify tokens) the whole depth menu can be worse than
+    standard decoding — measured 0.67x on gemma4 26B story/16k with the
+    best depth choice. Depth 0 runs the cycle as a plain 1-token step
+    ([next_main] only, no drafts, no rollback) whose cost is tracked as
+    ``t[0]`` through the same EMA/probe machinery, so the controller
+    parks at 0 when every speculative depth loses and re-enters through
+    the existing bidirectional probes. ``t[0]`` gets its first real
+    measurement from the warmup sweep (which ends with one depth-0
+    cycle) and stays fresh via parked cycles and the staleness explorer.
+    Parking alone is not enough on fast backbones — a parked cycle still
+    pays the MTP loop's synchronous host round-trip that the standard
+    decoder pipelines away — so a sustained park hands the sequence back
+    to the standard step entirely (``_park_mtp_to_standard``).
+
     Content-adaptive by construction: prose/chat settles at depth 1,
     code/predictable text climbs. Rejected alternatives (interleaved
     in-process A/B, rotated order, paired per rep, on Qwen3.6-35B-A3B +
@@ -1475,10 +1580,32 @@ class _DepthController:
     # measured slope between depths. 7 ms matches dense backbones (6-10 ms).
     MARGINAL_MS = 7.0
     HYSTERESIS = 1.03  # switch depth only for a >3% score gain
+    # Hand-off gate: ``t[0]`` is measured INSIDE the MTP loop, so it carries
+    # the loop's synchronous host round-trip that the standard decoder
+    # pipelines away. Speculation that cannot beat this taxed baseline by
+    # EXIT_MARGIN is losing to the real standard step; after EXIT_STREAK
+    # consecutive losing decisions the sequence leaves the MTP path
+    # entirely (_park_mtp_to_standard). EXIT_MARGIN is only the
+    # pre-measurement fallback (like MARGINAL_MS): each hand-off measures
+    # the actual standard-step rate right after it and stores the real
+    # loop tax on the model instance, which seeds later controllers via
+    # the ``exit_margin`` constructor arg — machine/model-measured, not
+    # a hardcoded ratio.
+    EXIT_MARGIN = 1.15
+    EXIT_STREAK = 16
 
-    def __init__(self, max_depth: int, marginal_ms: Optional[float] = None):
+    def __init__(
+        self,
+        max_depth: int,
+        marginal_ms: Optional[float] = None,
+        exit_margin: Optional[float] = None,
+    ):
         if marginal_ms:
             self.MARGINAL_MS = float(marginal_ms)
+        if exit_margin:
+            self.EXIT_MARGIN = min(
+                _STD_TAX_MAX, max(1.0, float(exit_margin))
+            )
         self.max_depth = max(1, int(max_depth))
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
         self.p = [0.6] * self.max_depth
@@ -1486,15 +1613,23 @@ class _DepthController:
         self.t_age: Dict[int, float] = {}  # ms since each depth was measured
         self.cycles = 0
         self.probe_left = 0
+        self.exit_streak = 0
         self._ms_probe = 0.0  # wall-time since any probe burst
         self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
-        # Measure each depth once (max..1) before the score gate takes over, so
-        # t[] and the marginal estimate are data-driven within max_depth cycles.
+        # Measure each depth once (max..1), then the depth-0 plain step
+        # three times, before the score gate takes over — t[], including
+        # the baseline the exit decision compares against, is data-driven
+        # within max_depth + 3 cycles. The baseline gets extra samples
+        # because it may never be selected again (no refresh path), and
+        # the one-way exit decision must not hang on a single first-run
+        # sample; plain-step warmup cycles cost almost nothing.
         self._warmup: List[int] = list(range(self.max_depth, 0, -1))
+        if self.max_depth > 1:
+            self._warmup.extend([0, 0, 0])
 
     def observe(self, used: int, accepted: int, cycle_ms: float) -> None:
         self.cycles += 1
-        used = max(1, min(int(used), self.max_depth))
+        used = max(0, min(int(used), self.max_depth))
         accepted = max(0, min(int(accepted), used))
         # Acceptance: token-domain EMA (a property of model/content, not load).
         a = self.ALPHA
@@ -1512,6 +1647,11 @@ class _DepthController:
         self.t_age[used] = 0.0
         self._ms_probe += cycle_ms
         self._ms_explore += cycle_ms
+
+        if self._speculation_losing():
+            self.exit_streak += 1
+        else:
+            self.exit_streak = 0
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
@@ -1567,6 +1707,12 @@ class _DepthController:
         if prev is None:
             self.t[used] = cycle_ms
             return
+        if self._warmup:
+            # Repeated warmup samples (the depth-0 tail): keep the fastest.
+            # First-run shape/branch warmup inflates early samples, and the
+            # slow EMA below would freeze that bias into the exit decision.
+            self.t[used] = min(prev, cycle_ms)
+            return
         # Deliberately a per-cycle EMA, NOT an irregular-sampling EMA weighted
         # by staleness age. Age-weighting (nearly replacing a stale estimate at
         # the first probe cycle) is the textbook form, but it was measured
@@ -1600,8 +1746,16 @@ class _DepthController:
             return self.t[d]
         if not self.t:
             return 30.0 + self.MARGINAL_MS * d
+        if d == 0:
+            # The plain step sits below the L=1 -> L=2 verify jump, so the
+            # per-row marginal says nothing about it. Estimate it at the
+            # cheapest measured cycle: conservative (true t[0] is lower),
+            # which keeps an unmeasured baseline from hijacking probes —
+            # yet still within PROBE_MARGIN exactly when acceptance is so
+            # poor that the baseline is a genuine rival.
+            return min(self.t.values())
         ref = min(self.t, key=lambda x: abs(x - d))
-        return self.t[ref] + self._marginal_est() * (d - ref)
+        return max(1e-3, self.t[ref] + self._marginal_est() * (d - ref))
 
     def _score(self, d: int) -> float:
         expected = 1.0
@@ -1610,6 +1764,40 @@ class _DepthController:
             run *= self.p[j]
             expected += run
         return expected / max(1e-6, self._t_est(d))
+
+    def _speculation_losing(self) -> bool:
+        # True when the best speculative depth cannot beat the (taxed)
+        # in-loop baseline by EXIT_MARGIN. Only meaningful once the warmup
+        # sweep has measured t[0].
+        if self._warmup or 0 not in self.t:
+            return False
+        base = self._score(0)
+        if base <= 0.0:
+            return False
+        best = max(self._score(d) for d in range(1, self.max_depth + 1))
+        return best < base * self.EXIT_MARGIN
+
+    def should_exit(self) -> bool:
+        """Sustained losing speculation: hand the sequence back to the
+        standard decoder."""
+        return self.exit_streak >= self.EXIT_STREAK
+
+    def _select_candidates(self) -> List[int]:
+        # Depth 0 is only selectable once its cost has actually been
+        # measured (or seeded) — an extrapolated baseline must never PARK
+        # the sequence, only motivate a probe.
+        ds = list(range(1, self.max_depth + 1))
+        if 0 in self.t:
+            ds.insert(0, 0)
+        return ds
+
+    def _probe_candidates(self) -> List[int]:
+        # Probing depth 0 is always safe (it IS a plain decode step), so
+        # the baseline is discoverable before any measurement exists.
+        # Speculative depths come first: on an unmeasured-vs-unmeasured
+        # staleness tie they keep priority (warmup semantics), while a
+        # never-measured baseline still outranks any finite age.
+        return list(range(1, self.max_depth + 1)) + [0]
 
     def _best_rival(self) -> Optional[int]:
         # The highest-scoring depth other than cur, if within PROBE_MARGIN —
@@ -1622,7 +1810,7 @@ class _DepthController:
             return self._most_stale()
         rival = None
         rival_score = 0.0
-        for d in range(1, self.max_depth + 1):
+        for d in self._probe_candidates():
             if d == self.cur:
                 continue
             s = self._score(d)
@@ -1638,7 +1826,7 @@ class _DepthController:
         # that fresh-vs-stale comparison bias stays bounded.
         cand = None
         worst = -1.0
-        for d in range(1, self.max_depth + 1):
+        for d in self._probe_candidates():
             if d == self.cur:
                 continue
             age = self.t_age.get(d)
@@ -1648,15 +1836,15 @@ class _DepthController:
         return cand
 
     def _best(self) -> int:
-        # argmax of measured score with switch hysteresis; the shallow-to-deep
-        # scan with strict '>' keeps the lower depth on an exact tie.
-        scores = [self._score(d) for d in range(1, self.max_depth + 1)]
-        best_i = 0
-        for i in range(1, self.max_depth):
-            if scores[i] > scores[best_i]:
-                best_i = i
-        best_d = best_i + 1
-        if best_d != self.cur and scores[best_i] < scores[self.cur - 1] * self.HYSTERESIS:
+        # argmax of measured score with switch hysteresis; ascending scan
+        # with strict '>' keeps the shallower choice on an exact tie.
+        best_d = self.cur
+        best_score = -1.0
+        for d in self._select_candidates():
+            s = self._score(d)
+            if s > best_score:
+                best_d, best_score = d, s
+        if best_d != self.cur and best_score < self._score(self.cur) * self.HYSTERESIS:
             return self.cur
         return best_d
 
@@ -1726,6 +1914,19 @@ def _chain_next_drafts(
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
 
+    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth == 0 and not state.mtp_cache:
+        # Depth-0 with a stateless head (no cache to keep warm, e.g. the
+        # gemma4 assistant): skip the fold entirely — on fast backbones its
+        # head forward + trunk norm is a measurable per-step tax (~15% of a
+        # plain step on gemma4 26B) that would keep the parked throughput
+        # below baseline. Head-history models keep folding below so their
+        # cache stays consistent for re-entry.
+        state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = []
+        return
+
     if _HEAD_HIDDEN_POST_NORM and hidden_rows.ndim == 3:
         hidden_rows = _trunk_norm_module(model)(hidden_rows)
 
@@ -1745,7 +1946,6 @@ def _chain_next_drafts(
 
     chain_prefix = committed[-1:]
     h = head_hidden[:, -1:]
-    depth = state.controller.cur if state.controller is not None else state.depth
     chain_cache = state.mtp_cache
     if state.head_clone and depth > 1:
         chain_cache = _clone_mtp_head_cache(state.mtp_cache)
@@ -1772,12 +1972,19 @@ def _chain_next_drafts(
         )
         h = head_hidden[:, -1:]
 
-    state.drafts = mx.concatenate(draft_toks)
+    if draft_toks:
+        state.drafts = mx.concatenate(draft_toks)
+        # Fire-and-forget dispatch: the GPU evaluates the chain while the
+        # host finishes emit bookkeeping; the next cycle's sync finds it
+        # materialized.
+        mx.async_eval(state.drafts)
+    else:
+        # Depth 0 (controller escape hatch): no drafts — the next cycle
+        # verifies [next_main] alone, i.e. a plain decode step. The fold
+        # above still ran so head-history models stay warm for re-entry.
+        state.drafts = mx.zeros((0,), dtype=mx.uint32)
     state.draft_lps = draft_lps
     state.draft_accept_lps = draft_accept_lps
-    # Fire-and-forget dispatch: the GPU evaluates the chain while the host
-    # finishes emit bookkeeping; the next cycle's sync finds it materialized.
-    mx.async_eval(state.drafts)
 
 
 # ---------------------------------------------------------------------------
@@ -1852,8 +2059,17 @@ def _post_init_mtp(gen_batch: Any) -> None:
                 marginal_ms=getattr(
                     gen_batch.model, "_omlx_mtp_marginal_ms", None
                 ),
+                exit_margin=getattr(
+                    gen_batch.model, "_omlx_mtp_loop_tax", None
+                ),
             )
-        state.mtp_cache = gen_batch.model.make_mtp_cache()
+        primed = _prompt_priming.take_primed(
+            gen_batch.model, gen_batch.prompt_cache, main_tok
+        )
+        if primed is not None:
+            state.mtp_cache, state.hist_offset = primed
+        else:
+            state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
         state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
         state.queue.append(
@@ -1871,6 +2087,9 @@ def _post_init_mtp(gen_batch: Any) -> None:
 
     # MTP head sees (hidden_at_main, next_main_tok) and proposes the draft
     # that the *next* verify cycle will check against forward([next_main, draft]).
+    # The legacy depth-1 cycle rebuilds head history per cycle and never
+    # consumes a primed cache; release any capture leftovers.
+    _prompt_priming.drop_ctx(gen_batch.model)
     mtp_cache = gen_batch.model.make_mtp_cache()
     hidden_at_main = hidden[:, -1:, :]  # (1, 1, H)
     next_ids = next_main_tok.reshape(1, 1)
@@ -2025,6 +2244,47 @@ def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[A
     return responses
 
 
+def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Hand a parked sequence back to the standard pipelined decoder.
+
+    At a depth-0 cycle boundary the cache is committed-only and compact, so
+    unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
+    ``state.next_main`` (already streamed, not yet in the cache), sample its
+    successor as ``_next_tokens``, and drop the MTP state. The batch is
+    marked so eligibility never re-activates MTP — the controller already
+    proved speculation loses here, and the standard step's async pipelining
+    is what the parked cycles cannot match.
+    """
+    import mlx.core as mx
+
+    if state.next_main is None:
+        return False
+    try:
+        procs = _proc_list(gen_batch)
+        _set_singleton_mrope_delta(gen_batch)
+        prev_buf = None
+        if procs is not None:
+            prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
+        logits, _, _ = _call_backbone(
+            gen_batch.model, state.next_main[:, None], gen_batch.prompt_cache
+        )
+        last = _apply_processors(procs, prev_buf, logits[:, -1, :])
+        lp_2d = _logprobs(last)
+        next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(lp_2d))
+        mx.eval(next_tok)
+        gen_batch._next_tokens = next_tok
+        gen_batch._next_logprobs = [lp_2d.squeeze(0)]
+    except Exception as exc:
+        logger.debug("MTP park-to-standard handoff failed: %s", exc)
+        return False
+    gen_batch._omlx_mtp_parked = True
+    if state.controller is not None:
+        _arm_std_tax_probe(gen_batch, state.controller.t.get(0))
+    state._finish_reason = "parked"
+    _drop_mtp_state(gen_batch, "parked-at-depth-0", log_stats=True)
+    return True
+
+
 def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     """Emit one token; run a verify cycle if the queue is empty."""
     if state.queue:
@@ -2041,6 +2301,15 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
+    if (
+        state.chain
+        and state.controller is not None
+        and state.controller.should_exit()
+        and not state.queue
+    ):
+        # Emit this cycle's token either way; on a successful handoff the
+        # next next() call runs the standard step with _next_tokens set.
+        _park_mtp_to_standard(gen_batch, state)
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 
@@ -2070,6 +2339,8 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         ) + "]"
     else:
         depth_str = ""
+    if stats.zero_cycles:
+        depth_str += f" d0={stats.zero_cycles}"
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
@@ -2172,7 +2443,20 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         )
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
 
-    if is_greedy:
+    if k == 0:
+        # Depth-0 cycle (controller escape hatch): the forward above was a
+        # plain 1-token step at [next_main]; sample its next token and emit
+        # it as the bonus. No drafts to accept, nothing to roll back —
+        # per-cycle cost is the baseline step the controller tracks as t[0].
+        step_tok = _ensure_uint32(sampler(combined_lp[:1]).reshape(1))
+        m = 0
+        draft_ids: List[int] = []
+        emit_last_id = int(step_tok.tolist()[0])
+        emit_last_lp = combined_lp[0]
+        state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        state.stats.zero_cycles += 1
+    elif is_greedy:
         targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
         matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
         m_arr = mx.cumprod(matches).sum().reshape(1)

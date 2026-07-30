@@ -83,16 +83,17 @@ def apply_mlx_vlm_mtp_runtime_patch() -> bool:
     the runtime infrastructure so VLMBatchedEngine can actually invoke
     the MTP head at inference time.
 
-    Covers both Qwen3.5-MoE (qwen3_5_moe) and dense Qwen3.5/3.6
-    (qwen3_5) VLM families. Each sub-patch tracks its own ``_APPLIED``
-    flag, so calling repeatedly is cheap once both have settled.
-    Returns True if at least one sub-patch applied successfully — a
-    given model only needs whichever matches its model_type.
+    Covers Qwen3.5-MoE (qwen3_5_moe), dense Qwen3.5/3.6 (qwen3_5) and
+    Gemma 4 merged-assistant (gemma4) VLM families. Each sub-patch tracks
+    its own ``_APPLIED`` flag, so calling repeatedly is cheap once all
+    have settled. Returns True if at least one sub-patch applied
+    successfully — a given model only needs whichever matches its
+    model_type.
 
     Should be called *before* ``mlx_vlm.utils.load(...)`` so the
     instantiated LanguageModel picks up the patched ``__init__``.
     """
-    from . import qwen35_moe_vlm_runtime, qwen35_vlm_runtime
+    from . import gemma4_vlm_runtime, qwen35_moe_vlm_runtime, qwen35_vlm_runtime
 
     moe_ok = qwen35_moe_vlm_runtime.apply()
     if not moe_ok:
@@ -100,5 +101,8 @@ def apply_mlx_vlm_mtp_runtime_patch() -> bool:
     dense_ok = qwen35_vlm_runtime.apply()
     if not dense_ok:
         logger.debug("Qwen3.5 (dense) VLM runtime MTP patch did not apply")
+    gemma4_ok = gemma4_vlm_runtime.apply()
+    if not gemma4_ok:
+        logger.debug("Gemma 4 VLM runtime MTP patch did not apply")
 
-    return moe_ok or dense_ok
+    return moe_ok or dense_ok or gemma4_ok

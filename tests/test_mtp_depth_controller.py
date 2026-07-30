@@ -41,13 +41,21 @@ def test_observe_signature_is_three_positional():
 
 def test_warmup_measures_every_depth_once():
     c = _DepthController(3)
-    assert c.cur == 3  # sweep walks 3 -> 2 -> 1
+    assert c.cur == 3  # sweep walks 3 -> 2 -> 1 -> 0,0,0 (plain-step baseline)
     c.observe(3, 3, 30.0)
     assert c.cur == 2
     c.observe(2, 2, 20.0)
     assert c.cur == 1
     c.observe(1, 1, 10.0)
-    assert c.t == {1: 10.0, 2: 20.0, 3: 30.0}
+    assert c.cur == 0
+    # Three plain cycles measure the exit baseline; the fastest sample wins
+    # (first-run shape warmup inflates the early ones).
+    c.observe(0, 0, 14.0)
+    assert c.cur == 0
+    c.observe(0, 0, 8.5)
+    assert c.cur == 0
+    c.observe(0, 0, 9.0)
+    assert c.t == {0: 8.5, 1: 10.0, 2: 20.0, 3: 30.0}
     assert c._warmup == []
 
 
@@ -137,8 +145,12 @@ def test_most_stale_prefers_unmeasured_then_oldest():
     c.cur = 1
     c.t_age = {1: 0.0, 2: 500.0}  # depth 3 never measured -> infinitely stale
     assert c._most_stale() == 3
-    c.t_age = {1: 0.0, 2: 900.0, 3: 200.0}
+    # Baseline measured (the realistic post-seed state): oldest depth wins.
+    c.t_age = {0: 100.0, 1: 0.0, 2: 900.0, 3: 200.0}
     assert c._most_stale() == 2
+    # An unmeasured baseline outranks any finite age (discovery path).
+    c.t_age = {1: 0.0, 2: 900.0, 3: 200.0}
+    assert c._most_stale() == 0
 
 
 def test_stale_lock_is_broken_by_repeated_probes():
@@ -151,11 +163,11 @@ def test_stale_lock_is_broken_by_repeated_probes():
     c._warmup = []
     c.cur = 2
     c.p = [0.8, 0.3]
-    c.t = {1: 11.0, 2: 12.0}  # stale-high t[1]: hides depth 1's true advantage
-    c.t_age = {1: 0.0, 2: 0.0}
+    c.t = {0: 8.0, 1: 11.0, 2: 12.0}  # baseline measured, not competitive here  # stale-high t[1] hides depth 1's advantage
+    c.t_age = {0: 0.0, 1: 0.0, 2: 0.0}
     assert c._best() == 2  # locked on the stale estimate
     # Drive real cycles: depth 2 truly costs 12ms, depth 1 truly costs 10ms.
-    _simulate(c, 1500, p_by_depth=[0.8, 0.3], ms_by_depth={1: 10.0, 2: 12.0})
+    _simulate(c, 1500, p_by_depth=[0.8, 0.3], ms_by_depth={0: 8.0, 1: 10.0, 2: 12.0})
     assert c.t[1] < 10.5  # repeated probes converged t[1] toward the truth
     assert c._best() == 1  # lock broken
 
@@ -207,8 +219,8 @@ def test_exploration_probe_targets_most_stale_depth():
     c.probe_left = 0
     c.cur = 1
     c.p = [0.9, 0.1, 0.1]  # depths 2/3 score far below depth 1
-    c.t = {1: 10.0, 2: 30.0, 3: 50.0}
-    c.t_age = {1: 0.0, 2: 100.0, 3: 9000.0}
+    c.t = {0: 7.0, 1: 10.0, 2: 30.0, 3: 50.0}  # baseline measured, not stale
+    c.t_age = {0: 50.0, 1: 0.0, 2: 100.0, 3: 9000.0}
     assert c._best_rival() is None  # no close rival
     c._ms_probe = c.PROBE_PERIOD_MS + 1.0
     c._ms_explore = c.PROBE_PERIOD_MAX_MS + 1.0
@@ -231,8 +243,10 @@ def test_probe_burst_completes_and_resets_cadence():
 
 
 def test_expensive_extra_verify_settles_at_depth_1_end_to_end():
+    # Baseline (depth 0) is measured by the warmup tail but stays clearly
+    # non-competitive at 80% acceptance, so the run settles at depth 1.
     c = _DepthController(2)
-    _simulate(c, 200, p_by_depth=[0.8, 0.25], ms_by_depth={1: 10.0, 2: 19.0})
+    _simulate(c, 200, p_by_depth=[0.8, 0.25], ms_by_depth={0: 8.0, 1: 10.0, 2: 19.0})
     assert c._best() == 1
 
 
@@ -241,3 +255,191 @@ def test_max_depth_one_is_inert():
     _simulate(c, 40, p_by_depth=[0.9], ms_by_depth={1: 10.0})
     assert c.cur == 1
     assert c._best() == 1
+
+
+# ---------------------------------------------------------------------------
+# Depth 0 — the no-speculation escape hatch.
+# ---------------------------------------------------------------------------
+
+
+def _simulate_with_zero(controller, cycles, p_by_depth, ms_by_depth, seed=0):
+    """Like _simulate, but honors depth-0 selections (no drafts, base cost)."""
+    rng = random.Random(seed)
+    picks = []
+    for _ in range(cycles):
+        depth = controller.cur
+        picks.append(depth)
+        accepted = 0
+        for j in range(depth):
+            if rng.random() < p_by_depth[j]:
+                accepted += 1
+            else:
+                break
+        controller.observe(depth, accepted, ms_by_depth[depth])
+    return picks
+
+
+def test_zero_not_selectable_without_measurement():
+    # Extrapolated baselines must never park the sequence — only a measured
+    # (or seeded) t[0] makes depth 0 selectable.
+    c = _DepthController(2)
+    c._warmup = []
+    c.p = [0.1, 0.1]
+    c.t = {1: 20.0, 2: 22.0}
+    c.cur = 1
+    assert 0 not in c._select_candidates()
+    assert c._best() >= 1
+
+
+def test_unmeasured_zero_is_most_stale_probe_target():
+    # Discovery path without a post-init seed: the staleness explorer sees
+    # the unmeasured baseline as infinitely stale and probes it (a probe of
+    # depth 0 is just a plain decode step, so it is always safe).
+    c = _DepthController(2)
+    c._warmup = []
+    c.t = {1: 10.0, 2: 12.0}
+    c.t_age = {1: 0.0, 2: 50.0}
+    c.cur = 1
+    assert c._most_stale() == 0
+
+
+def test_observe_zero_updates_base_cost_only():
+    c = _DepthController(2)
+    c._warmup = []
+    c.p = [0.5, 0.5]
+    c.t = {1: 20.0, 2: 22.0}
+    c.cur = 1
+    p_before = list(c.p)
+    c.observe(0, 0, 10.0)
+    assert c.t[0] == 10.0
+    assert c.t[1] == 20.0 and c.t[2] == 22.0
+    assert c.p == p_before  # no acceptance evidence from a plain step
+
+
+def test_parks_at_zero_when_every_depth_loses():
+    # gemma4 26B story/16k analog: baseline 11.5 ms/token, the L=1->2 verify
+    # step makes even depth 1 cost ~26 ms at ~55% acceptance. Every
+    # speculative depth scores below the plain step, so the controller must
+    # park at 0 for the bulk of the run (probe bursts excepted).
+    c = _DepthController(3)
+    picks = _simulate_with_zero(
+        c,
+        300,
+        p_by_depth=[0.55, 0.5, 0.45],
+        ms_by_depth={0: 11.5, 1: 26.0, 2: 27.5, 3: 29.0},
+    )
+    parked = sum(1 for d in picks[50:] if d == 0)
+    assert parked / len(picks[50:]) > 0.7
+    assert c._best() == 0
+
+
+def test_reenters_speculation_when_content_turns_predictable():
+    # Park first (story analog), then flip the content to code-like accept
+    # rates: rival probes re-measure the speculative depths, acceptance
+    # evidence refreshes, and the controller must leave depth 0.
+    c = _DepthController(3)
+    _simulate_with_zero(
+        c,
+        200,
+        p_by_depth=[0.55, 0.5, 0.45],
+        ms_by_depth={0: 11.5, 1: 26.0, 2: 27.5, 3: 29.0},
+        seed=1,
+    )
+    picks = _simulate_with_zero(
+        c,
+        600,
+        p_by_depth=[0.95, 0.92, 0.9],
+        ms_by_depth={0: 11.5, 1: 13.0, 2: 14.0, 3: 15.0},
+        seed=2,
+    )
+    tail = picks[-100:]
+    speculative = sum(1 for d in tail if d >= 1)
+    assert speculative / len(tail) > 0.7
+    assert c._best() >= 1
+
+
+def test_high_accept_workload_never_parks():
+    # code/4k analog: speculation clearly wins; the escape hatch must not
+    # tax it (depth 0 may appear only inside rare probe bursts).
+    c = _DepthController(3)
+    picks = _simulate_with_zero(
+        c,
+        300,
+        p_by_depth=[0.9, 0.85, 0.8],
+        ms_by_depth={0: 10.0, 1: 12.0, 2: 13.0, 3: 14.5},
+    )
+    zero_share = sum(1 for d in picks[20:] if d == 0) / len(picks[20:])
+    assert zero_share < 0.2
+    assert c._best() >= 1
+
+
+
+def test_losing_speculation_builds_exit_streak():
+    # story/4k analog: best speculative score sits between 1.0x and
+    # EXIT_MARGIN of the taxed baseline — locally "fine", globally losing
+    # to the pipelined standard step. The streak must build toward exit.
+    c = _DepthController(3)
+    picks = _simulate_with_zero(
+        c,
+        60,
+        p_by_depth=[0.6, 0.5, 0.4],
+        ms_by_depth={0: 12.0, 1: 20.0, 2: 21.5, 3: 23.0},
+    )
+    assert c.should_exit()
+    assert c.exit_streak >= c.EXIT_STREAK
+    del picks
+
+
+def test_winning_speculation_never_exits():
+    # code analogs: clear speculative wins keep the exit streak at zero.
+    c = _DepthController(3)
+    _simulate_with_zero(
+        c,
+        120,
+        p_by_depth=[0.9, 0.85, 0.8],
+        ms_by_depth={0: 10.0, 1: 12.0, 2: 13.0, 3: 14.5},
+    )
+    assert not c.should_exit()
+    assert c.exit_streak == 0
+
+
+def test_exit_margin_arg_overrides_prior_with_clamp():
+    # A measured loop tax seeds later controllers; the fallback prior only
+    # applies until the first hand-off measured the real ratio.
+    from omlx.patches.mlx_lm_mtp.batch_generator import _STD_TAX_MAX
+
+    c = _DepthController(3, exit_margin=1.06)
+    assert math.isclose(c.EXIT_MARGIN, 1.06, rel_tol=1e-9)
+    assert math.isclose(_DepthController(3).EXIT_MARGIN, 1.15, rel_tol=1e-9)
+    assert _DepthController(3, exit_margin=9.0).EXIT_MARGIN == _STD_TAX_MAX
+    assert _DepthController(3, exit_margin=0.5).EXIT_MARGIN == 1.0
+
+
+def test_std_tax_probe_measures_and_smooths():
+    from types import SimpleNamespace
+
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _STD_TAX_SAMPLES,
+        _STD_TAX_SKIP,
+        _arm_std_tax_probe,
+        _record_std_tax_sample,
+    )
+
+    model = SimpleNamespace()
+    gb = SimpleNamespace(model=model)
+    _arm_std_tax_probe(gb, 12.0)
+    # Transition steps are skipped, then the median of the samples is used.
+    for _ in range(_STD_TAX_SKIP):
+        _record_std_tax_sample(gb, 99.0)
+    for _ in range(_STD_TAX_SAMPLES):
+        _record_std_tax_sample(gb, 10.0)
+    assert math.isclose(model._omlx_mtp_loop_tax, 1.2, rel_tol=1e-9)
+    assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    # A second hand-off EMA-blends toward the new measurement.
+    _arm_std_tax_probe(gb, 11.0)
+    for _ in range(_STD_TAX_SKIP):
+        _record_std_tax_sample(gb, 99.0)
+    for _ in range(_STD_TAX_SAMPLES):
+        _record_std_tax_sample(gb, 11.0)
+    assert 1.0 < model._omlx_mtp_loop_tax < 1.2
