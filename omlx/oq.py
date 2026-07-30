@@ -2073,6 +2073,9 @@ class _DiscoveredPlan:
 
     def _materialize_source(self, src_key):
         """Load a single source tensor from the lazy index."""
+        virtual = getattr(self._lazy, "_virtual", None)
+        if virtual and src_key in virtual:
+            return self._lazy.materialize_virtual(src_key)
         if hasattr(self._lazy, "_fp8_pairs") and src_key in self._lazy._fp8_pairs:
             return self._lazy._dequant_one(src_key)
         meta = self._lazy._index.get(src_key)
@@ -2422,6 +2425,7 @@ def estimate_bpw_and_size(
         allow_mxfp8_scale_inv_passthrough=(
             _uses_minimax_mxfp8_scale_inv_source(config)
         ),
+        config=config,
     )
     logical = idx.logical_metadata()
 
@@ -3313,6 +3317,7 @@ class _LazyTensorIndex:
         weight_files,
         *,
         allow_mxfp8_scale_inv_passthrough: bool = False,
+        config: dict | None = None,
     ):
         self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
         self._index = {}
@@ -3335,7 +3340,57 @@ class _LazyTensorIndex:
         self._fp8_pairs = {}
         self._fp8_scale_keys = set()
         self._src_quant = {}
+        # Virtual tensors: logical keys computed on demand from one or more
+        # on-disk tensors, for layouts the model's sanitize would otherwise
+        # have to restructure (see patches/virtual_tensors.py). ``_hidden``
+        # holds the source keys they consume; those leave the logical view.
+        self._virtual = {}
+        self._hidden = set()
         self._discover_fp8_pairs()
+        self._register_virtual_tensors(config)
+
+    def _register_virtual_tensors(self, config):
+        """Let model-specific registrars declare virtual tensors.
+
+        Deliberately not guarded: a registrar that recognises this checkpoint
+        but cannot make sense of its geometry must abort the run rather than
+        leave the original layout in place, which would quantize silently
+        wrong weights.
+        """
+        if not config:
+            return
+        from .patches.virtual_tensors import register_virtual_tensors
+
+        register_virtual_tensors(self, config)
+
+    def register_virtual(self, key, shape, dtype, materializer, *, hides=()):
+        """Declare ``key`` as produced on demand by ``materializer``.
+
+        ``shape``/``dtype`` describe the logical tensor as sanitize and the
+        quantization planner should see it (safetensors dtype spelling, e.g.
+        ``"BF16"``). ``hides`` lists the on-disk keys it is derived from; they
+        stay readable via :meth:`load_source` but disappear from the logical
+        view so sanitize never sees the pre-restructure layout.
+        """
+        self._virtual[key] = (tuple(shape), dtype, materializer)
+        self._hidden.update(hides)
+
+    def materialize_virtual(self, key):
+        """Produce a virtual tensor's value."""
+        return self._virtual[key][2]()
+
+    def source_shape(self, key):
+        """On-disk shape of ``key``, or None when absent.
+
+        Reads the safetensors header only — visibility and pairing are
+        ignored, so registrars can inspect keys they are about to hide.
+        """
+        meta = self._index.get(key)
+        return None if meta is None else meta[4]
+
+    def load_source(self, key):
+        """Load an on-disk tensor verbatim, bypassing fp8 pairing."""
+        return self._load_raw(key)
 
     def _discover_fp8_pairs(self):
         seen = set()
@@ -3499,13 +3554,13 @@ class _LazyTensorIndex:
         return self._src_quant.get(key)
 
     def _is_visible(self, k):
-        return k not in self._fp8_scale_keys
+        return k not in self._fp8_scale_keys and k not in self._hidden
 
     def logical_metadata(self):
         """Metadata for plan discovery: FP8 weights report as BF16, scale keys hidden."""
         result = {}
         for k, meta in self._index.items():
-            if k in self._fp8_scale_keys:
+            if not self._is_visible(k):
                 continue
             shape, dtype = meta[4], meta[5]
             if k in self._fp8_pairs:
@@ -3515,16 +3570,20 @@ class _LazyTensorIndex:
                     # FP4-packed bytes: logical width is 2 values per byte.
                     shape = (shape[0], shape[1] * 2)
             result[k] = (shape, dtype)
+        for k, (shape, dtype, _) in self._virtual.items():
+            result[k] = (shape, dtype)
         return result
 
     def keys(self):
         base = [k for k in self._index if self._is_visible(k)]
+        base.extend(k for k in self._virtual if k not in self._index)
         if hasattr(self, "_overrides"):
             base.extend(self._overrides.keys())
         return base
 
     def __len__(self):
         n = sum(1 for k in self._index if self._is_visible(k))
+        n += sum(1 for k in self._virtual if k not in self._index)
         if hasattr(self, "_overrides"):
             n += len(self._overrides)
         return n
@@ -3532,11 +3591,16 @@ class _LazyTensorIndex:
     def __contains__(self, k):
         if k in self._index and self._is_visible(k):
             return True
+        if k in self._virtual:
+            return True
         return hasattr(self, "_overrides") and k in self._overrides
 
     def __iter__(self):
         for k in self._index:
             if self._is_visible(k):
+                yield k
+        for k in self._virtual:
+            if k not in self._index:
                 yield k
         if hasattr(self, "_overrides"):
             for k in self._overrides:
@@ -3544,10 +3608,13 @@ class _LazyTensorIndex:
                     yield k
 
     def nbytes(self):
+        # Bytes we will actually read off disk. Hidden keys still count —
+        # they back virtual tensors and are read on demand — while scale
+        # keys stay excluded because they fold into their weight.
         return sum(
             e - s
             for k, (_, _, s, e, _, _) in self._index.items()
-            if self._is_visible(k)
+            if k not in self._fp8_scale_keys
         )
 
     def _load_raw(self, key):
@@ -3558,6 +3625,8 @@ class _LazyTensorIndex:
     def __getitem__(self, key):
         if hasattr(self, "_overrides") and key in self._overrides:
             return self._overrides[key]
+        if key in self._virtual:
+            return self.materialize_virtual(key)
         if key not in self._index:
             raise KeyError(key)
         if key in self._fp8_pairs:
@@ -3569,6 +3638,11 @@ class _LazyTensorIndex:
             if not self._is_visible(k):
                 continue
             yield k, self[k]
+            mx.clear_cache()
+        for k in list(self._virtual.keys()):
+            if k in self._index:
+                continue
+            yield k, self.materialize_virtual(k)
             mx.clear_cache()
         if hasattr(self, "_overrides"):
             for k, v in self._overrides.items():
@@ -3586,12 +3660,14 @@ class _LazyTensorIndex:
         self._index.pop(key, None)
         self._fp8_pairs.pop(key, None)
         self._src_quant.pop(key, None)
+        self._virtual.pop(key, None)
 
     def __delitem__(self, key):
         if key in self._fp8_pairs:
             sk = self._fp8_pairs.pop(key)
             self._fp8_scale_keys.discard(sk)
             self._index.pop(sk, None)
+        self._virtual.pop(key, None)
         self._index.pop(key, None)
         self._src_quant.pop(key, None)
         if hasattr(self, "_overrides"):
@@ -3608,6 +3684,8 @@ class _LazyTensorIndex:
     def pop(self, key, *default):
         if hasattr(self, "_overrides") and key in self._overrides:
             return self._overrides.pop(key)
+        if key in self._virtual:
+            return self.materialize_virtual(key)
         if key not in self._index:
             if default:
                 return default[0]
@@ -4427,6 +4505,7 @@ def quantize_oq_streaming(
         allow_mxfp8_scale_inv_passthrough=(
             _uses_minimax_mxfp8_scale_inv_source(config)
         ),
+        config=config,
     )
     if (
         preserve_mtp
@@ -6604,7 +6683,7 @@ def _build_streaming_proxy_for_sensitivity(
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
-    all_weights = _LazyTensorIndex(weight_files)
+    all_weights = _LazyTensorIndex(weight_files, config=config)
     sanitize_fn = _build_model_sanitizer(config, text_only=False)
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     if sanitize_fn is not None:
