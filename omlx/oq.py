@@ -4455,6 +4455,15 @@ def _lookup_imatrix_importance(
         return None
 
     base = tensor_name[: -len(".weight")]
+
+    # Embedding layers take discrete token IDs, not continuous activations —
+    # activation-energy imatrix does not apply.  Skip silently.
+    if any(
+        p in base
+        for p in ("embed_tokens", "wte", "word_embeddings", "embeddings.token")
+    ):
+        return None
+
     entry = imatrix.entries.get(base)
     if entry is None:
         if report is not None:
@@ -6422,6 +6431,30 @@ class OQImatrixCollector:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
 
 
+def _collect_lm_head_imatrix(model, hidden) -> bool:
+    """Forward final hidden states through the lm_head so its capture wrapper fires.
+
+    The layer-by-layer calibration walk never invokes lm_head, leaving it
+    without imatrix data.  This pass applies the final layer norm and feeds
+    the result into lm_head (discarding the logits immediately to save RAM).
+    """
+    inner = getattr(model, "language_model", None) or model
+    core = getattr(inner, "model", None) or inner
+    norm = getattr(core, "norm", None)
+    lm_head = getattr(inner, "lm_head", None)
+    if norm is None or lm_head is None:
+        return False
+    try:
+        h = norm(hidden)
+        logits = lm_head(h)
+        mx.eval(logits)
+        del logits
+        return True
+    except Exception as e:
+        logger.warning("oQe imatrix lm_head pass skipped: %s", e)
+        return False
+
+
 def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
     """Run the MTP head over a calibration micro-batch.
 
@@ -6586,6 +6619,13 @@ def _collect_imatrix_from_model(
                     _commit_layer_forward_aux(
                         position_ids, layer_idx, aux, fallback=prev_aux
                     )
+                    mx.synchronize()
+                    mx.clear_cache()
+
+                # lm_head pass: the layer walk never invokes lm_head,
+                # so forward the final hidden states through norm + lm_head
+                # to capture its activation statistics.
+                if _collect_lm_head_imatrix(model, inputs):
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -6814,6 +6854,13 @@ def _collect_imatrix(
         mx.clear_cache()
 
 
+def _oqe_cache_missing_lm_head(cache: OQImatrixData) -> bool:
+    """True when the cache predates the lm_head collection pass."""
+    return not any(
+        key == "lm_head" or key.endswith(".lm_head") for key in cache.entries
+    )
+
+
 def _oqe_cache_missing_mtp_entries(cache: OQImatrixData, config: dict) -> bool:
     """True when the model declares MTP heads but the cache predates the
     MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
@@ -6858,7 +6905,13 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_missing_mtp_entries(cache, config):
+            if _oqe_cache_missing_lm_head(cache):
+                logger.info(
+                    "oQe imatrix: cache predates lm_head collection "
+                    "(no lm_head entry), recollecting %s",
+                    path,
+                )
+            elif _oqe_cache_missing_mtp_entries(cache, config):
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
