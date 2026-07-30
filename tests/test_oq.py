@@ -34,6 +34,8 @@ from omlx.oq import (
     _build_streaming_proxy_for_sensitivity,
     _calibration_memory_budget,
     _checkpoint_storage_bytes,
+    _collect_imatrix_from_model,
+    _commit_layer_forward_aux,
     _configure_minimax_shared_expert_layout,
     _config_expects_moe_expert_counts,
     _discover_sanitize_plan,
@@ -53,15 +55,18 @@ from omlx.oq import (
     _LazyTensorIndex,
     _load_builtin_calibration,
     _measure_sensitivity,
+    _measure_sensitivity_from_model,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
     _normalize_sensitivity_map_override,
     _oqe_calibration_batch_plan,
     _perturb_bits_for,
+    _prepare_layer_inputs,
     _progress_total_bytes,
     _quantize_chunked,
     _sensitivity_lm_config_override,
     _should_quantize_tensor,
+    _source_imatrix_signature,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
@@ -1580,6 +1585,210 @@ class TestForwardLayer:
         assert seen == [("mask", None, "prev_topk")]
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGemma4StatefulLayerForward:
+    @staticmethod
+    def _tiny_model(backend: str):
+        common = {
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "vocab_size": 32,
+            "vocab_size_per_layer_input": 32,
+            "hidden_size_per_layer_input": 4,
+            "num_kv_shared_layers": 1,
+            "sliding_window": 8,
+            "sliding_window_pattern": 2,
+            "layer_types": ["sliding_attention", "sliding_attention"],
+            "use_double_wide_mlp": False,
+        }
+        if backend == "mlx_vlm":
+            config_module = pytest.importorskip("mlx_vlm.models.gemma4.config")
+            language_module = pytest.importorskip("mlx_vlm.models.gemma4.language")
+            config = config_module.TextConfig(**common)
+            return language_module.Gemma4TextModel(config)
+
+        gemma4_text = pytest.importorskip("mlx_lm.models.gemma4_text")
+        config = gemma4_text.ModelArgs(**common)
+        return gemma4_text.Gemma4TextModel(config)
+
+    @pytest.mark.parametrize("backend", ["mlx_vlm", "mlx_lm"])
+    def test_manual_layer_walk_matches_native_forward(self, backend):
+        model = self._tiny_model(backend)
+        tokens = mx.array([[1, 2, 3]])
+
+        expected = model(tokens)
+        raw_inputs = model.embed_tokens(tokens)
+        hidden, masks, state = _prepare_layer_inputs(
+            model, model.layers, tokens, raw_inputs
+        )
+
+        assert state["kind"] == "gemma4_shared_kv"
+        assert state["previous_kvs"] == [0, 0]
+        for layer_idx, layer in enumerate(model.layers):
+            hidden, aux = _forward_layer_result(
+                layer,
+                hidden,
+                masks[layer_idx],
+                state,
+                layer_idx=layer_idx,
+            )
+            _commit_layer_forward_aux(state, layer_idx, aux)
+        actual = model.norm(hidden)
+        mx.eval(expected, actual)
+
+        np.testing.assert_allclose(
+            np.asarray(actual.astype(mx.float32)),
+            np.asarray(expected.astype(mx.float32)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_imatrix_and_sensitivity_cover_shared_kv_tail(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        model = self._tiny_model("mlx_vlm")
+        tokens = mx.array([[1, 2, 3], [3, 2, 1]])
+        monkeypatch.setattr(
+            oq_module,
+            "_load_calibration_data",
+            lambda *_args, **_kwargs: tokens,
+        )
+
+        config = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 1,
+                "hidden_size_per_layer_input": 4,
+                "head_dim": 8,
+                "global_head_dim": 8,
+                "layer_types": ["sliding_attention", "sliding_attention"],
+            },
+        }
+        entries, metadata = _collect_imatrix_from_model(
+            model,
+            tokenizer=None,
+            config=config,
+            calib_dataset="test",
+            num_samples=2,
+            seq_length=3,
+        )
+
+        assert metadata["processed_samples"] == 2
+        assert "layers.0.self_attn.k_proj" in entries
+        assert "layers.1.self_attn.q_proj" in entries
+        assert "layers.1.self_attn.o_proj" in entries
+        assert "layers.1.mlp.down_proj" in entries
+        assert "layers.1.per_layer_projection" in entries
+        assert "layers.1.self_attn.k_proj" not in entries
+
+        sensitivity = _measure_sensitivity_from_model(
+            model,
+            tokenizer=None,
+            config=config,
+            oq_level=4,
+            calib_dataset="test",
+            num_samples=2,
+            seq_length=3,
+        )
+        assert set(sensitivity) == {0, 1}
+
+    def test_vlm_wrapper_uses_nested_text_model_as_layer_owner(self):
+        text_model = self._tiny_model("mlx_vlm")
+
+        class LanguageModel:
+            model = text_model
+
+            @property
+            def layers(self):
+                return self.model.layers
+
+        class VlmConfig:
+            model_type = "gemma4"
+
+        class VlmWrapper:
+            config = VlmConfig()
+            language_model = LanguageModel()
+
+            @property
+            def layers(self):
+                return self.language_model.layers
+
+        model = VlmWrapper()
+        tokens = mx.array([[1, 2, 3]])
+        inputs = text_model.embed_tokens(tokens)
+        _, _, state = _prepare_layer_inputs(model, model.layers, tokens, inputs)
+
+        assert state["kind"] == "gemma4_shared_kv"
+        assert state["previous_kvs"] == [0, 0]
+
+    def test_cache_signature_invalidates_only_stateful_gemma4(self, tmp_path):
+        common = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": 35,
+            },
+        }
+        e2b = {
+            **common,
+            "text_config": {
+                **common["text_config"],
+                "num_kv_shared_layers": 20,
+                "hidden_size_per_layer_input": 256,
+            },
+        }
+        dense = {
+            **common,
+            "text_config": {
+                **common["text_config"],
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+            },
+        }
+
+        kwargs = {
+            "num_samples": 128,
+            "seq_length": 512,
+            "calib_dataset": "test",
+        }
+        e2b_signature = _source_imatrix_signature(tmp_path, e2b, **kwargs)
+        dense_signature = _source_imatrix_signature(tmp_path, dense, **kwargs)
+
+        assert e2b_signature["layer_walk"] == "gemma4_shared_kv_v1"
+        assert "layer_walk" not in dense_signature
+
+    def test_dense_gemma4_keeps_generic_layer_path(self):
+        class Config:
+            model_type = "gemma4_text"
+            num_kv_shared_layers = 0
+            hidden_size_per_layer_input = 0
+
+        class DenseGemma4:
+            model_type = "gemma4_text"
+            config = Config()
+            layers = [object(), object()]
+
+        model = DenseGemma4()
+        tokens = mx.array([[1, 2, 3]])
+        inputs = mx.ones((1, 3, 8))
+        prepared, masks, state = _prepare_layer_inputs(
+            model, model.layers, tokens, inputs
+        )
+
+        assert prepared is inputs
+        assert len(masks) == 2
+        assert not isinstance(state, dict)
+
+
 # =============================================================================
 # Test _LazyTensorIndex
 # =============================================================================
@@ -2589,6 +2798,61 @@ class TestOqeCalibrationBatchPlan:
 
         assert plan["micro_batch_size"] == 1
         assert plan["fits_one_sample"] is False
+
+    def test_gemma4_shared_kv_state_reduces_micro_batch(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: 512 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 464 * gib
+        )
+        dense = _oqe_calibration_batch_plan(
+            {
+                "model_type": "gemma4",
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 42,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": 0,
+                    "hidden_size_per_layer_input": 0,
+                    "head_dim": 256,
+                    "global_head_dim": 512,
+                },
+            },
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=15 * gib,
+        )
+        e4b = _oqe_calibration_batch_plan(
+            {
+                "model_type": "gemma4",
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 42,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": 18,
+                    "hidden_size_per_layer_input": 256,
+                    "head_dim": 256,
+                    "global_head_dim": 512,
+                    "layer_types": ["sliding_attention"] * 20
+                    + ["full_attention"] * 4
+                    + ["sliding_attention"] * 18,
+                },
+            },
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=15 * gib,
+        )
+
+        assert dense["gemma4_state_bytes"] == 0
+        assert e4b["gemma4_state_bytes"] > 0
+        assert e4b["estimated_sample_bytes"] > dense["estimated_sample_bytes"]
+        assert e4b["micro_batch_size"] < dense["micro_batch_size"]
 
 
 class TestQuantProgressTotalBytes:

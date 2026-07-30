@@ -1229,6 +1229,125 @@ def resolve_output_name(
     return f"{base}{suffix}"
 
 
+# ── Gemma 4 assistant MTP combine ───────────────────────────────────────
+
+GEMMA4_ASSISTANT_MTP_PREFIX = "language_model.mtp."
+GEMMA4_ASSISTANT_MTP_SHARD = "model-mtp.safetensors"
+
+
+def validate_gemma4_assistant_pair(
+    base_config: dict, assistant_config: dict
+) -> None:
+    """Validate that a gemma4_assistant checkpoint can be merged into a base.
+
+    Raises ValueError with an operator-readable message on any mismatch so
+    the combine option fails at task submission, not after a full
+    quantization run.
+    """
+    if base_config.get("model_type") != "gemma4":
+        raise ValueError(
+            "Assistant MTP combine requires a gemma4 base model, got "
+            f"model_type={base_config.get('model_type')!r}"
+        )
+    if assistant_config.get("model_type") != "gemma4_assistant":
+        raise ValueError(
+            "Assistant model must have model_type 'gemma4_assistant', got "
+            f"{assistant_config.get('model_type')!r}"
+        )
+    asst_layers = int(
+        (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
+    )
+    if asst_layers <= 0:
+        raise ValueError(
+            "Assistant model config declares no text_config.num_hidden_layers"
+        )
+    base_hidden = (base_config.get("text_config") or {}).get("hidden_size")
+    backbone_hidden = assistant_config.get("backbone_hidden_size")
+    if base_hidden and backbone_hidden and base_hidden != backbone_hidden:
+        raise ValueError(
+            "Assistant model does not match the base model: "
+            f"backbone_hidden_size={backbone_hidden} but the base "
+            f"hidden_size={base_hidden}. Use the assistant checkpoint "
+            "released for this exact model size."
+        )
+
+
+def combine_gemma4_assistant_mtp(
+    output_path: Union[str, Path],
+    assistant_path: Union[str, Path],
+) -> None:
+    """Merge a gemma4_assistant checkpoint into a quantized output directory.
+
+    Writes the assistant weights as one extra shard under
+    ``language_model.mtp.*`` (kept at their shipped dtype, bf16), merges the
+    safetensors index, and embeds the assistant config at
+    ``text_config.mtp_assistant_config`` plus ``mtp_num_hidden_layers`` so
+    the gemma4 Lightning MTP runtime patch detects and attaches the head at
+    load time. The base weights and quantization config are untouched.
+    """
+    output = Path(output_path)
+    assistant = Path(assistant_path)
+
+    with open(output / "config.json") as f:
+        config = json.load(f)
+    with open(assistant / "config.json") as f:
+        assistant_config = json.load(f)
+    validate_gemma4_assistant_pair(config, assistant_config)
+
+    # Assistant checkpoints ship as a single file today, but read through
+    # the index when present so sharded re-exports keep working.
+    index_path = assistant / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shards = sorted(p.name for p in assistant.glob("*.safetensors"))
+    if not shards:
+        raise ValueError(f"No safetensors found in assistant model: {assistant}")
+
+    weights: dict = {}
+    for shard in shards:
+        weights.update(mx.load(str(assistant / shard)))
+    mtp_weights = {GEMMA4_ASSISTANT_MTP_PREFIX + k: v for k, v in weights.items()}
+
+    mx.save_safetensors(
+        str(output / GEMMA4_ASSISTANT_MTP_SHARD),
+        mtp_weights,
+        metadata={"format": "mlx"},
+    )
+    mtp_size = sum(v.nbytes for v in mtp_weights.values())
+
+    out_index_path = output / "model.safetensors.index.json"
+    if out_index_path.exists():
+        with open(out_index_path) as f:
+            index = json.load(f)
+        weight_map = index.setdefault("weight_map", {})
+        for key in mtp_weights:
+            weight_map[key] = GEMMA4_ASSISTANT_MTP_SHARD
+        metadata = index.get("metadata") or {}
+        metadata["total_size"] = int(metadata.get("total_size", 0) or 0) + mtp_size
+        index["metadata"] = metadata
+        with open(out_index_path, "w") as f:
+            json.dump(index, f, indent=2)
+
+    text_config = config.setdefault("text_config", {})
+    text_config["mtp_num_hidden_layers"] = int(
+        (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
+    )
+    text_config["mtp_assistant_config"] = assistant_config
+    with open(output / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    logger.info(
+        "Merged gemma4 assistant MTP head into %s "
+        "(%d tensors, %.2f GB, source=%s)",
+        output.name,
+        len(mtp_weights),
+        mtp_size / 1e9,
+        assistant.name,
+    )
+
+
 # ── Auto-discovery streaming sanitizer ──────────────────────────────────
 
 
@@ -2724,6 +2843,54 @@ def _oqe_calibration_batch_plan(
     route_factor = max(1, top_k if num_experts > 0 else 1)
     sample_bytes = max(1, int(seq_length) * max(1, hidden_size) * 4 * route_factor)
 
+    # Gemma 4 E2B/E4B keeps two additional activation families alive during
+    # its layer walk: the projected per-layer inputs and the K/V tensors that
+    # the tail layers reuse.  The generic hidden-state estimate misses both
+    # and can choose a micro-batch that exhausts unified memory once oQe uses
+    # the real Gemma 4 forward contract.  Account for the persistent bf16/fp16
+    # state here without changing batch sizing for dense 26B/31B variants.
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    model_type = str(
+        text_config.get("model_type") or config.get("model_type") or ""
+    ).lower()
+    num_hidden_layers = _nested_config_int(
+        config, ("num_hidden_layers", "n_layers", "num_layers"), default=0
+    )
+    num_kv_shared_layers = _nested_config_int(
+        config, ("num_kv_shared_layers",), default=0
+    )
+    per_layer_input_size = _nested_config_int(
+        config, ("hidden_size_per_layer_input",), default=0
+    )
+    gemma4_state_bytes = 0
+    if model_type.startswith("gemma4") and (
+        num_kv_shared_layers > 0 or per_layer_input_size > 0
+    ):
+        persistent_width = max(0, num_hidden_layers) * max(0, per_layer_input_size)
+        non_shared_layers = max(0, num_hidden_layers - num_kv_shared_layers)
+        num_kv_heads = _nested_config_int(config, ("num_key_value_heads",), default=1)
+        head_dim = _nested_config_int(config, ("head_dim",), default=0)
+        global_head_dim = _nested_config_int(
+            config, ("global_head_dim",), default=head_dim
+        )
+        layer_types = text_config.get("layer_types")
+        if not isinstance(layer_types, list):
+            layer_types = config.get("layer_types")
+        if isinstance(layer_types, list) and len(layer_types) >= non_shared_layers:
+            kv_head_dims = sum(
+                global_head_dim if layer_type == "full_attention" else head_dim
+                for layer_type in layer_types[:non_shared_layers]
+            )
+        else:
+            kv_head_dims = non_shared_layers * max(head_dim, global_head_dim)
+        # Two tensors (K and V), each with num_kv_heads heads. Gemma 4 keeps
+        # these and per-layer inputs in its model dtype during calibration.
+        persistent_width += 2 * max(1, num_kv_heads) * max(0, kv_head_dims)
+        gemma4_state_bytes = max(1, int(seq_length)) * max(0, persistent_width) * 2
+        sample_bytes += gemma4_state_bytes
+
     system_available = _system_available_memory_bytes()
     metal_available = _metal_available_memory_bytes()
     live_available = (
@@ -2764,6 +2931,10 @@ def _oqe_calibration_batch_plan(
         "hidden_size": int(hidden_size),
         "num_experts": int(num_experts),
         "top_k": int(top_k),
+        "gemma4_state_bytes": int(gemma4_state_bytes),
+        "num_hidden_layers": int(num_hidden_layers),
+        "num_kv_shared_layers": int(num_kv_shared_layers),
+        "per_layer_input_size": int(per_layer_input_size),
     }
 
 
@@ -3907,7 +4078,7 @@ def _source_imatrix_signature(
             for block in iter(lambda: f.read(1024 * 1024), b""):
                 ch.update(block)
         calib_hash = ch.hexdigest()
-    return {
+    signature = {
         "format": _OQE_IMATRIX_FORMAT,
         "model_name": source.name,
         "source_hash": h.hexdigest(),
@@ -3916,6 +4087,20 @@ def _source_imatrix_signature(
         "num_samples": int(num_samples),
         "seq_length": int(seq_length),
     }
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    model_type = str(
+        text_config.get("model_type") or config.get("model_type") or ""
+    ).lower()
+    if model_type.startswith("gemma4") and (
+        _nested_config_int(config, ("num_kv_shared_layers",), default=0) > 0
+        or _nested_config_int(config, ("hidden_size_per_layer_input",), default=0) > 0
+    ):
+        # Invalidate caches produced by the old independent-block walk, which
+        # captured only q_proj in the shared-KV tail of E2B/E4B.
+        signature["layer_walk"] = "gemma4_shared_kv_v1"
+    return signature
 
 
 def _save_oqe_imatrix(
@@ -5536,8 +5721,203 @@ def _find_model_layers(model):
     return embed_fn, layers
 
 
-def _forward_layer_result(block, inputs, mask, position_ids):
+_GEMMA4_LAYER_STATE_KIND = "gemma4_shared_kv"
+
+
+def _find_layer_model(model, layers):
+    """Return the module that owns ``layers`` and the layer-level helpers."""
+    # Check the deepest language module first. VLM wrappers may expose a
+    # delegated ``layers`` property while keeping the Gemma 4 text config and
+    # layer-walk helpers only on ``language_model.model``.
+    candidates = []
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        language_core = getattr(language_model, "model", None)
+        if language_core is not None:
+            candidates.append(language_core)
+        candidates.append(language_model)
+    model_core = getattr(model, "model", None)
+    if model_core is not None:
+        candidates.append(model_core)
+    candidates.append(model)
+
+    seen = set()
+    for candidate in candidates:
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if getattr(candidate, "layers", None) is layers:
+            return candidate
+    return None
+
+
+def _object_config_int(config, key: str, default: int = 0) -> int:
+    if isinstance(config, dict):
+        value = config.get(key, default)
+    else:
+        value = getattr(config, key, default)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
+    """Build the stateful E2B/E4B layer-walk inputs.
+
+    Gemma 4 E2B/E4B cannot be calibrated by invoking each decoder block as an
+    independent transformer layer. They project a token-derived input for
+    every layer and their tail layers consume K/V tensors produced by earlier
+    blocks. Mirror the native Gemma 4 model loop so imatrix collection and
+    sensitivity measurement see the same activations as inference.
+    """
+    layer_model = _find_layer_model(model, layers)
+    if layer_model is None:
+        return None
+
+    layer_config = getattr(layer_model, "config", None)
+    if layer_config is None:
+        return None
+    if isinstance(layer_config, dict):
+        model_type = str(layer_config.get("model_type", "")).lower()
+    else:
+        model_type = str(getattr(layer_config, "model_type", "")).lower()
+    num_kv_shared_layers = _object_config_int(layer_config, "num_kv_shared_layers")
+    per_layer_input_size = _object_config_int(
+        layer_config, "hidden_size_per_layer_input"
+    )
+    if not model_type.startswith("gemma4") or (
+        num_kv_shared_layers <= 0 and per_layer_input_size <= 0
+    ):
+        return None
+
+    num_layers = len(layers)
+    if not 0 <= num_kv_shared_layers <= num_layers:
+        raise RuntimeError(
+            "Gemma 4 calibration has an invalid shared-KV layout: "
+            f"layers={num_layers}, shared={num_kv_shared_layers}"
+        )
+
+    raw_inputs = inputs
+    embed_scale = getattr(layer_model, "embed_scale", 1.0)
+    inputs = raw_inputs * embed_scale
+
+    if per_layer_input_size > 0:
+        get_per_layer_inputs = getattr(layer_model, "get_per_layer_inputs", None)
+        project_per_layer_inputs = getattr(
+            layer_model, "project_per_layer_inputs", None
+        )
+        if callable(get_per_layer_inputs) and callable(project_per_layer_inputs):
+            per_layer_inputs = get_per_layer_inputs(calib_data)
+            per_layer_inputs = project_per_layer_inputs(inputs, per_layer_inputs)
+        else:
+            get_per_layer_inputs = getattr(layer_model, "_get_per_layer_inputs", None)
+            project_per_layer_inputs = getattr(
+                layer_model, "_project_per_layer_inputs", None
+            )
+            if not callable(get_per_layer_inputs) or not callable(
+                project_per_layer_inputs
+            ):
+                raise RuntimeError(
+                    "Gemma 4 calibration cannot build per-layer inputs for "
+                    f"{type(layer_model).__name__}"
+                )
+            per_layer_inputs = get_per_layer_inputs(calib_data, raw_inputs)
+            per_layer_inputs = project_per_layer_inputs(inputs, per_layer_inputs)
+
+        if (
+            getattr(per_layer_inputs, "ndim", 0) != 4
+            or int(per_layer_inputs.shape[2]) != num_layers
+        ):
+            raise RuntimeError(
+                "Gemma 4 calibration produced invalid per-layer inputs: "
+                f"shape={getattr(per_layer_inputs, 'shape', None)}, "
+                f"layers={num_layers}"
+            )
+        per_layer_inputs = [
+            per_layer_inputs[:, :, layer_idx, :] for layer_idx in range(num_layers)
+        ]
+    else:
+        per_layer_inputs = [None] * num_layers
+
+    make_masks = getattr(layer_model, "_make_masks", None)
+    if not callable(make_masks):
+        raise RuntimeError(
+            "Gemma 4 calibration cannot build the model attention-mask schedule"
+        )
+    layer_masks = list(make_masks(inputs, [None] * num_layers))
+    if len(layer_masks) != num_layers:
+        raise RuntimeError(
+            "Gemma 4 calibration produced an invalid mask schedule: "
+            f"masks={len(layer_masks)}, layers={num_layers}"
+        )
+
+    previous_kvs = list(getattr(layer_model, "previous_kvs", range(num_layers)))
+    if len(previous_kvs) != num_layers or any(
+        not 0 <= int(previous_idx) <= layer_idx
+        for layer_idx, previous_idx in enumerate(previous_kvs)
+    ):
+        raise RuntimeError("Gemma 4 calibration produced an invalid shared-KV schedule")
+
+    state = {
+        "kind": _GEMMA4_LAYER_STATE_KIND,
+        "per_layer_inputs": per_layer_inputs,
+        "previous_kvs": previous_kvs,
+        "intermediates": [(None, None)] * num_layers,
+    }
+    return inputs, layer_masks, state
+
+
+def _forward_gemma4_layer_result(block, inputs, mask, state, layer_idx: int):
+    if not 0 <= int(layer_idx) < len(state["previous_kvs"]):
+        raise RuntimeError(f"Invalid Gemma 4 calibration layer index: {layer_idx}")
+    previous_idx = int(state["previous_kvs"][layer_idx])
+    shared_kv, offset = state["intermediates"][previous_idx]
+    try:
+        result = block(
+            inputs,
+            mask,
+            None,
+            per_layer_input=state["per_layer_inputs"][layer_idx],
+            shared_kv=shared_kv,
+            offset=offset,
+        )
+    except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+        raise RuntimeError(
+            f"Gemma 4 calibration forward failed at layer {layer_idx}: {e}"
+        ) from e
+    if not isinstance(result, tuple) or len(result) < 3:
+        raise RuntimeError(
+            "Gemma 4 calibration expected a (hidden, shared_kv, offset) result "
+            f"at layer {layer_idx}, got {type(result).__name__}"
+        )
+    return result[0], (result[1], result[2])
+
+
+def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None:
+    if not isinstance(state, dict):
+        return
+    if state.get("kind") == _GEMMA4_LAYER_STATE_KIND:
+        if not isinstance(aux, tuple) or len(aux) != 2:
+            raise RuntimeError(
+                f"Gemma 4 calibration layer {layer_idx} returned invalid state"
+            )
+        state["intermediates"][layer_idx] = aux
+    elif state.get("kind") == "glm_moe_dsa":
+        state["prev_topk_indices"] = aux if aux is not None else fallback
+
+
+def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
     """Forward pass through a transformer layer, returning output and aux."""
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _GEMMA4_LAYER_STATE_KIND
+    ):
+        if layer_idx is None:
+            raise RuntimeError("Gemma 4 calibration requires a layer index")
+        return _forward_gemma4_layer_result(
+            block, inputs, mask, position_ids, int(layer_idx)
+        )
     if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
         try:
             result = block(
@@ -5685,6 +6065,9 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
             "",
         )
     )
+    gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
+    if gemma4_inputs is not None:
+        return gemma4_inputs
     if model_type.startswith("deepseek_v4"):
         args = model.args
         h = mx.broadcast_to(
@@ -6048,17 +6431,19 @@ def _collect_imatrix_from_model(
                         else None
                     )
                     out, aux = _forward_layer_result(
-                        block, inputs, layer_mask, position_ids
+                        block,
+                        inputs,
+                        layer_mask,
+                        position_ids,
+                        layer_idx=layer_idx,
                     )
                     if out is None:
                         continue
                     mx.eval(out)
                     inputs = out
-                    if (
-                        isinstance(position_ids, dict)
-                        and position_ids.get("kind") == "glm_moe_dsa"
-                    ):
-                        position_ids["prev_topk_indices"] = aux or prev_aux
+                    _commit_layer_forward_aux(
+                        position_ids, layer_idx, aux, fallback=prev_aux
+                    )
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -6448,7 +6833,11 @@ def _measure_sensitivity_from_model(
             else None
         )
         out_float, baseline_aux = _forward_layer_result(
-            block, inputs, layer_mask, position_ids
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
         )
         if out_float is None:
             continue
@@ -6458,7 +6847,13 @@ def _measure_sensitivity_from_model(
         )
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
-        out_quant, _ = _forward_layer_result(block, inputs, layer_mask, position_ids)
+        out_quant, _ = _forward_layer_result(
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
+        )
         if out_quant is not None:
             raw_mse = ((out_float - out_quant) ** 2).mean()
             out_magnitude = (out_float**2).mean()
@@ -6470,6 +6865,9 @@ def _measure_sensitivity_from_model(
 
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
+        _commit_layer_forward_aux(
+            position_ids, layer_idx, baseline_aux, fallback=prev_aux
+        )
         inputs = out_float
         mx.synchronize()
         mx.clear_cache()
@@ -7003,7 +7401,11 @@ def _measure_sensitivity_from_quantized_model(
             else None
         )
         out_baseline, baseline_aux = _forward_layer_result(
-            block, inputs, layer_mask, position_ids
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
         )
         if out_baseline is None:
             continue
@@ -7053,7 +7455,11 @@ def _measure_sensitivity_from_quantized_model(
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
         out_perturbed, _ = _forward_layer_result(
-            block, inputs, layer_mask, position_ids
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
         )
 
         modules_by_path = dict(
@@ -7084,6 +7490,9 @@ def _measure_sensitivity_from_quantized_model(
 
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
+        _commit_layer_forward_aux(
+            position_ids, layer_idx, baseline_aux, fallback=prev_aux
+        )
         inputs = out_baseline
         mx.eval(inputs)
         mx.synchronize()

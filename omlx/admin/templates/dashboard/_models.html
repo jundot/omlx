@@ -1459,6 +1459,18 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <!-- Combine gemma4 assistant model as MTP head -->
+                                        <div x-show="oqMtpAssistantCandidates().length > 0" x-cloak>
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.combine_assistant') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.combine_assistant_help') }}</p>
+                                            <select x-model="oqMtpAssistantPath"
+                                                    class="mt-2 w-full px-3 py-2 text-sm border border-neutral-200 rounded-xl bg-white focus:outline-none focus:ring-2 focus:ring-black/10">
+                                                <option value="">{{ t('models.oq.combine_assistant_none') }}</option>
+                                                <template x-for="m in oqMtpAssistantCandidates()" :key="m.path">
+                                                    <option :value="m.path" x-text="m.name + ' (' + m.size_formatted + ')'"></option>
+                                                </template>
+                                            </select>
+                                        </div>
                                         <!-- Non-quant weight dtype -->
                                         <div class="flex items-center justify-between gap-4">
                                             <div class="flex-1 min-w-0">

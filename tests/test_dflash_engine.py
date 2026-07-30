@@ -806,6 +806,27 @@ class TestDFlashCompatibility:
         assert compatible is True
         assert reason == ""
 
+    def test_gemma4_unified_top_level_is_compatible(self, tmp_path):
+        """Current mlx-community Gemma 4 exports declare gemma4_unified at the
+        top level with text_config.model_type=gemma4_unified_text (#2153).
+        mlx-lm remaps gemma4_unified onto the gemma4 module, so DFlash drives
+        the same text stack and the gate must accept it."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "gemma4_unified",
+                    "text_config": {"model_type": "gemma4_unified_text"},
+                }
+            )
+        )
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
     def test_gemma4_assistant_is_incompatible(self, tmp_path):
         """MTP -assistant variants declare gemma4_assistant at the top level
         even though their text_config.model_type is gemma4_text. The toggle
@@ -1404,3 +1425,38 @@ class TestDFlashRuntimeCacheStats:
         )
         assert counters["ssd_hot_hits"] == 0
         assert counters["ssd_disk_loads"] == 5
+
+
+class TestFormatPhaseTimings:
+    def test_empty_or_invalid_returns_empty(self):
+        from omlx.engine.dflash import _format_phase_timings
+
+        assert _format_phase_timings(None) == ""
+        assert _format_phase_timings({}) == ""
+        assert _format_phase_timings("nope") == ""
+
+    def test_formats_all_phases_in_ms(self):
+        from omlx.engine.dflash import _format_phase_timings
+
+        out = _format_phase_timings(
+            {
+                "prefill": 2417_200.0,
+                "draft": 289_600.0,
+                "draft_prefill": 12_100.0,
+                "draft_incremental": 277_500.0,
+                "verify": 24_172_100.0,
+                "replay": 4_700.0,
+                "commit": 3_100.0,
+            }
+        )
+        assert out == (
+            ", phases[prefill=2417.2ms draft=289.6ms(first=12.1/incr=277.5)"
+            " verify=24172.1ms replay=4.7ms commit=3.1ms]"
+        )
+
+    def test_missing_keys_render_zero(self):
+        from omlx.engine.dflash import _format_phase_timings
+
+        out = _format_phase_timings({"verify": 1000.0})
+        assert "verify=1.0ms" in out
+        assert "prefill=0.0ms" in out
