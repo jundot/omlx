@@ -32,6 +32,18 @@ class PrefillTransientTracker:
     # genuinely recurring giant transient still reaches the guard through
     # the last-delta/EWMA terms of _predicted_chunk_transient.
     _OBSERVED_MAX_CLAMP_BYTES = 4 * 1024**3
+    # A sample whose per_token exceeds the current EWMA by more than this
+    # ratio is treated as measurement noise (a tail/residual prefill chunk,
+    # not a genuine cost-per-token regime change) and excluded from the EWMA
+    # blend. Chosen from a real incident (2026-07-29, Qwen3.6-35B-A3B):
+    # baseline samples ranged ~525-1867 KB/token (largest legitimate
+    # fluctuation ~1.7x the running EWMA) before a single n=185 tail chunk
+    # measured 10497.1 KB/token — a ~13.6x jump off an EWMA of 773.3 KB/token
+    # — and pushed the EWMA to 3690.5 KB/token in one update, poisoning every
+    # later admission check for the rest of the process lifetime. 8x sits
+    # above the largest observed legitimate fluctuation and below the
+    # observed outlier.
+    _EWMA_OUTLIER_RATIO = 8.0
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -62,6 +74,13 @@ class PrefillTransientTracker:
         floor; charging the big-chunk max at admission rejected every
         prompt at a 21GB ceiling). Big-chunk transients stay the throttle's
         domain via the EWMA/last-delta terms.
+
+        A sample whose per-token rate exceeds the current EWMA by more than
+        ``_EWMA_OUTLIER_RATIO`` is excluded from the EWMA blend (see that
+        constant's docstring) — it still counts toward ``samples`` and
+        still updates ``last_delta_bytes``/``last_n_tokens`` raw, so a
+        genuine regime change remains visible via those fields even while
+        the accumulated EWMA is protected from a single noisy reading.
         """
         if n_tokens <= 0:
             return
@@ -87,6 +106,21 @@ class PrefillTransientTracker:
         per_token = transient_bytes / n_tokens
         if self._samples == 0:
             self._ewma_per_token = per_token
+        elif per_token > self._ewma_per_token * self._EWMA_OUTLIER_RATIO:
+            # Reject from the EWMA blend: a single sample this far above
+            # the running rate is more likely a noisy phys_footprint()
+            # delta (see _record_chunk_transient's docstring on
+            # buffer-pool-driven noise) than a real per-token cost jump.
+            # last_delta_bytes/last_n_tokens below still record it raw for
+            # diagnostics — only the accumulated EWMA is protected.
+            logger.debug(
+                "PrefillTransientTracker(%s): rejected %.1f-byte/token "
+                "outlier from EWMA (current %.1f, ratio limit %.1fx)",
+                self._model_id,
+                per_token,
+                self._ewma_per_token,
+                self._EWMA_OUTLIER_RATIO,
+            )
         else:
             self._ewma_per_token = (
                 self._EWMA_ALPHA * per_token
