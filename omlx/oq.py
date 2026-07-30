@@ -3295,6 +3295,26 @@ _MULTIMODAL_SIDECAR_PATTERNS = (
 )
 
 
+def _holds_chat_template(path: Path) -> bool:
+    """Whether a processor config carries a chat template inline.
+
+    Current Transformers writes chat templates to their own file, but older
+    processor repos keep one under a ``chat_template`` key inside
+    ``processor_config.json`` / ``preprocessor_config.json``, and Transformers
+    still honours it on load. Such a file has to be kept even for a text-only
+    output, because dropping it would silently take the model's chat template
+    with it.
+
+    An unreadable or non-JSON file counts as carrying one: preserving a file
+    we cannot parse is the cheaper mistake.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("chat_template") is not None
+    except (OSError, ValueError):
+        return True
+
+
 def _copy_model_sidecars(
     source: Path, output: Path, *, text_only: bool = False
 ) -> None:
@@ -3302,13 +3322,18 @@ def _copy_model_sidecars(
 
     ``text_only`` skips the multimodal processor configs, matching the
     modality metadata that :func:`_normalize_text_only_in_config` drops from
-    the output config.
+    the output config. A processor config that carries an inline chat
+    template is kept regardless, since that template is not modality
+    metadata and may be the only copy.
     """
-    patterns = _SIDECAR_PATTERNS
-    if not text_only:
-        patterns += _MULTIMODAL_SIDECAR_PATTERNS
-    for pattern in patterns:
+    for pattern in _SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
+            shutil.copy2(src_file, output / src_file.name)
+
+    for pattern in _MULTIMODAL_SIDECAR_PATTERNS:
+        for src_file in source.glob(pattern):
+            if text_only and not _holds_chat_template(src_file):
+                continue
             shutil.copy2(src_file, output / src_file.name)
 
     for py_file in source.glob("*.py"):
