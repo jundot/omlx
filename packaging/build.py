@@ -12,6 +12,8 @@ Usage:
     python build.py --print-fingerprint
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import re
