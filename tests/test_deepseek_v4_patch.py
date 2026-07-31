@@ -558,6 +558,134 @@ class TestChatTemplateV4:
         assert "sunny, 22C" in prompt
 
 
+class TestChatTemplateV4DSpark:
+    """Official DSpark/0731 message encoding and reasoning-effort controls."""
+
+    def test_basic_thinking_prompt_matches_official_reference(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4_dspark as ct
+
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        assert prompt == (
+            "<｜begin▁of▁sentence｜>You are a helpful assistant."
+            "<｜User｜>What is 2+2?<｜Assistant｜><think>"
+        )
+
+    def test_reasoning_effort_levels_are_distinct(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4_dspark as ct
+
+        messages = [{"role": "user", "content": "Diagnose this."}]
+        low = ct.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            reasoning_effort="low",
+        )
+        high = ct.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            reasoning_effort="high",
+        )
+        maximum = ct.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            reasoning_effort="max",
+        )
+
+        assert low.startswith("<｜begin▁of▁sentence｜><｜User｜>")
+        assert high.startswith(
+            "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+        )
+        assert maximum.startswith(
+            "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"
+        )
+        assert high != maximum
+
+    def test_tool_results_use_official_user_block_format(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4_dspark as ct
+
+        messages = [
+            {"role": "user", "content": "Weather in Seoul?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location":"Seoul"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "sunny, 22C",
+            },
+        ]
+        prompt = ct.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        assert "<｜User｜><tool_result>sunny, 22C</tool_result>" in prompt
+        assert "<function_results>" not in prompt
+        assert prompt.endswith("<｜Assistant｜><think>")
+
+    def test_top_level_tools_are_injected_into_official_system_message(
+        self, applied_patch
+    ):
+        from omlx.patches.deepseek_v4 import chat_template_v4_dspark as ct
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        prompt = ct.apply_chat_template(
+            [{"role": "user", "content": "Weather?"}],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        assert "### Available Tool Schemas" in prompt
+        assert "get_weather" in prompt
+        assert prompt.count("### Available Tool Schemas") == 1
+
+    def test_dspark_config_selects_official_protocol(self, applied_patch):
+        from omlx.patches.deepseek_v4 import tokenizer_patch
+
+        assert tokenizer_patch._uses_dspark_protocol(
+            {
+                "model_type": "deepseek_v4",
+                "dspark_block_size": 5,
+                "dspark_target_layer_ids": [40, 41, 42],
+                "dspark_markov_rank": 256,
+            }
+        )
+        assert not tokenizer_patch._uses_dspark_protocol(
+            {"model_type": "deepseek_v4", "num_nextn_predict_layers": 1}
+        )
+
+
 class TestChatTemplateModuleRegistration:
     """sys.modules registration so mlx-lm's importlib path picks up our types."""
 

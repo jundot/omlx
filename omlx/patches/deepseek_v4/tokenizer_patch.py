@@ -162,20 +162,37 @@ def _register_chat_template_and_parser_modules() -> None:
         sys.modules["mlx_lm.tool_parsers.deepseek_v4"] = _tp
 
 
-def _is_deepseek_v4_model(model_path) -> bool:
-    """Return True if ``model_path/config.json`` declares deepseek_v4*."""
+def _deepseek_v4_config(model_path) -> dict | None:
+    """Return a DeepSeek V4 config dict, or ``None`` for another family."""
     import json
     from pathlib import Path
 
     p = Path(model_path) / "config.json"
     if not p.exists():
-        return False
+        return None
     try:
-        return str(json.loads(p.read_text()).get("model_type", "")).startswith(
-            "deepseek_v4"
-        )
+        config = json.loads(p.read_text())
     except Exception:
+        return None
+    if not str(config.get("model_type", "")).startswith("deepseek_v4"):
+        return None
+    return config
+
+
+def _is_deepseek_v4_model(model_path) -> bool:
+    """Return True if ``model_path/config.json`` declares deepseek_v4*."""
+    return _deepseek_v4_config(model_path) is not None
+
+
+def _uses_dspark_protocol(config: dict | None) -> bool:
+    """Identify the official DSpark/0731 prompt and speculative format."""
+    if not config:
         return False
+    return bool(
+        int(config.get("dspark_block_size", 0) or 0) > 0
+        and config.get("dspark_target_layer_ids")
+        and int(config.get("dspark_markov_rank", 0) or 0) > 0
+    )
 
 
 def apply_load_patch() -> bool:
@@ -207,10 +224,14 @@ def apply_load_patch() -> bool:
             eos_token_ids=eos_token_ids,
         )
 
-        if not _is_deepseek_v4_model(model_path):
+        config = _deepseek_v4_config(model_path)
+        if config is None:
             return wrapper
 
-        from . import chat_template_v4 as _ct
+        if _uses_dspark_protocol(config):
+            from . import chat_template_v4_dspark as _ct
+        else:
+            from . import chat_template_v4 as _ct
         from . import tool_parser_v4 as _tp
 
         # Skip if the published tokenizer_config already wired up V4 by
