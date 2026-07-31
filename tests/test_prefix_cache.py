@@ -9,6 +9,7 @@ PagedCacheManager for block-based storage with SSD persistence.
 import sys
 import time
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,6 +19,7 @@ from omlx.cache.paged_cache import (
     PagedCacheManager,
     compute_block_hash,
 )
+from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
 from omlx.cache.stats import PrefixCacheStats
 
@@ -53,6 +55,37 @@ class TestBlockCacheEntry:
 
 class TestBlockAwarePrefixCache:
     """Tests for BlockAwarePrefixCache."""
+
+    @staticmethod
+    def _make_ssd_prefix_cache(
+        cache_directory: Path,
+        *,
+        num_layers: int = 1,
+        hot_cache_max_bytes: int = 0,
+        hot_cache_only: bool = False,
+    ) -> tuple[BlockAwarePrefixCache, PagedCacheManager, PagedSSDCacheManager]:
+        ssd_manager = PagedSSDCacheManager(
+            cache_dir=cache_directory,
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=hot_cache_max_bytes,
+            hot_cache_only=hot_cache_only,
+            expected_model_name="test-model",
+            expected_num_layers=num_layers,
+            expected_block_size=4,
+        )
+        paged_manager = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        paged_manager.set_paged_ssd_cache_manager(ssd_manager)
+        prefix_cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=num_layers),
+            paged_cache_manager=paged_manager,
+            paged_ssd_cache_manager=ssd_manager,
+        )
+        return prefix_cache, paged_manager, ssd_manager
 
     @pytest.fixture
     def paged_cache(self):
@@ -160,6 +193,280 @@ class TestBlockAwarePrefixCache:
         """Test store_cache with empty tokens returns None."""
         result = prefix_cache.store_cache("req-001", [], [])
         assert result is None
+
+    def test_exact_prefix_survives_ssd_manager_restart(self, tmp_path):
+        """An exact static prefix includes its partial terminal block on SSD."""
+        import mlx.core as mx
+
+        cache_directory = tmp_path / "exact-prefix"
+        tokens = list(range(7))
+        keys = mx.arange(7, dtype=mx.float32).reshape(1, 1, 7, 1)
+        values = (keys + 10).astype(mx.float32)
+        extracted_cache = [
+            {
+                "state": (keys, values),
+                "meta_state": (7,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+
+        first_prefix_cache, _, first_ssd_manager = self._make_ssd_prefix_cache(
+            cache_directory
+        )
+
+        stored_table = first_prefix_cache.store_exact_prefix(
+            "cold-static-prefix",
+            tokens,
+            extracted_cache,
+        )
+        assert stored_table is not None
+        assert stored_table.num_tokens == len(tokens)
+
+        ordinary_table, ordinary_remaining = first_prefix_cache.fetch_cache(
+            "ordinary-prefix",
+            [*tokens, 8],
+        )
+        assert ordinary_table is not None
+        assert ordinary_table.num_tokens == 4
+        assert ordinary_remaining == [4, 5, 6, 8]
+        first_prefix_cache.release_cache("ordinary-prefix")
+        first_ssd_manager.close()
+
+        restarted_prefix_cache, _, restarted_ssd_manager = (
+            self._make_ssd_prefix_cache(cache_directory)
+        )
+
+        try:
+            restored_table = restarted_prefix_cache.fetch_exact_prefix(
+                "warm-static-prefix",
+                tokens,
+            )
+            assert restored_table is not None
+            restored_cache = restarted_prefix_cache.reconstruct_cache(
+                restored_table,
+                promote_to_hot_cache=False,
+            )
+            assert restored_cache is not None
+            restored_keys, restored_values = restored_cache[0].state
+            assert restored_table.num_tokens == len(tokens)
+            assert mx.array_equal(restored_keys, keys).item()
+            assert mx.array_equal(restored_values, values).item()
+
+            changed_tokens = [*tokens[:-1], 99]
+            assert (
+                restarted_prefix_cache.fetch_exact_prefix(
+                    "changed-static-prefix",
+                    changed_tokens,
+                )
+                is None
+            )
+        finally:
+            restarted_ssd_manager.close()
+
+    def test_aligned_exact_prefix_does_not_reuse_placeholder_terminal(self, tmp_path):
+        """An aligned static tip must not collide with an ordinary chain block."""
+        import mlx.core as mx
+
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "aligned-exact-prefix",
+            num_layers=2,
+        )
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["KVCache", "ArraysCache"],
+            model_name="test-model",
+        )
+        keys = mx.arange(12, dtype=mx.float32).reshape(1, 1, 12, 1)
+        values = keys + 20
+        first_recurrent_state = mx.ones((1, 2), dtype=mx.float32)
+        second_recurrent_state = mx.ones((1, 2), dtype=mx.float32) * 2
+        extracted_cache = [
+            {
+                "state": (keys, values),
+                "meta_state": (12,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            },
+            {
+                "state": (first_recurrent_state, second_recurrent_state),
+                "meta_state": (),
+                "class_name": "ArraysCache",
+                "cache_type": "ArraysCache",
+            },
+        ]
+
+        try:
+            ordinary_table = prefix_cache.store_cache(
+                "ordinary-longer-prompt",
+                list(range(12)),
+                extracted_cache,
+                model_cache_config=model_cache_config,
+                hot_cache_write_back=False,
+            )
+            assert ordinary_table is not None
+
+            exact_table = prefix_cache.store_exact_prefix(
+                "aligned-static-prefix",
+                list(range(8)),
+                extracted_cache,
+                model_cache_config=model_cache_config,
+            )
+            assert exact_table is not None
+            prefix_cache.clear_request_entry("aligned-static-prefix")
+
+            restored_table = prefix_cache.fetch_exact_prefix(
+                "aligned-static-restore",
+                list(range(8)),
+            )
+            assert restored_table is not None
+            restored_cache = prefix_cache.reconstruct_cache(
+                restored_table,
+                promote_to_hot_cache=False,
+            )
+            assert restored_cache is not None
+            assert restored_cache[0].state[0].shape[2] == 8
+            restored_arrays_cache = restored_cache[1]
+            restored_arrays_cache[0] = mx.zeros((1, 2), dtype=mx.float32)
+            assert mx.array_equal(
+                restored_arrays_cache[0],
+                mx.zeros((1, 2), dtype=mx.float32),
+            ).item()
+            assert mx.array_equal(
+                restored_arrays_cache[1],
+                second_recurrent_state,
+            ).item()
+        finally:
+            ssd_manager.close()
+
+    def test_exact_prefix_missing_terminal_is_a_complete_miss(self, tmp_path):
+        import mlx.core as mx
+
+        prefix_cache, paged_manager, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "missing-exact-terminal"
+        )
+        tokens = list(range(7))
+        keys = mx.ones((1, 1, 7, 1))
+        extracted_cache = [
+            {
+                "state": (keys, keys),
+                "meta_state": (7,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+
+        try:
+            assert (
+                prefix_cache.store_exact_prefix(
+                    "stored-exact-prefix", tokens, extracted_cache
+                )
+                is not None
+            )
+            terminal_hash = prefix_cache._exact_prefix_hashes(tokens)[-1][0]
+            assert ssd_manager.delete_block(terminal_hash)
+
+            assert (
+                prefix_cache.restore_exact_prefix(
+                    "missing-terminal-restore",
+                    tokens,
+                    promote_to_hot_cache=False,
+                )
+                is None
+            )
+            assert "missing-terminal-restore" not in paged_manager.request_tables
+            assert prefix_cache.get_stats().exact_prefix_misses == 1
+        finally:
+            ssd_manager.close()
+
+    def test_exact_prefix_uses_global_hot_tier_without_requiring_it(self, tmp_path):
+        import mlx.core as mx
+
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "exact-prefix-hot-tier",
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+        tokens = list(range(7))
+        keys = mx.ones((1, 1, 7, 1))
+        extracted_cache = [
+            {
+                "state": (keys, keys),
+                "meta_state": (7,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+
+        try:
+            assert (
+                prefix_cache.store_exact_prefix(
+                    "write-through-static-prefix", tokens, extracted_cache
+                )
+                is not None
+            )
+            assert ssd_manager.get_stats().hot_cache_entries == 0
+
+            assert (
+                prefix_cache.restore_exact_prefix(
+                    "hot-promoting-restore",
+                    tokens,
+                    promote_to_hot_cache=True,
+                )
+                is not None
+            )
+            assert ssd_manager.get_stats().hot_cache_entries > 0
+
+            ssd_manager.clear_hot_cache()
+            assert (
+                prefix_cache.restore_exact_prefix(
+                    "pressure-bypass-restore",
+                    tokens,
+                    promote_to_hot_cache=False,
+                )
+                is not None
+            )
+            assert ssd_manager.get_stats().hot_cache_entries == 0
+        finally:
+            ssd_manager.close()
+
+    def test_exact_prefix_honors_global_hot_cache_only_mode(self, tmp_path):
+        import mlx.core as mx
+
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "unused-hot-only-cache",
+            hot_cache_max_bytes=10 * 1024**2,
+            hot_cache_only=True,
+        )
+        tokens = list(range(7))
+        keys = mx.ones((1, 1, 7, 1))
+        extracted_cache = [
+            {
+                "state": (keys, keys),
+                "meta_state": (7,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+
+        try:
+            assert (
+                prefix_cache.store_exact_prefix(
+                    "hot-only-static-prefix", tokens, extracted_cache
+                )
+                is not None
+            )
+            assert ssd_manager.get_stats().hot_cache_entries > 0
+            assert (
+                prefix_cache.restore_exact_prefix(
+                    "hot-only-restore",
+                    tokens,
+                    promote_to_hot_cache=True,
+                )
+                is not None
+            )
+        finally:
+            ssd_manager.close()
 
     def test_store_cache_creates_block_table(self, prefix_cache):
         """Test store_cache creates a block table."""
@@ -713,9 +1020,7 @@ class TestPrefixIndexLifecycle:
         blocks = paged_cache.get_new_blocks(num)
         for block in blocks:
             block.token_count = paged_cache.block_size
-        prefix_cache._update_prefix_index(
-            tokens, [block.block_id for block in blocks]
-        )
+        prefix_cache._update_prefix_index(tokens, [block.block_id for block in blocks])
         return blocks
 
     def test_lifecycle_hooks_registered(self, prefix_cache, paged_cache):
@@ -780,9 +1085,7 @@ class TestPrefixIndexLifecycle:
         paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
         assert len(prefix_cache._prefix_index) == 1
 
-        prefix_cache._forget_incompatible_ssd_block(
-            block.block_hash, block.block_id
-        )
+        prefix_cache._forget_incompatible_ssd_block(block.block_hash, block.block_id)
 
         assert len(prefix_cache._prefix_index) == 0
 
@@ -828,9 +1131,7 @@ class TestPrefixIndexValidation:
         blocks = paged_cache.get_new_blocks(num)
         for block in blocks:
             block.token_count = paged_cache.block_size
-        prefix_cache._update_prefix_index(
-            tokens, [block.block_id for block in blocks]
-        )
+        prefix_cache._update_prefix_index(tokens, [block.block_id for block in blocks])
         return blocks
 
     def test_valid_index_hit_returns_full_prefix(self, prefix_cache, paged_cache):
@@ -2659,9 +2960,10 @@ class TestTurboQuantFormatMismatchRecovery:
         assert block_table.num_tokens == 4
         assert blocks[1].ref_count == 1
         mock_ssd.forget_block.assert_called_once_with(blocks[1].block_hash)
-        assert paged_cache.cached_block_hash_to_block.get_block(
-            blocks[1].block_hash
-        ) is None
+        assert (
+            paged_cache.cached_block_hash_to_block.get_block(blocks[1].block_hash)
+            is None
+        )
 
     def test_reconstruct_rejects_stale_first_block_with_manager_signature(self, mx):
         """A live manager signature must make stale block 0 fail its own check."""
@@ -3537,8 +3839,7 @@ class TestTurboQuantMixedPayloadReconstruction:
 
         tq_metadata = self._metadata(["TurboQuantKVCache"], [tq.meta_state], 1)
         mock_ssd.load_block_with_metadata.side_effect = [
-            ([self._tq_block_payload(tq_mod, ks, vs, i)], tq_metadata)
-            for i in range(3)
+            ([self._tq_block_payload(tq_mod, ks, vs, i)], tq_metadata) for i in range(3)
         ]
 
         result = cache.reconstruct_cache(block_table)
@@ -3671,9 +3972,7 @@ class TestTurboQuantMixedPayloadReconstruction:
         block_table = self._alloc_block_table(paged_cache, 2)
 
         full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
-        full_values = mx.random.normal(
-            (1, self.HEADS, 2 * self.BLOCK, self.HDIM)
-        )
+        full_values = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
         tq, ks, vs, ref_keys, ref_values = self._tq_quantize(
             mx, tq_mod, full_keys, full_values, bits=8.0
         )
@@ -3710,9 +4009,7 @@ class TestTurboQuantMixedPayloadReconstruction:
         block_table = self._alloc_block_table(paged_cache, 2)
 
         full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
-        full_values = mx.random.normal(
-            (1, self.HEADS, 2 * self.BLOCK, self.HDIM)
-        )
+        full_values = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
         tq, ks, vs, _, _ = self._tq_quantize(
             mx, tq_mod, full_keys, full_values, bits=8.0
         )
@@ -3784,12 +4081,8 @@ class TestReconstructionSilentFallbackHardening:
 
     def _plain_slice(self, mx):
         return (
-            mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
-                mx.float16
-            ),
-            mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
-                mx.float16
-            ),
+            mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(mx.float16),
+            mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(mx.float16),
         )
 
     def _metadata(self, num_layers=1):

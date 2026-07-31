@@ -38,13 +38,85 @@ class _Model:
 
 
 class _CacheLayer:
+    """Mock cache layer that supports the ``.state`` property setter.
+
+    The real mlx-lm cache types (KVCache, RotatingKVCache, ArraysCache) expose
+    a ``state`` property with a setter that stores the KV tensor tuple. The
+    static-prefix KV cache (#2177) restores states by assigning
+    ``layer.state = state``. This mock stores the assigned value so the restore
+    path can be exercised without real MLX tensors.
+    """
+
     def __init__(self) -> None:
-        self.state = object()
+        self._state = (object(),)
+
+    @property
+    def state(self) -> Any:
+        return self._state
+
+    @state.setter
+    def state(self, value: Any) -> None:
+        self._state = value
 
 
-def _all_tokens(system_token_count: int, conversation_token_count: int) -> list[int]:
+class _TieredExactPrefixCache:
+    def __init__(self) -> None:
+        self.tokens: list[int] | None = None
+        self.layer_states: list[dict[str, Any]] | None = None
+        self.restore_promotions: list[bool] = []
+
+    def restore_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        promote_to_hot_cache: bool,
+    ) -> list[Any] | None:
+        del request_id
+        self.restore_promotions.append(promote_to_hot_cache)
+        if tokens != self.tokens or self.layer_states is None:
+            return None
+        restored_layers = [_CacheLayer() for _ in self.layer_states]
+        for restored_layer, layer_state in zip(
+            restored_layers, self.layer_states, strict=True
+        ):
+            restored_layer.state = layer_state["state"]
+        return restored_layers
+
+    def store_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        cache_data: list[dict[str, Any]],
+        model_cache_config: Any = None,
+    ) -> object:
+        del request_id, model_cache_config
+        self.tokens = list(tokens)
+        self.layer_states = cache_data
+        return object()
+
+
+def _extract_cache_states(
+    cache: list[Any],
+) -> tuple[list[dict[str, Any]], Any]:
+    return [
+        {
+            "state": layer.state,
+            "meta_state": (),
+            "class_name": "_CacheLayer",
+            "cache_type": "test",
+        }
+        for layer in cache
+    ], None
+
+
+def _all_tokens(
+    system_token_count: int,
+    conversation_token_count: int,
+    conversation_start: int = 1_000,
+) -> list[int]:
     return list(range(system_token_count)) + list(
-        range(1_000, 1_000 + conversation_token_count)
+        range(conversation_start, conversation_start + conversation_token_count)
     )
 
 
@@ -53,11 +125,22 @@ def _run(
     system_token_count: int,
     conversation_token_count: int,
     selected_indices: list[int],
+    cached_tokens: int = 0,
+    request_prompt_cache: list[Any] | None = None,
+    conversation_start: int = 1_000,
+    extract_cache_states: target_workflow.ExtractCacheStates | None = None,
     abort_error: _AbortError | None = None,
     abort_at: int | None = None,
     sparse_abort_error: _AbortError | None = None,
+    exact_prefix_cache: _TieredExactPrefixCache | None = None,
+    static_prefix_tokens: list[int] | None = None,
+    promote_static_prefix_to_hot_cache: bool = True,
 ) -> tuple[Any, _Logger, dict[str, Any]]:
-    all_tokens = _all_tokens(system_token_count, conversation_token_count)
+    all_tokens = _all_tokens(
+        system_token_count,
+        conversation_token_count,
+        conversation_start,
+    )
     plan = plan_specprefill_target(
         all_tokens=all_tokens,
         system_token_count=system_token_count,
@@ -125,7 +208,9 @@ def _run(
 
     with (
         patch.object(target_workflow, "make_prompt_cache", return_value=prompt_cache),
-        patch.object(target_workflow.mx, "eval", side_effect=trace["evaluations"].append),
+        patch.object(
+            target_workflow.mx, "eval", side_effect=trace["evaluations"].append
+        ),
         patch.object(target_workflow.mx, "stream", side_effect=use_stream),
         patch(
             "omlx.patches.specprefill._find_attention_layers",
@@ -140,8 +225,10 @@ def _run(
         result = target_workflow.run_specprefill_target_prefill(
             target_model=model,
             request=SimpleNamespace(
-                cached_tokens=0,
-                num_prompt_tokens=len(all_tokens),
+                request_id="target-request",
+                cached_tokens=cached_tokens,
+                num_prompt_tokens=cached_tokens + len(all_tokens),
+                prompt_cache=request_prompt_cache,
             ),
             plan=plan,
             all_tokens=all_tokens,
@@ -153,6 +240,10 @@ def _run(
             report_sparse_progress=report_sparse_progress,
             sync_and_clear_cache=lambda: trace["syncs"].append(stream),
             log=logger,
+            extract_cache_states=extract_cache_states,
+            exact_prefix_cache=exact_prefix_cache,
+            static_prefix_tokens=static_prefix_tokens,
+            promote_static_prefix_to_hot_cache=promote_static_prefix_to_hot_cache,
         )
     trace.update(
         {
@@ -193,7 +284,11 @@ def test_system_prefill_chunks_reports_checks_abort_and_uses_stream():
 
 @pytest.mark.parametrize(
     ("selected_indices", "expected_selected", "keeps_original"),
-    [([0, 5, 10], [0, 5, 10], True), ([10, 11, 0], [0, 10], False), ([11, 1, 11, 5], [1, 5, 11], False)],
+    [
+        ([0, 5, 10], [0, 5, 10], True),
+        ([10, 11, 0], [0, 10], False),
+        ([11, 1, 11, 5], [1, 5, 11], False),
+    ],
 )
 def test_sparse_prefill_preserves_sparse_inputs(
     selected_indices: list[int], expected_selected: list[int], keeps_original: bool
@@ -230,6 +325,76 @@ def test_runtime_patch_helpers_adjust_rope_log_and_handoff_result():
         "SpecPrefill: sparse prefill 2/10 conv tokens in 1.2s "
         "(total 15, cached 0, system 5 full, conv 10 sparse)",
     ]
+
+
+def test_target_prefill_extends_an_existing_partial_prefix_cache():
+    restored_prefix_cache = [_CacheLayer()]
+
+    _, _, trace = _run(
+        system_token_count=5,
+        conversation_token_count=8,
+        selected_indices=[0, 2, 6],
+        cached_tokens=4,
+        request_prompt_cache=restored_prefix_cache,
+    )
+
+    assert all(cache is restored_prefix_cache for _, cache in trace["model"].calls)
+    assert trace["sparse_calls"][0]["cache"] is restored_prefix_cache
+
+
+def test_github_2177_restores_static_prefix_from_tiered_cache():
+    exact_prefix_cache = _TieredExactPrefixCache()
+    static_prefix_tokens = list(range(5))
+    common_args = {
+        "system_token_count": 5,
+        "conversation_token_count": 12,
+        "selected_indices": [0, 5, 10],
+        "exact_prefix_cache": exact_prefix_cache,
+        "static_prefix_tokens": static_prefix_tokens,
+        "extract_cache_states": _extract_cache_states,
+    }
+
+    _, _, cold_trace = _run(**common_args)
+    warm_result, warm_logger, warm_trace = _run(
+        **common_args,
+        conversation_start=2_000,
+        promote_static_prefix_to_hot_cache=False,
+    )
+
+    assert len(cold_trace["model"].calls) == 2
+    assert warm_trace["model"].calls == []
+    assert warm_result.static_prefix_cached_tokens == len(static_prefix_tokens)
+    assert exact_prefix_cache.restore_promotions == [True, False]
+    assert "system 5 static-cached" in warm_logger.info_messages[-1]
+
+
+def test_static_prefix_hit_supersedes_a_shorter_block_cache_hit():
+    exact_prefix_cache = _TieredExactPrefixCache()
+    static_prefix_tokens = list(range(5))
+    _run(
+        system_token_count=5,
+        conversation_token_count=8,
+        selected_indices=[0, 2, 6],
+        exact_prefix_cache=exact_prefix_cache,
+        static_prefix_tokens=static_prefix_tokens,
+        extract_cache_states=_extract_cache_states,
+    )
+    shorter_block_cache = [_CacheLayer()]
+
+    result, _, warm_trace = _run(
+        system_token_count=3,
+        conversation_token_count=8,
+        selected_indices=[0, 2, 6],
+        cached_tokens=2,
+        request_prompt_cache=shorter_block_cache,
+        exact_prefix_cache=exact_prefix_cache,
+        static_prefix_tokens=static_prefix_tokens,
+        extract_cache_states=_extract_cache_states,
+    )
+
+    assert result.static_prefix_cached_tokens == 5
+    assert result.prompt_cache is not shorter_block_cache
+    assert warm_trace["model"].calls == []
 
 
 def test_scheduler_abort_error_propagates_unchanged():

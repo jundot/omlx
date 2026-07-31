@@ -1722,6 +1722,7 @@ class Scheduler:
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
         self._draft_paged_ssd_cache_manager: Any | None = None
+        self._draft_prefix_cache: Any | None = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
 
@@ -6961,7 +6962,7 @@ class Scheduler:
                 "Could not close the previous SpecPrefill draft SSD cache manager"
             )
         self._specprefill_draft_model = draft_model
-        self._draft_prefix_cache: Any | None = None
+        self._draft_prefix_cache = None
         if not draft_model_name:
             logger.info(
                 "SpecPrefill: draft model set without a stable model name "
@@ -8792,6 +8793,13 @@ class Scheduler:
 
                     from .specprefill.target import run_specprefill_target_prefill
 
+                    # all_tokens may start after an ordinary cache hit; exact
+                    # matching needs the complete static prefix from the prompt.
+                    prompt_token_ids = request.prompt_token_ids or []
+                    static_prefix_tokens = list(
+                        prompt_token_ids[: request.specprefill_system_end]
+                    )
+
                     target_result = run_specprefill_target_prefill(
                         target_model=self.model,
                         request=request,
@@ -8805,6 +8813,19 @@ class Scheduler:
                         report_sparse_progress=_report_sparse_progress,
                         sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
                         log=logger,
+                        extract_cache_states=self._extract_cache_states,
+                        # Preserve an ordinary cache hit that already extends
+                        # beyond the static boundary; exact restoration is only
+                        # useful while some system/tool tokens remain.
+                        exact_prefix_cache=(
+                            self.block_aware_cache
+                            if target_plan.system_token_count > 0
+                            else None
+                        ),
+                        static_prefix_tokens=static_prefix_tokens,
+                        promote_static_prefix_to_hot_cache=(
+                            not self._bypass_hot_cache_under_pressure()
+                        ),
                     )
 
                     cache_to_use = target_result.prompt_cache
@@ -11369,7 +11390,25 @@ class Scheduler:
             "prefix_tokens_requested": prefix_stats.tokens_requested_total,
             "prefix_tokens_saved": prefix_stats.tokens_saved,
             "evictions": prefix_stats.evictions,
+            "target_static_hits": prefix_stats.exact_prefix_hits,
+            "target_static_misses": prefix_stats.exact_prefix_misses,
+            "target_static_tokens_restored": (
+                prefix_stats.exact_prefix_tokens_restored
+            ),
         }
+
+        # Target exact-prefix and draft ordinary-prefix reuse are separate
+        # model-specific caches, so expose their counters independently.
+        draft_prefix_cache = self._draft_prefix_cache
+        if draft_prefix_cache is not None:
+            draft_stats = draft_prefix_cache.get_stats()
+            counters.update(
+                {
+                    "draft_prefix_hits": draft_stats.hits,
+                    "draft_prefix_misses": draft_stats.misses,
+                    "draft_prefix_tokens_saved": draft_stats.tokens_saved,
+                }
+            )
 
         if self.paged_ssd_cache_manager is not None:
             ssd = self.paged_ssd_cache_manager.get_stats()
@@ -11400,7 +11439,29 @@ class Scheduler:
             stats["block_size"] = self.config.paged_cache_block_size
 
         if self.block_aware_cache is not None:
-            stats["prefix_cache"] = self.block_aware_cache.get_stats_dict()
+            prefix_stats = self.block_aware_cache.get_stats_dict()
+            stats["prefix_cache"] = prefix_stats
+            specprefill_cache_stats = {
+                "target_static_hits": prefix_stats["exact_prefix_hits"],
+                "target_static_misses": prefix_stats["exact_prefix_misses"],
+                "target_static_tokens_restored": prefix_stats[
+                    "exact_prefix_tokens_restored"
+                ],
+                "target_static_stores": prefix_stats["exact_prefix_stores"],
+                "target_static_store_failures": prefix_stats[
+                    "exact_prefix_store_failures"
+                ],
+            }
+            if self._draft_prefix_cache is not None:
+                draft_stats = self._draft_prefix_cache.get_stats()
+                specprefill_cache_stats.update(
+                    {
+                        "draft_prefix_hits": draft_stats.hits,
+                        "draft_prefix_misses": draft_stats.misses,
+                        "draft_prefix_tokens_saved": draft_stats.tokens_saved,
+                    }
+                )
+            stats["specprefill_cache"] = specprefill_cache_stats
 
         counters = self._collect_cache_counters()
         if counters:

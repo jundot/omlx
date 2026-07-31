@@ -90,6 +90,11 @@ class PrefixCacheStats(BaseCacheStats):
     last_tokens_to_next_block: int = 0
     tokens_matched_total: int = 0
     tokens_requested_total: int = 0
+    exact_prefix_hits: int = 0
+    exact_prefix_misses: int = 0
+    exact_prefix_tokens_restored: int = 0
+    exact_prefix_stores: int = 0
+    exact_prefix_store_failures: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -115,6 +120,11 @@ class PrefixCacheStats(BaseCacheStats):
         self.last_tokens_to_next_block = 0
         self.tokens_matched_total = 0
         self.tokens_requested_total = 0
+        self.exact_prefix_hits = 0
+        self.exact_prefix_misses = 0
+        self.exact_prefix_tokens_restored = 0
+        self.exact_prefix_stores = 0
+        self.exact_prefix_store_failures = 0
         self._total_queries = 0
 
 

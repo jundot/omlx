@@ -25,6 +25,7 @@ import mlx.core as mx
 import pytest
 
 import omlx.scheduler as scheduler_module
+from omlx.cache.stats import PrefixCacheStats
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
@@ -3327,8 +3328,66 @@ class TestSchedulerSSDLayerSignature:
             scheduler.shutdown()
 
 
-class TestSpecPrefillDraftCacheSignature:
-    """Regression coverage for SpecPrefill draft-cache isolation (#1925)."""
+class TestSpecPrefillCaches:
+    """Regression coverage for target-prefix reuse and draft-cache isolation."""
+
+    def test_cache_counters_work_before_a_draft_model_is_configured(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = SimpleNamespace(
+            get_stats=lambda: PrefixCacheStats(hits=2, misses=1)
+        )
+        try:
+            counters = scheduler._collect_cache_counters()
+
+            assert counters is not None
+            assert counters["prefix_hits"] == 2
+            assert "draft_prefix_hits" not in counters
+        finally:
+            scheduler.shutdown()
+
+    def test_static_target_prefix_does_not_create_an_independent_ram_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        try:
+            scheduler.set_specprefill_draft_model(object())
+
+            assert not hasattr(scheduler, "_specprefill_static_prefix_kv_cache")
+        finally:
+            scheduler.shutdown()
+
+    def test_cache_counters_distinguish_target_static_and_draft_reuse(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.block_aware_cache = SimpleNamespace(
+            get_stats=lambda: PrefixCacheStats(
+                hits=11,
+                misses=3,
+                tokens_saved=9_000,
+                exact_prefix_hits=4,
+                exact_prefix_misses=1,
+                exact_prefix_tokens_restored=24_000,
+            )
+        )
+        scheduler._draft_prefix_cache = SimpleNamespace(
+            get_stats=lambda: PrefixCacheStats(
+                hits=8,
+                misses=2,
+                tokens_saved=48_000,
+            )
+        )
+        scheduler.paged_ssd_cache_manager = None
+
+        counters = scheduler._collect_cache_counters()
+
+        assert counters is not None
+        assert counters["target_static_hits"] == 4
+        assert counters["target_static_misses"] == 1
+        assert counters["target_static_tokens_restored"] == 24_000
+        assert counters["draft_prefix_hits"] == 8
+        assert counters["draft_prefix_misses"] == 2
+        assert counters["draft_prefix_tokens_saved"] == 48_000
 
     def test_draft_cache_reconstructs_with_target_turboquant_enabled(
         self, mock_tokenizer, tmp_path

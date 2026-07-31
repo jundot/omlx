@@ -24,6 +24,12 @@ def _make_counters(
     ssd_errors=0,
     hot_cache_evictions=0,
     hot_cache_promotions=0,
+    target_static_hits=0,
+    target_static_misses=0,
+    target_static_tokens_restored=0,
+    draft_prefix_hits=0,
+    draft_prefix_misses=0,
+    draft_prefix_tokens_saved=0,
 ):
     return {
         "prefix_hits": prefix_hits,
@@ -38,6 +44,12 @@ def _make_counters(
         "ssd_errors": ssd_errors,
         "hot_cache_evictions": hot_cache_evictions,
         "hot_cache_promotions": hot_cache_promotions,
+        "target_static_hits": target_static_hits,
+        "target_static_misses": target_static_misses,
+        "target_static_tokens_restored": target_static_tokens_restored,
+        "draft_prefix_hits": draft_prefix_hits,
+        "draft_prefix_misses": draft_prefix_misses,
+        "draft_prefix_tokens_saved": draft_prefix_tokens_saved,
     }
 
 
@@ -119,6 +131,27 @@ class TestCacheRateTrackerRates:
         new = _make_counters(ssd_hot_hits=80, ssd_disk_loads=20)
         result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
         assert result["windows"]["1m"]["ssd_hot_rate"] == 0.8
+
+    def test_specprefill_target_and_draft_reuse_are_distinct(self):
+        old = _make_counters()
+        new = _make_counters(
+            target_static_hits=3,
+            target_static_misses=1,
+            target_static_tokens_restored=18_000,
+            draft_prefix_hits=7,
+            draft_prefix_misses=2,
+            draft_prefix_tokens_saved=42_000,
+        )
+
+        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+
+        window = result["windows"]["1m"]
+        assert window["target_static_hit_rate"] == 0.75
+        assert window["target_static_tokens_restored"] == 18_000
+        assert window["draft_prefix_hit_rate"] == pytest.approx(7 / 9, abs=0.0001)
+        assert window["draft_prefix_tokens_saved"] == 42_000
+        assert result["cumulative"]["target_static_hits"] == 3
+        assert result["cumulative"]["draft_prefix_hits"] == 7
 
     def test_insufficient_data_returns_empty_window(self):
         tracker = CacheRateTracker(min_interval=0.0)

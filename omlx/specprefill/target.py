@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
@@ -22,11 +22,35 @@ class SpecPrefillTargetPrefillResult:
 
     prompt_cache: list[Any]
     tokens_to_process: Sequence[int]
+    static_prefix_cached_tokens: int = 0
+
+
+class ExactPrefixCache(Protocol):
+    """Exact target-prefix operations provided by the tiered prefix cache."""
+
+    def restore_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        promote_to_hot_cache: bool,
+    ) -> list[Any] | None: ...
+
+    def store_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        cache_data: list[dict[str, Any]],
+        model_cache_config: Any = ...,
+    ) -> Any: ...
 
 
 CheckAbort = Callable[[int], None]
 ReportProgress = Callable[[int, int], None]
 SyncAndClearCache = Callable[[], None]
+# Issue #2177: helper signature mirroring Scheduler._extract_cache_states.
+# Returns the per-layer extracted state dicts and an optional ModelCacheConfig.
+ExtractCacheStates = Callable[[list[Any]], tuple[list[dict[str, Any]], Any | None]]
 
 
 def run_specprefill_target_prefill(
@@ -43,6 +67,14 @@ def run_specprefill_target_prefill(
     report_sparse_progress: ReportProgress,
     sync_and_clear_cache: SyncAndClearCache,
     log: logging.Logger,
+    # Issue #2177: opt-in static system/tool prefix reuse. When the cache,
+    # tokens, and extraction callback are provided, the first request stores
+    # the prefetched system state in the tiered cache; later requests restore
+    # it and skip the target-model system-prefill loop.
+    extract_cache_states: ExtractCacheStates | None = None,
+    exact_prefix_cache: ExactPrefixCache | None = None,
+    static_prefix_tokens: Sequence[int] | None = None,
+    promote_static_prefix_to_hot_cache: bool = True,
 ) -> SpecPrefillTargetPrefillResult:
     """Prefill system and selected conversation tokens for one request."""
     prompt_cache = None
@@ -70,9 +102,37 @@ def run_specprefill_target_prefill(
         conversation_token_count = plan.conversation_token_count
         generation_kickoff_index = plan.generation_kickoff_index
         prefill_started_at = time.monotonic()
-        prompt_cache = make_prompt_cache(target_model)
+        prompt_cache = (
+            request.prompt_cache
+            if request.cached_tokens > 0 and request.prompt_cache is not None
+            else None
+        )
 
-        if system_token_count > 0:
+        # Issue #2177: try to restore the stable system/tool prefix from the
+        # tiered prefix cache before prefilling. This mirrors how the
+        # draft workflow (``draft.run_specprefill_draft_scoring``) uses
+        # ``draft_prefix_cache.fetch_cache``/``reconstruct_cache`` to reuse the
+        # draft-model prefix instead of re-scoring from scratch.
+        static_prefix_cached_tokens = 0
+        if exact_prefix_cache is not None and static_prefix_tokens:
+            full_static_prefix_tokens = list(static_prefix_tokens)
+            restored_cache = exact_prefix_cache.restore_exact_prefix(
+                f"{request.request_id}:specprefill-static-restore",
+                full_static_prefix_tokens,
+                promote_to_hot_cache=promote_static_prefix_to_hot_cache,
+            )
+            if restored_cache is not None:
+                prompt_cache = restored_cache
+                static_prefix_cached_tokens = len(full_static_prefix_tokens)
+                report_system_progress(system_token_count, system_token_count)
+                log.info(
+                    f"SpecPrefill: restored {static_prefix_cached_tokens} "
+                    "static system-prefix tokens from tiered cache"
+                )
+        if prompt_cache is None:
+            prompt_cache = make_prompt_cache(target_model)
+
+        if system_token_count > 0 and static_prefix_cached_tokens == 0:
             sys_arr = mx.array(all_tokens[:system_token_count])
             system_processed = 0
             while sys_arr.size > prefill_step_size:
@@ -102,6 +162,30 @@ def run_specprefill_target_prefill(
                 f"SpecPrefill: system prompt {system_token_count} tokens full prefill"
             )
 
+            # Issue #2177: capture the just-computed system-prefix KV states so
+            # the next request with the same system prefix can restore them
+            # without re-running the target model. The store path mirrors the
+            # draft workflow's ``store_cache`` call after scoring.
+            if (
+                exact_prefix_cache is not None
+                and static_prefix_tokens
+                and extract_cache_states
+            ):
+                try:
+                    extracted_states, model_cache_config = extract_cache_states(
+                        prompt_cache
+                    )
+                    if extracted_states:
+                        exact_prefix_cache.store_exact_prefix(
+                            f"{request.request_id}:specprefill-static-store",
+                            list(static_prefix_tokens),
+                            extracted_states,
+                            model_cache_config=model_cache_config,
+                        )
+                except Exception as error:
+                    log.debug(
+                        f"SpecPrefill: static prefix tiered-cache store failed: {error}"
+                    )
         selected = selected_indices
         # BatchGenerator processes the generation-kickoff token separately.
         if plan.remove_kickoff_index:
@@ -133,15 +217,21 @@ def run_specprefill_target_prefill(
 
         selected_token_count = int(selected.shape[0])
         prefill_seconds = time.monotonic() - prefill_started_at
+        system_cache_summary = (
+            f"{static_prefix_cached_tokens} static-cached"
+            if static_prefix_cached_tokens > 0
+            else f"{system_token_count} full"
+        )
         log.info(
             f"SpecPrefill: sparse prefill {selected_token_count}/"
             f"{conversation_token_count} conv tokens in {prefill_seconds:.1f}s "
             f"(total {request.num_prompt_tokens}, cached {request.cached_tokens}, "
-            f"system {system_token_count} full, conv {conversation_token_count} sparse)"
+            f"system {system_cache_summary}, conv {conversation_token_count} sparse)"
         )
         return SpecPrefillTargetPrefillResult(
             prompt_cache=prompt_cache,
             tokens_to_process=all_tokens[-1:],
+            static_prefix_cached_tokens=static_prefix_cached_tokens,
         )
     except Exception:
         prompt_cache = None

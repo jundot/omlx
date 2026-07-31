@@ -24,6 +24,7 @@ from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
+    BlockHash,
     BlockTable,
     CacheBlock,
     PagedCacheManager,
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Each entry is two 32-byte hashes; the cap only guards against unbounded
 # growth from many distinct conversation chains over a long-lived process.
 _TIP_LINEAGE_MAX_ENTRIES = 4096
+_EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 
 
 @dataclass
@@ -141,6 +143,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._exact_prefix_hits = 0
+        self._exact_prefix_misses = 0
+        self._exact_prefix_tokens_restored = 0
+        self._exact_prefix_stores = 0
+        self._exact_prefix_store_failures = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -440,6 +447,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
         hot_cache_write_back: bool = True,
+        _store_exact_terminal: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -462,6 +470,9 @@ class BlockAwarePrefixCache(CacheManager):
                 ArraysCache state instead of placeholders in hybrid models.
             hot_cache_write_back: When False, SSD-backed hot cache is bypassed
                 for newly stored dirty blocks.
+            _store_exact_terminal: Internal exact-prefix mode that persists the
+                trailing partial block and isolates the terminal hash from
+                ordinary prefix matching.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -528,15 +539,21 @@ class BlockAwarePrefixCache(CacheManager):
         # Skipping partial blocks also ensures is_last_block points to
         # the last full block, which is critical for non-sliceable caches
         # (ArraysCache/RotatingKVCache) that use last-block-only storage.
-        num_new_blocks = len(new_tokens) // self.block_size
+        num_new_blocks = (
+            math.ceil(len(new_tokens) / self.block_size)
+            if _store_exact_terminal
+            else len(new_tokens) // self.block_size
+        )
         trailing_partial_tokens = len(new_tokens) % self.block_size
-        self._last_partial_tokens_skipped = trailing_partial_tokens
+        self._last_partial_tokens_skipped = (
+            0 if _store_exact_terminal else trailing_partial_tokens
+        )
         self._last_tokens_to_next_block = (
             self.block_size - trailing_partial_tokens
-            if trailing_partial_tokens > 0
+            if trailing_partial_tokens > 0 and not _store_exact_terminal
             else 0
         )
-        if trailing_partial_tokens > 0:
+        if trailing_partial_tokens > 0 and not _store_exact_terminal:
             self._partial_block_skips += 1
             self._partial_tokens_skipped += trailing_partial_tokens
             logger.debug(
@@ -570,15 +587,20 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
-            block_extra_keys = resolve_block_extra_keys(
-                global_end,
-                extra_keys=extra_keys,
-                extra_key_token_start=extra_key_token_start,
-                extra_key_ranges=extra_key_ranges,
-            )
+            is_exact_terminal = _store_exact_terminal and i == num_new_blocks - 1
+            block_extra_keys: tuple[Any, ...] | None
+            if is_exact_terminal:
+                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+            else:
+                block_extra_keys = resolve_block_extra_keys(
+                    global_end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
 
             # Check if this block already exists (deduplication)
-            if len(block_tokens) == self.block_size:
+            if len(block_tokens) == self.block_size and not is_exact_terminal:
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -617,10 +639,17 @@ class BlockAwarePrefixCache(CacheManager):
                 model_name=self.paged_cache.model_name,
             )
 
-            # Register hash for full blocks (for deduplication)
-            if len(block_tokens) == self.block_size:
+            # Register ordinary full blocks for general prefix matching. The
+            # exact terminal uses a separate hash domain so it can carry the
+            # complete non-sliceable state without colliding with a normal
+            # block that may contain placeholders.
+            if len(block_tokens) == self.block_size and not is_exact_terminal:
                 self.paged_cache.register_block_hash(
                     block, block_tokens, parent_hash, extra_keys=block_extra_keys
+                )
+            elif is_exact_terminal and block.block_hash is not None:
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block.block_hash, block
                 )
 
             # Extract tensor slice and save to paged SSD
@@ -805,8 +834,12 @@ class BlockAwarePrefixCache(CacheManager):
                 if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._rotating_tip_lineage.clear()
 
-        # Update prefix index
-        self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
+        # Exact terminal blocks are discoverable only through
+        # fetch_exact_prefix(); never expose them to general prefix matching.
+        if not _store_exact_terminal:
+            self._update_prefix_index(
+                tokens, block_table.block_ids, extra_keys=extra_keys
+            )
 
         # Store entry for request tracking
         self._request_tables[request_id] = BlockCacheEntry(
@@ -821,6 +854,151 @@ class BlockAwarePrefixCache(CacheManager):
         )
 
         return block_table
+
+    def store_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        cache_data: list[Any],
+        model_cache_config: ModelCacheConfig | None = None,
+    ) -> BlockTable | None:
+        """Persist a complete prefix, including its exact terminal boundary.
+
+        Ordinary prefix matching remains full-block-only. This path stores one
+        domain-separated terminal block, excludes it from general matching,
+        and restores it only when the complete static-prefix token chain
+        matches. That captures an arbitrary system/tool boundary without
+        making the target model repeatedly prefill its uncached suffix.
+        SSD-backed configurations use write-through so the hot tier is never
+        the only durable copy.
+        """
+        if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        block_table = self.store_cache(
+            request_id,
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+            hot_cache_write_back=False,
+            _store_exact_terminal=True,
+        )
+        if block_table is None or block_table.num_tokens != len(tokens):
+            self.paged_cache.delete_block_table(request_id)
+            self._request_tables.pop(request_id, None)
+            self._exact_prefix_store_failures += 1
+            return None
+
+        stored_table = block_table.copy(request_id)
+        self._request_tables.pop(request_id, None)
+        self.paged_cache.request_tables.pop(request_id, None)
+        # Drop request ownership while retaining indexed, zero-reference block
+        # metadata so the exact chain remains discoverable and evictable.
+        self.paged_cache.release_for_eviction(block_table.block_ids)
+        self._exact_prefix_stores += 1
+        return stored_table
+
+    def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
+        """Return deterministic block hashes and token counts for an exact prefix."""
+        block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
+        parent_hash: BlockHash | None = None
+        terminal_start = ((len(tokens) - 1) // self.block_size) * self.block_size
+
+        for block_start in range(0, len(tokens), self.block_size):
+            block_tokens = tokens[block_start : block_start + self.block_size]
+            extra_keys = (
+                (_EXACT_PREFIX_TERMINAL_KEY,) if block_start == terminal_start else None
+            )
+            block_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+            block_hashes_and_token_counts.append((block_hash, len(block_tokens)))
+            parent_hash = block_hash
+
+        return block_hashes_and_token_counts
+
+    def fetch_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+    ) -> BlockTable | None:
+        """Acquire an all-or-nothing exact prefix chain from hot cache or SSD."""
+        if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        acquired_blocks: list[CacheBlock] = []
+        for block_hash, token_count in self._exact_prefix_hashes(tokens):
+            cached_block = self.paged_cache.cached_block_hash_to_block.get_block(
+                block_hash
+            )
+            if cached_block is None:
+                if not self.paged_ssd_cache.has_block(block_hash):
+                    for block_to_release in acquired_blocks:
+                        self.paged_cache.free_block(block_to_release.block_id)
+                    return None
+                # Recreate only the paged-manager metadata; reconstruction
+                # still loads the tensor payload from the existing cache tier.
+                cached_block = self.paged_cache.allocate_block()
+                if cached_block is None:
+                    for block_to_release in acquired_blocks:
+                        self.paged_cache.free_block(block_to_release.block_id)
+                    return None
+                cached_block.block_hash = block_hash
+                cached_block.token_count = token_count
+                cached_block.ref_count = 0
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block_hash, cached_block
+                )
+
+            acquired_block = self.paged_cache.acquire_cached_block(
+                cached_block.block_id, block_hash
+            )
+            if acquired_block is None:
+                for previous_block in acquired_blocks:
+                    self.paged_cache.free_block(previous_block.block_id)
+                return None
+            acquired_blocks.append(acquired_block)
+
+        block_table = self.paged_cache.create_block_table(request_id)
+        for acquired_block in acquired_blocks:
+            block_table.add_block(acquired_block.block_id, acquired_block.token_count)
+        self._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            last_access=time.time(),
+        )
+        return block_table
+
+    def restore_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        promote_to_hot_cache: bool,
+    ) -> list[Any] | None:
+        """Reconstruct a complete exact prefix and release temporary block refs."""
+        block_table = self.fetch_exact_prefix(request_id, tokens)
+        if block_table is None:
+            self._exact_prefix_misses += 1
+            return None
+
+        try:
+            if promote_to_hot_cache:
+                self.preload_blocks(block_table)
+            restored_cache = self.reconstruct_cache(
+                block_table,
+                promote_to_hot_cache=promote_to_hot_cache,
+            )
+            if restored_cache is None or block_table.num_tokens != len(tokens):
+                self._exact_prefix_misses += 1
+                return None
+            self._exact_prefix_hits += 1
+            self._exact_prefix_tokens_restored += len(tokens)
+            return restored_cache
+        finally:
+            self.release_cache(request_id)
 
     def _get_cache_seq_len(self, cache_data: list[dict[str, Any]]) -> int:
         """
@@ -3170,6 +3348,11 @@ class BlockAwarePrefixCache(CacheManager):
             last_tokens_to_next_block=self._last_tokens_to_next_block,
             tokens_matched_total=self._tokens_matched_total,
             tokens_requested_total=self._tokens_requested_total,
+            exact_prefix_hits=self._exact_prefix_hits,
+            exact_prefix_misses=self._exact_prefix_misses,
+            exact_prefix_tokens_restored=self._exact_prefix_tokens_restored,
+            exact_prefix_stores=self._exact_prefix_stores,
+            exact_prefix_store_failures=self._exact_prefix_store_failures,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -3198,6 +3381,11 @@ class BlockAwarePrefixCache(CacheManager):
             "last_tokens_to_next_block": self._last_tokens_to_next_block,
             "tokens_matched_total": self._tokens_matched_total,
             "tokens_requested_total": self._tokens_requested_total,
+            "exact_prefix_hits": self._exact_prefix_hits,
+            "exact_prefix_misses": self._exact_prefix_misses,
+            "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
+            "exact_prefix_stores": self._exact_prefix_stores,
+            "exact_prefix_store_failures": self._exact_prefix_store_failures,
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -3213,6 +3401,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._exact_prefix_hits = 0
+        self._exact_prefix_misses = 0
+        self._exact_prefix_tokens_restored = 0
+        self._exact_prefix_stores = 0
+        self._exact_prefix_store_failures = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:
