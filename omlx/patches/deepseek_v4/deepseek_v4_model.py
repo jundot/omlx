@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -10,15 +11,38 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
+from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, PoolingCache, RotatingKVCache
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
-from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
 _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = False
+_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DEFAULT_MIN_L = 128
+
+
+def _parse_sparse_attention_native_min_l(value: str | None) -> int:
+    """Resolve the portable work-shape threshold for the native kernel."""
+    if value is None:
+        return _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DEFAULT_MIN_L
+    try:
+        return max(2, int(value))
+    except ValueError:
+        return _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DEFAULT_MIN_L
+
+
+# The native kernel dispatches one threadgroup per query token.  Short
+# speculative-verification windows (DSpark normally uses L=2..6) therefore
+# leave Apple GPUs badly under-occupied and are slower than MLX's fallback.
+# This is deliberately a workload threshold rather than a chip-name check.
+# Benchmarking a future kernel/device can override it before server launch:
+# OMLX_DEEPSEEK_V4_NATIVE_SPARSE_ATTENTION_MIN_L=<query rows>.
+_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_MIN_L = _parse_sparse_attention_native_min_l(
+    os.environ.get("OMLX_DEEPSEEK_V4_NATIVE_SPARSE_ATTENTION_MIN_L")
+)
 
 
 def _materialize_cache_arrays(cache: Optional[Any]) -> None:
@@ -394,7 +418,7 @@ def _sparse_pooled_attention(
         and topk.dtype == mx.uint32
         and B >= 1
         and H == 64
-        and L > 1
+        and L >= _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_MIN_L
         and D == 512
         and local_kv.ndim == 4
         and local_kv.shape[1] == 1

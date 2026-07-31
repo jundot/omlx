@@ -957,6 +957,118 @@ class TestCacheMaterialization:
         assert loop_pos < materialize_pos < pipeline_send_pos
 
 
+class TestDeepSeekV4SparseAttentionNativeDispatch:
+    """The prefill-shaped native kernel must not handle short verify windows."""
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            (None, 128),
+            ("256", 256),
+            ("1", 2),
+            ("invalid", 128),
+        ],
+    )
+    def test_portable_min_length_policy(self, applied_patch, configured, expected):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        assert dsv4._parse_sparse_attention_native_min_l(configured) == expected
+
+    @staticmethod
+    def _inputs(mx, query_length):
+        q = mx.zeros((1, 64, query_length, 512), dtype=mx.float16)
+        local_kv = mx.zeros((1, 1, 1, 512), dtype=mx.float16)
+        pooled = mx.zeros((1, 1, 512), dtype=mx.float16)
+        topk = mx.zeros((1, query_length, 1), dtype=mx.uint32)
+        sinks = mx.zeros((64,), dtype=mx.float16)
+        return q, local_kv, pooled, topk, sinks
+
+    @pytest.mark.parametrize("query_length", [2, 3, 4, 5, 6, 64])
+    def test_short_lengths_fall_back(self, applied_patch, monkeypatch, query_length):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(glm_fast, "has_symbol", lambda _name: True)
+
+        def fail_native(*_args, **_kwargs):
+            raise AssertionError(
+                f"native sparse attention must not run for L={query_length}"
+            )
+
+        monkeypatch.setattr(
+            glm_fast,
+            "deepseek_v4_sparse_attention",
+            fail_native,
+        )
+
+        q, local_kv, pooled, topk, sinks = self._inputs(mx, query_length)
+        out = dsv4._sparse_pooled_attention(
+            q,
+            local_kv,
+            pooled,
+            topk,
+            None,
+            None,
+            1.0,
+            sinks,
+            q_offset=0,
+            compress_ratio=4,
+            local_window=128,
+        )
+
+        assert out.shape == q.shape
+
+    def test_threshold_length_can_use_native(self, applied_patch, monkeypatch):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(
+            glm_fast,
+            "has_symbol",
+            lambda name: name == "deepseek_v4_sparse_attention",
+        )
+        native_calls = []
+
+        def fake_native(q, *_args, **_kwargs):
+            native_calls.append(q.shape)
+            return mx.zeros_like(q)
+
+        monkeypatch.setattr(
+            glm_fast,
+            "deepseek_v4_sparse_attention",
+            fake_native,
+        )
+
+        query_length = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_MIN_L
+        q, local_kv, pooled, topk, sinks = self._inputs(mx, query_length)
+        out = dsv4._sparse_pooled_attention(
+            q,
+            local_kv,
+            pooled,
+            topk,
+            None,
+            None,
+            1.0,
+            sinks,
+            q_offset=0,
+            compress_ratio=4,
+            local_window=128,
+        )
+
+        assert native_calls == [q.shape]
+        assert out.shape == q.shape
+
+
 class TestDeepseekV4SwitchGLU:
     """DeepSeek-V4 SwitchGLU execution guards."""
 
