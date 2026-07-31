@@ -1949,7 +1949,11 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
-    sampler = _resolve_draft_sampler(gen_batch, state)
+    # DSpark is trained as a full proposal distribution and the reference
+    # runtime samples it with the request's temperature.  Unlike the shallow
+    # legacy MTP head, it should not use oMLX's deliberately sharpened
+    # fallback drafter sampler.
+    sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth

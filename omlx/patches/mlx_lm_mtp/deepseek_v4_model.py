@@ -401,8 +401,12 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
-        dspark_targets = set(
-            tuple(getattr(self.args, "dspark_target_layer_ids", ()) or ())
+        # Avoid even the three HC-mean reductions when DSpark hidden output
+        # was not requested (notably an MTP-disabled 0731 model).
+        dspark_targets = (
+            set(tuple(getattr(self.args, "dspark_target_layer_ids", ()) or ()))
+            if return_raw_hidden
+            else set()
         )
         dspark_hiddens = []
         for layer, layer_cache in zip(self.pipeline_layers, cache):

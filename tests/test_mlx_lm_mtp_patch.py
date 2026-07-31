@@ -688,7 +688,7 @@ class TestDeepseekV4Model:
 
         monkeypatch.setattr(
             batch_generator,
-            "_resolve_draft_sampler",
+            "_resolve_sampler",
             lambda *_: greedy,
         )
         monkeypatch.setattr(batch_generator, "_proc_list", lambda *_: None)
