@@ -89,6 +89,7 @@ DFlash upstream registers `QwenGdnTargetOps` and `Gemma4TargetOps`. oMLX also re
 | google/gemma-4-31b-it | z-lab/gemma-4-31B-it-DFlash |
 | google/gemma-4-26b-a4b-it | z-lab/gemma-4-26B-A4B-it-DFlash |
 | poolside/Laguna-XS-2.1 | poolside/Laguna-XS-2.1-DFlash |
+| poolside/Laguna-XS-2.1-NVFP4(-mlx) | poolside/Laguna-XS-2.1-DFlash-NVFP4 |
 | poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
 | poolside/Laguna-S-2.1-NVFP4(-mlx) | poolside/Laguna-S-2.1-DFlash-NVFP4 |
 
@@ -96,7 +97,15 @@ Other model families (Llama, Gemma3, etc.) are not supported — they require bo
 
 Laguna target and draft checkpoints must be from the same size family and should
 use Poolside's quantization-matched draft when one is published (for example,
-`Laguna-S-2.1-DFlash-NVFP4` with the NVFP4 target). The adapter validates target
+`Laguna-S-2.1-DFlash-NVFP4` with the NVFP4 target). DFlash drafts predict from
+hidden states captured inside the target, so a precision-mismatched pair (a
+BF16-target draft on a community-quantized target, or an NVFP4 draft on an oQ
+target) collapses acceptance to roughly one draft token per cycle and makes
+DFlash slower than plain decoding (issue #2398). The engine logs a warning at
+load time for recognizably mismatched pairs and shows it in the dashboard's
+Active Models card, together with per-session acceptance and tokens/cycle
+counters. Poolside also publishes INT4/FP8 drafters; their vLLM-format targets
+are not yet validated in oMLX. The adapter validates target
 depth, hidden size, and capture-layer IDs at load time. It implements Laguna's
 per-head/per-element softplus attention gating, partial RoPE,
 per-captured-layer RMS normalization, Poolside's fused `qkv_proj` checkpoint

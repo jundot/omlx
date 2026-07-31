@@ -315,6 +315,28 @@
                                             </template>
                                         </div>
                                     </template>
+                                    <!-- DFlash speculation sub-row (issue #2398) -->
+                                    <template x-if="m.dflash && (m.dflash.speculation || m.dflash.pairing_warning)">
+                                        <div class="mt-1.5 ml-5 space-y-1">
+                                            <template x-if="m.dflash.speculation && m.dflash.speculation.last">
+                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-neutral-400">
+                                                    <span class="font-medium text-neutral-500">DFlash</span>
+                                                    <span x-text="'acceptance ' + Math.round((m.dflash.speculation.last.acceptance_ratio || 0) * 100) + '%'"></span>
+                                                    <span x-show="m.dflash.speculation.last.tokens_per_cycle != null"
+                                                          x-text="(m.dflash.speculation.last.tokens_per_cycle || 0).toFixed(2) + ' tok/cycle'"></span>
+                                                    <span x-text="formatTokenCount(m.dflash.speculation.last.accepted_draft_tokens || 0) + ' draft tok (last req)'"></span>
+                                                    <span x-show="m.dflash.speculation.totals && m.dflash.speculation.totals.requests > 1"
+                                                          x-text="'session: ' + Math.round((m.dflash.speculation.totals.acceptance_ratio || 0) * 100) + '% · ' + (m.dflash.speculation.totals.tokens_per_cycle || 0).toFixed(2) + ' tok/cycle · ' + m.dflash.speculation.totals.requests + ' req'"></span>
+                                                </div>
+                                            </template>
+                                            <template x-if="m.dflash.pairing_warning">
+                                                <div class="flex items-center gap-1.5 text-[10px] text-amber-600">
+                                                    <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                                    <span class="min-w-0" x-text="m.dflash.pairing_warning"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
                                     <!-- Waiting sub-rows -->
                                     <template x-if="m.waiting && m.waiting.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">

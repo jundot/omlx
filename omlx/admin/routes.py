@@ -4681,6 +4681,24 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
+        # DFlash observability (issue #2398): session speculation counters and
+        # the load-time precision pairing warning. None on non-DFlash engines.
+        dflash_info = None
+        if entry is not None and entry.engine is not None:
+            pairing = getattr(entry.engine, "pairing_warning", None)
+            speculation = None
+            get_speculation = getattr(entry.engine, "get_speculation_stats", None)
+            if callable(get_speculation):
+                try:
+                    speculation = get_speculation()
+                except Exception:
+                    logger.debug("get_speculation_stats failed", exc_info=True)
+            if speculation is not None or pairing:
+                dflash_info = {
+                    "speculation": speculation,
+                    "pairing_warning": pairing,
+                }
+
         models.append(
             {
                 "id": model_id,
@@ -4707,6 +4725,7 @@ def _build_active_models_data() -> dict:
                 "generating": generating,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
+                "dflash": dflash_info,
             }
         )
 

@@ -14,6 +14,7 @@ import copy
 import gc
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -112,6 +113,70 @@ def _format_phase_timings(phase_timings_us: object) -> str:
         f" replay={_ms('replay')}ms"
         f" commit={_ms('commit')}ms]"
     )
+
+
+# Precision suffixes Poolside uses for drafts trained against a quantized
+# target ("Laguna-S-2.1-DFlash-NVFP4" etc.). Anything else after "-DFlash-"
+# (e.g. z-lab's "-b16" block-size suffix) makes no precision claim.
+_DRAFT_PRECISION_TAGS = frozenset({"NVFP4", "INT4", "INT8", "FP8", "FP4", "MXFP4"})
+
+
+def check_draft_target_precision_pairing(
+    target_name: str,
+    target_config: dict | None,
+    draft_path: str,
+    model_type: str | None = None,
+) -> str | None:
+    """Heuristic precision-pairing check between a DFlash draft and its target.
+
+    DFlash drafts predict from hidden states captured inside the target, so a
+    draft trained against one target precision loses acceptance against
+    another (issue #2398: ~1 accepted draft token per cycle pairing BF16-target
+    Laguna drafts with community-quantized targets). Draft checkpoints do not
+    record their training target, so this keys off the published naming
+    convention (``*-DFlash`` = BF16 target, ``*-DFlash-<PRECISION>`` = the
+    matching quantized target) and the target's own quantization config.
+
+    Returns a warning message, or None when the pair looks matched or the
+    names carry no precision claim. The BF16-draft-on-quantized-target rule is
+    applied to Laguna only: the supported-pairs table explicitly endorses
+    quantized Qwen/Gemma4 targets with their generic drafts.
+    """
+    draft_base = Path(str(draft_path).rstrip("/")).name
+    match = re.search(r"-DFlash(?:-([A-Za-z0-9]+))?$", draft_base, re.IGNORECASE)
+    if match is None:
+        return None
+    suffix = (match.group(1) or "").upper()
+    draft_tag = suffix if suffix in _DRAFT_PRECISION_TAGS else ""
+
+    quant_section = None
+    if isinstance(target_config, dict):
+        quant_section = target_config.get("quantization") or target_config.get(
+            "quantization_config"
+        )
+    target_quantized = bool(quant_section)
+
+    advice = (
+        "Precision-mismatched pairs collapse draft acceptance and can make "
+        "DFlash slower than plain decoding (see issue #2398). Use the draft "
+        "published for this exact target precision."
+    )
+    if draft_tag:
+        if draft_tag.lower() in str(target_name).lower():
+            return None
+        return (
+            f"DFlash draft '{draft_base}' is published for a {draft_tag} "
+            f"target, but the loaded target is '{target_name}'"
+            f"{' (quantized)' if target_quantized else ' (not quantized)'}. "
+            f"{advice}"
+        )
+    if target_quantized and (model_type or "").lower() == "laguna":
+        return (
+            f"DFlash draft '{draft_base}' follows the BF16-target naming "
+            f"convention, but the loaded Laguna target '{target_name}' is "
+            f"quantized. {advice}"
+        )
+    return None
 
 
 class _DFlashPrefillGuard:
@@ -250,6 +315,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Session-scope hit/eviction rates for the admin cache observability
         # panel, fed from the dflash-mlx runtime cache manager counters.
         self._cache_rate_tracker = CacheRateTracker()
+        # Draft/target precision pairing warning (set in start(), surfaced in
+        # the dashboard) and per-session speculation counters fed from each
+        # request's SummaryEvent.
+        self._pairing_warning: str | None = None
+        self._spec_stats_lock = threading.Lock()
+        self._spec_last: dict[str, Any] | None = None
+        self._spec_totals = {
+            "requests": 0,
+            "generation_tokens": 0,
+            "accepted_draft_tokens": 0,
+            "cycles": 0,
+        }
 
         self._max_dflash_ctx = (
             getattr(model_settings, "dflash_max_ctx", None) if model_settings else None
@@ -497,6 +574,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             self._model_type_str = config.get("model_type")
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
+
+        self._pairing_warning = check_draft_target_precision_pairing(
+            self._model_name,
+            config if isinstance(config, dict) else None,
+            self._draft_model_path,
+            model_type=self._model_type_str,
+        )
+        if self._pairing_warning:
+            logger.warning(self._pairing_warning)
 
         suppress_ref = (
             getattr(self._executor_tokenizer, "name_or_path", None) or self._model_name
@@ -1127,6 +1213,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     )
 
                 elif isinstance(event, SummaryEvent):
+                    self._record_speculation_summary(event)
                     # Flush any buffered tail from the parser (e.g. close an
                     # unterminated <think> block) before the metrics chunk so
                     # the client sees a well-formed final delta.
@@ -1312,6 +1399,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                                 parsed_visible_parts.append(result.visible_text)
                     elif isinstance(event, SummaryEvent):
                         summary = event
+                        self._record_speculation_summary(event)
                 if parser_session is not None:
                     final = parser_session.finalize()
                     if final.visible_text:
@@ -1753,7 +1841,64 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
+            "pairing_warning": self._pairing_warning,
+            "speculation": self.get_speculation_stats(),
         }
+
+    @property
+    def pairing_warning(self) -> str | None:
+        """Draft/target precision pairing warning from load time, if any."""
+        return self._pairing_warning
+
+    def _record_speculation_summary(self, summary: Any) -> None:
+        """Fold one request's SummaryEvent into the session speculation stats.
+
+        Called from the MLX executor thread in both generate paths, hence the
+        lock. Best-effort: a malformed event is dropped, never raised.
+        """
+        try:
+            gen_tokens = int(summary.generation_tokens)
+            cycles = int(summary.cycles_completed)
+            ratio = float(summary.acceptance_ratio)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if gen_tokens <= 0 and cycles <= 0:
+            return
+        accepted = int(round(gen_tokens * ratio))
+        last = {
+            "generation_tokens": gen_tokens,
+            "cycles": cycles,
+            "acceptance_ratio": ratio,
+            "accepted_draft_tokens": accepted,
+            "tokens_per_cycle": (gen_tokens / cycles) if cycles > 0 else None,
+            "fallback_ar": bool(getattr(summary, "fallback_ar", False)),
+        }
+        with self._spec_stats_lock:
+            self._spec_last = last
+            self._spec_totals["requests"] += 1
+            self._spec_totals["generation_tokens"] += gen_tokens
+            self._spec_totals["accepted_draft_tokens"] += accepted
+            self._spec_totals["cycles"] += cycles
+
+    def get_speculation_stats(self) -> dict[str, Any] | None:
+        """Session speculation counters for the admin dashboard.
+
+        The logged acceptance ratio is the share of output tokens supplied by
+        the draft (issue #2398); tokens_per_cycle is the number users need to
+        judge whether speculation is actually winning.
+        """
+        with self._spec_stats_lock:
+            if self._spec_totals["requests"] == 0:
+                return None
+            totals = dict(self._spec_totals)
+            last = dict(self._spec_last) if self._spec_last else None
+        gen_tokens = totals["generation_tokens"]
+        cycles = totals["cycles"]
+        totals["acceptance_ratio"] = (
+            totals["accepted_draft_tokens"] / gen_tokens if gen_tokens > 0 else None
+        )
+        totals["tokens_per_cycle"] = gen_tokens / cycles if cycles > 0 else None
+        return {"last": last, "totals": totals}
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         if self._fallback_engine is not None:
