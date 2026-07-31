@@ -712,6 +712,69 @@ class TestDeepseekV4Model:
         assert len(state.draft_lps) == 5
         assert len(state.draft_accept_lps) == 5
 
+    def test_dspark_sanitize_keeps_all_three_stage_names(self, monkeypatch):
+        """Official mtp.0/1/2 names map onto the nested MLX modules."""
+        import mlx.core as mx
+
+        import omlx.patches.mlx_lm_mtp as mtp_runtime
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
+
+        apply_deepseek_v4_patch()
+        assert deepseek_v4_model.apply()
+        monkeypatch.setattr(mtp_runtime, "_MTP_ACTIVE", True)
+
+        import mlx_lm.models.deepseek_v4 as dsv4
+
+        args = dsv4.ModelArgs.from_dict(
+            {
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "moe_intermediate_size": 8,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "num_experts_per_tok": 2,
+                "q_lora_rank": 8,
+                "qk_rope_head_dim": 2,
+                "head_dim": 8,
+                "o_groups": 2,
+                "o_lora_rank": 8,
+                "index_n_heads": 2,
+                "index_head_dim": 4,
+                "index_topk": 4,
+                "hc_mult": 4,
+                "compress_ratios": [0, 0, 0],
+                "num_nextn_predict_layers": 1,
+                "dspark_block_size": 5,
+                "dspark_noise_token_id": 31,
+                "dspark_target_layer_ids": [0, 1, 2],
+                "dspark_markov_rank": 4,
+            }
+        )
+        model = dsv4.Model(args)
+        one = mx.ones((1,))
+        mapped = model.sanitize(
+            {
+                "mtp.0.main_proj.weight": one,
+                "mtp.0.attn.wq_a.weight": one,
+                "mtp.1.ffn.gate.weight": one,
+                "mtp.2.markov_head.markov_w1.weight": one,
+                "mtp.2.confidence_head.proj.weight": one,
+                "mtp.2.hc_head_fn": one,
+            }
+        )
+
+        assert "mtp.0.main_proj.weight" in mapped
+        assert "mtp.0.block.attn.wq_a.weight" in mapped
+        assert "mtp.1.block.ffn.gate.weight" in mapped
+        assert "mtp.2.markov_head.markov_w1.weight" in mapped
+        assert "mtp.2.confidence_head.proj.weight" in mapped
+        assert "mtp.2.hc_head.fn" in mapped
+
 
 class TestBatchGeneratorDispatch:
     @pytest.fixture(autouse=True)
