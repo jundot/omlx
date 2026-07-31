@@ -21,6 +21,17 @@ _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 8192
+# Expert sorting and the native block-list kernels are prefill
+# optimizations.  Dispatching them from ``indices.size`` alone makes the
+# arithmetic depend on how many unrelated requests happen to share a decode
+# batch: a single DeepSeek-V4 token has 24 routes, so B=1/B=2 used stock
+# gather_qmm while B=4/B=8 crossed the old 64-route threshold.  DSpark's
+# 2--6-token target verification window crossed it as well.
+#
+# Keep short decode/speculative windows on the same unsorted stock path and
+# decide from each sequence's own length, not total batch width.  Normal
+# prompt chunks still take the native prefill path.
+_DEEPSEEK_MOE_NATIVE_MIN_SEQUENCE_LENGTH = 16
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
@@ -57,6 +68,27 @@ def _scatter_unsort(x, inv_order, shape=None):
     if shape is not None:
         x = mx.unflatten(x, 0, shape)
     return x
+
+
+def _should_sort_experts(x: mx.array, indices: mx.array) -> bool:
+    """Whether this per-sequence shape is large enough for prefill kernels.
+
+    ``x`` is normally ``[B, L, H, D]`` for DeepSeek-V4's Hyper-Connection
+    stream, and can be ``[B, L, D]`` for compatible callers.  In both cases
+    dimension 1 is the per-request sequence length.  Batch size must not
+    select a different numerical path for the same request.
+    """
+
+    if x.ndim >= 3:
+        sequence_length = int(x.shape[1])
+    elif x.ndim == 2:
+        sequence_length = int(x.shape[0])
+    else:
+        sequence_length = 1
+    return (
+        sequence_length >= _DEEPSEEK_MOE_NATIVE_MIN_SEQUENCE_LENGTH
+        and indices.size >= 64
+    )
 
 
 @lru_cache(maxsize=None)
@@ -390,10 +422,10 @@ class SwitchGLU(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices, scores=None) -> mx.array:
+        do_sort = _should_sort_experts(x, indices)
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 
-        do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
@@ -403,20 +435,24 @@ class SwitchGLU(nn.Module):
 
         block_plan = None
         native_kinds = None
-        use_f16_moe = False
+        use_f16_affine_moe = False
         projections = (self.up_proj, self.gate_proj, self.down_proj)
         if do_sort and all(isinstance(p, QuantizedSwitchLinear) for p in projections):
             native_kinds = tuple(p._native_block_kind(x, do_sort) for p in projections)
-            if x.dtype == mx.bfloat16:
+            # MXFP4 has native BF16 instantiations and must retain the
+            # request's decode dtype.  Legacy affine 2/3-bit checkpoints can
+            # carry FP16 scales/biases; keep their prefill-only compatibility
+            # path without letting batch width trigger it during decode.
+            if x.dtype == mx.bfloat16 and all(
+                kind is None for kind in native_kinds
+            ):
                 f16_native_kinds = tuple(
                     p._native_block_kind(x, do_sort, dtype=mx.float16)
                     for p in projections
                 )
-                if all(kind == "mxfp4" for kind in f16_native_kinds) or all(
-                    kind == "affine" for kind in f16_native_kinds
-                ):
+                if all(kind == "affine" for kind in f16_native_kinds):
                     native_kinds = f16_native_kinds
-                    use_f16_moe = True
+                    use_f16_affine_moe = True
             if all(kind is not None for kind in native_kinds):
                 block_bm, block_variant = _mxfp4_block_config(idx.size)
                 block_meta, block_count = _build_mxfp4_blocks(
@@ -426,7 +462,7 @@ class SwitchGLU(nn.Module):
                 )
                 block_plan = (block_meta, block_count, block_variant)
 
-        if use_f16_moe:
+        if use_f16_affine_moe:
             x = x.astype(mx.float16)
 
         use_pair_proj = (
@@ -527,7 +563,7 @@ class SwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         x = x.squeeze(-2)
-        if use_f16_moe:
+        if use_f16_affine_moe:
             x = x.astype(original_dtype)
         return x
 
@@ -548,9 +584,9 @@ class SwitchMLP(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
+        do_sort = _should_sort_experts(x, indices)
         x = mx.expand_dims(x, (-2, -3))
 
-        do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:

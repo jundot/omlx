@@ -1072,6 +1072,145 @@ class TestDeepSeekV4SparseAttentionNativeDispatch:
 class TestDeepseekV4SwitchGLU:
     """DeepSeek-V4 SwitchGLU execution guards."""
 
+    def test_short_decode_dispatch_is_per_sequence_not_batch(self):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        # DeepSeek-V4 has four Hyper-Connection streams and six routed
+        # experts, hence 24 routes per generated token.  The old global
+        # ``indices.size >= 64`` decision flipped B=1 to B=8 onto a
+        # different precision/kernel path.
+        for batch in (1, 2, 4, 8):
+            x = mx.zeros((batch, 1, 4, 32), dtype=mx.bfloat16)
+            indices = mx.zeros((batch, 1, 4, 6), dtype=mx.int32)
+            assert not switch_layers._should_sort_experts(x, indices)
+
+        # DSpark verifies at most six target tokens per cycle.  Keep that
+        # short block on the same row-stable path too, while preserving the
+        # optimized path for real prompt chunks.
+        short_x = mx.zeros((8, 6, 4, 32), dtype=mx.bfloat16)
+        short_indices = mx.zeros((8, 6, 4, 6), dtype=mx.int32)
+        assert not switch_layers._should_sort_experts(short_x, short_indices)
+
+        prefill_x = mx.zeros((1, 16, 4, 32), dtype=mx.bfloat16)
+        prefill_indices = mx.zeros((1, 16, 4, 6), dtype=mx.int32)
+        assert switch_layers._should_sort_experts(prefill_x, prefill_indices)
+
+    def test_short_mxfp4_block_matches_serial_m1(self, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        mx.random.seed(23)
+        model = switch_layers.SwitchGLU(32, 32, 8, bias=False)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            setattr(
+                model,
+                name,
+                getattr(model, name).to_quantized(
+                    group_size=32,
+                    bits=4,
+                    mode="mxfp4",
+                ),
+            )
+
+        # Pretend every native symbol is installed.  Short decode/verify must
+        # still avoid it; if the dispatch regresses these sentinels fail.
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "has_symbol",
+            lambda name: True,
+        )
+
+        def fail_native(*args, **kwargs):
+            raise AssertionError("short decode entered a native prefill kernel")
+
+        for name in (
+            "deepseek_mxfp4_gather_qmm_blocks",
+            "deepseek_mxfp4_gather_qmm_pair_blocks",
+            "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
+        ):
+            monkeypatch.setattr(
+                switch_layers.glm_fast,
+                name,
+                fail_native,
+                raising=False,
+            )
+
+        x = mx.random.normal((1, 6, 4, 32), dtype=mx.bfloat16)
+        indices = mx.random.randint(0, 8, (1, 6, 4, 6)).astype(mx.int32)
+        block = model(x, indices)
+        serial = mx.concatenate(
+            [model(x[:, i : i + 1], indices[:, i : i + 1]) for i in range(6)],
+            axis=1,
+        )
+        mx.eval(block, serial)
+
+        assert mx.array_equal(block, serial).item()
+
+    def test_mxfp4_prefill_native_keeps_bfloat16(self, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        mx.random.seed(29)
+        model = switch_layers.SwitchGLU(32, 32, 8, bias=False)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            setattr(
+                model,
+                name,
+                getattr(model, name).to_quantized(
+                    group_size=32,
+                    bits=4,
+                    mode="mxfp4",
+                ),
+            )
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "has_symbol",
+            lambda name: True,
+        )
+        monkeypatch.setattr(
+            switch_layers,
+            "_build_mxfp4_blocks",
+            lambda indices, experts, bm: (
+                mx.zeros((1, 3), dtype=mx.int32),
+                mx.ones((1,), dtype=mx.int32),
+            ),
+        )
+        seen = []
+
+        def fake_pair(x, w0, s0, w1, s1, *args, **kwargs):
+            seen.append(x.dtype)
+            return mx.zeros(
+                x.shape[:-1] + (w0.shape[1] + w1.shape[1],),
+                dtype=x.dtype,
+            )
+
+        def fake_single(x, w, scales, *args, **kwargs):
+            seen.append(x.dtype)
+            return mx.zeros(x.shape[:-1] + (w.shape[1],), dtype=x.dtype)
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
+            fake_pair,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "deepseek_mxfp4_gather_qmm_blocks",
+            fake_single,
+            raising=False,
+        )
+
+        x = mx.zeros((1, 16, 4, 32), dtype=mx.bfloat16)
+        indices = mx.zeros((1, 16, 4, 6), dtype=mx.int32)
+        y = model(x, indices)
+        mx.eval(y)
+
+        assert seen == [mx.bfloat16, mx.bfloat16]
+        assert y.dtype == mx.bfloat16
+
     def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
 
