@@ -4,7 +4,8 @@
 This package adapts two upstream PRs into runtime monkey-patches:
 
 - ml-explore/mlx-lm#990 — Qwen3.5 / Qwen3.6 native MTP heads (dense + MoE)
-- Blaizzy/mlx-lm#15    — DeepSeek-V4-Flash native MTP heads
+- Blaizzy/mlx-lm#15    — preview DeepSeek-V4-Flash native MTP heads
+- DeepSeek-V4-Flash-0731 — official three-stage, five-token DSpark module
 
 Both PRs follow the same shape: a model gains an extra ``mtp`` module + a
 ``mtp_forward`` method and an enhanced ``__call__`` that returns hidden
@@ -64,7 +65,8 @@ def is_mtp_active() -> bool:
 # patched ``TextModel.__init__`` copies it onto the instance
 # (``_omlx_mtp_depth``) so decode never reads the global. Depth > 1 only
 # engages on models whose patch marks ``_omlx_mtp_chain`` (Qwen3.5/3.6);
-# DeepSeek-V4 stays on the depth-1 legacy cycle.
+# DeepSeek-V4 preview uses this controller; the 0731 DSpark path takes its
+# fixed five-token block size directly from the checkpoint config.
 _MTP_DEPTH = 1
 
 
