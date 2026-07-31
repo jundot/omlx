@@ -539,3 +539,48 @@ def test_active_models_resolves_scheduler_property_without_async_core():
     assert model["active_requests"] == 1
     assert model["generating"][0]["request_id"] == "gen-1"
     assert model["activities"] == []
+
+
+def test_active_models_surfaces_dflash_guardrail_stats():
+    """DFlash warning and exact speculation counters reach the dashboard API."""
+
+    speculation = {
+        "last": {
+            "generation_tokens": 768,
+            "cycles": 377,
+            "acceptance_ratio": 391 / 768,
+            "accepted_draft_tokens": 391,
+            "tokens_per_cycle": 768 / 377,
+            "accepted_draft_tokens_per_cycle": 391 / 377,
+            "fallback_ar": False,
+            "fallback_reason": None,
+        },
+        "totals": {
+            "requests": 1,
+            "speculative_requests": 1,
+            "fallback_requests": 0,
+            "generation_tokens": 768,
+            "accepted_draft_tokens": 391,
+            "cycles": 377,
+            "acceptance_ratio": 391 / 768,
+            "tokens_per_cycle": 768 / 377,
+            "accepted_draft_tokens_per_cycle": 391 / 377,
+        },
+    }
+
+    class Engine:
+        scheduler = None
+        pairing_warning = "Possible DFlash precision mismatch"
+
+        def get_activity_snapshot(self):
+            return {"active_requests": 0, "activities": []}
+
+        def get_speculation_stats(self):
+            return speculation
+
+    data = _build_with_pool(FakeDFlashPool(Engine()))
+
+    assert data["models"][0]["dflash"] == {
+        "speculation": speculation,
+        "pairing_warning": "Possible DFlash precision mismatch",
+    }

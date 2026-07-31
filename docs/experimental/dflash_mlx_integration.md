@@ -28,12 +28,12 @@ Key distinction from traditional speculative decoding: the draft model uses **bl
 ```
 API Request → server.py → engine_pool.py
                               │
-                              ├─ prompt < DFLASH_MAX_CTX (4096)
+                              ├─ dflash_max_ctx unset, or prompt below limit
                               │     └─ DFlashEngine
                               │           └─ stream_dflash_generate()  [dflash-mlx]
                               │                 └─ draft/verify loop (internal)
                               │
-                              └─ prompt >= DFLASH_MAX_CTX
+                              └─ configured limit reached
                                     └─ fallback engine (BatchedEngine / VLMBatchedEngine)
                                           └─ BatchGenerator + paged cache + SSD cache
 ```
@@ -42,7 +42,8 @@ DFlashEngine is a `BaseEngine` implementation that:
 - Loads target + draft models via `dflash_mlx.runtime.load_target_bundle()` / `load_draft_bundle()`
 - Consumes structured events from `stream_dflash_generate()` (prefill, token, summary)
 - Bridges sync generation to async streaming via `asyncio.Queue`
-- Holds an internal fallback engine for long-context requests
+- Lazily replaces DFlash with a fallback engine when a configured context
+  limit is reached
 
 ---
 
@@ -66,7 +67,7 @@ DFlashEngine is a `BaseEngine` implementation that:
 
 ### Dependency
 
-- `dflash-mlx` pinned to `bstnxbt/dflash-mlx@9ca0028` (v0.1.10)
+- `dflash-mlx` pinned to `jundot/dflash-mlx@474f8e1` (v0.1.10+omlx.3)
 - Listed as required dependency in `pyproject.toml` and `packaging/venvstacks.toml`
 
 ### Supported models
@@ -89,23 +90,23 @@ DFlash upstream registers `QwenGdnTargetOps` and `Gemma4TargetOps`. oMLX also re
 | google/gemma-4-31b-it | z-lab/gemma-4-31B-it-DFlash |
 | google/gemma-4-26b-a4b-it | z-lab/gemma-4-26B-A4B-it-DFlash |
 | poolside/Laguna-XS-2.1 | poolside/Laguna-XS-2.1-DFlash |
-| poolside/Laguna-XS-2.1-NVFP4(-mlx) | poolside/Laguna-XS-2.1-DFlash-NVFP4 |
+| poolside/Laguna-XS-2.1-NVFP4-mlx | poolside/Laguna-XS-2.1-DFlash-NVFP4 |
 | poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
-| poolside/Laguna-S-2.1-NVFP4(-mlx) | poolside/Laguna-S-2.1-DFlash-NVFP4 |
+| poolside/Laguna-S-2.1-NVFP4-mlx | poolside/Laguna-S-2.1-DFlash-NVFP4 |
 
 Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
 
 Laguna target and draft checkpoints must be from the same size family and should
 use Poolside's quantization-matched draft when one is published (for example,
-`Laguna-S-2.1-DFlash-NVFP4` with the NVFP4 target). DFlash drafts predict from
-hidden states captured inside the target, so a precision-mismatched pair (a
-BF16-target draft on a community-quantized target, or an NVFP4 draft on an oQ
-target) collapses acceptance to roughly one draft token per cycle and makes
-DFlash slower than plain decoding (issue #2398). The engine logs a warning at
-load time for recognizably mismatched pairs and shows it in the dashboard's
-Active Models card, together with per-session acceptance and tokens/cycle
-counters. Poolside also publishes INT4/FP8 drafters; their vLLM-format targets
-are not yet validated in oMLX. The adapter validates target
+`Laguna-S-2.1-DFlash-NVFP4` with the NVFP4 target). A checkpoint that explicitly
+declares a different precision from the target may reduce acceptance; issue
+#2398 motivates checking this, but does not isolate pairing as the sole cause.
+The engine warns only when both target and draft expose contradictory precision
+metadata, and shows the warning in the dashboard together with acceptance and
+separate accepted-draft/output tokens-per-cycle counters. A generic `-DFlash`
+suffix is not treated as proof of a BF16-only draft. Poolside also publishes
+INT4/FP8 drafters; their vLLM-format
+targets are not yet validated in oMLX. The adapter validates target
 depth, hidden size, and capture-layer IDs at load time. It implements Laguna's
 per-head/per-element softplus attention gating, partial RoPE,
 per-captured-layer RMS normalization, Poolside's fused `qkv_proj` checkpoint
@@ -127,6 +128,9 @@ Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also 
 | `dflash_draft_quant_weight_bits` | int | Draft model quantization weight bits |
 | `dflash_draft_quant_activation_bits` | int | Draft model quantization activation bits |
 | `dflash_draft_quant_group_size` | int | Draft model quantization group size |
+| `dflash_max_ctx` | int or null | Optional prompt-token threshold for batched fallback (`null` = unlimited) |
+| `dflash_in_memory_cache` | bool | Enable DFlash L1 prefix snapshots |
+| `dflash_ssd_cache` | bool | Enable DFlash L2 snapshot spill |
 
 Configured via web admin UI → Model Settings → Experimental Features → DFlash.
 
@@ -134,7 +138,7 @@ Configured via web admin UI → Model Settings → Experimental Features → DFl
 
 ## Generation flow
 
-### Short context (< DFLASH_MAX_CTX)
+### DFlash path
 
 1. `DFlashEngine.stream_generate()` tokenizes prompt
 2. Submits to MLX executor thread via `_run_generate_streaming()`
@@ -150,11 +154,11 @@ Configured via web admin UI → Model Settings → Experimental Features → DFl
    - `"event": "summary"` → log metrics (tok/s, acceptance ratio, cycles)
 6. EOS tokens filtered from output
 
-### Long context (>= DFLASH_MAX_CTX)
+### Configured context fallback
 
 1. `DFlashEngine.stream_generate()` detects prompt length exceeds threshold
 2. Delegates entire request to `_fallback_engine.stream_generate()`
-3. Fallback engine is BatchedEngine or VLMBatchedEngine (started during `DFlashEngine.start()`)
+3. DFlash weights are evicted and BatchedEngine or VLMBatchedEngine starts lazily
 4. Full omlx features available: paged cache, SSD cache, prefix cache, continuous batching
 
 ### Non-streaming
@@ -196,15 +200,16 @@ The DFlash paper (arXiv:2602.06036) evaluates both temperature=0 (4.9x speedup) 
 
 DFlashEngine processes one request at a time. No continuous batching — the entire GPU is dedicated to a single draft/verify loop. For concurrent users, requests are serialized on the MLX executor thread.
 
-**Mitigation**: for Apple Silicon personal use (1-2 concurrent users), single-request 3-4x speed improvement outweighs batching benefits.
+**Trade-off**: on Apple Silicon with low concurrency, speculation can outweigh
+batching when acceptance is high; measure the actual target/draft pair and
+workload rather than assuming a fixed speedup.
 
 ### 2. Context length limit
 
 DFlash effectiveness degrades with long contexts:
-- Draft model trained on max sequence length 3072-4096 tokens
 - Verify pass attention cost grows with KV cache size
-- Default `DFLASH_MAX_CTX = 4096` (configurable via environment variable)
-- Beyond threshold, automatic fallback to BatchedEngine/VLMBatchedEngine
+- `dflash_max_ctx` defaults to unlimited
+- Setting a threshold enables automatic fallback to BatchedEngine/VLMBatchedEngine
 
 ### 3. Model support
 
@@ -217,13 +222,15 @@ Qwen, Gemma4, and Laguna have compatible target adapters and published draft che
 DFlashEngine loads both target and draft models simultaneously:
 - Draft model: typically ~1B parameters (small relative to target)
 - Draft int4 quantization available to reduce footprint
-- Fallback engine also loaded (for long-context requests) — shares the same model weights via mlx-lm if model path matches
+- The fallback engine is loaded only after DFlash weights are evicted
 
-### 5. No paged/SSD cache
+### 5. Separate prefix cache
 
-DFlashEngine does not use omlx's paged KV cache or SSD cache system. Cache is managed entirely within dflash-mlx's generation loop. Each request does full prefill from scratch (no prefix cache reuse across requests).
+DFlashEngine does not use omlx's paged KV block cache. It has a separate
+dflash-mlx snapshot cache: optional L1 memory entries and L2 SSD spill.
 
-**Mitigation**: long-context requests (where prefix caching matters most) fall back to BatchedEngine which has full paged + SSD cache support.
+When context fallback is configured, the batched engine provides oMLX's paged
+and SSD block cache after the switch.
 
 ### 6. No batch benchmark
 
@@ -240,14 +247,13 @@ When temperature > 0, acceptance rate drops because draft and target independent
 ```
 DFlashEngine.start()
   ├── load target model (dflash-mlx)
-  ├── load draft model (dflash-mlx)
-  └── start fallback engine
-        ├── VLMBatchedEngine (if model detected as VLM)
-        └── BatchedEngine (otherwise)
+  └── load draft model (dflash-mlx)
 
 Request arrives:
-  ├── len(prompt_tokens) < DFLASH_MAX_CTX → DFlash path
-  └── len(prompt_tokens) >= DFLASH_MAX_CTX → fallback engine path
+  ├── no configured limit, or prompt below it → DFlash path
+  └── configured limit reached
+        ├── evict DFlash target + draft
+        └── lazily start VLMBatchedEngine or BatchedEngine
 
 DFlashEngine.start() fails:
   └── engine_pool catches exception → creates VLMBatchedEngine or BatchedEngine directly
@@ -265,7 +271,6 @@ DFlash check runs **before** engine type routing in `_load_engine()`. If `dflash
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DFLASH_MAX_CTX` | 4096 | Max prompt tokens before fallback to AR |
 | `DFLASH_VERIFY_LEN` | block_size | Cap on verify block length |
 | `DFLASH_DRAFT_SINK` | 64 | Draft KV cache sink size |
 | `DFLASH_DRAFT_WINDOW` | 1024 | Draft KV cache window size |
@@ -290,7 +295,7 @@ DFlash generation complete: 502 tokens, 45.3 tok/s, acceptance=87.2%, cycles=38
 
 Context fallback is logged:
 ```
-DFlash context fallback: 5120 >= 4096, using vlm engine
+DFlash context fallback: 5120 >= 4096, evicting dflash models and switching to vlm engine
 ```
 
 ---
@@ -310,7 +315,7 @@ DFlash context fallback: 5120 >= 4096, using vlm engine
 2. Set the matching draft model path (for example, `poolside/Laguna-S-2.1-DFlash-NVFP4` for an NVFP4 Laguna S target)
 3. Reload model
 4. Send short prompt → verify DFlash logs (acceptance ratio, tok/s)
-5. Send long prompt (>4K tokens) → verify fallback to BatchedEngine logs
+5. Configure `dflash_max_ctx`, then send a prompt at or above it → verify fallback logs
 
 ---
 
@@ -318,5 +323,5 @@ DFlash context fallback: 5120 >= 4096, using vlm engine
 
 - **Upstream sync**: merge temperature patch to bstnxbt/dflash-mlx, update pin
 - **Broader model support**: as dflash-mlx adds new model families, omlx gets support automatically
-- **Prefix caching**: explore chunked prefill with block-level KV save/restore for multi-turn conversation acceleration (requires dflash-mlx exposing cache manipulation APIs)
-- **Benchmark integration**: add DFlash-specific benchmark metrics (acceptance ratio, draft/verify timing breakdown) to admin panel
+- **Adaptive fallback**: evaluate switching to plain decoding when measured speculation is consistently unprofitable
+- **Performance coverage**: add real Laguna matched-pair tests across short and long contexts
