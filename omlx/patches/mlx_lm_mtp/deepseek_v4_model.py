@@ -13,11 +13,11 @@ adds the MTP head + ``mtp_forward`` / ``make_mtp_cache``. Apply order:
 caller (``patches/mlx_lm_mtp/__init__.py``) runs ``apply()`` after the
 base DeepSeek-V4 patch has registered the module.
 
-The DeepSeek-V4 backbone has 4D hidden states (``B, S, hc_mult, hidden``)
-because of the Hyper-head broadcasting. Both the patched ``__call__``
-(with ``return_hidden=True``) and ``mtp_forward`` accept / produce 4D
-tensors; the ``BatchGenerator`` MTP dispatch handles the dimension
-difference via a small adapter (see ``batch_generator._slice_hidden``).
+The preview DeepSeek-V4 backbone has 4D hidden states
+(``B, S, hc_mult, hidden``) because of Hyper-Connections.  The 0731
+checkpoint instead returns the concatenated, HC-mean hidden states from
+the target backbone layers requested by DSpark.  Both variants share the
+same public speculative-generation hooks.
 """
 
 from __future__ import annotations
@@ -29,6 +29,25 @@ from typing import Any, Dict, List, Optional
 from . import prompt_priming
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dspark_config(config: Any) -> bool:
+    """Return whether ``config`` describes the official DSpark module."""
+    return bool(
+        int(getattr(config, "dspark_block_size", 0) or 0) > 0
+        and tuple(getattr(config, "dspark_target_layer_ids", ()) or ())
+        and int(getattr(config, "dspark_markov_rank", 0) or 0) > 0
+    )
+
+
+def _mtp_stage_count(config: Any) -> int:
+    """Physical checkpoint stages (DSpark's config compatibility field lies)."""
+    if _is_dspark_config(config):
+        # The official 0731 checkpoint has one DSpark stage per target
+        # backbone hidden (40, 41, 42).  Unlike the preview checkpoint,
+        # num_nextn_predict_layers is not the physical stage count.
+        return len(tuple(config.dspark_target_layer_ids))
+    return int(getattr(config, "num_nextn_predict_layers", 0) or 0)
 
 
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
@@ -59,6 +78,7 @@ def apply() -> bool:
 
     _patch_model_args(dsv4)
     _register_mtp_block(dsv4)
+    _register_dspark_block(dsv4)
     _patch_deepseek_v4_model_call(dsv4)
     _patch_model(dsv4)
 
@@ -95,7 +115,17 @@ def _patch_model_args(dsv4: Any) -> None:
         # ``DeepseekV4Block(..., layer_idx=n_main+i)`` lookup succeeds.
         args = original_from_dict(cls, params)
         n_main = int(getattr(args, "num_hidden_layers", 0) or 0)
-        n_mtp = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
+        # Older mlx-lm ModelArgs did not declare the new DSpark fields.  Set
+        # them explicitly so this patch also works on the oMLX release
+        # candidate's pinned mlx-lm version.
+        for name, default in (
+            ("dspark_block_size", 0),
+            ("dspark_noise_token_id", 0),
+            ("dspark_target_layer_ids", ()),
+            ("dspark_markov_rank", 0),
+        ):
+            setattr(args, name, params.get(name, getattr(args, name, default)))
+        n_mtp = _mtp_stage_count(args)
         if n_mtp > 0 and hasattr(args, "compress_ratios"):
             ratios = list(args.compress_ratios)
             if len(ratios) < n_main + n_mtp:
@@ -164,6 +194,163 @@ def _register_mtp_block(dsv4: Any) -> None:
     dsv4.MTPBlock = MTPBlock
 
 
+def _register_dspark_block(dsv4: Any) -> None:
+    """Register the official 0731 DSpark attention and stage modules.
+
+    DSpark's persistent cache contains only K/V projected from the target
+    backbone hidden states.  The five query slots (anchor + four noise
+    tokens) attend to that sliding window and to one another non-causally,
+    but are deliberately not written to the persistent cache.
+    """
+    if hasattr(dsv4, "DSparkBlock"):
+        return
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    LocalAttention = dsv4.LocalAttention
+    DeepseekV4Block = dsv4.DeepseekV4Block
+    HyperHead = dsv4.HyperHead
+    hc_expand = dsv4.hc_expand
+    scaled_dot_product_attention = dsv4.scaled_dot_product_attention
+
+    class DSparkAttention(LocalAttention):
+        """Local attention with a backbone-derived persistent K/V window."""
+
+        def _project_kv(self, x, offset):
+            batch, length, _ = x.shape
+            kv = self.kv_norm(self.wkv(x)).reshape(
+                batch, 1, length, self.head_dim
+            )
+            return self.rope(kv, offset)
+
+        def prefill(self, main_x, cache):
+            if cache is None or main_x is None or main_x.shape[1] == 0:
+                return None
+            offset = cache.offset
+            main_kv = self._project_kv(main_x, offset)
+            values = mx.zeros((*main_kv.shape[:-1], 0), dtype=main_kv.dtype)
+            kv, _ = cache.update_and_fetch(main_kv, values)
+            return kv
+
+        def __call__(self, x, mask=None, cache=None, main_x=None):
+            del mask  # DSpark query slots are intentionally non-causal.
+            batch, length, _ = x.shape
+
+            context_kv = self.prefill(main_x, cache)
+            query_offset = cache.offset if cache is not None else 0
+
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+            q = q.reshape(batch, length, self.n_heads, self.head_dim)
+            q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+            q = q.transpose(0, 2, 1, 3)
+            q = self.rope(q, query_offset)
+
+            query_kv = self._project_kv(x, query_offset)
+            if context_kv is None:
+                full_kv = query_kv
+            else:
+                full_kv = mx.concatenate([context_kv, query_kv], axis=2)
+
+            out = scaled_dot_product_attention(
+                q,
+                full_kv,
+                full_kv,
+                cache=None,
+                scale=self.scale,
+                mask=None,
+                sinks=self.attn_sink.astype(q.dtype),
+            )
+            out = self.rope(out, query_offset, inverse=True)
+
+            out = out.reshape(
+                batch, self.o_groups, -1, length, self.head_dim
+            )
+            out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+            out = self.wo_a(out)
+            out = out.transpose(0, 2, 1, 3).flatten(-2)
+            out = self.wo_b(out)
+
+            if self.sharding_group is not None:
+                out = mx.distributed.all_sum(out, group=self.sharding_group)
+            return out
+
+    class DSparkMarkovHead(nn.Module):
+        def __init__(self, config):
+            rank = int(config.dspark_markov_rank)
+            self.markov_w1 = nn.Embedding(config.vocab_size, rank)
+            self.markov_w2 = nn.Linear(rank, config.vocab_size, bias=False)
+
+        def __call__(self, token_ids):
+            embed = self.markov_w1(token_ids)
+            return self.markov_w2(embed), embed
+
+    class DSparkConfidenceHead(nn.Module):
+        def __init__(self, config):
+            self.proj = nn.Linear(
+                config.hidden_size + int(config.dspark_markov_rank),
+                1,
+                bias=False,
+            )
+
+        def __call__(self, hidden, markov_embed):
+            return self.proj(
+                mx.concatenate([hidden, markov_embed], axis=-1).astype(mx.float32)
+            ).squeeze(-1)
+
+    class DSparkBlock(nn.Module):
+        """One of the three full decoder stages stored under ``mtp.<i>``."""
+
+        def __init__(self, config, layer_idx: int, stage_idx: int, n_stages: int):
+            self.block = DeepseekV4Block(config, layer_idx)
+            self.block.attn = DSparkAttention(config, layer_idx)
+            self.stage_idx = stage_idx
+            self.block_size = int(config.dspark_block_size)
+            self.noise_token_id = int(config.dspark_noise_token_id)
+
+            if stage_idx == 0:
+                targets = tuple(config.dspark_target_layer_ids)
+                self.main_proj = nn.Linear(
+                    config.hidden_size * len(targets),
+                    config.hidden_size,
+                    bias=False,
+                )
+                self.main_norm = nn.RMSNorm(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
+
+            if stage_idx == n_stages - 1:
+                self.norm = nn.RMSNorm(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
+                self.hc_head = HyperHead(config)
+                self.markov_head = DSparkMarkovHead(config)
+                # Kept load-compatible even though confidence-guided dynamic
+                # depth is not yet used by oMLX (nor by vLLM today).
+                self.confidence_head = DSparkConfidenceHead(config)
+
+        def prefill(self, main_x, cache):
+            return self.block.attn.prefill(main_x, cache)
+
+        def __call__(self, h, main_x, input_ids, cache):
+            residual = h
+            x, post, comb = self.block.attn_hc(h)
+            x = self.block.attn(
+                self.block.attn_norm(x),
+                cache=cache,
+                main_x=main_x,
+            )
+            h = hc_expand(x, residual, post, comb)
+
+            residual = h
+            x, post, comb = self.block.ffn_hc(h)
+            x = self.block.ffn(self.block.ffn_norm(x), input_ids)
+            return hc_expand(x, residual, post, comb)
+
+    dsv4.DSparkAttention = DSparkAttention
+    dsv4.DSparkBlock = DSparkBlock
+
+
 # ---------------------------------------------------------------------------
 # DeepseekV4Model — return_raw_hidden support.
 # ---------------------------------------------------------------------------
@@ -214,8 +401,15 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
+        dspark_targets = set(
+            tuple(getattr(self.args, "dspark_target_layer_ids", ()) or ())
+        )
+        dspark_hiddens = []
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+            layer_idx = getattr(getattr(layer, "attn", None), "layer_idx", None)
+            if layer_idx in dspark_targets:
+                dspark_hiddens.append(h.mean(axis=2))
 
         materialize_cache_arrays(cache)
 
@@ -232,6 +426,14 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 
         out = self.norm(self.hc_head(h))
         if return_raw_hidden:
+            if dspark_targets:
+                if len(dspark_hiddens) != len(dspark_targets):
+                    raise RuntimeError(
+                        "DSpark requires all target backbone hidden states on "
+                        "one pipeline rank; distributed pipeline execution is "
+                        "not supported yet"
+                    )
+                return out, mx.concatenate(dspark_hiddens, axis=-1)
             return out, h
         return out
 
@@ -270,7 +472,8 @@ def _patch_model(dsv4: Any) -> None:
 
     def __init__(self, config):
         original_init(self, config)
-        n_mtp = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+        n_mtp = _mtp_stage_count(config)
+        is_dspark = _is_dspark_config(config)
         # See qwen35_model._patch_model: gated on the MTP active-flag so
         # mtp_enabled=False produces a model indistinguishable from stock.
         from . import is_mtp_active
@@ -279,7 +482,15 @@ def _patch_model(dsv4: Any) -> None:
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
         if mtp_decode_enabled:
             n_main = config.num_hidden_layers
-            self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
+            if is_dspark:
+                self.mtp = [
+                    dsv4.DSparkBlock(config, n_main + i, i, n_mtp)
+                    for i in range(n_mtp)
+                ]
+            else:
+                self.mtp = [
+                    dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)
+                ]
             # Depth-k chained drafting is available: mtp_forward supports
             # return_hidden below, backbone rollback goes through
             # mtp_partial_rollback, and the head cache is a RotatingKVCache
@@ -288,8 +499,17 @@ def _patch_model(dsv4: Any) -> None:
             from . import get_mtp_depth
 
             self._omlx_mtp_chain = True
-            self._omlx_mtp_depth = get_mtp_depth()
-            self._omlx_mtp_head_clone = True
+            self._omlx_dspark = is_dspark
+            if is_dspark:
+                self._omlx_mtp_depth = int(config.dspark_block_size)
+                self._omlx_mtp_head_clone = False
+                # The returned hidden is a concatenation of target-layer
+                # activations, not the final trunk hidden accepted by
+                # model.norm.
+                self._omlx_mtp_head_prenorm = True
+            else:
+                self._omlx_mtp_depth = get_mtp_depth()
+                self._omlx_mtp_head_clone = True
 
     def __call__(
         self,
@@ -383,6 +603,22 @@ def _patch_model(dsv4: Any) -> None:
         if cache is None:
             cache = [None] * len(self.mtp)
 
+        if getattr(self, "_omlx_dspark", False):
+            # Prompt priming calls this public hook with every confirmed
+            # target hidden.  DSpark uses those rows only to build the
+            # backbone-derived K/V window; proposal queries are produced by
+            # dspark_logits below.
+            main_x = self.mtp[0].main_norm(self.mtp[0].main_proj(h))
+            for stage, layer_cache in zip(self.mtp, cache):
+                stage.prefill(main_x, layer_cache)
+            materialize_cache_arrays(cache)
+            empty = mx.zeros(
+                (h.shape[0], 0, self.args.vocab_size), dtype=h.dtype
+            )
+            if return_hidden:
+                return empty, h
+            return empty
+
         first_cache = cache[0]
         mask_cache = (
             first_cache[0] if isinstance(first_cache, CacheList) else first_cache
@@ -410,6 +646,51 @@ def _patch_model(dsv4: Any) -> None:
         logits = self.lm_head(out)
         if return_hidden:
             return logits, h
+        return logits
+
+    def dspark_logits(self, h, input_ids, cache=None):
+        """Return the five parallel DSpark base-logit rows.
+
+        Markov biasing and sequential sampling stay in BatchGenerator so
+        oMLX's sampler, logits processors, and exact acceptance math are
+        applied consistently with every other model.
+        """
+        if not getattr(self, "_omlx_dspark", False):
+            raise RuntimeError("dspark_logits called on a non-DSpark model")
+        if cache is None:
+            cache = self.make_mtp_cache()
+
+        first = self.mtp[0]
+        main_x = first.main_norm(first.main_proj(h))
+        anchor = input_ids[:, -1:].astype(mx.uint32)
+        noise = mx.full(
+            (anchor.shape[0], int(self.args.dspark_block_size) - 1),
+            int(self.args.dspark_noise_token_id),
+            dtype=anchor.dtype,
+        )
+        query_ids = mx.concatenate([anchor, noise], axis=1)
+        x = self.model.embed_tokens(query_ids)
+        x = mx.broadcast_to(
+            x[:, :, None, :],
+            (x.shape[0], x.shape[1], self.args.hc_mult, x.shape[2]),
+        )
+        x = mx.contiguous(x)
+        for stage, layer_cache in zip(self.mtp, cache):
+            x = stage(x, main_x, query_ids, layer_cache)
+
+        last = self.mtp[-1]
+        out = last.norm(last.hc_head(x))
+        logits = self.lm_head(out)
+        materialize_cache_arrays(cache)
+        return logits
+
+    def dspark_markov_logits(self, token_ids):
+        """Vocabulary bias conditioned on the previous sampled draft token."""
+        if not getattr(self, "_omlx_dspark", False):
+            raise RuntimeError(
+                "dspark_markov_logits called on a non-DSpark model"
+            )
+        logits, _ = self.mtp[-1].markov_head(token_ids)
         return logits
 
     def _cache_can_trim(c, n: int) -> bool:
@@ -481,6 +762,7 @@ def _patch_model(dsv4: Any) -> None:
         layers.
         """
         n_layers = self.args.num_hidden_layers
+        n_mtp_layers = _mtp_stage_count(self.args)
         has_mtp = hasattr(self, "mtp")
         has_mtp_weights = any(k.startswith("mtp.") for k in weights)
         # Disable MTP module if weights are absent (e.g. quantized checkpoints
@@ -633,7 +915,7 @@ def _patch_model(dsv4: Any) -> None:
         # ndim==2 gate keeps this idempotent for checkpoints that already
         # store the 3D MultiLinear layout (e.g. oQ output).
         if has_mtp:
-            for mtp_idx in range(self.args.num_nextn_predict_layers):
+            for mtp_idx in range(n_mtp_layers):
                 prefix = f"mtp.{mtp_idx}.block.attn.wo_a"
                 for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
                     if key in weights and weights[key].ndim == 2:
@@ -643,7 +925,7 @@ def _patch_model(dsv4: Any) -> None:
 
         # Stack routed expert weights for MTP layers (PR 15).
         if has_mtp:
-            for mtp_idx in range(self.args.num_nextn_predict_layers):
+            for mtp_idx in range(n_mtp_layers):
                 prefix = f"mtp.{mtp_idx}.block.ffn.experts"
                 for src, dst in (
                     ("w1", "gate_proj"),
@@ -669,6 +951,8 @@ def _patch_model(dsv4: Any) -> None:
     __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
+    cls.dspark_logits = dspark_logits
+    cls.dspark_markov_logits = dspark_markov_logits
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_clamp_accept = mtp_clamp_accept
     cls.mtp_partial_rollback = mtp_partial_rollback

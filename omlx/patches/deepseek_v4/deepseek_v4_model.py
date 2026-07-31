@@ -82,6 +82,14 @@ class ModelArgs(BaseModelArgs):
     index_head_dim: int = 128
     index_topk: int = 512
     num_nextn_predict_layers: int = 1
+    # DeepSeek-V4-Flash-0731's DSpark speculative module.  The official
+    # checkpoint keeps the three DSpark stages under ``mtp.*`` but
+    # ``num_nextn_predict_layers`` remains 1 for compatibility with the
+    # preview model, so these fields are the authoritative discriminator.
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_markov_rank: int = 0
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
 
@@ -126,7 +134,12 @@ def make_quantization_config(model):
     mtp_projs = {
         k: mxfp8
         for k, _ in flat_modules
-        if k.startswith("mtp.") and (k.endswith(".e_proj") or k.endswith(".h_proj"))
+        if k.startswith("mtp.")
+        and (
+            k.endswith(".e_proj")
+            or k.endswith(".h_proj")
+            or k.endswith(".main_proj")
+        )
     }
 
     return {

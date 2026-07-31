@@ -564,6 +564,154 @@ class TestDeepseekV4Model:
         assert "materialize_cache_arrays(cache)" in call_source
         assert "materialize_cache_arrays(cache)" in model_source
 
+    def test_dspark_config_uses_physical_stage_count(self):
+        """0731 advertises one next-token layer but stores three DSpark stages."""
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
+
+        apply_deepseek_v4_patch()
+        assert deepseek_v4_model.apply()
+
+        import mlx_lm.models.deepseek_v4 as dsv4
+
+        args = dsv4.ModelArgs.from_dict(
+            {
+                "num_hidden_layers": 43,
+                "compress_ratios": [0] * 43,
+                "num_nextn_predict_layers": 1,
+                "dspark_block_size": 5,
+                "dspark_noise_token_id": 128799,
+                "dspark_target_layer_ids": [40, 41, 42],
+                "dspark_markov_rank": 256,
+            }
+        )
+        assert deepseek_v4_model._is_dspark_config(args)
+        assert deepseek_v4_model._mtp_stage_count(args) == 3
+        assert len(args.compress_ratios) == 46
+        assert hasattr(dsv4, "DSparkAttention")
+        assert hasattr(dsv4, "DSparkBlock")
+
+    def test_dspark_tiny_model_shapes_and_cache(self, monkeypatch):
+        """A tiny DSpark graph captures three hiddens and drafts five rows."""
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+        import omlx.patches.mlx_lm_mtp as mtp_runtime
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
+
+        apply_deepseek_v4_patch()
+        assert deepseek_v4_model.apply()
+        monkeypatch.setattr(mtp_runtime, "_MTP_ACTIVE", True)
+
+        import mlx_lm.models.deepseek_v4 as dsv4
+
+        args = dsv4.ModelArgs.from_dict(
+            {
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "moe_intermediate_size": 8,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "num_experts_per_tok": 2,
+                "q_lora_rank": 8,
+                "qk_rope_head_dim": 2,
+                "head_dim": 8,
+                "o_groups": 2,
+                "o_lora_rank": 8,
+                "index_n_heads": 2,
+                "index_head_dim": 4,
+                "index_topk": 4,
+                "hc_mult": 4,
+                "compress_ratios": [0, 0, 0],
+                "num_nextn_predict_layers": 1,
+                "dspark_block_size": 5,
+                "dspark_noise_token_id": 31,
+                "dspark_target_layer_ids": [0, 1, 2],
+                "dspark_markov_rank": 4,
+            }
+        )
+        model = dsv4.Model(args)
+        backbone_cache = model.make_cache()
+        dspark_cache = model.make_mtp_cache()
+
+        logits, hidden = model(
+            mx.array([[1, 2]], dtype=mx.uint32),
+            cache=backbone_cache,
+            return_hidden=True,
+        )
+        base = model.dspark_logits(
+            hidden[:, -1:],
+            mx.array([[3]], dtype=mx.uint32),
+            dspark_cache,
+        )
+        bias = model.dspark_markov_logits(mx.array([3], dtype=mx.uint32))
+        mx.eval(logits, hidden, base, bias)
+
+        assert logits.shape == (1, 2, 32)
+        assert hidden.shape == (1, 2, 48)
+        assert base.shape == (1, 5, 32)
+        assert bias.shape == (1, 32)
+        assert [cache.offset for cache in dspark_cache] == [1, 1, 1]
+
+    def test_dspark_batch_drafter_applies_markov_rows_sequentially(
+        self, monkeypatch
+    ):
+        """The parallel backbone rows must condition on each prior draft."""
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        seen_markov = []
+
+        class FakeDSpark:
+            _omlx_dspark = True
+
+            def dspark_logits(self, hidden, committed, cache):
+                assert hidden.shape == (1, 1, 6)
+                assert committed.tolist() == [[7]]
+                rows = mx.full((1, 5, 12), -10.0)
+                # Base argmaxes are 1..5.
+                for row in range(5):
+                    rows[:, row, row + 1] = 10.0
+                return rows
+
+            def dspark_markov_logits(self, previous):
+                seen_markov.append(int(previous.item()))
+                return mx.zeros((1, 12))
+
+        def greedy(logprobs):
+            return mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+
+        monkeypatch.setattr(
+            batch_generator,
+            "_resolve_draft_sampler",
+            lambda *_: greedy,
+        )
+        monkeypatch.setattr(batch_generator, "_proc_list", lambda *_: None)
+
+        state = batch_generator._MtpState(uid=1)
+        state.mtp_cache = [object()]
+        batch = SimpleNamespace(model=FakeDSpark())
+        batch_generator._dspark_next_drafts(
+            batch,
+            state,
+            mx.zeros((1, 1, 6)),
+            mx.array([7], dtype=mx.uint32),
+            None,
+            5,
+        )
+        mx.eval(state.drafts)
+
+        assert state.drafts.tolist() == [1, 2, 3, 4, 5]
+        assert seen_markov == [7, 1, 2, 3, 4]
+        assert state.hist_offset == 1
+        assert len(state.draft_lps) == 5
+        assert len(state.draft_accept_lps) == 5
+
 
 class TestBatchGeneratorDispatch:
     @pytest.fixture(autouse=True)

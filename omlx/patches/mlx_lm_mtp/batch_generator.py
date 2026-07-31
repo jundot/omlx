@@ -1953,6 +1953,15 @@ def _chain_next_drafts(
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
+    if getattr(model, "_omlx_dspark", False):
+        return _dspark_next_drafts(
+            gen_batch,
+            state,
+            hidden_rows,
+            committed,
+            prev_buf,
+            depth,
+        )
     if depth == 0 and not state.mtp_cache:
         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
         # gemma4 assistant): skip the fold entirely — on fast backbones its
@@ -2038,6 +2047,74 @@ def _chain_next_drafts(
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
     state.draft_lps = draft_lps
     state.draft_accept_lps = draft_accept_lps
+
+
+def _dspark_next_drafts(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_rows: Any,
+    committed: Any,
+    prev_buf: Optional[Any],
+    depth: int,
+) -> None:
+    """Produce DSpark's parallel block and apply its sequential Markov bias.
+
+    The three-stage DSpark backbone computes all query rows in one pass.
+    Sampling is sequential only because row ``j`` receives a low-rank
+    vocabulary bias derived from token ``j-1``.  Keeping that loop here
+    preserves oMLX's logits processors and records the exact filtered draft
+    distributions consumed by Leviathan/Chen acceptance.
+    """
+    import mlx.core as mx
+
+    model = gen_batch.model
+    sampler = _resolve_draft_sampler(gen_batch, state)
+    procs = _proc_list(gen_batch)
+
+    if depth <= 0:
+        state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = []
+        return
+
+    n = int(committed.shape[0])
+    base_logits = model.dspark_logits(
+        hidden_rows,
+        committed.reshape(1, n),
+        state.mtp_cache,
+    )
+    state.hist_offset += n
+    depth = min(depth, int(base_logits.shape[1]))
+
+    draft_toks: List[Any] = []
+    draft_lps: List[Any] = []
+    draft_accept_lps: List[Any] = []
+    previous = committed[-1:].reshape(1)
+    chain_prefix = committed[-1:]
+
+    for j in range(depth):
+        logits_2d = base_logits[:, j, :] + model.dspark_markov_logits(previous)
+        if procs is not None and prev_buf is not None:
+            prev = mx.concatenate(
+                [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
+                + [tok.reshape(1).astype(mx.int32) for tok in draft_toks]
+            )
+            logits_2d = _apply_processors(procs, prev, logits_2d)
+        lp_2d = _logprobs(logits_2d)
+        tok = _ensure_uint32(sampler(lp_2d))
+        draft_toks.append(tok)
+        draft_lps.append(lp_2d.squeeze(0))
+        draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
+        previous = tok.reshape(1)
+
+    state.drafts = (
+        mx.concatenate(draft_toks)
+        if draft_toks
+        else mx.zeros((0,), dtype=mx.uint32)
+    )
+    state.draft_lps = draft_lps
+    state.draft_accept_lps = draft_accept_lps
+    mx.async_eval(state.drafts)
 
 
 # ---------------------------------------------------------------------------

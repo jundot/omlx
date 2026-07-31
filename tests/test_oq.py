@@ -726,6 +726,22 @@ class TestMtpFcFullPrecision:
         bits, _, _ = _get_predicate_bits("mtp.0.h_proj.weight", {}, 4, 64)
         assert bits is None
 
+    def test_dspark_main_proj_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        bits, _, _ = _get_predicate_bits("mtp.0.main_proj.weight", {}, 4, 64)
+        assert bits is None
+
+    def test_dspark_markov_head_protected(self):
+        from omlx.oq import _get_predicate_bits
+
+        for key in (
+            "mtp.2.markov_head.markov_w1.weight",
+            "mtp.2.markov_head.markov_w2.weight",
+        ):
+            bits, _, _ = _get_predicate_bits(key, {}, 4, 64)
+            assert bits is None
+
     def test_deepseek_hc_head_sanitized_protected(self):
         from omlx.oq import _get_predicate_bits
 

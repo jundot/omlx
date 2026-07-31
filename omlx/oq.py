@@ -3842,7 +3842,10 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     Qwen3.5-27B accepted 0/157 cycles). PR 990 protects ``mtp.fc`` for
     Qwen3.5/3.6; PR 15's DeepSeek-V4 ``MTPBlock`` exposes the same
     semantics under different names (``e_proj`` + ``h_proj`` for the
-    embedding/hidden fusion; ``hc_head.*`` for the final projection);
+    preview model, ``main_proj`` for 0731 DSpark, and ``hc_head.*`` for
+    the final projection). DSpark's low-rank Markov head supplies a
+    vocabulary-wide bias at every draft position and is equally
+    acceptance-sensitive;
     GLM-5.2's ``GlmMTPBlock`` calls it ``eh_proj``. All of these stay in
     full precision; the MTP block's internal decoder block (attn/ffn)
     gets the same quantization as the backbone's other layers.
@@ -3853,7 +3856,16 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
         return True
     # DeepSeek-V4 / GLM-5.2 MTP block fusion projections
-    if name.endswith((".e_proj.weight", ".h_proj.weight", ".eh_proj.weight")):
+    if name.endswith(
+        (
+            ".e_proj.weight",
+            ".h_proj.weight",
+            ".eh_proj.weight",
+            ".main_proj.weight",
+        )
+    ):
+        return True
+    if ".markov_head." in name:
         return True
     # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
     # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
