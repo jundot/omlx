@@ -110,6 +110,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
 CUSTOM_KERNEL_DIRS=(
+    "$REPO_ROOT/omlx/custom_kernels/bonsai"
     "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
     "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
     "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
@@ -229,6 +230,7 @@ _custom_kernel_pythonpath() {
 
 _clean_custom_kernel_build_artifacts() {
     local dir
+    local kernel_name
     for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
         [ -d "$dir" ] || continue
         find "$dir" -maxdepth 1 -type f \( \
@@ -239,16 +241,23 @@ _clean_custom_kernel_build_artifacts() {
     done
 
     if [ -d "$REPO_ROOT/build" ]; then
-        for ext_name in \
-            "omlx.custom_kernels.glm_moe_dsa._ext" \
-            "omlx.custom_kernels.minimax_m3._ext" \
-            "omlx.custom_kernels.qwen35_prefill._ext"; do
+        for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
+            kernel_name="$(basename "$dir")"
             find "$REPO_ROOT/build" \
                 -type d \
-                -name "$ext_name" \
+                -name "omlx.custom_kernels.${kernel_name}._ext" \
                 -prune \
                 -exec rm -rf {} +
         done
+        # setuptools' build/lib tree can retain extensions from a previous
+        # Python ABI even after the CMake target directories are removed.
+        # build_ext --inplace copies every retained artifact into the source
+        # package, so remove those native outputs before rebuilding.
+        find "$REPO_ROOT/build" \
+            -type f \
+            -path "*/omlx/custom_kernels/*" \
+            \( -name "*.so" -o -name "*.dylib" -o -name "*.metallib" \) \
+            -delete
     fi
 }
 
