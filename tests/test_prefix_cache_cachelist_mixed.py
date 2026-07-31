@@ -267,6 +267,45 @@ def test_live_subtypes_descriptor_matches_block_stamp():
     )
 
 
+def test_loaded_cachelist_payload_resaves_in_canonical_format(tmp_path):
+    """A load/rewrite/save cycle must retain CacheList's wire layout.
+
+    ``load_block_with_metadata`` returns the legacy bare-list shape.  The
+    save boundary must re-wrap it before serializing, or rotating-tip
+    rewrites lose both ``sub_count`` metadata and the sub-composition cache
+    signature, causing every later prefix restore to truncate.
+    """
+    from omlx.cache.paged_ssd_cache import _signature_cachelist_subtypes
+
+    cache, ssd = _make_cache(tmp_path)
+    table = _store_blocks(cache, num_blocks=1, request_id="req-resave-source")
+    assert table is not None
+    source = cache.paged_cache.allocated_blocks[table.block_ids[0]]
+
+    loaded, metadata = ssd.load_block_with_metadata(source.block_hash)
+    assert loaded is not None and metadata is not None
+    assert isinstance(loaded[0], list)
+
+    rewritten_hash = b"cachelist-resave-regression-0001"
+    assert len(rewritten_hash) == 32
+    assert ssd.save_block(
+        rewritten_hash,
+        loaded,
+        token_count=BLOCK_SIZE,
+        model_name="test-model",
+        layer_cache_types=metadata["layer_cache_types"],
+        layer_meta_states=metadata["layer_meta_states"],
+    )
+
+    rewritten, rewritten_meta = ssd.load_block_with_metadata(rewritten_hash)
+    assert rewritten is not None and rewritten_meta is not None
+    assert isinstance(rewritten[0], list)
+    assert len(rewritten[0]) == 2
+    assert _signature_cachelist_subtypes(
+        rewritten_meta["cache_signature"]
+    ) == {"0": ["KVCache", "ArraysCache:4"]}
+
+
 def test_stale_sub_composition_swept(tmp_path):
     """A stored block whose ArraysCache slot count disagrees with the live
     model expectation must be swept, not restored into an IndexError."""

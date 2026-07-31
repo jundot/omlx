@@ -402,6 +402,36 @@ def _block_cachelist_subtypes(
     return subtypes or None
 
 
+def _normalize_cachelist_storage_payloads(
+    cache_data: list[Any],
+    layer_cache_types: list[str] | None,
+) -> list[Any]:
+    """Canonicalize loaded CacheList payloads before writing them again.
+
+    ``load_block_with_metadata`` intentionally exposes a CacheList layer as
+    a bare list of sub-cache states for compatibility with prefix-cache
+    callers.  The writer's canonical representation is the
+    ``("__cache_list__", sub_states)`` marker.  A load/rewrite/save path
+    (notably superseded rotating-tip stripping) therefore needs this small
+    boundary normalization; otherwise the bare list is serialized as one
+    generic N-state and loses both its sub-cache wire layout and its
+    ``cachelist_subtypes`` compatibility signature.
+    """
+    if not cache_data or not layer_cache_types:
+        return cache_data
+
+    normalized: list[Any] | None = None
+    for i, cache_type in enumerate(layer_cache_types):
+        if i >= len(cache_data):
+            break
+        if cache_type != "CacheList" or not isinstance(cache_data[i], list):
+            continue
+        if normalized is None:
+            normalized = list(cache_data)
+        normalized[i] = ("__cache_list__", cache_data[i])
+    return normalized if normalized is not None else cache_data
+
+
 def cachelist_subtypes_from_cache_list(
     cache_list: list[Any] | tuple[Any, ...] | None,
 ) -> dict[str, list[str]] | None:
@@ -2167,6 +2197,9 @@ class PagedSSDCacheManager(CacheManager):
             return False
 
         layer_cache_types = _storage_layer_cache_types(layer_cache_types)
+        cache_data = _normalize_cachelist_storage_payloads(
+            cache_data, layer_cache_types
+        )
 
         # First save call after a model load is the canonical source for
         # the live layer-cache signature (post-TurboQuant / post-MTP). If

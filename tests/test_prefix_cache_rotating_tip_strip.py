@@ -115,6 +115,39 @@ def _hybrid_cache_data(seq_len, rotating_type="RotatingKVCache"):
     ]
 
 
+def _deepseek_cachelist_data(seq_len):
+    """DeepSeek-V4 shape: a rotating layer plus mixed CacheList layer."""
+    rotating_state = (
+        mx.ones((1, 2, WINDOW, 8)),
+        mx.ones((1, 2, WINDOW, 8)),
+    )
+    pooling_state = (
+        mx.ones((1, WINDOW, 8)),
+        mx.ones((1, WINDOW, 8)),
+        mx.ones((1, seq_len, 8)),
+    )
+    return [
+        {
+            "state": rotating_state,
+            "cache_type": "RotatingKVCache",
+            "class_name": "RotatingKVCache",
+            "meta_state": ("0", str(WINDOW), str(seq_len), str(WINDOW)),
+        },
+        {
+            "state": [rotating_state, pooling_state],
+            "cache_type": "CacheList",
+            "class_name": "CacheList",
+            "meta_state": (
+                ["RotatingKVCache", "PoolingCache"],
+                [
+                    ("0", str(WINDOW), str(seq_len), str(WINDOW)),
+                    (str(WINDOW),),
+                ],
+            ),
+        },
+    ]
+
+
 def _kvcache_only_data(seq_len):
     return [
         {
@@ -227,6 +260,39 @@ def test_stripped_block_keeps_sliceable_layers(tmp_path):
         if CacheTypeRegistry.is_rotating_family(t)
     )
     assert cache._is_placeholder_state(data[rotating_idx])
+
+
+def test_stripped_deepseek_tip_keeps_cachelist_signature(tmp_path):
+    """A DeepSeek load/rewrite/save must preserve CacheList composition."""
+    from omlx.cache.paged_ssd_cache import _signature_cachelist_subtypes
+
+    cache, ssd = _make_cache(tmp_path)
+    expected_subtypes = {"1": ["RotatingKVCache", "PoolingCache"]}
+    ssd.set_expected_layer_signature(
+        ["RotatingKVCache", "CacheList"],
+        cachelist_subtypes=expected_subtypes,
+    )
+
+    t1 = _store_turn(cache, 1, num_blocks=2, data_fn=_deepseek_cachelist_data)
+    tip1 = _block_hash(cache, t1, -1)
+    _, before_meta = ssd.load_block_with_metadata(tip1)
+    assert before_meta is not None
+    assert _signature_cachelist_subtypes(
+        before_meta["cache_signature"]
+    ) == expected_subtypes
+
+    _store_turn(cache, 2, num_blocks=3, data_fn=_deepseek_cachelist_data)
+    _store_turn(cache, 3, num_blocks=4, data_fn=_deepseek_cachelist_data)
+
+    rewritten, after_meta = ssd.load_block_with_metadata(tip1)
+    assert rewritten is not None and after_meta is not None
+    assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE
+    assert isinstance(rewritten[1], list)
+    assert len(rewritten[1]) == 2
+    assert _signature_cachelist_subtypes(
+        after_meta["cache_signature"]
+    ) == expected_subtypes
+    assert ssd.is_signature_compatible(after_meta["cache_signature"])
 
 
 def test_hot_cache_byte_counter_consistent(tmp_path):
