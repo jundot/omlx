@@ -293,6 +293,11 @@ class RequestOutput:
     # Set by non-streaming generate() to allow TTFT / prefill-duration estimation.
     first_token_at: Optional[float] = None
 
+    # Target-model probability records for the committed tokens in this
+    # output.  The transport layer converts these token-id records to its own
+    # wire schema; speculative providers never expose drafter probabilities.
+    logprobs: Optional[List[Dict[str, Any]]] = None
+
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None
     # Prefix cache stats

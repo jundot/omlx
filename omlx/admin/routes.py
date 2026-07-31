@@ -148,6 +148,13 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    # dSpark (generic target/drafter channel)
+    dspark_enabled: bool | None = None
+    dspark_draft_model: str | None = None
+    dspark_format: str | None = None
+    dspark_max_draft_tokens: str | int | None = None
+    dspark_markov_mode: str | None = None
+    dspark_pairing_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -459,6 +466,32 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not model_path:
         return False, "model_path missing"
     return is_dflash_compatible(model_path)
+
+
+def _resolve_dspark_draft_path(engine_pool: Any, value: str | None) -> str | None:
+    """Resolve an API model id or a literal checkpoint path to a local path."""
+    if not value:
+        return None
+    entry = engine_pool.get_entry(value) if engine_pool is not None else None
+    return str(entry.model_path) if entry is not None else value
+
+
+def _dspark_compat_for_model(
+    engine_pool: Any,
+    model_info: dict,
+    settings: Any | None,
+) -> dict[str, Any] | None:
+    draft = getattr(settings, "dspark_draft_model", None) if settings else None
+    if not draft:
+        return None
+    from ..dspark.compat import validate_pair
+
+    return validate_pair(
+        model_info.get("model_path") or "",
+        _resolve_dspark_draft_path(engine_pool, draft) or draft,
+        requested_format=getattr(settings, "dspark_format", "auto"),
+        pairing_mode=getattr(settings, "dspark_pairing_mode", "exact"),
+    ).to_dict()
 
 
 def _entry_is_diffusion_model(entry) -> bool:
@@ -1845,6 +1878,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         for ref in (
             _ms.specprefill_draft_model,
             _ms.dflash_draft_model,
+            _ms.dspark_draft_model,
             _ms.vlm_mtp_draft_model,
         ):
             if ref:
@@ -1868,6 +1902,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        dspark_compat = _dspark_compat_for_model(
+            engine_pool, model_info, settings
+        )
 
         model_data = {
             "id": model_id,
@@ -1916,6 +1953,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
+            "dspark_compatibility": dspark_compat,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "is_paroquant": is_paroquant,
@@ -1933,6 +1971,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             ]
 
         models.append(model_data)
+
 
     if markitdown_model_visible(global_settings) and not any(
         m.get("id") == MARKITDOWN_MODEL_ID for m in models
@@ -1970,6 +2009,37 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         )
 
     return {"models": models}
+
+
+@router.get("/api/models/{model_id}/dspark/compatibility")
+async def get_dspark_compatibility(
+    model_id: str,
+    draft_model: str | None = None,
+    dspark_format: str = "auto",
+    pairing_mode: str = "exact",
+    is_admin: bool = Depends(require_admin),
+):
+    """Probe a dSpark target/drafter pair without loading either model."""
+    engine_pool = _get_engine_pool()
+    settings_manager = _get_settings_manager()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    settings = settings_manager.get_settings(model_id) if settings_manager else None
+    draft = draft_model or getattr(settings, "dspark_draft_model", None)
+    if not draft:
+        raise HTTPException(status_code=400, detail="draft_model is required")
+    from ..dspark.compat import validate_pair
+
+    result = validate_pair(
+        entry.model_path,
+        _resolve_dspark_draft_path(engine_pool, draft) or draft,
+        requested_format=dspark_format,
+        pairing_mode=pairing_mode,
+    )
+    return result.to_dict()
 
 
 @router.post("/api/models/{model_id}/unload")
@@ -2348,6 +2418,77 @@ async def update_model_settings(
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
 
+    # dSpark settings. Pair validation happens before persistence and before
+    # EnginePool can allocate either checkpoint; an incompatible pair never
+    # silently falls back to target-only generation.
+    for field_name in (
+        "dspark_draft_model",
+        "dspark_format",
+        "dspark_max_draft_tokens",
+        "dspark_markov_mode",
+        "dspark_pairing_mode",
+    ):
+        if field_name in sent:
+            value = getattr(request, field_name)
+            if field_name == "dspark_draft_model":
+                value = value or None
+            setattr(current_settings, field_name, value)
+    dspark_pair_fields = {
+        "dspark_draft_model",
+        "dspark_format",
+        "dspark_markov_mode",
+        "dspark_pairing_mode",
+    }
+    dspark_config_changed = bool(dspark_pair_fields.intersection(sent))
+    if "dspark_enabled" in sent or (
+        dspark_config_changed and current_settings.dspark_enabled
+    ):
+        enabled = (
+            False
+            if is_diffusion_model
+            else (
+                bool(request.dspark_enabled)
+                if "dspark_enabled" in sent
+                else bool(current_settings.dspark_enabled)
+            )
+        )
+        if enabled:
+            for other_name, other_label in (
+                ("dflash_enabled", "DFlash"),
+                ("mtp_enabled", "MTP"),
+                ("vlm_mtp_enabled", "VLM MTP"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_name))
+                    if other_name in sent
+                    else bool(getattr(current_settings, other_name))
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"dSpark and {other_label} cannot both be enabled",
+                    )
+            draft = current_settings.dspark_draft_model
+            if not draft:
+                raise HTTPException(
+                    status_code=400,
+                    detail="dspark_enabled requires dspark_draft_model",
+                )
+            from ..dspark.compat import validate_pair
+
+            compatibility = validate_pair(
+                entry.model_path,
+                _resolve_dspark_draft_path(engine_pool, draft) or draft,
+                requested_format=current_settings.dspark_format,
+                pairing_mode=current_settings.dspark_pairing_mode,
+            )
+            if not compatibility.compatible:
+                raise HTTPException(
+                    status_code=400,
+                    detail="; ".join(compatibility.blocked_reasons),
+                )
+        current_settings.dspark_enabled = enabled
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
@@ -2554,6 +2695,12 @@ async def update_model_settings(
         or "dflash_in_memory_cache_max_bytes" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
+        or "dspark_enabled" in sent
+        or "dspark_draft_model" in sent
+        or "dspark_format" in sent
+        or "dspark_max_draft_tokens" in sent
+        or "dspark_markov_mode" in sent
+        or "dspark_pairing_mode" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent

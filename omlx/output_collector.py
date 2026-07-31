@@ -135,6 +135,9 @@ class RequestOutputCollector:
         # Combine new tokens
         merged_new_token_ids = existing.new_token_ids + new.new_token_ids
         merged_new_text = existing.new_text + new.new_text
+        merged_logprobs = None
+        if existing.logprobs is not None or new.logprobs is not None:
+            merged_logprobs = list(existing.logprobs or ()) + list(new.logprobs or ())
 
         return RequestOutput(
             request_id=new.request_id,
@@ -156,6 +159,7 @@ class RequestOutputCollector:
                 if new.generated_until is not None
                 else existing.generated_until
             ),
+            logprobs=merged_logprobs,
             tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
             cached_tokens=new.cached_tokens,
             error=new.error or existing.error,

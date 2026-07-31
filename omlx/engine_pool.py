@@ -390,6 +390,22 @@ class EnginePool:
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
 
+        dspark_active = (
+            bool(data.get("dspark_enabled", False))
+            and has_value("dspark_draft_model")
+            and not is_diffusion
+        )
+        add("dspark_enabled", dspark_active)
+        if dspark_active:
+            for key in (
+                "dspark_draft_model",
+                "dspark_format",
+                "dspark_max_draft_tokens",
+                "dspark_markov_mode",
+                "dspark_pairing_mode",
+            ):
+                add(key, data.get(key))
+
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"
         )
@@ -1695,14 +1711,52 @@ class EnginePool:
             # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
             pass
 
-            # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
+            # Generic dSpark and DFlash take priority over the discovered
+            # engine type because both own the target loading pipeline.
+            trc = (
+                bool(getattr(model_settings, "trust_remote_code", False))
+                if model_settings
+                else False
+            )
+
+            async def prefill_eviction_callback(
+                eviction_request: object,
+                *,
+                _model_id: str = model_id,
+            ) -> bool:
+                return await self._evict_idle_lru_for_prefill(
+                    exclude_model_id=_model_id,
+                    eviction_request=eviction_request,
+                )
+
             engine = None
             if model_settings is not None:
+                dspark_enabled = getattr(model_settings, "dspark_enabled", False)
+                dspark_draft = getattr(model_settings, "dspark_draft_model", None)
+                if dspark_enabled and dspark_draft:
+                    if self._entry_is_diffusion_model(entry):
+                        raise ValueError("dSpark is not supported for diffusion models")
+                    from .engine.dspark import DSparkEngine
+
+                    draft_entry = self._entries.get(dspark_draft)
+                    draft_path = draft_entry.model_path if draft_entry else dspark_draft
+                    engine = DSparkEngine(
+                        model_name=entry.model_path,
+                        draft_model_path=draft_path,
+                        model_settings=model_settings,
+                        scheduler_config=self._scheduler_config,
+                        trust_remote_code=trc,
+                        prefill_eviction_callback=prefill_eviction_callback,
+                    )
+                    logger.info(
+                        "dSpark enabled for %s, draft=%s", model_id, draft_path
+                    )
+
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if (
-                    dflash_enabled
+                    engine is None
+                    and dflash_enabled
                     and dflash_draft
                     and self._entry_is_diffusion_model(entry)
                 ):
@@ -1711,7 +1765,7 @@ class EnginePool:
                         "loading %s with its native VLM engine",
                         model_id,
                     )
-                elif dflash_enabled and dflash_draft:
+                elif engine is None and dflash_enabled and dflash_draft:
                     try:
                         from .engine.dflash import DFlashEngine
 
@@ -1755,22 +1809,6 @@ class EnginePool:
             # When unset, defaults to False -- repos with custom modeling_*.py
             # will fail to load until the user explicitly toggles this on
             # in the admin UI's model settings modal.
-            trc = (
-                bool(getattr(model_settings, "trust_remote_code", False))
-                if model_settings
-                else False
-            )
-
-            async def prefill_eviction_callback(
-                eviction_request: object,
-                *,
-                _model_id: str = model_id,
-            ) -> bool:
-                return await self._evict_idle_lru_for_prefill(
-                    exclude_model_id=_model_id,
-                    eviction_request=eviction_request,
-                )
-
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
                 if effective_type == "embedding":
@@ -1813,12 +1851,20 @@ class EnginePool:
             _is_dflash_engine = (
                 engine is not None and type(engine).__name__ == "DFlashEngine"
             )
+            _is_dspark_engine = (
+                engine is not None and type(engine).__name__ == "DSparkEngine"
+            )
             if _is_dflash_engine:
                 await self._unload_other_dflash_engines(model_id)
 
             try:
                 await engine.start()
             except Exception as start_error:
+                if _is_dspark_engine:
+                    # A configured dSpark pairing is an explicit production
+                    # route. Never hide incompatibility or loader failures by
+                    # silently changing the model/caches underneath the request.
+                    raise
                 if _is_dflash_engine:
                     # DFlash engine failed to start -- fall back to the
                     # model's natural engine type (VLM or Batched)
@@ -2163,6 +2209,22 @@ class EnginePool:
         Returns:
             Dictionary with pool status information
         """
+        def runtime_stats(engine: object | None) -> dict:
+            if engine is None:
+                return {}
+            getter = getattr(engine, "get_stats", None)
+            if not callable(getter):
+                return {}
+            try:
+                value = getter()
+                return dict(value) if isinstance(value, dict) else {}
+            except Exception as exc:
+                logger.debug("Engine stats unavailable: %s", exc)
+                return {}
+
+        per_engine_stats = {
+            mid: runtime_stats(entry.engine) for mid, entry in self._entries.items()
+        }
         return {
             "final_ceiling": self._current_ceiling(),
             "current_model_memory": self._current_model_memory,
@@ -2182,7 +2244,10 @@ class EnginePool:
                     "estimated_size": e.estimated_size,
                     "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
-                    "engine_type": e.engine_type,
+                    "engine_type": per_engine_stats[mid].get(
+                        "engine_type", e.engine_type
+                    ),
+                    "discovered_engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
                     "model_context_length": e.model_context_length,
@@ -2192,6 +2257,7 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "runtime": per_engine_stats[mid] or None,
                 }
                 for mid, e in sorted(self._entries.items())
             ],

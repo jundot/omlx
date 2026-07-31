@@ -19,6 +19,8 @@ from omlx.api.openai_models import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionTokenLogprob,
+    ChoiceLogprobs,
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
@@ -32,6 +34,7 @@ from omlx.api.openai_models import (
     ToolCall,
     ToolDefinition,
     Usage,
+    format_chat_logprobs,
 )
 
 
@@ -530,6 +533,24 @@ class TestChatCompletionRequest:
         )
         assert req.guided_grammar == 'root ::= "YES"'
 
+    def test_logprobs_are_preserved_and_bounded(self):
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            logprobs=True,
+            top_logprobs=5,
+        )
+        assert req.logprobs is True
+        assert req.top_logprobs == 5
+
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="gpt-4",
+                messages=[Message(role="user", content="Hello")],
+                logprobs=True,
+                top_logprobs=21,
+            )
+
 
 class TestChatCompletionResponse:
     """Tests for ChatCompletionResponse model."""
@@ -625,6 +646,48 @@ class TestChatCompletionResponse:
 
         assert data["model"] == "gpt-4"
         assert data["object"] == "chat.completion"
+
+    def test_response_with_openai_logprobs(self):
+        payload = ChoiceLogprobs(
+            content=[
+                ChatCompletionTokenLogprob(
+                    token="你",
+                    logprob=-0.25,
+                    bytes=list("你".encode()),
+                )
+            ]
+        )
+        resp = ChatCompletionResponse(
+            model="gpt-4",
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(content="你"),
+                    logprobs=payload,
+                )
+            ],
+        )
+        dumped = resp.model_dump(mode="json", exclude_none=True)
+        assert dumped["choices"][0]["logprobs"]["content"][0] == {
+            "token": "你",
+            "logprob": -0.25,
+            "bytes": [228, 189, 160],
+            "top_logprobs": [],
+        }
+
+    def test_engine_logprobs_conversion(self):
+        class Tokenizer:
+            @staticmethod
+            def decode(token_ids):
+                return {1: "你", 2: "好"}[token_ids[0]]
+
+        payload = format_chat_logprobs(
+            [{"token_id": 1, "logprob": -0.1, "top": [(2, -0.3)]}],
+            Tokenizer(),
+        )
+        assert payload is not None
+        assert payload.content[0].token == "你"
+        assert payload.content[0].bytes == [228, 189, 160]
+        assert payload.content[0].top_logprobs[0].token == "好"
 
 
 class TestChatCompletionChunk:

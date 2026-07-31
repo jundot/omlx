@@ -358,7 +358,7 @@ class _PrefillAbortedError(Exception):
         self.aborted_uids = aborted_uids
         self.processed_tokens = processed_tokens
         super().__init__(
-            f"Prefill aborted for UIDs {aborted_uids} " f"at {processed_tokens} tokens"
+            f"Prefill aborted for UIDs {aborted_uids} at {processed_tokens} tokens"
         )
 
 
@@ -440,6 +440,7 @@ class _PrefillState:
     sampler: Any = None
     sm: Any = None
     per_row_lps: Any = None
+    speculative_state: Any = None
 
 
 @dataclass
@@ -1049,7 +1050,7 @@ try:
         # Surface which ones so a regression in Llama-4 batching is visible
         # to operators without diffing the patch against installed mlx_lm.
         logger.info(
-            "ChunkedKVCache patch: methods already present upstream, " "skipped: %s",
+            "ChunkedKVCache patch: methods already present upstream, skipped: %s",
             ", ".join(_ckvcache_methods_skipped),
         )
 except ImportError:
@@ -1760,6 +1761,13 @@ class Scheduler:
         # Injected by VLMBatchedEngine.set_vlm_mtp_drafter alongside the drafter.
         self._vlm_mtp_draft_block_size: int | None = None
 
+        # Scheduler-native dSpark provider.  It shares this scheduler's target
+        # model and request/cache lifecycle; negative UIDs identify rows that
+        # are stepped by the provider rather than mlx-lm BatchGenerator.
+        self._dspark_provider: Any | None = None
+        self._dspark_active: dict[int, Any] = {}
+        self._dspark_next_uid: int = -1_000_000
+
         # Phase timing instrumentation for cache-on overhead diagnostics.
         # Accumulated wall-time per phase + invocation count, dumped at request
         # end or via get_phase_stats(). Adds ~100ns per measurement.
@@ -1899,9 +1907,9 @@ class Scheduler:
 
         # Streaming detokenizers for proper UTF-8 handling (one per active request)
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
-        self._request_detokenizers: dict[str, Any] = (
-            {}
-        )  # request_id → active detokenizer
+        self._request_detokenizers: dict[
+            str, Any
+        ] = {}  # request_id → active detokenizer
 
         # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
         self._output_parser_factory: OutputParserFactory | None = None
@@ -3097,6 +3105,12 @@ class Scheduler:
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: dict[int, int] = {}
+        dspark_prefill_state = None
+        if self._dspark_provider is not None and vlm_embeds is None:
+            dspark_prefill_state = self._dspark_provider.begin_prefill(
+                request, int(getattr(request, "cached_tokens", 0) or 0)
+            )
+            request._dspark_prefill_state = dspark_prefill_state
 
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
@@ -3162,11 +3176,19 @@ class Scheduler:
                         model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
                             extra_kwargs, n_to_process
                         )
-                self.model(
-                    input_arr[:, :n_to_process],
-                    cache=prompt_cache,
-                    **model_kwargs,
-                )
+                if dspark_prefill_state is not None:
+                    self._dspark_provider.prefill_context(
+                        dspark_prefill_state,
+                        input_arr[:, :n_to_process],
+                        prompt_cache,
+                        dspark_prefill_state.offset,
+                    )
+                else:
+                    self.model(
+                        input_arr[:, :n_to_process],
+                        cache=prompt_cache,
+                        **model_kwargs,
+                    )
                 mx.eval([c.state for c in prompt_cache])
                 input_arr = input_arr[:, n_to_process:]
                 if embeds_array is not None:
@@ -3265,9 +3287,7 @@ class Scheduler:
                     # band by design — the per-chunk notice is DEBUG there,
                     # not a warning about an unexpected state.
                     _log = (
-                        logger.debug
-                        if self._prefill_speed_priority
-                        else logger.warning
+                        logger.debug if self._prefill_speed_priority else logger.warning
                     )
                     _log(
                         f"Prefill above max_bytes at "
@@ -4322,7 +4342,7 @@ class Scheduler:
         with mx.stream(self._stream):
             input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
 
-        return _PrefillState(
+        state = _PrefillState(
             request=request,
             cache=prompt_cache,
             tokens_remaining=input_arr,
@@ -4334,6 +4354,11 @@ class Scheduler:
             block_size=block_size,
             total_length=len(tokens),
         )
+        if self._dspark_provider is not None:
+            state.speculative_state = self._dspark_provider.begin_prefill(
+                request, int(getattr(request, "cached_tokens", 0) or 0)
+            )
+        return state
 
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
         """Process one prefill chunk from *state*.
@@ -4398,7 +4423,21 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
-            self.model(chunk, cache=state.cache)
+            dspark_provider = getattr(self, "_dspark_provider", None)
+            if dspark_provider is not None:
+                if state.speculative_state is None:
+                    state.speculative_state = dspark_provider.begin_prefill(
+                        state.request,
+                        int(getattr(state.request, "cached_tokens", 0) or 0),
+                    )
+                dspark_provider.prefill_context(
+                    state.speculative_state,
+                    chunk,
+                    state.cache,
+                    state.speculative_state.offset,
+                )
+            else:
+                self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
@@ -4434,11 +4473,7 @@ class Scheduler:
             state.request.request_id,
             state.tokens_processed,
             state.total_length - 1,
-            (
-                self.config.model_name
-                if self.config.model_name
-                else ""
-            ),
+            (self.config.model_name if self.config.model_name else ""),
         )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
@@ -4491,9 +4526,7 @@ class Scheduler:
                 # Speed priority runs full chunks through this caution band
                 # by design — the per-chunk notice is DEBUG there, not a
                 # warning about an unexpected state.
-                _log = (
-                    logger.debug if self._prefill_speed_priority else logger.warning
-                )
+                _log = logger.debug if self._prefill_speed_priority else logger.warning
                 _log(
                     f"Chunked prefill above max_bytes at "
                     f"{state.tokens_processed} tokens: "
@@ -4553,6 +4586,32 @@ class Scheduler:
         """
         if request.sampling_params.seed is not None:
             mx.random.seed(request.sampling_params.seed)
+
+        # Native dSpark verifies against the same finalized oMLX cache that a
+        # normal decode row would receive (including TurboQuant conversion).
+        dspark_provider = getattr(self, "_dspark_provider", None)
+        if dspark_provider is not None and state.cache is not None:
+            self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
+            uid = self._route_to_dspark(
+                request,
+                state.cache,
+                state.last_token,
+                state.sampler,
+                state.sm,
+                logits_processors=state.per_row_lps,
+                prefill_state=state.speculative_state,
+            )
+            self.request_id_to_uid[request.request_id] = uid
+            self.uid_to_request_id[uid] = request.request_id
+            now = time.monotonic()
+            request.batch_uid = uid
+            request.status = RequestStatus.RUNNING
+            request.generation_started_at = now
+            request.last_activity_at = now
+            self.running[request.request_id] = request
+            scheduled.append(request)
+            self.total_prompt_tokens += request.num_prompt_tokens
+            return
 
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
@@ -4682,7 +4741,7 @@ class Scheduler:
                 still_prefilling.append(request)
                 still_prefilling.extend(pending_prefills[index + 1 :])
                 logger.info(
-                    "Paused chunked prefill request %s for LRU eviction " "(reason=%s)",
+                    "Paused chunked prefill request %s for LRU eviction (reason=%s)",
                     rid,
                     e.request.reason,
                 )
@@ -4735,10 +4794,11 @@ class Scheduler:
             self._emit_final_boundary_if_needed(state)
             _sync_and_clear_cache(self._stream)
 
-            # Ensure a BatchGenerator exists (may not if all requests were
-            # previously in chunked prefill with no running decode).
-            self._ensure_batch_generator(request.sampling_params)
-            if self.batch_generator is None:
+            # Native dSpark owns decode for this scheduler.  Do not create an
+            # unused BatchGenerator (and its second cache/sampler state).
+            if self._dspark_provider is None:
+                self._ensure_batch_generator(request.sampling_params)
+            if self._dspark_provider is None and self.batch_generator is None:
                 # Unlikely, but if BG creation fails put request back.
                 logger.error(
                     "BatchGenerator unavailable at chunked-prefill completion "
@@ -4822,8 +4882,7 @@ class Scheduler:
 
         pending_tokens = tuple(token for token, _ in pending)
         reported_match = tuple(
-            int(token)
-            for token in (getattr(response, "match_sequence", None) or ())
+            int(token) for token in (getattr(response, "match_sequence", None) or ())
         )
         matched_sequence = (
             reported_match
@@ -4855,7 +4914,7 @@ class Scheduler:
                 suppressed_stream_text
             ):
                 terminal_output.output_text = terminal_output.output_text[
-                    :-len(suppressed_stream_text)
+                    : -len(suppressed_stream_text)
                 ]
             else:
                 matched_prefix_tokens = matched_sequence[:-1]
@@ -4868,7 +4927,7 @@ class Scheduler:
                     and request.request_id not in self._output_parser_sessions
                 ):
                     terminal_output.output_text = self.tokenizer.decode(
-                        output_token_ids[:-len(matched_prefix_tokens)]
+                        output_token_ids[: -len(matched_prefix_tokens)]
                     )
             request.output_text = terminal_output.output_text
 
@@ -5654,14 +5713,14 @@ class Scheduler:
                 # to this thread's stream index -> "no Stream(gpu, N)" -> SIGABRT.
                 # Mirrors _on_prefill_boundary_snapshot's in-memory fallback.
                 self._eval_snapshot_cache(snapshot_cache)
-                self._boundary_cache_snapshots[request.request_id][
-                    total_tokens
-                ] = snapshot_cache
+                self._boundary_cache_snapshots[request.request_id][total_tokens] = (
+                    snapshot_cache
+                )
         else:
             self._eval_snapshot_cache(snapshot_cache)
-            self._boundary_cache_snapshots[request.request_id][
-                total_tokens
-            ] = snapshot_cache
+            self._boundary_cache_snapshots[request.request_id][total_tokens] = (
+                snapshot_cache
+            )
 
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
@@ -6961,7 +7020,9 @@ class Scheduler:
                             draft_cache_list,
                             model_name=name,
                         )
-                        draft_layer_cache_types = draft_model_cache_config.get_type_names()
+                        draft_layer_cache_types = (
+                            draft_model_cache_config.get_type_names()
+                        )
                     except Exception as e:
                         logger.debug(
                             "Could not infer SpecPrefill draft cache layout: %s", e
@@ -7047,6 +7108,61 @@ class Scheduler:
                 "VLM MTP drafter attached to scheduler (block_size=%s)",
                 draft_block_size,
             )
+
+    def set_dspark_provider(self, provider: Any | None) -> None:
+        """Attach the native dSpark provider to this Scheduler.
+
+        Engine startup performs probing/loading on the same single-thread MLX
+        executor before calling this method.  A provider is mutually exclusive
+        with the other speculative providers.
+        """
+        if provider is not None and (
+            self._vlm_mtp_drafter is not None or self._dspark_provider is not None
+        ):
+            raise RuntimeError("only one speculative draft provider may be active")
+        self._dspark_provider = provider
+        logger.info(
+            "native dSpark provider %s",
+            "attached" if provider is not None else "detached",
+        )
+
+    def _route_to_dspark(
+        self,
+        request: Request,
+        prefilled_cache: list[Any],
+        last_tokens: list[int],
+        sampler: Callable[[Any], Any],
+        state_machine: Any,
+        logits_processors: list[Any] | None = None,
+        prefill_state: Any = None,
+    ) -> int:
+        provider = self._dspark_provider
+        if provider is None:
+            raise RuntimeError("dSpark route requested without a provider")
+        state = provider.create_request_state(
+            request,
+            prefilled_cache,
+            last_tokens,
+            sampler,
+            list(logits_processors or ()),
+            state_machine,
+            prefill_state,
+        )
+        uid = self._dspark_next_uid
+        self._dspark_next_uid -= 1
+        self._dspark_active[uid] = state
+        return uid
+
+    def _step_dspark(self) -> list[Any]:
+        provider = self._dspark_provider
+        if provider is None or not self._dspark_active:
+            return []
+        active = list(self._dspark_active.items())
+        responses = provider.step_batch(active)
+        for uid, state in active:
+            if state.finished:
+                self._dspark_active.pop(uid, None)
+        return responses
 
     def _route_to_vlm_mtp(
         self,
@@ -7716,8 +7832,7 @@ class Scheduler:
             logger.warning(f"Idle reclaim failed: {e}")
             return
         logger.info(
-            "Idle reclaim: trimmed Metal transients between turns "
-            "(%.1fGB -> %.1fGB)",
+            "Idle reclaim: trimmed Metal transients between turns (%.1fGB -> %.1fGB)",
             before / 1024**3,
             after / 1024**3,
         )
@@ -7765,6 +7880,9 @@ class Scheduler:
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
             if uid < 0:
+                dspark_state = self._dspark_active.pop(uid, None)
+                if dspark_state is not None and self._dspark_provider is not None:
+                    self._dspark_provider.abort(dspark_state)
                 mtp_state = self._vlm_mtp_active.pop(uid, None)
                 if mtp_state is not None:
                     close = getattr(mtp_state.generator, "close", None)
@@ -8262,8 +8380,7 @@ class Scheduler:
             return
 
         logger.warning(
-            "Preflight safety-cap rejected (%d tokens, cached=%d, "
-            "request_id=%s): %s",
+            "Preflight safety-cap rejected (%d tokens, cached=%d, request_id=%s): %s",
             num_prompt_tokens,
             cached_tokens,
             request_id,
@@ -8532,10 +8649,13 @@ class Scheduler:
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
 
-            # Ensure we have a batch generator
-            self._ensure_batch_generator(request.sampling_params)
+            # Native dSpark uses this Scheduler directly and must not create a
+            # parallel BatchGenerator state machine.  Other engine types keep
+            # the original path unchanged.
+            if self._dspark_provider is None:
+                self._ensure_batch_generator(request.sampling_params)
 
-            if self.batch_generator is None:
+            if self._dspark_provider is None and self.batch_generator is None:
                 # Put back and try again later
                 self.waiting.appendleft(request)
                 break
@@ -8778,7 +8898,9 @@ class Scheduler:
                         check_abort=_check_specprefill_abort,
                         report_system_progress=_report_system_progress,
                         report_sparse_progress=_report_sparse_progress,
-                        sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),
+                        sync_and_clear_cache=lambda: _sync_and_clear_cache(
+                            self._stream
+                        ),
                         log=logger,
                     )
 
@@ -9021,6 +9143,31 @@ class Scheduler:
             # (fp16 prefill → quantize once); _merge_caches() turns the per
             # request TQ cache into a BatchTurboQuantKVCache on insert.
 
+            if self._dspark_provider is not None:
+                if cache_to_use is None:
+                    cache_to_use = make_prompt_cache(self.model)
+                dspark_uid = self._route_to_dspark(
+                    request,
+                    cache_to_use,
+                    tokens_to_process,
+                    sampler,
+                    sm,
+                    logits_processors=logits_processors,
+                    prefill_state=getattr(request, "_dspark_prefill_state", None),
+                )
+                request._dspark_prefill_state = None
+                self.request_id_to_uid[request.request_id] = dspark_uid
+                self.uid_to_request_id[dspark_uid] = request.request_id
+                now = time.monotonic()
+                request.batch_uid = dspark_uid
+                request.status = RequestStatus.RUNNING
+                request.generation_started_at = now
+                request.last_activity_at = now
+                self.running[request.request_id] = request
+                scheduled.append(request)
+                self.total_prompt_tokens += request.num_prompt_tokens
+                continue
+
             # VLM MTP routing: if a gemma4_assistant drafter is attached, run
             # an extra last-token forward to capture hidden + shared_kv_states,
             # sample the first bonus, and hand the request to a vlm_mtp
@@ -9133,6 +9280,13 @@ class Scheduler:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
                 continue
+            # A speculative provider may commit a verified block in one
+            # Scheduler step.  A text-level stop or parser stop can terminate
+            # on an early token even though later verified responses for the
+            # same UID are already present in this list.  Never let those
+            # later responses overwrite the terminal output in the collector.
+            if request_id in finished_ids:
+                continue
 
             request = self.running.get(request_id)
             if request is None:
@@ -9242,6 +9396,38 @@ class Scheduler:
             ):
                 response.logprobs = None
 
+            token_logprobs = None
+            if (
+                getattr(response, "logprobs", None) is not None
+                and request.sampling_params.logprobs
+                and not is_stop
+            ):
+                row = response.logprobs
+                chosen = float(row[int(response.token)].item())
+                top_count = int(request.sampling_params.top_logprobs or 0)
+                top: list[tuple[int, float]] = []
+                if top_count > 0:
+                    top_count = min(top_count, int(row.shape[-1]))
+                    # top_logprobs is API-bounded to a small value.  argsort is
+                    # deliberately used here instead of negative-k argpartition:
+                    # MLX releases differ in their handling of a negative kth.
+                    top_ids = mx.argsort(-row)[:top_count]
+                    top_vals = row[top_ids]
+                    mx.eval(top_ids, top_vals)
+                    ids = top_ids.tolist()
+                    vals = top_vals.tolist()
+                    top = [
+                        (int(token_id), float(value))
+                        for token_id, value in zip(ids, vals)
+                    ]
+                token_logprobs = [
+                    {
+                        "token_id": int(response.token),
+                        "logprob": chosen,
+                        "top": top,
+                    }
+                ]
+
             # Create output
             output_generated_at = (
                 generated_at
@@ -9257,6 +9443,7 @@ class Scheduler:
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
+                logprobs=token_logprobs,
                 cached_tokens=request.cached_tokens,
             )
 
@@ -9563,11 +9750,7 @@ class Scheduler:
                                         )
                                     )
                                     if intermediate_snapshots is not None:
-                                        for (
-                                            snapshot_cache
-                                        ) in (
-                                            intermediate_snapshots.iter_in_memory_extracted()
-                                        ):
+                                        for snapshot_cache in intermediate_snapshots.iter_in_memory_extracted():
                                             pre_eval_arrays.extend(
                                                 self._collect_arrays_from_extracted_cache(
                                                     snapshot_cache
@@ -9840,6 +10023,10 @@ class Scheduler:
 
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
+        if self._dspark_provider is not None:
+            for state in self._dspark_active.values():
+                self._dspark_provider.abort(state)
+        self._dspark_active.clear()
         # Clear batch generator (this is the source of the corruption)
         self.batch_generator = None
         self._current_sampler_params = None
@@ -9879,6 +10066,10 @@ class Scheduler:
 
     def _recover_from_generation_overflow_error(self) -> None:
         """Reset decode state after MLX __next_prime overflow."""
+        if self._dspark_provider is not None:
+            for state in self._dspark_active.values():
+                self._dspark_provider.abort(state)
+        self._dspark_active.clear()
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_snapshot_required = None
@@ -10080,6 +10271,7 @@ class Scheduler:
         failed_ids: list[str] = []
         retryable: list[Request] = []
         self._generation_overflow_recovery_ids.clear()
+        self._dspark_active.clear()
         for request in retry_candidates:
             request.generation_overflow_retries += 1
             request_id = request.request_id
@@ -10279,7 +10471,9 @@ class Scheduler:
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
             if (
-                self.batch_generator is not None or self._vlm_mtp_active
+                self.batch_generator is not None
+                or self._vlm_mtp_active
+                or self._dspark_active
             ) and self.running:
                 if self.batch_generator is not None:
                     responses = list(self.batch_generator.next_generated())
@@ -10290,6 +10484,8 @@ class Scheduler:
                 # is per-uid.
                 if self._vlm_mtp_active:
                     responses.extend(self._step_vlm_mtp())
+                if self._dspark_active:
+                    responses.extend(self._step_dspark())
                 output.has_work = True
 
                 if responses:
@@ -10382,8 +10578,7 @@ class Scheduler:
                             finished=True,
                             finish_reason="error",
                             error=(
-                                f"Cache corruption not recoverable "
-                                f"after retries: {e}"
+                                f"Cache corruption not recoverable after retries: {e}"
                             ),
                         )
                     )
@@ -10426,7 +10621,7 @@ class Scheduler:
             import traceback
 
             logger.error(
-                f"Error in batch generation step: {e}\n" f"{traceback.format_exc()}"
+                f"Error in batch generation step: {e}\n{traceback.format_exc()}"
             )
             raise
 
@@ -10509,6 +10704,16 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
+        if self._dspark_provider is not None:
+            speculative = dict(
+                self._dspark_provider.stats(self._dspark_active.values())
+            )
+            speculative["active_requests"] = len(self._dspark_active)
+            if speculative.get("verify_rounds"):
+                speculative["accept_length"] = (
+                    speculative.get("accepted_tokens", 0) / speculative["verify_rounds"]
+                )
+            stats["speculative"] = speculative
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -10525,6 +10730,10 @@ class Scheduler:
         # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
             self._do_abort_request(request_id)
+        if self._dspark_provider is not None:
+            for state in self._dspark_active.values():
+                self._dspark_provider.abort(state)
+        self._dspark_active.clear()
 
         self.waiting.clear()
         self.prefilling.clear()
@@ -10604,6 +10813,9 @@ class Scheduler:
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
         self._close_specprefill_draft_cache_manager()
+        if self._dspark_provider is not None:
+            self._dspark_provider.close()
+            self._dspark_provider = None
         self.paged_cache_manager = None
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
@@ -10675,6 +10887,9 @@ class Scheduler:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
             self._boundary_snapshot_store = None
         self._close_specprefill_draft_cache_manager()
+        if self._dspark_provider is not None:
+            self._dspark_provider.close()
+            self._dspark_provider = None
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
         if self.paged_ssd_cache_manager is not None:

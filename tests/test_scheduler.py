@@ -5227,6 +5227,29 @@ class TestStopStringOutputBuffer:
         assert outputs[-1].finish_reason == "stop"
         assert outputs[-1].output_token_ids == [10, *stop_tokens[:-1]]
 
+    def test_verified_block_tail_cannot_overwrite_terminal_stop(self, mock_model):
+        scheduler = self._setup(mock_model)
+        stop_tokens = _StopSequenceTokenizer.stop_tokens
+        responses = [
+            self._response(10),
+            *(self._response(token) for token in stop_tokens[:-1]),
+            self._response(
+                stop_tokens[-1],
+                finish_reason="stop",
+                match_sequence=stop_tokens,
+            ),
+            # A speculative provider may already have verified a wider block
+            # when a text/parser stop terminates on an earlier token.
+            self._response(10),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {"stop-output"}
+        assert "".join(output.new_text for output in outputs) == "body\n"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+
     def test_regular_tokens_are_not_delayed(self, mock_model):
         scheduler = self._setup(mock_model)
 
