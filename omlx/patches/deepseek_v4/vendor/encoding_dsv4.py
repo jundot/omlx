@@ -153,12 +153,14 @@ def tool_calls_to_openai_format(tool_calls):
     ]
 
 
-def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
+def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     """
     Encode tool call arguments into DSML parameter format.
 
     Args:
-        tool_call: Dict with "name" and "arguments" (JSON string) keys.
+        tool_call: Dict with "name" and "arguments" keys. OpenAI history
+            commonly carries arguments as a JSON string, while oMLX's
+            normalized message path carries the already-decoded dict.
 
     Returns:
         DSML-formatted parameter string.
@@ -166,10 +168,22 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call["arguments"]
+    if isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except (json.JSONDecodeError, TypeError):
+            # Preserve the official encoder's tolerance for malformed
+            # string payloads without treating a valid decoded dict as an
+            # error and wrapping it once per history replay.
+            arguments = {"arguments": raw_arguments}
+    elif isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    else:
+        raise TypeError(
+            "Tool call arguments must be a JSON string or object, "
+            f"got {type(raw_arguments).__name__}"
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

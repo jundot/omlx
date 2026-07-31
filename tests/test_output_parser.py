@@ -502,6 +502,8 @@ class TestOutputParserFactory:
 
         assert factory is not None
         assert factory.kind == "deepseek_v4"
+        assert factory.thinking_start_text == "<think>"
+        assert factory.thinking_end_text == "</think>"
 
     def test_deepseek_v4_stops_at_first_dsml_tool_block(self):
         tokenizer = DeepSeekV4Tokenizer(

@@ -643,6 +643,50 @@ class TestChatTemplateV4DSpark:
         assert "<function_results>" not in prompt
         assert prompt.endswith("<｜Assistant｜><think>")
 
+    def test_replayed_dict_tool_arguments_are_not_nested(self, applied_patch):
+        """oMLX normalizes OpenAI JSON arguments to a dict before replay.
+
+        The DSpark encoder must render that dict exactly like the original
+        JSON string; wrapping it as an ``arguments`` parameter adds one
+        nesting level on every agent retry.
+        """
+        from omlx.patches.deepseek_v4 import chat_template_v4_dspark as ct
+
+        def render(arguments):
+            return ct.apply_chat_template(
+                [
+                    {"role": "user", "content": "Run the command."},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "run_command",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "ok",
+                    },
+                ],
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+
+        as_json = render('{"command":"echo ok"}')
+        as_dict = render({"command": "echo ok"})
+
+        assert as_dict == as_json
+        assert 'parameter name="command" string="true">echo ok<' in as_dict
+        assert 'parameter name="arguments"' not in as_dict
+
     def test_top_level_tools_are_injected_into_official_system_message(
         self, applied_patch
     ):

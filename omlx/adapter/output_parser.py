@@ -1007,6 +1007,8 @@ def detect_output_parser(
                 model_path=session_model_path,
             ),
             stop_token_ids=set(),
+            thinking_start_text="<think>",
+            thinking_end_text="</think>",
             protocol_marker_texts=(
                 _DEEPSEEK_V4_TOOL_CALL_START,
                 _DEEPSEEK_V4_TOOL_CALL_END,
