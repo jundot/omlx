@@ -714,7 +714,18 @@ def _patch_model(dsv4: Any) -> None:
             if n <= rem_min:
                 return True
             can_undo = getattr(c, "_can_undo", None)
-            return bool(can_undo and can_undo(n))
+            allowed = bool(can_undo and can_undo(n))
+            if not allowed:
+                logger.debug(
+                    "DSpark rollback blocked by %s: n=%d remainder=%r ratio=%r "
+                    "undo=%s",
+                    type(c).__name__,
+                    n,
+                    remainder,
+                    getattr(c, "ratio", None),
+                    getattr(c, "_undo", None) is not None,
+                )
+            return allowed
         is_trimmable = getattr(c, "is_trimmable", None)
         if callable(is_trimmable) and is_trimmable():
             return True
@@ -723,6 +734,14 @@ def _patch_model(dsv4: Any) -> None:
         undo = getattr(c, "_mtp_undo", None)
         if undo is not None:
             return undo[1].shape[2] >= n
+        logger.debug(
+            "DSpark rollback blocked by %s: n=%d offset=%r idx=%r max_size=%r",
+            type(c).__name__,
+            n,
+            getattr(c, "offset", None),
+            getattr(c, "_idx", None),
+            getattr(c, "max_size", None),
+        )
         return False
 
     def mtp_clamp_accept(self, cache, accepted: int, num_drafts: int) -> int:
@@ -739,6 +758,37 @@ def _patch_model(dsv4: Any) -> None:
             if n <= 0 or all(_cache_can_trim(c, n) for c in cache):
                 return m
         return 0
+
+    def mtp_safe_draft_depth(self, cache, desired: int) -> int:
+        """Clamp a verify block before it crosses an unreplayable pool seam.
+
+        PoolingCache can undo one multi-token update only while replaying the
+        confirmed prefix does not itself complete another compression window.
+        A rejection after ``m`` accepted drafts keeps ``m + 1`` rows (the
+        confirmed main token plus those drafts), so a depth ``k`` is safe for
+        every possible reject position iff ``remainder + k < ratio``.
+        """
+
+        safe = max(0, int(desired))
+        pending = list(cache or ())
+        while pending and safe:
+            entry = pending.pop()
+            subs = getattr(entry, "caches", None)
+            if subs is not None:
+                pending.extend(subs)
+                continue
+            remainder = getattr(entry, "remainder", None)
+            ratio = getattr(entry, "ratio", None)
+            if remainder is None or not ratio:
+                continue
+            values = (
+                [int(remainder)]
+                if isinstance(remainder, int)
+                else [int(v) for v in remainder]
+            )
+            for rem in values:
+                safe = min(safe, max(0, int(ratio) - rem - 1))
+        return safe
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         """Trim the verify window back to ``accepted`` drafts on every layer."""
@@ -959,5 +1009,6 @@ def _patch_model(dsv4: Any) -> None:
     cls.dspark_markov_logits = dspark_markov_logits
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_clamp_accept = mtp_clamp_accept
+    cls.mtp_safe_draft_depth = mtp_safe_draft_depth
     cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize

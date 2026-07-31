@@ -160,6 +160,15 @@ def apply() -> bool:
                         return _mtp_next(self, state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP next() fallback to standard step: %s", exc)
+                    # A failed verify may already have advanced the backbone
+                    # cache through speculative rows.  Dropping the state
+                    # directly leaves `_next_tokens` stale against that
+                    # advanced cache and corrupts every following token.
+                    # Re-prefill the emitted timeline before handing control
+                    # back to mlx-lm's standard decoder.
+                    active = getattr(self, "_omlx_mtp_state", None)
+                    if active is not None:
+                        _reconcile_mtp_to_standard(self, active)
                     _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
@@ -1949,11 +1958,6 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
-    # DSpark is trained as a full proposal distribution and the reference
-    # runtime samples it with the request's temperature.  Unlike the shallow
-    # legacy MTP head, it should not use oMLX's deliberately sharpened
-    # fallback drafter sampler.
-    sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
@@ -1966,6 +1970,7 @@ def _chain_next_drafts(
             prev_buf,
             depth,
         )
+    sampler = _resolve_draft_sampler(gen_batch, state)
     if depth == 0 and not state.mtp_cache:
         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
         # gemma4 assistant): skip the fold entirely — on fast backbones its
@@ -2072,7 +2077,10 @@ def _dspark_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
-    sampler = _resolve_draft_sampler(gen_batch, state)
+    # DSpark is trained as a full proposal distribution and the reference
+    # runtime samples it with the request's temperature. Unlike the shallow
+    # legacy MTP head, it should not use oMLX's sharpened fallback drafter.
+    sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
 
     if depth <= 0:
@@ -2546,6 +2554,14 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
+    safe_depth = getattr(gen_batch.model, "mtp_safe_draft_depth", None)
+    if callable(safe_depth):
+        safe_k = max(0, min(k, int(safe_depth(gen_batch.prompt_cache, k))))
+        if safe_k < k:
+            state.drafts = state.drafts[:safe_k]
+            state.draft_lps = state.draft_lps[:safe_k]
+            state.draft_accept_lps = state.draft_accept_lps[:safe_k]
+            k = safe_k
     cycle_t0 = time.perf_counter()
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)

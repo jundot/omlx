@@ -657,6 +657,16 @@ class TestDeepseekV4Model:
         assert bias.shape == (1, 32)
         assert [cache.offset for cache in dspark_cache] == [1, 1, 1]
 
+        pool = SimpleNamespace(remainder=[0], ratio=4)
+        container = SimpleNamespace(caches=[pool])
+        assert model.mtp_safe_draft_depth([container], 5) == 3
+        pool.remainder = [1]
+        assert model.mtp_safe_draft_depth([container], 5) == 2
+        pool.remainder = [2]
+        assert model.mtp_safe_draft_depth([container], 5) == 1
+        pool.remainder = [3]
+        assert model.mtp_safe_draft_depth([container], 5) == 0
+
     def test_dspark_batch_drafter_applies_markov_rows_sequentially(
         self, monkeypatch
     ):
