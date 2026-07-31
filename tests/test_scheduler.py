@@ -764,10 +764,40 @@ class TestSchedulerAddRequest:
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
 
-    def test_admission_does_not_defer_for_short_prompt_even_with_high_ratio(
+    def test_admission_defers_just_below_threshold_for_complete_block_prefix(
         self, mock_model, mock_tokenizer
     ):
-        """Prompts below the freshness minimum should never wait on store_cache."""
+        """A full cacheable prefix should bridge one block of threshold slack."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 512
+        prompt = list(range(8175))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(7680)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_well_below_threshold_even_with_high_ratio(
+        self, mock_model, mock_tokenizer
+    ):
+        """Short prompts retain the no-wait path even with a high overlap ratio."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
         prompt = list(range(7000))
@@ -778,6 +808,36 @@ class TestSchedulerAddRequest:
         scheduler._inflight_store_futures["req-prev"] = future
         scheduler._inflight_store_info["req-prev"] = (
             scheduler_module._InflightStoreInfo(tokens=list(range(6000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_near_threshold_for_incomplete_block_prefix(
+        self, mock_model, mock_tokenizer
+    ):
+        """Threshold slack applies only when every full prompt block is pending."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 512
+        prompt = list(range(8175))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(7679)))
         )
 
         request = Request(

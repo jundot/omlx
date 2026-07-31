@@ -6755,8 +6755,6 @@ class Scheduler:
             return None
 
         prompt = request.prompt_token_ids or []
-        if len(prompt) < self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS:
-            return None
 
         best_rid: str | None = None
         best_future: concurrent.futures.Future | None = None
@@ -6776,6 +6774,20 @@ class Scheduler:
 
         if best_future is None or best_rid is None:
             return None
+        if len(prompt) < self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS:
+            # A prompt just below the normal threshold can still contain a
+            # complete threshold-sized conversation prefix once its partial
+            # tail is excluded.  Let that request wait only when the pending
+            # store covers every cacheable full block; arbitrary short prompts
+            # retain the no-wait fast path.
+            block_size = max(1, self.config.paged_cache_block_size)
+            near_threshold = len(prompt) >= max(
+                block_size,
+                self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS - block_size,
+            )
+            full_cacheable_prefix = len(prompt) // block_size * block_size
+            if not near_threshold or best_common < full_cacheable_prefix:
+                return None
         if not (
             best_common >= self._CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS
             or best_common / len(prompt) >= self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO
