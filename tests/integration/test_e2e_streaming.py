@@ -516,7 +516,12 @@ class TestStreamingHelperFunctions:
         from omlx.api.openai_models import CompletionRequest
 
         engine = MockBaseEngine()
-        request = CompletionRequest(model="test-model", prompt="Test", stream=True)
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Test",
+            stream=True,
+            stream_options={"include_usage": True},
+        )
 
         event_ids = set()
         async for event in stream_completion(engine, "Test", request):
