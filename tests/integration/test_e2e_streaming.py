@@ -518,6 +518,7 @@ class TestStreamingHelperFunctions:
         engine = MockBaseEngine()
         request = CompletionRequest(model="test-model", prompt="Test", stream=True)
 
+        event_ids = set()
         async for event in stream_completion(engine, "Test", request):
             if event != "data: [DONE]\n\n":
                 json_str = event[6:-2]  # Remove "data: " and "\n\n"
@@ -525,6 +526,9 @@ class TestStreamingHelperFunctions:
                 assert "id" in data
                 assert "model" in data
                 assert "choices" in data
+                event_ids.add(data["id"])
+
+        assert len(event_ids) == 1
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_yields_sse(self):

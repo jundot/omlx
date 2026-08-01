@@ -154,6 +154,28 @@ class TestKeepaliveChunkFormats:
         assert items == ["data: real\n\n"]
 
 
+class TestCompletionKeepaliveSharesStreamId:
+    def test_frame_uses_given_response_id(self):
+        from omlx.server import _completion_keepalive_chunk
+
+        frame = _completion_keepalive_chunk("cmpl-abc123")
+        assert frame.startswith("data: ")
+        assert frame.endswith("\n\n")
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload["id"] == "cmpl-abc123"
+        assert payload["object"] == "text_completion"
+        assert payload["choices"][0]["text"] == ""
+        assert payload["choices"][0]["finish_reason"] is None
+
+    def test_frame_does_not_use_sentinel_id(self):
+        from omlx.server import _completion_keepalive_chunk
+
+        payload = json.loads(
+            _completion_keepalive_chunk("cmpl-real").removeprefix("data: ").strip()
+        )
+        assert payload["id"] != "cmpl-keepalive"
+
+
 class TestChatKeepaliveSharesStreamId:
     """The chunk-form chat keepalive must reuse the stream's completion id.
 

@@ -1882,6 +1882,15 @@ _KEEPALIVE_COMPLETION_CHUNK = (
     '"model":"keepalive",'
     '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
 )
+
+
+def _completion_keepalive_chunk(response_id: str) -> str:
+    """Keepalive frame that shares the stream's completion id."""
+    return (
+        'data: {"id":"' + response_id + '","object":"text_completion","created":0,'
+        '"model":"keepalive",'
+        '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
+    )
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -2989,6 +2998,10 @@ async def create_completion(
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
+            response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
+            keepalive = _resolve_keepalive("openai_completion")
+            if keepalive == _KEEPALIVE_COMPLETION_CHUNK:
+                keepalive = _completion_keepalive_chunk(response_id)
             return StreamingResponse(
                 _release_after_stream(
                     _with_sse_keepalive(
@@ -2999,9 +3012,10 @@ async def create_completion(
                             model_load_duration=model_load_duration,
                             prompt_token_ids=prompt_token_ids_by_prompt[0],
                             resolved_model=resolved_model,
+                            response_id=response_id,
                         ),
                         http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("openai_completion"),
+                        keepalive_chunk=keepalive,
                     ),
                     lease,
                 ),
@@ -4082,8 +4096,10 @@ async def stream_completion(
     model_load_duration: float = 0.0,
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
+    response_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
+    response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
@@ -4149,7 +4165,7 @@ async def stream_completion(
                 pending_think_prefix_strip = False
 
             data = {
-                "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+                "id": response_id,
                 "object": "text_completion",
                 "created": int(time.time()),
                 "model": request.model,
@@ -4220,7 +4236,7 @@ async def stream_completion(
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
             usage_data = {
-                "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+                "id": response_id,
                 "object": "text_completion",
                 "created": int(time.time()),
                 "model": request.model,
