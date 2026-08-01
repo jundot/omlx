@@ -786,7 +786,21 @@ class InklingOutputParserSession:
                 continue
             if not isinstance(parsed, dict) or not parsed.get("name"):
                 continue
-            args = parsed.get("args", {})
+            # Accept both payload conventions: Inkling-native {"name", "args":
+            # {...}} and the OpenAI wire format {"name", "arguments": "<json>"}
+            # that quantized checkpoints sometimes emit (both are abundant in
+            # tool-call training data). A JSON-encoded string is decoded; only
+            # a non-object result falls back to {}.
+            args = parsed.get("args")
+            if args is None:
+                args = parsed.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = None
+            if not isinstance(args, dict):
+                args = {}
             tool_calls.append(
                 {
                     "name": str(parsed["name"]),
