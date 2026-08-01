@@ -575,6 +575,65 @@ class TestJinaReranker:
         assert np.allclose(actual, expected, atol=1e-6)
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_load_jina_projector_v35_sequential_keys(self, tmp_path):
+        """v3.5 exports the projector from an nn.Sequential container, so keys
+        are index-named ("projector.0"/"projector.2") instead of v3's
+        "linear1"/"linear2". Same architecture, same math -- should load
+        identically. Regression test for jundot/omlx#2422."""
+        model_dir = self._make_jina_model_dir(tmp_path, name="jina-reranker-v3.5-mlx")
+        model = MLXRerankerModel(str(model_dir))
+
+        w1 = np.zeros((512, 1024), dtype=np.float32)
+        w2 = np.zeros((512, 512), dtype=np.float32)
+
+        w1[0, 0] = 1.5
+        w1[1, 1] = -2.0
+        w1[2, 2] = 0.5
+
+        w2[0, 0] = 1.0
+        w2[1, 1] = -3.0
+        w2[3, 2] = 2.0
+
+        save_file(
+            {
+                "projector.0.weight": w1,
+                "projector.2.weight": w2,
+            },
+            str(model_dir / "projector.safetensors"),
+        )
+
+        projector = model._load_jina_projector(model_dir)
+
+        x = np.zeros((2, 1024), dtype=np.float32)
+        x[0, 0] = 2.0
+        x[0, 1] = 1.0
+        x[0, 2] = 4.0
+        x[1, 0] = -3.0
+        x[1, 1] = 5.0
+        x[1, 2] = -2.0
+
+        projected = projector(mx.array(x))
+        mx.eval(projected)
+
+        expected = np.maximum(x @ w1.T, 0.0) @ w2.T
+        actual = np.array(projected.tolist(), dtype=np.float32)
+        assert np.allclose(actual, expected, atol=1e-6)
+
+    def test_load_jina_projector_unrecognized_keys_raises_clear_error(self, tmp_path):
+        """Neither v3 nor v3.5 key scheme present should raise a clear error
+        listing both expected schemes and the actual available keys."""
+        model_dir = self._make_jina_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+
+        save_file(
+            {"some.other.weight": np.zeros((512, 1024), dtype=np.float32)},
+            str(model_dir / "projector.safetensors"),
+        )
+
+        with pytest.raises(ValueError, match="none of the expected key schemes"):
+            model._load_jina_projector(model_dir)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_rerank_jina_returns_scores_and_sorted_indices(self, tmp_path):
         """_rerank_jina should produce per-doc scores and descending indices."""
         model_dir = self._make_jina_model_dir(tmp_path)

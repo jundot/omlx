@@ -573,37 +573,51 @@ class MLXRerankerModel:
         # raises "TypeError: data type 'bfloat16' not understood".
         weights = mx.load(str(projector_path))
 
-        required_keys = ("linear1.weight", "linear2.weight")
-        missing_keys = [key for key in required_keys if key not in weights]
-        if missing_keys:
+        # v3 ships two named nn.Linear submodules ("linear1"/"linear2").
+        # v3.5 exports the same fc1 -> ReLU -> fc2 stack from an nn.Sequential
+        # container, so the keys are auto-named by list index instead
+        # ("projector.0"/"projector.2", index 1 is ReLU). Confirmed against
+        # upstream's own remap in _load_projector:
+        # https://huggingface.co/jinaai/jina-reranker-v3.5-mlx/blob/3dd4ac901ccdcac85abe3815df0a0aaaf44e4a21/modeling.py
+        key_schemes = (
+            ("linear1.weight", "linear2.weight"),
+            ("projector.0.weight", "projector.2.weight"),
+        )
+        first_key = second_key = None
+        for scheme in key_schemes:
+            if all(key in weights for key in scheme):
+                first_key, second_key = scheme
+                break
+
+        if first_key is None:
             raise ValueError(
-                f"Jina projector is malformed: missing keys {missing_keys} in "
-                f"{projector_path}. "
+                "Jina projector is malformed: none of the expected key schemes "
+                f"{key_schemes} were fully present in {projector_path}. "
                 f"Available keys: {sorted(weights.keys())}"
             )
 
-        linear1_weight = weights["linear1.weight"]
-        linear2_weight = weights["linear2.weight"]
+        linear1_weight = weights[first_key]
+        linear2_weight = weights[second_key]
 
         if len(linear1_weight.shape) != 2 or len(linear2_weight.shape) != 2:
             raise ValueError(
                 "Jina projector weights must be 2D matrices: "
-                f"linear1.weight={linear1_weight.shape}, "
-                f"linear2.weight={linear2_weight.shape}."
+                f"{first_key}={linear1_weight.shape}, "
+                f"{second_key}={linear2_weight.shape}."
             )
 
         if linear1_weight.shape != (512, 1024) or linear2_weight.shape != (512, 512):
             raise ValueError(
                 "Unexpected Jina projector shapes. Expected "
-                "linear1.weight=(512, 1024) and linear2.weight=(512, 512), "
-                f"got linear1.weight={linear1_weight.shape}, "
-                f"linear2.weight={linear2_weight.shape}."
+                f"{first_key}=(512, 1024) and {second_key}=(512, 512), "
+                f"got {first_key}={linear1_weight.shape}, "
+                f"{second_key}={linear2_weight.shape}."
             )
 
         def _project(x):
             if x.shape[-1] != linear1_weight.shape[1]:
                 raise ValueError(
-                    "Jina projector input dim mismatch for linear1: "
+                    "Jina projector input dim mismatch for first layer: "
                     f"input={x.shape[-1]}, expected={linear1_weight.shape[1]}."
                 )
             hidden = x @ mx.transpose(linear1_weight)
