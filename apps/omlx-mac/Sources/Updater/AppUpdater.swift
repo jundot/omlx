@@ -194,7 +194,7 @@ final class AppUpdater {
         }
     }
 
-    private final class DMGDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    private final class DMGDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         let destination: URL
         let onProgress: @Sendable (Int, Int64, Int64) -> Void
         var continuation: CheckedContinuation<Void, Error>?
