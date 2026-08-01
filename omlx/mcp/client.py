@@ -20,6 +20,23 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
+
+
+def _sdk_attr(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read the first present attribute among ``names``.
+
+    The mcp SDK renamed its result fields from camelCase to snake_case in
+    2.0 (protocol revision 2026-07-28). Accepting both spellings keeps the
+    client working across SDK versions instead of raising AttributeError
+    (or silently falling back) on one of them.
+    """
+    for name in names:
+        value = getattr(obj, name, _MISSING)
+        if value is not _MISSING:
+            return value
+    return default
+
 
 class MCPClient:
     """
@@ -216,10 +233,14 @@ class MCPClient:
 
         # Initialize with capabilities
         result = await self._session.initialize()
+        protocol = _sdk_attr(
+            result, "protocol_version", "protocolVersion", default="unknown"
+        )
+        server_info = _sdk_attr(result, "server_info", "serverInfo")
         logger.debug(
             f"MCP server '{self.name}' initialized: "
-            f"protocol={result.protocolVersion}, "
-            f"server={result.serverInfo.name if result.serverInfo else 'unknown'}"
+            f"protocol={protocol}, "
+            f"server={server_info.name if server_info else 'unknown'}"
         )
 
     async def _discover_tools(self):
@@ -236,9 +257,9 @@ class MCPClient:
                     server_name=self.name,
                     name=tool.name,
                     description=tool.description or "",
-                    input_schema=tool.inputSchema
-                    if hasattr(tool, "inputSchema")
-                    else {},
+                    input_schema=_sdk_attr(
+                        tool, "input_schema", "inputSchema", default={}
+                    ),
                 )
                 self._tools.append(mcp_tool)
                 logger.debug(f"Discovered tool: {mcp_tool.full_name}")
@@ -337,7 +358,9 @@ class MCPClient:
             return MCPToolResult(
                 tool_name=tool_name,
                 content=content,
-                is_error=result.isError if hasattr(result, "isError") else False,
+                is_error=bool(
+                    _sdk_attr(result, "is_error", "isError", default=False)
+                ),
             )
 
         except asyncio.TimeoutError:
@@ -358,9 +381,12 @@ class MCPClient:
     def _extract_content(self, result) -> Any:
         """Extract content from MCP tool result."""
         if not hasattr(result, "content") or not result.content:
-            # Fall back to structuredContent if available
-            if hasattr(result, "structuredContent") and result.structuredContent:
-                return result.structuredContent
+            # Fall back to structured content if available
+            structured = _sdk_attr(
+                result, "structured_content", "structuredContent"
+            )
+            if structured:
+                return structured
             return None
 
         # Handle list of content items
