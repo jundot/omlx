@@ -694,7 +694,15 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
     n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
     if n_main <= 0:
         return ()
-    return tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+    return tuple(
+        prefix
+        for i in range(n_mtp)
+        for prefix in (
+            f"model.layers.{n_main + i}.",
+            f"language_model.model.layers.{n_main + i}.",
+            f"model.language_model.layers.{n_main + i}.",
+        )
+    )
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
@@ -771,6 +779,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type == "glm_moe_dsa"
         or model_type == "gemma4"
         or model_type in ("inkling", "inkling_mm_model")
+        or model_type == "step3p7"
     )
 
 
