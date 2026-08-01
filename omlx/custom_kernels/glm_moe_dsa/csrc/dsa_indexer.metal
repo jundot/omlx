@@ -42,6 +42,12 @@ instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);
 instantiate_dsa_topk_indices(float16, half, 512, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 512, 1024);
 
+instantiate_kernel(
+    "dspark_fp32_topk_indices_topk512_t256",
+    dspark_fp32_topk_indices,
+    512,
+    256);
+
 // ── DC-1: fused decode indexer scan ──────────────────────────────────────────
 // One thread per key position: score(key) = sum_h w_h * relu(q_h · k_key), fp32
 // accumulation throughout (strictly tighter than the bf16 op-chain it replaces).

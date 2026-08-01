@@ -138,4 +138,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
     except Exception:
         logger.debug("verify qmm patch not applied", exc_info=True)
 
+    from ..deepseek_v4.decode_consistency import apply as apply_ds_consistency
+
+    apply_ds_consistency()
+
     return True

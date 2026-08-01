@@ -34,6 +34,8 @@ target_sources(
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.cpp
   ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.cpp
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fused_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp)
@@ -50,6 +52,8 @@ if(MLX_BUILD_METAL)
   set(OMLX_GLM_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.metal
+      ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.metal
+      ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.metal
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
@@ -108,6 +112,7 @@ if(MLX_BUILD_METAL)
   add_custom_target(omlx_glm_kernels_metallib DEPENDS ${OMLX_GLM_METALLIB})
 
   add_dependencies(omlx_glm_kernel_ops omlx_glm_kernels_metallib)
+
 endif()
 
 nanobind_add_module(

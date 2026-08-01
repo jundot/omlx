@@ -791,6 +791,20 @@ class TestNormalizeMtpInConfig:
         # Non-mtp fields untouched.
         assert cfg["text_config"]["num_hidden_layers"] == 64
 
+    def test_removes_dspark_discriminator_fields(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {
+            "num_nextn_predict_layers": 1,
+            "dspark_block_size": 5,
+            "dspark_noise_token_id": 128799,
+            "dspark_target_layer_ids": [40, 41, 42],
+            "dspark_markov_rank": 256,
+        }
+        _normalize_mtp_in_config(cfg)
+        assert cfg["num_nextn_predict_layers"] == 0
+        assert not any(key.startswith("dspark_") for key in cfg)
+
     def test_no_mtp_fields_is_noop(self):
         from omlx.oq import _normalize_mtp_in_config
 

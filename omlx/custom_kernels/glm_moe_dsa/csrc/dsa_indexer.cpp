@@ -349,6 +349,57 @@ class DSATopKIndicesPrimitive : public Primitive {
   bool causal_valid_prefix_;
 };
 
+class DSparkFP32TopKIndicesPrimitive : public Primitive {
+ public:
+  explicit DSparkFP32TopKIndicesPrimitive(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("DSpark FP32 top-k has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    const auto& scores = inputs[0];
+    auto& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    constexpr int topk = 512;
+    constexpr int threads = 256;
+    const int rows = scores.shape(0);
+    DSATopKParams params{
+        /* int rows = */ rows,
+        /* int L = */ 1,
+        /* int K = */ scores.shape(1),
+        /* int topk = */ topk,
+        /* bool causal_valid_prefix = */ false};
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel =
+        d.get_kernel("dspark_fp32_topk_indices_topk512_t256", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(scores, 0);
+    encoder.set_output_array(out, 1);
+    encoder.set_bytes(params, 2);
+    encoder.dispatch_threadgroups(
+        MTL::Size(rows, 1, 1), MTL::Size(threads, 1, 1));
+  }
+
+  DEFINE_NAME(OMLXDSparkFP32TopKIndices)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& /* other */) const override {
+    return true;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
 // ── DC-1: fused decode indexer scan ─────────────────────────────────────────
 // One kernel computes the head-summed indexer scores for a single query position
 // (s == 1) directly into [B,1,1,S] with fp32 accumulation, replacing the decode
@@ -607,6 +658,31 @@ array dsa_topk_indices(
     bool causal_valid_prefix,
     StreamOrDevice s) {
   return dsa_topk_indices_impl(scores, topk, bucketed, causal_valid_prefix, s);
+}
+
+array dspark_fp32_topk_indices(
+    const array& scores,
+    int topk,
+    StreamOrDevice s) {
+  if (scores.ndim() != 2 || scores.dtype() != float32 || topk != 512 ||
+      scores.shape(1) < topk) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dspark_fp32_topk_indices] expected FP32 "
+        << "scores [rows, K>=512] and topk=512, got " << scores.shape()
+        << ", topk=" << topk << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu) {
+    throw std::invalid_argument("DSpark FP32 top-k requires Metal.");
+  }
+  auto contiguous_scores = ensure_row_contiguous(scores, stream);
+  Shape out_shape{contiguous_scores.shape(0), topk};
+  return array(
+      std::move(out_shape),
+      uint32,
+      std::make_shared<DSparkFP32TopKIndicesPrimitive>(stream),
+      std::vector<array>{contiguous_scores});
 }
 
 array dsa_decode_scores(

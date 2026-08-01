@@ -778,7 +778,11 @@ class TestCacheMaterialization:
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         source = inspect.getsource(dsv4.DeepseekV4Model.__call__)
 
-        loop_pos = source.index("for layer, layer_cache in zip")
+        loop_pos = max(
+            source.find("for layer, layer_cache in zip"),
+            source.find("for layer_idx, (layer, layer_cache) in enumerate"),
+        )
+        assert loop_pos >= 0
         materialize_pos = source.index("_materialize_cache_arrays(cache)")
         pipeline_send_pos = source.index("if pipeline_rank != 0")
 
@@ -960,6 +964,28 @@ class TestMakeQuantizationConfigMtp:
 
         qcfg = dsv4.make_quantization_config(_ModelStub())
         assert not any(k.startswith("mtp.") for k in qcfg)
+
+    def test_dspark_main_projection_gets_mxfp8(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _DSparkStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.main_proj = nn.Linear(24, 8, bias=False)
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp = [_DSparkStub()]
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        assert qcfg["mtp.0.main_proj"] == {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        }
 
 
 class TestDeepSeekV4SanitizeAffineSwitchMLP:
@@ -1196,8 +1222,14 @@ class TestPoolingCacheTrimRollback:
         self._push(cache, self._tok(verify), pos)
         assert cache.is_trimmable()
         assert cache.trim(1) == 1
-        self._push(ref, self._tok(verify[:1]), pos)
-        pos += 1
+        if cache_cls.__name__ == "BatchPoolingCache" and cache.pooled is not None:
+            # A rejected speculative token may have completed a pooled
+            # window.  The physical tail must be removed as well as hidden
+            # from the logical length; DSpark's M=1 verify path consumes the
+            # physical view directly.
+            assert cache.pooled.shape[1] == max(cache._pool_lengths)
+        self._push(ref, self._tok(verify[:-1]), pos)
+        pos += len(verify) - 1
 
         out = self._push(cache, self._tok(post), pos)
         ref_out = self._push(ref, self._tok(post), pos)
@@ -1293,6 +1325,31 @@ class TestPoolingCacheTrimRollback:
         # in the remainder buffer and no pooled row remains visible.
         assert cache.remainder == 3
         assert cache.size() == 0
+
+    def test_accepted_prefix_can_cross_pool_boundary(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # The four-row verify crosses the boundary on its first row. Keeping
+        # three rows must retain that pooled result and restore the two raw
+        # rows after it, exactly like three ordinary decode calls.
+        self._equivalence(
+            PoolingCache,
+            [[1.0, 2.0, 3.0]],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0],
+            applied_patch,
+        )
+
+    def test_singleton_batch_accepted_prefix_crosses_boundary(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        self._equivalence(
+            BatchPoolingCache,
+            [[1.0, 2.0, 3.0]],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0],
+            applied_patch,
+        )
 
 
 class TestNaxMoEStockRouting:

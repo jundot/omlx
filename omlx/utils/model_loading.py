@@ -474,9 +474,14 @@ def maybe_apply_pre_load_patches(
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
+                backend = (
+                    "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
+                )
                 logger.info(
-                    "Native MTP patch applied for %s (model_type=%s, active)",
+                    "Speculative backend selected for %s: %s "
+                    "(model_type=%s, active)",
                     model_name,
+                    backend,
                     model_type,
                 )
             else:
@@ -649,8 +654,22 @@ def maybe_apply_pre_load_patches(
                 )
 
 
+def _has_dspark_heads(config: dict) -> bool:
+    """True for checkpoints with an embedded DSpark drafter."""
+    cfgs = (config, config.get("text_config") or {})
+    for cfg in cfgs:
+        if int(cfg.get("dspark_block_size", 0) or 0) <= 0:
+            continue
+        target_ids = cfg.get("dspark_target_layer_ids") or ()
+        if target_ids:
+            return True
+    return False
+
+
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
+    if _has_dspark_heads(config):
+        return True
     if int(config.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(config.get("num_nextn_predict_layers", 0) or 0) > 0:

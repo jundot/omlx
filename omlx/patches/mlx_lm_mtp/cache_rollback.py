@@ -51,6 +51,36 @@ def _is_undo_armed() -> bool:
     return getattr(armed, "value", False)
 
 
+def _is_decode_consistent_armed() -> bool:
+    try:
+        from omlx.patches.deepseek_v4.decode_consistency import is_armed
+
+        return is_armed()
+    except Exception:
+        return False
+
+
+def stage_functional_rotating_update(self, keys, values) -> None:
+    """Stage undo for a rotating-cache update that only rebinds arrays.
+
+    DeepSeek's decode-consistent verify builds its physical-ring snapshots
+    from the pre-update cache and then rebinds the cache to the final one.
+    The old array wrappers are never mutated, so retaining their references
+    is sufficient and avoids the defensive full-cache copy used for setitem.
+    """
+    if not _is_undo_armed():
+        self._mtp_undo = None
+        return
+    fields = ("keys", "values", "offset", "_idx")
+    fields += tuple(
+        field
+        for field in ("_offset", "rotated", "left_padding")
+        if hasattr(self, field)
+    )
+    snap = {field: getattr(self, field) for field in fields}
+    self._mtp_undo = (snap, keys, values, True)
+
+
 def _wrap_rotating(cls, fields) -> None:
     """Wrap update_and_fetch / is_trimmable / trim with the MTP undo log."""
     if getattr(cls, "_omlx_mtp_undo_attached", False):
@@ -63,11 +93,23 @@ def _wrap_rotating(cls, fields) -> None:
     orig_trim = cls.trim
 
     def update_and_fetch(self, keys, values):
-        # Only armed verify-sized updates are undoable: S == 1 uses the
-        # in-place ring write (setitem invalidates reference snapshots) and
-        # prompt chunks have no rollback consumer. The upper bound covers
-        # depth-k chain verify windows (k + 1 tokens).
-        if 2 <= keys.shape[2] <= 8 and _is_undo_armed():
+        # DSpark's decode-consistent verify advances the cache with several
+        # M=1 updates; other MTP backends use one M=2..8 update. Preserve one
+        # pre-block snapshot for both forms so rejection can restore exactly.
+        steps = keys.shape[2]
+        armed = _is_undo_armed()
+        existing = getattr(self, "_mtp_undo", None)
+        decode_consistent = steps == 1 or _is_decode_consistent_armed()
+        chained = decode_consistent and armed and existing is not None and existing[3]
+        if chained:
+            snap, old_keys, old_values, _ = existing
+            self._mtp_undo = (
+                snap,
+                mx.concatenate([old_keys, keys], axis=2),
+                mx.concatenate([old_values, values], axis=2),
+                True,
+            )
+        elif armed and 1 <= steps <= 8:
             snap = {}
             for f in fields:
                 v = getattr(self, f)
@@ -76,7 +118,7 @@ def _wrap_rotating(cls, fields) -> None:
                     # so a plain reference would see the post-update value.
                     v = v + 0
                 snap[f] = v
-            self._mtp_undo = (snap, keys, values)
+            self._mtp_undo = (snap, keys, values, decode_consistent)
         else:
             self._mtp_undo = None
         return orig_update(self, keys, values)
@@ -94,15 +136,24 @@ def _wrap_rotating(cls, fields) -> None:
         self._mtp_undo = None
         if undo is None:
             return 0
-        snap, keys, values = undo
+        snap, keys, values, decode_consistent = undo
         k = keys.shape[2] - n
         if k < 0:
             return 0
         for f, v in snap.items():
             setattr(self, f, v)
         if k > 0:
-            # Replay the confirmed prefix as a normal decode-sized update.
-            orig_update(self, keys[..., :k, :], values[..., :k, :])
+            # A decode-consistent verify must also leave the committed cache
+            # in the same physical ring layout as k ordinary M=1 updates.
+            if decode_consistent:
+                for idx in range(k):
+                    orig_update(
+                        self,
+                        keys[..., idx : idx + 1, :],
+                        values[..., idx : idx + 1, :],
+                    )
+            else:
+                orig_update(self, keys[..., :k, :], values[..., :k, :])
             self._mtp_undo = None
         return n
 

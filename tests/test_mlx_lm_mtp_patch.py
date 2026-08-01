@@ -57,6 +57,17 @@ class TestCacheRollback:
         cache = ArraysCache(size=2)
         assert cache.rollback_state is None
 
+    def test_full_accept_clears_pooling_undo_chain(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _clear_rollback
+
+        pool = SimpleNamespace(_undo=object(), _undo_chain=True)
+        container = SimpleNamespace(caches=[SimpleNamespace(caches=[pool])])
+
+        _clear_rollback([container])
+
+        assert pool._undo is None
+        assert pool._undo_chain is False
+
 
 class TestQwen35Model:
     @pytest.fixture(autouse=True)
@@ -1490,6 +1501,17 @@ class TestMtpCompatibilityHelpers:
 
     def test_has_mtp_heads_nextn_field(self):
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
+
+    def test_has_mtp_heads_dspark_fields(self):
+        assert (
+            _has_mtp_heads(
+                {
+                    "dspark_block_size": 5,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                }
+            )
+            is True
+        )
 
     def test_has_mtp_heads_text_config_field(self):
         assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True

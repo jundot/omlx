@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
-from . import prompt_priming
+from . import deepseek_v4_dspark, prompt_priming
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ def apply() -> bool:
 
     _patch_model_args(dsv4)
     _register_mtp_block(dsv4)
+    deepseek_v4_dspark.register(dsv4)
     _patch_deepseek_v4_model_call(dsv4)
     _patch_model(dsv4)
 
@@ -95,9 +96,17 @@ def _patch_model_args(dsv4: Any) -> None:
         # ``DeepseekV4Block(..., layer_idx=n_main+i)`` lookup succeeds.
         args = original_from_dict(cls, params)
         n_main = int(getattr(args, "num_hidden_layers", 0) or 0)
-        n_mtp = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
+        is_dspark = deepseek_v4_dspark.is_dspark_config(args)
+        n_mtp = (
+            deepseek_v4_dspark.stage_count(args)
+            if is_dspark
+            else int(getattr(args, "num_nextn_predict_layers", 0) or 0)
+        )
         if n_mtp > 0 and hasattr(args, "compress_ratios"):
+            source_ratios = list(params.get("compress_ratios") or ())
             ratios = list(args.compress_ratios)
+            if is_dspark and len(source_ratios) >= n_main + n_mtp:
+                ratios = source_ratios[: n_main + n_mtp]
             if len(ratios) < n_main + n_mtp:
                 ratios = ratios + [0] * (n_main + n_mtp - len(ratios))
             args.compress_ratios = ratios
@@ -179,13 +188,14 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     from mlx_lm.models.base import create_attention_mask
 
     CacheList = dsv4.CacheList
-    materialize_cache_arrays = dsv4._materialize_cache_arrays
+    _materialize_cache_arrays = dsv4._materialize_cache_arrays
 
     def __call__(
         self,
         inputs,
         cache=None,
         return_raw_hidden: bool = False,
+        return_dspark_hidden: bool = False,
     ):
         h = self.embed_tokens(inputs)
         h = mx.broadcast_to(
@@ -214,10 +224,17 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
-        for layer, layer_cache in zip(self.pipeline_layers, cache):
+        target_ids = tuple(getattr(self.args, "dspark_target_layer_ids", ()) or ())
+        target_id_set = set(target_ids)
+        dspark_hidden = {}
+        for layer_idx, (layer, layer_cache) in enumerate(
+            zip(self.pipeline_layers, cache)
+        ):
             h = layer(h, mask, layer_cache, inputs)
+            if return_dspark_hidden and layer_idx in target_id_set:
+                dspark_hidden[layer_idx] = h.mean(axis=2)
 
-        materialize_cache_arrays(cache)
+        _materialize_cache_arrays(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -231,6 +248,16 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         out = self.norm(self.hc_head(h))
+        if return_dspark_hidden:
+            if len(dspark_hidden) != len(target_ids):
+                raise RuntimeError(
+                    "DeepSeek DSpark target tap mismatch: "
+                    f"captured={len(dspark_hidden)}, expected={len(target_ids)}"
+                )
+            return out, mx.concatenate(
+                [dspark_hidden[layer_idx] for layer_idx in target_ids],
+                axis=-1,
+            )
         if return_raw_hidden:
             return out, h
         return out
@@ -270,16 +297,27 @@ def _patch_model(dsv4: Any) -> None:
 
     def __init__(self, config):
         original_init(self, config)
-        n_mtp = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+        is_dspark = deepseek_v4_dspark.is_dspark_config(config)
+        n_mtp = (
+            deepseek_v4_dspark.stage_count(config)
+            if is_dspark
+            else int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+        )
         # See qwen35_model._patch_model: gated on the MTP active-flag so
         # mtp_enabled=False produces a model indistinguishable from stock.
         from . import is_mtp_active
 
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        self._omlx_dspark_decode_enabled = bool(mtp_decode_enabled and is_dspark)
         if mtp_decode_enabled:
             n_main = config.num_hidden_layers
-            self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
+            if is_dspark:
+                self.mtp = [
+                    dsv4.DSparkBlock(config, n_main + i, i, n_mtp) for i in range(n_mtp)
+                ]
+            else:
+                self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
             # Depth-k chained drafting is available: mtp_forward supports
             # return_hidden below, backbone rollback goes through
             # mtp_partial_rollback, and the head cache is a RotatingKVCache
@@ -288,8 +326,22 @@ def _patch_model(dsv4: Any) -> None:
             from . import get_mtp_depth
 
             self._omlx_mtp_chain = True
-            self._omlx_mtp_depth = get_mtp_depth()
-            self._omlx_mtp_head_clone = True
+            depth = get_mtp_depth()
+            if is_dspark:
+                depth = min(depth, int(config.dspark_block_size))
+                self._omlx_mtp_head_clone = False
+                # DSpark context caches are singleton and committed-only. The
+                # existing row-wise extract/merge path does not model them.
+                self._omlx_mtp_rowwise_unsupported = True
+                logger.info(
+                    "DeepSeek speculative backend selected: embedded DSpark "
+                    "(%d stages, draft width %d)",
+                    n_mtp,
+                    depth,
+                )
+            else:
+                self._omlx_mtp_head_clone = True
+            self._omlx_mtp_depth = depth
 
     def __call__(
         self,
@@ -307,8 +359,22 @@ def _patch_model(dsv4: Any) -> None:
         # and draft rejection rolls back via cache.trim in
         # _restore_or_trim_caches, so the argument is accepted and unused.
         if return_hidden:
+            if getattr(self, "_omlx_dspark_decode_enabled", False):
+                h, h_aux = self.model(inputs, cache, return_dspark_hidden=True)
+                return self.lm_head(h), h_aux
             h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
             return self.lm_head(h), h_raw
+        if (
+            getattr(self, "_omlx_dspark_decode_enabled", False)
+            and not n_confirmed
+            and cache is not None
+        ):
+            h, h_aux = self.model(inputs, cache, return_dspark_hidden=True)
+            try:
+                deepseek_v4_dspark.capture_prompt(self, inputs, h_aux, cache)
+            except Exception:
+                logger.debug("DeepSeek DSpark prompt capture failed", exc_info=True)
+            return self.lm_head(h)
         if not n_confirmed and prompt_priming.capture_eligible(self, cache):
             # Prompt-priming capture needs the head-input hidden (the raw 4D
             # Hyper-stream activation), which the stock branch discards
@@ -331,6 +397,8 @@ def _patch_model(dsv4: Any) -> None:
         """
         if not hasattr(self, "mtp"):
             return None
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            return [dsv4.DSparkContextCache(self.args.sliding_window) for _ in self.mtp]
         caches = []
         sw = self.args.sliding_window
         for mtp_block in self.mtp:
@@ -357,6 +425,112 @@ def _patch_model(dsv4: Any) -> None:
                 )
         return caches
 
+    def dspark_append_context(
+        self,
+        main_hidden,
+        cache,
+        *,
+        start_offset=None,
+    ):
+        """Project target taps once and append committed K/V to every stage."""
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            raise RuntimeError("DSpark context requested on a Lightning MTP model")
+        first = self.mtp[0]
+        main_x = first.main_norm(first.main_proj(main_hidden))
+        for stage, stage_cache in zip(self.mtp, cache):
+            stage.attn.append_context(
+                main_x,
+                stage_cache,
+                start_offset=start_offset,
+            )
+        return main_x
+
+    def dspark_forward(
+        self,
+        main_hidden,
+        anchor_ids,
+        cache=None,
+        *,
+        draft_length=None,
+    ):
+        """Run one parallel DSpark proposal block.
+
+        ``main_hidden`` contains concatenated target taps for newly committed
+        target inputs. ``anchor_ids`` is the newest target-confirmed token;
+        remaining query positions use the checkpoint's noise token.
+        """
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            raise RuntimeError("DSpark forward requested on a Lightning MTP model")
+        if cache is None:
+            cache = self.make_mtp_cache()
+        self.dspark_append_context(main_hidden, cache)
+
+        width = int(draft_length or self._omlx_mtp_depth)
+        max_width = int(self.args.dspark_block_size)
+        width = max(1, min(width, max_width))
+        anchor_ids = anchor_ids.reshape(anchor_ids.shape[0], -1)[:, -1:]
+        draft_ids = mx.full(
+            (anchor_ids.shape[0], width),
+            int(self.args.dspark_noise_token_id),
+            dtype=anchor_ids.dtype,
+        )
+        draft_ids = mx.concatenate([anchor_ids, draft_ids[:, 1:]], axis=1)
+
+        hidden = self.model.embed_tokens(draft_ids)
+        hidden = mx.broadcast_to(
+            hidden[:, :, None, :],
+            (
+                hidden.shape[0],
+                hidden.shape[1],
+                self.args.hc_mult,
+                hidden.shape[-1],
+            ),
+        )
+        hidden = mx.contiguous(hidden)
+        for stage_idx, (stage, stage_cache) in enumerate(zip(self.mtp, cache)):
+            hidden = stage(
+                hidden,
+                draft_ids,
+                stage_cache,
+                output_width=width if stage_idx + 1 == len(self.mtp) else None,
+            )
+
+        final = self.mtp[-1]
+        head_hidden = final.hc_head(hidden)
+        from omlx.patches.deepseek_v4.verify_qmv import dspark_head_gemv
+
+        logits = dspark_head_gemv(self.lm_head, final.norm(head_hidden))
+        return logits[:, :width], head_hidden[:, :width]
+
+    def dspark_markov(self, token_ids):
+        """Return DSpark's previous-token logit bias and rank-R embedding."""
+        head = self.mtp[-1].markov_head
+        embedding = head.markov_w1(token_ids)
+        from omlx.patches.deepseek_v4.verify_qmv import dspark_head_gemv
+
+        return dspark_head_gemv(head.markov_w2, embedding), embedding
+
+    def dspark_calibration_forward(self, target_hiddens, input_ids):
+        """Exercise all DSpark linears for oQe imatrix collection."""
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            return None
+        width = min(int(self.args.dspark_block_size), max(1, input_ids.shape[1] - 1))
+        context = target_hiddens[:, :-1]
+        anchor = input_ids[:, -1:]
+        logits, _ = self.dspark_forward(
+            context,
+            anchor,
+            self.make_mtp_cache(),
+            draft_length=width,
+        )
+        mx.eval(logits)
+        return logits
+
+    def mtp_take_primed(self, cache, main_token):
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            return None
+        return deepseek_v4_dspark.take_primed(self, cache, main_token)
+
     def mtp_forward(
         self,
         h,
@@ -380,6 +554,20 @@ def _patch_model(dsv4: Any) -> None:
         positions (0 = all); the chain's history+draft fold only needs the
         final position and the vocab is large enough that it matters.
         """
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            logits, hidden = self.dspark_forward(
+                h,
+                input_ids,
+                cache,
+                draft_length=input_ids.shape[1],
+            )
+            if logits_keep and logits.shape[1] > logits_keep:
+                logits = logits[:, -logits_keep:]
+                hidden = hidden[:, -logits_keep:]
+            if return_hidden:
+                return logits, hidden
+            return logits
+
         if cache is None:
             cache = [None] * len(self.mtp)
 
@@ -481,6 +669,7 @@ def _patch_model(dsv4: Any) -> None:
         layers.
         """
         n_layers = self.args.num_hidden_layers
+        is_dspark = bool(getattr(self, "_omlx_dspark_decode_enabled", False))
         has_mtp = hasattr(self, "mtp")
         has_mtp_weights = any(k.startswith("mtp.") for k in weights)
         # Disable MTP module if weights are absent (e.g. quantized checkpoints
@@ -491,6 +680,8 @@ def _patch_model(dsv4: Any) -> None:
             except AttributeError:
                 pass
             has_mtp = False
+            self._omlx_mtp_decode_enabled = False
+            self._omlx_dspark_decode_enabled = False
 
         new_weights: Dict[str, Any] = {}
         for k, v in weights.items():
@@ -553,8 +744,9 @@ def _patch_model(dsv4: Any) -> None:
             if old in weights:
                 weights[new] = weights.pop(old)
 
-        # Block-internal weight key remapping. Adds PR 15's ``mtp.*`` →
-        # ``mtp.<idx>.block.*`` nesting on top of the existing remap.
+        # Block-internal weight key remapping. Legacy Lightning MTP nests
+        # stage weights under ``mtp.<idx>.block``; 0731 DSpark stages are
+        # represented directly at ``mtp.<idx>`` to match the checkpoint.
         remapped = {}
         w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         mtp_block_subs = (
@@ -574,7 +766,9 @@ def _patch_model(dsv4: Any) -> None:
                 parts = nk.split(".", 2)  # ["mtp", "<idx>", "<rest>"]
                 if len(parts) == 3:
                     rest = parts[2]
-                    if any(rest.startswith(s) for s in mtp_block_subs):
+                    if not is_dspark and any(
+                        rest.startswith(s) for s in mtp_block_subs
+                    ):
                         nk = f"mtp.{parts[1]}.block.{rest}"
                     for param in ("fn", "base", "scale"):
                         if rest == f"hc_head_{param}":
@@ -633,8 +827,14 @@ def _patch_model(dsv4: Any) -> None:
         # ndim==2 gate keeps this idempotent for checkpoints that already
         # store the 3D MultiLinear layout (e.g. oQ output).
         if has_mtp:
-            for mtp_idx in range(self.args.num_nextn_predict_layers):
-                prefix = f"mtp.{mtp_idx}.block.attn.wo_a"
+            n_mtp = (
+                deepseek_v4_dspark.stage_count(self.args)
+                if is_dspark
+                else self.args.num_nextn_predict_layers
+            )
+            block_part = "" if is_dspark else ".block"
+            for mtp_idx in range(n_mtp):
+                prefix = f"mtp.{mtp_idx}{block_part}.attn.wo_a"
                 for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
                     if key in weights and weights[key].ndim == 2:
                         weights[key] = weights[key].reshape(
@@ -643,8 +843,14 @@ def _patch_model(dsv4: Any) -> None:
 
         # Stack routed expert weights for MTP layers (PR 15).
         if has_mtp:
-            for mtp_idx in range(self.args.num_nextn_predict_layers):
-                prefix = f"mtp.{mtp_idx}.block.ffn.experts"
+            n_mtp = (
+                deepseek_v4_dspark.stage_count(self.args)
+                if is_dspark
+                else self.args.num_nextn_predict_layers
+            )
+            block_part = "" if is_dspark else ".block"
+            for mtp_idx in range(n_mtp):
+                prefix = f"mtp.{mtp_idx}{block_part}.ffn.experts"
                 for src, dst in (
                     ("w1", "gate_proj"),
                     ("w2", "down_proj"),
@@ -658,8 +864,29 @@ def _patch_model(dsv4: Any) -> None:
                                 for e in range(self.args.n_routed_experts)
                             ]
                             weights[
-                                f"mtp.{mtp_idx}.block.ffn.switch_mlp.{dst}.{suffix}"
+                                f"mtp.{mtp_idx}{block_part}.ffn.switch_mlp."
+                                f"{dst}.{suffix}"
                             ] = mx.stack(stacked)
+
+        # Preserve the base DeepSeek sanitizer's affine SwitchGLU dtype
+        # normalization. MLX affine MoE kernels require FP16 scale/bias
+        # metadata when the packed weight is uint32; this applies equally to
+        # backbone and oQ/oQe-quantized DSpark experts.
+        for key, value in list(weights.items()):
+            if (
+                ".ffn.switch_mlp." not in key
+                or not key.endswith((".scales", ".biases"))
+                or value.dtype != mx.bfloat16
+            ):
+                continue
+            stem = key.rsplit(".", 1)[0]
+            if (
+                stem + ".weight" in weights
+                and stem + ".scales" in weights
+                and stem + ".biases" in weights
+                and weights[stem + ".weight"].dtype == mx.uint32
+            ):
+                weights[key] = value.astype(mx.float16)
 
         return weights
 
@@ -670,6 +897,11 @@ def _patch_model(dsv4: Any) -> None:
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.dspark_append_context = dspark_append_context
+    cls.dspark_forward = dspark_forward
+    cls.dspark_markov = dspark_markov
+    cls.dspark_calibration_forward = dspark_calibration_forward
+    cls.mtp_take_primed = mtp_take_primed
     cls.mtp_clamp_accept = mtp_clamp_accept
     cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize

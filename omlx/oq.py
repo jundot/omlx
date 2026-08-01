@@ -3396,6 +3396,17 @@ def _normalize_mtp_in_config(config: dict) -> None:
     # Inkling nests the declaration under a top-level mtp_config block.
     if isinstance(config.get("mtp_config"), dict):
         config.pop("mtp_config", None)
+    # DeepSeek-V4-Flash-0731 uses these fields as the embedded-DSpark
+    # discriminator. Leaving them behind after mtp.* tensors are stripped
+    # would make the shared Lightning MTP toggle select a missing drafter.
+    for key in (
+        "dspark_block_size",
+        "dspark_noise_token_id",
+        "dspark_target_layer_ids",
+        "dspark_markov_rank",
+        "n_mtp_layers",
+    ):
+        config.pop(key, None)
 
 
 def _normalize_text_only_in_config(config: dict) -> None:
@@ -3852,8 +3863,11 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
         return True
-    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections
-    if name.endswith((".e_proj.weight", ".h_proj.weight", ".eh_proj.weight")):
+    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections. Embedded DSpark
+    # combines target-layer taps through main_proj instead of e_proj/h_proj.
+    if name.endswith(
+        (".e_proj.weight", ".h_proj.weight", ".eh_proj.weight", ".main_proj.weight")
+    ):
         return True
     # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
     # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
@@ -3864,6 +3878,11 @@ def _is_mtp_protected_tensor(name: str) -> bool:
         or name.endswith(".hc_head_base")
         or name.endswith(".hc_head_scale")
     ):
+        return True
+    # DSpark's rank-R Markov transition is added directly to draft logits;
+    # quantizing it can change every proposal distribution. The confidence
+    # head is tiny and precision-sensitive, so neither is worth compressing.
+    if ".markov_head." in name or ".confidence_head." in name:
         return True
     return False
 
@@ -6827,7 +6846,12 @@ class OQImatrixCollector:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
 
 
-def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
+def _collect_mtp_head_imatrix(
+    model,
+    batch,
+    hidden,
+    dspark_hiddens=None,
+) -> bool:
     """Run the MTP head over a calibration micro-batch.
 
     The trunk-layer walk never invokes the head, so without this pass every
@@ -6842,6 +6866,16 @@ def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
     if mtp is None:
         return False
     try:
+        dspark_calibration = getattr(inner, "dspark_calibration_forward", None)
+        if (
+            getattr(inner, "_omlx_dspark_decode_enabled", False)
+            and callable(dspark_calibration)
+            and dspark_hiddens
+        ):
+            target_hidden = mx.concatenate(dspark_hiddens, axis=-1)
+            out = dspark_calibration(target_hidden, batch)
+            mx.eval(out)
+            return True
         if isinstance(mtp, (list, tuple)):
             # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
             # trunk hidden; Model.mtp_forward wires mask/cache/embedding.
@@ -6967,6 +7001,13 @@ def _collect_imatrix_from_model(
                     model, layers, batch, inputs
                 )
 
+                inner = getattr(model, "language_model", None) or model
+                args = getattr(inner, "args", None)
+                dspark_target_ids = set(
+                    getattr(args, "dspark_target_layer_ids", ()) or ()
+                )
+                dspark_hiddens = []
+
                 for layer_idx, block in enumerate(layers):
                     layer_mask = (
                         layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
@@ -6988,6 +7029,11 @@ def _collect_imatrix_from_model(
                         continue
                     mx.eval(out)
                     inputs = out
+                    # DSpark config uses one-based completed layer depths,
+                    # matching the runtime target-tap path.
+                    if layer_idx + 1 in dspark_target_ids:
+                        tapped = out.mean(axis=2) if out.ndim == 4 else out
+                        dspark_hiddens.append(tapped)
                     _commit_layer_forward_aux(
                         position_ids, layer_idx, aux, fallback=prev_aux
                     )
@@ -6998,7 +7044,12 @@ def _collect_imatrix_from_model(
                 # the final-layer hidden states; feed them (post-norm) plus
                 # the shifted token ids through the head so its linears
                 # contribute imatrix entries too.
-                if _collect_mtp_head_imatrix(model, batch, inputs):
+                if _collect_mtp_head_imatrix(
+                    model,
+                    batch,
+                    inputs,
+                    dspark_hiddens=dspark_hiddens,
+                ):
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -7881,7 +7932,11 @@ def _measure_sensitivity_from_quantized_model(
                     set_mtp_active,
                 )
 
-                have_lm_patch = apply_mlx_lm_mtp_patch()
+                apply_mlx_lm_mtp_patch()
+                # apply() is idempotent and returns whether it changed live
+                # classes, not whether the patch is available. A prior oQe
+                # phase commonly installed it already.
+                have_lm_patch = True
             except Exception:
                 have_lm_patch = False
                 is_mtp_active = None
