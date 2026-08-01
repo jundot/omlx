@@ -714,11 +714,9 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
-                    sublabel: vm.vlmMtpEnabled
-                        ? vm.vlmMtpProcessorLockedReason
-                        : String(localized: "settings.advanced.thinking_budget.sub",
-                                 defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
-                                 comment: "Sublabel for the thinking budget field")) {
+                    sublabel: String(localized: "settings.advanced.thinking_budget.sub",
+                                     defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
+                                     comment: "Sublabel for the thinking budget field")) {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
@@ -727,8 +725,6 @@ private struct AdvancedTab: View {
                         Toggle("", isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                             .labelsHidden().toggleStyle(.switch)
                     }
-                    .disabled(vm.vlmMtpEnabled)
-                    .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
                                   defaultValue: "Limit Tool Result Tokens",

@@ -458,15 +458,9 @@
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.thinking_budget_hint') }}</p>
-                                        <p x-show="modelSettings.vlm_mtp_enabled"
-                                           class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                     </div>
-                                    <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null; }"
-                                            :disabled="modelSettings.vlm_mtp_enabled"
-                                            :class="[
-                                                modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200',
-                                                modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''
-                                            ]"
+                                    <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                            :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>

@@ -1437,6 +1437,8 @@
             // which the VLM MTP decode path cannot apply (#2399). Mirrors
             // vlm_mtp_processor_conflicts() in model_settings.py; neutral
             // values (repetition 1.0, presence 0.0) do not conflict.
+            // Thinking budget is exempt: it is applied on the vlm_mtp path
+            // at verify time (MTPProcessingSampler).
             vlmMtpProcessorConflict() {
                 const ms = this.modelSettings;
                 if (!ms) return false;
@@ -1445,7 +1447,6 @@
                 const pres = num(ms.presence_penalty);
                 return (rep !== null && rep !== 1.0)
                     || (pres !== null && pres !== 0.0)
-                    || !!ms.enableThinkingBudget
                     || !!ms.guided_grammar_enabled;
             },
 

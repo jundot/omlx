@@ -556,3 +556,52 @@ class ThinkingBudgetProcessor:
         forced = mx.full(logits.shape, float("-inf"))
         forced[..., target_id] = 0.0
         return forced
+
+    # -- Speculative-decoding (vlm_mtp) support -----------------------------
+    #
+    # The vlm_mtp decode path applies this processor inside mlx-vlm's
+    # speculative verify walk, where positions past the first draft
+    # rejection are discarded and re-sampled on the next round.
+    # ``snapshot_state()`` / ``restore_state()`` let the caller checkpoint
+    # the processor after each position and rewind it when a draft suffix
+    # is rejected, keeping the one-call-per-emitted-token contract intact.
+    # See ``omlx/speculative/processing_sampler.py``.
+
+    _SNAPSHOT_ATTRS = (
+        "_thinking_tokens",
+        "_in_thinking",
+        "_forcing",
+        "_waiting_utf8",
+        "_force_idx",
+        "_done",
+        "_first_call",
+        "_recent_tokens",
+        "_last_token_utf8_complete",
+        "_pending_utf8",
+        "_accepted_up_to",
+    )
+
+    def snapshot_state(self) -> dict:
+        """Checkpoint mutable state for position-keyed rewind (vlm_mtp)."""
+        state: dict = {}
+        for name in self._SNAPSHOT_ATTRS:
+            if not hasattr(self, name):
+                continue
+            value = getattr(self, name)
+            if isinstance(value, list):
+                value = list(value)
+            state[name] = value
+        return state
+
+    def restore_state(self, state: dict) -> None:
+        """Restore a checkpoint produced by :meth:`snapshot_state`."""
+        for name in self._SNAPSHOT_ATTRS:
+            if name in state:
+                value = state[name]
+                if isinstance(value, list):
+                    value = list(value)
+                setattr(self, name, value)
+            elif name == "_accepted_up_to" and hasattr(self, name):
+                # Lazily-created attr absent from the snapshot: drop it so
+                # the next __call__ re-baselines from the history it sees.
+                delattr(self, name)

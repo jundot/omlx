@@ -786,8 +786,8 @@ final class ModelSettingsScreenVM {
         }
         if vlmMtpProcessorConflict {
             return String(localized: "settings.vlm_mtp.conflict.processors",
-                          defaultValue: "Unset repetition / presence penalty and thinking budget before enabling VLM MTP.",
-                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty or thinking-budget settings are set")
+                          defaultValue: "Unset repetition / presence penalty before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty settings are set")
         }
         return nil
     }
@@ -795,11 +795,13 @@ final class ModelSettingsScreenVM {
     /// Settings that materialize as per-request logits processors, which the
     /// vlm_mtp decode path cannot apply (#2399). Mirrors
     /// vlm_mtp_processor_conflicts() in model_settings.py; neutral values
-    /// (repetition 1.0, presence 0.0) do not conflict.
+    /// (repetition 1.0, presence 0.0) do not conflict. Thinking budget is
+    /// exempt: it is applied on the vlm_mtp path at verify time
+    /// (MTPProcessingSampler).
     var vlmMtpProcessorConflict: Bool {
         if let rep = Double(repetitionPenalty), rep != 1.0 { return true }
         if let pres = Double(presencePenalty), pres != 0.0 { return true }
-        return thinkingBudgetEnabled
+        return false
     }
 
     /// Sublabel / tooltip for the sampling rows locked while VLM MTP is on.

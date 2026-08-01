@@ -683,13 +683,22 @@ class TestVlmMtpProcessorExclusivity:
         [
             ("repetition_penalty", 1.2),
             ("presence_penalty", 0.5),
-            ("thinking_budget_enabled", True),
             ("guided_grammar_enabled", True),
         ],
     )
     def test_conflicting_setting_raises(self, field, value):
         with pytest.raises(ValueError, match="vlm_mtp_enabled cannot be combined"):
             ModelSettings(vlm_mtp_enabled=True, **{field: value})
+
+    def test_thinking_budget_no_longer_conflicts(self):
+        """Thinking budget is applied on the vlm_mtp path at verify time
+        (MTPProcessingSampler), so the combo is allowed."""
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            thinking_budget_enabled=True,
+        )
+        assert settings.vlm_mtp_enabled is True
+        assert settings.thinking_budget_enabled is True
 
     def test_conflicts_ignored_when_vlm_mtp_off(self):
         settings = ModelSettings(
