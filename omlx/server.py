@@ -273,6 +273,16 @@ class ServerState:
 _server_state: ServerState = ServerState()
 
 
+def _hit_token_limit(last_output) -> bool:
+    """True when generation stopped because it ran out of ``max_tokens``.
+
+    Used to tell ``ThinkingParser.finish()`` that a missing ``</think>`` is our
+    doing rather than the model's, so it does not recover the reasoning text
+    into ``content``.
+    """
+    return last_output is not None and last_output.finish_reason == "length"
+
+
 def get_server_state() -> ServerState:
     """Get the global server state."""
     return _server_state
@@ -4445,7 +4455,9 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=_hit_token_limit(last_output)
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -4925,7 +4937,9 @@ async def stream_anthropic_messages(
         return
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        truncated=_hit_token_limit(last_output)
+    )
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6372,7 +6386,9 @@ async def stream_responses_api(
 
     # Flush remaining content from parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=_hit_token_limit(last_output)
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
