@@ -782,8 +782,21 @@ class InklingOutputParserSession:
             try:
                 parsed = json.loads(payload)
             except (json.JSONDecodeError, ValueError):
-                logger.debug("Inkling tool-call payload not valid JSON")
-                continue
+                # Quantized checkpoints occasionally emit the payload with the
+                # final closing brace(s) missing (observed: a complete nested
+                # args object short exactly one "}" before <|end_message|>).
+                # Brace-balance repair only runs after strict parsing failed,
+                # so well-formed payloads are never touched.
+                balance = payload.count("{") - payload.count("}")
+                if balance > 0:
+                    try:
+                        parsed = json.loads(payload + "}" * balance)
+                    except (json.JSONDecodeError, ValueError):
+                        logger.debug("Inkling tool-call payload not valid JSON")
+                        continue
+                else:
+                    logger.debug("Inkling tool-call payload not valid JSON")
+                    continue
             if not isinstance(parsed, dict) or not parsed.get("name"):
                 continue
             # Accept both payload conventions: Inkling-native {"name", "args":
