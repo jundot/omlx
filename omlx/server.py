@@ -125,6 +125,7 @@ from .api.openai_models import (
     ModelsResponse,
     PromptTokensDetails,
     Usage,
+    format_chat_logprobs,
 )
 from .api.parser_tool_calls import (
     convert_parser_tool_calls as _convert_parser_tool_calls,
@@ -2540,6 +2541,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 for ref in (
                     _ms.specprefill_draft_model,
                     _ms.dflash_draft_model,
+                    _ms.dspark_draft_model,
                     _ms.vlm_mtp_draft_model,
                 ):
                     if ref:
@@ -3092,11 +3094,11 @@ async def create_completion(
             )
 
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
@@ -3415,6 +3417,9 @@ async def create_chat_completion(
             "xtc_probability": xtc_probability,
             "xtc_threshold": xtc_threshold,
         }
+        if request.logprobs:
+            chat_kwargs["logprobs"] = True
+            chat_kwargs["top_logprobs"] = request.top_logprobs
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -3554,11 +3559,7 @@ async def create_chat_completion(
                 f"request_max_tokens={request.max_tokens}"
             )
             first_token_at = getattr(output, "first_token_at", None)
-            ttft = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
-            )
+            ttft = (first_token_at - start_time) if first_token_at is not None else 0.0
             gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
@@ -3633,6 +3634,9 @@ async def create_chat_completion(
                             tool_calls=tool_calls,
                         ),
                         finish_reason=finish_reason,
+                        logprobs=format_chat_logprobs(
+                            getattr(output, "logprobs", None), engine.tokenizer
+                        ),
                     )
                 ],
                 usage=Usage(
@@ -4342,6 +4346,7 @@ async def stream_chat_completion(
     first_token_time = None
     last_output = None
     accumulated_text = ""
+    emitted_logprobs = 0
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
     try:
@@ -4436,6 +4441,30 @@ async def stream_chat_completion(
                             ],
                         )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+            # Some speculative runtimes finalize target logprobs by verified
+            # block rather than alongside text fragments.  Emit each record
+            # once, before the finish chunk, even when its text was streamed
+            # earlier.  The records remain ordered exactly like committed
+            # completion tokens.
+            output_logprobs = getattr(output, "logprobs", None)
+            if output_logprobs and len(output_logprobs) > emitted_logprobs:
+                pending_logprobs = output_logprobs[emitted_logprobs:]
+                emitted_logprobs = len(output_logprobs)
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(),
+                            finish_reason=None,
+                            logprobs=format_chat_logprobs(
+                                pending_logprobs, engine.tokenizer
+                            ),
+                        )
+                    ],
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
         error_data = {"error": {"message": str(e), "type": "server_error"}}
@@ -5447,11 +5476,11 @@ async def create_anthropic_message(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -5933,11 +5962,11 @@ async def create_response(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,

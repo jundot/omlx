@@ -93,6 +93,9 @@ class GenerationOutput:
     generated_at: Optional[float] = None
     generated_until: Optional[float] = None
     first_token_at: Optional[float] = None
+    # Target-model probability records for committed tokens. Speculative
+    # engines must never expose drafter probabilities here.
+    logprobs: Optional[List[Dict[str, Any]]] = None
 
 
 class BaseEngine(ABC):

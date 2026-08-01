@@ -2868,6 +2868,18 @@ def estimate_bpw_and_size(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    # Speculative drafter checkpoints are not standalone CausalLMs.  Running
+    # them through oQ can produce an unloadable checkpoint (and, for shared
+    # head sidecars, cannot be mathematically defined without the target).
+    # They must be prepared by the format-aware dSpark preparation path.
+    from .model_discovery import is_helper_model_config
+
+    if is_helper_model_config(config):
+        raise ValueError(
+            "speculative drafter helpers cannot be quantized with oQ; "
+            "use the Prepare dSpark task so checkpoint metadata and tensor "
+            "ownership are preserved"
+        )
 
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
@@ -5214,6 +5226,16 @@ def quantize_oq_streaming(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    # A drafter is not a standalone CausalLM.  oQ cannot preserve its
+    # target-pairing metadata or shared-head ownership, so route it through
+    # the format-aware dSpark preparation task instead.
+    from .model_discovery import is_helper_model_config
+
+    if is_helper_model_config(config):
+        raise ValueError(
+            "speculative drafter helpers cannot be quantized with oQ; "
+            "use Prepare dSpark instead"
+        )
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )

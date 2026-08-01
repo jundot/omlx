@@ -128,6 +128,10 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dspark_enabled: Enable the generic dSpark speculative-decoding engine.
+        dspark_draft_model: Path/repo for a dSpark helper checkpoint.
+        dspark_format: Drafter format (auto/deepspec/speculators/higgs_sidecar).
+        dspark_pairing_mode: exact or target-verified cross-target pairing.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -233,6 +237,15 @@ class ModelSettings:
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
+    # dSpark (generic speculative decoding). Unlike the legacy Bonsai adapter,
+    # these fields are target-agnostic and are consumed directly by EnginePool.
+    dspark_enabled: bool = False
+    dspark_draft_model: Optional[str] = None
+    dspark_format: str = "auto"  # auto | deepspec | speculators | higgs_sidecar
+    dspark_max_draft_tokens: Optional[str | int] = "auto"
+    dspark_markov_mode: str = "auto"  # auto | enabled | disabled
+    dspark_pairing_mode: str = "exact"  # exact | verified_cross_target
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
@@ -277,6 +290,39 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        conflicting_speculators = [
+            name
+            for name in ("dflash_enabled", "mtp_enabled", "vlm_mtp_enabled")
+            if getattr(self, name)
+        ]
+        if self.dspark_enabled and conflicting_speculators:
+            raise ValueError(
+                "dspark_enabled is mutually exclusive with "
+                + ", ".join(conflicting_speculators)
+            )
+        if self.dspark_format not in {
+            "auto",
+            "deepspec",
+            "speculators",
+            "higgs_sidecar",
+        }:
+            raise ValueError(f"unsupported dspark_format: {self.dspark_format!r}")
+        if self.dspark_pairing_mode not in {"exact", "verified_cross_target"}:
+            raise ValueError(
+                f"unsupported dspark_pairing_mode: {self.dspark_pairing_mode!r}"
+            )
+        if self.dspark_markov_mode not in {"auto", "enabled", "disabled"}:
+            raise ValueError(
+                f"unsupported dspark_markov_mode: {self.dspark_markov_mode!r}"
+            )
+        if self.dspark_max_draft_tokens != "auto" and (
+            not isinstance(self.dspark_max_draft_tokens, int)
+            or isinstance(self.dspark_max_draft_tokens, bool)
+            or self.dspark_max_draft_tokens < 0
+        ):
+            raise ValueError(
+                "dspark_max_draft_tokens must be 'auto' or a non-negative integer"
+            )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is

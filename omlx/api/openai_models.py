@@ -287,6 +287,11 @@ class ChatCompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # OpenAI-compatible token probability reporting.  ``top_logprobs=0``
+    # still reports the selected token; values above zero additionally return
+    # that many alternatives.
+    logprobs: bool = False
+    top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
@@ -327,12 +332,90 @@ class AssistantMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
 
 
+class TopLogprob(BaseModel):
+    """One candidate token and its target-model log probability."""
+
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChatCompletionTokenLogprob(BaseModel):
+    """Probability information for one committed completion token."""
+
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+    top_logprobs: List[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    """OpenAI chat-completion logprobs payload."""
+
+    content: Optional[List[ChatCompletionTokenLogprob]] = None
+    refusal: Optional[List[ChatCompletionTokenLogprob]] = None
+
+
+def format_chat_logprobs(raw: Any, tokenizer: Any) -> Optional[ChoiceLogprobs]:
+    """Convert engine token-id probability records to OpenAI's wire shape.
+
+    dSpark records use ``{token_id, logprob, top: [(id, logprob), ...]}``.
+    Keeping conversion at the API boundary avoids coupling drafter handlers to
+    a transport schema and guarantees that only target-verified tokens appear.
+    """
+
+    if raw is None:
+        return None
+
+    def decode_token(token_id: Any) -> str:
+        try:
+            return str(tokenizer.decode([int(token_id)]))
+        except Exception:
+            return ""
+
+    content: List[ChatCompletionTokenLogprob] = []
+    for entry in raw:
+        if not isinstance(entry, dict) or "token_id" not in entry:
+            continue
+        token = decode_token(entry["token_id"])
+        alternatives: List[TopLogprob] = []
+        for candidate in entry.get("top", []) or []:
+            if isinstance(candidate, dict):
+                candidate_id = candidate.get("token_id", candidate.get("id"))
+                candidate_logprob = candidate.get("logprob")
+            else:
+                try:
+                    candidate_id, candidate_logprob = candidate
+                except (TypeError, ValueError):
+                    continue
+            if candidate_id is None or candidate_logprob is None:
+                continue
+            candidate_token = decode_token(candidate_id)
+            alternatives.append(
+                TopLogprob(
+                    token=candidate_token,
+                    logprob=float(candidate_logprob),
+                    bytes=list(candidate_token.encode()),
+                )
+            )
+        content.append(
+            ChatCompletionTokenLogprob(
+                token=token,
+                logprob=float(entry.get("logprob", float("-inf"))),
+                bytes=list(token.encode()),
+                top_logprobs=alternatives,
+            )
+        )
+    return ChoiceLogprobs(content=content)
+
+
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
 
     index: int = 0
     message: AssistantMessage
     finish_reason: Optional[str] = "stop"
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class PromptTokensDetails(BaseModel):
@@ -527,6 +610,7 @@ class ChatCompletionChunkChoice(BaseModel):
     index: int = 0
     delta: ChatCompletionChunkDelta
     finish_reason: Optional[str] = None
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatCompletionChunk(BaseModel):

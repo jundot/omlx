@@ -95,8 +95,15 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
 # engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
 # drafter families are added.
 HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
-_HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
-_HELPER_CONFIG_KEYS = ("dflash_config",)
+_HELPER_ARCH_TOKENS = (
+    "draft",
+    "assistant",
+    "mtp",
+    "dspark",
+    "deepspec",
+    "speculator",
+)
+_HELPER_CONFIG_KEYS = ("dflash_config", "dspark_config", "speculators_config")
 
 
 def is_helper_config_model_type(config_model_type: str | None) -> bool:
