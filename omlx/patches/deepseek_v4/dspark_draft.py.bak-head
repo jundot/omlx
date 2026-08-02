@@ -204,25 +204,6 @@ class SpecRunner:
         _cr.apply(); self.cr = _cr
         self.eos = tok.eos_token_id
         self.policy = policy if policy is not None else make_static_policy(thr)
-        try:
-            import os as _os
-            if _os.environ.get("OMLX_DSPARK_HEAD_MXFP8", "1") != "0":
-                _hw = model.lm_head.weight.astype(mx.bfloat16)
-                _q = mx.quantize(_hw, group_size=32, bits=8, mode="mxfp8")
-                _qw, _qs = _q[0], _q[1]
-                mx.eval(_qw, _qs)
-                class _MXFP8Head:
-                    def __init__(s_, W, S_):
-                        s_.W, s_.S = W, S_
-                    def __call__(s_, x):
-                        return q8m(x, s_.W, s_.S)
-                model.lm_head = _MXFP8Head(_qw, _qs)
-                import logging as _lg
-                _lg.getLogger(__name__).info(
-                    "dspark: lm_head -> mxfp8 g32 (S13: 0/1024 argmax flips, KL 2e-5)")
-        except Exception as _e:
-            import logging as _lg
-            _lg.getLogger(__name__).warning("dspark: lm_head requant skipped: %r", _e)
     def _draft(self, anchor_id, a, sample):
         D = self.D; S2 = D.stages[2]
         x = D.inner.embed_tokens(mx.array([[anchor_id, NOISE, NOISE, NOISE, NOISE]]))
