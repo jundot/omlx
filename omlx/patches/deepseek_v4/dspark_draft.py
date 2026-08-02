@@ -206,6 +206,20 @@ class SpecRunner:
         self.policy = policy if policy is not None else make_static_policy(thr)
         try:
             import os as _os
+            if _os.environ.get("OMLX_DSPARK_FAST_INDEXER", "0") == "1" and not getattr(dsv4, "_dspark_fast_indexer", False):
+                def _dspark_fast_topk(scores, k):
+                    return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+                dsv4._stable_topk_indices = _dspark_fast_topk
+                dsv4._dspark_fast_indexer = True
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "dspark: fast indexer fallback enabled (pre-1a3099eb argpartition selection; "
+                    "cutoff-tie membership is scheduling-order, NOT deterministic; ~1.5 ms/forward recovered at 2.4k+)")
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("dspark: fast indexer rebind skipped: %r", _e)
+        try:
+            import os as _os
             if _os.environ.get("OMLX_DSPARK_COMPILE_HC", "1") != "0" and not getattr(dsv4, "_dspark_hc_compiled", False):
                 _op = getattr(hcm, "_hc_expand_op", None)
                 _chc = _op if _op is not None else mx.compile(hcm.hc_expand)
