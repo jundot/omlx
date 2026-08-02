@@ -42,6 +42,41 @@ logger = logging.getLogger(__name__)
 # Max pending writes before save() blocks.
 _MAX_PENDING_WRITES = 128
 
+# Mamba2-family SSM states (fp32, shape (B, num_heads, head_dim, state_size))
+# are stored as int8 with per-row fp32 scales: 4x smaller serialize copies,
+# pending buffers, and files; error bounded by rowmax/254. 8-bit storage is
+# established as accuracy-safe for this state type (Quamba/Quamba2, ICML'25);
+# other fp32 cache states (e.g. gated-deltanet recurrent states) are NOT
+# covered by that result and stay fp32. The caller identifies eligible layers
+# semantically via ``ssm_state_shapes`` (see ``save``); a tensor is quantized
+# only when it also matches the expected per-layer state shape and dtype.
+# Disable via OMLX_SNAPSHOT_Q8=0.
+_Q8_ENABLED = os.environ.get("OMLX_SNAPSHOT_Q8", "1") != "0"
+_Q8_MIN_ELEMS = 65536
+
+
+def _q8_eligible(elem, expected_shape) -> bool:
+    return (
+        _Q8_ENABLED
+        and HAS_MLX
+        and expected_shape is not None
+        and elem.dtype == mx.float32
+        and elem.ndim == 4
+        and tuple(elem.shape[1:]) == tuple(expected_shape)
+        and elem.size >= _Q8_MIN_ELEMS
+    )
+
+
+def _q8_quantize(elem):
+    scale = mx.max(mx.abs(elem), axis=-1, keepdims=True) / 127.0
+    scale = mx.maximum(scale, 1e-12)
+    q = mx.round(elem / scale).astype(mx.int8)
+    return q, scale.astype(mx.float32)
+
+
+def _q8_dequantize(q, scale):
+    return q.astype(mx.float32) * scale
+
 
 def reset_boundary_snapshot_root(base_dir: Path) -> None:
     """Remove all boundary snapshot sessions for a server lifecycle boundary."""
@@ -130,6 +165,7 @@ class BoundarySnapshotSSDStore:
         token_count: int,
         snapshot_cache: list[Any],
         extract_cache_states_fn: Callable,
+        ssm_state_shapes: dict[int, tuple[int, ...]] | None = None,
     ) -> bool:
         """Serialize snapshot to SSD (non-blocking).
 
@@ -146,6 +182,12 @@ class BoundarySnapshotSSDStore:
         extract_cache_states_fn : callable
             ``Scheduler._extract_cache_states`` — converts raw cache objects
             to ``List[Dict[str, Any]]``.
+        ssm_state_shapes : dict, optional
+            Per-layer expected Mamba2 SSM state shape (without the batch
+            axis), e.g. ``{i: (num_heads, head_dim, state_size)}``. Only
+            fp32 states on these layers that match the expected shape are
+            stored as int8; everything else stays in its native dtype.
+            ``None`` disables int8 storage for this snapshot.
 
         Returns
         -------
@@ -162,8 +204,12 @@ class BoundarySnapshotSSDStore:
                 return False
 
             # 2. Flatten tensors + metadata for safetensors serialization.
+            # When int8 storage applies, _serialize_extracted also swaps the
+            # affected elements of ``extracted`` for their dequantized values
+            # so every read path (pending fast path, raw bytes, disk) restores
+            # the exact same representation regardless of writer timing.
             tensors_raw, metadata = self._serialize_extracted(
-                extracted, request_id, token_count
+                extracted, request_id, token_count, ssm_state_shapes
             )
 
             # 3. Buffer in pending writes for instant read-back.
@@ -642,13 +688,21 @@ class BoundarySnapshotSSDStore:
         extracted: list[dict[str, Any]],
         request_id: str,
         token_count: int,
+        ssm_state_shapes: dict[int, tuple[int, ...]] | None = None,
     ) -> tuple[dict[str, tuple[bytes, str, list[int]]], dict[str, str]]:
         """Convert extracted cache states to tensors_raw + metadata.
 
         Must be called on the inference thread (for mx.eval / _extract_tensor_bytes).
+
+        For layers listed in ``ssm_state_shapes``, fp32 states matching the
+        expected SSM state shape are stored as int8 (see ``save``). Each
+        quantized element of ``extracted`` is replaced in place with its
+        dequantized value, so the pending-writes fast path returns the same
+        representation as the raw-bytes and disk read paths.
         """
         arrays: dict[str, Any] = {}  # name -> mx.array
         layer_info: list[dict[str, str]] = []
+        dequantized: list[Any] = []  # replacements to materialize with arrays
 
         for i, layer_state in enumerate(extracted):
             class_name = layer_state.get("class_name", "KVCache")
@@ -703,6 +757,11 @@ class BoundarySnapshotSSDStore:
                 if has_tensors:
                     info["has_state"] = "true"
                     info["state_count"] = str(len(state))
+                    expected_shape = (
+                        ssm_state_shapes.get(i) if ssm_state_shapes else None
+                    )
+                    new_state = list(state)
+                    quantized_any = False
                     for k, elem in enumerate(state):
                         if not hasattr(elem, "shape"):
                             # Non-tensor element (None, scalar). Mark it so
@@ -712,8 +771,21 @@ class BoundarySnapshotSSDStore:
                         if _has_zero_dim(elem):
                             arrays[f"layer_{i}_state_{k}"] = mx.zeros((1,))
                             info[f"zero_dim_{k}"] = _encode_shape(elem.shape)
+                        elif _q8_eligible(elem, expected_shape):  # int8 SSM state
+                            q8, q8s = _q8_quantize(elem)
+                            arrays[f"layer_{i}_state_{k}"] = q8
+                            arrays[f"layer_{i}_state_{k}_q8s"] = q8s
+                            info[f"q8_{k}"] = "1"
+                            dq = _q8_dequantize(q8, q8s)
+                            new_state[k] = dq
+                            dequantized.append(dq)
+                            quantized_any = True
                         else:
                             arrays[f"layer_{i}_state_{k}"] = elem
+                    if quantized_any:
+                        layer_state["state"] = (
+                            tuple(new_state) if isinstance(state, tuple) else new_state
+                        )
                 else:
                     info["has_state"] = "false"
             else:
@@ -721,9 +793,12 @@ class BoundarySnapshotSSDStore:
 
             layer_info.append(info)
 
-        # Materialize lazy tensors on inference thread.
-        if arrays:
-            mx.eval(*arrays.values())
+        # Materialize lazy tensors on inference thread. The dequantized
+        # replacements must be concrete here too: the pending fast path may
+        # hand them to a different thread, which cannot evaluate ops bound
+        # to this thread's stream.
+        if arrays or dequantized:
+            mx.eval(*arrays.values(), *dequantized)
 
         # Extract raw bytes (Metal-safe memoryview copy).
         tensors_raw = {}
@@ -859,6 +934,13 @@ class BoundarySnapshotSSDStore:
                     zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
                     restored = _restore_tensor_from_bytes(raw, dtype_str, [1])
                     elements.append(mx.zeros(zd_shape, dtype=restored.dtype))
+                elif (  # int8 snapshot state
+                    info.get(f"q8_{k}") == "1" and f"{key}_q8s" in tensors_raw
+                ):
+                    q8 = _restore_tensor_from_bytes(raw, dtype_str, shape)
+                    sraw, sdt, sshape = tensors_raw[f"{key}_q8s"]
+                    q8s = _restore_tensor_from_bytes(sraw, sdt, sshape)
+                    elements.append(_q8_dequantize(q8, q8s))
                 else:
                     elements.append(_restore_tensor_from_bytes(raw, dtype_str, shape))
             return tuple(elements)
@@ -993,6 +1075,11 @@ class BoundarySnapshotSSDStore:
                 if zd_marker in info:
                     zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
                     elements.append(mx.zeros(zd_shape, dtype=tensor.dtype))
+                elif (  # int8 snapshot state
+                    info.get(f"q8_{k}") == "1"
+                    and arrays.get(f"{key}_q8s") is not None
+                ):
+                    elements.append(_q8_dequantize(tensor, arrays[f"{key}_q8s"]))
                 else:
                     elements.append(tensor)
             return tuple(elements)

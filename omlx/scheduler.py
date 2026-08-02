@@ -1803,6 +1803,9 @@ class Scheduler:
         self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
         self._boundary_snapshot_store: BoundarySnapshotSSDStore | None = None
+        # Lazy per-layer map of expected Mamba2 SSM state shapes, used to
+        # scope int8 boundary-snapshot storage (None until first computed).
+        self._ssm_q8_state_shapes: dict[int, tuple[int, ...]] | None = None
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
         self.paged_cache_manager: PagedCacheManager | None = None
@@ -5456,6 +5459,51 @@ class Scheduler:
             with mx.stream(self._stream):
                 mx.eval(*leaves)
 
+    def _mamba2_ssm_state_shapes(self) -> dict[int, tuple[int, ...]]:
+        """Per-layer expected Mamba2 SSM state shape, for int8 snapshots.
+
+        Walks the model's layers once and records, for each layer whose
+        mixer is a Mamba2-family SSM (has ``num_heads`` / ``head_dim`` /
+        ``ssm_state_size`` plus ``conv1d`` and ``A_log``), the expected
+        state shape ``(num_heads, head_dim, ssm_state_size)`` without the
+        batch axis. This is the state type whose 8-bit storage is
+        accuracy-validated (Quamba2); other fp32 recurrent states (e.g.
+        gated-deltanet) deliberately do not match and stay fp32 in
+        boundary snapshots.
+        """
+        if self._ssm_q8_state_shapes is not None:
+            return self._ssm_q8_state_shapes
+
+        shapes: dict[int, tuple[int, ...]] = {}
+        model = getattr(self, "model", None)
+        layers = getattr(model, "layers", None)
+        if layers is None:
+            layers = getattr(getattr(model, "model", None), "layers", None)
+        try:
+            for i, layer in enumerate(layers or []):
+                modules = getattr(layer, "modules", None)
+                if not callable(modules):
+                    continue
+                for m in modules():
+                    num_heads = getattr(m, "num_heads", None)
+                    head_dim = getattr(m, "head_dim", None)
+                    state_size = getattr(m, "ssm_state_size", None)
+                    if (
+                        isinstance(num_heads, int)
+                        and isinstance(head_dim, int)
+                        and isinstance(state_size, int)
+                        and getattr(m, "conv1d", None) is not None
+                        and getattr(m, "A_log", None) is not None
+                    ):
+                        shapes[i] = (num_heads, head_dim, state_size)
+                        break
+        except Exception as e:
+            logger.debug("Mamba2 SSM state shape scan failed: %s", e)
+            shapes = {}
+
+        self._ssm_q8_state_shapes = shapes
+        return shapes
+
     def _on_prefill_boundary_snapshot(
         self,
         request_id: str,
@@ -5502,6 +5550,7 @@ class Scheduler:
                     token_count,
                     snapshot_cache,
                     self._extract_cache_states,
+                    ssm_state_shapes=self._mamba2_ssm_state_shapes(),
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
@@ -5761,6 +5810,7 @@ class Scheduler:
                     total_tokens,
                     snapshot_cache,
                     self._extract_cache_states,
+                    ssm_state_shapes=self._mamba2_ssm_state_shapes(),
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
