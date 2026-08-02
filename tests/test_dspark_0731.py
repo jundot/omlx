@@ -71,6 +71,8 @@ def test_eligibility_matrix(monkeypatch):
     assert dg._eligible(_gb())                                   # greedy singleton
     t1 = types.SimpleNamespace(temp=1.0, top_p=1.0, top_k=0, min_p=0.0)
     assert dg._eligible(_gb(samplers=[t1]))                      # exact temp-1.0
+    t95 = types.SimpleNamespace(temp=1.0, top_p=0.95, top_k=0, min_p=0.0)
+    assert dg._eligible(_gb(samplers=[t95]))                     # agentic top-p
     t7 = types.SimpleNamespace(temp=0.7, top_p=0.9, top_k=0, min_p=0.0)
     assert not dg._eligible(_gb(samplers=[t7]))                  # general sampling: defer
     assert not dg._eligible(_gb(uids=["a", "b"]))                # not singleton

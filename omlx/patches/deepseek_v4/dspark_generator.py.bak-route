@@ -101,8 +101,7 @@ def _eligible(gb) -> bool:
     if s is None: return True
     t = getattr(s, "temp", None)
     if t == 0.0: return True
-    tp = getattr(s, "top_p", 1.0)
-    if (t == 1.0 and (tp is None or tp == 0.0 or 0.0 < tp <= 1.0)
+    if (t == 1.0 and getattr(s, "top_p", 1.0) in (0.0, 1.0)
             and getattr(s, "top_k", 0) in (0, None) and getattr(s, "min_p", 0.0) in (0.0, None)):
         return True
     return False
@@ -111,7 +110,6 @@ def _runner(gb):
     global _RUNNER
     m = gb.model
     if _RUNNER is not None and _RUNNER.model is m: return _RUNNER
-    _t0 = time.perf_counter()
     dd = _dd()
     mdir = os.environ["OMLX_DSPARK_SPEC"]
     dsv4 = sys.modules[type(m.model).__module__]
@@ -127,7 +125,7 @@ def _runner(gb):
     tokns = type("T", (), {"eos_token_id": eos})
     R = dd.SpecRunner(mdir, m, tokns, dsv4, hcm, thr=0.6)
     _RUNNER = R
-    logger.info("dspark: SpecRunner built for %s (eos=%d) in %.1fs (one-time)", mdir, eos, time.perf_counter() - _t0)
+    logger.info("dspark: SpecRunner built for %s (eos=%d)", mdir, eos)
     return R
 
 def _attn_ramp(R, dd, L, xc, a, base):
@@ -208,18 +206,11 @@ def _run_cycle(gb, st):
         st.cool = getattr(st, "cool", 0) + 1
     st.drafted += ell
     snaps = _snapshot_async(cache) if ell > 0 else None
-    _dsm = R.D.dsv4
-    _sp = getattr(_dsm, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False)
-    if ell + 1 >= 5:
-        _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
     D.REC[0] = True; cr.set_undo_armed(ell > 0)
     vlog = gb.model(mx.array([[st.anchor] + d[:ell]]), cache=cache)
     cr.set_undo_armed(False); D.REC[0] = False
-    _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = _sp
     if st.sample:
         PT = mx.softmax(vlog[0].astype(mx.float32), axis=-1)
-        if getattr(st, "top_p", 1.0) < 1.0:
-            PT = _nucleus(PT, st.top_p)
         if ell > 0:
             idx = mx.array(d[:ell])
             ptd = mx.take_along_axis(PT[:ell], idx[:, None], axis=-1)[:, 0]
@@ -255,12 +246,9 @@ def _run_cycle(gb, st):
             st.resto += 1
             dd._restore(snaps)
             for t in D.TAPS: t.clear()
-            if k + 1 >= 5:
-                _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
             D.REC[0] = True
             rl = gb.model(mx.array([[st.anchor] + d[:k]]), cache=cache)
             D.REC[0] = False; mx.eval(rl)
-            _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = _sp
             D.extend_rings(D.take_taps(), st.C)
     else:
         D.extend_rings(mh, st.C, do_eval=False)
@@ -290,8 +278,6 @@ def _prepare(gb) -> Optional["_State"]:
     st = _State(uid=gb.uids[0], C=C, base=C, anchor=anchor)
     s = _sampler_of(gb)
     st.sample = bool(s is not None and getattr(s, "temp", None) == 1.0)
-    _tp = getattr(s, "top_p", 1.0) if s is not None else 1.0
-    st.top_p = 1.0 if (_tp is None or _tp == 0.0) else float(_tp)
     R.D.reset_rings()
     for t in R.D.TAPS: t.clear()
     st.queue.append((anchor, None, "init"))
@@ -431,22 +417,3 @@ def _snapshot_async(cache):
         snaps.append((lf, d))
     mx.async_eval(*todo)
     return snaps
-
-
-def _nucleus(P, p):
-    """Top-p truncate + renormalize per row, in-graph.
-
-    Lossless-speculation note: applying the nucleus to the TARGET only is
-    exact — draft tokens outside the target nucleus get q=0 and auto-reject;
-    residual max(q-p,0)/Z and bonus/correction sampling already use the
-    truncated q. The draft distribution needs no masking for correctness.
-    """
-    import mlx.core as mx
-    order = mx.argsort(-P, axis=-1)
-    Ps = mx.take_along_axis(P, order, axis=-1)
-    cs = mx.cumsum(Ps, axis=-1)
-    keep_sorted = (cs - Ps) < p            # include the crossing token
-    inv = mx.argsort(order, axis=-1)
-    keep = mx.take_along_axis(keep_sorted, inv, axis=-1)
-    Pm = mx.where(keep, P, mx.zeros_like(P))
-    return Pm / mx.maximum(Pm.sum(axis=-1, keepdims=True), 1e-30)
