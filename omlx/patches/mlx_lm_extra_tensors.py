@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Patch mlx-lm's weight-shard glob to pick up indexed MTP sidecar files.
+"""Patch mlx-lm's weight-shard glob to pick up MTP sidecar files.
 
 ``mlx_lm.utils.load_model`` discovers weight shards with
 ``glob.glob(str(model_path / "model*.safetensors"))``. MTPLX-forge exports
@@ -14,8 +14,8 @@ missing the mtp.* tensors" even though the checkpoint has them (issue
 Fix: replace the ``glob`` name ``mlx_lm.utils`` resolves at call time with a
 thin proxy. Every pattern except the ``model*.safetensors`` shard-discovery
 call passes straight through to the real ``glob.glob``; that one call gets
-augmented with sidecar files referenced by ``mtp.*``-prefixed keys in the
-model's safetensors index.
+augmented with sidecar files declared by that model's config or referenced by
+``mtp.*``-prefixed keys in its safetensors index.
 
 This is distinct from issue #1944 / PR #1962, which fix the Native MTP
 *compatibility check* (``_checkpoint_has_mtp_weights`` /
@@ -29,11 +29,10 @@ from __future__ import annotations
 import glob as _glob_module
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-_EXTRA_TENSOR_FILES: list[str] = []
 
 _MTP_INDEX_PREFIXES = (
     "mtp.",
@@ -43,58 +42,61 @@ _MTP_INDEX_PREFIXES = (
 )
 
 
-def set_extra_tensor_files(files: list[str]) -> None:
-    """Set the process-wide sidecar file list for the next ``mlx_lm.load()``.
-
-    Same construction-time-flag pattern as ``mlx_lm_mtp.set_mtp_active``:
-    the caller resets this to ``[]`` before every load so a model without a
-    sidecar isn't polluted by a prior load's file list.
-    """
-    global _EXTRA_TENSOR_FILES
-    _EXTRA_TENSOR_FILES = list(files)
-
-
-def get_extra_tensor_files() -> list[str]:
-    return list(_EXTRA_TENSOR_FILES)
-
-
 def sidecar_files_for(model_path: str | Path) -> list[str]:
     """Return absolute paths of safetensors sidecars holding mtp.* weights.
 
-    Reads ``model.safetensors.index.json``'s ``weight_map``, collects the
-    distinct filenames backing ``mtp.*``-prefixed keys, and drops any that
-    already match mlx-lm's own ``model*.safetensors`` glob (no need to add
-    those — mlx-lm finds them on its own).
+    Merges ``config.json``'s ``mlx_lm_extra_tensors.mtp_file`` with filenames
+    backing ``mtp.*``-prefixed keys in ``model.safetensors.index.json``. Drops
+    exact files already matched by mlx-lm's own ``model*.safetensors`` glob.
 
-    Returns ``[]`` when there's no index, the index is unreadable, or every
-    mtp.* key already lives in a ``model*.safetensors`` shard.
+    Returns ``[]`` when neither source declares an MTP sidecar or every
+    declared file is already covered by mlx-lm's shard glob.
     """
     p = Path(model_path)
-    index_path = p / "model.safetensors.index.json"
-    if not index_path.exists():
-        return []
-    try:
-        weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
-    except Exception as e:
-        logger.debug("Failed to read %s for sidecar scan: %s", index_path, e)
-        return []
+    sidecar_names: set[str] = set()
 
-    sidecar_names = {
-        fname
-        for key, fname in weight_map.items()
-        if isinstance(key, str)
-        and key.startswith(_MTP_INDEX_PREFIXES)
-        and isinstance(fname, str)
-    }
+    config_path = p / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text())
+            extra_tensors = config.get("mlx_lm_extra_tensors")
+            if isinstance(extra_tensors, dict):
+                mtp_file = extra_tensors.get("mtp_file")
+                if isinstance(mtp_file, str) and mtp_file:
+                    sidecar_names.add(mtp_file)
+        except Exception as e:
+            logger.debug("Failed to read %s for sidecar scan: %s", config_path, e)
+
+    index_path = p / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
+            sidecar_names.update(
+                fname
+                for key, fname in weight_map.items()
+                if isinstance(key, str)
+                and key.startswith(_MTP_INDEX_PREFIXES)
+                and isinstance(fname, str)
+            )
+        except Exception as e:
+            logger.debug("Failed to read %s for sidecar scan: %s", index_path, e)
+
     if not sidecar_names:
         return []
 
+    model_root = Path(os.path.abspath(p))
     already_covered = {
-        Path(f).name for f in _glob_module.glob(str(p / "model*.safetensors"))
+        Path(os.path.abspath(f))
+        for f in _glob_module.glob(str(model_root / "model*.safetensors"))
     }
-    return sorted(
-        str(p / fname) for fname in sidecar_names if fname not in already_covered
-    )
+    sidecars = {
+        path
+        for fname in sidecar_names
+        if (path := Path(os.path.abspath(model_root / fname))).is_relative_to(
+            model_root
+        )
+    }
+    return sorted(str(path) for path in sidecars if path not in already_covered)
 
 
 class _GlobProxy:
@@ -110,9 +112,14 @@ class _GlobProxy:
 
     def glob(self, pattern, *args, **kwargs):
         matches = _glob_module.glob(pattern, *args, **kwargs)
-        if pattern.endswith("model*.safetensors") and _EXTRA_TENSOR_FILES:
+        try:
+            pattern_path = Path(pattern)
+        except TypeError:
+            return matches
+        if pattern_path.name == "model*.safetensors":
+            sidecars = sidecar_files_for(pattern_path.parent)
             existing = set(matches)
-            matches = matches + [f for f in _EXTRA_TENSOR_FILES if f not in existing]
+            matches = matches + [f for f in sidecars if f not in existing]
         return matches
 
     def __getattr__(self, name):

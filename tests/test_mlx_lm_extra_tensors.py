@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the MTP sidecar glob patch (issue #2062).
 
-Covers ``sidecar_files_for`` (index scan), the process-wide file-list
-flag, ``_GlobProxy`` (augmented glob), ``apply()`` (idempotent install),
-and the ``maybe_apply_pre_load_patches`` dispatch wiring.
+Covers ``sidecar_files_for`` (config + index scan), model-scoped
+``_GlobProxy`` augmentation, ``apply()`` (idempotent install), and the
+``maybe_apply_pre_load_patches`` dispatch wiring.
 """
 
 from __future__ import annotations
@@ -15,17 +15,14 @@ import pytest
 from omlx.patches import mlx_lm_extra_tensors as extra_tensors
 
 
-@pytest.fixture(autouse=True)
-def _reset_extra_tensor_files():
-    extra_tensors.set_extra_tensor_files([])
-    yield
-    extra_tensors.set_extra_tensor_files([])
-
-
 def _write_index(tmp_path, weight_map: dict) -> None:
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map})
     )
+
+
+def _write_config(tmp_path, config: dict) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(config))
 
 
 class TestSidecarFilesFor:
@@ -34,6 +31,10 @@ class TestSidecarFilesFor:
 
     def test_returns_empty_on_malformed_index(self, tmp_path):
         (tmp_path / "model.safetensors.index.json").write_text("{not valid")
+        assert extra_tensors.sidecar_files_for(tmp_path) == []
+
+    def test_returns_empty_on_malformed_config(self, tmp_path):
+        (tmp_path / "config.json").write_text("{not valid")
         assert extra_tensors.sidecar_files_for(tmp_path) == []
 
     def test_returns_empty_when_no_mtp_keys(self, tmp_path):
@@ -69,6 +70,58 @@ class TestSidecarFilesFor:
                 str(tmp_path / "mtp.safetensors")
             ]
 
+    def test_finds_nested_sidecar_declared_by_config(self, tmp_path):
+        _write_config(
+            tmp_path,
+            {
+                "mlx_lm_extra_tensors": {
+                    "mtp_file": "mtp/weights.safetensors",
+                    "mtp_tensor_count": 15,
+                }
+            },
+        )
+        assert extra_tensors.sidecar_files_for(tmp_path) == [
+            str(tmp_path / "mtp" / "weights.safetensors")
+        ]
+
+    def test_merges_and_deduplicates_config_and_index_sidecars(self, tmp_path):
+        _write_config(
+            tmp_path,
+            {"mlx_lm_extra_tensors": {"mtp_file": "mtp/weights.safetensors"}},
+        )
+        _write_index(
+            tmp_path,
+            {
+                "mtp.fc.weight": "mtp/weights.safetensors",
+                "mtp.norm.weight": "mtp-extra.safetensors",
+            },
+        )
+        assert extra_tensors.sidecar_files_for(tmp_path) == [
+            str(tmp_path / "mtp-extra.safetensors"),
+            str(tmp_path / "mtp" / "weights.safetensors"),
+        ]
+
+    @pytest.mark.parametrize(
+        "extra_config",
+        [
+            None,
+            "mtp.safetensors",
+            {"mtp_file": None},
+            {"mtp_file": 123},
+            {"mtp_file": ""},
+        ],
+    )
+    def test_ignores_invalid_config_declaration(self, tmp_path, extra_config):
+        _write_config(tmp_path, {"mlx_lm_extra_tensors": extra_config})
+        assert extra_tensors.sidecar_files_for(tmp_path) == []
+
+    def test_ignores_sidecar_path_outside_model_directory(self, tmp_path):
+        _write_config(
+            tmp_path,
+            {"mlx_lm_extra_tensors": {"mtp_file": "../outside.safetensors"}},
+        )
+        assert extra_tensors.sidecar_files_for(tmp_path) == []
+
     def test_ignores_mtp_keys_already_in_a_model_shard(self, tmp_path):
         # mlx-lm's own glob already covers this file; don't duplicate it.
         (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"")
@@ -97,21 +150,6 @@ class TestSidecarFilesFor:
         assert extra_tensors.sidecar_files_for(tmp_path) == []
 
 
-class TestExtraTensorFilesFlag:
-    def test_default_is_empty(self):
-        assert extra_tensors.get_extra_tensor_files() == []
-
-    def test_set_and_get_roundtrip(self):
-        extra_tensors.set_extra_tensor_files(["/a/mtp.safetensors"])
-        assert extra_tensors.get_extra_tensor_files() == ["/a/mtp.safetensors"]
-
-    def test_get_returns_a_copy(self):
-        extra_tensors.set_extra_tensor_files(["/a/mtp.safetensors"])
-        files = extra_tensors.get_extra_tensor_files()
-        files.append("/b/other.safetensors")
-        assert extra_tensors.get_extra_tensor_files() == ["/a/mtp.safetensors"]
-
-
 class TestGlobProxy:
     def test_passthrough_for_unrelated_pattern(self, tmp_path):
         (tmp_path / "config.json").write_text("{}")
@@ -122,7 +160,7 @@ class TestGlobProxy:
         (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"")
         sidecar = str(tmp_path / "mtp.safetensors")
         (tmp_path / "mtp.safetensors").write_bytes(b"")
-        extra_tensors.set_extra_tensor_files([sidecar])
+        _write_index(tmp_path, {"mtp.fc.weight": "mtp.safetensors"})
 
         proxy = extra_tensors._GlobProxy()
         matches = proxy.glob(str(tmp_path / "model*.safetensors"))
@@ -131,7 +169,7 @@ class TestGlobProxy:
             sidecar,
         }
 
-    def test_no_augmentation_when_flag_empty(self, tmp_path):
+    def test_no_augmentation_when_model_has_no_sidecars(self, tmp_path):
         (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"")
         proxy = extra_tensors._GlobProxy()
         matches = proxy.glob(str(tmp_path / "model*.safetensors"))
@@ -140,11 +178,32 @@ class TestGlobProxy:
     def test_does_not_duplicate_a_match_already_found(self, tmp_path):
         shard = tmp_path / "model-00001-of-00001.safetensors"
         shard.write_bytes(b"")
-        extra_tensors.set_extra_tensor_files([str(shard)])
+        _write_index(tmp_path, {"mtp.fc.weight": shard.name})
 
         proxy = extra_tensors._GlobProxy()
         matches = proxy.glob(str(tmp_path / "model*.safetensors"))
         assert matches == [str(shard)]
+
+    def test_resolves_sidecars_from_each_pattern_model_directory(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        target_shard = target / "model.safetensors"
+        target_shard.write_bytes(b"")
+        target_sidecar = target / "mtp.safetensors"
+        target_sidecar.write_bytes(b"")
+        _write_index(target, {"mtp.fc.weight": target_sidecar.name})
+
+        draft = tmp_path / "draft"
+        draft.mkdir()
+        draft_shard = draft / "model.safetensors"
+        draft_shard.write_bytes(b"")
+
+        proxy = extra_tensors._GlobProxy()
+        assert set(proxy.glob(str(target / "model*.safetensors"))) == {
+            str(target_shard),
+            str(target_sidecar),
+        }
+        assert proxy.glob(str(draft / "model*.safetensors")) == [str(draft_shard)]
 
     def test_getattr_delegates_to_real_glob_module(self):
         proxy = extra_tensors._GlobProxy()
@@ -213,7 +272,7 @@ class TestApply:
         original_glob = mlx_lm_utils.glob
         try:
             extra_tensors.apply()
-            extra_tensors.set_extra_tensor_files([str(sidecar)])
+            _write_index(tmp_path, {"mtp.fc.weight": sidecar.name})
             matches = mlx_lm_utils.glob.glob(str(tmp_path / "model*.safetensors"))
             assert str(sidecar) in matches
         finally:
@@ -223,7 +282,13 @@ class TestApply:
 class TestMaybeApplyPreLoadPatchesDispatch:
     """Integration: the loader-level dispatch in model_loading.py."""
 
-    def _write_mtp_model(self, tmp_path, *, sidecar: bool):
+    def _write_mtp_model(
+        self,
+        tmp_path,
+        *,
+        indexed_sidecar: bool = False,
+        config_sidecar: str | None = None,
+    ):
         config = {
             "model_type": "qwen3_5_moe",
             "architectures": ["Qwen3_5MoeForConditionalGeneration"],
@@ -233,42 +298,121 @@ class TestMaybeApplyPreLoadPatchesDispatch:
                 "num_hidden_layers": 2,
             },
         }
-        (tmp_path / "config.json").write_text(json.dumps(config))
+        if config_sidecar is not None:
+            config["mlx_lm_extra_tensors"] = {"mtp_file": config_sidecar}
+        _write_config(tmp_path, config)
         weight_map = {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"}
         (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"")
-        if sidecar:
+        if indexed_sidecar:
             weight_map["mtp.fc.weight"] = "mtp.safetensors"
             (tmp_path / "mtp.safetensors").write_bytes(b"")
+        if config_sidecar is not None:
+            sidecar_path = tmp_path / config_sidecar
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            sidecar_path.write_bytes(b"")
         _write_index(tmp_path, weight_map)
 
-    def test_registers_sidecar_for_mtp_model(self, tmp_path):
+    def test_installs_proxy_for_indexed_sidecar(self, tmp_path):
         from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-        self._write_mtp_model(tmp_path, sidecar=True)
-        maybe_apply_pre_load_patches(str(tmp_path))
-        assert extra_tensors.get_extra_tensor_files() == [
-            str(tmp_path / "mtp.safetensors")
-        ]
+        try:
+            from mlx_lm import utils as mlx_lm_utils
+        except ImportError:
+            pytest.skip("mlx-lm not importable")
 
-    def test_no_sidecar_registered_when_index_has_no_extra_files(self, tmp_path):
+        self._write_mtp_model(tmp_path, indexed_sidecar=True)
+        original_glob = mlx_lm_utils.glob
+        try:
+            maybe_apply_pre_load_patches(str(tmp_path))
+            matches = mlx_lm_utils.glob.glob(str(tmp_path / "model*.safetensors"))
+            assert str(tmp_path / "mtp.safetensors") in matches
+        finally:
+            mlx_lm_utils.glob = original_glob
+
+    def test_installs_proxy_for_config_declared_nested_sidecar(self, tmp_path):
         from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-        self._write_mtp_model(tmp_path, sidecar=False)
-        maybe_apply_pre_load_patches(str(tmp_path))
-        assert extra_tensors.get_extra_tensor_files() == []
+        try:
+            from mlx_lm import utils as mlx_lm_utils
+        except ImportError:
+            pytest.skip("mlx-lm not importable")
 
-    def test_flag_resets_between_loads(self, tmp_path):
-        """A model without MTP heads must not inherit a prior sidecar list."""
+        self._write_mtp_model(tmp_path, config_sidecar="mtp/weights.safetensors")
+        original_glob = mlx_lm_utils.glob
+        try:
+            maybe_apply_pre_load_patches(str(tmp_path))
+            matches = mlx_lm_utils.glob.glob(str(tmp_path / "model*.safetensors"))
+            assert str(tmp_path / "mtp" / "weights.safetensors") in matches
+        finally:
+            mlx_lm_utils.glob = original_glob
+
+    def test_target_sidecar_does_not_leak_into_specprefill_draft(
+        self, tmp_path, monkeypatch
+    ):
+        """Second mlx-lm load stays scoped without a second pre-load dispatch."""
         from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-        mtp_dir = tmp_path / "mtp_model"
-        mtp_dir.mkdir()
-        self._write_mtp_model(mtp_dir, sidecar=True)
-        maybe_apply_pre_load_patches(str(mtp_dir))
-        assert extra_tensors.get_extra_tensor_files() != []
+        try:
+            from mlx_lm import utils as mlx_lm_utils
+        except ImportError:
+            pytest.skip("mlx-lm not importable")
 
-        plain_dir = tmp_path / "plain_model"
-        plain_dir.mkdir()
-        (plain_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
-        maybe_apply_pre_load_patches(str(plain_dir))
-        assert extra_tensors.get_extra_tensor_files() == []
+        target = tmp_path / "target"
+        target.mkdir()
+        self._write_mtp_model(target, indexed_sidecar=True)
+
+        draft = tmp_path / "draft"
+        draft.mkdir()
+        draft_shard = draft / "model.safetensors"
+        draft_shard.write_bytes(b"")
+        _write_config(draft, {"model_type": "llama"})
+
+        class FakeModelArgs:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel:
+            def __init__(self, args):
+                self.loaded_weights = []
+
+            def eval(self):
+                pass
+
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = list(weights)
+
+        loaded_files = []
+        monkeypatch.setattr(
+            mlx_lm_utils.mx,
+            "load",
+            lambda path: loaded_files.append(str(path)) or {},
+        )
+
+        def get_model_classes(config):
+            return FakeModel, FakeModelArgs
+
+        original_glob = mlx_lm_utils.glob
+        try:
+            maybe_apply_pre_load_patches(str(target))
+            mlx_lm_utils.load_model(
+                target,
+                lazy=True,
+                get_model_classes=get_model_classes,
+            )
+            target_files = set(loaded_files)
+
+            loaded_files.clear()
+            mlx_lm_utils.load_model(
+                draft,
+                lazy=True,
+                get_model_classes=get_model_classes,
+            )
+
+            assert target_files == {
+                str(target / "model-00001-of-00001.safetensors"),
+                str(target / "mtp.safetensors"),
+            }
+            assert loaded_files == [str(draft_shard)]
+        finally:
+            mlx_lm_utils.glob = original_glob
