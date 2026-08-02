@@ -320,7 +320,7 @@
                                         <div class="mt-1.5 ml-5 space-y-1">
                                             <template x-if="m.dflash.speculation && m.dflash.speculation.last">
                                                 <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-neutral-400">
-                                                    <span class="font-medium text-neutral-500">DFlash</span>
+                                                    <span class="font-medium text-neutral-500">{{ t('status.active_models.dflash_label') }}</span>
                                                     <span x-show="m.dflash.speculation.last.fallback_ar"
                                                           x-text="window.t('status.active_models.dflash_fallback_ar') + (m.dflash.speculation.last.fallback_reason ? ' · ' + m.dflash.speculation.last.fallback_reason : '')"></span>
                                                     <span x-show="!m.dflash.speculation.last.fallback_ar"

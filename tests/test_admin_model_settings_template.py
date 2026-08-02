@@ -1,5 +1,6 @@
 """Regression tests for admin model-settings UI gates."""
 
+import json
 from pathlib import Path
 
 
@@ -8,6 +9,11 @@ def _model_settings_template() -> str:
     return (
         root / "omlx/admin/templates/dashboard/_modal_model_settings.html"
     ).read_text()
+
+
+def _status_template() -> str:
+    root = Path(__file__).resolve().parents[1]
+    return (root / "omlx/admin/templates/dashboard/_status.html").read_text()
 
 
 def _section(html: str, start_marker: str, end_marker: str) -> str:
@@ -52,3 +58,35 @@ def test_reasoning_effort_offers_max_after_high():
     assert high_option in html
     assert max_option in html
     assert html.index(high_option) < html.index(max_option)
+
+
+def test_model_settings_feature_labels_use_i18n_keys():
+    modal_html = _model_settings_template()
+    status_html = _status_template()
+
+    assert "{{ t('modal.model_settings.reasoning_parser') }}" in modal_html
+    assert "{{ t('modal.model_settings.specprefill') }}" in modal_html
+    assert "{{ t('modal.model_settings.dflash') }}" in modal_html
+    assert "{{ t('status.active_models.dflash_label') }}" in status_html
+
+    assert ">Reasoning Parser</label>" not in modal_html
+    assert ">SpecPrefill</span>" not in modal_html
+    assert ">DFlash</span>" not in modal_html
+    assert ">DFlash</span>" not in status_html
+
+
+def test_model_settings_feature_i18n_keys_exist_in_english_and_chinese():
+    root = Path(__file__).resolve().parents[1]
+    keys = {
+        "modal.model_settings.reasoning_parser",
+        "modal.model_settings.specprefill",
+        "modal.model_settings.dflash",
+        "status.active_models.dflash_label",
+    }
+
+    for language in ("en", "zh"):
+        translations = json.loads(
+            (root / f"omlx/admin/i18n/{language}.json").read_text()
+        )
+        missing_keys = keys - translations.keys()
+        assert not missing_keys, f"{language}.json is missing {sorted(missing_keys)}"
