@@ -253,6 +253,8 @@ def _run_cycle(gb, st):
             D.extend_rings(mh[:, :k + 1], st.C, do_eval=False)
         else:
             st.resto += 1
+            if snaps is None:
+                raise _Fallback("trim failed with snapshot elided (OMLX_DSPARK_SNAPSHOT=1 restores per-cycle insurance)")
             dd._restore(snaps)
             for t in D.TAPS: t.clear()
             if k + 1 >= 5:
@@ -413,8 +415,17 @@ def enable() -> bool:
     return True
 
 
+_SNAP_ELIDE_LOGGED = False
+
 def _snapshot_async(cache):
     """Detached cache snapshot; async_eval keeps FIFO ordering ahead of verify writes (no host stall)."""
+    import os as _os
+    if _os.environ.get("OMLX_DSPARK_SNAPSHOT", "0") != "1":
+        global _SNAP_ELIDE_LOGGED
+        if not _SNAP_ELIDE_LOGGED:
+            logger.info("dspark: per-cycle cache snapshot ELIDED (restore fired 0x in project history; OMLX_DSPARK_SNAPSHOT=1 restores)")
+            _SNAP_ELIDE_LOGGED = True
+        return None
     import mlx.core as mx
     dd = _dd()
     snaps, todo = [], []

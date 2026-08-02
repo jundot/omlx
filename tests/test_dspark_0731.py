@@ -93,6 +93,9 @@ def test_snapshot_async_copy_semantics(monkeypatch):
                                  stack=[mx.ones((3,)), "tag"])
     stub = types.SimpleNamespace(_leaves=lambda cache: [leaf])
     monkeypatch.setattr(dg, "_DD", stub)
+    monkeypatch.delenv("OMLX_DSPARK_SNAPSHOT", raising=False)
+    assert dg._snapshot_async(object()) is None   # default contract: elided (commit 13)
+    monkeypatch.setenv("OMLX_DSPARK_SNAPSHOT", "1")
     (lf, d), = dg._snapshot_async(object())
     assert lf is leaf and d["meta"] == 7
     assert d["keys"] is not leaf.keys and bool(mx.array_equal(d["keys"], leaf.keys))
