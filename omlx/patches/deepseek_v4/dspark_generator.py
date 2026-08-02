@@ -127,10 +127,106 @@ def _eligible(gb) -> bool:
         return True
     return False
 
+
+
+_EAGER = {"future": None, "building": False}
+
+def _eager_materialize(R):
+    """Force-evaluate every array the runner owns (mx.eval pass only).
+    Lazy compute nodes (mtp loads, lm_head requant) become concrete,
+    thread-portable buffers; left lazy they bind to the building thread's
+    stream (s95: Stream(cpu,1) on the inference thread). Measured clean in
+    s96: 0 errors, DSPARK[0] on request one, isolated tax 1.1 s. Deliberately
+    NO warmup draft (s97: crashed and poisoned the runner - breaker-capped)
+    and NO force-touch (page cache measured warm; cold boot may pay page-in
+    on the first request - still <= lazy)."""
+    import inspect as _ins
+    import mlx.core as mx
+    prune = {id(getattr(R, "model", None)), id(getattr(R, "tokenizer", None))}
+    seen, arrs = set(), []
+    def walk(o, d):
+        if o is None or id(o) in seen or id(o) in prune or d > 5:
+            return
+        seen.add(id(o))
+        if isinstance(o, mx.array):
+            arrs.append(o); return
+        if _ins.ismodule(o) or _ins.isclass(o) or _ins.isroutine(o):
+            return
+        if isinstance(o, (list, tuple, set)):
+            for v in o: walk(v, d + 1)
+            return
+        if isinstance(o, dict):
+            for v in o.values(): walk(v, d + 1)
+            return
+        dd_ = getattr(o, "__dict__", None)
+        if dd_:
+            for v in dd_.values(): walk(v, d + 1)
+    walk(R, 0)
+    if arrs:
+        mx.eval(*arrs)
+    return len(arrs), sum(int(a.nbytes) for a in arrs)
+
+def _install_eager_init():
+    import os as _os
+    if not _os.environ.get("OMLX_DSPARK_SPEC"):
+        return
+    if _os.environ.get("OMLX_DSPARK_EAGER_INIT", "1") == "0":
+        return
+    try:
+        from omlx.utils import model_loading as _ml
+        if getattr(_ml, "_omlx_dspark_eager", False):
+            return
+        _orig = _ml.apply_post_load_transforms
+        def _wrapped(model, *a, **kw):
+            out = _orig(model, *a, **kw)
+            try:
+                mm = out if out is not None else model
+                inner = getattr(mm, "model", None)
+                if inner is not None and "deepseek_v4" in type(inner).__module__ and _EAGER["future"] is None:
+                    ex = None
+                    for _ip in ("omlx.engine_core", "omlx.engine.engine_core"):
+                        try:
+                            ex = __import__(_ip, fromlist=["get_mlx_executor"]).get_mlx_executor()
+                            break
+                        except Exception:
+                            continue
+                    if ex is None:
+                        logger.info("dspark: eager init skipped (mlx executor not found; lazy build remains)")
+                    else:
+                        def _task(mm=mm):
+                            _EAGER["building"] = True
+                            try:
+                                R = _runner(type("GB", (), {"model": mm}))
+                                try:
+                                    n, nb = _eager_materialize(R)
+                                    logger.info("dspark: eager-materialized %d arrays (%.2f GB)", n, nb / 1e9)
+                                except Exception as _me:
+                                    logger.warning("dspark: eager materialize skipped: %r", _me)
+                                return R
+                            finally:
+                                _EAGER["building"] = False
+                        _EAGER["future"] = ex.submit(_task)
+                        logger.info("dspark: eager SpecRunner build submitted at model load")
+            except Exception as e:
+                logger.warning("dspark: eager init skipped: %r", e)
+            return out
+        _ml.apply_post_load_transforms = _wrapped
+        _ml._omlx_dspark_eager = True
+    except Exception as e:
+        logger.warning("dspark: eager init hook not installed: %r", e)
+
 def _runner(gb):
     global _RUNNER
     m = gb.model
     if _RUNNER is not None and _RUNNER.model is m: return _RUNNER
+    if _RUNNER is None and _EAGER.get("future") is not None and not _EAGER.get("building"):
+        try:
+            _EAGER["future"].result()
+        except Exception as _e:
+            logger.warning("dspark: eager build failed, building lazily: %r", _e)
+        _EAGER["future"] = None
+        if _RUNNER is not None and _RUNNER.model is m:
+            return _RUNNER
     _t0 = time.perf_counter()
     dd = _dd()
     mdir = os.environ["OMLX_DSPARK_SPEC"]
@@ -433,6 +529,7 @@ def enable() -> bool:
     GenerationBatch.filter = patched_filter
     GenerationBatch._omlx_dspark_patched = True
     logger.info("dspark: GenerationBatch wraps installed")
+    _install_eager_init()
     return True
 
 
