@@ -85,6 +85,17 @@ class DeleteSubKeyRequest(BaseModel):
     key: str
 
 
+class CodexInterceptorStartRequest(BaseModel):
+    """Start a process-scoped Codex desktop session backed by local oMLX."""
+
+    model: str
+    project: str | None = None
+    local_slot: str | None = None
+    context_window: int | None = Field(default=None, gt=0)
+    launch_app: bool = True
+    replace_existing: bool = False
+
+
 class CacheProbeRequest(BaseModel):
     """Request model for probing per-prompt cache state.
 
@@ -4480,6 +4491,97 @@ async def get_server_stats(
 async def get_server_activity(is_admin: bool = Depends(require_admin)):
     """Return lightweight current model and request activity for live displays."""
     return {"active_models": _build_active_models_data()}
+
+
+@router.get("/api/codex-interceptor/status")
+async def get_codex_interceptor_status(
+    is_admin: bool = Depends(require_admin),
+):
+    """Return metadata-only live routing and lifecycle state."""
+    from ..codex_interceptor import get_codex_interceptor_manager
+
+    return await asyncio.to_thread(get_codex_interceptor_manager().status)
+
+
+@router.get("/api/codex-interceptor/doctor")
+async def get_codex_interceptor_doctor(
+    is_admin: bool = Depends(require_admin),
+):
+    """Report prerequisites without launching or changing any process."""
+    from ..codex_interceptor import get_codex_interceptor_manager
+
+    return await asyncio.to_thread(get_codex_interceptor_manager().doctor)
+
+
+@router.post("/api/codex-interceptor/start")
+async def start_codex_interceptor(
+    request: CodexInterceptorStartRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start the proxy and launch a fresh Codex instance through it."""
+    from ..codex_interceptor import get_codex_interceptor_manager
+    from ..codex_interceptor.manager import (
+        DEFAULT_LOCAL_SLOT,
+        CodexInterceptorConfig,
+    )
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server settings are unavailable")
+    model = request.model.strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="A local model is required")
+    project = Path(request.project or str(Path.home())).expanduser()
+    host = "127.0.0.1"
+    port = int(global_settings.server.port)
+    api_key = global_settings.auth.api_key or ""
+    config = CodexInterceptorConfig(
+        model=model,
+        upstream_url=f"http://{host}:{port}/v1/responses",
+        api_key=api_key,
+        auth_header=bool(api_key),
+        project=project,
+        local_slot=(request.local_slot or DEFAULT_LOCAL_SLOT).strip()
+        or DEFAULT_LOCAL_SLOT,
+        local_label=f"Local · oMLX · {model.rsplit('/', 1)[-1]}",
+        context_window=request.context_window,
+        launch_app=request.launch_app,
+        replace_existing=request.replace_existing,
+    )
+    try:
+        manager = get_codex_interceptor_manager()
+        status = await asyncio.to_thread(manager.start, config)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    engine_pool = _get_engine_pool()
+    session_id = status.get("session_id")
+
+    async def warm_selected_model() -> None:
+        if engine_pool is None:
+            manager.set_warmup_status(session_id, "unavailable")
+            return
+        try:
+            await engine_pool.get_engine(model)
+            manager.set_warmup_status(session_id, "ready")
+        except Exception:
+            logger.exception("Codex interceptor model warm-up failed")
+            manager.set_warmup_status(session_id, "failed")
+
+    asyncio.create_task(warm_selected_model())
+    return status
+
+
+@router.post("/api/codex-interceptor/stop")
+async def stop_codex_interceptor(
+    is_admin: bool = Depends(require_admin),
+):
+    """Gracefully close the managed Codex instance and its proxy."""
+    from ..codex_interceptor import get_codex_interceptor_manager
+
+    return await asyncio.to_thread(get_codex_interceptor_manager().stop)
 
 
 def _build_active_models_data() -> dict:

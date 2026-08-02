@@ -154,6 +154,12 @@ paroquant = [
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
     "paroquant==0.1.16; python_version >= '3.11'",
 ]
+codex-interceptor = [
+    # Transparent, process-scoped HTTPS interception for the native Codex
+    # integration. Kept optional for headless/library installs.
+    # v12 requires Python 3.12; the app bundle embeds Python 3.11.
+    "mitmproxy>=11,<12",
+]
 # Internal extra consumed by packaging/build.py to populate the
 # venvstacks mlx-base layer's requirements list. Listed here as the
 # single source of truth so the layer-template venvstacks.toml stays
@@ -169,6 +175,7 @@ paroquant = [
 bundle = [
     "mcp>=1.5.0",
     "modelscope>=1.10.0",
+    "mitmproxy>=11,<12",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
     "librosa>=0.10.0",

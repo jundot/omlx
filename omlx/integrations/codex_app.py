@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Codex App (OpenAI Codex App Desktop) integration.
 
-This integration launches the Codex App Desktop GUI/TUI via the
-``codex app`` subcommand, while sharing the same config file as
-the CLI variant (``~/.codex/config.toml``).
+This integration launches a fresh Codex desktop process through oMLX's
+transparent local-inference proxy. It intentionally leaves
+``~/.codex/config.toml`` byte-for-byte unchanged.
 
 OpenAI renamed the desktop app from Codex to ChatGPT. In-place
 upgrades keep the old ``/Applications/Codex.app`` folder name while
@@ -16,11 +16,8 @@ is on PATH (DMG-only installs).
 Usage:
     omlx launch codex_app --model qwen3.5
 
-Which launches:
-    codex app
-
-Both CLI and App use the same config file:
-    ~/.codex/config.toml
+The normal signed-in Codex provider, projects and feature surface are retained;
+only the selected Responses model slot is routed to local inference.
 """
 
 from __future__ import annotations
@@ -30,8 +27,9 @@ import plistlib
 import shutil
 from pathlib import Path
 
+from omlx.codex_interceptor.manager import CodexInterceptorManager
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.integrations.codex import CODEX_CONFIG_PATH, write_codex_config
+from omlx.integrations.codex import CODEX_CONFIG_PATH, interceptor_config
 from omlx.utils.install import get_cli_command_prefix
 
 CODEX_APP_BUNDLE_ID = "com.openai.codex"
@@ -77,7 +75,7 @@ def resolve_codex_binary() -> str | None:
 
 
 class CodexAppIntegration(Integration):
-    """Codex App Desktop integration that configures ~/.codex/config.toml for oMLX."""
+    """Codex desktop integration using a transparent, process-scoped proxy."""
 
     CONFIG_PATH = CODEX_CONFIG_PATH
 
@@ -85,7 +83,7 @@ class CodexAppIntegration(Integration):
         super().__init__(
             name="codex_app",
             display_name="Codex App",
-            type="config_file",
+            type="environment",
             install_check="codex",
             install_hint=(
                 "Install the ChatGPT (formerly Codex) desktop app, "
@@ -105,18 +103,8 @@ class CodexAppIntegration(Integration):
         )
 
     def configure(self, ctx: IntegrationContext) -> None:
-        write_codex_config(self.CONFIG_PATH, ctx)
+        return None
 
     def launch(self, ctx: IntegrationContext) -> None:
-        self.configure(ctx)
-
-        env = self._scrubbed_env()
-        env["OMLX_API_KEY"] = ctx.auth_token
-
-        # Launch codex app (desktop GUI/TUI) instead of codex CLI
-        # Note: codex app doesn't accept -m flag, model is set in config
-        codex_bin = resolve_codex_binary() or "codex"
-        args = [codex_bin, "app"]
-        args.extend(ctx.extra_args)
-
-        os.execvpe(codex_bin, args, env)
+        manager = CodexInterceptorManager()
+        raise SystemExit(manager.run_desktop(interceptor_config(ctx, launch_app=True)))
