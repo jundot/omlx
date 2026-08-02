@@ -205,7 +205,7 @@ def _run_cycle(gb, st):
     if ell == 0 and os.environ.get("OMLX_DSPARK_COOLDOWN"):
         st.cool = getattr(st, "cool", 0) + 1
     st.drafted += ell
-    snaps = dd._snapshot(cache) if ell > 0 else None
+    snaps = _snapshot_async(cache) if ell > 0 else None
     D.REC[0] = True; cr.set_undo_armed(ell > 0)
     vlog = gb.model(mx.array([[st.anchor] + d[:ell]]), cache=cache)
     cr.set_undo_armed(False); D.REC[0] = False
@@ -224,23 +224,24 @@ def _run_cycle(gb, st):
         while k < ell and usl[k] < min(1.0, ptl[k] / max(pdl[k], 1e-30)): k += 1
         if k < ell:
             resid = mx.maximum(PT[k] - PD[k], 0)
-            ssum = resid.sum(); mx.eval(ssum)
-            src = resid if float(ssum.item()) > 1e-9 else PT[k]
-            nxt = int(mx.random.categorical(mx.log(src + 1e-30)[None])[0].item())
+            src = mx.where(resid.sum() > 1e-9, resid, PT[k])
+            nxt_a = mx.random.categorical(mx.log(src + 1e-30)[None])[0]
         else:
-            nxt = int(mx.random.categorical(mx.log(PT[ell] + 1e-30)[None])[0].item())
+            nxt_a = mx.random.categorical(mx.log(PT[ell] + 1e-30)[None])[0]
+        nxt = -1
     else:
         tv = mx.argmax(vlog[0], axis=-1); mx.eval(tv)
         tv = [int(v) for v in tv.tolist()]
         k = 0
         while k < ell and tv[k] == d[k] and d[k] != EOS: k += 1
         nxt = tv[k] if k < ell else tv[ell]
+        nxt_a = None
     mh = D.take_taps()
     if k < ell:
         need = ell - k
         got = [lf.trim(need) for lf in dd._leaves(cache)]
         if all(g == need for g in got):
-            D.extend_rings(mh[:, :k + 1], st.C)
+            D.extend_rings(mh[:, :k + 1], st.C, do_eval=False)
         else:
             st.resto += 1
             dd._restore(snaps)
@@ -250,7 +251,13 @@ def _run_cycle(gb, st):
             D.REC[0] = False; mx.eval(rl)
             D.extend_rings(D.take_taps(), st.C)
     else:
-        D.extend_rings(mh, st.C)
+        D.extend_rings(mh, st.C, do_eval=False)
+    _tails = [L.ckv for L in D.stages if L.ckv is not None]
+    if st.sample and nxt < 0:
+        mx.eval(nxt_a, *_tails)
+        nxt = int(nxt_a.item())
+    else:
+        mx.eval(*_tails)
     for i in range(k):
         st.queue.append((d[i], None, "draft"))
         if d[i] == EOS: break
@@ -390,3 +397,23 @@ def enable() -> bool:
     GenerationBatch._omlx_dspark_patched = True
     logger.info("dspark: GenerationBatch wraps installed")
     return True
+
+
+def _snapshot_async(cache):
+    """Detached cache snapshot; async_eval keeps FIFO ordering ahead of verify writes (no host stall)."""
+    import mlx.core as mx
+    dd = _dd()
+    snaps, todo = [], []
+    for lf in dd._leaves(cache):
+        d = {}
+        for k, v in vars(lf).items():
+            if isinstance(v, mx.array):
+                v2 = v + 0; d[k] = v2; todo.append(v2)
+            elif isinstance(v, list):
+                d[k] = [(x + 0) if isinstance(x, mx.array) else x for x in v]
+                todo += [x for x in d[k] if isinstance(x, mx.array)]
+            else:
+                d[k] = v
+        snaps.append((lf, d))
+    mx.async_eval(*todo)
+    return snaps

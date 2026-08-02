@@ -103,12 +103,13 @@ class DSpark:
         return mh
     def reset_rings(self):
         for L in self.stages: L.ckv = None
-    def extend_rings(self, mh, start):
+    def extend_rings(self, mh, start, do_eval=True):
         mainx = rmsn(q8m(mh, *self.M.proj), self.M.norm)
         for L in self.stages:
             new = self.ROPE(rmsn(q8m(mainx, *L.wkv), L.kvn).reshape(1, 1, -1, 512), start)
             L.ckv = new if L.ckv is None else mx.concatenate([L.ckv, new], axis=2)
-        mx.eval(*[L.ckv for L in self.stages])
+        if do_eval:
+            mx.eval(*[L.ckv for L in self.stages])
     def _attn(self, L, xc, a):
         q = rmsn(q8m(xc, *L.wqa), L.qn)
         q = q8m(q, *L.wqb).reshape(1, BLK, 64, 512)
