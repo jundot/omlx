@@ -232,6 +232,13 @@ Search and download MLX models from HuggingFace directly in the admin dashboard.
 
 Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, and Pi directly from the admin dashboard with a single click. No manual config editing required.
 
+For Codex, the native **Codex Local Interceptor** lets you choose a local model
+and project, then starts a fresh Codex desktop session through a process-scoped
+loopback proxy. The selected Codex model slot runs through oMLX while other
+models and non-inference features continue to use OpenAI normally. oMLX never
+edits `~/.codex/config.toml`; the UI shows that invariant along with live
+local/cloud routing counts and latency.
+
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
 </p>
