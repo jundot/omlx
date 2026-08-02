@@ -317,3 +317,71 @@ def test_sync_async_snapshot_equivalence_temp1(rig):
     out_a, r_a = _sampled_run(rig, pt, 200, desync=True)
     assert out_s == out_a, "same-seed transcripts diverged between snapshot modes"
     assert r_s == r_a, f"restore counts differ: {r_s} vs {r_a}"
+
+
+@needs_model
+def test_topp_acceptance_certificate(rig):
+    """Top-p contract: output ≡ nucleus-sampled target distribution.
+
+    With acceptance min(1, qt(x)/p(x)) against the nucleus-truncated target qt,
+    the per-proposal accept probability is Σ_x min(p(x), qt(x)); pooled over a
+    run, realized acceptance must match that prediction within 2σ (binomial).
+    The draft stays unmasked — proposals outside the target nucleus get qt=0
+    and auto-reject, which the same identity prices in. Also checks nucleus
+    rows renormalize to unit mass.
+    """
+    import math
+    mx, model, R = rig.mx, rig.model, rig.R
+    TP = 0.95
+    probe = mx.softmax(mx.random.normal((4, 4096)).astype(mx.float32), axis=-1)
+    mass = dg._nucleus(probe, TP).sum(axis=-1); mx.eval(mass)
+    assert abs(float(mass.min().item()) - 1.0) < 1e-4
+    assert abs(float(mass.max().item()) - 1.0) < 1e-4
+
+    pt = rig.tok.encode("Write a detailed 800-word essay on the history of lighthouses.")
+    mx.random.seed(0)
+    cache, lg = _prefill_spec(rig, pt)
+    C = len(pt)
+    p0 = dg._nucleus(mx.softmax(lg[0, -1].astype(mx.float32), axis=-1)[None], TP)[0]
+    anchor = int(mx.random.categorical(mx.log(p0 + 1e-30)[None])[0].item())
+    out = [anchor]; EXP = []; ACC = []
+    while len(out) < 200 and out[-1] != R.eos:
+        d, cf, PD = R._draft(anchor, C, True)
+        ell = R.policy(cf)
+        snaps = dd._snapshot(cache) if ell > 0 else None
+        R.D.REC[0] = True; R.cr.set_undo_armed(ell > 0)
+        vlog = model(mx.array([[anchor] + d[:ell]]), cache=cache)
+        R.cr.set_undo_armed(False); R.D.REC[0] = False
+        PTn = dg._nucleus(mx.softmax(vlog[0].astype(mx.float32), axis=-1), TP)
+        if ell > 0:
+            idx = mx.array(d[:ell])
+            ptd = mx.take_along_axis(PTn[:ell], idx[:, None], -1)[:, 0]
+            pdd = mx.take_along_axis(PD[:ell], idx[:, None], -1)[:, 0]
+            ex = mx.minimum(PD[:ell], PTn[:ell]).sum(axis=-1)
+            us = mx.random.uniform(shape=(ell,))
+            mx.eval(ptd, pdd, ex, us)
+            ptl, pdl, exl, usl = ptd.tolist(), pdd.tolist(), ex.tolist(), us.tolist()
+        else:
+            ptl = pdl = exl = usl = []
+        k = 0
+        while k < ell and usl[k] < min(1.0, ptl[k] / max(pdl[k], 1e-30)): k += 1
+        for j in range(min(k + 1, ell)):
+            EXP.append(exl[j]); ACC.append(1 if j < k else 0)
+        if k < ell:
+            resid = mx.maximum(PTn[k] - PD[k], 0)
+            ssum = resid.sum(); mx.eval(ssum)
+            src = resid if float(ssum.item()) > 1e-9 else PTn[k]
+            nxt = int(mx.random.categorical(mx.log(src + 1e-30)[None])[0].item())
+        else:
+            nxt = int(mx.random.categorical(mx.log(PTn[ell] + 1e-30)[None])[0].item())
+        _finish_cycle(rig, cache, C, anchor, d, k, ell, snaps)
+        for tkn in d[:k]:
+            out.append(tkn)
+            if tkn == R.eos: break
+        if out[-1] != R.eos: out.append(nxt)
+        C += k + 1; anchor = out[-1]
+    assert len(EXP) >= 60, "run too short to certify"
+    r = sum(ACC) / len(ACC); e = sum(EXP) / len(EXP)
+    sig = math.sqrt(sum(x * (1 - x) for x in EXP)) / len(EXP)
+    assert abs(r - e) <= 2 * max(sig, 1e-9), \
+        "acceptance dev %+.3f exceeds 2 sigma=%.3f (n=%d)" % (r - e, 2 * sig, len(EXP))
