@@ -29,6 +29,13 @@ final class IntegrationsScreenVM {
 
     // Other integrations
     var codexModel: String = ""
+    var codexProject: String = UserDefaults.standard.string(
+        forKey: "omlx.codexInterceptor.project"
+    ) ?? FileManager.default.homeDirectoryForCurrentUser.path
+    var codexLocalSlot: String = "gpt-5.3-codex-spark"
+    private(set) var codexStatus: CodexInterceptorStatusDTO?
+    private(set) var codexDoctor: CodexInterceptorDoctorDTO?
+    private(set) var codexBusy = false
     var opencodeModel: String = ""
     var openclawModel: String = ""
     var piModel: String = ""
@@ -44,6 +51,7 @@ final class IntegrationsScreenVM {
     private(set) var mcpConfigLoaded: String = ""
 
     private(set) var availableModels: [String] = []
+    private var modelContextWindows: [String: Int] = [:]
     var lastError: String?
 
     // Server-resolved fields used by the command builders. Populated from
@@ -174,6 +182,10 @@ final class IntegrationsScreenVM {
             // Available models
             let models = try await client.listModels().models
             self.availableModels = models.map { $0.id }
+            self.modelContextWindows = Dictionary(uniqueKeysWithValues: models.compactMap { model in
+                let context = model.settings?.maxContextWindow ?? model.modelContextLength
+                return context.map { (model.id, $0) }
+            })
 
             // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the
@@ -187,8 +199,81 @@ final class IntegrationsScreenVM {
                 }
             }
             self.lastError = nil
+            await refreshCodex(client: client, includeDoctor: true)
         } catch {
             self.lastError = error.omlxDescription
+        }
+    }
+
+    var canStartCodex: Bool {
+        !codexBusy && !(codexStatus?.running ?? false) && !codexModel.isEmpty
+            && !codexProject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (codexDoctor?.ready ?? true)
+    }
+
+    var codexNeedsRestart: Bool {
+        !(codexStatus?.running ?? false) && (codexDoctor?.codexRunning ?? false)
+    }
+
+    func setCodexProject(_ path: String) {
+        codexProject = path
+        UserDefaults.standard.set(path, forKey: "omlx.codexInterceptor.project")
+    }
+
+    func refreshCodex(client: OMLXClient, includeDoctor: Bool = false) async {
+        do {
+            codexStatus = try await client.getCodexInterceptorStatus()
+            if includeDoctor || codexDoctor == nil || codexNeedsRestart {
+                codexDoctor = try await client.getCodexInterceptorDoctor()
+            }
+        } catch {
+            if includeDoctor { lastError = error.omlxDescription }
+        }
+    }
+
+    func monitorCodex(client: OMLXClient) async {
+        while !Task.isCancelled {
+            await refreshCodex(client: client)
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    func startCodex(client: OMLXClient, replaceExisting: Bool = false) async {
+        guard canStartCodex || replaceExisting else { return }
+        codexBusy = true
+        defer { codexBusy = false }
+        do {
+            codexStatus = try await client.startCodexInterceptor(
+                CodexInterceptorStartRequest(
+                    model: codexModel,
+                    project: codexProject,
+                    localSlot: codexLocalSlot,
+                    contextWindow: modelContextWindows[codexModel],
+                    launchApp: true,
+                    replaceExisting: replaceExisting
+                )
+            )
+            UserDefaults.standard.set(
+                codexProject,
+                forKey: "omlx.codexInterceptor.project"
+            )
+            codexDoctor = try? await client.getCodexInterceptorDoctor()
+            lastError = nil
+        } catch {
+            lastError = error.omlxDescription
+            await refreshCodex(client: client, includeDoctor: true)
+        }
+    }
+
+    func stopCodex(client: OMLXClient) async {
+        codexBusy = true
+        defer { codexBusy = false }
+        do {
+            codexStatus = try await client.stopCodexInterceptor()
+            codexDoctor = try? await client.getCodexInterceptorDoctor()
+            lastError = nil
+        } catch {
+            lastError = error.omlxDescription
         }
     }
 

@@ -81,6 +81,8 @@
 		9BB000000000000000000003 /* HFUploadDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000003 /* HFUploadDTO.swift */; };
 		9BB000000000000000000004 /* BenchDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000004 /* BenchDTO.swift */; };
 		9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000005 /* PresetBundleDTO.swift */; };
+		FBB000000000000000000001 /* CodexInterceptorDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCC000000000000000000001 /* CodexInterceptorDTO.swift */; };
+		FBB000000000000000000002 /* CodexInterceptorDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCC000000000000000000002 /* CodexInterceptorDTODecodeTests.swift */; };
 		9BB000000000000000000006 /* PresetBundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000006 /* PresetBundleStore.swift */; };
 		AACFCBE42FE115A200B224C0 /* ProgressBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = AACFCBE32FE115A200B224C0 /* ProgressBar.swift */; };
 		AAD9D5172FE283D100FAEA05 /* ServerScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5162FE283D100FAEA05 /* ServerScreenVM.swift */; };
@@ -222,6 +224,8 @@
 		9CC000000000000000000003 /* HFUploadDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFUploadDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000004 /* BenchDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000005 /* PresetBundleDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleDTO.swift; sourceTree = "<group>"; };
+		FCC000000000000000000001 /* CodexInterceptorDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexInterceptorDTO.swift; sourceTree = "<group>"; };
+		FCC000000000000000000002 /* CodexInterceptorDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexInterceptorDTODecodeTests.swift; sourceTree = "<group>"; };
 		9CC000000000000000000006 /* PresetBundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleStore.swift; sourceTree = "<group>"; };
 		AACFCBE32FE115A200B224C0 /* ProgressBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgressBar.swift; sourceTree = "<group>"; };
 		AAD9D5162FE283D100FAEA05 /* ServerScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVM.swift; sourceTree = "<group>"; };
@@ -335,6 +339,7 @@
 				DCC000000000000000000112 /* SystemStatsTests.swift */,
 				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
 				DCC000000000000000000901 /* BenchDTODecodeTests.swift */,
+				FCC000000000000000000002 /* CodexInterceptorDTODecodeTests.swift */,
 				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
 				DCC000000000000000000105 /* ThemeTests.swift */,
 				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
@@ -524,6 +529,7 @@
 				9CC000000000000000000003 /* HFUploadDTO.swift */,
 				9CC000000000000000000004 /* BenchDTO.swift */,
 				9CC000000000000000000005 /* PresetBundleDTO.swift */,
+				FCC000000000000000000001 /* CodexInterceptorDTO.swift */,
 				DCC000000000000000000101 /* ModelCardDTO.swift */,
 			);
 			path = DTO;
@@ -755,6 +761,7 @@
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB00000000000000000000A /* MSTaskDTO.swift in Sources */,
 				9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */,
+				FBB000000000000000000001 /* CodexInterceptorDTO.swift in Sources */,
 				DBB000000000000000000101 /* ModelCardDTO.swift in Sources */,
 				AAD9D51B2FE2841500FAEA05 /* LogsScreenVM.swift in Sources */,
 				DBB000000000000000000102 /* ModelCardSheet.swift in Sources */,
@@ -807,6 +814,7 @@
 				DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */,
 				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
 				DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */,
+				FBB000000000000000000002 /* CodexInterceptorDTODecodeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
