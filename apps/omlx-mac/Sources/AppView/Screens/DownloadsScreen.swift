@@ -39,6 +39,21 @@ struct DownloadsScreen: View {
                 msAvailable: vm.msAvailable
             )
 
+            if vm.source == .ms {
+                Aria2SettingsSection(
+                    installed: vm.aria2Installed,
+                    version: vm.aria2Version,
+                    installing: vm.aria2Installing,
+                    saving: vm.aria2Saving,
+                    proxyDisabled: vm.aria2ProxyDisabled,
+                    proxy: $vm.aria2Proxy,
+                    connectionsPerFile: $vm.aria2ConnectionsPerFile,
+                    concurrentFiles: $vm.aria2ConcurrentFiles,
+                    onInstall: { vm.installAria2(client: services.client) },
+                    onSave: { vm.saveAria2Settings(client: services.client) }
+                )
+            }
+
             if vm.source == .hf {
                 AddFromHFSection(
                     repoText: $vm.repoText,
@@ -128,6 +143,84 @@ struct DownloadsScreen: View {
                     vm.startDownload(repo: repo, client: services.client)
                 }
             )
+        }
+    }
+}
+
+private struct Aria2SettingsSection: View {
+    let installed: Bool
+    let version: String?
+    let installing: Bool
+    let saving: Bool
+    let proxyDisabled: Bool
+    @Binding var proxy: String
+    @Binding var connectionsPerFile: Int
+    @Binding var concurrentFiles: Int
+    let onInstall: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        SectionHeader("aria2")
+        ListGroup {
+            FreeRow {
+                HStack(spacing: 10) {
+                    Image(systemName: installed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(installed ? .green : .orange)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(installed ? (version ?? "aria2 ready") : "Optional ModelScope acceleration")
+                            .font(.omlxText(12, weight: .medium))
+                        if !installed {
+                            Text("One-click installation uses Homebrew. Install Homebrew first if it is unavailable.")
+                                .font(.omlxText(10.5))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if !installed {
+                        Button(installing ? "Installing…" : "Install aria2", action: onInstall)
+                            .buttonStyle(.omlx(.primary))
+                            .disabled(installing)
+                    }
+                }
+            }
+            FreeRow {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("aria2 HTTP proxy")
+                        .font(.omlxText(11, weight: .medium))
+                    TextField("http://127.0.0.1:7897", text: $proxy)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(proxyDisabled)
+                    Text(proxyDisabled
+                         ? "Mirror downloads force a direct connection, so the aria2 proxy is unavailable."
+                         : "Optional HTTP proxy used only by aria2; empty inherits the current oMLX environment.")
+                        .font(.omlxText(10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            FreeRow {
+                Stepper(value: $connectionsPerFile, in: 1...16) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Connections per file: \(connectionsPerFile)")
+                        Text("Splits one large file into parallel ranges; higher values may speed up a single large file.")
+                            .font(.omlxText(10.5)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            FreeRow(isLast: true) {
+                HStack {
+                    Stepper(value: $concurrentFiles, in: 1...16) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Concurrent files: \(concurrentFiles)")
+                            Text("Controls how many files download at once; higher values increase connections and disk pressure.")
+                                .font(.omlxText(10.5)).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button(saving ? "Saving…" : "Save", action: onSave)
+                        .buttonStyle(.omlx(.primary))
+                        .disabled(saving)
+                }
+            }
         }
     }
 }

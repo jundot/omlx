@@ -470,6 +470,30 @@ class TestUpdateGlobalSettingsMidSystemCache:
         gs.save.assert_called_once()
 
 
+class TestUpdateGlobalSettingsAria2:
+    def test_saves_transfer_settings_for_next_download(self):
+        gs = _make_global_settings()
+        gs.aria2 = SimpleNamespace(
+            proxy="", connections_per_file=8, concurrent_files=4
+        )
+        request = GlobalSettingsRequest(
+            aria2_proxy="http://127.0.0.1:7897",
+            aria2_connections_per_file=12,
+            aria2_concurrent_files=3,
+        )
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.aria2.proxy == "http://127.0.0.1:7897"
+        assert gs.aria2.connections_per_file == 12
+        assert gs.aria2.concurrent_files == 3
+        assert "aria2" in result["runtime_applied"]
+        gs.save.assert_called_once()
+
+
 class TestUpdateGlobalSettingsSampling:
     """update_global_settings: saving and hot-applying sampling defaults."""
 

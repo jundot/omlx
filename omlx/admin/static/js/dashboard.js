@@ -99,6 +99,8 @@
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
+                modelscope: { endpoint: '' },
+                aria2: { proxy: '', connections_per_file: 8, concurrent_files: 4 },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
@@ -364,6 +366,14 @@
 
             // ModelScope Downloader state
             downloaderSource: 'hf',
+            aria2Status: { installed: false, path: null, version: null },
+            aria2Installing: false,
+            aria2Saving: false,
+            aria2Error: '',
+            get aria2MirrorActive() {
+                const endpoint = this.globalSettings.modelscope.endpoint;
+                return Boolean((endpoint || '').trim());
+            },
             msAvailable: false,
             msInitialized: false,
             msRepoId: '',
@@ -571,6 +581,7 @@
 
                 await Promise.all([
                     this.loadGlobalSettings(),
+                    this.loadAria2Status(),
                     this.loadModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
@@ -794,6 +805,8 @@
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
+                            modelscope: { ...this.globalSettings.modelscope, ...data.modelscope },
+                            aria2: { ...this.globalSettings.aria2, ...data.aria2 },
                             network: { ...this.globalSettings.network, ...data.network },
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
@@ -913,6 +926,9 @@
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
                             hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
+                            aria2_proxy: this.globalSettings.aria2.proxy,
+                            aria2_connections_per_file: Number(this.globalSettings.aria2.connections_per_file),
+                            aria2_concurrent_files: Number(this.globalSettings.aria2.concurrent_files),
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
                             network_no_proxy: this.globalSettings.network.no_proxy,
@@ -4666,6 +4682,61 @@
                     // Use explicit theme
                     this.activeTheme = this.theme;
                     document.documentElement.setAttribute('data-theme', this.activeTheme);
+                }
+            },
+
+            // =================================================================
+            // aria2 dependency and transfer settings
+            // =================================================================
+
+            async loadAria2Status() {
+                try {
+                    const response = await fetch('/admin/api/aria2/status');
+                    if (response.ok) this.aria2Status = await response.json();
+                } catch (err) {
+                    this.aria2Error = String(err);
+                }
+            },
+
+            async installAria2() {
+                this.aria2Installing = true;
+                this.aria2Error = '';
+                try {
+                    const response = await fetch('/admin/api/aria2/install', { method: 'POST' });
+                    const data = await response.json();
+                    if (!response.ok || !data.installed) {
+                        this.aria2Error = data.error || 'aria2 installation failed. Homebrew is required.';
+                        return;
+                    }
+                    await this.loadAria2Status();
+                } catch (err) {
+                    this.aria2Error = String(err);
+                } finally {
+                    this.aria2Installing = false;
+                }
+            },
+
+            async saveAria2Settings() {
+                this.aria2Saving = true;
+                this.aria2Error = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            aria2_proxy: this.globalSettings.aria2.proxy,
+                            aria2_connections_per_file: Number(this.globalSettings.aria2.connections_per_file),
+                            aria2_concurrent_files: Number(this.globalSettings.aria2.concurrent_files),
+                        }),
+                    });
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.aria2Error = data.detail || 'Failed to save aria2 settings.';
+                    }
+                } catch (err) {
+                    this.aria2Error = String(err);
+                } finally {
+                    this.aria2Saving = false;
                 }
             },
 

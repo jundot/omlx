@@ -1112,6 +1112,26 @@ class TestGlobalSettingsValidation:
                 integrations_openclaw_tools_profile="invalid-profile"
             )
 
+    def test_aria2_connection_limits(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(aria2_connections_per_file=0)
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(aria2_concurrent_files=17)
+        req = admin_routes.GlobalSettingsRequest(
+            aria2_connections_per_file=16,
+            aria2_concurrent_files=1,
+        )
+        assert req.aria2_connections_per_file == 16
+        assert req.aria2_concurrent_files == 1
+
+    def test_aria2_proxy_accepts_http_and_rejects_socks(self):
+        req = admin_routes.GlobalSettingsRequest(
+            aria2_proxy="http://127.0.0.1:7897"
+        )
+        assert req.aria2_proxy == "http://127.0.0.1:7897"
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(aria2_proxy="socks5://127.0.0.1:7897")
+
     def test_integrations_openclaw_tools_profile_accepts_valid_values(self):
         req = admin_routes.GlobalSettingsRequest(
             integrations_openclaw_tools_profile="coding"

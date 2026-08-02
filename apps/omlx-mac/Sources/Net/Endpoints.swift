@@ -44,6 +44,8 @@ enum AdminAPI {
     static let presetsRefresh  = "\(prefix)/presets/refresh"
 
     static let hfTasks         = "\(prefix)/hf/tasks"
+    static let aria2Status     = "\(prefix)/aria2/status"
+    static let aria2Install    = "\(prefix)/aria2/install"
     static let hfDownload      = "\(prefix)/hf/download"
     static func hfCancel(_ taskId: String) -> String { "\(prefix)/hf/cancel/\(taskId)" }
     static func hfRetry(_ taskId: String) -> String  { "\(prefix)/hf/retry/\(taskId)" }

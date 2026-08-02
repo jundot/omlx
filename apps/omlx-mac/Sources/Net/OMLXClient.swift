@@ -198,6 +198,14 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.hfTasks)
     }
 
+    func getAria2Status() async throws -> Aria2StatusDTO {
+        try await get(AdminAPI.aria2Status)
+    }
+
+    func installAria2() async throws -> Aria2StatusDTO {
+        try await postEmpty(AdminAPI.aria2Install)
+    }
+
     func startHFDownload(repoId: String, hfToken: String = "") async throws -> StartHFDownloadResponse {
         try await post(AdminAPI.hfDownload, body: StartHFDownloadRequest(
             repoId: repoId, hfToken: hfToken

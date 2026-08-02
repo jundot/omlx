@@ -109,6 +109,9 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
         XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
         XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
+        XCTAssertEqual(settings.aria2?.connectionsPerFile, 8)
+        XCTAssertEqual(settings.aria2?.concurrentFiles, 4)
+        XCTAssertEqual(settings.aria2?.proxy, "http://127.0.0.1:7897")
     }
 
     // MARK: - Models list

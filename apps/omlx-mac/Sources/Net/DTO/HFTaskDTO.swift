@@ -41,6 +41,13 @@ struct StartHFDownloadResponse: Decodable, Sendable {
     let task: HFTaskDTO?
 }
 
+struct Aria2StatusDTO: Decodable, Sendable {
+    let installed: Bool
+    let path: String?
+    let version: String?
+    let error: String?
+}
+
 // GET /admin/api/hf/recommended returns two parallel lists (mirrors
 // hf_downloader.py:237-240). The dashboard JS paginates them separately;
 // the Swift screen merges them into a single deduped list ordered

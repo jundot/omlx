@@ -56,6 +56,20 @@ final class DownloadsScreenVM {
     var msMirrorDraft: String = ""
     private(set) var msMirrorBusy: Bool = false
 
+    // MARK: - aria2
+
+    private(set) var aria2Installed = false
+    private(set) var aria2Version: String?
+    private(set) var aria2Installing = false
+    private(set) var aria2Saving = false
+    var aria2Proxy = ""
+    var aria2ConnectionsPerFile = 8
+    var aria2ConcurrentFiles = 4
+
+    var aria2ProxyDisabled: Bool {
+        msMirrorIsCustom
+    }
+
     private(set) var msSearchResults: [MSModelInfo] = []
     private(set) var msSearchLoading: Bool = false
     var msSearchDismissed: Bool = false
@@ -145,6 +159,7 @@ final class DownloadsScreenVM {
             }
         }
         await refreshMirrors(client: client)
+        await refreshAria2(client: client)
         await refreshMsAvailability(client: client)
         await loadActiveRecommendedIfNeeded(client: client)
     }
@@ -183,8 +198,55 @@ final class DownloadsScreenVM {
             let settings = try await client.getGlobalSettings()
             self.mirrorEndpoint = settings.huggingface?.endpoint ?? ""
             self.msMirrorEndpoint = settings.modelscope?.endpoint ?? ""
+            self.aria2Proxy = settings.aria2?.proxy ?? ""
+            self.aria2ConnectionsPerFile = settings.aria2?.connectionsPerFile ?? 8
+            self.aria2ConcurrentFiles = settings.aria2?.concurrentFiles ?? 4
         } catch {
             // Non-fatal — leave mirrors as defaults.
+        }
+    }
+
+    private func refreshAria2(client: OMLXClient) async {
+        do {
+            let status = try await client.getAria2Status()
+            aria2Installed = status.installed
+            aria2Version = status.version
+        } catch {
+            aria2Installed = false
+        }
+    }
+
+    func installAria2(client: OMLXClient) {
+        Task { [weak self] in
+            guard let self else { return }
+            aria2Installing = true
+            defer { aria2Installing = false }
+            do {
+                let status = try await client.installAria2()
+                aria2Installed = status.installed
+                aria2Version = status.version
+                lastError = status.error
+            } catch {
+                lastError = error.omlxDescription
+            }
+        }
+    }
+
+    func saveAria2Settings(client: OMLXClient) {
+        Task { [weak self] in
+            guard let self else { return }
+            aria2Saving = true
+            defer { aria2Saving = false }
+            do {
+                _ = try await client.updateGlobalSettings(GlobalSettingsPatch(
+                    aria2Proxy: aria2Proxy.trimmingCharacters(in: .whitespaces),
+                    aria2ConnectionsPerFile: aria2ConnectionsPerFile,
+                    aria2ConcurrentFiles: aria2ConcurrentFiles
+                ))
+                lastError = nil
+            } catch {
+                lastError = error.omlxDescription
+            }
         }
     }
 

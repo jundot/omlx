@@ -23,12 +23,13 @@ from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -37,6 +38,7 @@ from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
+from .aria2_downloader import Aria2Installer, get_aria2_status
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -49,6 +51,7 @@ from .auth import (
 )
 
 logger = logging.getLogger(__name__)
+_aria2_installer = Aria2Installer()
 
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 
@@ -261,6 +264,11 @@ class GlobalSettingsRequest(BaseModel):
     # ModelScope settings
     ms_endpoint: str | None = None
 
+    # Optional aria2 transfer settings for ModelScope
+    aria2_proxy: str | None = None
+    aria2_connections_per_file: int | None = Field(default=None, ge=1, le=16)
+    aria2_concurrent_files: int | None = Field(default=None, ge=1, le=16)
+
     # Network settings
     network_http_proxy: str | None = None
     network_https_proxy: str | None = None
@@ -307,6 +315,19 @@ class GlobalSettingsRequest(BaseModel):
     # Auth settings
     api_key: str | None = None
     skip_api_key_verification: bool | None = None
+
+    @field_validator("aria2_proxy")
+    @classmethod
+    def validate_aria2_proxy(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        parsed = urlparse(cleaned)
+        if parsed.scheme != "http" or not parsed.hostname:
+            raise ValueError("aria2_proxy must be an HTTP proxy URL")
+        return cleaned
 
 
 class HFDownloadRequest(BaseModel):
@@ -3222,6 +3243,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "modelscope": {
             "endpoint": global_settings.modelscope.endpoint,
         },
+        "aria2": {
+            "proxy": global_settings.aria2.proxy,
+            "connections_per_file": global_settings.aria2.connections_per_file,
+            "concurrent_files": global_settings.aria2.concurrent_files,
+        },
         "network": {
             "http_proxy": global_settings.network.http_proxy,
             "https_proxy": global_settings.network.https_proxy,
@@ -3657,6 +3683,21 @@ async def update_global_settings(
         logger.info(
             f"ModelScope endpoint updated to: " f"{request.ms_endpoint or '(default)'}"
         )
+
+    aria2_changed = False
+    if request.aria2_proxy is not None:
+        global_settings.aria2.proxy = request.aria2_proxy
+        aria2_changed = True
+    if request.aria2_connections_per_file is not None:
+        global_settings.aria2.connections_per_file = (
+            request.aria2_connections_per_file
+        )
+        aria2_changed = True
+    if request.aria2_concurrent_files is not None:
+        global_settings.aria2.concurrent_files = request.aria2_concurrent_files
+        aria2_changed = True
+    if aria2_changed:
+        runtime_applied.append("aria2")
 
     # Apply network settings (Live - immediately applied via env vars)
     network_changed = False
@@ -5233,6 +5274,20 @@ async def probe_cache(
 # =============================================================================
 # HuggingFace Downloader API Routes
 # =============================================================================
+
+
+@router.get("/api/aria2/status")
+async def aria2_status(is_admin: bool = Depends(require_admin)):
+    """Return whether the optional aria2 executable is available."""
+
+    return await get_aria2_status()
+
+
+@router.post("/api/aria2/install")
+async def install_aria2(is_admin: bool = Depends(require_admin)):
+    """Install the fixed aria2 package through Homebrew."""
+
+    return await _aria2_installer.install()
 
 
 @router.post("/api/hf/download")

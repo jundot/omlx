@@ -562,6 +562,37 @@ class ModelScopeSettings:
 
 
 @dataclass
+class Aria2Settings:
+    """Optional aria2 transfer settings for ModelScope downloads."""
+
+    proxy: str = ""
+    connections_per_file: int = 8
+    concurrent_files: int = 4
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proxy": self.proxy,
+            "connections_per_file": self.connections_per_file,
+            "concurrent_files": self.concurrent_files,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Aria2Settings:
+        def bounded(value: Any, default: int) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(1, min(16, parsed))
+
+        return cls(
+            proxy=str(data.get("proxy", "") or "").strip(),
+            connections_per_file=bounded(data.get("connections_per_file"), 8),
+            concurrent_files=bounded(data.get("concurrent_files"), 4),
+        )
+
+
+@dataclass
 class NetworkSettings:
     """Network proxy and TLS trust settings."""
 
@@ -801,6 +832,7 @@ class GlobalSettings:
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
+    aria2: Aria2Settings = field(default_factory=Aria2Settings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
@@ -891,6 +923,8 @@ class GlobalSettings:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
             if "modelscope" in data:
                 self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
+            if "aria2" in data:
+                self.aria2 = Aria2Settings.from_dict(data["aria2"])
             if "network" in data:
                 self.network = NetworkSettings.from_dict(data["network"])
             if "sampling" in data:
@@ -1192,6 +1226,7 @@ class GlobalSettings:
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
+            "aria2": self.aria2.to_dict(),
             "network": self.network.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
@@ -1487,6 +1522,7 @@ class GlobalSettings:
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
+            "aria2": self.aria2.to_dict(),
             "network": self.network.to_dict(),
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),

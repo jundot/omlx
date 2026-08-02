@@ -234,6 +234,54 @@
                             </button>
                         </div>
 
+                        <!-- Optional ModelScope aria2 acceleration -->
+                        <div x-show="downloaderSource === 'ms'" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                            <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div>
+                                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-600">aria2</div>
+                                    <div class="text-xs text-neutral-500 mt-1" x-text="aria2Status.installed ? (aria2Status.version || 'Ready') : 'Optional ModelScope acceleration'"></div>
+                                </div>
+                                <button x-show="!aria2Status.installed" @click="installAria2()" :disabled="aria2Installing"
+                                        class="px-4 py-2 bg-neutral-900 text-white text-xs font-semibold rounded-full disabled:opacity-50">
+                                    <span x-text="aria2Installing ? 'Installing…' : 'Install aria2'"></span>
+                                </button>
+                            </div>
+                            <div class="px-6 py-5 space-y-4">
+                                <p x-show="!aria2Status.installed" class="text-xs text-amber-700">
+                                    One-click installation uses Homebrew. Install Homebrew first if it is unavailable.
+                                </p>
+                                <div>
+                                    <label class="block text-xs font-medium text-neutral-600 mb-1.5">aria2 HTTP proxy</label>
+                                    <input type="text" x-model="globalSettings.aria2.proxy"
+                                           :disabled="aria2MirrorActive"
+                                           placeholder="http://127.0.0.1:7897"
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm font-mono disabled:bg-neutral-100 disabled:text-neutral-400">
+                                    <p class="text-xs text-neutral-500 mt-1.5"
+                                       x-text="aria2MirrorActive ? 'Mirror downloads force a direct connection, so the aria2 proxy is unavailable.' : 'Optional HTTP proxy used only by aria2; empty inherits the current oMLX environment.'"></p>
+                                </div>
+                                <div class="grid sm:grid-cols-2 gap-4">
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">Connections per file</span>
+                                        <input type="number" min="1" max="16" x-model.number="globalSettings.aria2.connections_per_file"
+                                               class="mt-1.5 w-full px-4 py-2 border border-neutral-200 rounded-xl">
+                                        <span class="block text-xs text-neutral-500 mt-1">Splits one large file into parallel ranges; higher values may speed up a single large file.</span>
+                                    </label>
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">Concurrent files</span>
+                                        <input type="number" min="1" max="16" x-model.number="globalSettings.aria2.concurrent_files"
+                                               class="mt-1.5 w-full px-4 py-2 border border-neutral-200 rounded-xl">
+                                        <span class="block text-xs text-neutral-500 mt-1">Controls how many files download at once; higher values increase connections and disk pressure.</span>
+                                    </label>
+                                </div>
+                                <div class="flex items-center justify-between">
+                                    <p x-show="aria2Error" x-text="aria2Error" class="text-xs text-red-600"></p>
+                                    <button @click="saveAria2Settings()" :disabled="aria2Saving"
+                                            class="ml-auto px-4 py-2 bg-neutral-900 text-white text-xs font-semibold rounded-full disabled:opacity-50"
+                                            x-text="aria2Saving ? 'Saving…' : 'Save aria2 settings'"></button>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- ===== HuggingFace Source ===== -->
                         <div x-show="downloaderSource === 'hf'">
 

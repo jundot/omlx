@@ -27,6 +27,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let sampling: SamplingDTO?
     let huggingface: HuggingFaceDTO?
     let modelscope: ModelScopeDTO?
+    let aria2: Aria2DTO?
     let network: NetworkDTO?
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
@@ -162,6 +163,12 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let endpoint: String
     }
 
+    struct Aria2DTO: Codable, Equatable, Sendable {
+        let proxy: String
+        let connectionsPerFile: Int
+        let concurrentFiles: Int
+    }
+
     /// Mirrors `omlx.settings.NetworkSettings`. All four fields are simple
     /// strings; empty string = unset. Patched via `network_*` flat keys.
     struct NetworkDTO: Codable, Equatable, Sendable {
@@ -246,6 +253,10 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// ModelScope mirror endpoint. Empty string = use modelscope.cn.
     /// Patched via `ms_endpoint` (encoder converts to snake_case).
     var msEndpoint: String? = nil
+
+    var aria2Proxy: String? = nil
+    var aria2ConnectionsPerFile: Int? = nil
+    var aria2ConcurrentFiles: Int? = nil
 
     /// Process-wide outbound HTTP proxy. Empty string = unset. The server
     /// applies via env vars (HTTP_PROXY / HTTPS_PROXY / NO_PROXY /
