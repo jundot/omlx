@@ -271,6 +271,13 @@ def maybe_apply_pre_load_patches(
 
     apply_arrays_cache_extract_guard()
 
+    # Model-independent, self-gating: bind the standalone MTP sidecar
+    # (MTPLX / mlx-lm forge exports keep the MTP head in mtp.safetensors)
+    # into the model at load time. No-op for checkpoints without a sidecar.
+    from ..patches.mtplx_mtp_sidecar import apply as apply_mtplx_sidecar
+
+    apply_mtplx_sidecar()
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -683,6 +690,18 @@ def _has_mtp_heads(config: dict) -> bool:
     mtp_cfg = config.get("mtp_config") or {}
     if int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
+    # MTPLX / mlx-lm forge exports keep the MTP head in a standalone sidecar
+    # file referenced by ``mlx_lm_extra_tensors.mtp_file`` (default
+    # ``mtp.safetensors``), and stamp the config with ``mtplx_mtp_contract``
+    # / ``mtplx_mtp_quantization`` markers. These are reliable signals that
+    # MTP heads exist even when the qwen-style ``mtp_num_hidden_layers``
+    # field is absent or renamed (see ``_checkpoint_has_mtp_weights`` for the
+    # matching sidecar discovery).
+    extra = config.get("mlx_lm_extra_tensors") or {}
+    if isinstance(extra, dict) and extra.get("mtp_file"):
+        return True
+    if config.get("mtplx_mtp_contract") or config.get("mtplx_mtp_quantization"):
+        return True
     return False
 
 
@@ -742,9 +761,21 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     "Missing N parameters: language_model.mtp.*", the engine falls back to
     LLM, and vision is silently dropped (issue #1426).
 
-    Reads ``model.safetensors.index.json`` when present (no shard I/O).
-    Falls back to the first safetensors shard's metadata header. Returns
-    False when neither resolves — callers treat that as "no MTP weights"
+    MTPLX / mlx-lm forge exports (e.g. ``*MTPLX-8bit``) keep the MTP head in
+    a *standalone sidecar* referenced by ``config.json ->
+    mlx_lm_extra_tensors.mtp_file`` (default ``mtp.safetensors``; sometimes
+    ``mtp/weights.safetensors``). That sidecar is deliberately NOT listed in
+    ``model.safetensors.index.json``, so the index-only fast path must be
+    followed by an explicit sidecar scan — otherwise the MTP weights are
+    invisible and the admin toggle stays disabled even though the head is
+    fully present on disk.
+
+    Scan order:
+      1. ``model.safetensors.index.json`` weight_map (no shard I/O).
+      2. The resolved MTP sidecar(s) named above.
+      3. Fallback: every other ``*.safetensors`` shard header.
+
+    Returns False when none resolve — callers treat that as "no MTP weights"
     (the conservative choice: skip MTPModule attachment).
     """
     p = Path(model_path)
@@ -753,27 +784,63 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
 
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(p)
 
+    # Resolve MTP sidecar candidates (MTPLX / mlx-lm forge convention).
+    sidecars: list[Path] = []
+    try:
+        cfg_path = p / "config.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            extra = cfg.get("mlx_lm_extra_tensors") or {}
+            if isinstance(extra, dict) and extra.get("mtp_file"):
+                sidecars.append(extra["mtp_file"])
+    except Exception:
+        pass
+    sidecars.extend(["mtp.safetensors", "mtp/weights.safetensors"])
+    resolved_sidecars: list[Path] = []
+    for name in sidecars:
+        sp = Path(name)
+        if not sp.is_absolute():
+            sp = p / sp
+        if sp.exists() and sp not in resolved_sidecars:
+            resolved_sidecars.append(sp)
+
+    # 1) Fast path: index weight_map (no shard I/O).
     index_path = p / "model.safetensors.index.json"
     if index_path.exists():
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(k.startswith(prefixes) for k in weight_map)
+            if any(k.startswith(prefixes) for k in weight_map):
+                return True
         except Exception as e:
             logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
+    # 2) Explicit sidecar scan (MTPLX / mlx-lm mtp_file convention).
+    try:
+        import safetensors as _st
+    except Exception as e:
+        logger.debug("safetensors import failed for mtp weight scan: %s", e)
+        _st = None
+    if _st is not None:
+        for sp in resolved_sidecars:
+            try:
+                with _st.safe_open(str(sp), framework="numpy") as f:
+                    if any(k.startswith(prefixes) for k in f.keys()):
+                        return True
+            except Exception as e:
+                logger.debug("Failed to read %s header for mtp weight scan: %s", sp, e)
+
+    # 3) Fallback: scan every other safetensors shard's metadata header.
     shards = sorted(p.glob("*.safetensors"))
     if not shards:
         return False
-    try:
-        import safetensors
-    except Exception as e:
-        logger.debug("safetensors import failed for mtp weight scan: %s", e)
+    if _st is None:
         return False
-
     for shard in shards:
+        if shard in resolved_sidecars:
+            continue  # already scanned above
         try:
-            with safetensors.safe_open(str(shard), framework="numpy") as f:
+            with _st.safe_open(str(shard), framework="numpy") as f:
                 for k in f.keys():
                     if k.startswith(prefixes):
                         return True
@@ -795,6 +862,13 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         return False
     if not model_type:
         return False
+    # MTPLX-forged exports (mlx-lm/forge) stamp an explicit mtplx_mtp_contract
+    # marker in config.json; any qwen-family type carrying it is MTP-capable
+    # regardless of minor model_type naming drift across forge releases.
+    if config.get("mtplx_mtp_contract") and (model_type or "").startswith(
+        ("qwen3_5", "qwen3_6", "qwen3_next")
+    ):
+        return True
     return (
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
