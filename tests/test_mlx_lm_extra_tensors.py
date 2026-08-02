@@ -349,7 +349,8 @@ class TestMaybeApplyPreLoadPatchesDispatch:
     def test_target_sidecar_does_not_leak_into_specprefill_draft(
         self, tmp_path, monkeypatch
     ):
-        """Second mlx-lm load stays scoped without a second pre-load dispatch."""
+        """DeepSeek-patched second load stays scoped without redispatch."""
+        from omlx.patches.deepseek_v4.utils_patch import apply_utils_patch
         from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
         try:
@@ -394,6 +395,10 @@ class TestMaybeApplyPreLoadPatchesDispatch:
 
         original_glob = mlx_lm_utils.glob
         try:
+            # DeepSeek V4 permanently replaces mlx-lm's loader. Its replacement
+            # must still resolve the live mlx_lm.utils.glob proxy.
+            apply_utils_patch()
+            mlx_lm_utils.glob = extra_tensors._GlobProxy()
             maybe_apply_pre_load_patches(str(target))
             mlx_lm_utils.load_model(
                 target,

@@ -20,7 +20,6 @@ When mlx-lm merges PR 1192 upstream this patch should be removed.
 
 from __future__ import annotations
 
-import glob
 import importlib.util
 import json
 import logging
