@@ -849,6 +849,7 @@ class TestServeCommandFunctions:
             "paged_ssd_cache_dir": None,
             "paged_ssd_cache_max_size": None,
             "hot_cache_max_size": None,
+            "mru_partial_max_entries": None,
             "no_cache": True,
             "initial_cache_blocks": None,
             "mcp_config": None,
@@ -898,6 +899,7 @@ class TestServeCommandFunctions:
             get_ssd_cache_dir=lambda base_path: tmp_path / "cache",
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
             get_hot_cache_max_size_bytes=lambda: 0,
+            mru_partial_max_entries=4,
         )
         settings.auth = SimpleNamespace(api_key=None)
         settings.ensure_directories = lambda: log_dir.mkdir(parents=True, exist_ok=True)

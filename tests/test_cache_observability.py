@@ -11,34 +11,46 @@ import pytest
 from omlx.cache.observability import CacheRateTracker
 
 
-def _make_counters(
-    prefix_hits=0,
-    prefix_misses=0,
-    prefix_tokens_matched=0,
-    prefix_tokens_requested=0,
-    prefix_tokens_saved=0,
-    evictions=0,
-    ssd_hot_hits=0,
-    ssd_disk_loads=0,
-    ssd_saves=0,
-    ssd_errors=0,
-    hot_cache_evictions=0,
-    hot_cache_promotions=0,
-):
-    return {
-        "prefix_hits": prefix_hits,
-        "prefix_misses": prefix_misses,
-        "prefix_tokens_matched": prefix_tokens_matched,
-        "prefix_tokens_requested": prefix_tokens_requested,
-        "prefix_tokens_saved": prefix_tokens_saved,
-        "evictions": evictions,
-        "ssd_hot_hits": ssd_hot_hits,
-        "ssd_disk_loads": ssd_disk_loads,
-        "ssd_saves": ssd_saves,
-        "ssd_errors": ssd_errors,
-        "hot_cache_evictions": hot_cache_evictions,
-        "hot_cache_promotions": hot_cache_promotions,
-    }
+# Counter keys produced by Scheduler._collect_cache_counters.  Adding a new
+# observability counter means adding it here and in the production code
+# in lockstep; the explicit-kwargs alternative duplicated the schema once
+# in the function signature and once in the dict construction.
+_COUNTER_KEYS = (
+    "prefix_hits",
+    "prefix_misses",
+    "prefix_tokens_matched",
+    "prefix_tokens_requested",
+    "prefix_tokens_saved",
+    "evictions",
+    "ssd_hot_hits",
+    "ssd_disk_loads",
+    "ssd_saves",
+    "ssd_errors",
+    "hot_cache_evictions",
+    "hot_cache_promotions",
+    "mru_partial_stashes",
+    "mru_partial_hits",
+    "mru_partial_evictions",
+    "mru_partial_tokens_saved",
+)
+
+
+def _make_counters(**overrides):
+    """Build a counter dict for snapshot testing.
+
+    All keys default to ``0``; override individual values via kwargs.
+    Unknown keys raise — the typo-catching the explicit-signature form
+    used to provide.
+    """
+    unknown = set(overrides) - set(_COUNTER_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown counter keys: {sorted(unknown)}. "
+            f"Known: {sorted(_COUNTER_KEYS)}"
+        )
+    counters = {k: 0 for k in _COUNTER_KEYS}
+    counters.update(overrides)
+    return counters
 
 
 class TestCacheRateTrackerSnapshot:
@@ -119,6 +131,33 @@ class TestCacheRateTrackerRates:
         new = _make_counters(ssd_hot_hits=80, ssd_disk_loads=20)
         result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
         assert result["windows"]["1m"]["ssd_hot_rate"] == 0.8
+
+    def test_mru_partial_hit_rate(self):
+        """Stash payoff = hits / stashes.  Workload that stashed 100 and
+        only got 75 hits has rate 0.75; high enough to justify the
+        feature, low enough that a smaller capacity might do."""
+        old = _make_counters(mru_partial_stashes=0, mru_partial_hits=0)
+        new = _make_counters(mru_partial_stashes=100, mru_partial_hits=75)
+        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+        assert result["windows"]["1m"]["mru_partial_hit_rate"] == 0.75
+        assert result["cumulative"]["mru_partial_hit_rate"] == 0.75
+
+    def test_mru_partial_zero_stashes_no_nan(self):
+        """If no stashes happened in the window, hit_rate must be 0.0
+        not NaN.  Mirrors the prefix_hit_rate empty-window guard."""
+        counters = _make_counters(mru_partial_stashes=0, mru_partial_hits=0)
+        result = self._tracker_with_two_snapshots(counters, counters, elapsed=60.0)
+        assert result["windows"]["1m"]["mru_partial_hit_rate"] == 0.0
+        assert result["cumulative"]["mru_partial_hit_rate"] == 0.0
+
+    def test_mru_partial_tokens_saved_delta(self):
+        """Tokens saved is the direct compute-saved measure; it
+        accumulates regardless of hit rate."""
+        old = _make_counters(mru_partial_tokens_saved=0)
+        new = _make_counters(mru_partial_tokens_saved=12345)
+        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+        assert result["windows"]["1m"]["mru_partial_tokens_saved"] == 12345
+        assert result["cumulative"]["mru_partial_tokens_saved"] == 12345
 
     def test_insufficient_data_returns_empty_window(self):
         tracker = CacheRateTracker(min_interval=0.0)

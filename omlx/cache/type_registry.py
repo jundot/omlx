@@ -25,6 +25,36 @@ from .type_handlers import (
 logger = logging.getLogger(__name__)
 
 
+# Authoritative whitelist of cache class names whose KV state is safe to
+# slice along the sequence axis (axis=2).  Used by:
+#   - scheduler.py: snapshot-skip gating, partial extraction
+#   - prefix_cache.py: MRU partial stash/apply gate
+#
+# Important: this is NOT derivable from CacheTypeHandler.supports_block_slicing
+# alone, because DefaultCacheHandler (used as a fallback for class names with
+# no registered handler) inherits from KVCacheHandler and reports
+# supports_block_slicing=True.  That makes Batch* and Pool* class names
+# silently sliceable via the registry, which is wrong.  Code that needs to
+# decide "may I slice this layer's KV" MUST consult this whitelist by
+# class-name string, not the registry.
+KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
+    {
+        "KVCache",
+        "BatchKVCache",
+        "QuantizedKVCache",
+        "TurboQuantKVCache",
+        "BatchTurboQuantKVCache",
+        # ChunkedKVCache is included once the batch=1 patch in scheduler.py
+        # installs its extract/filter/size pass-throughs (PR #1152); without
+        # that patch, Llama-4 requests fall back to the snapshot path.
+        "ChunkedKVCache",
+        # MiniMaxM3KVCache (non-batch) is sliceable via MiniMaxM3KVCacheHandler.
+        # The batch variant is intentionally excluded (see whitelist note above).
+        "MiniMaxM3KVCache",
+    }
+)
+
+
 class CacheTypeRegistry:
     """Registry for cache type handlers.
 

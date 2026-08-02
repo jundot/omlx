@@ -4242,6 +4242,12 @@ def _build_runtime_cache_observability(
         "hot_cache_max_bytes": 0,
         "hot_cache_size_bytes": 0,
         "hot_cache_entries": 0,
+        # MRU partial cache feature gate.  Per-model occupancy lives on each
+        # models[] entry; there is no payload-level entries aggregate
+        # because MRU tail slots are per-model, not a shared budget — only
+        # this max-entries sum is kept, purely so the dashboard can tell
+        # whether the feature is configured for any loaded model.
+        "mru_partial_max_entries": 0,
     }
 
     engine_pool = _get_engine_pool()
@@ -4375,6 +4381,18 @@ def _build_runtime_cache_observability(
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+            "mru_partial_entries": int(
+                prefix_stats.get("mru_partial_entries", 0) or 0
+            ),
+            "mru_partial_max_entries": int(
+                prefix_stats.get("mru_partial_max_entries", 0) or 0
+            ),
+            # Tri-state: None (unknown / no inference yet), True (eligible),
+            # False (model uses non-sliceable cache layers — every stash
+            # refused at the safety gate; dashboard renders 'N/A (see log)').
+            "mru_partial_supported": prefix_stats.get(
+                "mru_partial_supported", None
+            ),
         }
 
         cache_rates = runtime_stats.get("cache_rates")
@@ -4400,15 +4418,22 @@ def _build_runtime_cache_observability(
     disk_max = payload["disk_max_bytes"]
     hot_cache_size_total = 0
     hot_cache_entries_total = 0
+    mru_max_entries_total = 0
     for m in payload["models"]:
         hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
         hot_cache_entries_total += m.get("hot_cache_entries", 0)
         hot_cache_max = max(hot_cache_max, m.get("hot_cache_max_bytes", 0))
         disk_max = max(disk_max, m.get("max_size_bytes", 0))
+        # MRU: only the max-entries sum is kept, and only as a feature-on
+        # gate for the dashboard.  Per-model occupancy is on each models[]
+        # entry; an aggregate live count would be meaningless because the
+        # slots are per-model, not a shared budget.
+        mru_max_entries_total += m.get("mru_partial_max_entries", 0)
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
     payload["disk_max_bytes"] = disk_max
+    payload["mru_partial_max_entries"] = mru_max_entries_total
 
     # Fallback: if no loaded models contributed stats, scan the cache
     # directory directly so the dashboard still shows real disk usage.
@@ -4861,6 +4886,22 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                     exc,
                 )
 
+        # MRU partials chain from paged-block hashes whose KV bytes are
+        # gone after the ssd_manager.clear() above.  Drop them so the
+        # admin "clear all warm caches" intent is honoured symmetrically.
+        # Single-tier behaviour (no clear) is the surviving-stash hazard
+        # the peer review caught for this endpoint.
+        block_aware_cache = getattr(scheduler, "block_aware_cache", None)
+        if block_aware_cache is not None:
+            try:
+                block_aware_cache.clear_mru_partials()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear MRU partials for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
     # Phase 2: remove any remaining files on disk (covers unloaded models)
     global_settings = _get_global_settings()
     if global_settings is not None:
@@ -4914,6 +4955,23 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
                     model_id,
                     exc,
                 )
+
+        # MRU partials remain correctness-valid after a hot-cache clear
+        # (parent block_hashes survive in the SSD index), but they hold
+        # KV bytes in memory that an operator clicking "clear hot cache"
+        # is asking to free.  Wipe is a deliberate memory-pressure
+        # choice, not a correctness requirement.
+        block_aware_cache = getattr(scheduler, "block_aware_cache", None)
+        if block_aware_cache is not None:
+            try:
+                block_aware_cache.clear_mru_partials()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear MRU partials for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
         rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
         if rate_tracker is not None:
             rate_tracker.clear()

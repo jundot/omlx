@@ -902,6 +902,9 @@ class TestRuntimeCacheObservability:
                 "hot_cache_max_bytes": 0,
                 "hot_cache_size_bytes": 0,
                 "hot_cache_entries": 0,
+                "mru_partial_entries": 0,
+                "mru_partial_max_entries": 0,
+                "mru_partial_supported": None,
             },
             {
                 "id": "model-b",
@@ -919,6 +922,9 @@ class TestRuntimeCacheObservability:
                 "hot_cache_max_bytes": 0,
                 "hot_cache_size_bytes": 0,
                 "hot_cache_entries": 0,
+                "mru_partial_entries": 0,
+                "mru_partial_max_entries": 0,
+                "mru_partial_supported": None,
             },
         ]
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
@@ -1101,6 +1107,114 @@ class TestRuntimeCacheObservability:
         assert model_payload["has_sub_block_cache"] is True
         assert model_payload["indexed_blocks_display"] == "<1024"
         assert model_payload["last_partial_tokens_skipped"] == 577
+
+
+class TestClearSSDCacheAlsoWipesMRUPartials:
+    """The ``/api/ssd-cache/clear`` admin endpoint must also clear the
+    MRU partial cache.  Without this, partials chain from paged-block
+    hashes whose backing KV bytes were just flushed by ssd_manager.clear()
+    and the operator's "drop all warm caches" intent is only half-honored.
+    """
+
+    def _scheduler_with_mocks(self):
+        """Build a SimpleNamespace scheduler with mock ssd manager and
+        block_aware_cache that we can introspect after the endpoint runs."""
+        ssd_manager = MagicMock()
+        ssd_manager.clear.return_value = 5  # arbitrary deleted count
+        block_aware_cache = MagicMock()
+        block_aware_cache.clear_mru_partials.return_value = 3
+        return SimpleNamespace(
+            paged_ssd_cache_manager=ssd_manager,
+            block_aware_cache=block_aware_cache,
+        )
+
+    def test_endpoint_calls_clear_mru_partials_on_each_scheduler(self):
+        scheduler_a = self._scheduler_with_mocks()
+        scheduler_b = self._scheduler_with_mocks()
+
+        with patch.object(
+            admin_routes,
+            "_iter_loaded_schedulers",
+            return_value=iter([("model-a", scheduler_a), ("model-b", scheduler_b)]),
+        ), patch.object(admin_routes, "_get_global_settings", return_value=None):
+            asyncio.run(admin_routes.clear_ssd_cache(is_admin=True))
+
+        scheduler_a.paged_ssd_cache_manager.clear.assert_called_once()
+        scheduler_a.block_aware_cache.clear_mru_partials.assert_called_once()
+        scheduler_b.paged_ssd_cache_manager.clear.assert_called_once()
+        scheduler_b.block_aware_cache.clear_mru_partials.assert_called_once()
+
+    def test_mru_clear_failure_does_not_block_other_scheduler(self):
+        """A failure in one scheduler's clear_mru_partials must be logged
+        but not prevent other schedulers from being cleared."""
+        scheduler_a = self._scheduler_with_mocks()
+        scheduler_a.block_aware_cache.clear_mru_partials.side_effect = RuntimeError(
+            "boom"
+        )
+        scheduler_b = self._scheduler_with_mocks()
+
+        with patch.object(
+            admin_routes,
+            "_iter_loaded_schedulers",
+            return_value=iter([("model-a", scheduler_a), ("model-b", scheduler_b)]),
+        ), patch.object(admin_routes, "_get_global_settings", return_value=None):
+            asyncio.run(admin_routes.clear_ssd_cache(is_admin=True))
+
+        # Scheduler B must still have been cleared despite A's failure.
+        scheduler_b.block_aware_cache.clear_mru_partials.assert_called_once()
+
+
+class TestClearHotCacheAlsoWipesMRUPartials:
+    """The ``/api/hot-cache/clear`` admin endpoint must also clear the
+    MRU partial cache.  Unlike the SSD endpoint, the MRU entries remain
+    correctness-valid after a hot-cache clear (parent block_hashes
+    survive in the SSD index) — the wipe is a memory-pressure choice
+    that matches the operator's "free RAM" intent for this button.
+    """
+
+    def _scheduler_with_mocks(self):
+        ssd_manager = MagicMock()
+        ssd_manager.clear_hot_cache.return_value = 4  # arbitrary entry count
+        block_aware_cache = MagicMock()
+        block_aware_cache.clear_mru_partials.return_value = 2
+        rate_tracker = MagicMock()
+        return SimpleNamespace(
+            paged_ssd_cache_manager=ssd_manager,
+            block_aware_cache=block_aware_cache,
+            _cache_rate_tracker=rate_tracker,
+        )
+
+    def test_endpoint_calls_clear_mru_partials_on_each_scheduler(self):
+        scheduler_a = self._scheduler_with_mocks()
+        scheduler_b = self._scheduler_with_mocks()
+
+        with patch.object(
+            admin_routes,
+            "_iter_loaded_schedulers",
+            return_value=iter([("model-a", scheduler_a), ("model-b", scheduler_b)]),
+        ):
+            asyncio.run(admin_routes.clear_hot_cache(is_admin=True))
+
+        scheduler_a.paged_ssd_cache_manager.clear_hot_cache.assert_called_once()
+        scheduler_a.block_aware_cache.clear_mru_partials.assert_called_once()
+        scheduler_b.paged_ssd_cache_manager.clear_hot_cache.assert_called_once()
+        scheduler_b.block_aware_cache.clear_mru_partials.assert_called_once()
+
+    def test_mru_clear_failure_does_not_block_other_scheduler(self):
+        scheduler_a = self._scheduler_with_mocks()
+        scheduler_a.block_aware_cache.clear_mru_partials.side_effect = RuntimeError(
+            "boom"
+        )
+        scheduler_b = self._scheduler_with_mocks()
+
+        with patch.object(
+            admin_routes,
+            "_iter_loaded_schedulers",
+            return_value=iter([("model-a", scheduler_a), ("model-b", scheduler_b)]),
+        ):
+            asyncio.run(admin_routes.clear_hot_cache(is_admin=True))
+
+        scheduler_b.block_aware_cache.clear_mru_partials.assert_called_once()
 
 
 class TestGlobalSettingsValidation:

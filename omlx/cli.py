@@ -295,6 +295,15 @@ def serve_command(args):
         else:
             scheduler_config.hot_cache_max_size = 0
 
+        # MRU partial cache: CLI arg > settings.  Independent of SSD/hot
+        # configuration — the MRU stash works in any mode where
+        # reconstruct_cache has a path (which is gated by manager presence,
+        # not by SSD writes; see BlockAwarePrefixCache._can_reconstruct).
+        if args.mru_partial_max_entries is not None:
+            scheduler_config.mru_partial_max_entries = int(args.mru_partial_max_entries)
+        else:
+            scheduler_config.mru_partial_max_entries = settings.cache.mru_partial_max_entries
+
         if args.no_cache:
             print(
                 "Mode: Multi-model serving (no oMLX cache, mlx-lm BatchGenerator only)"
@@ -927,6 +936,17 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
+    )
+    serve_parser.add_argument(
+        "--mru-partial-max-entries",
+        type=int,
+        default=None,
+        help=(
+            "Maximum simultaneous MRU partial-block stashes. Each entry is "
+            "bounded at one block_size of KV memory. 0 disables the feature. "
+            "Default: 4. Under --hot-cache-only this shares the in-memory KV "
+            "headroom envelope with --hot-cache-max-size; tune both together."
+        ),
     )
     serve_parser.add_argument(
         "--no-cache",

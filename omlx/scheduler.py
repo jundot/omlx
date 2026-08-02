@@ -1119,20 +1119,15 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
-# ChunkedKVCache is included once the batch=1 patch above installs its
-# extract/filter/size pass-throughs; without it Llama-4 requests fall
-# back to the snapshot path unnecessarily.
-_KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
-    {
-        "KVCache",
-        "BatchKVCache",
-        "QuantizedKVCache",
-        "TurboQuantKVCache",
-        "BatchTurboQuantKVCache",
-        "ChunkedKVCache",
-        "MiniMaxM3KVCache",
-    }
-)
+# Canonical home: omlx/cache/type_registry.py.  ChunkedKVCache and
+# MiniMaxM3KVCache are included there once the batch=1 patch above installs
+# their extract/filter/size pass-throughs (PR #1152); without it Llama-4
+# requests fall back to the snapshot path unnecessarily.
+from omlx.cache.type_registry import KNOWN_SLICEABLE_CACHE_TYPES
+
+# Module-local alias kept for backwards compatibility with existing
+# call sites in this file.
+_KNOWN_SLICEABLE_CACHE_TYPES = KNOWN_SLICEABLE_CACHE_TYPES
 
 
 _TURBOQUANT_KV_CACHE_TYPES = frozenset(
@@ -1423,6 +1418,11 @@ class SchedulerConfig:
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
+    # Bounded LRU stash for trailing sub-block partials of previous
+    # prefills, keyed by parent-block hash.  Each entry holds at most
+    # one block_size of KV memory.  ``0`` disables the feature; default
+    # of 4 matches the dflash max_entries precedent (PR #1120).
+    mru_partial_max_entries: int = 4
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -1887,6 +1887,7 @@ class Scheduler:
             self.block_aware_cache = BlockAwarePrefixCache(
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
+                mru_partial_max_entries=self.config.mru_partial_max_entries,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -2016,6 +2017,16 @@ class Scheduler:
         # None = no deferred clear pending; int = step at which to fire.
         self._deferred_clear_at: int | None = None
 
+        # Per-completion budget for suppressing the deferred Metal cache
+        # clear when the prefix cache has a warm MRU partial (a strong
+        # signal that the same prompt may return immediately and would
+        # benefit from the still-resident lazy KV tensors).
+        # The budget is reset to True on every _cleanup_finished() that
+        # arms _deferred_clear_at.  Once spent (suppression has happened
+        # once), the deferred clear fires at the next deadline regardless
+        # of MRU state, bounding total deferral at 2x _DEFERRED_CLEAR_DELAY.
+        self._mru_clear_suppression_available: bool = False
+
         # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
@@ -2136,6 +2147,7 @@ class Scheduler:
         extra_keys: tuple[Any, ...] | None,
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
+        prompt_token_count: int,
         hot_cache_write_back: bool = True,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
@@ -2181,29 +2193,18 @@ class Scheduler:
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
                     _safe_sync_stream(self._stream)
-                if hot_cache_write_back:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                    )
-                else:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                        hot_cache_write_back=False,
-                    )
+                block_table = self.block_aware_cache.store_cache(
+                    request_id,
+                    token_sequence_to_store,
+                    cache_to_store,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=intermediate_snapshots,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                    prompt_token_count=prompt_token_count,
+                    hot_cache_write_back=hot_cache_write_back,
+                )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -6984,12 +6985,55 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids[
                         block_table.num_tokens :
                     ]
+                    # MiniMax M3 prefill-step alignment and the MRU partial
+                    # splice are mutually exclusive and ordered deliberately.
+                    # Alignment is a model-correctness requirement (it trims
+                    # the block table down to an external prefill-chunk
+                    # boundary) and computes its trim count from
+                    # block_table.num_tokens; the splice extends prompt_cache
+                    # past that boundary WITHOUT touching block_table, so if
+                    # the splice ran first it would desync alignment's trim
+                    # math.  Alignment therefore wins when it fires; the
+                    # splice only runs when alignment is a no-op (non-MiniMax
+                    # M3 models, or configs where prefill_step <= block_size).
                     if self._align_minimax_m3_partial_cache_to_prefill_step(request):
                         request.cached_tokens = block_table.num_tokens
                         request.shared_prefix_blocks = len(block_table.block_ids)
                         request.remaining_tokens = request.prompt_token_ids[
                             block_table.num_tokens :
                         ]
+                    # Splice the in-memory MRU partial onto the reconstructed
+                    # cache when the trailing tokens match.  Saves the
+                    # re-prefill of the sub-block tail on exact-repeat
+                    # prompts.  The splice is a no-op when no partial is
+                    # stashed or the trailing tokens differ.
+                    #
+                    # Accounting note: the partial advances cached_tokens
+                    # but is NOT a stored paged block, so shared_prefix_blocks
+                    # stays at the count of paged blocks reused.  After a
+                    # successful splice the invariant relaxes from
+                    #     cached_tokens == shared_prefix_blocks * block_size
+                    # to
+                    #     cached_tokens >= shared_prefix_blocks * block_size
+                    # with cached_tokens - shared_prefix_blocks * block_size
+                    # ∈ [0, block_size) representing the partial.  Current
+                    # readers (the scheduler's prefill-completion log lines
+                    # downstream) tolerate the relaxed form; future readers
+                    # that index block_table.block_ids by
+                    # shared_prefix_blocks must NOT use cached_tokens to
+                    # bound the loop.
+                    elif request.remaining_tokens:
+                        (
+                            request.prompt_cache,
+                            request.remaining_tokens,
+                            partial_applied,
+                        ) = self.block_aware_cache.apply_mru_partial(
+                            request.prompt_cache,
+                            block_table,
+                            request.remaining_tokens,
+                        )
+                        if partial_applied > 0:
+                            request.cached_tokens += partial_applied
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
@@ -7212,6 +7256,10 @@ class Scheduler:
                     model=draft_model,
                     paged_cache_manager=draft_paged,
                     paged_ssd_cache_manager=draft_ssd,
+                    # MRU disabled on the draft cache: apply_mru_partial is
+                    # only ever called on the main block_aware_cache, so a
+                    # draft-cache stash is dead work that never pays off.
+                    mru_partial_max_entries=0,
                 )
                 self._draft_prefix_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
@@ -9826,6 +9874,10 @@ class Scheduler:
                                     request_id,
                                 )
 
+                            # Prompt boundary for the MRU partial stash:
+                            # token_sequence_to_store is prompt+output, but a
+                            # repeat request resubmits the prompt only.
+                            prompt_token_count = len(request.prompt_token_ids)
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
@@ -9852,6 +9904,7 @@ class Scheduler:
                                         request.vlm_extra_keys_for_cache,
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
+                                        prompt_token_count,
                                         hot_cache_write_back,
                                     )
                                 except BaseException:
@@ -9882,6 +9935,7 @@ class Scheduler:
                                     request.vlm_extra_keys_for_cache,
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
+                                    prompt_token_count,
                                     hot_cache_write_back,
                                 )
                             logger.debug(
@@ -10044,6 +10098,17 @@ class Scheduler:
         """
         target = self._step_counter + self._DEFERRED_CLEAR_DELAY
         if self._deferred_clear_at is None or target > self._deferred_clear_at:
+            # Arm the suppression budget only when STARTING a new
+            # deferral epoch (transition from None).  Subsequent
+            # completions in the same epoch may legitimately push the
+            # deadline out (for IOKit safety, #557) but must NOT
+            # refresh the budget — otherwise a hot-prompt workload
+            # whose completions arrive faster than _DEFERRED_CLEAR_DELAY
+            # could keep re-arming after the budget was spent and
+            # defer the clear forever, defeating the pool-bloat
+            # mitigation (#411).  One suppression per epoch, total.
+            if self._deferred_clear_at is None:
+                self._mru_clear_suppression_available = True
             self._deferred_clear_at = target
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
@@ -10086,6 +10151,7 @@ class Scheduler:
 
         # Cancel any pending deferred Metal cache clear
         self._deferred_clear_at = None
+        self._mru_clear_suppression_available = False
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
@@ -10661,8 +10727,26 @@ class Scheduler:
             self._deferred_clear_at is not None
             and self._step_counter >= self._deferred_clear_at
         ):
-            should_clear = True
-            self._deferred_clear_at = None
+            # If the prefix cache is holding a warm MRU partial and we
+            # haven't yet spent the per-completion suppression budget,
+            # defer the clear by one more _DEFERRED_CLEAR_DELAY window.
+            # The MRU partial is a strong predictor that the next
+            # request will reuse the still-resident lazy KV tensors.
+            # The budget is one-shot, so total deferral is bounded at
+            # 2x _DEFERRED_CLEAR_DELAY even under hot-prompt repeats.
+            if (
+                self._mru_clear_suppression_available
+                and self.block_aware_cache is not None
+                and self.block_aware_cache.has_mru_partial()
+            ):
+                self._deferred_clear_at = (
+                    self._step_counter + self._DEFERRED_CLEAR_DELAY
+                )
+                self._mru_clear_suppression_available = False
+            else:
+                should_clear = True
+                self._deferred_clear_at = None
+                self._mru_clear_suppression_available = False
         # Hard-pressure reclaim requested by ProcessMemoryEnforcer. Drains via
         # the same _sync_and_clear_cache path so freed hot-cache / pooled
         # buffers are returned to the OS at a synchronized, lock-protected
@@ -10787,6 +10871,7 @@ class Scheduler:
         # anywhere re-opens the wedge, because the enforcer does not
         # re-issue below hard pressure (issue #2179).
         self._deferred_clear_at = None
+        self._mru_clear_suppression_available = False
 
     def deep_reset(self) -> None:
         """
@@ -11592,6 +11677,12 @@ class Scheduler:
             "prefix_tokens_requested": prefix_stats.tokens_requested_total,
             "prefix_tokens_saved": prefix_stats.tokens_saved,
             "evictions": prefix_stats.evictions,
+            "mru_partial_stashes": prefix_stats.mru_partial_stashes,
+            "mru_partial_hits": prefix_stats.mru_partial_hits,
+            "mru_partial_evictions": prefix_stats.mru_partial_evictions,
+            "mru_partial_tokens_saved": prefix_stats.mru_partial_tokens_saved,
+            "mru_partial_entries": prefix_stats.mru_partial_entries,
+            "mru_partial_max_entries": prefix_stats.mru_partial_max_entries,
         }
 
         if self.paged_ssd_cache_manager is not None:
