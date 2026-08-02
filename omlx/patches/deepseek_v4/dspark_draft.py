@@ -80,8 +80,8 @@ class DSpark:
         S2.hh.base = K("mtp.2.hc_head_base").astype(mx.float32)
         S2.hh.scale = K("mtp.2.hc_head_scale").astype(mx.float32); S2.hh.eval()
         S2.norm_w = K("mtp.2.norm.weight")
-        S2.W1 = KS(2, "markov_w1").astype(mx.float32)
-        S2.W2T = KS(2, "markov_w2").astype(mx.float32).T
+        S2.W1 = KS(2, "markov_w1")  # native bf16 on disk; fp32 upcast removed (S49: dtau +0.000, -0.7 ms/cycle)
+        S2.W2T = KS(2, "markov_w2").T
         mx.eval(S2.W1, S2.W2T)
         raw.clear(); gc.collect(); mx.clear_cache()
         layers = self.inner.layers
