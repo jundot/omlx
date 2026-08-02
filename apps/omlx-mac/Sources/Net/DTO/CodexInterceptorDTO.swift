@@ -23,6 +23,17 @@ struct CodexInterceptorStatusDTO: Codable, Equatable, Sendable {
     let sessionId: String?
     let startedAt: Double?
     let model: String?
+    let activeModel: String?
+    let activeContextWindow: Int?
+    let activeModelLoaded: Bool?
+    let activeModelLoading: Bool?
+    let pendingModel: String?
+    let pendingContextWindow: Int?
+    let pendingModelLoaded: Bool?
+    let pendingModelLoading: Bool?
+    let modelSwitching: Bool?
+    let modelSwitchLoading: Bool?
+    let modelSwitchError: String?
     let localSlot: String?
     let project: String?
     let proxyPid: Int?
@@ -34,8 +45,13 @@ struct CodexInterceptorStatusDTO: Codable, Equatable, Sendable {
     let completedRequests: Int
     let failedRequests: Int
     let lastRoute: String?
+    let lastRequestedModel: String?
+    let lastEffectiveModel: String?
     let latestMetrics: CodexInterceptorMetricsDTO
     let warmupStatus: String
+    let warmupModel: String?
+    let warmupModelLoaded: Bool?
+    let warmupModelLoading: Bool?
     let diagnosticsPath: String?
     let configPath: String
     let configModified: Bool
@@ -59,4 +75,9 @@ struct CodexInterceptorStartRequest: Codable, Sendable {
     let contextWindow: Int?
     let launchApp: Bool
     let replaceExisting: Bool
+}
+
+struct CodexInterceptorSwitchRequest: Codable, Sendable {
+    let model: String
+    let contextWindow: Int?
 }

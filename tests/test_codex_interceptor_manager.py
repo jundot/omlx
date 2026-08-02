@@ -1,8 +1,12 @@
 """Lifecycle, privacy, and configuration invariants for native Codex routing."""
 
+import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from omlx.codex_interceptor.manager import (
     CodexInterceptorConfig,
@@ -128,6 +132,8 @@ def test_proxy_child_drops_stale_interceptor_and_audit_environment(tmp_path):
     session.mkdir()
     status_path = session / "status.jsonl"
     status_path.touch()
+    route_path = session / "route.json"
+    route_path.write_text("{}")
     captured = {}
 
     def fake_popen(_argv, **kwargs):
@@ -159,6 +165,7 @@ def test_proxy_child_drops_stale_interceptor_and_audit_environment(tmp_path):
             session_id="session-1",
             session_dir=session,
             status_path=status_path,
+            route_path=route_path,
         )
 
     env = captured["env"]
@@ -166,6 +173,111 @@ def test_proxy_child_drops_stale_interceptor_and_audit_environment(tmp_path):
     assert "HARNESS_INTERCEPTOR_MODEL" not in env
     assert "OMLX_CODEX_INTERCEPTOR_GPT56_PRO" not in env
     assert "OMLX_CODEX_INTERCEPTOR_CLOUD_AUDIT_DIR" not in env
+    assert env["OMLX_CODEX_INTERCEPTOR_ROUTE_PATH"] == str(route_path)
+
+
+def test_model_switch_is_warmed_before_atomic_next_turn_publish(tmp_path):
+    manager = CodexInterceptorManager(runtime_root=tmp_path / "runtime")
+    proxy = FakeProcess()
+    initial = replace(config(tmp_path), context_window=32768)
+
+    with (
+        patch.object(manager, "_check_upstream"),
+        patch.object(manager, "_resolve_proxy_command", return_value=["mitmdump"]),
+        patch.object(manager, "_start_proxy", return_value=proxy),
+        patch("omlx.codex_interceptor.manager._terminate"),
+    ):
+        started = manager.start(initial)
+        with pytest.raises(RuntimeError, match="finish loading"):
+            manager.begin_model_switch("local/larger", context_window=65536)
+        manager.set_warmup_status(started["session_id"], "ready", "local/model")
+        route_path = manager._route_path
+        assert route_path is not None
+        assert route_path.stat().st_mode & 0o777 == 0o600
+        before = json.loads(route_path.read_text())
+
+        generation, loading = manager.begin_model_switch(
+            "local/larger",
+            context_window=65536,
+        )
+        manager.set_warmup_status(
+            started["session_id"],
+            "ready",
+            "local/model",
+        )
+        assert loading["active_model"] == "local/model"
+        assert loading["model_switch_loading"] is True
+        assert manager.status()["warmup_model"] == "local/larger"
+        assert manager.status()["warmup_status"] == "loading"
+        assert json.loads(route_path.read_text()) == before
+
+        queued = manager.complete_model_switch(generation)
+        published = json.loads(route_path.read_text())
+        assert published["model"] == "local/larger"
+        assert published["revision"] == before["revision"] + 1
+        assert queued["active_model"] == "local/model"
+        assert queued["pending_model"] == "local/larger"
+
+        manager._status_path.write_text(
+            json.dumps(
+                {
+                    "event": "local_model_changed",
+                    "local_model": "local/larger",
+                    "advertised_context_window": 65536,
+                    "route_revision": published["revision"],
+                }
+            )
+            + "\n"
+        )
+        active = manager.status()
+
+    assert active["active_model"] == "local/larger"
+    assert active["active_context_window"] == 65536
+    assert active["pending_model"] is None
+    assert active["model_switching"] is False
+
+
+@pytest.mark.parametrize("target_context", [None, 16384])
+def test_model_switch_refuses_unknown_or_smaller_context(tmp_path, target_context):
+    manager = CodexInterceptorManager(runtime_root=tmp_path / "runtime")
+    proxy = FakeProcess()
+    initial = replace(config(tmp_path), context_window=32768)
+
+    with (
+        patch.object(manager, "_check_upstream"),
+        patch.object(manager, "_resolve_proxy_command", return_value=["mitmdump"]),
+        patch.object(manager, "_start_proxy", return_value=proxy),
+        patch("omlx.codex_interceptor.manager._terminate"),
+    ):
+        started = manager.start(initial)
+        manager.set_warmup_status(started["session_id"], "ready", "local/model")
+        with pytest.raises(RuntimeError, match="fresh Codex session"):
+            manager.begin_model_switch(
+                "local/unsafe",
+                context_window=target_context,
+            )
+
+
+def test_stopping_invalidates_an_in_progress_model_load(tmp_path):
+    manager = CodexInterceptorManager(runtime_root=tmp_path / "runtime")
+    proxy = FakeProcess()
+    initial = replace(config(tmp_path), context_window=32768)
+
+    with (
+        patch.object(manager, "_check_upstream"),
+        patch.object(manager, "_resolve_proxy_command", return_value=["mitmdump"]),
+        patch.object(manager, "_start_proxy", return_value=proxy),
+        patch("omlx.codex_interceptor.manager._terminate"),
+    ):
+        started = manager.start(initial)
+        manager.set_warmup_status(started["session_id"], "ready", "local/model")
+        generation, _ = manager.begin_model_switch(
+            "local/larger",
+            context_window=65536,
+        )
+        manager.stop()
+        with pytest.raises(RuntimeError, match="no longer current"):
+            manager.complete_model_switch(generation)
 
 
 def test_proxy_crash_closes_managed_codex_and_surfaces_error(tmp_path):

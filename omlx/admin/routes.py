@@ -51,6 +51,7 @@ from .auth import (
 logger = logging.getLogger(__name__)
 
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
+_codex_interceptor_background_tasks: set[asyncio.Task] = set()
 
 
 # =============================================================================
@@ -88,12 +89,19 @@ class DeleteSubKeyRequest(BaseModel):
 class CodexInterceptorStartRequest(BaseModel):
     """Start a process-scoped Codex desktop session backed by local oMLX."""
 
-    model: str
-    project: str | None = None
-    local_slot: str | None = None
-    context_window: int | None = Field(default=None, gt=0)
+    model: str = Field(min_length=1, max_length=1024)
+    project: str | None = Field(default=None, max_length=4096)
+    local_slot: str | None = Field(default=None, max_length=1024)
+    context_window: int | None = Field(default=None, gt=0, le=10_000_000)
     launch_app: bool = True
     replace_existing: bool = False
+
+
+class CodexInterceptorSwitchRequest(BaseModel):
+    """Warm and route the next idle local turn to another oMLX model."""
+
+    model: str = Field(min_length=1, max_length=1024)
+    context_window: int | None = Field(default=None, gt=0, le=10_000_000)
 
 
 class CacheProbeRequest(BaseModel):
@@ -4500,7 +4508,9 @@ async def get_codex_interceptor_status(
     """Return metadata-only live routing and lifecycle state."""
     from ..codex_interceptor import get_codex_interceptor_manager
 
-    return await asyncio.to_thread(get_codex_interceptor_manager().status)
+    status = await asyncio.to_thread(get_codex_interceptor_manager().status)
+    engine_pool = _get_engine_pool() if _get_engine_pool else None
+    return _with_codex_model_runtime(status, engine_pool)
 
 
 @router.get("/api/codex-interceptor/doctor")
@@ -4511,6 +4521,92 @@ async def get_codex_interceptor_doctor(
     from ..codex_interceptor import get_codex_interceptor_manager
 
     return await asyncio.to_thread(get_codex_interceptor_manager().doctor)
+
+
+def _require_codex_generation_model(engine_pool, model: str) -> dict:
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Model pool is unavailable")
+    status = engine_pool.get_status()
+    models = status.get("models", []) if isinstance(status, dict) else []
+    info = next(
+        (item for item in models if isinstance(item, dict) and item.get("id") == model),
+        None,
+    )
+    if info is None:
+        raise HTTPException(status_code=400, detail=f"Local model not found: {model}")
+    model_type = info.get("model_type")
+    if model_type not in {None, "llm", "vlm"}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model {model} cannot serve Codex Responses requests "
+                f"(type: {model_type})"
+            ),
+        )
+    return info
+
+
+def _start_codex_background_task(coroutine) -> None:
+    """Retain fire-and-monitor work until asyncio reports it complete."""
+    task = asyncio.create_task(coroutine)
+    _codex_interceptor_background_tasks.add(task)
+    task.add_done_callback(_codex_interceptor_background_tasks.discard)
+
+
+def _with_codex_model_runtime(status: dict, engine_pool) -> dict:
+    """Add live engine residency without coupling it to proxy lifecycle state."""
+    augmented = dict(status)
+    models = []
+    if engine_pool is not None:
+        try:
+            pool_status = engine_pool.get_status()
+        except Exception:
+            logger.exception("Could not read Codex model residency state")
+            pool_status = None
+        if isinstance(pool_status, dict):
+            models = pool_status.get("models", [])
+    by_id = {
+        item.get("id"): item
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for prefix, model_key in (
+        ("active_model", "active_model"),
+        ("warmup_model", "warmup_model"),
+        ("pending_model", "pending_model"),
+    ):
+        info = by_id.get(augmented.get(model_key))
+        augmented[f"{prefix}_loaded"] = (
+            bool(info.get("loaded")) if info is not None else None
+        )
+        augmented[f"{prefix}_loading"] = (
+            bool(info.get("is_loading")) if info is not None else None
+        )
+    return augmented
+
+
+def _codex_context_window(
+    model: str,
+    model_info: dict,
+    requested: int | None,
+) -> int | None:
+    """Resolve the same effective context policy used by model serving."""
+    if requested is not None:
+        return requested
+    settings_manager = _get_settings_manager() if _get_settings_manager else None
+    if settings_manager is not None:
+        settings = settings_manager.get_settings_for_request(model)
+        override = getattr(settings, "max_context_window", None)
+        if isinstance(override, int) and override > 0:
+            return override
+    native = model_info.get("model_context_length")
+    global_settings = _get_global_settings() if _get_global_settings else None
+    sampling = getattr(global_settings, "sampling", None)
+    if isinstance(native, int) and native > 0:
+        policy = getattr(sampling, "max_context_window_policy", None)
+        return min(native, policy) if isinstance(policy, int) and policy > 0 else native
+    fallback = getattr(sampling, "max_context_window", None)
+    return fallback if isinstance(fallback, int) and fallback > 0 else None
 
 
 @router.post("/api/codex-interceptor/start")
@@ -4532,6 +4628,8 @@ async def start_codex_interceptor(
     if not model:
         raise HTTPException(status_code=400, detail="A local model is required")
     project = Path(request.project or str(Path.home())).expanduser()
+    engine_pool = _get_engine_pool()
+    model_info = _require_codex_generation_model(engine_pool, model)
     host = "127.0.0.1"
     port = int(global_settings.server.port)
     api_key = global_settings.auth.api_key or ""
@@ -4544,7 +4642,7 @@ async def start_codex_interceptor(
         local_slot=(request.local_slot or DEFAULT_LOCAL_SLOT).strip()
         or DEFAULT_LOCAL_SLOT,
         local_label=f"Local · oMLX · {model.rsplit('/', 1)[-1]}",
-        context_window=request.context_window,
+        context_window=_codex_context_window(model, model_info, request.context_window),
         launch_app=request.launch_app,
         replace_existing=request.replace_existing,
     )
@@ -4556,22 +4654,67 @@ async def start_codex_interceptor(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    engine_pool = _get_engine_pool()
     session_id = status.get("session_id")
 
     async def warm_selected_model() -> None:
         if engine_pool is None:
-            manager.set_warmup_status(session_id, "unavailable")
+            manager.set_warmup_status(session_id, "unavailable", model)
             return
         try:
             await engine_pool.get_engine(model)
-            manager.set_warmup_status(session_id, "ready")
+            manager.set_warmup_status(session_id, "ready", model)
         except Exception:
             logger.exception("Codex interceptor model warm-up failed")
-            manager.set_warmup_status(session_id, "failed")
+            manager.set_warmup_status(session_id, "failed", model)
 
-    asyncio.create_task(warm_selected_model())
-    return status
+    _start_codex_background_task(warm_selected_model())
+    return _with_codex_model_runtime(status, engine_pool)
+
+
+@router.post("/api/codex-interceptor/switch-model")
+async def switch_codex_interceptor_model(
+    request: CodexInterceptorSwitchRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Warm a compatible model and route the next idle local turn to it."""
+    from ..codex_interceptor import get_codex_interceptor_manager
+
+    model = request.model.strip()
+    engine_pool = _get_engine_pool()
+    model_info = _require_codex_generation_model(engine_pool, model)
+    manager = get_codex_interceptor_manager()
+    try:
+        switch_generation, status = await asyncio.to_thread(
+            manager.begin_model_switch,
+            model,
+            context_window=_codex_context_window(
+                model,
+                model_info,
+                request.context_window,
+            ),
+            local_label=f"Local · oMLX · {model.rsplit('/', 1)[-1]}",
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def warm_and_publish_switch() -> None:
+        try:
+            await engine_pool.get_engine(model)
+            await asyncio.to_thread(
+                manager.complete_model_switch,
+                switch_generation,
+            )
+        except Exception as exc:
+            logger.exception("Codex interceptor model switch failed")
+            manager.fail_model_switch(
+                switch_generation,
+                f"Could not switch to {model}: {type(exc).__name__}: {exc}",
+            )
+
+    _start_codex_background_task(warm_and_publish_switch())
+    return _with_codex_model_runtime(status, engine_pool)
 
 
 @router.post("/api/codex-interceptor/stop")
@@ -4581,7 +4724,9 @@ async def stop_codex_interceptor(
     """Gracefully close the managed Codex instance and its proxy."""
     from ..codex_interceptor import get_codex_interceptor_manager
 
-    return await asyncio.to_thread(get_codex_interceptor_manager().stop)
+    status = await asyncio.to_thread(get_codex_interceptor_manager().stop)
+    engine_pool = _get_engine_pool() if _get_engine_pool else None
+    return _with_codex_model_runtime(status, engine_pool)
 
 
 def _build_active_models_data() -> dict:

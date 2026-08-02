@@ -140,6 +140,12 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.codexInterceptorStop)
     }
 
+    func switchCodexInterceptorModel(
+        _ body: CodexInterceptorSwitchRequest
+    ) async throws -> CodexInterceptorStatusDTO {
+        try await post(AdminAPI.codexInterceptorSwitch, body: body)
+    }
+
     // PR 8 — Models / Profiles / HF
 
     func listModels() async throws -> ListModelsResponse {

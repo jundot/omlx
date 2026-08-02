@@ -56,17 +56,37 @@ private struct CodexInterceptorSection: View {
 
         ListGroup {
             Row(
-                label: "Local model",
-                sublabel: "Shown as the local slot inside Codex; all other models keep using the cloud"
+                label: vm.codexStatus?.running == true ? "Next local model" : "Local model",
+                sublabel: "Only the local Codex slot uses this model; Codex model-picker changes to other slots stay on OpenAI"
             ) {
                 Popup(
                     selection: vm.bind($vm.codexModel, save: {
                         Task { await vm.save(.codexModel, client: client) }
                     }),
                     width: 260,
-                    options: vm.modelOptions
+                    options: vm.codexModelOptions
                 )
-                .disabled(vm.codexStatus?.running == true || vm.codexBusy)
+                .disabled(vm.codexBusy)
+            }
+
+            if let status = vm.codexStatus, status.running {
+                Row(
+                    label: "Active local model",
+                    sublabel: activeModelDescription(status)
+                ) {
+                    HStack(spacing: 8) {
+                        Text(vm.activeCodexModel ?? "Waiting for route")
+                            .font(.omlxMono(11.5))
+                            .foregroundStyle(theme.text)
+                            .lineLimit(1)
+                        Text(activeModelBadge(status))
+                            .font(.omlxText(8.5, weight: .bold))
+                            .foregroundStyle(
+                                status.activeModelLoaded == false
+                                    ? theme.warningText : theme.successText
+                            )
+                    }
+                }
             }
 
             Row(
@@ -134,7 +154,8 @@ private struct CodexInterceptorSection: View {
             .padding(.top, 8)
         }
 
-        if let error = vm.codexStatus?.error, !error.isEmpty {
+        if let error = vm.codexStatus?.error ?? vm.codexStatus?.modelSwitchError,
+           !error.isEmpty {
             HStack(spacing: 7) {
                 Image(systemName: "xmark.octagon.fill")
                 Text(error)
@@ -147,6 +168,22 @@ private struct CodexInterceptorSection: View {
 
         HStack(spacing: 8) {
             if vm.codexStatus?.running == true {
+                if vm.canSwitchCodexModel {
+                    Button("Use for Next Turn") {
+                        Task { await vm.switchCodexModel(client: client) }
+                    }
+                    .buttonStyle(.omlx(.primary))
+                    .disabled(vm.codexBusy)
+                } else if vm.codexStatus?.modelSwitchLoading == true {
+                    Button("Loading Model…") {}
+                        .buttonStyle(.omlx(.normal))
+                        .disabled(true)
+                } else if vm.codexStatus?.pendingModel != nil {
+                    Button("Switch Queued") {}
+                        .buttonStyle(.omlx(.normal))
+                        .disabled(true)
+                }
+
                 Button("Restart") {
                     Task {
                         await vm.stopCodex(client: client)
@@ -214,8 +251,22 @@ private struct CodexInterceptorSection: View {
     }
 
     private func routeDescription(_ status: CodexInterceptorStatusDTO) -> String {
+        if status.modelSwitchLoading == true, let warming = status.warmupModel {
+            return "Loading " + warming + "; local traffic stays on "
+                + (vm.activeCodexModel ?? "the active model") + " until it is ready"
+        }
+        if let pending = status.pendingModel {
+            if status.activeLocalRequests > 0 {
+                return "Finishing the current turn on \(vm.activeCodexModel ?? "the active model"), then switching to \(pending)"
+            }
+            return "\(pending) is loaded and queued for the next local turn"
+        }
         if status.activeLocalRequests > 0 {
-            return "Local inference active · \(status.model ?? "selected model")"
+            return "Local inference active · \(vm.activeCodexModel ?? "selected model")"
+        }
+        if status.modelSwitchError != nil {
+            return "Switch failed; local traffic remains on "
+                + (vm.activeCodexModel ?? "the active model")
         }
         if status.warmupStatus == "loading" {
             return "Loading \(status.model ?? "selected model") in the background"
@@ -224,10 +275,43 @@ private struct CodexInterceptorSection: View {
             return "Model warm-up failed; the first request will retry loading"
         }
         switch status.lastRoute {
-        case "local": return "Last request routed locally"
-        case "cloud": return "Last request passed through to OpenAI"
+        case "local":
+            let model = status.lastEffectiveModel ?? vm.activeCodexModel ?? "selected model"
+            return "Last request routed locally · " + model
+        case "cloud":
+            let model = status.lastEffectiveModel
+                ?? status.lastRequestedModel
+                ?? "cloud model"
+            return "Last request passed through to OpenAI · " + model
         default: return "Waiting for Codex inference traffic"
         }
+    }
+
+    private func activeModelDescription(_ status: CodexInterceptorStatusDTO) -> String {
+        var parts: [String] = []
+        if let context = status.activeContextWindow {
+            parts.append("\(context.formatted()) token advertised context")
+        }
+        if status.activeLocalRequests > 0 {
+            parts.append("serving now")
+        } else if status.activeModelLoading == true {
+            parts.append("loading")
+        } else if status.activeModelLoaded == true {
+            parts.append("resident in memory")
+        } else if status.activeModelLoaded == false {
+            parts.append("loads on the next local turn")
+        } else {
+            parts.append("used for the next local turn")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func activeModelBadge(_ status: CodexInterceptorStatusDTO) -> String {
+        if status.activeLocalRequests > 0 { return "SERVING" }
+        if status.activeModelLoading == true { return "LOADING" }
+        if status.activeModelLoaded == true { return "LOADED" }
+        if status.activeModelLoaded == false { return "ON DEMAND" }
+        return "ACTIVE"
     }
 
     private func prerequisiteMessage(_ doctor: CodexInterceptorDoctorDTO) -> String {

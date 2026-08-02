@@ -5,6 +5,7 @@ import http.client as http_client
 import json
 import os
 import ssl
+import stat as stat_module
 import sys
 import threading
 import time
@@ -288,6 +289,11 @@ class CodexLocalInterceptor:
         self.local_context_window = _positive_int_env(
             "OMLX_CODEX_INTERCEPTOR_LOCAL_CONTEXT_WINDOW"
         )
+        route_path = os.environ.get("OMLX_CODEX_INTERCEPTOR_ROUTE_PATH")
+        self.route_path = Path(route_path).expanduser() if route_path else None
+        self._route_mtime_ns: int | None = None
+        self._route_revision = 0
+        self._active_local_operations = 0
         self.websocket_states: dict[str, ResponsesWebSocketState] = {}
         self.websocket_tasks: set[asyncio.Task] = set()
         capabilities_path = os.environ.get("OMLX_CODEX_INTERCEPTOR_CAPABILITIES_PATH")
@@ -352,11 +358,12 @@ class CodexLocalInterceptor:
         )
 
     async def running(self) -> None:
-        if not self.residency_keepalive_enabled:
-            return
-        task = asyncio.create_task(self._residency_loop())
-        self.websocket_tasks.add(task)
-        task.add_done_callback(self.websocket_tasks.discard)
+        tasks = [asyncio.create_task(self._route_watch_loop())]
+        if self.residency_keepalive_enabled:
+            tasks.append(asyncio.create_task(self._residency_loop()))
+        for task in tasks:
+            self.websocket_tasks.add(task)
+            task.add_done_callback(self.websocket_tasks.discard)
 
     def done(self) -> None:
         for task in tuple(self.websocket_tasks):
@@ -368,6 +375,100 @@ class CodexLocalInterceptor:
             self.upstream_pool.close()
             self.upstream_pool = PersistentUpstreamPool(self.upstream_url)
         return self.upstream_pool
+
+    async def _route_watch_loop(self) -> None:
+        while True:
+            self._refresh_route_if_idle()
+            await asyncio.sleep(0.25)
+
+    def _begin_local_operation(self) -> None:
+        self._active_local_operations += 1
+
+    def _finish_local_operation(self) -> None:
+        self._active_local_operations = max(0, self._active_local_operations - 1)
+        if self._active_local_operations == 0:
+            self._refresh_route_if_idle()
+
+    def _refresh_route_if_idle(self) -> bool:
+        """Apply an atomic route update only between local operations."""
+        path = self.route_path
+        if path is None or self._active_local_operations:
+            return False
+        try:
+            route_stat = path.lstat()
+            if not stat_module.S_ISREG(route_stat.st_mode):
+                raise PermissionError("route control must be a regular file")
+            if hasattr(os, "getuid") and route_stat.st_uid != os.getuid():
+                raise PermissionError("route control has an unexpected owner")
+            if route_stat.st_mode & 0o077:
+                raise PermissionError("route control permissions are too broad")
+            if route_stat.st_size > 16 * 1024:
+                raise ValueError("route control file is unexpectedly large")
+            if route_stat.st_mtime_ns == self._route_mtime_ns:
+                return False
+            self._route_mtime_ns = route_stat.st_mtime_ns
+            decoded = json.loads(path.read_text(encoding="utf-8"))
+            schema_version = (
+                decoded.get("schema_version") if isinstance(decoded, dict) else None
+            )
+            model = decoded.get("model") if isinstance(decoded, dict) else None
+            revision = decoded.get("revision") if isinstance(decoded, dict) else None
+            local_label = (
+                decoded.get("local_label") if isinstance(decoded, dict) else None
+            )
+            context_window = (
+                decoded.get("context_window") if isinstance(decoded, dict) else None
+            )
+            if (
+                schema_version != 1
+                or not isinstance(model, str)
+                or not model.strip()
+                or len(model) > 1024
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < self._route_revision
+                or not isinstance(local_label, str)
+                or not local_label
+                or len(local_label) > 1024
+                or (
+                    context_window is not None
+                    and (
+                        not isinstance(context_window, int)
+                        or isinstance(context_window, bool)
+                        or context_window <= 0
+                        or context_window > 10_000_000
+                    )
+                )
+            ):
+                raise ValueError("invalid route control fields")
+        except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError) as exc:
+            self._record("route_update_rejected", error=type(exc).__name__)
+            return False
+        if revision == self._route_revision:
+            return False
+        previous_model = self.model
+        self.model = model.strip()
+        self.local_label = local_label
+        self.local_context_window = context_window
+        self._route_revision = revision
+        self.local_failures.clear()
+        self.local_replays.clear()
+        self.local_event_replays.clear()
+        self.prefix_prefills.clear()
+        self._load_prefix_prefills()
+        self._capabilities_mtime_ns = None
+        self._native_function_calls = False
+        self._native_capability_reported = False
+        self._record(
+            "local_model_changed",
+            previous_local_model=previous_model,
+            local_model=self.model,
+            local_server=self.local_server,
+            local_slot=self.local_slot,
+            advertised_context_window=self.local_context_window,
+            route_revision=self._route_revision,
+        )
+        return True
 
     def _load_prefix_prefills(self) -> None:
         self.prefix_prefills = OrderedDict()
@@ -439,6 +540,14 @@ class CodexLocalInterceptor:
             await self._run_residency_keepalive()
 
     async def _run_residency_keepalive(self) -> None:
+        self._refresh_route_if_idle()
+        self._begin_local_operation()
+        try:
+            await self._run_residency_keepalive_inner()
+        finally:
+            self._finish_local_operation()
+
+    async def _run_residency_keepalive_inner(self) -> None:
         started = time.monotonic()
         body = json.dumps(
             {
@@ -645,6 +754,7 @@ class CodexLocalInterceptor:
                     local_slot=self.local_slot,
                 )
                 return
+            self._refresh_route_if_idle()
             request.decode(strict=False)
             request_summary = summarize_responses_request(payload, len(raw))
             compaction_request = is_compaction_request(payload)
@@ -811,6 +921,8 @@ class CodexLocalInterceptor:
                 "utf-8"
             )
         )
+        flow.metadata["omlx_local_operation"] = True
+        self._begin_local_operation()
         self._record(
             "inference_routed",
             original_host=original_host,
@@ -1020,15 +1132,36 @@ class CodexLocalInterceptor:
             requested_model=requested_model,
             request_bytes=len(body),
         )
-        task = asyncio.create_task(
-            self._run_prefix_prefill(
+        self._begin_local_operation()
+        tracked_prefill = self._run_tracked_prefix_prefill(
+            digest,
+            body,
+            requested_model=requested_model,
+        )
+        try:
+            task = asyncio.create_task(tracked_prefill)
+        except Exception:
+            tracked_prefill.close()
+            self._finish_local_operation()
+            raise
+        self.websocket_tasks.add(task)
+        task.add_done_callback(self.websocket_tasks.discard)
+
+    async def _run_tracked_prefix_prefill(
+        self,
+        digest: str,
+        body: bytes,
+        *,
+        requested_model: str | None,
+    ) -> None:
+        try:
+            await self._run_prefix_prefill(
                 digest,
                 body,
                 requested_model=requested_model,
             )
-        )
-        self.websocket_tasks.add(task)
-        task.add_done_callback(self.websocket_tasks.discard)
+        finally:
+            self._finish_local_operation()
 
     async def _run_prefix_prefill(
         self,
@@ -1263,6 +1396,7 @@ class CodexLocalInterceptor:
                 transport="websocket",
             )
             return
+        self._refresh_route_if_idle()
         message.drop()
         state = self.websocket_states.setdefault(flow.id, ResponsesWebSocketState())
         if state.is_prewarm(payload):
@@ -1284,11 +1418,30 @@ class CodexLocalInterceptor:
                 requested_model=requested_model,
             )
             return
-        task = asyncio.create_task(
-            self._serve_local_websocket_request(flow, state, payload, message.timestamp)
+        self._begin_local_operation()
+        tracked_request = self._serve_tracked_local_websocket_request(
+            flow, state, payload, message.timestamp
         )
+        try:
+            task = asyncio.create_task(tracked_request)
+        except Exception:
+            tracked_request.close()
+            self._finish_local_operation()
+            raise
         self.websocket_tasks.add(task)
         task.add_done_callback(self.websocket_tasks.discard)
+
+    async def _serve_tracked_local_websocket_request(
+        self,
+        flow: http.HTTPFlow,
+        state: ResponsesWebSocketState,
+        payload: dict[str, Any],
+        received_at: float,
+    ) -> None:
+        try:
+            await self._serve_local_websocket_request(flow, state, payload, received_at)
+        finally:
+            self._finish_local_operation()
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
         self.websocket_states.pop(flow.id, None)
@@ -1900,6 +2053,13 @@ class CodexLocalInterceptor:
         )
 
     def response(self, flow: http.HTTPFlow) -> None:
+        try:
+            self._handle_response(flow)
+        finally:
+            if flow.metadata.pop("omlx_local_operation", False):
+                self._finish_local_operation()
+
+    def _handle_response(self, flow: http.HTTPFlow) -> None:
         if flow.metadata.get("harness_remote_inference") and flow.response is not None:
             self._audit_cloud_http_response_headers(flow)
             self._audit_cloud_http_response_body(flow)
@@ -2211,6 +2371,13 @@ class CodexLocalInterceptor:
         return decoded
 
     def error(self, flow: http.HTTPFlow) -> None:
+        try:
+            self._handle_error(flow)
+        finally:
+            if flow.metadata.pop("omlx_local_operation", False):
+                self._finish_local_operation()
+
+    def _handle_error(self, flow: http.HTTPFlow) -> None:
         if flow.metadata.get("harness_remote_inference"):
             self._audit_cloud_bytes(
                 "cloud.transport.error",

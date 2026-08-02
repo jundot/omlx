@@ -76,6 +76,8 @@ SAFE_EVENT_FIELDS = frozenset(
         "connection_reused",
         "response_id",
         "previous_local_slot",
+        "previous_local_model",
+        "route_revision",
         "patched_model_count",
         "advertised_context_window",
         "opaque_compaction_item_count",

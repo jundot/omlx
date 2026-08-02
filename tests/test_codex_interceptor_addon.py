@@ -163,6 +163,30 @@ class AddonTestCase(unittest.TestCase):
             "context_management": {"compaction": {"enabled": True}},
         }
 
+    def write_route(
+        self,
+        model: str,
+        *,
+        revision: int,
+        context_window: int = 65536,
+    ) -> Path:
+        path = self.status_path.parent / "route.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "revision": revision,
+                    "model": model,
+                    "local_label": f"Local · oMLX · {model}",
+                    "context_window": context_window,
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        self.interceptor.route_path = path
+        return path
+
     def test_status_writer_rejects_content_and_raw_error_details(self):
         self.interceptor._record(
             "privacy_boundary",
@@ -186,6 +210,52 @@ class AddonTestCase(unittest.TestCase):
             }
             & event.keys()
         )
+
+    def test_route_update_changes_only_metadata_when_idle(self):
+        self.interceptor.local_failures["secret-digest"] = (time.time(), 1)
+        route = self.write_route("local/new", revision=2)
+
+        self.assertTrue(self.interceptor._refresh_route_if_idle())
+
+        self.assertEqual(self.interceptor.model, "local/new")
+        self.assertEqual(self.interceptor.local_context_window, 65536)
+        self.assertEqual(self.interceptor.local_failures, {})
+        self.assertEqual(route.stat().st_mode & 0o777, 0o600)
+        changed = [
+            event
+            for event in self.recorded()
+            if event["event"] == "local_model_changed"
+        ][-1]
+        self.assertEqual(changed["previous_local_model"], "claude-opus-5")
+        self.assertEqual(changed["route_revision"], 2)
+        self.assertNotIn("secret-digest", repr(changed))
+
+    def test_route_update_waits_until_all_local_work_is_finished(self):
+        self.interceptor._begin_local_operation()
+        self.write_route("local/next", revision=3)
+
+        self.assertFalse(self.interceptor._refresh_route_if_idle())
+        self.assertEqual(self.interceptor.model, "claude-opus-5")
+
+        self.interceptor._finish_local_operation()
+
+        self.assertEqual(self.interceptor.model, "local/next")
+        self.assertEqual(self.interceptor._active_local_operations, 0)
+
+    def test_route_update_rejects_a_symlink_control_file(self):
+        target = self.write_route("local/target", revision=4)
+        link = target.with_name("route-link.json")
+        link.symlink_to(target)
+        self.interceptor.route_path = link
+
+        self.assertFalse(self.interceptor._refresh_route_if_idle())
+        self.assertEqual(self.interceptor.model, "claude-opus-5")
+        rejected = [
+            event
+            for event in self.recorded()
+            if event["event"] == "route_update_rejected"
+        ]
+        self.assertEqual(rejected[-1]["error"], "PermissionError")
 
 
 class AddonCompactionTests(AddonTestCase):

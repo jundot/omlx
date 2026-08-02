@@ -38,14 +38,13 @@ bundled mitmproxy dependency, and SwiftUI controls described below. The runtime
 also filters status fields at the writer, so diagnostics cannot become a traffic
 capture through an accidental future call site.
 
-Automated verification on the branch includes 140 focused Python tests, a
+Automated verification on the branch includes 245 focused Python tests, a
 successful macOS app-and-test build, two passing Swift DTO tests, Python 3.11
 bundle dependency resolution, and an actual `mitmdump` routing smoke test that
 proved local model rewrite, credential replacement, response delivery, config
 immutability, and absence of prompt/response/credential content from the status
-file. The full upstream Python suite completed with 7,734 passes, 63 skips, and
-12 failures in unrelated numerical-tolerance, ambient API-key, and legacy test
-environment cases.
+file. The full upstream Python suite completed with 7,764 passes, 63 skips, and
+11 failures in unrelated numerical-tolerance and ambient API-key cases.
 
 The staged-app desktop acceptance checklist remains a release gate. It cannot be
 run from the Codex session creating this branch because the required fresh-app
@@ -278,6 +277,13 @@ Interceptor** section.
   actual wire slot and local label once Codex fetches its catalogue.
 - Primary **Start Interceptor** button. Once the proxy is ready it opens a fresh
   Codex app automatically.
+- While running, the picker becomes **Next local model**. **Use for Next Turn**
+  warms the target asynchronously and publishes an owner-only atomic route
+  update only after all local HTTP, WebSocket, prefill, and residency work is
+  idle. An in-flight response always finishes on the model that started it.
+- Show the active route separately from the model being loaded or queued. A
+  switch to a smaller or unknown context window is refused with an instruction
+  to start a fresh session; a same-or-larger context can switch in place.
 - **Stop** and **Restart** actions while active, with the private diagnostics path
   visible for troubleshooting.
 - If Codex is already open, replace Start with an explicit **Quit Codex & Start**
@@ -287,7 +293,8 @@ Interceptor** section.
 
 Show, without exposing content:
 
-- lifecycle status pill and active model/slot route;
+- lifecycle status pill, active local model/slot route, engine loaded/loading
+  state, and any pending next-turn model;
 - current activity: ready, receiving, prefilling, generating, delivered, or error;
 - local request/response count and OpenAI pass-through request/response count;
 - first-byte, first-visible, total latency, output tokens/second, cache hit rate,
@@ -298,8 +305,10 @@ Show, without exposing content:
 - invariant checks: config unchanged, process-only proxy, local upstream, and
   non-inference pass-through observed.
 
-The model and project controls are disabled while active. Changing either offers
-a managed restart rather than mutating a live session underneath Codex.
+The project control is disabled while active. The model control remains
+available, but its change is staged: the backend loads the target first and the
+proxy adopts it only between local operations. Codex's own model picker remains
+native; selecting a non-local slot continues to use OpenAI.
 
 ## Settings and persistence
 
@@ -358,13 +367,17 @@ From a staged OMLX app bundle:
 2. Start OMLX, select a local model, choose a project, and click Start.
 3. Confirm the relabelled local slot appears and returns a local response.
 4. Select another Codex model and confirm it uses OpenAI.
-5. Confirm existing Projects, Automations, plugins/MCP, and account state remain
+5. In OMLX, warm a same-or-larger-context local model during a local turn;
+   confirm the current response finishes on the old model and the next local
+   turn uses the new model. Confirm a smaller-context switch is refused.
+6. Confirm existing Projects, Automations, plugins/MCP, and account state remain
    available.
-6. Exercise a Codex tool call and Computer Use/browser capability.
-7. Watch local/remote counters and latency update in OMLX.
-8. Stop from OMLX and confirm Codex/proxy children exit cleanly.
-9. Re-hash the Codex config and confirm it is identical.
-10. Inspect diagnostics and confirm no prompt, response, header, cookie, or key was
+7. Exercise a Codex tool call and Computer Use/browser capability.
+8. Watch local/remote counters, active/effective model, residency, and latency
+   update in OMLX.
+9. Stop from OMLX and confirm Codex/proxy children exit cleanly.
+10. Re-hash the Codex config and confirm it is identical.
+11. Inspect diagnostics and confirm no prompt, response, header, cookie, or key was
     recorded.
 
 ## Failure behavior to design explicitly

@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -70,6 +70,8 @@ _SAFE_EVENT_FIELDS = {
     "prefix_prefill_status",
     "residency_status",
     "performance_warning",
+    "previous_local_model",
+    "route_revision",
     "warning",
     "error",
 }
@@ -237,6 +239,8 @@ class CodexInterceptorManager:
         self._session_id: str | None = None
         self._session_dir: Path | None = None
         self._status_path: Path | None = None
+        self._route_path: Path | None = None
+        self._route_revision = 0
         self._listen_port: int | None = None
         self._status_offset = 0
         self._status_remainder = ""
@@ -246,10 +250,20 @@ class CodexInterceptorManager:
         self._counts = {"local": 0, "cloud": 0, "completed": 0, "failed": 0}
         self._active_local = 0
         self._last_route: str | None = None
+        self._last_requested_model: str | None = None
+        self._last_effective_model: str | None = None
+        self._active_model: str | None = None
+        self._active_context_window: int | None = None
+        self._pending_model: str | None = None
+        self._pending_context_window: int | None = None
+        self._switch_generation = 0
+        self._switch_candidate: CodexInterceptorConfig | None = None
+        self._model_switch_error: str | None = None
         self._effective_slot: str | None = None
         self._latest_metrics: dict[str, Any] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=40)
         self._warmup_status = "idle"
+        self._warmup_model: str | None = None
 
     def doctor(self) -> dict[str, Any]:
         app = _find_codex_app_bundle()
@@ -279,10 +293,10 @@ class CodexInterceptorManager:
                 raise RuntimeError(
                     "the Codex interceptor is already running; stop it before changing settings"
                 )
+            self._config = config
             self._reset_status_locked()
             self._phase = "starting"
             self._error = None
-            self._config = config
             self._effective_slot = config.local_slot
             self._started_at = time.time()
             self._config_hash_before = _sha256_file(_CODEX_CONFIG)
@@ -319,6 +333,14 @@ class CodexInterceptorManager:
             status_path = session_dir / "status.jsonl"
             status_path.touch(mode=0o600)
             os.chmod(status_path, 0o600)
+            route_path = session_dir / "route.json"
+            self._write_route_config(
+                route_path,
+                revision=1,
+                model=config.model,
+                local_label=config.local_label,
+                context_window=config.context_window,
+            )
             listen_port = config.listen_port or _suggest_port()
             proxy = self._start_proxy(
                 config=config,
@@ -327,12 +349,15 @@ class CodexInterceptorManager:
                 session_id=session_id,
                 session_dir=session_dir,
                 status_path=status_path,
+                route_path=route_path,
             )
             with self._lock:
                 self._proxy = proxy
                 self._session_id = session_id
                 self._session_dir = session_dir
                 self._status_path = status_path
+                self._route_path = route_path
+                self._route_revision = 1
                 self._listen_port = listen_port
                 self._phase = "running"
             threading.Thread(
@@ -369,6 +394,8 @@ class CodexInterceptorManager:
             self._opener = None
             self._proxy = None
             self._listen_port = None
+            self._switch_generation += 1
+            self._switch_candidate = None
         if app_pid is not None:
             self._quit_pids([app_pid])
         _terminate(opener, timeout=2)
@@ -419,22 +446,179 @@ class CodexInterceptorManager:
                 self._proxy = None
             return self._status_locked()
 
+    def begin_model_switch(
+        self,
+        model: str,
+        *,
+        context_window: int | None,
+        local_label: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Reserve a safe model switch before asynchronously warming it.
+
+        This performs context and concurrency checks before a potentially long
+        model load. ``complete_model_switch`` publishes the route only after
+        the selected engine is ready.
+        """
+        model = model.strip()
+        if not model:
+            raise ValueError("a local model is required")
+        with self._lock:
+            self._consume_events_locked()
+            if not self._is_running_locked() or self._config is None:
+                raise RuntimeError("the Codex interceptor is not running")
+            if self._warmup_status == "loading":
+                raise RuntimeError("wait for the current local model to finish loading")
+            if self._switch_candidate is not None or self._pending_model is not None:
+                raise RuntimeError("a local model switch is already loading or queued")
+            active_model = self._active_model or self._config.model
+            current_context = self._active_context_window
+            target_context = (
+                context_window
+                if context_window is not None
+                else current_context
+                if model == active_model
+                else None
+            )
+            if (
+                target_context is not None
+                and current_context is not None
+                and target_context < current_context
+            ) or (
+                model != active_model
+                and (current_context is None or target_context is None)
+            ):
+                raise RuntimeError(
+                    "this model has a smaller or unknown context window; stop the "
+                    "interceptor and start a fresh Codex session with that model"
+                )
+            candidate = replace(
+                self._config,
+                model=model,
+                local_label=local_label or f"Local · oMLX · {model.rsplit('/', 1)[-1]}",
+                context_window=target_context,
+            )
+            self._switch_generation += 1
+            switch_generation = self._switch_generation
+            self._switch_candidate = candidate
+            self._warmup_status = "loading"
+            self._warmup_model = model
+            self._model_switch_error = None
+            return switch_generation, self._status_locked()
+
+    def complete_model_switch(self, switch_generation: int) -> dict[str, Any]:
+        """Publish a previously reserved switch after its engine is warm."""
+        with self._lock:
+            if (
+                switch_generation != self._switch_generation
+                or self._switch_candidate is None
+            ):
+                raise RuntimeError("the local model switch is no longer current")
+            candidate = self._switch_candidate
+            route_path = self._route_path
+        if route_path is None:
+            raise RuntimeError("the interceptor route control is unavailable")
+        self._check_upstream(candidate)
+        with self._lock:
+            if (
+                switch_generation != self._switch_generation
+                or self._switch_candidate != candidate
+                or not self._is_running_locked()
+                or self._route_path != route_path
+            ):
+                raise RuntimeError("the Codex interceptor stopped during model switch")
+            self._route_revision += 1
+            self._write_route_config(
+                route_path,
+                revision=self._route_revision,
+                model=candidate.model,
+                local_label=candidate.local_label,
+                context_window=candidate.context_window,
+            )
+            self._config = candidate
+            if (
+                candidate.model == self._active_model
+                and candidate.context_window == self._active_context_window
+            ):
+                self._pending_model = None
+                self._pending_context_window = None
+            else:
+                self._pending_model = candidate.model
+                self._pending_context_window = candidate.context_window
+            self._switch_candidate = None
+            self._warmup_status = "ready"
+            self._warmup_model = candidate.model
+            self._model_switch_error = None
+            return self._status_locked()
+
+    def fail_model_switch(
+        self,
+        switch_generation: int,
+        error: str,
+    ) -> dict[str, Any]:
+        """Record a load failure only if it belongs to the current switch."""
+        with self._lock:
+            if switch_generation != self._switch_generation:
+                return self._status_locked()
+            self._switch_candidate = None
+            self._warmup_status = "failed"
+            self._model_switch_error = error[:1024]
+            return self._status_locked()
+
+    def switch_model(
+        self,
+        model: str,
+        *,
+        context_window: int | None,
+        local_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Synchronously publish a model that the caller has already warmed."""
+        switch_generation, _ = self.begin_model_switch(
+            model,
+            context_window=context_window,
+            local_label=local_label,
+        )
+        try:
+            return self.complete_model_switch(switch_generation)
+        except Exception as exc:
+            self.fail_model_switch(switch_generation, str(exc))
+            raise
+
     def _reset_status_locked(self) -> None:
+        self._route_path = None
+        self._route_revision = 0
         self._counts = {"local": 0, "cloud": 0, "completed": 0, "failed": 0}
         self._active_local = 0
         self._last_route = None
+        self._last_requested_model = None
+        self._last_effective_model = None
+        self._active_model = self._config.model if self._config else None
+        self._active_context_window = (
+            self._config.context_window if self._config else None
+        )
+        self._pending_model = None
+        self._pending_context_window = None
+        self._switch_generation += 1
+        self._switch_candidate = None
+        self._model_switch_error = None
         self._effective_slot = None
         self._latest_metrics = {}
         self._events.clear()
         self._warmup_status = "loading"
+        self._warmup_model = self._config.model if self._config else None
         self._status_offset = 0
         self._status_remainder = ""
 
-    def set_warmup_status(self, session_id: str | None, status: str) -> None:
+    def set_warmup_status(
+        self, session_id: str | None, status: str, model: str | None = None
+    ) -> None:
         """Update readiness only when it still belongs to the active session."""
         with self._lock:
             if session_id == self._session_id:
+                if model is not None and model != self._warmup_model:
+                    return
                 self._warmup_status = status
+                if model is not None:
+                    self._warmup_model = model
 
     def _is_running_locked(self) -> bool:
         return self._proxy is not None and self._proxy.poll() is None
@@ -448,7 +632,16 @@ class CodexInterceptorManager:
             "error": self._error,
             "session_id": self._session_id,
             "started_at": self._started_at,
-            "model": config.model if config else None,
+            "model": self._active_model or (config.model if config else None),
+            "active_model": self._active_model,
+            "active_context_window": self._active_context_window,
+            "pending_model": self._pending_model,
+            "pending_context_window": self._pending_context_window,
+            "model_switching": (
+                self._switch_candidate is not None or self._pending_model is not None
+            ),
+            "model_switch_loading": self._switch_candidate is not None,
+            "model_switch_error": self._model_switch_error,
             "local_slot": self._effective_slot,
             "project": str(config.project) if config else None,
             "proxy_pid": self._proxy.pid if self._is_running_locked() else None,
@@ -462,8 +655,11 @@ class CodexInterceptorManager:
             "completed_requests": self._counts["completed"],
             "failed_requests": self._counts["failed"],
             "last_route": self._last_route,
+            "last_requested_model": self._last_requested_model,
+            "last_effective_model": self._last_effective_model,
             "latest_metrics": dict(self._latest_metrics),
             "warmup_status": self._warmup_status,
+            "warmup_model": self._warmup_model,
             "recent_events": list(self._events),
             "diagnostics_path": str(self._status_path) if self._status_path else None,
             "config_path": str(_CODEX_CONFIG),
@@ -523,6 +719,7 @@ class CodexInterceptorManager:
         session_id: str,
         session_dir: Path,
         status_path: Path,
+        route_path: Path,
     ) -> subprocess.Popen[Any]:
         confdir = session_dir / "mitmproxy"
         confdir.mkdir(mode=0o700)
@@ -542,6 +739,7 @@ class CodexInterceptorManager:
                 if config.auth_header
                 else "0",
                 "OMLX_CODEX_INTERCEPTOR_STATUS_PATH": str(status_path),
+                "OMLX_CODEX_INTERCEPTOR_ROUTE_PATH": str(route_path),
                 "OMLX_CODEX_INTERCEPTOR_SESSION_ID": session_id,
                 "OMLX_CODEX_INTERCEPTOR_LOCAL_LABEL": config.local_label,
                 "OMLX_CODEX_INTERCEPTOR_LOCAL_SERVER": "oMLX",
@@ -747,6 +945,31 @@ class CodexInterceptorManager:
         return target
 
     @staticmethod
+    def _write_route_config(
+        path: Path,
+        *,
+        revision: int,
+        model: str,
+        local_label: str,
+        context_window: int | None,
+    ) -> None:
+        payload = {
+            "schema_version": 1,
+            "revision": revision,
+            "model": model,
+            "local_label": local_label,
+            "context_window": context_window,
+        }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(payload, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+
+    @staticmethod
     def _quit_pids(pids: list[int]) -> None:
         for pid in pids:
             with contextlib.suppress(ProcessLookupError):
@@ -791,11 +1014,44 @@ class CodexInterceptorManager:
                 raw.get("local_slot"), str
             ):
                 self._effective_slot = raw["local_slot"]
+            if event == "local_model_changed" and isinstance(
+                raw.get("local_model"), str
+            ):
+                self._active_model = raw["local_model"]
+                context_window = raw.get("advertised_context_window")
+                self._active_context_window = (
+                    context_window if isinstance(context_window, int) else None
+                )
+                if self._pending_model == self._active_model:
+                    self._pending_model = None
+                    self._pending_context_window = None
             if event == "inference_routed":
+                if isinstance(raw.get("local_model"), str):
+                    self._active_model = raw["local_model"]
+                    if self._pending_model == self._active_model:
+                        self._active_context_window = self._pending_context_window
+                        self._pending_model = None
+                        self._pending_context_window = None
+                self._last_requested_model = (
+                    raw["requested_model"]
+                    if isinstance(raw.get("requested_model"), str)
+                    else None
+                )
+                self._last_effective_model = self._active_model
                 self._counts["local"] += 1
                 self._active_local += 1
                 self._last_route = "local"
             elif event == "remote_inference_routed":
+                self._last_requested_model = (
+                    raw["requested_model"]
+                    if isinstance(raw.get("requested_model"), str)
+                    else None
+                )
+                self._last_effective_model = (
+                    raw["effective_model"]
+                    if isinstance(raw.get("effective_model"), str)
+                    else self._last_requested_model
+                )
                 self._counts["cloud"] += 1
                 self._last_route = "cloud"
             elif event == "inference_completed":

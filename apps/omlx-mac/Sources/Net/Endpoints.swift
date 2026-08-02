@@ -25,6 +25,7 @@ enum AdminAPI {
     static let codexInterceptorDoctor = "\(prefix)/codex-interceptor/doctor"
     static let codexInterceptorStart  = "\(prefix)/codex-interceptor/start"
     static let codexInterceptorStop   = "\(prefix)/codex-interceptor/stop"
+    static let codexInterceptorSwitch = "\(prefix)/codex-interceptor/switch-model"
 
     static let models          = "\(prefix)/models"
     static func loadModel(_ id: String) -> String   { "\(models)/\(id)/load" }

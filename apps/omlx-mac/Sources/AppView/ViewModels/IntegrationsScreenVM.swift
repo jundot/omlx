@@ -51,6 +51,7 @@ final class IntegrationsScreenVM {
     private(set) var mcpConfigLoaded: String = ""
 
     private(set) var availableModels: [String] = []
+    private(set) var availableCodexModels: [String] = []
     private var modelContextWindows: [String: Int] = [:]
     var lastError: String?
 
@@ -74,6 +75,11 @@ final class IntegrationsScreenVM {
             out.append((id, id))
         }
         return out
+    }
+
+    var codexModelOptions: [(String, String)] {
+        [("", "Select a generation model…")]
+            + availableCodexModels.map { ($0, $0) }
     }
 
     /// Composed `omlx launch claude` command. Claude tier selections are
@@ -182,6 +188,13 @@ final class IntegrationsScreenVM {
             // Available models
             let models = try await client.listModels().models
             self.availableModels = models.map { $0.id }
+            self.availableCodexModels = models.compactMap { model in
+                let type = model.modelType ?? "llm"
+                return type == "llm" || type == "vlm" ? model.id : nil
+            }
+            if !codexModel.isEmpty && !availableCodexModels.contains(codexModel) {
+                codexModel = ""
+            }
             self.modelContextWindows = Dictionary(uniqueKeysWithValues: models.compactMap { model in
                 let context = model.settings?.maxContextWindow ?? model.modelContextLength
                 return context.map { (model.id, $0) }
@@ -213,6 +226,19 @@ final class IntegrationsScreenVM {
 
     var codexNeedsRestart: Bool {
         !(codexStatus?.running ?? false) && (codexDoctor?.codexRunning ?? false)
+    }
+
+    var activeCodexModel: String? {
+        codexStatus?.activeModel ?? codexStatus?.model
+    }
+
+    var canSwitchCodexModel: Bool {
+        guard codexStatus?.running == true, !codexBusy, !codexModel.isEmpty else {
+            return false
+        }
+        guard codexStatus?.warmupStatus != "loading" else { return false }
+        guard codexStatus?.modelSwitching != true else { return false }
+        return codexModel != activeCodexModel
     }
 
     func setCodexProject(_ path: String) {
@@ -274,6 +300,24 @@ final class IntegrationsScreenVM {
             lastError = nil
         } catch {
             lastError = error.omlxDescription
+        }
+    }
+
+    func switchCodexModel(client: OMLXClient) async {
+        guard canSwitchCodexModel else { return }
+        codexBusy = true
+        defer { codexBusy = false }
+        do {
+            codexStatus = try await client.switchCodexInterceptorModel(
+                CodexInterceptorSwitchRequest(
+                    model: codexModel,
+                    contextWindow: modelContextWindows[codexModel]
+                )
+            )
+            lastError = nil
+        } catch {
+            lastError = error.omlxDescription
+            await refreshCodex(client: client)
         }
     }
 

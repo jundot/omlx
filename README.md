@@ -237,7 +237,11 @@ and project, then starts a fresh Codex desktop session through a process-scoped
 loopback proxy. The selected Codex model slot runs through oMLX while other
 models and non-inference features continue to use OpenAI normally. oMLX never
 edits `~/.codex/config.toml`; the UI shows that invariant along with live
-local/cloud routing counts and latency.
+local/cloud routing counts and latency. While the interceptor is running, OMLX
+also shows the active local model and whether it is loaded, and can warm a
+different generation model for the next local turn without interrupting a
+response already in flight. Switching to a smaller or unknown context window
+requires a fresh intercepted session.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
