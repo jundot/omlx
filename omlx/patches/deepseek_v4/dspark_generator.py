@@ -110,6 +110,7 @@ def _runner(gb):
     global _RUNNER
     m = gb.model
     if _RUNNER is not None and _RUNNER.model is m: return _RUNNER
+    _t0 = time.perf_counter()
     dd = _dd()
     mdir = os.environ["OMLX_DSPARK_SPEC"]
     dsv4 = sys.modules[type(m.model).__module__]
@@ -125,7 +126,7 @@ def _runner(gb):
     tokns = type("T", (), {"eos_token_id": eos})
     R = dd.SpecRunner(mdir, m, tokns, dsv4, hcm, thr=0.6)
     _RUNNER = R
-    logger.info("dspark: SpecRunner built for %s (eos=%d)", mdir, eos)
+    logger.info("dspark: SpecRunner built for %s (eos=%d) in %.1fs (one-time)", mdir, eos, time.perf_counter() - _t0)
     return R
 
 def _attn_ramp(R, dd, L, xc, a, base):
