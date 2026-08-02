@@ -18,6 +18,26 @@ logger = logging.getLogger(__name__)
 
 class _Fallback(Exception): pass
 _RUNNER = None
+
+_DSPARK_ERRORS = 0
+_DSPARK_DISABLED = False
+
+def _note_activation_error():
+    """Circuit breaker: after OMLX_DSPARK_ERROR_LIMIT activation errors
+    (default 5; 0 disables the breaker), disable dspark for this process.
+    Prevents the activate->error->reconcile-by-reprefill loop (s95: errors
+    every ~2 tokens, reconcile cost growing with context, 4.0 tok/s)."""
+    global _DSPARK_ERRORS, _DSPARK_DISABLED
+    import os as _os
+    try:
+        limit = int(_os.environ.get("OMLX_DSPARK_ERROR_LIMIT", "5"))
+    except ValueError:
+        limit = 5
+    _DSPARK_ERRORS += 1
+    if limit > 0 and _DSPARK_ERRORS >= limit and not _DSPARK_DISABLED:
+        _DSPARK_DISABLED = True
+        logger.warning("dspark: DISABLED for this process after %d activation errors "
+                       "(OMLX_DSPARK_ERROR_LIMIT=%d; restart to re-enable)", _DSPARK_ERRORS, limit)
 _DD = None
 
 def _dd():
@@ -379,7 +399,7 @@ def enable() -> bool:
         st = getattr(self, "_omlx_dspark_state", None)
         if st is not None and st.queue and getattr(self, "uids", None) and self.uids[0] == st.uid:
             return _pop_emit(self, st)
-        if _eligible(self):
+        if not _DSPARK_DISABLED and _eligible(self):
             try:
                 st = _prepare(self)
                 if st is not None:
@@ -393,6 +413,7 @@ def enable() -> bool:
                 _reconcile_and_drop(self, "fallback")
             except Exception as e:
                 logger.warning("dspark error -> standard: %r", e)
+                _note_activation_error()
                 _reconcile_and_drop(self, "error")
         elif getattr(self, "_omlx_dspark_state", None) is not None:
             _reconcile_and_drop(self, "ineligible")

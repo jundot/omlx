@@ -388,3 +388,22 @@ def test_topp_acceptance_certificate(rig):
     sig = math.sqrt(sum(x * (1 - x) for x in EXP)) / len(EXP)
     assert abs(r - e) <= 2 * max(sig, 1e-9), \
         "acceptance dev %+.3f exceeds 2 sigma=%.3f (n=%d)" % (r - e, 2 * sig, len(EXP))
+
+
+def test_dspark_error_circuit_breaker(monkeypatch):
+    import importlib.util, os, sys
+    p = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
+        "omlx", "patches", "deepseek_v4", "dspark_generator.py"))
+    spec = importlib.util.spec_from_file_location("dg_breaker_test", p)
+    dg = importlib.util.module_from_spec(spec); sys.modules["dg_breaker_test"] = dg
+    spec.loader.exec_module(dg)
+    monkeypatch.setenv("OMLX_DSPARK_ERROR_LIMIT", "3")
+    dg._DSPARK_ERRORS = 0; dg._DSPARK_DISABLED = False
+    dg._note_activation_error(); dg._note_activation_error()
+    assert not dg._DSPARK_DISABLED
+    dg._note_activation_error()
+    assert dg._DSPARK_DISABLED
+    monkeypatch.setenv("OMLX_DSPARK_ERROR_LIMIT", "0")
+    dg._DSPARK_ERRORS = 0; dg._DSPARK_DISABLED = False
+    for _ in range(10): dg._note_activation_error()
+    assert not dg._DSPARK_DISABLED
