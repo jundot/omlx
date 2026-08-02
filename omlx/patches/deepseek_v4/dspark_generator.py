@@ -206,9 +206,14 @@ def _run_cycle(gb, st):
         st.cool = getattr(st, "cool", 0) + 1
     st.drafted += ell
     snaps = _snapshot_async(cache) if ell > 0 else None
+    _dsm = R.D.dsv4
+    _sp = getattr(_dsm, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False)
+    if ell + 1 >= 5:
+        _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
     D.REC[0] = True; cr.set_undo_armed(ell > 0)
     vlog = gb.model(mx.array([[st.anchor] + d[:ell]]), cache=cache)
     cr.set_undo_armed(False); D.REC[0] = False
+    _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = _sp
     if st.sample:
         PT = mx.softmax(vlog[0].astype(mx.float32), axis=-1)
         if ell > 0:
@@ -246,9 +251,12 @@ def _run_cycle(gb, st):
             st.resto += 1
             dd._restore(snaps)
             for t in D.TAPS: t.clear()
+            if k + 1 >= 5:
+                _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
             D.REC[0] = True
             rl = gb.model(mx.array([[st.anchor] + d[:k]]), cache=cache)
             D.REC[0] = False; mx.eval(rl)
+            _dsm._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = _sp
             D.extend_rings(D.take_taps(), st.C)
     else:
         D.extend_rings(mh, st.C, do_eval=False)
