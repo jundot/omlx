@@ -770,14 +770,14 @@ class TestSchedulerAddRequest:
         """Prompts below the freshness minimum should never wait on store_cache."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
-        prompt = list(range(7000))
+        prompt = list(range(4095))
 
         future = MagicMock()
         future.done.return_value = False
         future.result.return_value = None
         scheduler._inflight_store_futures["req-prev"] = future
         scheduler._inflight_store_info["req-prev"] = (
-            scheduler_module._InflightStoreInfo(tokens=list(range(6000)))
+            scheduler_module._InflightStoreInfo(tokens=list(range(3584)))
         )
 
         request = Request(
@@ -792,6 +792,62 @@ class TestSchedulerAddRequest:
         scheduler.block_aware_cache.fetch_cache.assert_not_called()
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_defers_for_immediate_4k_boundary_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """A 4K repeat should wait for its 3584-token boundary snapshot."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(4096))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(3584)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_for_4k_store_below_relevance_ratio(
+        self, mock_model, mock_tokenizer
+    ):
+        """The lower size gate must not make weakly related 4K stores wait."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(4096))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(1024)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
 
     def test_admission_defers_for_relevant_store_during_active_work(
         self, mock_model, mock_tokenizer

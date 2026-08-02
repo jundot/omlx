@@ -6802,7 +6802,13 @@ class Scheduler:
                 f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
             )
 
-    _CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS = 8192
+    # A 4K prompt is the smallest standard benchmark/workload where a missed
+    # async store is already a multi-second re-prefill.  DeepSeek V4 boundary
+    # snapshots intentionally retain 3584 of 4096 prompt tokens, and their SSD
+    # write can finish just after the first HTTP response is returned.  Include
+    # this workload class in the non-blocking freshness deferral so an immediate
+    # repeated turn waits for that relevant store instead of racing it.
+    _CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS = 4096
     _CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS = 8192
     _CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO = 0.30
     _CACHE_FRESHNESS_WAIT_TIMEOUT_S = 4.0
