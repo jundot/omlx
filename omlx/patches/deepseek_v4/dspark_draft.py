@@ -206,6 +206,19 @@ class SpecRunner:
         self.policy = policy if policy is not None else make_static_policy(thr)
         try:
             import os as _os
+            if _os.environ.get("OMLX_DSPARK_COMPILE_HC", "1") != "0" and not getattr(dsv4, "_dspark_hc_compiled", False):
+                _op = getattr(hcm, "_hc_expand_op", None)
+                _chc = _op if _op is not None else mx.compile(hcm.hc_expand)
+                dsv4.hc_expand = _chc   # the model's from-import binding (122 sites/forward)
+                hcm.hc_expand = _chc    # draft path attribute access (6 sites/draft)
+                dsv4._dspark_hc_compiled = True
+                import logging as _lg
+                _lg.getLogger(__name__).info("dspark: hc_expand rebound to compiled inner op (wrapper frames bypassed)")
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("dspark: hc_expand compile skipped: %r", _e)
+        try:
+            import os as _os
             if _os.environ.get("OMLX_DSPARK_HEAD_MXFP8", "1") != "0":
                 _hw = model.lm_head.weight.astype(mx.bfloat16)
                 _q = mx.quantize(_hw, group_size=32, bits=8, mode="mxfp8")
