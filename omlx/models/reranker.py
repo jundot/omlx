@@ -661,7 +661,7 @@ class MLXRerankerModel:
         user_content = (
             f"I will provide you with {len(sanitized_docs)} passages, each indicated "
             f"by a numerical identifier. Rank the passages based on their relevance "
-            f"to query: {sanitized_query}\n"
+            f"to query: {sanitized_query}<|rerank_token|>\n"
         )
         if sanitized_instruction:
             user_content += f"<instruct>\n{sanitized_instruction}\n</instruct>\n"
@@ -733,6 +733,21 @@ class MLXRerankerModel:
         denom = mx.maximum(doc_norms * query_norm, eps)
         numer = mx.sum(doc_vecs * query_vec, axis=-1)
         return numer / denom
+
+    def _fuse_query_vectors(
+        self, query_vecs: list, weights: list[float]
+    ) -> mx.array:
+        """Weighted-average fusion of per-chunk query vectors.
+
+        Weight is each chunk's block_weight (max normalized cosine score) -
+        chunks where the model found a strong match count more toward the
+        final fused query representation. Mirrors the reference
+        jina-reranker-v3.5-mlx rerank()'s weighted average over per-block
+        query embeddings.
+        """
+        stacked = mx.stack(query_vecs, axis=0)
+        weight_array = mx.array(weights, dtype=stacked.dtype).reshape(-1, 1)
+        return (stacked * weight_array).sum(axis=0) / weight_array.sum()
 
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
@@ -1048,11 +1063,16 @@ class MLXRerankerModel:
         max_length: int = 8192,
     ) -> RerankOutput:
         """
-        Rerank using Jina v3 listwise embedding-based scoring.
+        Rerank using Jina v3.5 dual-matching + block-fusion listwise scoring.
 
-        Builds multi-document prompts, extracts hidden states at special token
-        positions, applies the projector, and computes query-document cosine
-        similarities. Uses deterministic greedy chunking under max_length.
+        Builds multi-document prompts (dual rerank tokens: early header +
+        late query block), extracts hidden states at special token positions,
+        applies the projector, and scores each chunk against its own query
+        vector. Chunk scores are provisional: after every chunk is scored,
+        their query vectors are fused into one (weighted by each chunk's
+        strongest match) and every document is re-scored against that fused
+        vector for the final result. Uses deterministic greedy chunking under
+        max_length.
         """
         tokenizer = self.processor
         doc_embed_token_id = self._doc_embed_token_id
@@ -1125,9 +1145,15 @@ class MLXRerankerModel:
         sanitized_query = self._sanitize_jina_text(query)
         sanitized_docs = [self._sanitize_jina_text(doc) for doc in documents]
 
-        scores = [0.0] * len(documents)
         total_tokens = 0
         start = 0
+        # Accumulated across all chunks for the block-fusion pass below: each
+        # chunk's query vector + weight, and every doc vector in original
+        # document order (via all_doc_indices, since chunks are variable-size).
+        chunk_query_vecs: list[mx.array] = []
+        chunk_weights: list[float] = []
+        all_doc_indices: list[int] = []
+        all_doc_vecs: list[mx.array] = []
         while start < len(sanitized_docs):
             chunk_doc_indices: list[int] = []
             chunk_docs: list[str] = []
@@ -1172,9 +1198,11 @@ class MLXRerankerModel:
                 for pos, token_id in enumerate(chunk_input_ids)
                 if token_id == query_embed_token_id
             ]
-            if not query_positions:
+            if len(query_positions) != 2:
                 raise ValueError(
-                    "Jina prompt does not contain '<|rerank_token|>' in tokenized input."
+                    "Jina dual-matching prompt must contain two "
+                    "'<|rerank_token|>' positions (early header + late query "
+                    f"block); found {len(query_positions)} in tokenized input."
                 )
 
             doc_positions = [
@@ -1189,20 +1217,52 @@ class MLXRerankerModel:
                 )
 
             selected_doc_positions = doc_positions[: len(chunk_docs)]
-            query_hidden = hidden_states[0, query_positions[0], :]
+            # Dual matching: score from the LATE rerank-token position. The
+            # early one is an anchor the late position can attend back to,
+            # not a second read-out point. Matches the reference
+            # _score_block, which reads rerank_pos[1].
+            late_query_position = query_positions[1]
+            query_hidden = hidden_states[0, late_query_position, :]
             doc_hidden = hidden_states[0, selected_doc_positions, :]
 
-            query_vec = projector(query_hidden)
-            doc_vecs = projector(doc_hidden)
-            similarities = self._cosine_similarity(query_vec, doc_vecs)
-            mx.eval(similarities)
+            # Upcast to float32 before any scoring math: the checkpoint's
+            # hidden states/projector output are bf16, whose ~3 significant
+            # digits are coarse enough to measurably shift cosine-similarity
+            # results. Matches the reference _score_block, which does the
+            # same upcast (Q_emb_mlx.astype(mx.float32)) immediately after
+            # its own projector call, before any normalization/dot-product
+            # math.
+            query_vec = projector(query_hidden).astype(mx.float32)
+            doc_vecs = projector(doc_hidden).astype(mx.float32)
+            cos_scores = self._cosine_similarity(query_vec, doc_vecs)
+            mx.eval(cos_scores)
 
-            chunk_scores = similarities.tolist()
-            for original_idx, score in zip(chunk_doc_indices, chunk_scores):
-                scores[original_idx] = float(score)
+            # Block weight: how strongly this chunk's best match stood out.
+            # Blocks fused below are weighted by this, not scored directly.
+            # Matches the reference _score_block's block_weight.
+            block_weight = float(((1.0 + cos_scores) / 2.0).max())
+
+            chunk_query_vecs.append(query_vec)
+            chunk_weights.append(block_weight)
+            all_doc_indices.extend(chunk_doc_indices)
+            all_doc_vecs.append(doc_vecs)
 
             total_tokens += len(chunk_input_ids)
             start = cursor
+
+        # Block fusion: combine every chunk's query vector into one, weighted
+        # by each chunk's block_weight, then re-score every accumulated
+        # document vector against that single fused vector. Matches the
+        # reference rerank()'s fusion step, rather than treating each chunk's
+        # provisional scores as final.
+        fused_query_vec = self._fuse_query_vectors(chunk_query_vecs, chunk_weights)
+        stacked_doc_vecs = mx.concatenate(all_doc_vecs, axis=0)
+        final_similarities = self._cosine_similarity(fused_query_vec, stacked_doc_vecs)
+        mx.eval(final_similarities)
+
+        scores = [0.0] * len(documents)
+        for original_idx, score in zip(all_doc_indices, final_similarities.tolist()):
+            scores[original_idx] = float(score)
 
         # Sort by score descending
         indexed_scores = list(enumerate(scores))
