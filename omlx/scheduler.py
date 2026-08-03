@@ -63,7 +63,11 @@ from .speculative.processing_sampler import (
     MTPProcessingSampler,
     supports_vlm_mtp_processing,
 )
-from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .speculative.vlm_mtp import (
+    VLMMTPDrafter,
+    run_vlm_mtp_decode,
+    vlm_mtp_positioned_sampling_available,
+)
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
@@ -7368,18 +7372,25 @@ class Scheduler:
             )
             return None
 
-        if mtp_processors and not hasattr(lm, "speculative_logits_from_hidden"):
-            # Without this hook, mlx-vlm's verify step samples target tokens
-            # from raw logits in one vectorized call and never consults the
+        if mtp_processors and not vlm_mtp_positioned_sampling_available(self.model):
+            # Without speculative_logits_from_hidden visible to the round
+            # loop, mlx-vlm's verify step samples target tokens from raw
+            # logits in one vectorized call and never consults the
             # positioned ``sample_target`` hook — processors would be
-            # silently dropped again (#2399). Decline instead.
+            # silently dropped again (#2399). The check must look at what
+            # the round loop will actually see: for mRoPE adapters (Qwen
+            # VLMs) _VLMAdapterMTPProxy hides the inner model's
+            # speculative_* fast paths, so probing the inner model
+            # directly would pass the gate and then silently skip the
+            # budget. Decline instead.
             logger.info(
                 "vlm_mtp routing skipped for %s: request carries logits "
-                "processors but %s lacks speculative_logits_from_hidden "
-                "(positioned verify sampling unavailable); falling back to "
-                "BatchGenerator",
+                "processors but positioned verify sampling is unavailable "
+                "on %s (speculative_logits_from_hidden hidden or missing "
+                "on the round-loop view, e.g. mRoPE adapters); falling "
+                "back to BatchGenerator",
                 request.request_id,
-                type(lm).__name__,
+                type(self.model).__name__,
             )
             return None
         target_model = self.model

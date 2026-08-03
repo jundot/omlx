@@ -30,6 +30,10 @@ from omlx.speculative.processing_sampler import (
     MTPProcessingSampler,
     supports_vlm_mtp_processing,
 )
+from omlx.speculative.vlm_mtp import (
+    _VLMAdapterMTPProxy,
+    vlm_mtp_positioned_sampling_available,
+)
 
 VOCAB = 32
 THINK = 7  # the model's preferred "thinking filler" token
@@ -472,3 +476,130 @@ class TestRouteGate:
         assert 1 in sampler._snapshots
         assert sampler._history == PROMPT + [THINK]
         assert sched._vlm_mtp_active[uid].sampler is sampler
+
+
+# ---------------------------------------------------------------------------
+# 5. Positioned-hook visibility through _VLMAdapterMTPProxy (mRoPE gate)
+# ---------------------------------------------------------------------------
+
+
+def _hook(hidden):
+    return hidden
+
+
+def _make_adapter(*, mrope: bool, adapter_hook: bool, lm_hook: bool):
+    """Build a fake VLM adapter + inner language model pair."""
+    lm_attrs = {"rollback_speculative_cache": lambda *a, **k: None}
+    if lm_hook:
+        lm_attrs["speculative_logits_from_hidden"] = _hook
+    lm = SimpleNamespace(**lm_attrs)
+    adapter_attrs = {"_language_model": lm, "_uses_mrope": mrope}
+    if adapter_hook:
+        adapter_attrs["speculative_logits_from_hidden"] = _hook
+    return SimpleNamespace(**adapter_attrs), lm
+
+
+class TestPositionedHookVisibility:
+    """The routing gate must probe what mlx-vlm's round loop will actually
+    see. For mRoPE adapters (Qwen VLMs) _VLMAdapterMTPProxy hides the inner
+    language model's ``speculative_*`` fast paths, so a check against the
+    inner model passes while the loop silently falls back to plain
+    vectorized sampling and drops the processors (#2399)."""
+
+    @pytest.mark.parametrize("mrope", [False, True])
+    @pytest.mark.parametrize("adapter_hook", [False, True])
+    @pytest.mark.parametrize("lm_hook", [False, True])
+    def test_helper_matches_real_proxy_resolution(
+        self, mrope, adapter_hook, lm_hook
+    ):
+        """vlm_mtp_positioned_sampling_available == what the round loop
+        resolves through the real proxy, for every combination."""
+        adapter, lm = _make_adapter(
+            mrope=mrope, adapter_hook=adapter_hook, lm_hook=lm_hook
+        )
+        proxy = _VLMAdapterMTPProxy(adapter, lm)
+        # mlx-vlm's resolution (mtp.py): lm = model.language_model if
+        # present else model; positioned path gated on the hook's presence.
+        loop_lm = (
+            proxy.language_model
+            if hasattr(proxy, "language_model")
+            else proxy
+        )
+        loop_sees_hook = hasattr(loop_lm, "speculative_logits_from_hidden")
+        assert (
+            vlm_mtp_positioned_sampling_available(adapter) == loop_sees_hook
+        )
+
+    def test_mrope_hides_inner_hook(self):
+        """The maintainer-reported case: inner LM has the hook, adapter is
+        mRoPE — the proxy hides it, so availability must be False."""
+        adapter, lm = _make_adapter(
+            mrope=True, adapter_hook=False, lm_hook=True
+        )
+        assert hasattr(lm, "speculative_logits_from_hidden")  # naive check
+        assert not vlm_mtp_positioned_sampling_available(adapter)
+
+    def test_adapter_level_hook_survives_mrope(self):
+        """An mRoPE-safe hook implemented on the adapter itself is visible
+        to the loop and keeps the vlm_mtp route open."""
+        adapter, _ = _make_adapter(
+            mrope=True, adapter_hook=True, lm_hook=False
+        )
+        assert vlm_mtp_positioned_sampling_available(adapter)
+
+    def test_no_adapter_falls_back_to_model_probe(self):
+        bare = SimpleNamespace(speculative_logits_from_hidden=_hook)
+        assert vlm_mtp_positioned_sampling_available(bare)
+        assert not vlm_mtp_positioned_sampling_available(SimpleNamespace())
+
+    def test_route_gate_declines_mrope_adapter(self, caplog):
+        """Regression for the silent-drop report on Qwen VLM targets: the
+        gate must decline (falling back to BatchGenerator) even though the
+        inner language model carries the hook."""
+        adapter, _ = _make_adapter(
+            mrope=True, adapter_hook=False, lm_hook=True
+        )
+        sched = SimpleNamespace(
+            _vlm_mtp_drafter=object(),
+            _vlm_mtp_active={},
+            model=adapter,
+        )
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            uid = Scheduler._route_to_vlm_mtp(
+                sched,
+                _make_route_request(),
+                [object()],
+                [42],
+                _argmax_sampler,
+                object(),
+                logits_processors=[_make_budget_processor(4)],
+            )
+        assert uid is None
+        assert "positioned verify sampling is unavailable" in caplog.text
+
+    def test_route_gate_passes_non_mrope_adapter(self, caplog):
+        """Same shape, mRoPE off: the hook is visible through the proxy, so
+        the gate passes; routing then declines on the empty last_tokens —
+        the check immediately after the positioned gate — proving the
+        positioned gate itself let the request through."""
+        adapter, _ = _make_adapter(
+            mrope=False, adapter_hook=False, lm_hook=True
+        )
+        sched = SimpleNamespace(
+            _vlm_mtp_drafter=object(),
+            _vlm_mtp_active={},
+            model=adapter,
+        )
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            uid = Scheduler._route_to_vlm_mtp(
+                sched,
+                _make_route_request(),
+                [object()],
+                [],
+                _argmax_sampler,
+                object(),
+                logits_processors=[_make_budget_processor(4)],
+            )
+        assert uid is None
+        assert "positioned verify sampling is unavailable" not in caplog.text
+        assert "last_tokens empty" in caplog.text
