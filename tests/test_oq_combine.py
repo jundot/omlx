@@ -16,9 +16,12 @@ import pytest
 from omlx.oq import (
     GEMMA4_ASSISTANT_MTP_PREFIX,
     GEMMA4_ASSISTANT_MTP_SHARD,
+    MTPLX_RUNTIME_FILE,
+    MTPLX_SIDECAR_SHARD,
     combine_gemma4_assistant_mtp,
     combine_mtp_donor,
     combine_mtp_into_output,
+    import_mtplx_sidecar,
     validate_gemma4_assistant_pair,
     validate_mtp_donor_pair,
 )
@@ -436,3 +439,107 @@ def test_combine_dispatch_routes_qwen_donor(tmp_path):
     config = json.loads((out / "config.json").read_text())
     assert config["mtp_num_hidden_layers"] == 1
     assert "mtp_assistant_config" not in config
+
+
+# ── MTPLX side-car import ───────────────────────────────────────────────
+
+
+def _write_qwen_mtplx_sidecar_model(tmp_path, *, vlm=False, bad_contract=False):
+    out = _write_qwen_output(tmp_path, vlm=vlm)
+    config = json.loads((out / "config.json").read_text())
+    config["mtplx_mtp_payload_audit"] = {"passed": True, "payload_tensor_count": 8}
+    config["mtplx_mtp_contract"] = {
+        "base_hidden_variant": "post_norm",
+        "hidden_variant": "post_norm",
+        "concat_order": "embedding_hidden",
+        "mtp_position_mode": "local",
+    }
+    (out / "config.json").write_text(json.dumps(config))
+
+    runtime = {
+        "arch_id": "qwen3-next-mtp",
+        "mtp_sidecar": "bf16",
+        "mtp_depth_max": 3,
+        "mtp_contract": {
+            "base_hidden_variant": "post_norm",
+            "hidden_variant": "post_norm",
+            "concat_order": "embedding_hidden",
+            "mtp_position_mode": "local",
+        },
+    }
+    if bad_contract:
+        runtime["mtp_contract"]["hidden_variant"] = "pre_norm"
+    (out / MTPLX_RUNTIME_FILE).write_text(json.dumps(runtime))
+
+    bf16 = mx.bfloat16
+    sidecar_weights = {
+        "mtp.fc.weight": mx.ones((8, 16), dtype=bf16),
+        "mtp.norm.weight": mx.ones((8,), dtype=bf16),
+        "mtp.pre_fc_norm_embedding.weight": mx.ones((8,), dtype=bf16),
+        "mtp.pre_fc_norm_hidden.weight": mx.ones((8,), dtype=bf16),
+        "mtp.layers.0.input_layernorm.weight": mx.ones((8,), dtype=bf16),
+        "mtp.layers.0.self_attn.q_proj.weight": mx.ones((8, 8), dtype=bf16),
+        "mtp.layers.0.mlp.gate_proj.weight": mx.ones((16, 8), dtype=bf16),
+    }
+    mx.save_safetensors(
+        str(out / MTPLX_SIDECAR_SHARD),
+        sidecar_weights,
+        metadata={"format": "mlx"},
+    )
+    return out
+
+
+def test_import_mtplx_sidecar_falls_back_to_dup_for_vlm_prefix(tmp_path):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True)
+
+    result = import_mtplx_sidecar(out, prefer_no_dup=True)
+
+    assert result["merge_mode"] == "dup"
+    assert result["target_shard"] == GEMMA4_ASSISTANT_MTP_SHARD
+    shard = out / GEMMA4_ASSISTANT_MTP_SHARD
+    assert shard.exists()
+    merged = mx.load(str(shard))
+    assert all(k.startswith("language_model.mtp.") for k in merged)
+
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert (
+        index["weight_map"]["language_model.mtp.fc.weight"]
+        == GEMMA4_ASSISTANT_MTP_SHARD
+    )
+
+    config = json.loads((out / "config.json").read_text())
+    assert config["text_config"]["mtp_num_hidden_layers"] == 1
+    assert result["raw_tensor_count"] == 7
+    assert result["payload_tensor_count"] == 8
+
+    assert list(out.glob("model.safetensors.index.json.*.bak"))
+    assert list(out.glob("config.json.*.bak"))
+
+
+def test_import_mtplx_sidecar_uses_no_dup_when_keys_align(tmp_path):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=False)
+
+    result = import_mtplx_sidecar(out, prefer_no_dup=True)
+
+    assert result["merge_mode"] == "no-dup"
+    assert result["target_shard"] == MTPLX_SIDECAR_SHARD
+    assert not (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert index["weight_map"]["mtp.fc.weight"] == MTPLX_SIDECAR_SHARD
+
+
+def test_import_mtplx_sidecar_rejects_contract_mismatch(tmp_path):
+    out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True, bad_contract=True)
+
+    before_index = (out / "model.safetensors.index.json").read_text()
+    before_config = (out / "config.json").read_text()
+
+    with pytest.raises(ValueError, match="Unsupported MTPLX contract"):
+        import_mtplx_sidecar(out, prefer_no_dup=True)
+
+    assert (out / "model.safetensors.index.json").read_text() == before_index
+    assert (out / "config.json").read_text() == before_config
+    assert not list(out.glob("model.safetensors.index.json.*.bak"))
+    assert not list(out.glob("config.json.*.bak"))
+

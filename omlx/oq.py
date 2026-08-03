@@ -1231,6 +1231,16 @@ def resolve_output_name(
 
 GEMMA4_ASSISTANT_MTP_PREFIX = "language_model.mtp."
 GEMMA4_ASSISTANT_MTP_SHARD = "model-mtp.safetensors"
+MTPLX_SIDECAR_SHARD = "mtp.safetensors"
+MTPLX_RUNTIME_FILE = "mtplx_runtime.json"
+
+_MTPLX_CONTRACT_ALLOWLIST = {
+    "arch_id": "qwen3-next-mtp",
+    "base_hidden_variant": "post_norm",
+    "hidden_variant": "post_norm",
+    "concat_order": "embedding_hidden",
+    "mtp_position_mode": "local",
+}
 
 
 def validate_gemma4_assistant_pair(
@@ -1315,8 +1325,7 @@ def combine_gemma4_assistant_mtp(
         (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
     )
     text_config["mtp_assistant_config"] = assistant_config
-    with open(output / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(output / "config.json", config)
 
     logger.info(
         "Merged gemma4 assistant MTP head into %s "
@@ -1331,19 +1340,53 @@ def combine_gemma4_assistant_mtp(
 # ── Native MTP head donor combine (Qwen3.5/3.6) ─────────────────────────
 
 
-def _write_mtp_shard_and_merge_index(output: Path, mtp_weights: dict) -> int:
+def _timestamped_backup(path: Path) -> Path:
+    """Write ``<path>.<timestamp>.bak`` once; never overwrite old backups."""
+    stamp = _time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.{stamp}.bak")
+    if backup.exists():
+        raise FileExistsError(f"Refusing to overwrite existing backup: {backup}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically replace a JSON file while preserving a timestamped backup."""
+    _timestamped_backup(path)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+    ) as tmp:
+        json.dump(payload, tmp, indent=2)
+        tmp.flush()
+        temp_name = tmp.name
+    Path(temp_name).replace(path)
+
+
+def _write_mtp_shard_and_merge_index(
+    output: Path,
+    mtp_weights: dict,
+    *,
+    shard_name: str = GEMMA4_ASSISTANT_MTP_SHARD,
+    write_shard: bool = True,
+    shard_size_bytes: int | None = None,
+) -> int:
     """Write mtp weights as one extra shard and merge the safetensors index.
 
-    Shared by the gemma4 assistant combine and the native donor graft (the
-    shard name is historical). The index merge is a no-op when the output
-    has no ``model.safetensors.index.json``. Returns the shard byte size.
+    Shared by the gemma4 assistant combine and native MTP imports. The index
+    merge is a no-op when the output has no ``model.safetensors.index.json``.
+    Returns the shard byte size.
     """
-    mx.save_safetensors(
-        str(output / GEMMA4_ASSISTANT_MTP_SHARD),
-        mtp_weights,
-        metadata={"format": "mlx"},
+    if write_shard:
+        mx.save_safetensors(
+            str(output / shard_name),
+            mtp_weights,
+            metadata={"format": "mlx"},
+        )
+    mtp_size = (
+        int(shard_size_bytes)
+        if shard_size_bytes is not None
+        else sum(v.nbytes for v in mtp_weights.values())
     )
-    mtp_size = sum(v.nbytes for v in mtp_weights.values())
 
     out_index_path = output / "model.safetensors.index.json"
     if out_index_path.exists():
@@ -1351,13 +1394,207 @@ def _write_mtp_shard_and_merge_index(output: Path, mtp_weights: dict) -> int:
             index = json.load(f)
         weight_map = index.setdefault("weight_map", {})
         for key in mtp_weights:
-            weight_map[key] = GEMMA4_ASSISTANT_MTP_SHARD
+            weight_map[key] = shard_name
         metadata = index.get("metadata") or {}
         metadata["total_size"] = int(metadata.get("total_size", 0) or 0) + mtp_size
         index["metadata"] = metadata
-        with open(out_index_path, "w") as f:
-            json.dump(index, f, indent=2)
+        _atomic_write_json(out_index_path, index)
     return mtp_size
+
+
+def _synthesize_mtp_quant_entries(
+    donor_quant: dict,
+    mtp_key_shards: dict,
+    *,
+    recipient_prefix: str,
+) -> dict:
+    """Build per-layer quant entries for modules with explicit ``.scales``."""
+    if not isinstance(donor_quant, dict):
+        return {}
+    donor_global = {
+        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
+    }
+    quant_entries: dict = {}
+    for key in mtp_key_shards:
+        if not key.endswith(".scales"):
+            continue
+        base = key[: -len(".scales")]
+        bare_module = _strip_mtp_key_prefix(base)
+        if bare_module is None:
+            continue
+        candidates = (
+            base,
+            bare_module,
+            "language_model." + bare_module,
+            "model." + bare_module,
+            "model.language_model." + bare_module,
+        )
+        spec = None
+        for candidate in candidates:
+            value = donor_quant.get(candidate)
+            if isinstance(value, dict):
+                spec = value
+                break
+        if spec is None:
+            if not donor_global:
+                raise ValueError(
+                    "Donor MTP head is quantized but its config declares no "
+                    "global quantization parameters"
+                )
+            spec = donor_global
+        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    return quant_entries
+
+
+def _validate_mtplx_runtime_contract(model_path: Path) -> dict:
+    """Validate the MTPLX runtime contract and return the parsed payload."""
+    runtime_path = model_path / MTPLX_RUNTIME_FILE
+    if not runtime_path.exists():
+        raise ValueError(f"Missing required runtime contract: {runtime_path}")
+    with open(runtime_path) as f:
+        runtime = json.load(f)
+
+    contract = runtime.get("mtp_contract") or {}
+    checks = {
+        "arch_id": runtime.get("arch_id"),
+        "base_hidden_variant": contract.get("base_hidden_variant"),
+        "hidden_variant": contract.get("hidden_variant"),
+        "concat_order": contract.get("concat_order"),
+        "mtp_position_mode": contract.get("mtp_position_mode"),
+    }
+    for field, expected in _MTPLX_CONTRACT_ALLOWLIST.items():
+        actual = checks.get(field)
+        if actual != expected:
+            raise ValueError(
+                "Unsupported MTPLX contract "
+                f"{field}={actual!r}; expected {expected!r}"
+            )
+    return runtime
+
+
+def _validate_mtplx_payload_audit(
+    config: dict,
+    mtp_weights: dict,
+) -> tuple[int, int | None]:
+    """Validate payload audit schema and report (raw_count, audited_count)."""
+    raw_count = len(mtp_weights)
+    audit = config.get("mtplx_mtp_payload_audit")
+    if not isinstance(audit, dict):
+        return raw_count, None
+    if "passed" not in audit:
+        raise ValueError("mtplx_mtp_payload_audit is missing required 'passed' flag")
+    if not bool(audit.get("passed")):
+        raise ValueError("mtplx_mtp_payload_audit.passed is false")
+    audited = audit.get("payload_tensor_count")
+    if audited is None:
+        return raw_count, None
+    if not isinstance(audited, int):
+        raise ValueError(
+            "mtplx_mtp_payload_audit.payload_tensor_count must be an integer"
+        )
+    return raw_count, audited
+
+
+def import_mtplx_sidecar(
+    model_path: Union[str, Path],
+    *,
+    prefer_no_dup: bool = True,
+) -> dict:
+    """Import an MTPLX side-car head into a model index.
+
+    The importer is fail-closed on unsupported runtime contracts. It prefers a
+    no-dup merge (indexing the existing ``mtp.safetensors`` shard) when logical
+    weight names already match physical tensor keys; otherwise it writes a
+    remapped shard ``model-mtp.safetensors`` and points the index there.
+    """
+    output = Path(model_path)
+    sidecar = output / MTPLX_SIDECAR_SHARD
+    if not sidecar.exists():
+        raise ValueError(f"Missing required side-car weights: {sidecar}")
+    _validate_mtplx_runtime_contract(output)
+
+    with open(output / "config.json") as f:
+        config = json.load(f)
+    output_keys = _shard_key_map(output)
+    recipient_prefix = (
+        "language_model."
+        if any(k.startswith("language_model.") for k in output_keys)
+        else ""
+    )
+
+    sidecar_weights = mx.load(str(sidecar))
+    mtp_weights = {}
+    for key, value in sidecar_weights.items():
+        bare = _strip_mtp_key_prefix(key)
+        if bare is not None:
+            mtp_weights[recipient_prefix + bare] = value
+    if not mtp_weights:
+        raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
+
+    raw_count, audited_count = _validate_mtplx_payload_audit(config, mtp_weights)
+
+    desired_keys = set(mtp_weights.keys())
+    source_keys = set(sidecar_weights.keys())
+    no_dup_feasible = desired_keys.issubset(source_keys)
+    if prefer_no_dup and no_dup_feasible:
+        merge_mode = "no-dup"
+        target_shard = MTPLX_SIDECAR_SHARD
+        write_shard = False
+    else:
+        merge_mode = "dup"
+        target_shard = GEMMA4_ASSISTANT_MTP_SHARD
+        write_shard = True
+
+    mtp_size = _write_mtp_shard_and_merge_index(
+        output,
+        mtp_weights,
+        shard_name=target_shard,
+        write_shard=write_shard,
+        shard_size_bytes=sum(v.nbytes for v in mtp_weights.values()),
+    )
+
+    donor_quant = config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
+    mtp_key_shards = {
+        key: MTPLX_SIDECAR_SHARD
+        for key in sidecar_weights
+        if _strip_mtp_key_prefix(key)
+    }
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        mtp_key_shards,
+        recipient_prefix=recipient_prefix,
+    )
+    if quant_entries:
+        for section in ("quantization", "quantization_config"):
+            section_cfg = config.get(section)
+            if isinstance(section_cfg, dict):
+                section_cfg.update(quant_entries)
+
+    scope = _mtp_text_scope(config)
+    scope["mtp_num_hidden_layers"] = max(_mtp_declared_layers(config), 1)
+    _atomic_write_json(output / "config.json", config)
+
+    logger.info(
+        "Imported MTPLX side-car into %s (%s merge, %d tensors, %.2f GB)",
+        output.name,
+        merge_mode,
+        len(mtp_weights),
+        mtp_size / 1e9,
+    )
+    if audited_count is not None:
+        logger.info(
+            "MTPLX payload audit: raw_tensors=%d, payload_tensor_count=%d",
+            raw_count,
+            audited_count,
+        )
+
+    return {
+        "merge_mode": merge_mode,
+        "target_shard": target_shard,
+        "mtp_tensors": len(mtp_weights),
+        "raw_tensor_count": raw_count,
+        "payload_tensor_count": audited_count,
+    }
 
 
 def _file_sha256(path: Path) -> str:
@@ -1581,38 +1818,11 @@ def combine_mtp_donor(
     # mlx-lm's class_predicate applies the recipient's *global* bits to the
     # donor-packed arrays and the strict load fails on shape mismatch.
     donor_quant = donor_config.get("quantization") or {}
-    donor_global = {
-        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
-    }
-    quant_entries: dict = {}
-    for key in mtp_key_shards:
-        if not key.endswith(".scales"):
-            continue
-        base = key[: -len(".scales")]
-        bare_module = _strip_mtp_key_prefix(base)
-        if bare_module is None:
-            continue
-        candidates = (
-            base,
-            bare_module,
-            "language_model." + bare_module,
-            "model." + bare_module,
-            "model.language_model." + bare_module,
-        )
-        spec = None
-        for candidate in candidates:
-            value = donor_quant.get(candidate)
-            if isinstance(value, dict):
-                spec = value
-                break
-        if spec is None:
-            if not donor_global:
-                raise ValueError(
-                    "Donor MTP head is quantized but its config declares no "
-                    "global quantization parameters"
-                )
-            spec = donor_global
-        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        mtp_key_shards,
+        recipient_prefix=recipient_prefix,
+    )
 
     if quant_entries:
         for section in ("quantization", "quantization_config"):
@@ -1624,8 +1834,7 @@ def combine_mtp_donor(
     # re-declare it where the recipient keeps its num_hidden_layers.
     scope = _mtp_text_scope(config)
     scope["mtp_num_hidden_layers"] = _mtp_declared_layers(donor_config)
-    with open(output / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(output / "config.json", config)
 
     logger.info(
         "Grafted donor MTP head into %s (%d tensors, %.2f GB, source=%s)",
