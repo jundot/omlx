@@ -994,12 +994,14 @@
   "chat.mem_detail_model": "模型权重大小",
   "chat.mem_detail_context": "上下文(KV 缓存)",
   "chat.mem_detail_omlx": "oMLX 本体",
+  "chat.mem_detail_omlx_total": "oMLX 共占用",
   "chat.mem_detail_other": "其他进程和系统",
   "chat.mem_detail_refresh": "刷新间隔：{sec} 秒",
   "chat.mem_detail_final": "实际物理内存占用",
-  "chat.mem_detail_section_gross": "各项占用（压缩和交换前）",
+  "chat.mem_detail_section_gross": "内存占用明细",
   "chat.mem_detail_swap_release": "交换释放",
   "chat.mem_detail_section_relief": "压缩和交换",
   "chat.mem_detail_compressed_release": "压缩释放",
+  "chat.mem_detail_note": "进度条为活动监视器口径（已使用内存）；oMLX 显示用量为压缩和交换后的当前驻留量",
   "chat.web_sources_title": "搜索来源"
 }

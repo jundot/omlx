@@ -1493,11 +1493,6 @@ async def system_memory(_: bool = Depends(require_admin)):
             context = bd["context_bytes"]
             omlx_runtime = bd["omlx_runtime_bytes"]
             footprint = bd.get("footprint_bytes", model + context + omlx_runtime)
-            # "Other" = system-wide used (active+wired+compressed) minus the
-            # oMLX process footprint. The three oMLX components are mutually
-            # exclusive (model + context + runtime = footprint), so subtracting
-            # the footprint once removes all of oMLX from the system total.
-            other = max(0, mem["used_bytes"] - footprint)
             # Final actual physical RAM in use = vm_stat "used" (active+wired+
             # compressed), matching Activity Monitor's "已使用". Capped at 100%.
             final_used = mem["used_bytes"]
@@ -1509,7 +1504,6 @@ async def system_memory(_: bool = Depends(require_admin)):
                     "footprint_bytes": footprint,
                     "compressed_release_bytes": mem.get("compressed_release_bytes", 0),
                     "swap_bytes": mem.get("swap_bytes", 0),
-                    "other_bytes": other,
                     "final_used_bytes": final_used,
                 }
             )

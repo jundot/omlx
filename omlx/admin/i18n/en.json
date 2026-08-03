@@ -993,13 +993,15 @@
   "chat.mem_detail_title": "Memory usage",
   "chat.mem_detail_model": "Model weights",
   "chat.mem_detail_context": "Context (KV cache)",
-  "chat.mem_detail_omlx": "oMLX core",
+  "chat.mem_detail_omlx": "oMLX runtime",
+  "chat.mem_detail_omlx_total": "oMLX total",
   "chat.mem_detail_other": "Other processes & system",
   "chat.mem_detail_refresh": "Refresh interval: {sec}s",
   "chat.mem_detail_final": "Actual physical memory used",
-  "chat.mem_detail_section_gross": "Per-item usage (pre-compression & swap)",
+  "chat.mem_detail_section_gross": "Memory breakdown",
   "chat.mem_detail_swap_release": "Swap released",
   "chat.mem_detail_section_relief": "Compression & swap",
   "chat.mem_detail_compressed_release": "Compression saved",
+  "chat.mem_detail_note": "Bar uses Activity Monitor's 'Memory Used'; oMLX figures are post-compression & post-swap resident RAM",
   "chat.web_sources_title": "Sources"
 }

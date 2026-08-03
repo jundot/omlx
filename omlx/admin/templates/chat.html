@@ -1171,8 +1171,8 @@
                             <div>
                                 <div x-show="row.section" style="font-size: 12px; font-weight: 700; margin-top: 6px; margin-bottom: 2px; color: var(--text-secondary);" x-text="row.section"></div>
                                 <div x-show="!row.section" class="flex justify-between">
-                                    <span style="padding-left: 1em;" x-text="row.label" :style="row.deduct || row.info ? 'color: var(--text-tertiary);' : 'color: var(--text-secondary);'"></span>
-                                    <span x-text="row.value" :style="row.deduct || row.info ? 'color: var(--text-tertiary);' : 'color: var(--text-primary);'"></span>
+                                    <span style="padding-left: 1em;" x-text="row.label" :style="(row.deduct || row.info || row.total) ? 'color: var(--text-tertiary);' : 'color: var(--text-secondary);'"></span>
+                                    <span x-text="row.value" :style="row.total ? 'color: var(--text-primary); font-weight: 700;' : (row.deduct || row.info ? 'color: var(--text-tertiary);' : 'color: var(--text-primary);')"></span>
                                 </div>
                             </div>
                         </template>
@@ -1184,7 +1184,8 @@
                         <div style="height: 4px; border-radius: 2px; background: var(--border-faint); margin-top: 5px; overflow: hidden;">
                             <div :style="`height: 100%; width: ${memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).pct}%; background: ${memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).pct >= 90 ? '#dc2626' : (memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).pct >= 70 ? '#eab308' : '#22c55e')};`"></div>
                         </div>
-                        <div class="text-right" style="font-size: 10px; margin-top: 4px; color: var(--text-tertiary);" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).refresh"></div>
+                        <div style="font-size: 10px; margin-top: 4px; color: var(--text-tertiary);" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).note"></div>
+                        <div class="text-right" style="font-size: 10px; margin-top: 2px; color: var(--text-tertiary);" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).refresh"></div>
                     </div>
                 </template>
             </div>
@@ -1538,8 +1539,11 @@
                                 x-html="renderMarkdown(msg.content)"></div>
                             <!-- Web-search sources footer (A①: appended at end of answer) -->
                             <template x-if="msg.sources && msg.sources.length">
-                                <div class="web-sources-footer" style="margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line, #e5e7eb);">
-                                    <div style="color: var(--text-primary); font-size: 14px; margin-bottom: 5px;" x-text="window.t('chat.web_sources_title')"></div>
+                                <div class="web-sources-footer" style="margin-top: 10px; padding: 8px 0; border-top: 1px solid var(--line, #e5e7eb);">
+                                    <div class="flex items-center" style="margin-bottom: 6px;">
+                                        <span style="display: inline-block; width: 2em; flex-shrink: 0;"></span>
+                                        <span style="color: var(--text-primary); font-size: 14px;" x-text="window.t('chat.web_sources_title')"></span>
+                                    </div>
                                     <div class="flex flex-col gap-1.5">
                                         <template x-for="(s, i) in msg.sources" :key="i">
                                             <a :href="s.url" target="_blank" rel="noopener noreferrer"
@@ -3897,13 +3901,15 @@
             }
             const rows = [];
             if (d.model_bytes != null) {
-                // Section 1: gross per-item footprint (pre-compression & pre-swap).
+                // oMLX own usage (model weights + KV context + runtime),
+                // all current resident RAM (post-compression & post-swap).
                 rows.push({ section: window.t('chat.mem_detail_section_gross') });
                 rows.push({ label: window.t('chat.mem_detail_model'), value: `${fmtGB(d.model_bytes)} GB` });
                 rows.push({ label: window.t('chat.mem_detail_context'), value: `${fmtGB(d.context_bytes)} GB` });
                 rows.push({ label: window.t('chat.mem_detail_omlx'), value: `${fmtGB(d.omlx_runtime_bytes)} GB` });
-                rows.push({ label: window.t('chat.mem_detail_other'), value: `${fmtGB(d.other_bytes)} GB` });
-                // Section 2: relief (compression + swap released from RAM).
+                const omlxTotal = (d.model_bytes || 0) + (d.context_bytes || 0) + (d.omlx_runtime_bytes || 0);
+                rows.push({ label: window.t('chat.mem_detail_omlx_total'), value: `${fmtGB(omlxTotal)} GB`, total: true });
+                // Relief (compression + swap released from RAM).
                 const compRel = d.compressed_release_bytes || 0;
                 const swap = d.swap_bytes || 0;
                 if (compRel > 0 || swap > 0) {
@@ -3928,7 +3934,7 @@
                 finalLabel: window.t('chat.mem_detail_final'),
                 final: finalLine,
                 pct,
-                note: '',
+                note: window.t('chat.mem_detail_note'),
             };
         };
         const updateMem = async () => {
