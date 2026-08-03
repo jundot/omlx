@@ -1388,6 +1388,136 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     return templates.TemplateResponse(request, "chat.html", {"api_key": api_key or ""})
 
 
+import subprocess
+
+
+def _vm_pages_to_bytes(line: str, page: int) -> int:
+    """Parse a vm_stat 'Pages x: NNNN.' line into bytes."""
+    try:
+        val = int(line.split(":")[1].strip().rstrip(".").replace(",", "")) * page
+        return max(0, val)
+    except (IndexError, ValueError):
+        return 0
+
+
+def _read_macos_memory() -> Optional[dict]:
+    """Read physical memory usage on macOS via vm_stat + sysctl (stdlib only)."""
+    try:
+        hw = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3
+        )
+        total = int(hw.stdout.strip()) if hw.returncode == 0 else 0
+        vm = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=3
+        )
+        if vm.returncode != 0 or not total:
+            return None
+        # Page size is reported by vm_stat on its first line (Apple Silicon uses
+        # 16384, not the x86 4096). Parse it instead of hardcoding, otherwise
+        # the computed usage is off by 4x.
+        page = 4096
+        first = vm.stdout.splitlines()[0] if vm.stdout else ""
+        m = re.search(r"page size of\s+(\d+)\s+bytes", first)
+        if m:
+            page = int(m.group(1))
+        used = 0
+        compressed = 0          # Pages occupied by compressor (post-compression RAM)
+        compressed_stored = 0   # Pages stored in compressor (pre-compression)
+        for line in vm.stdout.splitlines():
+            # macOS "Memory Used" = App Memory (active) + Wired + Compressed.
+            # This matches Activity Monitor's "已使用" figure most closely.
+            if "Pages active" in line:
+                used += _vm_pages_to_bytes(line, page)
+            elif "Pages wired down" in line:
+                used += _vm_pages_to_bytes(line, page)
+            elif "Pages occupied by compressor" in line:
+                compressed += _vm_pages_to_bytes(line, page)
+            elif "Pages stored in compressor" in line:
+                compressed_stored += _vm_pages_to_bytes(line, page)
+        # Compressed memory physically saved = stored (pre-compression) - occupied
+        # (post-compression). Both are reported by vm_stat, so this is exact.
+        compressed_release = max(0, compressed_stored - compressed)
+        # Swap usage (pages written to disk, not resident in RAM).
+        swap = 0
+        try:
+            sw = subprocess.run(
+                ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=3
+            )
+            sm = re.search(r"used = ([\d.]+)\w+", sw.stdout)
+            if sm:
+                swap = int(float(sm.group(1)) * 1024 * 1024)
+        except Exception:
+            swap = 0
+        return {
+            "used_bytes": used,
+            "total_bytes": total,
+            "compressed_bytes": compressed,
+            "compressed_stored_bytes": compressed_stored,
+            "compressed_release_bytes": compressed_release,
+            "swap_bytes": swap,
+        }
+    except Exception:
+        return None
+
+
+@router.get("/api/system/memory")
+async def system_memory(_: bool = Depends(require_admin)):
+    """Lightweight physical-memory usage for the chat sidebar indicator.
+
+    macOS-only (reads vm_stat). Returns used/total/compressed bytes plus a
+    per-component breakdown (model weights, KV context, oMLX runtime, other)
+    so the sidebar tooltip can show a detailed, self-reconciling breakdown.
+    Returns null fields on unsupported platforms so the frontend can hide the
+    indicator gracefully.
+    """
+    mem = _read_macos_memory()
+    if not mem:
+        return JSONResponse({"used_bytes": None, "total_bytes": None})
+    out = {
+        "used_bytes": mem["used_bytes"],
+        "total_bytes": mem["total_bytes"],
+        "capacity_bytes": mem["total_bytes"],
+        "compressed_bytes": mem.get("compressed_bytes", 0),
+        "compressed_release_bytes": mem.get("compressed_release_bytes", 0),
+        "swap_bytes": mem.get("swap_bytes", 0),
+    }
+    # Per-component breakdown from the process memory enforcer (model + KV
+    # live inside the oMLX process, so we split them there rather than from
+    # vm_stat). If the enforcer is unavailable, omit the detail fields.
+    ss = _get_server_state()
+    enforcer = getattr(ss, "process_memory_enforcer", None) if ss else None
+    if enforcer is not None and hasattr(enforcer, "get_component_breakdown"):
+        try:
+            bd = enforcer.get_component_breakdown()
+            model = bd["model_bytes"]
+            context = bd["context_bytes"]
+            omlx_runtime = bd["omlx_runtime_bytes"]
+            footprint = bd.get("footprint_bytes", model + context + omlx_runtime)
+            # "Other" = system-wide used (active+wired+compressed) minus the
+            # oMLX process footprint. The three oMLX components are mutually
+            # exclusive (model + context + runtime = footprint), so subtracting
+            # the footprint once removes all of oMLX from the system total.
+            other = max(0, mem["used_bytes"] - footprint)
+            # Final actual physical RAM in use = vm_stat "used" (active+wired+
+            # compressed), matching Activity Monitor's "已使用". Capped at 100%.
+            final_used = mem["used_bytes"]
+            out.update(
+                {
+                    "model_bytes": model,
+                    "context_bytes": context,
+                    "omlx_runtime_bytes": omlx_runtime,
+                    "footprint_bytes": footprint,
+                    "compressed_release_bytes": mem.get("compressed_release_bytes", 0),
+                    "swap_bytes": mem.get("swap_bytes", 0),
+                    "other_bytes": other,
+                    "final_used_bytes": final_used,
+                }
+            )
+        except Exception as e:
+            logger.warning("Memory breakdown failed: %s", e)
+    return JSONResponse(out)
+
+
 @router.get("/static/{path:path}")
 async def admin_static(path: str):
     """Serve static files for admin panel (CSS, JS, fonts, logos, etc.)."""

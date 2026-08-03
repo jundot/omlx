@@ -1144,12 +1144,50 @@
         </div>
 
         <!-- Sidebar Footer -->
-        <div class="p-2 border-t border-line flex-shrink-0">
+        <div class="p-2 border-t border-line flex-shrink-0 flex items-center justify-between gap-2 relative">
             <button @click="showChatSettingsModal = true"
-                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+                class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="settings" class="w-3 h-3"></i>
                 {{ t('chat.chat_settings') }}
             </button>
+            <div class="relative" x-show="memText" x-cloak>
+                <div
+                    class="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-surface-muted cursor-pointer select-none"
+                    style="color: var(--text-tertiary);"
+                    @click="memPanel = !memPanel">
+                    <i data-lucide="memory-stick" class="w-3 h-3"></i>
+                    <span x-text="memText"></span>
+                </div>
+            </div>
+            <div x-show="memPanel && memDetailRows(memDetail, window.MEM_REFRESH_MS/1000)"
+                x-cloak
+                class="mem-popup rounded-lg shadow-lg"
+                style="position: absolute; left: 8px; right: 8px; bottom: 100%; margin-bottom: 8px; z-index: 60; padding: 10px; font-variant-numeric: tabular-nums; font-size: 12px; background: var(--bg-primary); border: 1px solid var(--border-faint);">
+                <template x-if="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000)">
+                    <div>
+                        <div class="text-sm font-semibold" style="color: var(--text-primary); margin-bottom: 4px;" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).title"></div>
+                        <div class="border-t" style="border-color: var(--border-faint); margin: 4px 0 6px;"></div>
+                        <template x-for="row in memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).rows" :key="row.label || row.section">
+                            <div>
+                                <div x-show="row.section" style="font-size: 12px; font-weight: 700; margin-top: 6px; margin-bottom: 2px; color: var(--text-secondary);" x-text="row.section"></div>
+                                <div x-show="!row.section" class="flex justify-between">
+                                    <span style="padding-left: 1em;" x-text="row.label" :style="row.deduct || row.info ? 'color: var(--text-tertiary);' : 'color: var(--text-secondary);'"></span>
+                                    <span x-text="row.value" :style="row.deduct || row.info ? 'color: var(--text-tertiary);' : 'color: var(--text-primary);'"></span>
+                                </div>
+                            </div>
+                        </template>
+                        <div class="border-t" style="border-color: var(--border-faint); margin: 6px 0;"></div>
+                        <div class="flex justify-between items-baseline">
+                            <span class="font-semibold" style="color: var(--text-primary);" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).finalLabel"></span>
+                            <span class="font-semibold" style="color: var(--text-primary);" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).final"></span>
+                        </div>
+                        <div style="height: 4px; border-radius: 2px; background: var(--border-faint); margin-top: 5px; overflow: hidden;">
+                            <div :style="`height: 100%; width: ${memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).pct}%; background: ${memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).pct >= 90 ? '#dc2626' : (memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).pct >= 70 ? '#eab308' : '#22c55e')};`"></div>
+                        </div>
+                        <div class="text-right" style="font-size: 10px; margin-top: 4px; color: var(--text-tertiary);" x-text="memDetailRows(memDetail, window.MEM_REFRESH_MS/1000).refresh"></div>
+                    </div>
+                </template>
+            </div>
         </div>
     </div>
 
@@ -1498,6 +1536,26 @@
                             <div class="message-body markdown-content" data-math-pending="true"
                                 :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
                                 x-html="renderMarkdown(msg.content)"></div>
+                            <!-- Web-search sources footer (A①: appended at end of answer) -->
+                            <template x-if="msg.sources && msg.sources.length">
+                                <div class="web-sources-footer" style="margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line, #e5e7eb);">
+                                    <div style="color: var(--text-primary); font-size: 14px; margin-bottom: 5px;" x-text="window.t('chat.web_sources_title')"></div>
+                                    <div class="flex flex-col gap-1.5">
+                                        <template x-for="(s, i) in msg.sources" :key="i">
+                                            <a :href="s.url" target="_blank" rel="noopener noreferrer"
+                                               class="web-source-item flex items-center gap-1.5"
+                                               style="color: var(--text-primary); font-size: 14px; text-decoration: none; overflow: hidden;"
+                                               :title="s.title">
+                                                <span style="display: inline-block; width: 2em; flex-shrink: 0;"></span>
+                                                <img :src="faviconFor(s.url)" alt="" class="web-source-favicon"
+                                                     style="width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;"
+                                                     onerror="this.style.display='none'">
+                                                <span class="web-source-title" style="overflow-wrap: anywhere;" x-text="truncateSource(s.title)"></span>
+                                            </a>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
                         </div>
                     </div>
                 </template>
@@ -1713,6 +1771,17 @@
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_document')">
                             <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                        </button>
+
+                        <!-- Web search toggle (inline, next to attachment buttons) -->
+                        <button @click="webSearchEnabled = !webSearchEnabled; localStorage.setItem('omlx-web-search-enabled', webSearchEnabled)"
+                            class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                            :class="webSearchEnabled
+                                ? 'bg-accent/10 border-accent hover:bg-accent/20'
+                                : 'bg-surface-muted hover:bg-surface border-line'"
+                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming()"
+                            :title="webSearchEnabled ? window.t('chat.web_search_on') : window.t('chat.web_search_off')">
+                            <i data-lucide="globe" class="w-4 h-4" :style="webSearchEnabled ? 'color: var(--accent);' : 'color: var(--text-tertiary);'"></i>
                         </button>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
@@ -2088,6 +2157,18 @@
             <!-- ==================== SETTINGS TAB ==================== -->
             <div x-show="rightSidebarTab === 'chat'" class="px-4 py-3 space-y-3">
 
+                <!-- Keyboard shortcuts (top of chat settings) -->
+                <div class="space-y-1">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('chat.shortcuts') }}</label>
+                    <button @click="showShortcutsHelp = true"
+                        class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium bg-surface-muted hover:bg-surface-alt transition-colors flex items-center justify-center gap-2"
+                        style="color: var(--text-primary);">
+                        <i data-lucide="keyboard" class="w-3.5 h-3.5"></i>
+                        <span>{{ t('chat.view_shortcuts') }}</span>
+                    </button>
+                </div>
+
                 <!-- Attachments -->
                 <div class="space-y-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
@@ -2158,16 +2239,117 @@
                     </div>
                 </div>
 
-                <!-- Keyboard shortcuts -->
-                <div class="space-y-1">
+                <!-- ==================== WEB SEARCH (in Chat settings) ==================== -->
+                <div class="space-y-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
-                        style="color: var(--text-secondary);">{{ t('chat.shortcuts') }}</label>
-                    <button @click="showShortcutsHelp = true"
-                        class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium bg-surface-muted hover:bg-surface-alt transition-colors flex items-center justify-center gap-2"
-                        style="color: var(--text-primary);">
-                        <i data-lucide="keyboard" class="w-3.5 h-3.5"></i>
-                        <span>{{ t('chat.view_shortcuts') }}</span>
-                    </button>
+                        style="color: var(--text-secondary);">{{ t('chat.web_tab') }}</label>
+
+                    <!-- Master toggle -->
+                    <div class="p-3 bg-surface-muted rounded-xl border border-line">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <i data-lucide="globe" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span class="text-xs font-medium truncate" style="color: var(--text-primary);"
+                                    x-text="window.t('chat.web_search_toggle')"></span>
+                            </div>
+                            <button type="button" role="switch"
+                                class="svg-allow-switch"
+                                :class="{ 'is-on': webSearchEnabled }"
+                                :aria-checked="webSearchEnabled ? 'true' : 'false'"
+                                :aria-label="window.t('chat.web_search_toggle')"
+                                @click="webSearchEnabled = !webSearchEnabled; localStorage.setItem('omlx-web-search-enabled', webSearchEnabled)">
+                                <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Intro (before provider selector) -->
+                    <div class="space-y-1" x-show="webSearchEnabled">
+                        <p class="text-[10px] leading-relaxed" style="color: var(--text-tertiary); white-space: pre-line;"
+                            x-text="window.t('chat.web_search_intro')"></p>
+                    </div>
+
+                    <!-- Provider selector -->
+                    <div class="space-y-1" x-show="webSearchEnabled">
+                        <label class="text-[10px] font-bold uppercase tracking-wider block"
+                            style="color: var(--text-secondary);" x-text="window.t('chat.web_search_provider')"></label>
+                        <select x-model="webSearchProvider"
+                            @change="localStorage.setItem('omlx-web-search-provider', webSearchProvider)"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                            <option value="duckduckgo" x-text="window.t('chat.web_provider_duckduckgo')"></option>
+                            <option value="searxng" x-text="window.t('chat.web_provider_searxng')"></option>
+                            <option value="anysearch" x-text="window.t('chat.web_provider_anysearch')"></option>
+                        </select>
+                        <p class="text-[10px]" style="color: var(--text-tertiary); white-space: pre-line;"
+                            x-text="window.t('chat.web_search_provider_hint')"></p>
+                    </div>
+
+                    <!-- SearXNG URL -->
+                    <div class="space-y-1" x-show="webSearchEnabled && webSearchProvider === 'searxng'">
+                        <label class="text-[10px] font-bold uppercase tracking-wider block"
+                            style="color: var(--text-secondary);" x-text="window.t('chat.web_searxng_url')"></label>
+                        <input type="text" x-model="searxngUrl"
+                            @change="localStorage.setItem('omlx-searxng-url', searxngUrl)"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);"
+                            placeholder="http://localhost:8080">
+                    </div>
+
+                    <!-- AnySearch API key + advantages -->
+                    <div class="space-y-1" x-show="webSearchEnabled && webSearchProvider === 'anysearch'">
+                        <label class="text-[10px] font-bold uppercase tracking-wider block"
+                            style="color: var(--text-secondary);" x-text="window.t('chat.web_anysearch_key')"></label>
+                        <input type="password" x-model="anysearchApiKey"
+                            @change="localStorage.setItem('omlx-anysearch-key', anysearchApiKey)"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);"
+                            :placeholder="window.t('chat.web_anysearch_key_placeholder')">
+                        <p class="text-[10px]" style="color: var(--text-tertiary);"
+                            x-text="window.t('chat.web_anysearch_key_hint')"></p>
+                    </div>
+
+                    <!-- Detailed settings (collapsible) -->
+                    <div class="space-y-2" x-show="webSearchEnabled">
+                        <button type="button"
+                            @click="webSearchExpanded = !webSearchExpanded; localStorage.setItem('omlx-web-search-expanded', webSearchExpanded)"
+                            class="flex items-center justify-between w-full text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">
+                            <span x-text="window.t('chat.web_advanced')"></span>
+                            <i data-lucide="chevron-down" class="w-3.5 h-3.5 transition-transform"
+                                :class="webSearchExpanded ? 'rotate-180' : ''"
+                                style="color: var(--text-tertiary);"></i>
+                        </button>
+                        <div x-show="webSearchExpanded" class="space-y-3 p-3 bg-surface-muted rounded-xl border border-line">
+                            <div class="space-y-1">
+                                <label class="text-[10px] font-bold uppercase tracking-wider block"
+                                    style="color: var(--text-secondary);" x-text="window.t('chat.web_top_k')"></label>
+                                <input type="number" min="1" max="10" step="1"
+                                    x-model.number="webSearchTopK"
+                                    @change="localStorage.setItem('omlx-web-search-topk', webSearchTopK)"
+                                    class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                                    style="color: var(--text-primary);">
+                                <p class="text-[10px]" style="color: var(--text-tertiary);"
+                                    x-text="window.t('chat.web_top_k_hint')"></p>
+                            </div>
+                            <div class="svg-allow-row">
+                                <div class="svg-allow-label">
+                                    <i data-lucide="file-text" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
+                                    <span class="text-xs font-medium truncate" style="color: var(--text-primary);"
+                                        x-text="window.t('chat.web_fetch_pages')"></span>
+                                </div>
+                                <button type="button" role="switch" class="svg-allow-switch"
+                                    :class="{ 'is-on': webSearchFetchPages }"
+                                    :aria-checked="webSearchFetchPages ? 'true' : 'false'"
+                                    :aria-label="window.t('chat.web_fetch_pages')"
+                                    @click="webSearchFetchPages = !webSearchFetchPages; localStorage.setItem('omlx-web-search-fetchpages', webSearchFetchPages)">
+                                    <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                                </button>
+                            </div>
+                            <p class="text-[10px]" style="color: var(--text-tertiary); white-space: pre-line;"
+                                x-text="window.t('chat.web_advanced_hint')"></p>
+                        </div>
+                    </div>
                 </div>
 
             </div>
@@ -2390,6 +2572,20 @@
             showShortcutsHelp: false,
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
+            // Web search (oMLX built-in)
+            webSearchEnabled: localStorage.getItem('omlx-web-search-enabled') === 'true',
+            webSearchProvider: localStorage.getItem('omlx-web-search-provider') || 'duckduckgo',
+            anysearchApiKey: localStorage.getItem('omlx-anysearch-key') || '',
+            searxngUrl: localStorage.getItem('omlx-searxng-url') || 'http://localhost:8080',
+            // Detailed settings (collapsible)
+            webSearchExpanded: localStorage.getItem('omlx-web-search-expanded') === 'true',
+            webSearchTopK: parseInt(localStorage.getItem('omlx-web-search-topk') || '3', 10) || 3,
+            webSearchFetchPages: localStorage.getItem('omlx-web-search-fetchpages') !== 'false',
+
+            // Sidebar memory indicator
+            memText: '',
+            memDetail: null,  // breakdown dict from /api/system/memory
+            memPanel: false,  // hover panel visibility
 
             // Chat State
             currentChatId: null,
@@ -3369,6 +3565,17 @@
                     // mutating the session's saved settings.
                     ...(context._generationOverride || {}),
                     ...(this.mcpTools.length > 0 && { tools: this.mcpTools }),
+                    // Built-in web search (oMLX)
+                    ...(this.webSearchEnabled ? {
+                        web_search: {
+                            enabled: true,
+                            provider: this.webSearchProvider,
+                            api_key: this.webSearchProvider === 'anysearch' ? this.anysearchApiKey : '',
+                            searxng_url: this.webSearchProvider === 'searxng' ? this.searxngUrl : '',
+                            top_k: this.webSearchTopK,
+                            fetch_pages: this.webSearchFetchPages,
+                        }
+                    } : {}),
                 };
             },
 
@@ -3677,6 +3884,74 @@
             },
 
             async init() {
+
+        // Sidebar memory indicator: poll /admin/api/system/memory at MEM_REFRESH_MS
+        const fmtGB = (b) => (b / 1024 ** 3).toFixed(1);
+        // Three-layer memory view:
+        //   1) gross per-item footprint (pre-compression)
+        //   2) relief from compression (lives in RAM, smaller) and swap (off RAM)
+        //   3) final actual physical RAM in use
+        this.memDetailRows = (d, sec) => {
+            if (!d || d.used_bytes == null || d.total_bytes == null) {
+                return null;
+            }
+            const rows = [];
+            if (d.model_bytes != null) {
+                // Section 1: gross per-item footprint (pre-compression & pre-swap).
+                rows.push({ section: window.t('chat.mem_detail_section_gross') });
+                rows.push({ label: window.t('chat.mem_detail_model'), value: `${fmtGB(d.model_bytes)} GB` });
+                rows.push({ label: window.t('chat.mem_detail_context'), value: `${fmtGB(d.context_bytes)} GB` });
+                rows.push({ label: window.t('chat.mem_detail_omlx'), value: `${fmtGB(d.omlx_runtime_bytes)} GB` });
+                rows.push({ label: window.t('chat.mem_detail_other'), value: `${fmtGB(d.other_bytes)} GB` });
+                // Section 2: relief (compression + swap released from RAM).
+                const compRel = d.compressed_release_bytes || 0;
+                const swap = d.swap_bytes || 0;
+                if (compRel > 0 || swap > 0) {
+                    rows.push({ section: window.t('chat.mem_detail_section_relief') });
+                }
+                if (compRel > 0) {
+                    rows.push({ label: window.t('chat.mem_detail_compressed_release'), value: `-${fmtGB(compRel)} GB`, deduct: true });
+                }
+                if (swap > 0) {
+                    rows.push({ label: window.t('chat.mem_detail_swap_release'), value: `-${fmtGB(swap)} GB`, deduct: true });
+                }
+            }
+            const finalUsed = d.final_used_bytes != null ? d.final_used_bytes : d.used_bytes;
+            const cap = d.capacity_bytes != null ? d.capacity_bytes : d.total_bytes;
+            const pct = Math.min(100, Math.round((finalUsed / cap) * 100));
+            const capGB = fmtGB(cap);
+            const finalLine = `${fmtGB(finalUsed)} GB / ${capGB} GB`;
+            return {
+                title: window.t('chat.mem_detail_title'),
+                refresh: window.t('chat.mem_detail_refresh').replace('{sec}', String(sec)),
+                rows,
+                finalLabel: window.t('chat.mem_detail_final'),
+                final: finalLine,
+                pct,
+                note: '',
+            };
+        };
+        const updateMem = async () => {
+            try {
+                const r = await fetch('/admin/api/system/memory');
+                if (!r.ok) return;
+                const d = await r.json();
+                if (d.used_bytes == null || d.total_bytes == null) {
+                    this.memText = '';
+                    return;
+                }
+                // Bottom-left button shows oMLX's own footprint (model weights +
+                // KV context + oMLX runtime) in plain GB, no percentage. The
+                // full system breakdown is still kept for the hover popup.
+                const omlxUsed = (d.model_bytes || 0) + (d.context_bytes || 0) + (d.omlx_runtime_bytes || 0);
+                this.memText = `${fmtGB(omlxUsed)} GB`;
+                // Keep the full breakdown for the tooltip (model/context/omlx/other/compressed).
+                this.memDetail = d;
+            } catch (e) { /* keep last value on transient errors */ }
+        };
+        window.MEM_REFRESH_MS = 1000;
+        updateMem();
+        setInterval(updateMem, window.MEM_REFRESH_MS);
 
         this.loadPromptProfiles();
 
@@ -4060,6 +4335,21 @@
     },
 
     // ===== Content Helpers =====
+
+    // Real favicon from the source site (B: true site icon).
+    faviconFor(url) {
+        try {
+            const u = new URL(url);
+            return `${u.protocol}//${u.hostname}/favicon.ico`;
+        } catch (e) {
+            return '';
+        }
+    },
+
+    // Source title shown in full at the end of the answer (no truncation).
+    truncateSource(title) {
+        return title || '';
+    },
 
     getTextContent(content) {
         if (typeof content === 'string') return content;
@@ -5197,6 +5487,7 @@
             let finishReason = null;
             let firstToken = false;  // flipped on first content/reasoning delta
             let lastUsage = null;    // filled by the stream_options usage chunk
+            let pendingSseEvent = null;  // tracks SSE event name for non-content frames
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -5209,9 +5500,30 @@
                 for (const line of lines) {
                     if (line.trim() === '' || line.trim() === 'data: [DONE]') continue;
 
+                    // Track SSE event name (e.g. "web_sources") so we can route
+                    // non-content frames. A named event arrives as two lines:
+                    //   event: <name>\n   data: <json>
+                    if (line.startsWith('event: ')) {
+                        pendingSseEvent = line.slice(7).trim();
+                        continue;
+                    }
+
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
+
+                            // Custom web-search sources event: stash the source
+                            // list on the stream so the assistant message can
+                            // render a citations footer.
+                            if (pendingSseEvent === 'web_sources') {
+                                pendingSseEvent = null;
+                                if (Array.isArray(data.sources)) {
+                                    stream.sources = data.sources;
+                                }
+                                continue;
+                            }
+                            pendingSseEvent = null;
+
                             const choice = data.choices?.[0];
                             const delta = choice?.delta;
                             if (choice?.finish_reason) finishReason = choice.finish_reason;
@@ -5456,6 +5768,7 @@
                 reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
                     ? stream.streamingThinking : null,
                 model: requestModel,
+                sources: stream.sources && stream.sources.length ? stream.sources : null,
                 meta: this.captureGenerationContext(
                     requestModel,
                     context.systemPrompt,

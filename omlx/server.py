@@ -125,6 +125,7 @@ from .api.openai_models import (
     ModelsResponse,
     PromptTokensDetails,
     Usage,
+    WebSearchRequest,
 )
 from .api.parser_tool_calls import (
     convert_parser_tool_calls as _convert_parser_tool_calls,
@@ -3331,6 +3332,9 @@ async def create_chat_completion(
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
 
+        # Built-in web search (oMLX): retrieve + inject cleaned context
+        messages, web_search_sources = await _maybe_run_web_search(request)
+
         # Merge MCP tools with user-provided tools unless the request explicitly
         # disables tool use.
         tools_disabled = request.tool_choice == "none"
@@ -3534,6 +3538,7 @@ async def create_chat_completion(
                             model_load_duration=model_load_duration,
                             resolved_model=resolved_model,
                             response_id=response_id,
+                            web_sources=web_search_sources or None,
                             **chat_kwargs,
                         ),
                         http_request=http_request,
@@ -3717,6 +3722,85 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+# -----------------------------------------------------------------------------
+# Built-in Web Search (oMLX)
+# -----------------------------------------------------------------------------
+
+def _latest_user_text(messages: list) -> str:
+    """Return the text of the last user message (dict or pydantic)."""
+    for m in reversed(messages):
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role != "user":
+            continue
+        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+        if isinstance(content, str):
+            return content
+        # multimodal content parts
+        if isinstance(content, list):
+            parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _inject_web_search_context(messages: list, context: str) -> list:
+    """Prepend web context to the first system message (or create one)."""
+    if not context:
+        return messages
+    block = (
+        "以下是联网检索到的参考信息（已整理，附来源），请优先据此回答：\n\n"
+        + context
+    )
+    messages = list(messages)
+    if messages and (
+        (isinstance(messages[0], dict) and messages[0].get("role") == "system")
+        or (not isinstance(messages[0], dict) and getattr(messages[0], "role", None) == "system")
+    ):
+        msg = messages[0]
+        if isinstance(msg, dict):
+            msg["content"] = f"{msg.get('content', '')}\n\n{block}"
+        else:
+            msg.content = f"{getattr(msg, 'content', '')}\n\n{block}"
+    else:
+        messages.insert(0, {"role": "system", "content": block})
+    return messages
+
+
+async def _maybe_run_web_search(request) -> tuple[list, list]:
+    """If web_search is enabled on the request, retrieve and inject context.
+
+    Returns a tuple of (messages, sources) where ``messages`` is the (possibly
+    mutated) message list as plain dicts, and ``sources`` is a list of
+    ``{title, url, snippet}`` dicts for the chat UI to render as citations
+    (empty list when web search is off or produced nothing).
+    """
+    raw = getattr(request, "web_search", None)
+    if raw is None:
+        return ([m.model_dump() if hasattr(m, "model_dump") else m for m in request.messages], [])
+    try:
+        cfg = WebSearchRequest(**(raw if isinstance(raw, dict) else raw.model_dump()))
+    except Exception:
+        return ([m.model_dump() if hasattr(m, "model_dump") else m for m in request.messages], [])
+    if not cfg.enabled:
+        return ([m.model_dump() if hasattr(m, "model_dump") else m for m in request.messages], [])
+    from .api import websearch as _websearch
+    msgs = [m.model_dump() if hasattr(m, "model_dump") else m for m in request.messages]
+    ws_cfg = _websearch.WebSearchConfig.from_request(cfg.model_dump())
+    result = await _websearch.run_web_search(ws_cfg, _latest_user_text(msgs))
+    sources = [
+        {"title": h.title, "url": h.url, "snippet": h.snippet}
+        for h in result.hits
+    ]
+    if not result.context:
+        if result.error:
+            notice = f"[联网搜索提示] {result.error}"
+            if any(m.get("role") == "system" for m in msgs):
+                msgs[0]["content"] = f"{notice}\n\n{msgs[0]['content']}"
+            else:
+                msgs.insert(0, {"role": "system", "content": notice})
+        return msgs, []
+    return _inject_web_search_context(msgs, result.context), sources
 
 
 def _normalize_structured_outputs(
@@ -4346,6 +4430,7 @@ async def stream_chat_completion(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_id: Optional[str] = None,
+    web_sources: Optional[list] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -4756,6 +4841,12 @@ async def stream_chat_completion(
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    # Emit web-search source list as a custom SSE event (captured by the chat
+    # UI to render a "sources" footer with favicons + links). Non-standard but
+    # harmless to OpenAI clients, which ignore unknown event names.
+    if web_sources:
+        yield f"event: web_sources\ndata: {json.dumps({'sources': web_sources}, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 

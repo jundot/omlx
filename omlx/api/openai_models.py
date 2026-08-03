@@ -23,6 +23,22 @@ from omlx.api.shared_models import (
 )
 
 # =============================================================================
+# Built-in Web Search (oMLX)
+# =============================================================================
+
+class WebSearchRequest(BaseModel):
+    """Per-request web search configuration for chat completions."""
+
+    enabled: bool = False
+    provider: str = "duckduckgo"  # duckduckgo | searxng | anysearch
+    top_k: int = 5
+    fetch_pages: bool = True
+    api_key: str = ""
+    searxng_url: str = ""
+    language: str = "auto"
+
+
+# =============================================================================
 # Content Types
 # =============================================================================
 
@@ -32,7 +48,6 @@ class ImageURL(BaseModel):
 
     url: str  # "data:image/jpeg;base64,..."
     detail: Optional[str] = "auto"  # "low", "high", "auto"
-
 
 class InputAudio(BaseModel):
     """Audio input data for multimodal models (OpenAI format)."""
@@ -308,6 +323,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Built-in web search (oMLX): inject retrieved, cleaned web context into the prompt
+    web_search: Optional[Union[dict, "WebSearchRequest"]] = None
 
     @field_validator("stop", mode="before")
     @classmethod

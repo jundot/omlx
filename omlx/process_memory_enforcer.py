@@ -357,6 +357,7 @@ class ProcessMemoryEnforcer:
             prefill_min_chunk_tokens: Floor for adaptive shrink.
         """
         self._engine_pool = engine_pool
+        self._model_baseline_bytes = 0  # captured idle MLX active memory ≈ model weights
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
         self._memory_guard_custom_ceiling_bytes = max(
             0, int(memory_guard_custom_ceiling_gb * 1024**3)
@@ -840,6 +841,84 @@ class ProcessMemoryEnforcer:
             if isinstance(value, (int, float)):
                 cached = max(cached, int(value))
         return cached
+
+    def _current_active_bytes(self) -> int:
+        """Current MLX active memory (model weights + KV cache).
+
+        Mirrors ``_current_usage_bytes`` but returns the raw active figure
+        (not the ``max(active, phys_footprint)`` watermark) so callers can
+        split model weights from KV-grown usage. Safe to call from a request
+        thread (only reads cached executor samples or ``mx.get_active_memory``
+        when no request is in flight).
+        """
+        if self._has_active_requests():
+            return self._cached_executor_active_memory_bytes()
+        try:
+            return int(mx.get_active_memory())
+        except Exception:
+            return self._cached_executor_active_memory_bytes()
+
+    def get_component_breakdown(self) -> dict:
+        """Per-component memory breakdown for the admin UI memory tooltip.
+
+        Returns a dict whose numeric fields all derive from real telemetry:
+          - model_bytes:      MLX model weights (idle active memory; also the
+                              monitor-stored baseline if it has been wired)
+          - context_bytes:    KV cache = current active - model weights
+          - omlx_runtime_bytes: process footprint - active (Python/runtime that
+                              lives outside the MLX allocation pool)
+          - footprint_bytes:  process phys_footprint (model + context + runtime)
+          - active_bytes:     model + context (MLX active memory)
+
+        The four components plus the separately-reported compressed memory and
+        an "other" catch-all (computed by the caller) reconcile to total
+        hardware memory.
+        """
+        footprint = get_phys_footprint()
+        active = self._current_active_bytes()
+
+        # Capture the model-weight baseline as the *minimum* MLX active memory
+        # seen since startup (any time a model is loaded active > 0). Loading a
+        # model allocates weights + a pre-allocated KV pool that stays resident,
+        # so this minimum is the model's fixed footprint; KV growth during
+        # requests only ever raises active above it. Using the running minimum
+        # (instead of "only when idle") avoids missing the capture when oMLX
+        # keeps a resident request active right after load.
+        if active > 0:
+            if self._model_baseline_bytes == 0 or active < self._model_baseline_bytes:
+                self._model_baseline_bytes = active
+
+        # Honor a monitor-stored baseline if one is ever wired in.
+        monitor_baseline = 0
+        for entry in self._engine_pool._entries.values():
+            sched = self._resolve_scheduler(entry)
+            mon = getattr(sched, "memory_monitor", None)
+            if mon is not None:
+                monitor_baseline = max(monitor_baseline, getattr(mon, "_baseline_memory", 0) or 0)
+
+        # Prefer the engine pool's precomputed real weight size
+        # (EngineEntry.estimated_size, derived from the safetensors shards) over
+        # the runtime-derived baseline. The runtime "active minimum" is a guess
+        # that collapses to 0 when the model was just loaded / the process is
+        # idle (dumping the entire active allocation into "context"), and even
+        # when captured it may include the pre-allocated KV pool so it runs
+        # high. The on-disk weight size is exact and always available once a
+        # model is loaded, so it wins; the runtime baseline is only a fallback.
+        loaded_weight_bytes = 0
+        for entry in self._engine_pool._entries.values():
+            if getattr(entry, "engine", None) is not None and getattr(entry, "estimated_size", 0):
+                loaded_weight_bytes = max(loaded_weight_bytes, int(entry.estimated_size))
+
+        model = loaded_weight_bytes if loaded_weight_bytes else max(self._model_baseline_bytes, monitor_baseline)
+        context = max(0, active - model)
+        omlx_runtime = max(0, footprint - active)
+        return {
+            "footprint_bytes": footprint,
+            "active_bytes": active,
+            "model_bytes": model,
+            "context_bytes": context,
+            "omlx_runtime_bytes": omlx_runtime,
+        }
 
     @staticmethod
     def _nonnegative_bytes(value: Any) -> int | None:
