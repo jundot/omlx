@@ -441,10 +441,19 @@ class MLXRerankerModel:
         Jina v3 reranker uses special-token hidden states + projector + cosine
         similarity for listwise scoring.
         """
+        from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
         from ..utils.model_loading import (
             lm_load_compat as mlx_lm_load,
             maybe_load_custom_quantization,
         )
+
+        # Some Qwen3-backbone rerankers (e.g. jina-reranker-v3.5-mlx) declare
+        # per-layer sliding/full attention via layer_types/sliding_window,
+        # which the pinned mlx-lm Qwen3 loader otherwise silently ignores.
+        # Backward-compatible for every other Qwen3 model - see the patch
+        # module's docstring.
+        if apply_qwen3_sliding_window_patch():
+            logger.info("Qwen3 sliding-window patch applied for %s", self.model_name)
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
