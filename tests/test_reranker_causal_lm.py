@@ -462,6 +462,29 @@ class TestJinaReranker:
         prompt_without_instruction = model._format_jina_prompt(query, docs)
         assert "<instruct>" not in prompt_without_instruction
 
+    def test_format_jina_prompt_emits_dual_rerank_tokens(self):
+        """v3.5 dual matching: exactly two '<|rerank_token|>' markers, an
+        early one in the header (before any passages) and a late one in the
+        closing <query> block. Regression test for jundot/omlx#2422 follow-up
+        (dual matching / block fusion)."""
+        model = MLXRerankerModel("unused")
+
+        query = "what is green tea"
+        docs = ["green tea health benefits", "coffee market prices"]
+
+        prompt = model._format_jina_prompt(query, docs)
+
+        assert prompt.count("<|rerank_token|>") == 2
+
+        early_pos = prompt.index("<|rerank_token|>")
+        late_pos = prompt.rindex("<|rerank_token|>")
+        first_passage_pos = prompt.index("<passage")
+
+        assert early_pos < first_passage_pos
+        assert f"to query: {query}<|rerank_token|>\n" in prompt[:first_passage_pos]
+        assert prompt[late_pos:].startswith("<|rerank_token|>\n</query>")
+        assert f"<query>\n{query}<|rerank_token|>\n</query>" in prompt
+
     def test_load_jina_projector_missing_file_raises_clear_error(self, tmp_path):
         """Missing projector.safetensors should raise a clear FileNotFoundError."""
         model = MLXRerankerModel("unused")
@@ -695,6 +718,251 @@ class TestJinaReranker:
         assert result.scores[1] > result.scores[0] > result.scores[2]
         assert result.indices == [1, 0, 2]
         assert result.total_tokens > 0
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_jina_reads_late_rerank_token_position(self, tmp_path):
+        """_rerank_jina must score from the LATE rerank-token position, not
+        the early one. Gives the early and late positions different hidden
+        vectors, where only reading the late one produces the correct
+        ranking. Proves query_positions[1] is actually selected, not just
+        coincidentally passing when both positions happen to match."""
+        model_dir = self._make_jina_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_jina_reranker = True
+        model._doc_embed_token_id = 2001
+        model._query_embed_token_id = 2002
+        model._jina_projector = lambda x: x
+
+        class _Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                ids = []
+                for piece in text.replace("\n", " ").split():
+                    if "<|rerank_token|>" in piece:
+                        ids.append(2002)
+                        remainder = piece.replace("<|rerank_token|>", "")
+                        if remainder:
+                            ids.append(7)
+                    elif "<|embed_token|>" in piece:
+                        ids.append(2001)
+                        remainder = piece.replace("<|embed_token|>", "")
+                        if remainder:
+                            ids.append(7)
+                    else:
+                        ids.append(7)
+                return ids
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return " ".join(["tok"] * len(token_ids))
+
+        model.processor = _Tokenizer()
+
+        def _fake_hidden_states(input_ids):
+            token_ids = input_ids[0].tolist()
+            hidden_states = np.zeros((1, len(token_ids), 2), dtype=np.float32)
+            doc_vectors = ([0.6, 0.8], [0.95, 0.1], [-0.2, 0.0])
+            doc_idx = 0
+            seen_query_tokens = 0
+            for pos, token_id in enumerate(token_ids):
+                if token_id == 2002:
+                    if seen_query_tokens == 0:
+                        # Early position: would reverse the ranking if used.
+                        hidden_states[0, pos, :] = np.array(
+                            [0.0, -1.0], dtype=np.float32
+                        )
+                    else:
+                        # Late position: the correct query vector.
+                        hidden_states[0, pos, :] = np.array(
+                            [1.0, 0.0], dtype=np.float32
+                        )
+                    seen_query_tokens += 1
+                elif token_id == 2001 and doc_idx < len(doc_vectors):
+                    hidden_states[0, pos, :] = np.array(
+                        doc_vectors[doc_idx], dtype=np.float32
+                    )
+                    doc_idx += 1
+            return mx.array(hidden_states)
+
+        with patch.object(
+            model, "_get_jina_hidden_states", side_effect=_fake_hidden_states
+        ):
+            result = model._rerank_jina(
+                "query", ["doc a", "doc b", "doc c"], max_length=256
+            )
+
+        assert result.indices == [1, 0, 2], (
+            "Ranking only matches if the LATE rerank-token position was used; "
+            f"got {result.indices}, which suggests the early position was "
+            "read instead."
+        )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_jina_wrong_rerank_token_count_raises(self, tmp_path):
+        """A chunk with a rerank-token count other than exactly 2 must raise
+        clearly, not silently index into whatever count is actually present.
+        Covers both too few (1) and too many (3)."""
+        model_dir = self._make_jina_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_jina_reranker = True
+        model._doc_embed_token_id = 2001
+        model._query_embed_token_id = 2002
+        model._jina_projector = lambda x: x
+
+        class _FixedCountTokenizer:
+            """Returns a fixed token sequence regardless of prompt content,
+            isolating the rerank-token count check from prompt formatting."""
+
+            def __init__(self, rerank_token_count):
+                self._count = rerank_token_count
+
+            def encode(self, text, add_special_tokens=False):
+                del text, add_special_tokens
+                return [2002] * self._count + [2001]
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return " ".join(["tok"] * len(token_ids))
+
+        for bad_count in (1, 3):
+            model.processor = _FixedCountTokenizer(bad_count)
+            with patch.object(
+                model,
+                "_get_jina_hidden_states",
+                return_value=mx.zeros((1, bad_count + 1, 2)),
+            ):
+                with pytest.raises(ValueError, match="must contain two"):
+                    model._rerank_jina("query", ["doc a"], max_length=256)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_fuse_query_vectors_weighted_average(self):
+        """_fuse_query_vectors must compute a true weighted average, not a
+        plain mean. Uses unequal weights so the two would differ, and
+        asserts the exact hand-computed expected result."""
+        model = MLXRerankerModel("unused")
+
+        query_vecs = [
+            mx.array([1.0, 0.0]),
+            mx.array([0.0, 1.0]),
+            mx.array([1.0, 1.0]),
+        ]
+        weights = [2.0, 1.0, 1.0]
+
+        fused = model._fuse_query_vectors(query_vecs, weights)
+        mx.eval(fused)
+
+        # weighted sum = 2*[1,0] + 1*[0,1] + 1*[1,1] = [3,2]; / total weight
+        # (4.0) = [0.75, 0.5]. Independently hand-computed, not derived by
+        # running the code and copying its output.
+        expected = np.array([0.75, 0.5], dtype=np.float32)
+        actual = np.array(fused.tolist(), dtype=np.float32)
+        assert np.allclose(actual, expected, atol=1e-6), (actual, expected)
+
+        # A plain (unweighted) mean would give [0.6667, 0.6667] - assert the
+        # result is NOT that, to confirm weighting actually has an effect
+        # rather than the weights being silently ignored.
+        plain_mean = np.array([2.0 / 3.0, 2.0 / 3.0], dtype=np.float32)
+        assert not np.allclose(actual, plain_mean, atol=1e-3)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_jina_block_fusion_across_chunks(self, tmp_path):
+        """Block fusion must combine evidence across chunks, not just pass
+        through each chunk's own provisional score.
+
+        Forces 3 documents into 3 separate chunks (max_length=115 fits
+        exactly 1 doc, never 2 - see the empirically measured token counts
+        below). Each chunk's query vector perfectly matches its own
+        document, so every per-chunk cos score and block_weight is 1.0 -
+        naive per-chunk scoring (the old v3-style behavior) would tie all
+        three at 1.0, preserving original order [0, 1, 2]. With fusion, the
+        query vectors combine into [0.6667, 0.3333] (2 of 3 chunks vote for
+        [1, 0]), giving final scores [0.8944, 0.4472, 0.8944] and ranking
+        [0, 2, 1] - a different ranking than naive scoring would produce,
+        proving fusion is actually applied, not a no-op.
+        """
+        model_dir = self._make_jina_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_jina_reranker = True
+        model._doc_embed_token_id = 2001
+        model._query_embed_token_id = 2002
+        model._jina_projector = lambda x: x
+
+        class _Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                ids = []
+                for piece in text.replace("\n", " ").split():
+                    if "<|rerank_token|>" in piece:
+                        ids.append(2002)
+                        remainder = piece.replace("<|rerank_token|>", "")
+                        if remainder:
+                            ids.append(7)
+                    elif "<|embed_token|>" in piece:
+                        ids.append(2001)
+                        remainder = piece.replace("<|embed_token|>", "")
+                        if remainder:
+                            ids.append(7)
+                    else:
+                        ids.append(7)
+                return ids
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                del skip_special_tokens
+                return " ".join(["tok"] * len(token_ids))
+
+        model.processor = _Tokenizer()
+
+        # Empirically measured under this tokenizer: 1 doc -> 114 tokens,
+        # 2 docs -> 120 tokens. max_length=115 fits exactly 1 doc per chunk,
+        # never 2, forcing 3 documents into 3 separate chunks.
+        chunk_vectors = [
+            ([1.0, 0.0], [1.0, 0.0]),  # chunk 1 (doc a): perfect match
+            ([0.0, 1.0], [0.0, 1.0]),  # chunk 2 (doc b): perfect match
+            ([1.0, 0.0], [1.0, 0.0]),  # chunk 3 (doc c): perfect match,
+            # same direction as chunk 1
+        ]
+        call_count = [0]
+
+        def _fake_hidden_states(input_ids):
+            token_ids = input_ids[0].tolist()
+            hidden_states = np.zeros((1, len(token_ids), 2), dtype=np.float32)
+            query_vec, doc_vec = chunk_vectors[call_count[0]]
+            call_count[0] += 1
+            for pos, token_id in enumerate(token_ids):
+                if token_id == 2002:
+                    # Both positions get the same vector here - this test
+                    # targets fusion, not late-position selection (already
+                    # covered by test_rerank_jina_reads_late_rerank_token_position).
+                    hidden_states[0, pos, :] = np.array(query_vec, dtype=np.float32)
+                elif token_id == 2001:
+                    hidden_states[0, pos, :] = np.array(doc_vec, dtype=np.float32)
+            return mx.array(hidden_states)
+
+        with patch.object(
+            model, "_get_jina_hidden_states", side_effect=_fake_hidden_states
+        ):
+            result = model._rerank_jina(
+                "query", ["doc a", "doc b", "doc c"], max_length=115
+            )
+
+        assert call_count[0] == 3, (
+            f"Expected 3 separate chunks (1 doc each), got {call_count[0]} "
+            "calls - adjust max_length if the fake tokenizer's boilerplate "
+            "token count has changed."
+        )
+
+        expected_scores = [
+            0.8944271909999159,
+            0.4472135954999579,
+            0.8944271909999159,
+        ]
+        assert result.scores == pytest.approx(expected_scores, abs=1e-6)
+        assert result.indices == [0, 2, 1]
+
+        # Naive (no-fusion) per-chunk scores would all be 1.0 (every doc
+        # perfectly matches its own chunk's query), tying all three and
+        # preserving original order [0, 1, 2] - confirm we do NOT get that.
+        assert result.indices != [0, 1, 2]
 
     def test_rerank_dispatch_and_max_length_for_jina(self, tmp_path):
         """rerank() should dispatch to _rerank_jina and honor max_length semantics."""
