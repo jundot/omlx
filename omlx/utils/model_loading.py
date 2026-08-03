@@ -611,6 +611,8 @@ def maybe_apply_pre_load_patches(
     if _has_mtp_heads(config):
         from ..patches.mlx_lm_extra_tensors import (
             apply as apply_extra_tensors_patch,
+        )
+        from ..patches.mlx_lm_extra_tensors import (
             sidecar_files_for,
         )
 
