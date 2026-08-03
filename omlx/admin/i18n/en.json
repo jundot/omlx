@@ -994,7 +994,7 @@
   "chat.mem_detail_model": "Model weights",
   "chat.mem_detail_context": "Context (KV cache)",
   "chat.mem_detail_omlx": "oMLX runtime",
-  "chat.mem_detail_omlx_total": "oMLX total",
+  "chat.mem_detail_omlx_total": "oMLX usage",
   "chat.mem_detail_other": "Other processes & system",
   "chat.mem_detail_refresh": "Refresh interval: {sec}s",
   "chat.mem_detail_final": "Actual physical memory used",
