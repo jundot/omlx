@@ -138,18 +138,28 @@ final class PerformanceScreenVM {
                                     comment: "Performance screen error when embedding batch size input is invalid")
             return
         }
-        // Idle timeout: empty = leave alone (no patch field for null). Non-
-        // empty must be a positive integer; server enforces >= 60 itself.
+        // Idle timeout: empty or "0" = explicit null (disable), matching the
+        // WebUI's "None (disabled)" option. Non-zero must be >= 60; the
+        // server enforces the minimum.
         let idleTrimmed = idleTimeoutText.trimmingCharacters(in: .whitespaces)
-        var idleSeconds: Int? = nil
+        var idlePatch: PatchOptionalInt = .null
         if !idleTrimmed.isEmpty {
-            guard let n = Int(idleTrimmed), n >= 60 else {
+            guard let n = Int(idleTrimmed) else {
                 self.lastError = String(localized: "performance.error.idle_timeout_invalid",
-                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty to leave unchanged).",
+                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty/0 to disable).",
+                                        comment: "Performance screen error when idle timeout input is invalid")
+                return
+            }
+            if n == 0 {
+                idlePatch = .null
+            } else if n >= 60 {
+                idlePatch = .value(n)
+            } else {
+                self.lastError = String(localized: "performance.error.idle_timeout_invalid",
+                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty/0 to disable).",
                                         comment: "Performance screen error when idle timeout input is below 60 seconds")
                 return
             }
-            idleSeconds = n
         }
         // Initial cache blocks: empty = leave alone, non-empty must parse.
         let initTrimmed = initialCacheBlocksText.trimmingCharacters(in: .whitespaces)
@@ -192,8 +202,15 @@ final class PerformanceScreenVM {
         if customCeiling != loadedMemoryGuardCustomCeilingGb {
             patch.memoryGuardCustomCeilingGb = customCeiling
         }
-        if idleSeconds != loadedIdleTimeoutSeconds, let s = idleSeconds {
-            patch.idleTimeoutSeconds = s
+        // idleTimeout: empty/0 = disable (.null), >= 60 = set (.value).
+        // Only send when it actually changed, like the other fields.
+        switch idlePatch {
+        case .null where loadedIdleTimeoutSeconds != nil:
+            patch.idleTimeoutSeconds = .null
+        case .value(let n) where n != loadedIdleTimeoutSeconds:
+            patch.idleTimeoutSeconds = .value(n)
+        default:
+            break
         }
         if modelFallback != loadedModelFallback { patch.modelFallback = modelFallback }
         // Cache
@@ -221,7 +238,12 @@ final class PerformanceScreenVM {
             self.loadedPrefillMemoryGuard = prefillMemoryGuard
             self.loadedMemoryGuardTier = tier
             self.loadedMemoryGuardCustomCeilingGb = customCeiling
-            if let s = idleSeconds { self.loadedIdleTimeoutSeconds = s }
+            switch idlePatch {
+            case .null:
+                self.loadedIdleTimeoutSeconds = nil
+            case .value(let s):
+                self.loadedIdleTimeoutSeconds = s
+            }
             self.loadedModelFallback = modelFallback
             self.loadedCacheEnabled = cacheEnabled
             self.loadedHotCacheOnly = hotCacheOnly

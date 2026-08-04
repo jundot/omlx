@@ -7445,13 +7445,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Idle Timeout must be ≥ 60 seconds (or empty to leave unchanged)."
+            "value" : "Idle Timeout must be ≥ 60 seconds (or empty/0 to disable)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Тайм-аут простоя должен быть ≥ 60 секунд (или пустым, чтобы оставить без изменений)."
+            "value" : "Тайм-аут простоя должен быть ≥ 60 секунд (или пустым/0 для отключения)."
           }
         }
       }
@@ -7751,13 +7751,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Server-wide auto-unload after N seconds idle. Empty = disabled. Minimum 60."
+            "value" : "Server-wide auto-unload after N seconds idle. Empty or 0 = disabled. Minimum 60."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Автовыгрузка на уровне сервера после N секунд простоя. Пусто = отключено. Минимум 60."
+            "value" : "Автовыгрузка на уровне сервера после N секунд простоя. Пусто или 0 = отключено. Минимум 60."
           }
         }
       }

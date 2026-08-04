@@ -214,8 +214,8 @@ private struct MemoryLifecycleSection: View {
                               defaultValue: "Idle Timeout",
                               comment: "Row label for idle timeout field"),
                 sublabel: String(localized: "performance.memory.idle_timeout.sub",
-                                 defaultValue: "Server-wide auto-unload after N seconds idle. Empty = disabled. Minimum 60.",
-                                 comment: "Sublabel for idle timeout")
+                                  defaultValue: "Server-wide auto-unload after N seconds idle. Empty or 0 = disabled. Minimum 60.",
+                                  comment: "Sublabel for idle timeout")
             ) {
                 TextInput(
                     text: $vm.idleTimeoutText,

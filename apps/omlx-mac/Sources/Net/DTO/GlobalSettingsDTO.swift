@@ -8,6 +8,25 @@
 
 import Foundation
 
+/// Explicit-null wrapper for Int patch fields. The property stays
+/// `PatchOptionalInt?`: `nil` = omit the key entirely, `.null` = send
+/// JSON `null`, `.value(n)` = send the integer.
+enum PatchOptionalInt: Equatable, Sendable {
+    case null, value(Int)
+}
+
+extension PatchOptionalInt: Encodable {
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null:
+            try container.encodeNil()
+        case .value(let n):
+            try container.encode(n)
+        }
+    }
+}
+
 struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let basePath: String?
     let server: ServerSettings
@@ -288,10 +307,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var initialCacheBlocks: Int? = nil
 
     /// Server-wide model auto-unload after N seconds idle. Server enforces
-    /// `>= 60`. Pass `nil` to leave unchanged; the Swift VM models the
-    /// "disabled" case separately (server-side disable isn't a patch op
-    /// today — see PerformanceScreen).
-    var idleTimeoutSeconds: Int? = nil
+    /// `>= 60`. `nil` (default) leaves it unchanged, `.null` disables
+    /// auto-unload, `.value(n)` sets it.
+    var idleTimeoutSeconds: PatchOptionalInt? = nil
 }
 
 struct UpdateGlobalSettingsResponse: Decodable, Sendable {

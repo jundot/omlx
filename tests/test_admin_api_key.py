@@ -1123,7 +1123,7 @@ class TestGlobalSettingsValidation:
             admin_routes.GlobalSettingsRequest(idle_timeout_seconds=-1)
 
     def test_idle_timeout_rejects_below_minimum(self):
-        # Minimum is 60s — anything smaller is not a meaningful idle window.
+        # Minimum is 60s — anything smaller (except 0) is not meaningful.
         with pytest.raises(ValidationError):
             admin_routes.GlobalSettingsRequest(idle_timeout_seconds=30)
 
@@ -1131,6 +1131,18 @@ class TestGlobalSettingsValidation:
         req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=None)
         assert req.idle_timeout_seconds is None
         # model_fields_set should include it when explicitly passed.
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_zero_as_disabled(self):
+        # 0 means "no limit" (disabled) — normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=0)
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_empty_string_as_disabled(self):
+        # Empty string from cleared textbox normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds="")
+        assert req.idle_timeout_seconds is None
         assert "idle_timeout_seconds" in req.model_fields_set
 
     def test_idle_timeout_accepts_valid_value(self):
