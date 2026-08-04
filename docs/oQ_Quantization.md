@@ -191,6 +191,7 @@ Code samples include real-world patterns (class definitions, import chains, mult
 | Nemotron-Cascade MoE | Full | Per-expert dense GPTQ |
 | Llama, Mistral, dense models | Full | Standard layer structure |
 | VLM models | Full (text) | Vision weights kept fp16 |
+| Ministral3 encoder (bidirectional) | Full | Non-causal `is_causal=false` encoder; Llama-4 attention scale |
 
 ### Streaming Path (oQ)
 
@@ -198,6 +199,17 @@ All models supported by mlx-lm/mlx-vlm. No architecture restrictions.
 Source checkpoints may use BF16/FP16 or reconstructable floating-point block
 formats, including native FP8 and MXFP8. oQ restores FP8/MXFP8 weight semantics
 from the checkpoint scales before applying the selected oQ or oQe format.
+
+## Bidirectional / Encoder Calibration
+
+oQ calibration defaults to causal (autoregressive) attention. For bidirectional
+encoder checkpoints such as **Ministral3** (`is_causal: false`), oQ automatically
+detects the encoder layout, loads the bare encoder without MLX-LM's causal-LM
+wrapper, and applies the Llama-4 attention scale instead of positional indices.
+Causal masking is disabled per-layer so sensitivity forward passes use full
+attention, matching the model's intended bidirectional behaviour. This lets oQ
+produce mixed-precision quantization for encoder-only or dual-mode checkpoints
+that were previously unsupported.
 
 ## Acknowledgments
 
