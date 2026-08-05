@@ -179,6 +179,30 @@ def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
+    """Map Ling block-scaled FP8 checkpoints to an MLX runtime format.
+
+    Ling 3.0 Flash FP8 checkpoints store E4M3 weights with float32
+    ``weight_scale_inv`` tensors on a 128x128 block grid. MLX has no native
+    matmul for that layout, so the vendored model sanitizer dequantizes each
+    block and requantizes it to 8-bit affine. Declaring the matching runtime
+    quantization here makes ``mlx_lm.utils.load_model`` construct
+    ``QuantizedLinear`` modules for the generated ``scales`` sidecars.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") != "bailing_hybrid":
+        return cfg
+    if isinstance(cfg.get("quantization"), dict):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict) or qc.get("quant_method") != "fp8":
+        return cfg
+
+    cfg["quantization"] = {"group_size": 64, "bits": 8}
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -197,6 +221,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
+        normalize_bailing_hybrid_fp8_quant(cfg)
         return cfg
 
     _lu.load_config = _patched

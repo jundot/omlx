@@ -67,6 +67,7 @@ class ModelArgs(BaseModelArgs):
     kda_safe_gate: bool = False
     kda_lower_bound: Optional[float] = None
     short_conv_kernel_size: int = 4
+    quantization_config: Optional[Dict[str, Any]] = None
 
 
 def recurrent_gla(
@@ -272,12 +273,19 @@ class DepthwiseConv1d(nn.Module):
         )
 
     def __call__(
-        self, x: mx.array, cache: Optional[mx.array] = None
+        self,
+        x: mx.array,
+        cache: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        lengths: Optional[mx.array] = None,
     ) -> Tuple[mx.array, mx.array]:
         batch, length, channels = x.shape
         kernel_size = self.weight.shape[-1]
         if cache is None:
             cache = mx.zeros((batch, channels, kernel_size), dtype=x.dtype)
+
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
 
         history = cache[:, :, -kernel_size + 1 :].transpose(0, 2, 1)
         conv_input = mx.concatenate([history, x], axis=1)
@@ -285,7 +293,15 @@ class DepthwiseConv1d(nn.Module):
         output = nn.silu(mx.conv_general(conv_input, weight, groups=channels))
 
         cache_input = mx.concatenate([cache, x.transpose(0, 2, 1)], axis=2)
-        return output, mx.contiguous(cache_input[:, :, -kernel_size:])
+        if lengths is not None:
+            ends = mx.clip(lengths, 0, length)
+            positions = (ends[:, None] + mx.arange(kernel_size))[..., None]
+            next_cache = mx.take_along_axis(
+                cache_input.transpose(0, 2, 1), positions, axis=1
+            ).transpose(0, 2, 1)
+        else:
+            next_cache = mx.contiguous(cache_input[:, :, -kernel_size:])
+        return output, mx.contiguous(next_cache)
 
 
 class GatedRMSNorm(nn.Module):
@@ -419,9 +435,17 @@ class LinearAttention(nn.Module):
         else:
             recurrent_state, conv_q, conv_k, conv_v = state
 
-        q, conv_q = self.q_conv1d(self.q_proj(x), conv_q)
-        k, conv_k = self.k_conv1d(self.k_proj(x), conv_k)
-        v, conv_v = self.v_conv1d(self.v_proj(x), conv_v)
+        lengths = cache.lengths if cache is not None else None
+        if lengths is not None:
+            # ``ArraysCache.merge`` initializes ``left_padding`` even for an
+            # empty cache, and its generic ``make_mask`` checks that field
+            # before ``lengths``. During right-padded prompt batches the
+            # resulting all-true mask would advance the recurrent state over
+            # padding. The current chunk lengths are authoritative here.
+            mask = mx.arange(L)[None, :] < lengths[:, None]
+        q, conv_q = self.q_conv1d(self.q_proj(x), conv_q, mask, lengths)
+        k, conv_k = self.k_conv1d(self.k_proj(x), conv_k, mask, lengths)
+        v, conv_v = self.v_conv1d(self.v_proj(x), conv_v, mask, lengths)
         q = q.reshape(B, L, self.num_attention_heads, self.head_dim)
         k = k.reshape(B, L, self.num_attention_heads, self.head_dim)
         v = v.reshape(B, L, self.num_attention_heads, self.head_dim)
@@ -448,6 +472,7 @@ class LinearAttention(nn.Module):
             cache[1] = conv_q
             cache[2] = conv_k
             cache[3] = conv_v
+            cache.advance(L)
 
         gate = self.g_proj(x).reshape(
             B, L, self.num_attention_heads, self.head_dim
@@ -671,7 +696,7 @@ class Model(nn.Module):
             # MoE expert stacking + gate remap
             if l >= self.args.first_k_dense_replace:
                 for m in ["gate_proj", "down_proj", "up_proj"]:
-                    for k in ["weight", "scales", "biases"]:
+                    for k in ["weight", "scales", "biases", "weight_scale_inv"]:
                         if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                             stacked = [
                                 weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
@@ -681,14 +706,18 @@ class Model(nn.Module):
                                 stacked
                             )
 
-                if f"{prefix}.mlp.gate.weight" in weights:
-                    weights[f"{prefix}.mlp.gate.gate_proj.weight"] = weights.pop(
-                        f"{prefix}.mlp.gate.weight"
-                    )
-                if f"{prefix}.mlp.gate.bias" in weights:
-                    weights[f"{prefix}.mlp.gate.gate_proj.bias"] = weights.pop(
-                        f"{prefix}.mlp.gate.bias"
-                    )
+                for suffix in (
+                    "weight",
+                    "bias",
+                    "scales",
+                    "biases",
+                    "weight_scale_inv",
+                ):
+                    source = f"{prefix}.mlp.gate.{suffix}"
+                    if source in weights:
+                        weights[f"{prefix}.mlp.gate.gate_proj.{suffix}"] = weights.pop(
+                            source
+                        )
 
             # MLA kv_b_proj split for global attention layers.
             kv_b_key = f"{prefix}.attention.kv_b_proj.weight"
@@ -703,6 +732,66 @@ class Model(nn.Module):
                 wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
                 weights[f"{prefix}.attention.embed_q.weight"] = wk
                 weights[f"{prefix}.attention.unembed_out.weight"] = wv
+
+        return self._convert_fp8_block_weights(weights)
+
+    def _convert_fp8_block_weights(self, weights):
+        """Convert Ling's block-scaled E4M3 tensors to 8-bit affine MLX.
+
+        Published FP8 checkpoints use a float32 ``weight_scale_inv`` grid,
+        normally with 128x128 blocks. Metal cannot multiply that layout
+        directly. Converting one stacked tensor at a time keeps peak memory
+        bounded while preserving the checkpoint's compact runtime footprint.
+        """
+        quantization_config = self.args.quantization_config or {}
+        block_size = quantization_config.get("weight_block_size", (128, 128))
+        if not isinstance(block_size, (list, tuple)) or len(block_size) != 2:
+            block_size = (128, 128)
+        block_rows, block_cols = (int(block_size[0]), int(block_size[1]))
+
+        scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
+        for scale_key in scale_keys:
+            weight_key = scale_key[: -len("_scale_inv")]
+            if weight_key not in weights or weights[weight_key].dtype != mx.uint8:
+                continue
+
+            scale = weights.pop(scale_key).astype(mx.float32)
+            weight = mx.from_fp8(weights.pop(weight_key), dtype=mx.float32)
+            out_dim, in_dim = weight.shape[-2:]
+            target_out = scale.shape[-2] * block_rows
+            target_in = scale.shape[-1] * block_cols
+            if target_out < out_dim or target_in < in_dim:
+                raise ValueError(
+                    f"Invalid FP8 block scale for {weight_key}: weight "
+                    f"{weight.shape}, scale {scale.shape}, block {block_size}"
+                )
+
+            pad_out = target_out - out_dim
+            pad_in = target_in - in_dim
+            if pad_out or pad_in:
+                padding = [(0, 0)] * (weight.ndim - 2)
+                padding.extend(((0, pad_out), (0, pad_in)))
+                weight = mx.pad(weight, padding)
+
+            lead = weight.shape[:-2]
+            weight = weight.reshape(
+                *lead,
+                scale.shape[-2],
+                block_rows,
+                scale.shape[-1],
+                block_cols,
+            )
+            weight = weight * scale[..., :, None, :, None]
+            weight = weight.reshape(*lead, target_out, target_in)
+            weight = weight[..., :out_dim, :in_dim].astype(mx.bfloat16)
+
+            quantized, scales, biases = mx.quantize(weight, group_size=64, bits=8)
+            weights[weight_key] = quantized
+            base = weight_key[: -len("weight")]
+            weights[f"{base}scales"] = scales
+            weights[f"{base}biases"] = biases
+            mx.eval(quantized, scales, biases)
+            mx.clear_cache()
 
         return weights
 

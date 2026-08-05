@@ -154,6 +154,40 @@ def test_mixed_global_and_linear_attention_cache_forward():
     assert all(response.finish_reason == "length" for response in finished)
 
 
+def _batch_greedy_tokens(model, prompts, max_tokens=6):
+    from mlx_lm.generate import BatchGenerator
+
+    generator = BatchGenerator(
+        model,
+        max_tokens=max_tokens,
+        prefill_batch_size=len(prompts),
+        completion_batch_size=len(prompts),
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+    )
+    uids = generator.insert(prompts, max_tokens=[max_tokens] * len(prompts))
+    tokens = {uid: [] for uid in uids}
+    for _ in range(max_tokens + 4):
+        _, responses = generator.next()
+        for response in responses:
+            tokens[response.uid].append(response.token)
+        if all(len(output) == max_tokens for output in tokens.values()):
+            break
+    return [tokens[uid] for uid in uids]
+
+
+def test_variable_length_batch_matches_single_request_greedy_tokens():
+    bailing_hybrid = _load_patch_module()
+    mx.random.seed(7)
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(_minimal_config()))
+
+    short_prompt = [4, 5]
+    long_prompt = [7, 8, 9, 10, 11, 12]
+    single = _batch_greedy_tokens(model, [short_prompt])[0]
+    batched = _batch_greedy_tokens(model, [short_prompt, long_prompt])[0]
+
+    assert batched == single
+
+
 def test_depthwise_conv_matches_token_loop_reference():
     bailing_hybrid = _load_patch_module()
     conv = bailing_hybrid.DepthwiseConv1d(channels=4, kernel_size=3)
@@ -179,6 +213,30 @@ def test_depthwise_conv_matches_token_loop_reference():
 
     assert mx.allclose(actual, expected, rtol=1e-5, atol=1e-6)
     assert mx.allclose(actual_cache, expected_cache)
+
+
+def test_depthwise_conv_uses_lengths_for_right_padded_cache_state():
+    bailing_hybrid = _load_patch_module()
+    conv = bailing_hybrid.DepthwiseConv1d(channels=4, kernel_size=3)
+    conv.weight = mx.arange(12, dtype=mx.float32).reshape(4, 1, 3) / 12
+    x = mx.arange(32, dtype=mx.float32).reshape(2, 4, 4) / 32
+    initial_cache = mx.arange(24, dtype=mx.float32).reshape(2, 4, 3) / 24
+    mask = mx.array(
+        [[True, True, False, False], [True, True, True, True]],
+        dtype=mx.bool_,
+    )
+
+    batch_output, batch_cache = conv(
+        x,
+        initial_cache,
+        mask=mask,
+        lengths=mx.array([2, 4]),
+    )
+    single_output, single_cache = conv(x[:1, :2], initial_cache[:1])
+    mx.eval(batch_output, batch_cache, single_output, single_cache)
+
+    assert mx.allclose(batch_output[0, :2], single_output[0])
+    assert mx.allclose(batch_cache[0], single_cache[0])
 
 
 @pytest.mark.parametrize("safe_gate", [False, True])
@@ -370,6 +428,144 @@ def test_sanitize_remaps_moe_and_mla_weights():
     )
     assert "model.layers.1.attention.kv_b_proj.weight" not in sanitized
     assert "model.layers.2.mtp.weight" not in sanitized
+
+
+def test_sanitize_converts_block_fp8_weights_to_affine_runtime_layout():
+    bailing_hybrid = _load_patch_module()
+    config = _minimal_config(
+        hidden_size=64,
+        intermediate_size=128,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    source = mx.linspace(-1.0, 1.0, 16 * 64).reshape(16, 64)
+    fp8 = mx.to_fp8(source)
+    weight_key = "model.layers.0.attention.q_proj.weight"
+    scale_key = f"{weight_key}_scale_inv"
+
+    sanitized = model.sanitize(
+        {
+            weight_key: fp8,
+            scale_key: mx.array([[0.5]], dtype=mx.float32),
+        }
+    )
+    restored = mx.dequantize(
+        sanitized[weight_key],
+        sanitized[weight_key.replace("weight", "scales")],
+        sanitized[weight_key.replace("weight", "biases")],
+        group_size=64,
+        bits=8,
+    )
+    expected = mx.from_fp8(fp8, dtype=mx.bfloat16) * 0.5
+    mx.eval(restored, expected)
+
+    assert scale_key not in sanitized
+    assert sanitized[weight_key].dtype == mx.uint32
+    assert mx.allclose(restored, expected, rtol=2e-2, atol=5e-3)
+
+
+def test_sanitize_stacks_fp8_expert_weights_and_sidecars():
+    bailing_hybrid = _load_patch_module()
+    config = _minimal_config(
+        hidden_size=64,
+        intermediate_size=128,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    weights = {}
+    for expert in range(2):
+        prefix = f"model.layers.1.mlp.experts.{expert}.gate_proj"
+        source = mx.full((16, 64), 0.25 * (expert + 1), dtype=mx.float32)
+        weights[f"{prefix}.weight"] = mx.to_fp8(source)
+        weights[f"{prefix}.weight_scale_inv"] = mx.ones((1, 1))
+
+    sanitized = model.sanitize(weights)
+    prefix = "model.layers.1.mlp.switch_mlp.gate_proj"
+
+    assert sanitized[f"{prefix}.weight"].shape == (2, 16, 16)
+    assert sanitized[f"{prefix}.scales"].shape == (2, 16, 1)
+    assert sanitized[f"{prefix}.biases"].shape == (2, 16, 1)
+    assert not any(key.endswith("weight_scale_inv") for key in sanitized)
+
+
+def test_bailing_fp8_config_normalizes_to_affine_runtime_quantization():
+    from omlx.utils.model_loading import normalize_bailing_hybrid_fp8_quant
+
+    config = _minimal_config(
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        }
+    )
+
+    assert normalize_bailing_hybrid_fp8_quant(config) is config
+    assert config["quantization"] == {"group_size": 64, "bits": 8}
+
+
+def test_fp8_checkpoint_loads_strictly_as_quantized_model(tmp_path):
+    bailing_hybrid = _load_patch_module()
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    config = _minimal_config(
+        hidden_size=64,
+        intermediate_size=128,
+        quantization_config={
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    )
+    source_model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    weights = dict(tree_flatten(source_model.parameters()))
+    weight_key = "model.layers.0.attention.q_proj.weight"
+    source_weight = weights[weight_key]
+    weights[weight_key] = mx.to_fp8(source_weight.astype(mx.float32))
+    weights[f"{weight_key}_scale_inv"] = mx.ones((1, 1), dtype=mx.float32)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    from mlx_lm.utils import load_model
+
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(tmp_path))
+    loaded, loaded_config = load_model(tmp_path, strict=True)
+    logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+    mx.eval(logits)
+
+    assert loaded_config["quantization"] == {"group_size": 64, "bits": 8}
+    assert isinstance(loaded.model.layers[0].attention.q_proj, nn.QuantizedLinear)
+    assert logits.shape == (1, 3, config["vocab_size"])
+
+
+def test_oq_discovers_ling_embeddings_and_hybrid_layer_masks():
+    bailing_hybrid = _load_patch_module()
+    from omlx.oq import (
+        _find_model_layers,
+        _layer_masks_for_model,
+        _uses_quantized_source_sensitivity,
+    )
+
+    config = _minimal_config(
+        quantization_config={"quant_method": "fp8"},
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    embed_fn, layers = _find_model_layers(model)
+    hidden = embed_fn(mx.array([[1, 2, 3]], dtype=mx.int32))
+    masks = _layer_masks_for_model(model, layers, hidden)
+
+    assert embed_fn is model.model.word_embeddings
+    assert layers is model.model.layers
+    assert masks[0] is None
+    assert masks[1] is not None
+    assert _uses_quantized_source_sensitivity(config) is True
 
 
 def test_pre_load_dispatch_calls_bailing_hybrid_patch(tmp_path, monkeypatch):

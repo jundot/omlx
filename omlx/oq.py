@@ -154,7 +154,10 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     quant_method = str(quantization_config.get("quant_method", "")).lower()
     if quant_method == "mxfp8":
         return True
-    return quant_method == "fp8" and _is_deepseek_v4_config(config)
+    return quant_method == "fp8" and (
+        _is_deepseek_v4_config(config)
+        or config.get("model_type") == "bailing_hybrid"
+    )
 
 
 def _is_minimax_m3_config(config: dict) -> bool:
@@ -3687,6 +3690,14 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"mimo_v2 patch not applied: {patch_err}")
 
+        if config.get("model_type") == "bailing_hybrid":
+            try:
+                from omlx.patches.bailing_hybrid import apply_bailing_hybrid_patch
+
+                apply_bailing_hybrid_patch()
+            except Exception as patch_err:
+                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
+
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
         # patched.
@@ -6248,6 +6259,9 @@ def _find_model_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
+    elif hasattr(model, "model") and hasattr(model.model, "word_embeddings"):
+        embed_fn = model.model.word_embeddings
+        layers = model.model.layers
     elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):
@@ -6529,14 +6543,20 @@ def _forward_layer(block, inputs, mask, position_ids):
 def _layer_masks_for_model(model, layers, inputs):
     """Build the per-layer mask schedule used by the original model."""
     if hasattr(model, "make_cache") and any(
-        hasattr(layer, "is_linear") for layer in layers
+        hasattr(layer, "is_linear") or hasattr(layer, "is_global")
+        for layer in layers
     ):
         try:
             from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
             cache = model.make_cache()
-            fa_idx = getattr(getattr(model, "model", model), "fa_idx", 0)
-            ssm_idx = getattr(getattr(model, "model", model), "ssm_idx", 0)
+            model_core = getattr(model, "model", model)
+            fa_idx = getattr(
+                model_core, "fa_idx", getattr(model_core, "_attn_idx", 0)
+            )
+            ssm_idx = getattr(
+                model_core, "ssm_idx", getattr(model_core, "_gla_idx", 0)
+            )
             fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
             ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
             try:
@@ -6556,8 +6576,15 @@ def _layer_masks_for_model(model, layers, inputs):
                 # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
                 # (S, S) causal mask.  During calibration there is no padding,
                 # so None is the correct mask for SSM layers.
+                def _is_ssm_layer(layer):
+                    if hasattr(layer, "is_linear"):
+                        return bool(layer.is_linear)
+                    if hasattr(layer, "is_global"):
+                        return not bool(layer.is_global)
+                    return False
+
                 return [
-                    ssm_mask if getattr(layer, "is_linear", False) else fa_mask
+                    ssm_mask if _is_ssm_layer(layer) else fa_mask
                     for layer in layers
                 ]
         except (ImportError, AttributeError):
