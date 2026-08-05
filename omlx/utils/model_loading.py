@@ -219,6 +219,9 @@ def maybe_apply_pre_load_patches(
     - MiMo V2.5 text backbone (PR 1219) when ``config.json`` declares
       ``model_type == "mimo_v2"``. The vendored model intentionally ignores
       the base checkpoint's vision, audio, speech, and MTP weights.
+    - Ling 3.0 Flash mixed MLA/KDA model when ``config.json`` declares
+      ``model_type == "bailing_hybrid"``. The vendored module is registered
+      as ``mlx_lm.models.bailing_hybrid`` before mlx-lm resolves its classes.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -338,6 +341,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_mimo_v2_patch():
             logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
+
+    if model_type == "bailing_hybrid":
+        from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
+
+        if apply_bailing_hybrid_patch():
+            logger.info("Ling 3.0 Flash pre-load patch applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured

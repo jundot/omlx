@@ -6288,6 +6288,29 @@ class Scheduler:
         if isinstance(cache, list):
             if len(cache) == 0:
                 return False
+
+            # Variable-state caches must keep the arity declared by the live
+            # model. Older model implementations can persist an ArraysCache
+            # with fewer (or zero) slots under the same class name; accepting
+            # it reaches the model with missing recurrent state and either
+            # crashes or silently corrupts a cached continuation.
+            try:
+                expected_cache = make_prompt_cache(self.model)
+            except Exception:
+                expected_cache = None
+            if isinstance(expected_cache, (list, tuple)) and len(
+                expected_cache
+            ) == len(cache):
+                arrays_names = {"ArraysCache", "SizedArraysCache"}
+                for layer_cache, expected_layer in zip(cache, expected_cache):
+                    if (
+                        type(expected_layer).__name__ == "ArraysCache"
+                        and type(layer_cache).__name__ in arrays_names
+                        and len(getattr(layer_cache, "state", ()))
+                        != len(getattr(expected_layer, "state", ()))
+                    ):
+                        return False
+
             # Check each layer
             for layer_cache in cache:
                 if layer_cache is None:
