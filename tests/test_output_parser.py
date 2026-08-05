@@ -416,6 +416,29 @@ class TestGemma4OutputParserSession:
         assert text == "<think>\nreasoning</think>\nanswermore"
         assert "<channel|>" not in text
 
+    def test_prefilled_thought_closes_before_visible_content(self):
+        """A prompt-side opener must seed the parser before generation.
+
+        Gemma 4 tool continuations start generation inside the thought
+        channel, so the generated stream contains only the body, close marker,
+        and visible answer.
+        """
+        token_map = {
+            1: "reasoning",
+            2: "<channel|>",
+            3: "answer",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+        session.notify_prefilled_thought()
+
+        parts = []
+        for token_id in [1, 2, 3]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        assert "".join(parts) == "reasoning</think>\nanswer"
+
     def test_stray_open_marker_inside_thought_dropped(self):
         """A nested ``<|channel>thought\\n`` while already inside a thought
         block must not re-emit ``<think>``. The block stays open until the
@@ -697,6 +720,9 @@ class TestOutputParserFactory:
 
         assert factory is not None
         assert factory.kind == "gemma4"
+        assert factory.thinking_start_text == "<|channel>thought"
+        assert factory.thinking_start_output_text == "<think>\n"
+        assert factory.thinking_end_text == "<channel|>"
 
     def test_session_receives_model_path_when_provided(self, monkeypatch):
         """Since #2178 the scheduler's model_name is a display id, so the

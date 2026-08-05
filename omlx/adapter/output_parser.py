@@ -989,6 +989,8 @@ def detect_output_parser(
                 model_path=session_model_path,
             ),
             stop_token_ids=set(),
+            thinking_start_text="<|channel>thought",
+            thinking_start_output_text="<think>\n",
             thinking_end_text="<channel|>",
             protocol_marker_texts=(
                 _OPEN_MARKER_BARE,

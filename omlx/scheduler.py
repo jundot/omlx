@@ -2644,6 +2644,13 @@ class Scheduler:
         """Remove any per-request protocol parser session."""
         self._output_parser_sessions.pop(request_id, None)
 
+    def _notify_output_parser_prefilled_thought(self, request_id: str) -> None:
+        """Seed a parser session when the prompt already opened thinking."""
+        parser_session = self._get_output_parser_session(request_id)
+        notify = getattr(parser_session, "notify_prefilled_thought", None)
+        if callable(notify):
+            notify()
+
     def _get_xtc_special_tokens(self) -> list[int]:
         """Get special tokens to exclude from XTC sampling.
 
@@ -8892,6 +8899,7 @@ class Scheduler:
             # budget processor can check needs_think_prefix.
             if self._detect_needs_think_prefix(request):
                 request.needs_think_prefix = True
+                self._notify_output_parser_prefilled_thought(request.request_id)
 
             # Per-request sampler/logits processors to avoid BatchGenerator recreation.
             sampler, logits_processors = self._build_sampler_and_processors(
