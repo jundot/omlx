@@ -472,7 +472,7 @@
   "settings.models.table.type": "类型",
   "settings.models.table.size": "大小",
   "settings.models.table.status": "状态",
-  "settings.models.table.pin": "固定",
+  "settings.models.table.pin": "常驻",
   "settings.models.table.pin_on_tooltip": "常驻：预加载，不自动卸载；注意 OOM",
   "settings.models.table.pin_off_tooltip": "非常驻：按需加载，自动卸载",
   "settings.models.table.default": "默认",
