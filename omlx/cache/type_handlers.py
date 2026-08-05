@@ -813,6 +813,17 @@ class ArraysCacheHandler(CacheTypeHandler):
         # Use latest state
         return states[-1]
 
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        """Reconstruct every element of a variable-length ArraysCache state."""
+        return self.reconstruct_cache(
+            {"states": list(elements)},
+            meta_state,
+        )
+
     def reconstruct_cache(
         self,
         state: dict[str, Any],

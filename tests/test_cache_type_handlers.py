@@ -718,6 +718,19 @@ class TestArraysCacheHandler:
 
         assert result["states"] == [3, 4, 5]
 
+    def test_deserialize_state_preserves_all_slots(self, handler):
+        """Variable-length state must not be dropped by fixed-axis decoding."""
+        import mlx.core as mx
+
+        elements = tuple(mx.full((1,), i) for i in range(4))
+
+        restored = handler.deserialize_state(elements)
+
+        assert isinstance(restored, SizedArraysCache)
+        assert len(restored.state) == 4
+        for expected, actual in zip(elements, restored.state):
+            assert mx.array_equal(expected, actual).item()
+
     def test_state_keys(self, handler):
         """Test state keys."""
         assert handler._get_state_keys() == ("states",)

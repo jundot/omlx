@@ -2898,9 +2898,16 @@ class BlockAwarePrefixCache(CacheManager):
                         last_block_meta_states
                     ):
                         meta_state = last_block_meta_states[layer_idx]
-                    cache = marker_handler.deserialize_state(
-                        tuple(elements), meta_state
-                    )
+                    if marker_handler.is_variable_length_state():
+                        cache = marker_handler.reconstruct_cache(
+                            {"states": list(elements)},
+                            meta_state,
+                            token_count=valid_token_count,
+                        )
+                    else:
+                        cache = marker_handler.deserialize_state(
+                            tuple(elements), meta_state
+                        )
                     if cache is None:
                         logger.error(
                             f"Layer {layer_idx}: failed to reconstruct {marker_class}"

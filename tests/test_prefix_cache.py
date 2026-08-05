@@ -3105,6 +3105,54 @@ class TestTurboQuantFormatMismatchRecovery:
         assert block_table.num_tokens == 8
         mock_ssd.forget_block.assert_not_called()
 
+    def test_reconstruct_preserves_variable_length_arrays_state(self, mx):
+        """N-tuple ArraysCache markers restore every recurrent state slot."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        block = paged_cache.allocate_block()
+        block.block_hash = b"arrays-four-state"
+        block.token_count = 4
+        block.ref_count = 2
+        paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+        block_table = BlockTable(
+            request_id="req-arrays-four-state",
+            block_ids=[block.block_id],
+            num_tokens=4,
+        )
+        states = [mx.full((1, 2, 3), i) for i in range(4)]
+        mock_ssd.load_block_with_metadata.return_value = (
+            [("__nstate__", "ArraysCache", states)],
+            {
+                "model_name": "test-model",
+                "num_layers": 1,
+                "block_size": 4,
+                "layer_cache_types": ["ArraysCache"],
+                "layer_meta_states": [()],
+            },
+        )
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert isinstance(result[0], SizedArraysCache)
+        assert result[0].size() == 4
+        assert len(result[0].state) == 4
+        for expected, actual in zip(states, result[0].state):
+            assert mx.array_equal(expected, actual).item()
+
 
 class TestPerBlockMetaStates:
     """Tests for per-block meta_states in store_cache with boundary snapshots.
