@@ -736,12 +736,17 @@ class Model(nn.Module):
         return self._convert_fp8_block_weights(weights)
 
     def _convert_fp8_block_weights(self, weights):
-        """Convert Ling's block-scaled E4M3 tensors to 8-bit affine MLX.
+        """Convert Ling's published FP8 and MXFP4 tensor layouts for MLX.
 
         Published FP8 checkpoints use a float32 ``weight_scale_inv`` grid,
         normally with 128x128 blocks. Metal cannot multiply that layout
         directly. Converting one stacked tensor at a time keeps peak memory
         bounded while preserving the checkpoint's compact runtime footprint.
+
+        The mixed FP4 checkpoint stores routed experts as two packed E2M1
+        values per int8 byte with one E8M0 scale per 32 logical values. That is
+        MLX's native MXFP4 layout, so only reinterpret the packed bytes and
+        rename the scale sidecar instead of dequantizing the experts.
         """
         quantization_config = self.args.quantization_config or {}
         block_size = quantization_config.get("weight_block_size", (128, 128))
@@ -752,10 +757,35 @@ class Model(nn.Module):
         scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
         for scale_key in scale_keys:
             weight_key = scale_key[: -len("_scale_inv")]
-            if weight_key not in weights or weights[weight_key].dtype != mx.uint8:
+            if weight_key not in weights:
                 continue
 
-            scale = weights.pop(scale_key).astype(mx.float32)
+            source_weight = weights[weight_key]
+            is_routed_mxfp4 = (
+                quantization_config.get("routed_experts_quant_method") == "mxfp4"
+                and ".mlp.switch_mlp." in weight_key
+                and source_weight.dtype == mx.int8
+            )
+            if is_routed_mxfp4:
+                scale = weights.pop(scale_key)
+                packed = weights.pop(weight_key).view(mx.uint32)
+                base = weight_key[: -len("weight")]
+                weights[weight_key] = packed
+                weights[f"{base}scales"] = scale
+                mx.eval(packed, scale)
+                continue
+
+            if source_weight.dtype != mx.uint8:
+                continue
+
+            scale = weights.pop(scale_key)
+            if scale.dtype == mx.uint8:
+                scale = mx.power(
+                    mx.array(2.0, dtype=mx.float32),
+                    scale.astype(mx.float32) - 127.0,
+                )
+            else:
+                scale = scale.astype(mx.float32)
             weight = mx.from_fp8(weights.pop(weight_key), dtype=mx.float32)
             out_dim, in_dim = weight.shape[-2:]
             target_out = scale.shape[-2] * block_rows

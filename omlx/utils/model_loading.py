@@ -180,7 +180,7 @@ def normalize_laguna_compressed_quant(cfg: dict) -> dict:
 
 
 def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
-    """Map Ling block-scaled FP8 checkpoints to an MLX runtime format.
+    """Map Ling mixed FP8/MXFP4 checkpoints to MLX runtime formats.
 
     Ling 3.0 Flash FP8 checkpoints store E4M3 weights with float32
     ``weight_scale_inv`` tensors on a 128x128 block grid. MLX has no native
@@ -188,6 +188,11 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
     block and requantizes it to 8-bit affine. Declaring the matching runtime
     quantization here makes ``mlx_lm.utils.load_model`` construct
     ``QuantizedLinear`` modules for the generated ``scales`` sidecars.
+
+    The FP4 release keeps non-expert projections in that FP8 layout, but stores
+    routed expert projections as packed MXFP4 with E8M0 scales. Those tensors
+    already match MLX's native MXFP4 representation after a byte reinterpret,
+    so add per-module overrides for the runtime ``SwitchGLU`` paths.
 
     Mutates *cfg* in place and returns it for convenience.
     """
@@ -199,7 +204,22 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
     if not isinstance(qc, dict) or qc.get("quant_method") != "fp8":
         return cfg
 
-    cfg["quantization"] = {"group_size": 64, "bits": 8}
+    quantization: dict[str, Any] = {"group_size": 64, "bits": 8}
+    if qc.get("routed_experts_quant_method") == "mxfp4":
+        group_size = int(qc.get("routed_experts_group_size", 32))
+        first_sparse_layer = int(cfg.get("first_k_dense_replace", 0))
+        num_hidden_layers = int(cfg.get("num_hidden_layers", 0))
+        expert_quantization = {
+            "group_size": group_size,
+            "bits": 4,
+            "mode": "mxfp4",
+        }
+        for layer_idx in range(first_sparse_layer, num_hidden_layers):
+            base = f"model.layers.{layer_idx}.mlp.switch_mlp"
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                quantization[f"{base}.{projection}"] = dict(expert_quantization)
+
+    cfg["quantization"] = quantization
     return cfg
 
 
