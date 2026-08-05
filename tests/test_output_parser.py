@@ -79,6 +79,20 @@ class DeepSeekV4Tokenizer(CohereTokenizer):
         return parse_tool_call(text, tools)
 
 
+class BailingHybridTokenizer(CohereTokenizer):
+    _token_ids = {
+        "<role>": 157151,
+        "</role>": 157152,
+    }
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self._token_ids.get(token, -1)
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        token_id = self._token_ids.get(text)
+        return [token_id] if token_id is not None else []
+
+
 class _FakeMelodyOptions:
     def cmd4(self):
         return self
@@ -176,6 +190,152 @@ class ByteFallbackTokenizer:
             return "\uc7a0"
         return "\ufffd" * sum(1 for token_id in token_ids if token_id != 0)
 
+
+class TestBailingHybridOutputParserSession:
+    def test_role_boundary_tokens_are_suppressed(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: "Now I have ",
+                2: "fixed it.",
+                157151: "<role>",
+                157152: "</role>",
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "bailing_hybrid"
+        session = factory.create_session(tokenizer)
+        results = [
+            session.process_token(token_id)
+            for token_id in (1, 157152, 2, 157151)
+        ]
+        final = session.finalize()
+
+        assert "".join(result.stream_text for result in results) == (
+            "Now I have fixed it."
+        )
+        assert "".join(result.visible_text for result in results) == (
+            "Now I have fixed it."
+        )
+        assert results[1].record_token is True
+        assert results[3].record_token is True
+        assert final.stream_text == ""
+        assert final.visible_text == ""
+
+    def test_fragmented_tool_protocol_is_hidden_and_parsed(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: "Before ",
+                2: "<to",
+                3: "ol_call>weather<arg_",
+                4: "key>city</arg_key><arg_value>Paris",
+                5: "</arg_value></tool_call>",
+                6: " after.",
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+
+        assert factory is not None
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        assert factory.create_session_with_tools is not None
+        session = factory.create_session_with_tools(tokenizer, tools)
+        results = [session.process_token(token_id) for token_id in range(1, 7)]
+        final = session.finalize()
+        streamed = "".join(result.stream_text for result in results)
+        visible = "".join(result.visible_text for result in results)
+
+        assert streamed + final.stream_text == "Before  after."
+        assert visible + final.visible_text == "Before  after."
+        assert all(
+            marker not in streamed + final.stream_text
+            for marker in ("<tool_call>", "<arg_key>", "<arg_value>")
+        )
+        assert final.finish_reason == "tool_calls"
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+    def test_tool_calls_use_request_schema_and_registered_names(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: (
+                    "<tool_call>weather<arg_key>code</arg_key>"
+                    "<arg_value>123</arg_value></tool_call>"
+                    "<tool_call>unknown<arg_key>x</arg_key>"
+                    "<arg_value>1</arg_value></tool_call>"
+                )
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+        assert factory is not None
+        assert factory.create_session_with_tools is not None
+        session = factory.create_session_with_tools(tokenizer, tools)
+        session.process_token(1)
+        final = session.finalize()
+
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"code": "123"}
+
+    def test_tool_protocol_without_request_tools_is_not_a_tool_call(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: (
+                    "<tool_call>weather<arg_key>city</arg_key>"
+                    "<arg_value>Paris</arg_value></tool_call>"
+                )
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+
+        assert factory is not None
+        session = factory.create_session(tokenizer)
+        session.process_token(1)
+        final = session.finalize()
+
+        assert final.tool_calls == []
+        assert final.finish_reason is None
 
 class TestCohere2MoeOutputParserSession:
     def test_detects_cohere2_moe_from_model_config(self, monkeypatch):

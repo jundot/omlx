@@ -43,6 +43,8 @@ class _ParserStopFactory:
     stop_token_ids = set()
     thinking_end_text = None
 
+    create_session_with_tools = None
+
     def create_session(self, tokenizer):
         return _ParserStopSession()
 

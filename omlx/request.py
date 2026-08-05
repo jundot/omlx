@@ -211,6 +211,9 @@ class Request:
         0  # Per-request prefill-headroom eviction phase counter
     )
 
+    # Request-scoped tool schemas used by protocol output parsers.
+    tools: list[dict[str, Any]] | None = None
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""

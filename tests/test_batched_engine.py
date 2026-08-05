@@ -28,8 +28,10 @@ class FakeStreamingCore:
 
     def __init__(self):
         self.aborted_request_id = None
+        self.add_request_kwargs = None
 
     async def add_request(self, **kwargs):
+        self.add_request_kwargs = kwargs
         return "request-1"
 
     async def stream_outputs(self, request_id):
@@ -342,6 +344,22 @@ class TestBatchedEngineStreamingCleanup:
         await stream.aclose()
 
         assert fake_engine.aborted_request_id == "request-1"
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_tools_to_request(self):
+        from omlx.engine.batched import BatchedEngine
+
+        tools = [{"type": "function", "function": {"name": "weather"}}]
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", tools=tools)
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["tools"] == tools
 
 
 class TestBatchedEngineApplyChatTemplate:
@@ -874,6 +892,21 @@ class TestBatchedEngineSpecPrefillForwarding:
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert call_kwargs["specprefill_keep_pct"] == 0.25
         assert call_kwargs["specprefill_threshold"] == 100
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_tools(self):
+        from omlx.engine.batched import BatchedEngine
+
+        tools = [{"type": "function", "function": {"name": "weather"}}]
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", tools=tools)
+
+        assert engine._engine.generate.call_args.kwargs["tools"] == tools
 
     @pytest.mark.asyncio
     async def test_generate_omits_specprefill_when_absent(self):

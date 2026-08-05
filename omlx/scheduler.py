@@ -2635,9 +2635,16 @@ class Scheduler:
             return None
 
         if request_id not in self._output_parser_sessions:
-            self._output_parser_sessions[request_id] = (
-                self._output_parser_factory.create_session(self.tokenizer)
-            )
+            request = self.running.get(request_id)
+            create_with_tools = self._output_parser_factory.create_session_with_tools
+            if create_with_tools is not None:
+                session = create_with_tools(
+                    self.tokenizer,
+                    request.tools if request is not None else None,
+                )
+            else:
+                session = self._output_parser_factory.create_session(self.tokenizer)
+            self._output_parser_sessions[request_id] = session
         return self._output_parser_sessions[request_id]
 
     def _cleanup_output_parser_session(self, request_id: str):
