@@ -533,6 +533,7 @@ class EngineCore:
         prompt: Union[str, List[int]],
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
+        request_metadata: Optional[Dict[str, str]] = None,
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
         vlm_inputs_embeds: Optional[Any] = None,
@@ -553,6 +554,7 @@ class EngineCore:
             prompt: Input prompt (string or token IDs)
             sampling_params: Generation parameters
             request_id: Optional custom request ID
+            request_metadata: Optional bounded labels for admin observability
             images: Optional images for multimodal
             videos: Optional videos for multimodal
             vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM
@@ -575,6 +577,7 @@ class EngineCore:
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            metadata=dict(request_metadata or {}),
             images=images,
             videos=videos,
             vlm_inputs_embeds=vlm_inputs_embeds,

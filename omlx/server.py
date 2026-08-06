@@ -178,6 +178,7 @@ from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
+from .request_attribution import request_attribution_from_headers
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -3511,6 +3512,10 @@ async def create_chat_completion(
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
+
+        request_metadata = request_attribution_from_headers(http_request.headers)
+        if request_metadata:
+            chat_kwargs["request_metadata"] = request_metadata
 
         await _raise_if_llm_lease_abort_requested(lease)
 

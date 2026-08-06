@@ -3112,6 +3112,8 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        request_metadata = kwargs.pop("request_metadata", None)
+
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
@@ -3119,6 +3121,7 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_metadata=request_metadata,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -3222,6 +3225,8 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        request_metadata = kwargs.pop("request_metadata", None)
+
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
 
@@ -3229,6 +3234,7 @@ class VLMBatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_metadata=request_metadata,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,

@@ -211,6 +211,10 @@ class Request:
         0  # Per-request prefill-headroom eviction phase counter
     )
 
+    # Caller-supplied observability labels. Appended to preserve positional
+    # compatibility; never used for tokenization, priority, or cache keys.
+    metadata: Dict[str, str] = field(default_factory=dict)
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""

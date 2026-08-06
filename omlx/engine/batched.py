@@ -738,10 +738,12 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        request_metadata = kwargs.pop("request_metadata", None)
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_metadata=request_metadata,
             **specprefill_kwargs,
         )
 
@@ -810,6 +812,8 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        request_metadata = kwargs.pop("request_metadata", None)
+
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
 
@@ -818,6 +822,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            request_metadata=request_metadata,
             **specprefill_kwargs,
         )
 
