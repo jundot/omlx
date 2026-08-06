@@ -3160,6 +3160,30 @@ class PagedSSDCacheManager(CacheManager):
                 return True
         return False
 
+    def is_hot_cached(self, block_hash: bytes) -> bool:
+        """
+        Check hot-cache membership without disturbing cache state.
+
+        Unlike ``_hot_cache_get``, this does not move the entry to MRU
+        position or touch the hot-cache budget tracker — safe to call from
+        a preflight probe that must not perturb real eviction order for a
+        request that may end up rejected or re-estimated.
+
+        Only the hot cache counts: a pending-write-buffer entry still
+        needs ``_arrays_from_tensors_raw()`` reconstruction, and an
+        SSD-index-only entry needs a real ``mx.load()`` restore, so
+        neither is "already materialized" in the sense this check exists
+        for (see ``model-ssd-kv-restoration-cost`` for the measurements).
+
+        Args:
+            block_hash: Content hash for the block.
+
+        Returns:
+            True if the block is currently present in the hot cache.
+        """
+        with self._hot_cache_lock:
+            return block_hash in self._hot_cache
+
     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
         """
         Parallel-load matched blocks from SSD into hot cache.

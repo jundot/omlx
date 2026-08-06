@@ -8401,6 +8401,61 @@ class Scheduler:
             return safety_rejection
         return None
 
+    def live_resident_prefix_length(
+        self,
+        tokens: list[int],
+        *,
+        extra_keys: tuple | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list | None = None,
+    ) -> int:
+        """Token count of the contiguous prompt prefix verified hot-cached now.
+
+        For the early prefill preflight (``preflight_or_raise``, called
+        before a request is queued and before any real ``fetch_cache()``
+        happens): a content-only prefix match is not a safe basis for a
+        memory credit, because ``PagedCacheManager.get_computed_blocks()``
+        (used by ``find_shared_prefix``) lazily registers SSD-index-only
+        blocks too — those still need a real restore via
+        ``PagedSSDCacheManager.preload_matched_blocks()`` /
+        ``load_block()``, measured at roughly 1.5-1.6x a block's own
+        steady-state footprint (see the ``model-ssd-kv-restoration-cost``
+        change). Only blocks confirmed present in the hot cache right now
+        are free of that cost, confirmed by zero measured restoration
+        delta for same-process hot-cache hits.
+
+        Stops at the first non-hot-cached block: KV state is reconstructed
+        in order, so a hot-cached block deeper in the match is useless if
+        an earlier block still needs restoring.
+
+        Returns 0 when the paged SSD cache isn't configured, or when
+        nothing matches.
+        """
+        if self.block_aware_cache is None or self.paged_ssd_cache_manager is None:
+            return 0
+        paged_cache = self.block_aware_cache.paged_cache
+        if paged_cache is None:
+            return 0
+        block_ids, remaining_tokens = paged_cache.find_shared_prefix(
+            tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        if not block_ids:
+            return 0
+        matched_tokens = len(tokens) - len(remaining_tokens)
+        block_size = paged_cache.block_size
+        verified_tokens = 0
+        for block_id in block_ids:
+            block = paged_cache.allocated_blocks.get(block_id)
+            if block is None or block.block_hash is None:
+                break
+            if not self.paged_ssd_cache_manager.is_hot_cached(block.block_hash):
+                break
+            verified_tokens += block_size
+        return min(verified_tokens, matched_tokens)
+
     def _admission_estimate(
         self,
         *,

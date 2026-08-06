@@ -971,7 +971,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # ``hydrate_target_cache`` clones every array), so the full prompt's
         # KV is allocated this request — unlike the scheduler's resident
         # paged cache. Subtracting hit tokens here would under-count and
-        # defeat the OOM guard.
+        # defeat the OOM guard. Unaffected by
+        # ``scope-cache-credit-live-resident``'s hot-cache-verified credit
+        # on the BatchedEngine/VLMBatchedEngine paths — that credit exists
+        # precisely because those paths' cache hits do NOT reconstruct
+        # into active memory when hot-cache-verified; this one always does.
         self._prefill_guard.preflight_or_raise(
             num_prompt_tokens=num_tokens, request_id=request_id
         )

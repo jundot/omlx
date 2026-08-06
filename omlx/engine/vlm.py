@@ -1313,9 +1313,17 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        token_ids: list[int] | None = None,
     ) -> None:
+        # See BatchedEngine._preflight_or_raise_with_eviction for the
+        # rationale (scope-cache-credit-live-resident): omitted token_ids
+        # preserves the previous cached_tokens=0 behavior.
+        cached_tokens = 0
+        if token_ids is not None:
+            cached_tokens = scheduler.live_resident_prefix_length(token_ids)
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
         if eviction_request is not None and self._prefill_eviction_callback is not None:
@@ -1326,6 +1334,7 @@ class VLMBatchedEngine(BaseEngine):
             await self._prefill_eviction_callback(eviction_request)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
 
@@ -3423,7 +3432,7 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            text_token_ids = self._tokenizer.encode(prompt)
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -3434,7 +3443,7 @@ class VLMBatchedEngine(BaseEngine):
             return
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
-        num_tokens += _count_image_tokens_real(
+        num_tokens = len(text_token_ids) + _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
             upper_bound=_derive_image_token_upper_bound(
@@ -3445,8 +3454,16 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
+        # text_token_ids only (no image extra_keys): a text-only match
+        # still hashes differently from a real image-bearing block (whose
+        # hash includes the image extra key), so this can only under-credit
+        # (safe), never mismatch a wrong block. See
+        # scope-cache-credit-live-resident's design for the full rationale.
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            token_ids=text_token_ids,
         )
 
     async def preflight_completion(
@@ -3465,7 +3482,7 @@ class VLMBatchedEngine(BaseEngine):
             )
             return
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            token_ids = self._tokenizer.encode(prompt)
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_completion: tokenizer.encode "
@@ -3479,7 +3496,10 @@ class VLMBatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=len(token_ids),
+            request_id=request_id,
+            token_ids=token_ids,
         )
 
     async def stream_chat(

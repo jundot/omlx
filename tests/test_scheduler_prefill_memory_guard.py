@@ -885,3 +885,112 @@ def test_admission_compares_against_hard_watermark():
     scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler.live_resident_prefix_length (scope-cache-credit-live-resident)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveResidentPrefixLength:
+    """The early preflight check may only credit cached_tokens for the
+    contiguous prefix verified present in PagedSSDCacheManager's hot cache
+    right now -- a find_shared_prefix() content match alone is not enough,
+    since it also lazily registers SSD-index-only blocks that still need a
+    real (non-free) restore. See model-ssd-kv-restoration-cost for the
+    live measurements motivating this split.
+    """
+
+    def test_zero_without_block_aware_cache(self):
+        scheduler = _make_scheduler()
+        scheduler.block_aware_cache = None
+        assert scheduler.live_resident_prefix_length([1, 2, 3]) == 0
+
+    def test_zero_without_ssd_cache_manager(self):
+        scheduler = _make_scheduler()
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_ssd_cache_manager = None
+        assert scheduler.live_resident_prefix_length([1, 2, 3]) == 0
+
+    def test_zero_when_no_shared_prefix(self):
+        scheduler = _make_scheduler()
+        paged_cache = MagicMock()
+        paged_cache.find_shared_prefix.return_value = ([], [1, 2, 3])
+        scheduler.block_aware_cache = MagicMock(paged_cache=paged_cache)
+        scheduler.paged_ssd_cache_manager = MagicMock()
+        assert scheduler.live_resident_prefix_length([1, 2, 3]) == 0
+
+    def test_full_credit_when_every_matched_block_is_hot_cached(self):
+        block_a = SimpleNamespace(block_hash=b"hash-a")
+        block_b = SimpleNamespace(block_hash=b"hash-b")
+        paged_cache = MagicMock()
+        paged_cache.block_size = 64
+        paged_cache.allocated_blocks = {1: block_a, 2: block_b}
+        paged_cache.find_shared_prefix.return_value = ([1, 2], [])
+
+        scheduler = _make_scheduler()
+        scheduler.block_aware_cache = MagicMock(paged_cache=paged_cache)
+        ssd = MagicMock()
+        ssd.is_hot_cached.side_effect = lambda h: h in (b"hash-a", b"hash-b")
+        scheduler.paged_ssd_cache_manager = ssd
+
+        assert scheduler.live_resident_prefix_length(list(range(128))) == 128
+
+    def test_zero_when_matched_block_is_ssd_index_only(self):
+        """A find_shared_prefix() match with no hot-cache backing gets no
+        credit, even though it IS a real cache hit for fetch_cache() later
+        -- restoring it from the SSD index costs real memory."""
+        block_a = SimpleNamespace(block_hash=b"hash-a")
+        paged_cache = MagicMock()
+        paged_cache.block_size = 64
+        paged_cache.allocated_blocks = {1: block_a}
+        paged_cache.find_shared_prefix.return_value = ([1], [])
+
+        scheduler = _make_scheduler()
+        scheduler.block_aware_cache = MagicMock(paged_cache=paged_cache)
+        ssd = MagicMock()
+        ssd.is_hot_cached.return_value = False
+        scheduler.paged_ssd_cache_manager = ssd
+
+        assert scheduler.live_resident_prefix_length(list(range(64))) == 0
+
+    def test_stops_at_first_non_hot_cached_block(self):
+        """A hot-cached block deeper in the match doesn't help if an
+        earlier block still needs restoring -- KV state is sequential."""
+        block_a = SimpleNamespace(block_hash=b"hash-a")  # hot-cached
+        block_b = SimpleNamespace(block_hash=b"hash-b")  # NOT hot-cached
+        block_c = SimpleNamespace(block_hash=b"hash-c")  # hot-cached, unreachable
+        paged_cache = MagicMock()
+        paged_cache.block_size = 64
+        paged_cache.allocated_blocks = {1: block_a, 2: block_b, 3: block_c}
+        paged_cache.find_shared_prefix.return_value = ([1, 2, 3], [])
+
+        scheduler = _make_scheduler()
+        scheduler.block_aware_cache = MagicMock(paged_cache=paged_cache)
+        ssd = MagicMock()
+        ssd.is_hot_cached.side_effect = lambda h: h in (b"hash-a", b"hash-c")
+        scheduler.paged_ssd_cache_manager = ssd
+
+        assert scheduler.live_resident_prefix_length(list(range(192))) == 64
+        # hash-c must never be checked -- the walk stops at hash-b.
+        checked = [c.args[0] for c in ssd.is_hot_cached.call_args_list]
+        assert checked == [b"hash-a", b"hash-b"]
+
+    def test_credit_capped_at_matched_tokens(self):
+        """Never credit more than find_shared_prefix() actually matched,
+        even if block_size * matched_block_count overshoots it."""
+        block_a = SimpleNamespace(block_hash=b"hash-a")
+        paged_cache = MagicMock()
+        paged_cache.block_size = 64
+        paged_cache.allocated_blocks = {1: block_a}
+        # Matched only 1 block but reports 40 remaining tokens out of 64 --
+        # i.e. matched_tokens (24) is less than block_size (64).
+        paged_cache.find_shared_prefix.return_value = ([1], list(range(40)))
+
+        scheduler = _make_scheduler()
+        scheduler.block_aware_cache = MagicMock(paged_cache=paged_cache)
+        ssd = MagicMock()
+        ssd.is_hot_cached.return_value = True
+        scheduler.paged_ssd_cache_manager = ssd
+
+        assert scheduler.live_resident_prefix_length(list(range(64))) == 24
