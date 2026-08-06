@@ -21276,7 +21276,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "DFlash 内存缓存"
+            "value" : "DFlash RAM 缓存"
           }
         }
       }
@@ -21468,7 +21468,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "需要先启用内存缓存。"
+            "value" : "需要先启用RAM 缓存。"
           }
         }
       }
@@ -24484,7 +24484,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "清除内存缓存"
+            "value" : "清除RAM 缓存"
           }
         }
       }
@@ -24652,7 +24652,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "内存缓存"
+            "value" : "RAM 缓存"
           }
         }
       }
