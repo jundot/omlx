@@ -1,0 +1,28 @@
+{
+  "upstream_commit": "49ec271676ba9c14bbebb75da1912e3fcb5fb0f4",
+  "focused_suite": {
+    "passed": 239,
+    "failed": 0
+  },
+  "new_dispatch_tests": {
+    "passed": 4,
+    "failed": 0
+  },
+  "complete_suite": {
+    "passed": 7926,
+    "skipped": 25,
+    "deselected": 74,
+    "failed": 0,
+    "seconds": 295.16
+  },
+  "boundary_requests": {
+    "passed": 7,
+    "failed": 0,
+    "all_cached_tokens_zero": true
+  },
+  "static_gates": {
+    "py_compile": "passed",
+    "git_diff_check": "passed",
+    "clean_patch_apply_check": "passed"
+  }
+}

@@ -162,6 +162,51 @@ def _make_hc_sinkhorn_collapse_kernel():
 _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 
 
+def _make_hc_expand_kernel():
+    """Fuse the prefill residual expansion without broadcast temporaries."""
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        const uint gid = thread_position_in_grid.x;
+        constexpr uint D4 = D / 4;
+        constexpr uint ROW_STRIDE = HC * D4;
+        const uint row = gid / ROW_STRIDE;
+        const uint within = gid - row * ROW_STRIDE;
+        const uint h = within / D4;
+        const uint d4 = within - h * D4;
+
+        using T4 = vec<T, 4>;
+        using U4 = vec<U, 4>;
+        const device T4* x4 = (const device T4*)x;
+        const device T4* residual4 = (const device T4*)residual;
+        device U4* out4 = (device U4*)out;
+
+        const uint x_index = row * D4 + d4;
+        const uint out_index = (row * HC + h) * D4 + d4;
+        float4 value = float4(x4[x_index]) * post[row * HC + h];
+
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < HC; ++j) {
+            const float coefficient = comb[(row * HC + j) * HC + h];
+            const uint residual_index = (row * HC + j) * D4 + d4;
+            value = fma(float4(coefficient), float4(residual4[residual_index]), value);
+        }
+        out4[out_index] = U4(value);
+    """
+
+    return mx.fast.metal_kernel(
+        name="deepseek_v4_hc_expand_prefill",
+        input_names=["x", "residual", "post", "comb"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_expand_kernel = _make_hc_expand_kernel()
+
+
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
@@ -263,7 +308,32 @@ def _hc_expand_op(x, residual, post, comb):
     return y.astype(x.dtype)
 
 
-def hc_expand(x, residual, post, comb):
+def hc_expand(x, residual, post, comb, use_kernel=True):
+    if (
+        use_kernel
+        and _hc_expand_kernel is not None
+        and x.ndim == 3
+        and residual.ndim == 4
+        and x.shape[1] > 6
+        and x.shape[-1] % 4 == 0
+        and residual.shape[:2] == x.shape[:2]
+        and residual.shape[-1] == x.shape[-1]
+        and post.shape == residual.shape[:-1]
+        and comb.shape == residual.shape[:-1] + (residual.shape[2],)
+        and x.dtype == residual.dtype
+        and x.dtype in (mx.float16, mx.bfloat16)
+    ):
+        B, L, D = x.shape
+        HC = residual.shape[2]
+        (out,) = _hc_expand_kernel(
+            inputs=[x, residual, post, comb],
+            template=[("T", x.dtype), ("U", x.dtype), ("HC", HC), ("D", D)],
+            grid=(B * L * HC * (D // 4), 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[residual.shape],
+            output_dtypes=[x.dtype],
+        )
+        return out
     return _hc_expand_op(x, residual, post, comb)
 
 

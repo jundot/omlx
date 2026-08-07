@@ -653,16 +653,17 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
 
     from omlx.patches.deepseek_v4.switch_layers import (
         _build_mxfp4_blocks,
-        _mxfp4_block_config,
+        _native_block_config,
     )
 
     mx.random.seed(11)
-    experts, output_dims, input_dims, routes = 8, 64, 128, 192
+    experts, output_dims, input_dims, routes = 256, 64, 128, 12288
     indices = mx.array(
         sorted((i * 7) % experts for i in range(routes)),
         dtype=mx.int32,
     )
-    block_bm, block_variant = _mxfp4_block_config(indices.size)
+    block_bm, block_variant = _native_block_config(indices.size, "affine")
+    assert (block_bm, block_variant) == (32, 2)
     block_meta, block_count = _build_mxfp4_blocks(indices, experts, block_bm)
 
     for dtype in (mx.bfloat16, mx.float16):
@@ -938,18 +939,18 @@ def test_deepseek_switchglu_dispatches_route_counting_sort_for_mxfp4(monkeypatch
 
     calls = []
 
-    class CountingSortReachedError(Exception):
+    class CountingSortReached(Exception):
         pass
 
     def counting_sort_spy(x, indices, num_experts, bm):
         calls.append((x.ndim, indices.size, num_experts, bm))
-        raise CountingSortReachedError
+        raise CountingSortReached
 
     monkeypatch.setattr(switch_layers, "_gather_counting_sort", counting_sort_spy)
 
     x = mx.random.normal((1, 11, 32), dtype=mx.bfloat16)
     indices = mx.zeros((1, 11, 6), dtype=mx.int32)
-    with pytest.raises(CountingSortReachedError):
+    with pytest.raises(CountingSortReached):
         model(x, indices)
 
     assert calls == [(5, 66, 256, 16)]
@@ -1012,6 +1013,46 @@ def test_deepseek_route_counting_sort_matches_argsort_output(monkeypatch):
 
     max_abs = mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32)))
     assert float(max_abs.item()) == 0.0
+
+
+def test_deepseek_affine_block_plan_keeps_large_route_threshold(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    layer = switch_layers.QuantizedSwitchLinear(
+        64,
+        64,
+        256,
+        bias=False,
+        group_size=64,
+        bits=2,
+        mode="affine",
+    )
+    monkeypatch.setattr(
+        switch_layers.QuantizedSwitchLinear,
+        "_native_block_kind",
+        lambda self, x, sorted_indices, dtype=None: "affine",
+    )
+
+    calls = []
+
+    class BlockPlanReachedError(Exception):
+        pass
+
+    def build_blocks_spy(indices, num_experts, bm):
+        calls.append((indices.size, num_experts, bm))
+        raise BlockPlanReachedError
+
+    monkeypatch.setattr(switch_layers, "_build_mxfp4_blocks", build_blocks_spy)
+
+    routes = 12288
+    x = mx.zeros((routes, 1, 64), dtype=mx.float16)
+    indices = mx.zeros((routes,), dtype=mx.int32)
+    with pytest.raises(BlockPlanReachedError):
+        layer(x, indices, sorted_indices=True)
+
+    assert calls == [(routes, 256, 32)]
 
 
 def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):

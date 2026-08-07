@@ -1,0 +1,79 @@
+{
+  "kind": "omlx-live-prefix-cache-consistency",
+  "label": "candidate-49ec2716-cache-on",
+  "model": "DeepSeek-V4-Flash-0731",
+  "prompt_chars": 71092,
+  "prompt_sha256": "a1465f4b5ee68dbd173c138dd65718bd06957439b66e99069e91f50364bf81f1",
+  "runs": [
+    {
+      "wall_time_seconds": 45.908931,
+      "usage": {
+        "prompt_tokens": 17219,
+        "completion_tokens": 2,
+        "total_tokens": 17221,
+        "input_tokens": 17219,
+        "output_tokens": 2,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "model_load_duration": 7.72,
+        "time_to_first_token": 37.92,
+        "total_time": 37.92,
+        "prompt_eval_duration": 37.92,
+        "generation_duration": 0.0,
+        "prompt_tokens_per_second": 454.03,
+        "generation_tokens_per_second": 6043.04
+      },
+      "finish_reason": "stop",
+      "content": "READY",
+      "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+      "repetition": 1
+    },
+    {
+      "wall_time_seconds": 7.622927,
+      "usage": {
+        "prompt_tokens": 17219,
+        "completion_tokens": 2,
+        "total_tokens": 17221,
+        "input_tokens": 17219,
+        "output_tokens": 2,
+        "prompt_tokens_details": {
+          "cached_tokens": 16896
+        },
+        "time_to_first_token": 7.58,
+        "total_time": 7.58,
+        "prompt_eval_duration": 7.58,
+        "generation_duration": 0.0,
+        "prompt_tokens_per_second": 2270.73,
+        "generation_tokens_per_second": 6389.78
+      },
+      "finish_reason": "stop",
+      "content": "READY",
+      "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+      "repetition": 2
+    },
+    {
+      "wall_time_seconds": 2.722459,
+      "usage": {
+        "prompt_tokens": 17219,
+        "completion_tokens": 2,
+        "total_tokens": 17221,
+        "input_tokens": 17219,
+        "output_tokens": 2,
+        "prompt_tokens_details": {
+          "cached_tokens": 16896
+        },
+        "time_to_first_token": 2.66,
+        "total_time": 2.66,
+        "prompt_eval_duration": 2.66,
+        "generation_duration": 0.0,
+        "prompt_tokens_per_second": 6471.89,
+        "generation_tokens_per_second": 5920.08
+      },
+      "finish_reason": "stop",
+      "content": "READY",
+      "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+      "repetition": 3
+    }
+  ]
+}
