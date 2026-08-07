@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Patch ``mlx_lm.utils.load_model`` for DeepSeek V4 support.
 
-Three surgical changes are applied:
+Two surgical changes from PR 1192 are applied:
 
 1. Weight loading goes through ``_load_safetensors`` instead of ``mx.load`` so
    safetensors files declaring the F8_E8M0 dtype (used by DeepSeek V4 fp8
@@ -10,12 +10,10 @@ Three surgical changes are applied:
    branch
    in the quantization config dispatch builds the per-layer quantization
    spec via ``deepseek_v4.make_quantization_config``.
-3. Sub-4-bit DeepSeek V4 configs disable the numerically sensitive prefill
-   attention and hyperconnection kernels before ``ModelArgs`` construction.
 
-Apart from that scoped guard, the rest of ``load_model``'s body is identical to
-the v0.31.3 (``ed1fca4``) upstream — copied verbatim from PR 1192 head
-``5c10538``. mlx-lm is pinned to a commit, so the body is stable.
+The rest of ``load_model``'s body is identical to the v0.31.3 (``ed1fca4``)
+upstream — copied verbatim from PR 1192 head ``5c10538``. mlx-lm is pinned
+to a commit, so the body is stable.
 
 When mlx-lm merges PR 1192 upstream this patch should be removed.
 """
@@ -42,21 +40,6 @@ logger = logging.getLogger(__name__)
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 _PATCHED = False
-
-
-def _prefill_numerical_optimizations_enabled(config: dict[str, Any]) -> bool:
-    """Keep numerically sensitive prefill kernels off for sub-4-bit V4."""
-    if not str(config.get("model_type", "")).startswith("deepseek_v4"):
-        return True
-    quantization = config.get("quantization")
-    if not isinstance(quantization, dict):
-        return True
-    bits = quantization.get("bits")
-    return not (
-        isinstance(bits, (int, float))
-        and not isinstance(bits, bool)
-        and float(bits) < 4
-    )
 
 
 def _load_safetensors(path: str) -> dict:
@@ -162,13 +145,6 @@ def _build_patched_load_model() -> Callable:
             text_config = config.get("text_config", {})
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
-
-        if str(config.get("model_type", "")).startswith("deepseek_v4"):
-            config["use_optimized_prefill"] = bool(
-                config.get("use_optimized_prefill", True)
-            ) and _prefill_numerical_optimizations_enabled(
-                config,
-            )
 
         model_args = model_args_class.from_dict(config)
         model = model_class(model_args)
