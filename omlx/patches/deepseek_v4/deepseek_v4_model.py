@@ -165,6 +165,7 @@ class ModelArgs(BaseModelArgs):
     n_mtp_layers: int = 0
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
+    use_optimized_prefill: bool = True
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -1550,7 +1551,10 @@ class CompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        use_optimized_prefill: Optional[bool] = None,
     ) -> mx.array:
+        if use_optimized_prefill is None:
+            use_optimized_prefill = self.config.use_optimized_prefill
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
@@ -1598,7 +1602,23 @@ class CompressedAttention(nn.Module):
             pooled_mask = (
                 pool_cache.make_mask(L, offset) if pool_cache is not None else None
             )
-        if self.dspark and B == 1 and L == 1:
+        if not use_optimized_prefill:
+            if pooled.shape[1] > 0:
+                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            if self.dspark and B == 1 and L == 1:
+                out = exact_attention(q, [kv], self.scale, sinks)
+            else:
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
+        elif self.dspark and B == 1 and L == 1:
             full_kv = (
                 mx.concatenate([kv, pooled[:, None]], axis=2)
                 if pooled.shape[1] > 0
@@ -1693,7 +1713,10 @@ class SparseCompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        use_optimized_prefill: Optional[bool] = None,
     ) -> mx.array:
+        if use_optimized_prefill is None:
+            use_optimized_prefill = self.config.use_optimized_prefill
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
@@ -1827,7 +1850,7 @@ class SparseCompressedAttention(nn.Module):
 
         pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
-        if 0 < pooled.shape[1] <= self.indexer.index_topk:
+        if use_optimized_prefill and 0 < pooled.shape[1] <= self.indexer.index_topk:
             index_pooled = self.indexer.compressor(x, idx_cache, offset)
             if index_pooled.shape[1] != pooled.shape[1]:
                 raise RuntimeError(
@@ -1855,6 +1878,21 @@ class SparseCompressedAttention(nn.Module):
                     q,
                     kv,
                     kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
+        elif pooled.shape[1] <= self.indexer.index_topk and not use_optimized_prefill:
+            full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+            mask = _extend_mask(mask, pmask, full_kv.shape[2])
+            if self.dspark and B == 1 and L == 1:
+                out = exact_attention(q, [full_kv], self.scale, sinks)
+            else:
+                out = scaled_dot_product_attention(
+                    q,
+                    full_kv,
+                    full_kv,
                     cache=local_cache,
                     scale=self.scale,
                     mask=mask,
@@ -1918,6 +1956,7 @@ class DeepseekV4Block(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
+        self.use_optimized_prefill = config.use_optimized_prefill
 
     def __call__(
         self,
@@ -1929,13 +1968,25 @@ class DeepseekV4Block(nn.Module):
         residual = h
         x, post, comb = self.attn_hc(h)
         x = self.attn(self.attn_norm(x), mask=mask, cache=cache)
-        h = hc_expand(x, residual, post, comb)
+        h = hc_expand(
+            x,
+            residual,
+            post,
+            comb,
+            use_kernel=self.use_optimized_prefill,
+        )
 
         residual = h
         x, post, comb = self.ffn_hc(h)
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
-        return hc_expand(x, residual, post, comb)
+        return hc_expand(
+            x,
+            residual,
+            post,
+            comb,
+            use_kernel=self.use_optimized_prefill,
+        )
 
 
 class DeepseekV4Model(PipelineMixin, nn.Module):

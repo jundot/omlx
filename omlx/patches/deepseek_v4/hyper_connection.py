@@ -308,9 +308,10 @@ def _hc_expand_op(x, residual, post, comb):
     return y.astype(x.dtype)
 
 
-def hc_expand(x, residual, post, comb):
+def hc_expand(x, residual, post, comb, use_kernel=True):
     if (
-        _hc_expand_kernel is not None
+        use_kernel
+        and _hc_expand_kernel is not None
         and x.ndim == 3
         and residual.ndim == 4
         and x.shape[1] > 6

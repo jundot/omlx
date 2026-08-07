@@ -104,6 +104,82 @@ class TestUtilsPatch:
 
         assert utils_mod.SAFETENSORS_DTYPE_FALLBACKS == {"F8_E8M0": "U8"}
 
+    @pytest.mark.parametrize("bits", (2, 3, 3.5))
+    def test_deepseek_low_bit_affine_disables_prefill_numerical_kernels(
+        self, bits
+    ):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _prefill_numerical_optimizations_enabled,
+        )
+
+        config = {
+            "model_type": "deepseek_v4",
+            "quantization": {"bits": bits, "group_size": 64, "mode": "affine"},
+        }
+
+        assert _prefill_numerical_optimizations_enabled(config) is False
+
+    @pytest.mark.parametrize(
+        "config",
+        (
+            {"model_type": "deepseek_v4"},
+            {
+                "model_type": "deepseek_v4",
+                "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
+            },
+            {
+                "model_type": "deepseek_v4",
+                "quantization": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+            },
+            {
+                "model_type": "other",
+                "quantization": {"bits": 2, "group_size": 64, "mode": "affine"},
+            },
+        ),
+    )
+    def test_prefill_numerical_kernels_stay_enabled_outside_low_bit_v4(
+        self, config
+    ):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _prefill_numerical_optimizations_enabled,
+        )
+
+        assert _prefill_numerical_optimizations_enabled(config) is True
+
+    def test_load_model_propagates_low_bit_prefill_safety_flag(
+        self, applied_patch, tmp_path
+    ):
+        import mlx.nn as nn
+        from mlx_lm.utils import load_model
+
+        (tmp_path / "config.json").write_text(
+            '{"model_type":"deepseek_v4","quantization":'
+            '{"bits":2,"group_size":64,"mode":"affine"},'
+            '"use_optimized_prefill":true}'
+        )
+
+        class Args:
+            received = None
+
+            @classmethod
+            def from_dict(cls, config):
+                cls.received = dict(config)
+                return cls()
+
+        class EmptyModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+
+        _, loaded_config = load_model(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (EmptyModel, Args),
+        )
+
+        assert Args.received["use_optimized_prefill"] is False
+        assert loaded_config["use_optimized_prefill"] is False
+
     def test_load_safetensors_passthrough_for_normal_dtype(
         self, applied_patch, tmp_path
     ):
@@ -1112,6 +1188,155 @@ class TestDeepseekV4PrefillOptimizations:
         assert calls[0][1] == (1, 1, 8)
         assert calls[0][2].tolist() == [[[0]] * 129]
 
+    def test_compressed_low_bit_safety_uses_dense_reference(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.CompressedAttention(self._attention_config(dsv4, 128), 0)
+        dense_key_shapes = []
+
+        def fail_sparse(*args, **kwargs):
+            raise AssertionError("low-bit safety must not use sparse pooled attention")
+
+        def dense_spy(q, key, value, *args, **kwargs):
+            dense_key_shapes.append(key.shape)
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", fail_sparse)
+        monkeypatch.setattr(dsv4, "scaled_dot_product_attention", dense_spy)
+
+        x = mx.random.normal((1, 129, 16), dtype=mx.bfloat16)
+        y = layer(x, use_optimized_prefill=False)
+        mx.eval(y)
+
+        assert y.shape == (1, 129, 16)
+        assert dense_key_shapes == [(1, 1, 130, 8)]
+
+    def test_compressed_all_pooled_attention_matches_dense_reference(
+        self, applied_patch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        mx.random.seed(23)
+        q = mx.random.normal((1, 2, 7, 8), dtype=mx.bfloat16)
+        local_kv = mx.random.normal((1, 1, 7, 8), dtype=mx.bfloat16)
+        pooled = mx.random.normal((1, 2, 8), dtype=mx.bfloat16)
+        topk = mx.broadcast_to(
+            mx.arange(2, dtype=mx.uint32)[None, None],
+            (1, 7, 2),
+        )
+        sinks = mx.array([-0.25, 0.5], dtype=mx.bfloat16)
+        scale = 8**-0.5
+
+        actual = dsv4._sparse_pooled_attention(
+            q,
+            local_kv,
+            pooled,
+            topk,
+            None,
+            None,
+            scale,
+            sinks,
+        )
+        full_kv = mx.concatenate([local_kv, pooled[:, None]], axis=2)
+        expected = dsv4.scaled_dot_product_attention(
+            q,
+            full_kv,
+            full_kv,
+            cache=None,
+            scale=scale,
+            mask=None,
+            sinks=sinks,
+        )
+        mx.eval(actual, expected)
+
+        max_abs = mx.max(
+            mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
+        )
+        assert float(max_abs.item()) <= 0.016
+
+    @pytest.mark.parametrize(
+        ("dtype_name", "max_tolerance"),
+        (("float16", 0.004), ("bfloat16", 0.032)),
+    )
+    def test_compressed_native_attention_matches_causal_reference(
+        self, applied_patch, dtype_name, max_tolerance
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.has_symbol("deepseek_v4_sparse_attention"):
+            pytest.skip("DeepSeek V4 sparse-attention kernel is unavailable")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        mx.random.seed(41)
+        dtype = getattr(mx, dtype_name)
+        offset, length, local_window, compress_ratio = 255, 17, 128, 128
+        local_start = max(0, offset - local_window)
+        local_length = offset - local_start + length
+        pooled_length = (offset + length) // compress_ratio
+        q = mx.random.normal((1, 64, length, 512), dtype=dtype)
+        local_kv = mx.random.normal((1, 1, local_length, 512), dtype=dtype)
+        pooled = mx.random.normal((1, pooled_length, 512), dtype=dtype)
+        topk = mx.broadcast_to(
+            mx.arange(pooled_length, dtype=mx.uint32)[None, None],
+            (1, length, pooled_length),
+        )
+        sinks = mx.random.normal((64,), dtype=dtype)
+        query_rows = mx.arange(length)[:, None]
+        local_positions = mx.arange(local_length)[None]
+        local_end = local_length - length + query_rows + 1
+        local_start_rows = mx.maximum(0, local_end - local_window)
+        pooled_positions = (mx.arange(pooled_length)[None] + 1) * compress_ratio - 1
+        local_mask = (local_positions >= local_start_rows) & (
+            local_positions < local_end
+        )
+        pooled_mask = pooled_positions <= offset + query_rows
+        scale = 512**-0.5
+
+        previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+        try:
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
+            actual = dsv4._sparse_pooled_attention(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                local_mask,
+                pooled_mask,
+                scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=compress_ratio,
+                local_window=local_window,
+            )
+            mx.eval(actual)
+
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+            expected = dsv4._sparse_pooled_attention(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                local_mask,
+                pooled_mask,
+                scale,
+                sinks,
+            )
+            mx.eval(expected)
+        finally:
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = previous
+
+        max_abs = mx.max(
+            mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
+        )
+        assert mx.allclose(actual, expected, atol=0.02, rtol=0.02).item()
+        assert float(max_abs.item()) <= max_tolerance
+
     def test_sparse_all_pooled_skips_indexer_but_advances_its_cache(
         self, applied_patch, monkeypatch
     ):
@@ -1149,10 +1374,75 @@ class TestDeepseekV4PrefillOptimizations:
         assert comp_cache.offset == index_cache.offset == 2
         assert calls[0].tolist() == [[[0, 1]] * 8]
 
+    def test_sparse_low_bit_safety_uses_indexer_and_dense_reference(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.SparseCompressedAttention(self._attention_config(dsv4, 4), 0)
+        calls = {"indexer": 0, "dense_key_shapes": []}
+
+        def indexer_spy(self, x, *args, **kwargs):
+            calls["indexer"] += 1
+            pooled_length = x.shape[1] // 4
+            return mx.broadcast_to(
+                mx.arange(pooled_length, dtype=mx.uint32)[None, None],
+                (x.shape[0], x.shape[1], pooled_length),
+            )
+
+        def fail_sparse(*args, **kwargs):
+            raise AssertionError("low-bit safety must not use sparse pooled attention")
+
+        def dense_spy(q, key, value, *args, **kwargs):
+            calls["dense_key_shapes"].append(key.shape)
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        monkeypatch.setattr(dsv4.Indexer, "__call__", indexer_spy)
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", fail_sparse)
+        monkeypatch.setattr(dsv4, "scaled_dot_product_attention", dense_spy)
+
+        x = mx.random.normal((1, 8, 16), dtype=mx.bfloat16)
+        y = layer(x, use_optimized_prefill=False)
+        mx.eval(y)
+
+        assert y.shape == (1, 8, 16)
+        assert calls == {"indexer": 1, "dense_key_shapes": [(1, 1, 10, 8)]}
+
+    def test_sparse_all_pooled_topk_matches_full_indexer(self, applied_patch):
+        import mlx.core as mx
+        from mlx_lm.models.cache import PoolingCache
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.SparseCompressedAttention(self._attention_config(dsv4, 4), 0)
+        mx.random.seed(29)
+        x = mx.random.normal((1, 8, 16), dtype=mx.bfloat16)
+        q_residual = layer.q_norm(layer.wq_a(x))
+        shortcut_cache = PoolingCache(4)
+        reference_cache = PoolingCache(4)
+
+        pooled = layer.indexer.compressor(x, shortcut_cache, 0)
+        shortcut = mx.broadcast_to(
+            mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+            (1, x.shape[1], pooled.shape[1]),
+        )
+        reference = layer.indexer(
+            x,
+            q_residual,
+            layer.rope,
+            reference_cache,
+            0,
+        )
+        mx.eval(shortcut, reference, shortcut_cache.pooled, reference_cache.pooled)
+
+        assert shortcut.tolist() == reference.tolist()
+        assert mx.array_equal(shortcut_cache.pooled, reference_cache.pooled).item()
+
     def test_hc_expand_dispatches_prefill_kernel_and_keeps_short_fallback(
         self, applied_patch, monkeypatch
     ):
         import mlx.core as mx
+
         from omlx.patches.deepseek_v4 import hyper_connection
 
         calls = []
@@ -1179,6 +1469,68 @@ class TestDeepseekV4PrefillOptimizations:
         mx.eval(short)
         assert short.shape == residual[:, :6].shape
         assert calls == []
+
+    def test_hc_expand_low_bit_safety_uses_reference(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import hyper_connection
+
+        def fail_kernel(**kwargs):
+            raise AssertionError("low-bit safety must not use the fused kernel")
+
+        monkeypatch.setattr(hyper_connection, "_hc_expand_kernel", fail_kernel)
+        x = mx.random.normal((1, 7, 8), dtype=mx.bfloat16)
+        residual = mx.random.normal((1, 7, 4, 8), dtype=mx.bfloat16)
+        post = mx.random.normal((1, 7, 4), dtype=mx.float32)
+        comb = mx.random.normal((1, 7, 4, 4), dtype=mx.float32)
+
+        actual = hyper_connection.hc_expand(
+            x,
+            residual,
+            post,
+            comb,
+            use_kernel=False,
+        )
+        expected = hyper_connection._hc_expand_op(x, residual, post, comb)
+        mx.eval(actual, expected)
+
+        assert mx.array_equal(actual, expected).item()
+
+    @pytest.mark.parametrize(
+        ("dtype_name", "max_tolerance"),
+        (("float16", 0.008), ("bfloat16", 0.04)),
+    )
+    def test_hc_expand_prefill_kernel_matches_equation(
+        self, applied_patch, dtype_name, max_tolerance
+    ):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import hyper_connection
+
+        mx.random.seed(31)
+        dtype = getattr(mx, dtype_name)
+        x = mx.random.normal((1, 17, 64), dtype=dtype)
+        residual = mx.random.normal((1, 17, 4, 64), dtype=dtype)
+        post = mx.random.normal((1, 17, 4), dtype=mx.float32)
+        comb = mx.random.normal((1, 17, 4, 4), dtype=mx.float32)
+
+        actual = hyper_connection.hc_expand(x, residual, post, comb)
+        expected = (
+            post[..., None] * x[:, :, None].astype(mx.float32)
+            + mx.einsum(
+                "bljh,bljd->blhd",
+                comb,
+                residual.astype(mx.float32),
+            )
+        ).astype(dtype)
+        mx.eval(actual, expected)
+
+        max_abs = mx.max(
+            mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
+        )
+        assert float(max_abs.item()) <= max_tolerance
 
 
 class TestPreLoadDispatch:

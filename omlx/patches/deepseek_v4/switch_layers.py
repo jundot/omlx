@@ -21,6 +21,7 @@ _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 16384
+_DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
@@ -257,6 +258,18 @@ def _mxfp4_block_config(num_routes: int) -> tuple[int, int]:
     )
 
 
+def _native_block_config(num_routes: int, native_kind: str) -> tuple[int, int]:
+    if (
+        native_kind == "affine"
+        and num_routes >= _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES
+    ):
+        return (
+            _DEEPSEEK_MXFP4_LARGE_BLOCK_BM,
+            _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT,
+        )
+    return _mxfp4_block_config(num_routes)
+
+
 def _unpack_mxfp4_block_plan(block_plan):
     if len(block_plan) == 3:
         return block_plan
@@ -370,7 +383,10 @@ class QuantizedSwitchLinear(nn.Module):
         native_kind = self._native_block_kind(x, sorted_indices)
         if native_kind is not None:
             if block_plan is None:
-                block_bm, block_variant = _mxfp4_block_config(indices.size)
+                block_bm, block_variant = _native_block_config(
+                    indices.size,
+                    native_kind,
+                )
                 block_meta, block_count = _build_mxfp4_blocks(
                     indices,
                     self.num_experts,
@@ -560,7 +576,11 @@ class SwitchGLU(nn.Module):
                 if prebuilt_block_plan is not None:
                     block_plan = prebuilt_block_plan
                 else:
-                    block_bm, block_variant = _mxfp4_block_config(idx.size)
+                    block_kind = "affine" if "affine" in native_kinds else "mxfp4"
+                    block_bm, block_variant = _native_block_config(
+                        idx.size,
+                        block_kind,
+                    )
                     block_meta, block_count = _build_mxfp4_blocks(
                         idx,
                         self.up_proj.num_experts,
