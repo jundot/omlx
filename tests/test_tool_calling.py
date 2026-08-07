@@ -22,9 +22,13 @@ from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _coerce_param_value,
     _gemma4_args_to_json_robust,
+    _json_value_end,
+    _marker_payloads,
     _parse_gemma4_tool_call_fallback,
+    _parse_hermes_tool_calls,
     _parse_namespaced_tool_calls,
     _parse_xml_tool_calls,
+    _strip_marker_spans,
     _remap_tool_call_names,
     _repair_json_value,
     _serialize_tool_call_arguments,
@@ -3274,3 +3278,147 @@ class TestSchemaAwareFallbackCoercion:
         assert _repair_json_value('[{"a": [1, 2}]}') == [{"a": [1, 2]}]
         assert _repair_json_value('{"a": "unterminated') == {"a": "unterminated"}
         assert _repair_json_value("not json at all") is None
+
+
+class TestToolCallMarkerInArguments:
+    """Literal tool-call markers inside argument strings (#2507).
+
+    A non-greedy ``start(.*?)end`` match stops at the first close marker, so a
+    call whose argument embeds that marker was truncated mid-JSON and dropped
+    silently. Payload boundaries are now found via JSON decoding.
+    """
+
+    PAYLOAD = "text with a literal </tool_call> inside"
+
+    @staticmethod
+    def _raw(body):
+        inner = json.dumps(
+            {"name": "note_write", "arguments": {"title": "t", "body": body}},
+            ensure_ascii=False,
+        )
+        return f"<tool_call>\n{inner}\n</tool_call>"
+
+    @staticmethod
+    def _tokenizer():
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: json.loads(text)
+        return tok
+
+    def test_marker_span_helpers_span_the_embedded_marker(self):
+        text = self._raw(self.PAYLOAD)
+        payloads = _marker_payloads(text, "<tool_call>", "</tool_call>")
+        assert len(payloads) == 1
+        assert json.loads(payloads[0])["arguments"]["body"] == self.PAYLOAD
+        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>").strip() == ""
+
+    def test_native_path_preserves_argument_with_close_marker(self):
+        cleaned, calls = parse_tool_calls(self._raw(self.PAYLOAD), self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == self.PAYLOAD
+        # The whole envelope is consumed, so no markup leaks into content.
+        assert cleaned == ""
+
+    def test_xml_fallback_preserves_argument_with_close_marker(self):
+        cleaned, calls = _parse_xml_tool_calls(self._raw(self.PAYLOAD))
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == self.PAYLOAD
+        assert cleaned == ""
+
+    def test_hermes_payload_with_close_marker(self):
+        inner = json.dumps(
+            {"name": "note_write", "arguments": {"body": "a <|tool_call_end|> b"}}
+        )
+        text = f"<|tool_call_start|>{inner}<|tool_call_end|>"
+        cleaned, calls = _parse_hermes_tool_calls(text)
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == "a <|tool_call_end|> b"
+        assert cleaned == ""
+
+    def test_streaming_does_not_leak_tail_as_content(self):
+        """The stream filter must not end the envelope on the embedded marker."""
+        raw = self._raw(self.PAYLOAD)
+        for chunk in (1, 3, 7, 64):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            emitted = "".join(
+                filt.feed(raw[i : i + chunk]) for i in range(0, len(raw), chunk)
+            )
+            emitted += filt.finish()
+            assert emitted == "", f"leaked at chunk size {chunk}: {emitted!r}"
+
+    def test_multiple_calls_still_split(self):
+        a = json.dumps({"name": "f", "arguments": {"s": "has </tool_call> inside"}})
+        b = json.dumps({"name": "g", "arguments": {"y": 2}})
+        text = f"pre <tool_call>{a}</tool_call> mid <tool_call>{b}</tool_call> post"
+        payloads = _marker_payloads(text, "<tool_call>", "</tool_call>")
+        assert [json.loads(p)["name"] for p in payloads] == ["f", "g"]
+        assert (
+            _strip_marker_spans(text, "<tool_call>", "</tool_call>")
+            == "pre  mid  post"
+        )
+
+    def test_non_json_dialect_keeps_first_match_behaviour(self):
+        """GLM-style payloads are not JSON, so boundary detection must not change them."""
+        text = (
+            "<tool_call>myfunc<arg_key>k</arg_key>"
+            "<arg_value>v</arg_value></tool_call>"
+        )
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [
+            "myfunc<arg_key>k</arg_key><arg_value>v</arg_value>"
+        ]
+
+    def test_unterminated_envelope_yields_no_span(self):
+        text = '<tool_call>{"name": "f", "arguments": {}}'
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == []
+        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>") == text
+
+    def test_incomplete_json_falls_back_to_first_marker(self):
+        """Never-completing JSON must not swallow the rest of the message."""
+        text = '<tool_call>{"name": "f", "arguments": {"s": "oops </tool_call>'
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [
+            '{"name": "f", "arguments": {"s": "oops '
+        ]
+
+    def test_boundary_scan_never_raises_on_deep_nesting(self):
+        """Boundary detection must degrade, not explode, on hostile nesting.
+
+        ``raw_decode`` recurses per nesting level, so deeply nested output
+        raises RecursionError rather than a decode error. A boundary hint must
+        never turn into an exception escaping the parse chain.
+        """
+        deep = "[" * 100_000
+        assert _json_value_end(deep, 0) is None
+        text = f"<tool_call>{deep}</tool_call>"
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [deep]
+
+    def test_boundary_scan_stays_linear_on_adversarial_output(self):
+        """Guard the linear-time rule for untrusted model output.
+
+        Locating the payload end must not re-scan the accumulated buffer once
+        per chunk: an unterminated JSON object stuffed with close markers
+        would then cost quadratic time. Model output is attacker-influenceable
+        via prompt injection, so this is a DoS surface, not just a slowdown.
+        """
+        import time
+
+        def elapsed(markers):
+            evil = (
+                "<tool_call>"
+                + '{"name":"f","arguments":{"s":"'
+                + "</tool_call>" * markers
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            for i in range(0, len(evil), 64):
+                filt.feed(evil[i : i + 64])
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up the interpreter before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
+        # headroom for a loaded CI box while still catching quadratic growth.
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"
