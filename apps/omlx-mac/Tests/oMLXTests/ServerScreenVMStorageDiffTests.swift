@@ -190,6 +190,27 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
     }
 
+    func testApplyConfigDualStackWildcardUsesLoopbackEndpoint() {
+        let cfg = AppConfig(
+            bindAddress: "::",
+            port: 8080,
+            apiKey: nil,
+            basePath: "/Users/Fido/.omlx",
+            modelDir: "/Users/Fido/.omlx/models",
+            modelDirs: ["/Users/Fido/.omlx/models"],
+            hfEndpoint: ""
+        )
+        let vm = ServerScreenVM()
+
+        vm.applyConfig(cfg)
+
+        XCTAssertEqual(vm.host, "::")
+        XCTAssertEqual(vm.appliedBindAddress, "::")
+        // :: is a dual-stack wildcard: it accepts IPv4 and IPv6, but the app's
+        // own client connects over loopback.
+        XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
+    }
+
     func testApplyConfigSeedsAutoStartWhenServerIsOffline() {
         let cfg = AppConfig(
             bindAddress: "127.0.0.1",

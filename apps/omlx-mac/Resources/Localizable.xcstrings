@@ -13176,19 +13176,19 @@
       }
     },
     "server.host.all_networks" : {
-      "comment" : "Listen-address popup option for binding to all interfaces",
+      "comment" : "Listen-address popup option for binding to all interfaces; the IPv6 wildcard also accepts IPv4 (dual-stack)",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "0.0.0.0 (All networks)"
+            "value" : "0.0.0.0 & :: (All Networks)"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "0.0.0.0 (все сети)"
+            "value" : "0.0.0.0 & :: (все сети)"
           }
         }
       }

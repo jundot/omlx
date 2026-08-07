@@ -48,7 +48,7 @@ struct Popup<Value: Hashable>: View {
     VStack(alignment: .leading, spacing: 14) {
         Popup(selection: $host, width: 220, options: [
             ("127.0.0.1", "127.0.0.1 (Local only)"),
-            ("0.0.0.0", "0.0.0.0 (All networks)"),
+            ("::", "0.0.0.0 & :: (All Networks)"),
             ("localhost", "localhost"),
         ])
         Popup(selection: $quant, width: 120, options: [
