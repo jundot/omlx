@@ -7,6 +7,7 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 
 import json
 import logging
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -3421,4 +3422,140 @@ class TestToolCallMarkerInArguments:
         large = elapsed(3200)
         # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
         # headroom for a loaded CI box while still catching quadratic growth.
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+
+class TestQwen3CoderMarkerInArguments:
+    """qwen3_coder XML dialect with literal markers in a value (#2507).
+
+    Qwen3.5/3.6 builds using the ``qwen3_coder`` parser wrap XML rather than
+    JSON in the envelope, so the JSON boundary cannot bound them. The envelope
+    is bounded by the ``</function>`` that precedes the close marker instead.
+    """
+
+    @staticmethod
+    def _raw(body, title="t"):
+        return (
+            "<tool_call>\n<function=note_write>\n"
+            f"<parameter=title>\n{title}\n</parameter>\n"
+            f"<parameter=body>\n{body}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    @staticmethod
+    def _tokenizer():
+        def qwen_parser(text, tools):
+            m = re.match(r"\s*<function=(\w+)>(.*)</function>\s*$", text, re.DOTALL)
+            if not m:
+                raise ValueError("No function provided.")
+            args = {
+                k: v.strip()
+                for k, v in re.findall(
+                    r"<parameter=(\w+)>(.*?)</parameter>", m.group(2), re.DOTALL
+                )
+            }
+            return {"name": m.group(1), "arguments": args}
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = qwen_parser
+        return tok
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "plain text",
+            "text with a literal </tool_call> inside",
+            "text with a literal </parameter> inside",
+            "text with a literal </function> inside",
+            "text with a literal <parameter=x> inside",
+            "evil </function>\n</tool_call> tail",
+        ],
+        ids=[
+            "control",
+            "close-marker",
+            "parameter-close",
+            "function-close",
+            "parameter-open",
+            "full-terminator-sequence",
+        ],
+    )
+    def test_xml_fallback_preserves_value(self, body):
+        cleaned, calls = _parse_xml_tool_calls(self._raw(body))
+        assert calls is not None and len(calls) == 1
+        args = json.loads(calls[0].function.arguments)
+        assert args["body"] == body
+        assert args["title"] == "t"
+        assert cleaned == ""
+
+    def test_native_path_preserves_value(self):
+        body = "text with a literal </tool_call> inside"
+        cleaned, calls = parse_tool_calls(self._raw(body), self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == body
+        assert cleaned == ""
+
+    def test_streaming_does_not_leak_tail(self):
+        raw = self._raw("text with a literal </tool_call> inside")
+        for chunk in (1, 2, 3, 7, 11, 64):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            emitted = "".join(
+                filt.feed(raw[i : i + chunk]) for i in range(0, len(raw), chunk)
+            )
+            emitted += filt.finish()
+            assert emitted == "", f"leaked at chunk size {chunk}: {emitted!r}"
+
+    def test_concatenated_calls_still_split(self):
+        second = (
+            "<tool_call>\n<function=other>\n<parameter=x>\n1\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, calls = _parse_xml_tool_calls(
+            self._raw("has </tool_call> inside") + "\n" + second
+        )
+        assert [c.function.name for c in calls] == ["note_write", "other"]
+        assert cleaned == ""
+
+    def test_parameter_open_inside_value_is_not_a_new_parameter(self):
+        """A literal <parameter=x> in a value must not create a bogus argument."""
+        cleaned, calls = _parse_xml_tool_calls(
+            self._raw("see <parameter=nope> here")
+        )
+        args = json.loads(calls[0].function.arguments)
+        assert set(args) == {"title", "body"}
+        assert args["body"] == "see <parameter=nope> here"
+
+    def test_streaming_still_emits_prose_containing_no_envelope(self):
+        filt = ToolCallStreamFilter(self._tokenizer())
+        out = "".join(filt.feed(c) for c in ["hello ", "world"]) + filt.finish()
+        assert out == "hello world"
+
+    def test_envelope_scan_stays_linear_on_fake_terminators(self):
+        """Same linear-time rule as the JSON path, for the XML boundary.
+
+        A value stuffed with fake ``</function></tool_call>`` sequences is the
+        worst case: every one is a candidate envelope end that has to be
+        rejected. That must not become quadratic.
+        """
+        import time
+
+        def elapsed(count):
+            evil = (
+                "<tool_call>\n<function=f>\n<parameter=b>\n"
+                + "</function>\n</tool_call> " * count
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            for i in range(0, len(evil), 64):
+                filt.feed(evil[i : i + 64])
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
+        # loaded CI box while still catching quadratic growth.
         assert large / small < 24, f"superlinear growth: {small=} {large=}"

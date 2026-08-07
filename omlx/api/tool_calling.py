@@ -323,6 +323,112 @@ def _json_value_end(text: str, start: int) -> Optional[int]:
     return end
 
 
+_XML_FUNCTION_OPEN = "<function="
+_XML_FUNCTION_CLOSE = "</function>"
+_XML_PARAMETER_OPEN = "<parameter="
+_XML_PARAMETER_CLOSE = "</parameter>"
+# Candidate envelope ends examined before giving up. Each candidate costs a
+# balance count over the payload, so this keeps hostile output linear.
+_XML_MAX_END_CANDIDATES = 32
+# Trailing payload context the stream filter keeps so a `</function>` split
+# across chunks is still visible when the close marker arrives.
+_XML_TAIL_KEEP = 64
+
+
+def _skip_ws(text: str, idx: int) -> int:
+    """First index at/after ``idx`` that is not ASCII whitespace."""
+    while idx < len(text) and text[idx] in " \t\r\n":
+        idx += 1
+    return idx
+
+
+def _xml_function_payload_end(
+    text: str, payload_start: int, end_marker: str
+) -> Optional[int]:
+    """Index just past the ``</function>`` closing a qwen3_coder payload.
+
+    The ``qwen3_coder`` parser (Qwen3.5/3.6 builds) wraps XML rather than JSON
+    in the envelope::
+
+        <tool_call><function=name><parameter=k>value</parameter></function></tool_call>
+
+    so ``_json_value_end`` cannot bound it and a literal close marker inside a
+    parameter value truncates the payload the same way (#2507).
+
+    The structural anchor is that a real envelope ends with ``</function>``
+    followed by the close marker, and that its parameter elements balance.
+    Requiring both skips copies embedded in values, including a value that
+    contains the whole ``</function>`` + close-marker sequence, while still
+    ending at the FIRST call when several are concatenated.
+
+    Returns ``None`` when the payload is not this dialect or has no such pair,
+    which leaves the caller on the historical first-match behaviour.
+    """
+    idx = _skip_ws(text, payload_start)
+    if not text.startswith(_XML_FUNCTION_OPEN, idx):
+        return None
+    search = idx
+    # Bounded so a value stuffed with fake terminators cannot make the balance
+    # check quadratic; past the cap we simply decline to bound the payload.
+    for _ in range(_XML_MAX_END_CANDIDATES):
+        close = text.find(_XML_FUNCTION_CLOSE, search)
+        if close < 0:
+            return None
+        after = close + len(_XML_FUNCTION_CLOSE)
+        if text.startswith(end_marker, _skip_ws(text, after)):
+            payload = text[idx:close]
+            if payload.count(_XML_PARAMETER_OPEN) == payload.count(
+                _XML_PARAMETER_CLOSE
+            ):
+                return after
+        search = after
+    return None
+
+
+def _xml_element_value_end(text: str, start: int, close_tag: str, next_open: str) -> int:
+    """End index of an XML value, tolerating ``close_tag`` inside the value.
+
+    The value really ends at the ``close_tag`` whose next non-space token is
+    either ``next_open`` (another sibling element) or the end of the enclosing
+    text. Copies sitting inside the value are followed by neither, so they are
+    skipped. Falls back to the first ``close_tag`` when nothing matches, which
+    is the historical behaviour, and to ``len(text)`` when there is none.
+    """
+    search = start
+    while True:
+        close = text.find(close_tag, search)
+        if close < 0:
+            first = text.find(close_tag, start)
+            return first if first >= 0 else len(text)
+        after = _skip_ws(text, close + len(close_tag))
+        if after >= len(text) or text.startswith(next_open, after):
+            return close
+        search = close + len(close_tag)
+
+
+_XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=(\w+)>")
+
+
+def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(key, value)`` for each ``<parameter=k>v</parameter>`` element.
+
+    Scanning advances past each value rather than using ``finditer`` over the
+    open tag alone, so a literal ``<parameter=`` sitting inside a value cannot
+    start a spurious element, and a literal ``</parameter>`` cannot end one
+    early (#2507).
+    """
+    pos = 0
+    while True:
+        match = _XML_PARAMETER_OPEN_RE.search(params_text, pos)
+        if not match:
+            return
+        value_end = _xml_element_value_end(
+            params_text, match.end(), _XML_PARAMETER_CLOSE, _XML_PARAMETER_OPEN
+        )
+        yield match.group(1), params_text[match.end() : value_end].strip()
+        pos = value_end + len(_XML_PARAMETER_CLOSE)
+
+
 def _find_marker_span_end(
     text: str, payload_start: int, end_marker: str
 ) -> Optional[Tuple[int, int]]:
@@ -338,17 +444,22 @@ def _find_marker_span_end(
     reports where the value really ends, which is authoritative and ignores
     marker text sitting inside a string.
 
-    Deliberately conservative: the JSON result is used *only* when it proves
-    the payload extends past the first close marker AND a later close marker
+    Two payload shapes can be bounded structurally: JSON, via ``raw_decode``,
+    and the ``qwen3_coder`` XML dialect, via its ``</function>`` close.
+
+    Deliberately conservative: a boundary is used *only* when it proves the
+    payload extends past the first close marker AND a later close marker
     exists.  Every other case falls back to the historical first-match
     behaviour, so this can only change outputs that are broken today.
     """
     plain = text.find(end_marker, payload_start)
     if plain < 0:
         return None
-    json_end = _json_value_end(text, payload_start)
-    if json_end is not None and json_end > plain:
-        later = text.find(end_marker, json_end)
+    boundary = _json_value_end(text, payload_start)
+    if boundary is None:
+        boundary = _xml_function_payload_end(text, payload_start, end_marker)
+    if boundary is not None and boundary > plain:
+        later = text.find(end_marker, boundary)
         if later >= 0:
             return later, later + len(end_marker)
     return plain, plain + len(end_marker)
@@ -443,17 +554,17 @@ def _parse_xml_tool_calls(
             pass
 
         # Qwen/Llama format: <function=name><parameter=key>value</parameter></function>
-        func_match = re.match(r"<function=(\w+)>(.*?)</function>", content, re.DOTALL)
-        if func_match:
-            func_name = func_match.group(1)
-            params_text = func_match.group(2)
+        # Bounded by rfind rather than a non-greedy match: the payload is already
+        # delimited, so the element closes at the LAST </function>, and a literal
+        # copy inside a parameter value must not end it early (#2507).
+        func_open = re.match(r"<function=(\w+)>", content)
+        func_close = content.rfind(_XML_FUNCTION_CLOSE)
+        if func_open and func_close >= func_open.end():
+            func_name = func_open.group(1)
+            params_text = content[func_open.end() : func_close]
             props = _tool_param_properties(func_name, tools)
             arguments = {}
-            for pm in re.finditer(
-                r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", params_text, re.DOTALL
-            ):
-                key = pm.group(1)
-                val = pm.group(2).strip()
+            for key, val in _iter_xml_parameters(params_text):
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
             tool_calls.append(
                 ToolCall(
@@ -1798,11 +1909,19 @@ class ToolCallStreamFilter:
         self._json_escaped = False
         self._json_scan_off = 0
         self._json_complete_off = 0
+        # Tail of already-consumed payload, kept so a `</function>` straddling
+        # the pending/buffer boundary is still visible to the xml check.
+        self._xml_prev_tail = ""
+        # First payload characters, accumulated across buffer drains purely to
+        # decide which dialect the payload is.
+        self._payload_head = ""
 
-    def _shift_json_scan(self, dropped: int) -> None:
+    def _shift_json_scan(self, dropped: int, moved: str = "") -> None:
         """Rebase scan offsets after ``dropped`` chars leave the buffer front."""
         self._json_scan_off = max(0, self._json_scan_off - dropped)
         self._json_complete_off = max(0, self._json_complete_off - dropped)
+        if moved:
+            self._xml_prev_tail = (self._xml_prev_tail + moved)[-_XML_TAIL_KEEP:]
 
     def _advance_json_scan(self, buffer: str) -> None:
         """Consume buffer chars not yet seen, updating JSON-completion state."""
@@ -1810,15 +1929,42 @@ class ToolCallStreamFilter:
         n = len(buffer)
 
         if self._json_state == "undecided":
-            while i < n and buffer[i] in " \t\r\n":
-                i += 1
-            if i >= n:
-                self._json_scan_off = i
-                return
-            # Objects only: a leading '[' is the Hermes bracket dialect
-            # ([execute_code(...)]), which never parses as JSON, so treating it
-            # as an unfinished object would suppress the envelope forever.
-            self._json_state = "scanning" if buffer[i] == "{" else "not_json"
+            # `{` settles JSON from a single character, but `<function=` needs
+            # ten, and the buffer is drained into the pending envelope between
+            # chunks, so those ten never coexist in it. Accumulate a small
+            # persistent head to decide the dialect across drains.
+            head_chunk: Optional[str] = None
+            if self._payload_head:
+                head_chunk = buffer[i:n]
+            else:
+                while i < n and buffer[i] in " \t\r\n":
+                    i += 1
+                if i >= n:
+                    self._json_scan_off = i
+                    return
+                if buffer[i] == "{":
+                    self._json_state = "scanning"
+                else:
+                    # A leading '[' is the Hermes bracket dialect
+                    # ([execute_code(...)]), which never parses as JSON, so
+                    # treating it as an unfinished object would suppress the
+                    # envelope forever.
+                    head_chunk = buffer[i:n]
+
+            if head_chunk is not None:
+                self._payload_head = (self._payload_head + head_chunk)[
+                    : len(_XML_FUNCTION_OPEN)
+                ]
+                self._json_scan_off = n
+                head = self._payload_head
+                if len(head) < len(_XML_FUNCTION_OPEN):
+                    if _XML_FUNCTION_OPEN.startswith(head):
+                        return  # still ambiguous, wait for more
+                    self._json_state = "not_json"
+                else:
+                    self._json_state = (
+                        "xml" if head == _XML_FUNCTION_OPEN else "not_json"
+                    )
 
         if self._json_state != "scanning":
             self._json_scan_off = n
@@ -1873,6 +2019,30 @@ class ToolCallStreamFilter:
             return -1
 
         self._advance_json_scan(buffer)
+
+        if self._json_state == "xml":
+            # qwen3_coder dialect: the envelope ends with </function> right
+            # before the close marker, so a marker inside a parameter value is
+            # not preceded by one. This is a local O(1) test per candidate,
+            # unlike the non-streaming path which can also balance parameter
+            # elements because it has the whole payload at once.
+            search = 0
+            while True:
+                idx = buffer.find(marker, search)
+                if idx < 0:
+                    return -1
+                # Only the characters immediately before the marker matter, so
+                # look at a fixed window instead of slicing the whole buffer:
+                # a per-candidate full slice would be quadratic when one chunk
+                # carries many markers.
+                window_start = idx - _XML_TAIL_KEEP
+                if window_start <= 0:
+                    seen = self._xml_prev_tail + buffer[:idx]
+                else:
+                    seen = buffer[window_start:idx]
+                if seen.rstrip(" \t\r\n").endswith(_XML_FUNCTION_CLOSE):
+                    return idx
+                search = idx + len(marker)
 
         if self._json_state == "not_json":
             # Hermes brackets, GLM arg_key/arg_value, prose: historical
@@ -2115,14 +2285,16 @@ class ToolCallStreamFilter:
                         self._buffer, self._suppressing_until
                     )
                     if keep:
-                        self._pending_envelope_parts.append(self._buffer[:-keep])
+                        moved = self._buffer[:-keep]
+                        self._pending_envelope_parts.append(moved)
                         # Rebase the JSON scan: those chars left the buffer
                         # front but were already consumed by the scanner.
-                        self._shift_json_scan(len(self._buffer) - keep)
+                        self._shift_json_scan(len(moved), moved)
                         self._buffer = self._buffer[-keep:]
                     else:
-                        self._pending_envelope_parts.append(self._buffer)
-                        self._shift_json_scan(len(self._buffer))
+                        moved = self._buffer
+                        self._pending_envelope_parts.append(moved)
+                        self._shift_json_scan(len(moved), moved)
                         self._buffer = ""
                     break
                 self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
