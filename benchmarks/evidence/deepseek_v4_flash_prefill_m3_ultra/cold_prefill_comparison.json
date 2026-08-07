@@ -1,0 +1,23 @@
+{
+  "upstream_commit": "49ec271676ba9c14bbebb75da1912e3fcb5fb0f4",
+  "prompt_tokens": 17219,
+  "repetitions_per_side": 5,
+  "baseline": {
+    "prefill_seconds_median": 35.97,
+    "prompt_tokens_per_second_median": 478.67,
+    "all_cold": true,
+    "all_correct": true
+  },
+  "candidate": {
+    "prefill_seconds_median": 30.87,
+    "prompt_tokens_per_second_median": 557.81,
+    "all_cold": true,
+    "all_correct": true
+  },
+  "change": {
+    "prefill_seconds_saved": 5.10,
+    "prefill_time_reduction_percent": 14.17848206839032,
+    "prompt_throughput_gain_percent": 16.533311049365935,
+    "speedup": 1.1653331104936593
+  }
+}

@@ -20,7 +20,7 @@ _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
-_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 8192
+_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 16384
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
@@ -50,6 +50,108 @@ def _gather_sort(x, indices):
     order = mx.argsort(indices)
     inv_order = mx.argsort(order)
     return x.flatten(0, -3)[order // M], indices[order], inv_order
+
+
+@lru_cache(maxsize=None)
+def _route_counting_sort_builder(num_experts: int, bm: int):
+    source = r"""
+        const uint expert_thread = thread_index_in_threadgroup;
+        threadgroup atomic_uint counts[NUM_EXPERTS];
+        threadgroup atomic_uint cursors[NUM_EXPERTS];
+        threadgroup uint route_starts[NUM_EXPERTS];
+        threadgroup uint block_starts[NUM_EXPERTS];
+
+        atomic_store_explicit(
+            &counts[expert_thread], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint route = expert_thread; route < M; route += NUM_EXPERTS) {
+            const uint expert = uint(indices[route]);
+            atomic_fetch_add_explicit(
+                &counts[expert], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (expert_thread == 0) {
+            uint route_offset = 0;
+            uint block_offset = 0;
+            for (uint expert = 0; expert < NUM_EXPERTS; ++expert) {
+                const uint count = atomic_load_explicit(
+                    &counts[expert], memory_order_relaxed);
+                route_starts[expert] = route_offset;
+                block_starts[expert] = block_offset;
+                atomic_store_explicit(
+                    &cursors[expert], route_offset, memory_order_relaxed);
+                route_offset += count;
+                block_offset += (count + BM - 1) / BM;
+            }
+            block_count[0] = int(block_offset);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint route = expert_thread; route < M; route += NUM_EXPERTS) {
+            const uint expert = uint(indices[route]);
+            const uint position = atomic_fetch_add_explicit(
+                &cursors[expert], 1u, memory_order_relaxed);
+            order[position] = route;
+            sorted_indices[position] = expert;
+            inverse[route] = position;
+        }
+
+        const uint count = atomic_load_explicit(
+            &counts[expert_thread], memory_order_relaxed);
+        const uint route_start = route_starts[expert_thread];
+        const uint block_start = block_starts[expert_thread];
+        for (uint local = 0; local < count; local += BM) {
+            const uint slot = block_start + local / BM;
+            block_meta[slot * 3 + 0] = int(route_start + local);
+            block_meta[slot * 3 + 1] = int(expert_thread);
+            block_meta[slot * 3 + 2] = int(min(uint(BM), count - local));
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"deepseek_v4_route_counting_sort_e{num_experts}_bm{bm}",
+        input_names=["indices"],
+        output_names=[
+            "order",
+            "sorted_indices",
+            "inverse",
+            "block_meta",
+            "block_count",
+        ],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+def _gather_counting_sort(x, indices, num_experts: int, bm: int):
+    *_, routes_per_token = indices.shape
+    flat_indices = indices.flatten()
+    num_routes = flat_indices.size
+    max_blocks = (num_routes + bm - 1) // bm + num_experts
+    builder = _route_counting_sort_builder(num_experts, bm)
+    order, sorted_indices, inverse, block_meta, block_count = builder(
+        inputs=[flat_indices],
+        template=[
+            ("T", flat_indices.dtype),
+            ("NUM_EXPERTS", num_experts),
+            ("BM", bm),
+            ("M", num_routes),
+        ],
+        grid=(num_experts, 1, 1),
+        threadgroup=(num_experts, 1, 1),
+        output_shapes=[
+            (num_routes,),
+            (num_routes,),
+            (num_routes,),
+            (max_blocks, 3),
+            (1,),
+        ],
+        output_dtypes=[mx.uint32, mx.uint32, mx.uint32, mx.int32, mx.int32],
+    )
+    sorted_x = x.flatten(0, -3)[order // routes_per_token]
+    return sorted_x, sorted_indices, inverse, (block_meta, block_count)
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -408,8 +510,29 @@ class SwitchGLU(nn.Module):
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
+        prebuilt_block_plan = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            block_bm, block_variant = _mxfp4_block_config(indices.size)
+            projections = (self.up_proj, self.gate_proj, self.down_proj)
+            sorted_input = x.flatten(0, -3)
+            use_counting_sort = (
+                self.up_proj.num_experts == 256
+                and all(isinstance(p, QuantizedSwitchLinear) for p in projections)
+                and not _nax_prefers_stock(indices.size)
+                and all(
+                    p._can_use_mxfp4_blocks(sorted_input, True) for p in projections
+                )
+            )
+            if use_counting_sort:
+                x, idx, inv_order, prebuilt_block_plan = _gather_counting_sort(
+                    x,
+                    indices,
+                    self.up_proj.num_experts,
+                    block_bm,
+                )
+                prebuilt_block_plan = (*prebuilt_block_plan, block_variant)
+            else:
+                x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
 
@@ -434,13 +557,16 @@ class SwitchGLU(nn.Module):
                     native_kinds = f16_native_kinds
                     use_f16_moe = True
             if all(kind is not None for kind in native_kinds):
-                block_bm, block_variant = _mxfp4_block_config(idx.size)
-                block_meta, block_count = _build_mxfp4_blocks(
-                    idx,
-                    self.up_proj.num_experts,
-                    block_bm,
-                )
-                block_plan = (block_meta, block_count, block_variant)
+                if prebuilt_block_plan is not None:
+                    block_plan = prebuilt_block_plan
+                else:
+                    block_bm, block_variant = _mxfp4_block_config(idx.size)
+                    block_meta, block_count = _build_mxfp4_blocks(
+                        idx,
+                        self.up_proj.num_experts,
+                        block_bm,
+                    )
+                    block_plan = (block_meta, block_count, block_variant)
 
         if use_f16_moe:
             x = x.astype(mx.float16)

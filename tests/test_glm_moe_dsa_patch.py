@@ -913,6 +913,48 @@ def test_deepseek_switchglu_does_not_use_native_weighted_sum(monkeypatch):
     assert calls["weighted_sum"] == 0
 
 
+def test_deepseek_switchglu_dispatches_route_counting_sort_for_mxfp4(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    model = switch_layers.SwitchGLU(32, 32, 256)
+    model.gate_proj = model.gate_proj.to_quantized(
+        group_size=32, bits=4, mode="mxfp4"
+    )
+    model.up_proj = model.up_proj.to_quantized(
+        group_size=32, bits=4, mode="mxfp4"
+    )
+    model.down_proj = model.down_proj.to_quantized(
+        group_size=32, bits=4, mode="mxfp4"
+    )
+
+    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda routes: False)
+    monkeypatch.setattr(
+        switch_layers.QuantizedSwitchLinear,
+        "_can_use_mxfp4_blocks",
+        lambda self, x, sorted_indices: x.ndim == 3 and sorted_indices,
+    )
+
+    calls = []
+
+    class CountingSortReached(Exception):
+        pass
+
+    def counting_sort_spy(x, indices, num_experts, bm):
+        calls.append((x.ndim, indices.size, num_experts, bm))
+        raise CountingSortReached
+
+    monkeypatch.setattr(switch_layers, "_gather_counting_sort", counting_sort_spy)
+
+    x = mx.random.normal((1, 11, 32), dtype=mx.bfloat16)
+    indices = mx.zeros((1, 11, 6), dtype=mx.int32)
+    with pytest.raises(CountingSortReached):
+        model(x, indices)
+
+    assert calls == [(5, 66, 256, 16)]
+
+
 def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):
     glm_moe_dsa = _load_patched_glm_module()
 

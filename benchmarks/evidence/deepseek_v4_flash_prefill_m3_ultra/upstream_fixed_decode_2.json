@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "kind": "omlx-inference-lab-direct-debug",
+  "label": "upstream-49ec2716-decode-2",
+  "recorded_at": "2026-08-07T13:03:15.394218+00:00",
+  "endpoint": "http://127.0.0.1:8006",
+  "model": "DeepSeek-V4-Flash-0731",
+  "corpus": "/private/tmp/omlx-prefill-control-49ec2716/omlx/admin/bench_corpora/code_python.txt",
+  "prompt_chars": 20161,
+  "prompt_sha256": "634fcbb47e77029e22fffe2970c281d517f41c773cd76ae431b9bdf37218b8e8",
+  "request": {
+    "max_tokens": 512,
+    "response_mode": "code-continuation",
+    "min_completion_tokens": 500,
+    "temperature": 0,
+    "stream": true,
+    "include_usage": true
+  },
+  "wall_time_seconds": 25.158545,
+  "usage": {
+    "prompt_tokens": 5476,
+    "completion_tokens": 512,
+    "total_tokens": 5988,
+    "input_tokens": 5476,
+    "output_tokens": 512,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "time_to_first_token": 12.75,
+    "total_time": 25.14,
+    "prompt_eval_duration": 12.75,
+    "generation_duration": 12.39,
+    "prompt_tokens_per_second": 429.35,
+    "generation_tokens_per_second": 41.34
+  },
+  "finish_reason": "length",
+  "response_content_sha256": "c93e250522c255c972385ea1371919c62c867e1aaae60c116166b90c82968c95",
+  "response_content_preview": "<turn|>)\\s*)?\",\n    re.DOTALL,\n)\n\n\ndef _extract_thought_and_response(text: str) -> tuple[str, str]:\n    \"\"\"Split a Gemma 4 reasoning-channel string into (thought, response).\n\n    The model emits ``<|c"
+}

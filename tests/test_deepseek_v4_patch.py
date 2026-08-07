@@ -1057,6 +1057,130 @@ class TestDeepseekV4SwitchGLU:
         assert y.shape == (1, 8, 8, 16)
 
 
+class TestDeepseekV4PrefillOptimizations:
+    @staticmethod
+    def _attention_config(dsv4, ratio):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[ratio],
+        )
+
+    def test_compressed_prefill_dispatches_native_all_pooled_path(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.CompressedAttention(self._attention_config(dsv4, 128), 0)
+        calls = []
+
+        def sparse_spy(q, local_kv, pooled, pooled_indices, *args, **kwargs):
+            calls.append((local_kv.shape, pooled.shape, pooled_indices))
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        def fail_sdpa(*args, **kwargs):
+            raise AssertionError("generic SDPA must not handle non-empty pooled prefill")
+
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
+        monkeypatch.setattr(dsv4, "scaled_dot_product_attention", fail_sdpa)
+
+        x = mx.random.normal((1, 129, 16), dtype=mx.bfloat16)
+        y = layer(x)
+        mx.eval(y, calls[0][2])
+
+        assert y.shape == (1, 129, 16)
+        assert calls[0][0] == (1, 1, 129, 8)
+        assert calls[0][1] == (1, 1, 8)
+        assert calls[0][2].tolist() == [[[0]] * 129]
+
+    def test_sparse_all_pooled_skips_indexer_but_advances_its_cache(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.SparseCompressedAttention(
+            self._attention_config(dsv4, 4), 0
+        )
+        calls = []
+
+        def fail_indexer(*args, **kwargs):
+            raise AssertionError("full indexer must be skipped when every pool row fits")
+
+        def sparse_spy(q, local_kv, pooled, pooled_indices, *args, **kwargs):
+            calls.append(pooled_indices)
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        monkeypatch.setattr(dsv4.Indexer, "__call__", fail_indexer)
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
+
+        comp_cache = PoolingCache(4)
+        index_cache = PoolingCache(4)
+        cache = CacheList(
+            RotatingKVCache(max_size=128),
+            comp_cache,
+            index_cache,
+        )
+        x = mx.random.normal((1, 8, 16), dtype=mx.bfloat16)
+        y = layer(x, cache=cache)
+        mx.eval(y, calls[0], comp_cache.pooled, index_cache.pooled)
+
+        assert y.shape == (1, 8, 16)
+        assert comp_cache.offset == index_cache.offset == 2
+        assert calls[0].tolist() == [[[0, 1]] * 8]
+
+    def test_hc_expand_dispatches_prefill_kernel_and_keeps_short_fallback(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from omlx.patches.deepseek_v4 import hyper_connection
+
+        calls = []
+
+        def kernel_spy(**kwargs):
+            calls.append(kwargs)
+            return (mx.zeros(kwargs["output_shapes"][0], dtype=mx.bfloat16),)
+
+        monkeypatch.setattr(hyper_connection, "_hc_expand_kernel", kernel_spy)
+        x = mx.zeros((1, 7, 8), dtype=mx.bfloat16)
+        residual = mx.zeros((1, 7, 4, 8), dtype=mx.bfloat16)
+        post = mx.zeros((1, 7, 4), dtype=mx.float32)
+        comb = mx.zeros((1, 7, 4, 4), dtype=mx.float32)
+        out = hyper_connection.hc_expand(x, residual, post, comb)
+        mx.eval(out)
+
+        assert out.shape == residual.shape
+        assert calls[0]["threadgroup"] == (1024, 1, 1)
+
+        calls.clear()
+        short = hyper_connection.hc_expand(
+            x[:, :6], residual[:, :6], post[:, :6], comb[:, :6]
+        )
+        mx.eval(short)
+        assert short.shape == residual[:, :6].shape
+        assert calls == []
+
+
 class TestPreLoadDispatch:
     """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
 

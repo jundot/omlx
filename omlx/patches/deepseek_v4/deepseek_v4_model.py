@@ -1598,11 +1598,32 @@ class CompressedAttention(nn.Module):
             pooled_mask = (
                 pool_cache.make_mask(L, offset) if pool_cache is not None else None
             )
-        if pooled.shape[1] > 0:
-            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-        mask = _extend_mask(mask, pooled_mask, kv.shape[2])
         if self.dspark and B == 1 and L == 1:
-            out = exact_attention(q, [kv], self.scale, sinks)
+            full_kv = (
+                mx.concatenate([kv, pooled[:, None]], axis=2)
+                if pooled.shape[1] > 0
+                else kv
+            )
+            out = exact_attention(q, [full_kv], self.scale, sinks)
+        elif pooled.shape[1] > 0:
+            pooled_indices = mx.broadcast_to(
+                mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+                (B, L, pooled.shape[1]),
+            )
+            out = _sparse_pooled_attention(
+                q,
+                kv,
+                pooled,
+                pooled_indices,
+                mask,
+                pooled_mask,
+                self.scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=self.compress_ratio,
+                local_window=self.config.sliding_window,
+                decode_consistent=self.dspark,
+            )
         else:
             out = scaled_dot_product_attention(
                 q,
@@ -1806,7 +1827,18 @@ class SparseCompressedAttention(nn.Module):
 
         pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
-        topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+        if 0 < pooled.shape[1] <= self.indexer.index_topk:
+            index_pooled = self.indexer.compressor(x, idx_cache, offset)
+            if index_pooled.shape[1] != pooled.shape[1]:
+                raise RuntimeError(
+                    "DeepSeek V4 attention/indexer pooling caches diverged"
+                )
+            topk = mx.broadcast_to(
+                mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+                (B, L, pooled.shape[1]),
+            )
+        else:
+            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
         sparse_mask = None
         if pmask is not None and topk is not None:
             sparse_mask = mx.take_along_axis(
@@ -1829,20 +1861,20 @@ class SparseCompressedAttention(nn.Module):
                     sinks=sinks,
                 )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pmask, full_kv.shape[2])
-            if self.dspark and B == 1 and L == 1:
-                out = exact_attention(q, [full_kv], self.scale, sinks)
-            else:
-                out = scaled_dot_product_attention(
-                    q,
-                    full_kv,
-                    full_kv,
-                    cache=local_cache,
-                    scale=self.scale,
-                    mask=mask,
-                    sinks=sinks,
-                )
+            out = _sparse_pooled_attention(
+                q,
+                kv,
+                pooled,
+                topk,
+                mask,
+                sparse_mask,
+                self.scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=self.compress_ratio,
+                local_window=self.config.sliding_window,
+                decode_consistent=self.dspark,
+            )
         else:
             out = _sparse_pooled_attention(
                 q,
