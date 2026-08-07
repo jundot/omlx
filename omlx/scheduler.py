@@ -6742,10 +6742,16 @@ class Scheduler:
                             }
                         )
                 elif hasattr(layer_cache, "cache"):
-                    # ArraysCache style: state stored in .cache list
+                    # ArraysCache style: state stored in .cache list. Keep
+                    # the FULL list — variable-length caches (e.g. Ling
+                    # 3.0 bailing_hybrid LinearAttention stores q/k/v/conv
+                    # states in slots 0..3) must round-trip every slot.
+                    # Trimming to (cache_list[0], cache_list[1]) rebuilds a
+                    # 2-slot cache whose cache[2]/cache[3] writes raise
+                    # IndexError on the next forward pass.
                     cache_list = layer_cache.cache
                     if isinstance(cache_list, list) and len(cache_list) >= 2:
-                        state = (cache_list[0], cache_list[1])
+                        state = tuple(cache_list)
                         meta = getattr(layer_cache, "meta_state", ())
                         extracted.append(
                             {

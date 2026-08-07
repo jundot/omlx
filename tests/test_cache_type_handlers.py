@@ -735,6 +735,32 @@ class TestArraysCacheHandler:
         """Test state keys."""
         assert handler._get_state_keys() == ("states",)
 
+    def test_reconstruct_cache_empty_states_returns_none(self, handler):
+        """Empty persisted state must not rebuild a degenerate 0-slot cache.
+
+        Regression: when a non-sliceable ArraysCache layer's snapshot was
+        skipped (placeholder-only blocks) or the cache was never updated,
+        reconstruct_cache built ``ArraysCache(size=0)`` and handed it to
+        the model. Fixed-slot models (Ling 3.0 bailing_hybrid reads/writes
+        slots 0..3) then crashed the forward pass with "not enough values
+        to unpack (expected 4, got 0)" or "list assignment index out of
+        range". Returning None lets the caller keep the model's fresh
+        cache.
+        """
+        assert handler.reconstruct_cache({"states": []}) is None
+
+    def test_reconstruct_cache_preserves_four_slots(self, handler):
+        """A 4-slot state round-trips all slots in order."""
+        import mlx.core as mx
+
+        states = [mx.full((1,), i) for i in range(4)]
+        restored = handler.reconstruct_cache({"states": states})
+
+        assert isinstance(restored, SizedArraysCache)
+        assert len(restored.state) == 4
+        for expected, actual in zip(states, restored.state):
+            assert mx.array_equal(expected, actual).item()
+
 
 class TestDefaultCacheHandler:
     """Tests for DefaultCacheHandler (fallback)."""

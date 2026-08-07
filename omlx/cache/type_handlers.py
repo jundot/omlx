@@ -848,6 +848,17 @@ class ArraysCacheHandler(CacheTypeHandler):
             return None
 
         states = state.get("states", [])
+        if not states:
+            # No state persisted for this layer — a non-sliceable cache
+            # whose snapshot was skipped (placeholder-only blocks) or a
+            # fresh never-updated cache. Returning a degenerate
+            # ArraysCache(size=0) hands the model an empty cache object
+            # whose first slot write or tuple-unpack crashes the forward
+            # pass (Ling 3.0 bailing_hybrid: "not enough values to
+            # unpack (expected 4, got 0)" / "list assignment index out
+            # of range"). Return None so the caller keeps the model's
+            # own fresh cache instead.
+            return None
         cache = ArraysCache(size=len(states))
         for i, s in enumerate(states):
             cache.cache[i] = s
