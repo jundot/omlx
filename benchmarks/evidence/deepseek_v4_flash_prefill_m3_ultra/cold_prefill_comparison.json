@@ -1,23 +1,115 @@
 {
-  "upstream_commit": "49ec271676ba9c14bbebb75da1912e3fcb5fb0f4",
-  "prompt_tokens": 17219,
+  "schema_version": 2,
+  "baseline_commit": "49ec271676ba9c14bbebb75da1912e3fcb5fb0f4",
+  "candidate_commit": "4d3d8e2fc78150778fddf331ff7d359acd0d8f85",
+  "candidate_patch_sha256": "c296094b893d261dd8989411f85c537f92ad45f4dd5d8d6002675ae93e380b03",
+  "model": {
+    "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
+  },
+  "prompt": {
+    "generator": "benchmarks/deepseek_v4_flash_prefill_repro.py",
+    "corpus": "omlx/admin/bench_corpora/code_python.txt",
+    "body_chars": 71000,
+    "prompt_chars": 71092,
+    "prompt_tokens": 17219,
+    "prompt_sha256": "a1465f4b5ee68dbd173c138dd65718bd06957439b66e99069e91f50364bf81f1",
+    "expected_output": "READY"
+  },
   "repetitions_per_side": 5,
   "baseline": {
+    "recorded_at": "2026-08-07T11:05:00.252955+00:00",
+    "runs": [
+      {
+        "repetition": 1,
+        "prefill_seconds": 36.96,
+        "prompt_tokens_per_second": 465.92,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 2,
+        "prefill_seconds": 35.97,
+        "prompt_tokens_per_second": 478.67,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 3,
+        "prefill_seconds": 35.96,
+        "prompt_tokens_per_second": 478.8,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 4,
+        "prefill_seconds": 35.98,
+        "prompt_tokens_per_second": 478.62,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 5,
+        "prefill_seconds": 35.97,
+        "prompt_tokens_per_second": 478.74,
+        "cached_tokens": 0,
+        "correct": true
+      }
+    ],
     "prefill_seconds_median": 35.97,
     "prompt_tokens_per_second_median": 478.67,
     "all_cold": true,
     "all_correct": true
   },
   "candidate": {
+    "recorded_at": "2026-08-07T11:08:13.518106+00:00",
+    "runs": [
+      {
+        "repetition": 1,
+        "prefill_seconds": 31.94,
+        "prompt_tokens_per_second": 539.02,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 2,
+        "prefill_seconds": 30.83,
+        "prompt_tokens_per_second": 558.47,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 3,
+        "prefill_seconds": 30.86,
+        "prompt_tokens_per_second": 557.92,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 4,
+        "prefill_seconds": 30.88,
+        "prompt_tokens_per_second": 557.52,
+        "cached_tokens": 0,
+        "correct": true
+      },
+      {
+        "repetition": 5,
+        "prefill_seconds": 30.87,
+        "prompt_tokens_per_second": 557.81,
+        "cached_tokens": 0,
+        "correct": true
+      }
+    ],
     "prefill_seconds_median": 30.87,
     "prompt_tokens_per_second_median": 557.81,
     "all_cold": true,
     "all_correct": true
   },
   "change": {
-    "prefill_seconds_saved": 5.10,
+    "prefill_seconds_saved": 5.1,
     "prefill_time_reduction_percent": 14.17848206839032,
     "prompt_throughput_gain_percent": 16.533311049365935,
     "speedup": 1.1653331104936593
-  }
+  },
+  "provenance_note": "The measured candidate is the pre-low-bit-hardening patch. The final draft keeps the same four-bit fast paths and adds sub-four-bit fallbacks."
 }

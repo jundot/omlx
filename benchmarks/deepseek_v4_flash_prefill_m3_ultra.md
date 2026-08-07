@@ -4,12 +4,15 @@ Validated: 2026-08-07
 
 Baseline: `49ec271676ba9c14bbebb75da1912e3fcb5fb0f4`
 
+Measured candidate: `4d3d8e2fc78150778fddf331ff7d359acd0d8f85`
+
 Machine: Mac Studio, M3 Ultra, 512 GB unified memory
-Model: DeepSeek V4 Flash 0731, official native mixed FP4/FP8 weights
+Model: `deepseek-ai/DeepSeek-V4-Flash-0731` at revision
+`7872f01b1d1fe23eabc4c98b48bffcef5a386062`
 
 ## Result
 
-This branch is an M3 Ultra draft candidate. It improves the controlled
+The measured candidate is an M3 Ultra draft. It improves the controlled
 17,219-token cold-prefill workload by 14.18% with no measured aggregate
 accuracy loss in the recorded evaluation.
 
@@ -120,65 +123,105 @@ regression locally. The PR remains a draft for cross-chip review.
 
 ## Reproduction
 
-Build each revision with the native kernels and verify that the extension is
-active:
+The headline performance comparison is between baseline `49ec2716` and
+candidate `4d3d8e2f`. The latter has patch SHA-256
+`c296094b893d261dd8989411f85c537f92ad45f4dd5d8d6002675ae93e380b03`.
+The PR's later commits add low-bit numerical hardening; the four-bit fast paths
+measured here are unchanged.
+
+First verify that the bundled corpus regenerates the exact recorded prompt:
 
 ```bash
-git checkout 49ec271676ba9c14bbebb75da1912e3fcb5fb0f4  # baseline
-OMLX_WITH_CUSTOM_KERNEL=1 python -m pip install -e .
-python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
-
-git checkout agent/deepseek-v4-prefill-m3-ultra             # candidate
-OMLX_WITH_CUSTOM_KERNEL=1 python -m pip install -e .
-python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+python benchmarks/deepseek_v4_flash_prefill_repro.py --verify-prompt
 ```
 
-For each revision, start a cache-disabled server with a fresh state directory.
-`MODEL_PARENT` must contain the `DeepSeek-V4-Flash-0731` model directory.
+This must report 71,092 characters and SHA-256
+`a1465f4b5ee68dbd173c138dd65718bd06957439b66e99069e91f50364bf81f1`.
+The runner also requires exactly 17,219 API prompt tokens, zero cached tokens,
+and the exact response `READY` on every timed request.
+
+Run the baseline and candidate sequentially; do not keep both large models
+loaded at once. From a checkout of the PR head, create two worktrees so the
+reproduction runner remains available while either measured revision is
+installed:
 
 ```bash
-omlx serve \
+git worktree add /tmp/omlx-prefill-base-49ec2716 \
+  49ec271676ba9c14bbebb75da1912e3fcb5fb0f4
+git worktree add /tmp/omlx-prefill-candidate-4d3d8e2f \
+  4d3d8e2fc78150778fddf331ff7d359acd0d8f85
+
+python3 -m venv /tmp/omlx-prefill-base-49ec2716/.venv
+env OMLX_WITH_CUSTOM_KERNEL=1 \
+  /tmp/omlx-prefill-base-49ec2716/.venv/bin/python -m pip install \
+  -e /tmp/omlx-prefill-base-49ec2716
+
+python3 -m venv /tmp/omlx-prefill-candidate-4d3d8e2f/.venv
+env OMLX_WITH_CUSTOM_KERNEL=1 \
+  /tmp/omlx-prefill-candidate-4d3d8e2f/.venv/bin/python -m pip install \
+  -e /tmp/omlx-prefill-candidate-4d3d8e2f
+```
+
+Verify both native extensions before running the model:
+
+```bash
+/tmp/omlx-prefill-base-49ec2716/.venv/bin/python -c \
+  "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+/tmp/omlx-prefill-candidate-4d3d8e2f/.venv/bin/python -c \
+  "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+```
+
+`MODEL_PARENT` must contain `DeepSeek-V4-Flash-0731` at the model revision
+recorded above. Start the baseline server in one terminal with a fresh state
+directory:
+
+```bash
+BASE_STATE=$(mktemp -d /tmp/omlx-prefill-base-state-XXXXXX)
+/tmp/omlx-prefill-base-49ec2716/.venv/bin/omlx serve \
   --model-dir "$MODEL_PARENT" \
-  --base-path "$RUN_STATE" \
+  --base-path "$BASE_STATE" \
   --no-cache \
   --memory-guard balanced \
   --port 8000
 ```
 
-The headline comparison used five cold requests per revision. The request body
-was 71,092 characters, tokenized to exactly 17,219 API prompt tokens, had
-SHA-256 `a1465f4b5ee68dbd173c138dd65718bd06957439b66e99069e91f50364bf81f1`,
-used temperature 0 and `max_tokens=8`, and asserted the exact response
-`READY`. Send the same saved prompt with:
+With the baseline server running, open another terminal in the PR checkout and
+record all five cold requests and the exact source revision:
 
 ```bash
-jq -n --rawfile prompt "$PROMPT_FILE" '{
-  model: "DeepSeek-V4-Flash-0731",
-  messages: [{role: "user", content: $prompt}],
-  temperature: 0,
-  max_tokens: 8,
-  stream: false
-}' > /tmp/deepseek-v4-prefill-request.json
-
-curl --fail-with-body --silent --show-error \
-  http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  --data-binary @/tmp/deepseek-v4-prefill-request.json
+python benchmarks/deepseek_v4_flash_prefill_repro.py \
+  --endpoint http://127.0.0.1:8000 \
+  --revision 49ec271676ba9c14bbebb75da1912e3fcb5fb0f4 \
+  --output /tmp/deepseek-v4-baseline.json
 ```
 
-The bundled admin benchmark provides a self-contained nearby reproduction with
-the repository's `code_python` corpus (16,384 prompt tokens rather than the
-17,219-token headline input):
+Stop the baseline server. After it exits, start the candidate with a new state
+directory and then record the candidate side:
 
 ```bash
-curl --fail-with-body --silent --show-error \
-  http://127.0.0.1:8000/admin/api/bench/start \
-  -H 'Content-Type: application/json' \
-  --data '{"model_id":"DeepSeek-V4-Flash-0731","prompt_lengths":[16384],"generation_length":8,"context_profile":"code_python"}'
-
-curl --no-buffer \
-  http://127.0.0.1:8000/admin/api/bench/"$BENCH_ID"/stream
+CANDIDATE_STATE=$(mktemp -d /tmp/omlx-prefill-candidate-state-XXXXXX)
+/tmp/omlx-prefill-candidate-4d3d8e2f/.venv/bin/omlx serve \
+  --model-dir "$MODEL_PARENT" \
+  --base-path "$CANDIDATE_STATE" \
+  --no-cache \
+  --memory-guard balanced \
+  --port 8000
 ```
+
+```bash
+python benchmarks/deepseek_v4_flash_prefill_repro.py \
+  --endpoint http://127.0.0.1:8000 \
+  --revision 4d3d8e2fc78150778fddf331ff7d359acd0d8f85 \
+  --baseline /tmp/deepseek-v4-baseline.json \
+  --output /tmp/deepseek-v4-candidate.json
+```
+
+The candidate command validates that the model, host, prompt, request controls,
+and repetition counts match before calculating the comparison. The two run
+files contain every measurement and their respective source SHAs, and the
+candidate file contains the comparison.
+The normalized historical measurements are also recorded in
+`benchmarks/evidence/deepseek_v4_flash_prefill_m3_ultra/cold_prefill_comparison.json`.
 
 The maintainer's low-bit regression uses the non-MTP oQ2.5e checkpoint at
 revision `5c8b6811550e8ef0c02c006a3fdfc4e724ffec1c`, server prefix caching
