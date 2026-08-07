@@ -21,6 +21,12 @@ enum AdminAPI {
     static let hotCacheClear   = "\(prefix)/hot-cache/clear"
     static let logs            = "\(prefix)/logs"
 
+    static let codexInterceptorStatus = "\(prefix)/codex-interceptor/status"
+    static let codexInterceptorDoctor = "\(prefix)/codex-interceptor/doctor"
+    static let codexInterceptorStart  = "\(prefix)/codex-interceptor/start"
+    static let codexInterceptorStop   = "\(prefix)/codex-interceptor/stop"
+    static let codexInterceptorSwitch = "\(prefix)/codex-interceptor/switch-model"
+
     static let models          = "\(prefix)/models"
     static func loadModel(_ id: String) -> String   { "\(models)/\(id)/load" }
     static func unloadModel(_ id: String) -> String { "\(models)/\(id)/unload" }

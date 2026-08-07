@@ -22,6 +22,7 @@ struct IntegrationsScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             ClaudeCodeSection(vm: vm, client: services.client)
             ClaudeSetupCommandSection(vm: vm)
+            CodexInterceptorSection(vm: vm, client: services.client)
             OtherIntegrationsSection(vm: vm, client: services.client)
             MCPSection(vm: vm, client: services.client)
 
@@ -34,6 +35,300 @@ struct IntegrationsScreen: View {
             }
         }
         .task { await vm.load(client: services.client) }
+        .task { await vm.monitorCodex(client: services.client) }
+    }
+}
+
+// MARK: - Codex local interceptor
+
+private struct CodexInterceptorSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        SectionHeader(
+            "Codex Local Interceptor",
+            subtitle: "Use a local model without replacing Codex configuration or losing native features"
+        ) {
+            StatusPill(status: pillStatus)
+        }
+
+        ListGroup {
+            Row(
+                label: vm.codexStatus?.running == true ? "Next local model" : "Local model",
+                sublabel: "Only the local Codex slot uses this model; Codex model-picker changes to other slots stay on OpenAI"
+            ) {
+                Popup(
+                    selection: vm.bind($vm.codexModel, save: {
+                        Task { await vm.save(.codexModel, client: client) }
+                    }),
+                    width: 260,
+                    options: vm.codexModelOptions
+                )
+                .disabled(vm.codexBusy)
+            }
+
+            if let status = vm.codexStatus, status.running {
+                Row(
+                    label: "Active local model",
+                    sublabel: activeModelDescription(status)
+                ) {
+                    HStack(spacing: 8) {
+                        Text(vm.activeCodexModel ?? "Waiting for route")
+                            .font(.omlxMono(11.5))
+                            .foregroundStyle(theme.text)
+                            .lineLimit(1)
+                        Text(activeModelBadge(status))
+                            .font(.omlxText(8.5, weight: .bold))
+                            .foregroundStyle(
+                                status.activeModelLoaded == false
+                                    ? theme.warningText : theme.successText
+                            )
+                    }
+                }
+            }
+
+            Row(
+                label: "Project folder",
+                sublabel: "The fresh Codex window opens directly in this workspace"
+            ) {
+                HStack(spacing: 8) {
+                    TextInput(text: $vm.codexProject, mono: true, width: 300)
+                        .disabled(vm.codexStatus?.running == true || vm.codexBusy)
+                    Button {
+                        chooseProject()
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .buttonStyle(.omlx(.normal))
+                    .disabled(vm.codexStatus?.running == true || vm.codexBusy)
+                    .help("Choose project folder")
+                }
+            }
+
+            Row(
+                label: "Codex configuration",
+                sublabel: vm.codexStatus?.configPath ?? vm.codexDoctor?.configPath
+            ) {
+                HStack(spacing: 7) {
+                    Image(systemName: vm.codexStatus?.configModified == true
+                          ? "exclamationmark.triangle.fill" : "checkmark.shield.fill")
+                        .foregroundStyle(vm.codexStatus?.configModified == true
+                                         ? theme.warningText : theme.successText)
+                    Text(vm.codexStatus?.configModified == true
+                         ? "Changed outside this session" : "Never modified by oMLX")
+                        .font(.omlxText(11.5, weight: .medium))
+                        .foregroundStyle(theme.textSecondary)
+                }
+            }
+
+            if let status = vm.codexStatus, status.running {
+                Row(label: "Traffic", sublabel: routeDescription(status), isLast: true) {
+                    HStack(spacing: 18) {
+                        metric("LOCAL", status.localRequests)
+                        metric("CLOUD", status.cloudRequests)
+                        metric("DONE", status.completedRequests)
+                        if status.failedRequests > 0 {
+                            metric("FAILED", status.failedRequests)
+                        }
+                        if let ttft = status.latestMetrics.firstVisibleMs {
+                            metric("VISIBLE", "\(Int(ttft.rounded())) ms")
+                        }
+                        if let speed = status.latestMetrics.tokensPerSecond {
+                            metric("SPEED", String(format: "%.1f tok/s", speed))
+                        }
+                    }
+                }
+            }
+        }
+
+        if let doctor = vm.codexDoctor, !doctor.ready {
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text(prerequisiteMessage(doctor))
+            }
+            .font(.omlxText(11.5))
+            .foregroundStyle(theme.warningText)
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+        }
+
+        if let error = vm.codexStatus?.error ?? vm.codexStatus?.modelSwitchError,
+           !error.isEmpty {
+            HStack(spacing: 7) {
+                Image(systemName: "xmark.octagon.fill")
+                Text(error)
+            }
+            .font(.omlxText(11.5))
+            .foregroundStyle(.red)
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+        }
+
+        HStack(spacing: 8) {
+            if vm.codexStatus?.running == true {
+                if vm.canSwitchCodexModel {
+                    Button("Use for Next Turn") {
+                        Task { await vm.switchCodexModel(client: client) }
+                    }
+                    .buttonStyle(.omlx(.primary))
+                    .disabled(vm.codexBusy)
+                } else if vm.codexStatus?.modelSwitchLoading == true {
+                    Button("Loading Model…") {}
+                        .buttonStyle(.omlx(.normal))
+                        .disabled(true)
+                } else if vm.codexStatus?.pendingModel != nil {
+                    Button("Switch Queued") {}
+                        .buttonStyle(.omlx(.normal))
+                        .disabled(true)
+                }
+
+                Button("Restart") {
+                    Task {
+                        await vm.stopCodex(client: client)
+                        await vm.startCodex(client: client)
+                    }
+                }
+                .buttonStyle(.omlx(.normal))
+                .disabled(vm.codexBusy)
+
+                Button("Stop Interceptor") {
+                    Task { await vm.stopCodex(client: client) }
+                }
+                .buttonStyle(.omlx(.destructive))
+                .disabled(vm.codexBusy)
+            } else {
+                Button(vm.codexNeedsRestart ? "Quit Codex & Start" : "Start Interceptor") {
+                    Task { await vm.startCodex(
+                        client: client,
+                        replaceExisting: vm.codexNeedsRestart
+                    ) }
+                }
+                .buttonStyle(.omlx(.primary))
+                .disabled(!vm.canStartCodex)
+            }
+            if vm.codexBusy {
+                ProgressView().controlSize(.small)
+            }
+            Spacer()
+            if let path = vm.codexStatus?.diagnosticsPath, vm.codexStatus?.running == true {
+                Text(path)
+                    .font(.omlxMono(9.5))
+                    .foregroundStyle(theme.textTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(path)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+    }
+
+    private var pillStatus: StatusPill.Status {
+        switch vm.codexStatus?.phase {
+        case "running": return .running
+        case "starting": return .starting
+        case "stopping": return .stopping
+        case "error": return .error
+        default: return .stopped
+        }
+    }
+
+    private func metric(_ label: String, _ value: Int) -> some View {
+        metric(label, String(value))
+    }
+
+    private func metric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text(label)
+                .font(.omlxText(8.5, weight: .semibold))
+                .foregroundStyle(theme.textTertiary)
+            Text(value)
+                .font(.omlxMono(11.5))
+                .foregroundStyle(theme.text)
+        }
+    }
+
+    private func routeDescription(_ status: CodexInterceptorStatusDTO) -> String {
+        if status.modelSwitchLoading == true, let warming = status.warmupModel {
+            return "Loading " + warming + "; local traffic stays on "
+                + (vm.activeCodexModel ?? "the active model") + " until it is ready"
+        }
+        if let pending = status.pendingModel {
+            if status.activeLocalRequests > 0 {
+                return "Finishing the current turn on \(vm.activeCodexModel ?? "the active model"), then switching to \(pending)"
+            }
+            return "\(pending) is loaded and queued for the next local turn"
+        }
+        if status.activeLocalRequests > 0 {
+            return "Local inference active · \(vm.activeCodexModel ?? "selected model")"
+        }
+        if status.modelSwitchError != nil {
+            return "Switch failed; local traffic remains on "
+                + (vm.activeCodexModel ?? "the active model")
+        }
+        if status.warmupStatus == "loading" {
+            return "Loading \(status.model ?? "selected model") in the background"
+        }
+        if status.warmupStatus == "failed" {
+            return "Model warm-up failed; the first request will retry loading"
+        }
+        switch status.lastRoute {
+        case "local":
+            let model = status.lastEffectiveModel ?? vm.activeCodexModel ?? "selected model"
+            return "Last request routed locally · " + model
+        case "cloud":
+            let model = status.lastEffectiveModel
+                ?? status.lastRequestedModel
+                ?? "cloud model"
+            return "Last request passed through to OpenAI · " + model
+        default: return "Waiting for Codex inference traffic"
+        }
+    }
+
+    private func activeModelDescription(_ status: CodexInterceptorStatusDTO) -> String {
+        var parts: [String] = []
+        if let context = status.activeContextWindow {
+            parts.append("\(context.formatted()) token advertised context")
+        }
+        if status.activeLocalRequests > 0 {
+            parts.append("serving now")
+        } else if status.activeModelLoading == true {
+            parts.append("loading")
+        } else if status.activeModelLoaded == true {
+            parts.append("resident in memory")
+        } else if status.activeModelLoaded == false {
+            parts.append("loads on the next local turn")
+        } else {
+            parts.append("used for the next local turn")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func activeModelBadge(_ status: CodexInterceptorStatusDTO) -> String {
+        if status.activeLocalRequests > 0 { return "SERVING" }
+        if status.activeModelLoading == true { return "LOADING" }
+        if status.activeModelLoaded == true { return "LOADED" }
+        if status.activeModelLoaded == false { return "ON DEMAND" }
+        return "ACTIVE"
+    }
+
+    private func prerequisiteMessage(_ doctor: CodexInterceptorDoctorDTO) -> String {
+        if !doctor.codexAppInstalled { return "Install the Codex desktop app to continue." }
+        if !doctor.mitmproxyAvailable { return "The bundled interceptor dependency is unavailable." }
+        return "Codex interceptor prerequisites are incomplete."
+    }
+
+    private func chooseProject() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: vm.codexProject)
+        if panel.runModal() == .OK, let url = panel.url {
+            vm.setCodexProject(url.path)
+        }
     }
 }
 
@@ -287,23 +582,6 @@ private struct OtherIntegrationsSection: View {
         )
 
         ListGroup {
-            IntegrationRow(
-                name: String(localized: "integrations.tool.codex",
-                             defaultValue: "Codex",
-                             comment: "Display name for the Codex integration"),
-                modelBinding: vm.bind($vm.codexModel, save: {
-                    Task { await vm.save(.codexModel, client: client) }
-                }),
-                modelOptions: vm.modelOptions,
-                command: vm.codexCommand,
-                commandLabel: String(localized: "integrations.codex.cli",
-                                     defaultValue: "CLI",
-                                     comment: "Label for the Codex CLI launcher command"),
-                secondaryCommand: vm.codexAppCommand,
-                secondaryCommandLabel: String(localized: "integrations.codex.app",
-                                             defaultValue: "Desktop App",
-                                             comment: "Label for the Codex desktop app launcher command")
-            )
             IntegrationRow(
                 name: String(localized: "integrations.tool.opencode",
                              defaultValue: "OpenCode",

@@ -480,6 +480,15 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    # A managed Codex process must never outlive the proxy environment it was
+    # launched with.  This is deliberately process-scoped and does not touch
+    # ~/.codex/config.toml.
+    try:
+        from .codex_interceptor import get_codex_interceptor_manager
+
+        await asyncio.to_thread(get_codex_interceptor_manager().stop)
+    except Exception as exc:  # pragma: no cover - best-effort shutdown safety
+        logger.warning("Failed to stop Codex interceptor cleanly: %s", exc)
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.

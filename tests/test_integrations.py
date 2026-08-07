@@ -84,165 +84,40 @@ class TestCodexIntegration:
         cmd = codex.get_command(ctx(port=8000, api_key="", model=""))
         assert "select-a-model" in cmd
 
-    def test_configure(self, tmp_path):
+    def test_configure_never_touches_codex_config(self, tmp_path):
         codex = CodexIntegration()
         config_path = tmp_path / "codex" / "config.toml"
+        config_path.parent.mkdir()
+        original = "features = { multi_agent = true }\n"
+        config_path.write_text(original)
         with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
             codex.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
 
-        assert config_path.exists()
-        content = config_path.read_text()
-        assert 'model = "qwen3.5"' in content
-        assert 'model_provider = "omlx"' in content
-        assert 'base_url = "http://127.0.0.1:8000/v1"' in content
-        assert 'env_key = "OMLX_API_KEY"' in content
-
-    def test_configure_custom_host(self, tmp_path):
-        codex = CodexIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(
-                ctx(port=9000, api_key="key", model="test", host="192.168.1.100")
-            )
-
-        content = config_path.read_text()
-        assert 'base_url = "http://192.168.1.100:9000/v1"' in content
-
-    def test_configure_creates_backup(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        config_path.write_text('model = "old"')
-
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="new"))
-
-        backups = list(tmp_path.glob("config.*.bak"))
-        assert len(backups) == 1
-        assert backups[0].read_text() == 'model = "old"'
+        assert config_path.read_text() == original
+        assert list(config_path.parent.glob("*.bak")) == []
 
     def test_type(self):
         codex = CodexIntegration()
-        assert codex.type == "config_file"
+        assert codex.type == "environment"
         assert codex.display_name == "Codex"
-
-    def test_configure_preserves_existing(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        existing = """\
-model = "old-model"
-other_key = "value"
-
-[model_providers.custom]
-name = "Custom"
-model = "should-not-override"
-
-[model_providers.omlx]
-name = "old-omlx"
-"""
-        config_path.write_text(existing)
-
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="new-model"))
-
-        content = config_path.read_text()
-        assert 'model = "new-model"' in content
-        assert 'model_provider = "omlx"' in content
-        assert 'other_key = "value"' in content
-        assert "[model_providers.custom]" in content
-        assert 'model = "should-not-override"' in content
-        assert "[model_providers.omlx]" in content
-        assert 'name = "oMLX"' in content
-        assert "old-omlx" not in content
-
-    def test_configure_reasoning_model(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="deepseek-r1-distill"))
-
-        content = config_path.read_text()
-        assert 'model_reasoning_effort = "high"' in content
-        assert 'model = "deepseek-r1-distill"' in content
-
-    def test_configure_non_reasoning_model(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="llama-3.1-8b"))
-
-        content = config_path.read_text()
-        assert "model_reasoning_effort" not in content
-
-    def test_configure_reasoning_true_overrides_slug(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, model="qwen3.6", reasoning=True))
-
-        content = config_path.read_text()
-        assert 'model_reasoning_effort = "high"' in content
-
-    def test_configure_reasoning_false_overrides_slug(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(
-                ctx(port=8000, model="deepseek-r1-distill", reasoning=False)
-            )
-
-        content = config_path.read_text()
-        assert "model_reasoning_effort" not in content
-
-    def test_configure_clears_stale_reasoning_flag(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        config_path.write_text(
-            'model = "old-thinking-model"\n'
-            'model_provider = "omlx"\n'
-            'model_reasoning_effort = "high"\n'
-        )
-
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="llama-3.1-8b"))
-
-        content = config_path.read_text()
-        assert 'model = "llama-3.1-8b"' in content
-        assert "model_reasoning_effort" not in content
 
     def test_launch_forwards_extra_args(self, tmp_path):
         codex = CodexIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
-        captured = {}
-
-        def fake_execvpe(binary, argv, env):
-            captured["argv"] = argv
-            captured["env"] = env
-
-        base_env = {
-            "PATH": "/usr/bin",
-            "PYTHONHOME": "/bundle/python",
-            "PYTHONPATH": "/bundle/lib",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-        with (
-            patch.object(CodexIntegration, "CONFIG_PATH", config_path),
-            patch("omlx.integrations.codex.os.environ", base_env),
-            patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
-        ):
-            codex.launch(
-                ctx(
-                    port=8000,
-                    api_key="key",
-                    model="qwen3.5",
-                    extra_args=("--yolo",),
+        with patch("omlx.integrations.codex.CodexInterceptorManager") as manager:
+            manager.return_value.run_cli.return_value = 7
+            with pytest.raises(SystemExit, match="7"):
+                codex.launch(
+                    ctx(
+                        port=8000,
+                        api_key="key",
+                        model="qwen3.5",
+                        extra_args=("--yolo",),
+                    )
                 )
-            )
-
-        assert captured["argv"] == ["codex", "-m", "qwen3.5", "--yolo"]
-        assert captured["env"]["OMLX_API_KEY"] == "key"
-        assert "PYTHONHOME" not in captured["env"]
-        assert "PYTHONPATH" not in captured["env"]
-        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+        config, args = manager.return_value.run_cli.call_args.args
+        assert config.upstream_url == "http://127.0.0.1:8000/v1/responses"
+        assert config.model == "qwen3.5"
+        assert args == ("--yolo",)
 
 
 def make_app_bundle(
@@ -269,58 +144,25 @@ class TestCodexAppIntegration:
         assert "omlx launch codex_app" in cmd
         assert "--model qwen3.5" in cmd
 
-    def test_configure(self, tmp_path):
+    def test_configure_never_touches_codex_config(self, tmp_path):
         codex_app = CodexAppIntegration()
         config_path = tmp_path / "codex" / "config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text("[features]\nmulti_agent = true\n")
         with patch.object(CodexAppIntegration, "CONFIG_PATH", config_path):
             codex_app.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
 
-        assert config_path.exists()
-        content = config_path.read_text()
-        assert 'model = "qwen3.5"' in content
-        assert 'model_provider = "omlx"' in content
-        assert 'base_url = "http://127.0.0.1:8000/v1"' in content
-        assert 'env_key = "OMLX_API_KEY"' in content
+        assert config_path.read_text() == "[features]\nmulti_agent = true\n"
 
     def test_launch_app(self, tmp_path):
         codex_app = CodexAppIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
-        captured = {}
-
-        def fake_execvpe(binary, argv, env):
-            captured["argv"] = argv
-            captured["env"] = env
-
-        base_env = {
-            "PATH": "/usr/bin",
-            "PYTHONHOME": "/bundle/python",
-            "PYTHONPATH": "/bundle/lib",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-        with (
-            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
-            patch("omlx.integrations.codex_app.os.environ", base_env),
-            patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
-            patch(
-                "omlx.integrations.codex_app.resolve_codex_binary",
-                return_value="/opt/homebrew/bin/codex",
-            ),
-        ):
-            codex_app.launch(
-                ctx(
-                    port=8000,
-                    api_key="key",
-                    model="qwen3.5",
-                    extra_args=(),
-                )
-            )
-
-        # Codex App should launch with "app" subcommand, not "-m <model>"
-        assert captured["argv"] == ["/opt/homebrew/bin/codex", "app"]
-        assert captured["env"]["OMLX_API_KEY"] == "key"
-        assert "PYTHONHOME" not in captured["env"]
-        assert "PYTHONPATH" not in captured["env"]
-        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+        with patch("omlx.integrations.codex_app.CodexInterceptorManager") as manager:
+            manager.return_value.run_desktop.return_value = 0
+            with pytest.raises(SystemExit, match="0"):
+                codex_app.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
+        config = manager.return_value.run_desktop.call_args.args[0]
+        assert config.launch_app is True
+        assert config.model == "qwen3.5"
 
     def test_is_installed_with_app_bundle_only(self, tmp_path):
         # DMG-only install: no codex CLI on PATH, old bundle folder name
@@ -358,30 +200,9 @@ class TestCodexAppIntegration:
         ):
             assert not CodexAppIntegration().is_installed()
 
-    def test_launch_falls_back_to_bundled_cli(self, tmp_path):
-        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
-        config_path = tmp_path / "codex" / "config.toml"
-        captured = {}
-
-        def fake_execvpe(binary, argv, env):
-            captured["binary"] = binary
-            captured["argv"] = argv
-
-        with (
-            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
-            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
-            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
-            patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
-        ):
-            CodexAppIntegration().launch(ctx(port=8000, api_key="key", model="q"))
-
-        bundled = str(bundle / "Contents" / "Resources" / "codex")
-        assert captured["binary"] == bundled
-        assert captured["argv"] == [bundled, "app"]
-
     def test_type(self):
         codex_app = CodexAppIntegration()
-        assert codex_app.type == "config_file"
+        assert codex_app.type == "environment"
         assert codex_app.display_name == "Codex App"
         assert codex_app.name == "codex_app"
 
