@@ -1806,7 +1806,18 @@ class SparseCompressedAttention(nn.Module):
 
         pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
-        topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+        if 0 < pooled.shape[1] <= self.indexer.index_topk:
+            index_pooled = self.indexer.compressor(x, idx_cache, offset)
+            if index_pooled.shape[1] != pooled.shape[1]:
+                raise RuntimeError(
+                    "DeepSeek V4 attention/indexer pooling caches diverged"
+                )
+            topk = mx.broadcast_to(
+                mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+                (B, L, pooled.shape[1]),
+            )
+        else:
+            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
         sparse_mask = None
         if pmask is not None and topk is not None:
             sparse_mask = mx.take_along_axis(

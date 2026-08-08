@@ -1591,6 +1591,92 @@ class TestNaxMoEStockRouting:
         assert gated == linear._native_block_kind(decode_x, True)
 
 
+class TestSparseCompressedAttentionIndexerSkip:
+    @staticmethod
+    def _config(dsv4):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[4],
+        )
+
+    def test_all_pooled_skips_scoring_and_preserves_indexer_cache(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.SparseCompressedAttention(self._config(dsv4), 0)
+        x = mx.random.normal((1, 10, 16), dtype=mx.bfloat16)
+
+        # The current full indexer is the reference for both selected rows and
+        # every public part of its compressor cache after a non-aligned chunk.
+        reference_cache = PoolingCache(4)
+        q_residual = layer.q_norm(layer.wq_a(x))
+        reference_topk = layer.indexer(
+            x,
+            q_residual,
+            layer.rope,
+            reference_cache,
+            0,
+        )
+        mx.eval(reference_topk, *(v for v in reference_cache.state if v is not None))
+        assert reference_topk.tolist() == [[[0, 1]] * 10]
+
+        original_compressor_call = dsv4.Compressor.__call__
+        indexer_compressor_calls = 0
+
+        def compressor_spy(compressor, *args, **kwargs):
+            nonlocal indexer_compressor_calls
+            if compressor is layer.indexer.compressor:
+                indexer_compressor_calls += 1
+            return original_compressor_call(compressor, *args, **kwargs)
+
+        def fail_full_indexer(*args, **kwargs):
+            raise AssertionError("all-pooled attention must skip indexer scoring")
+
+        monkeypatch.setattr(dsv4.Compressor, "__call__", compressor_spy)
+        monkeypatch.setattr(dsv4.Indexer, "__call__", fail_full_indexer)
+
+        comp_cache = PoolingCache(4)
+        index_cache = PoolingCache(4)
+        cache = CacheList(
+            RotatingKVCache(max_size=128),
+            comp_cache,
+            index_cache,
+        )
+        output = layer(x, cache=cache)
+        mx.eval(output, *(v for v in index_cache.state if v is not None))
+
+        assert output.shape == (1, 10, 16)
+        assert indexer_compressor_calls == 1
+        assert comp_cache.offset == index_cache.offset == reference_cache.offset == 2
+        assert index_cache.remainder == reference_cache.remainder == 2
+        for actual, expected in zip(index_cache.state, reference_cache.state):
+            assert (actual is None) == (expected is None)
+            if actual is not None:
+                assert mx.array_equal(actual, expected).item()
+
+
 class TestIndexerFallbackTiling:
     """The MLX indexer fallback (used when the native glm_moe_dsa kernel is
     not built) tiles the pooled axis so its (B, heads, L, P) intermediate
