@@ -652,8 +652,8 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
     from omlx.patches.deepseek_v4.switch_layers import (
+        _block_config,
         _build_mxfp4_blocks,
-        _mxfp4_block_config,
     )
 
     mx.random.seed(11)
@@ -662,7 +662,7 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
         sorted((i * 7) % experts for i in range(routes)),
         dtype=mx.int32,
     )
-    block_bm, block_variant = _mxfp4_block_config(indices.size)
+    block_bm, block_variant = _block_config(indices.size, "affine")
     block_meta, block_count = _build_mxfp4_blocks(indices, experts, block_bm)
 
     for dtype in (mx.bfloat16, mx.float16):
@@ -745,6 +745,33 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
             assert float(mx.max(mx.abs(y_ref - y_native)).item()) == 0.0
             assert float(mx.max(mx.abs(y_ref - y0_pair)).item()) == 0.0
             assert float(mx.max(mx.abs(y1_ref - y1_pair)).item()) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("mxfp4_threshold", "native_kind", "num_routes", "expected"),
+    [
+        (16384, "mxfp4", 8192, (16, 1)),
+        (16384, "mxfp4", 16383, (16, 1)),
+        (16384, "mxfp4", 16384, (32, 2)),
+        (8192, "mxfp4", 8192, (32, 2)),
+        (16384, "affine", 8191, (16, 1)),
+        (16384, "affine", 8192, (32, 2)),
+    ],
+)
+def test_deepseek_block_thresholds_are_scoped_by_native_kind(
+    monkeypatch, mxfp4_threshold, native_kind, num_routes, expected
+):
+    pytest.importorskip("mlx.core")
+
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    monkeypatch.setattr(
+        switch_layers,
+        "_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES",
+        mxfp4_threshold,
+    )
+
+    assert switch_layers._block_config(num_routes, native_kind) == expected
 
 
 def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
