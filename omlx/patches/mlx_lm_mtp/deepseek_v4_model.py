@@ -167,7 +167,8 @@ def _register_mtp_block(dsv4: Any) -> None:
             h_norm = self.hnorm(h)
             x = self.e_proj(e)[:, :, None, :] + self.h_proj(h_norm)
             x = mx.contiguous(x)
-            x = self.block(x, mask, cache, input_ids)
+            # MTP masks are created by the patched model from this cache/window.
+            x = self.block(x, mask, cache, input_ids, _standard_mask=True)
             return x
 
     dsv4.MTPBlock = MTPBlock
@@ -230,7 +231,7 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
         for layer_idx, (layer, layer_cache) in enumerate(
             zip(self.pipeline_layers, cache)
         ):
-            h = layer(h, mask, layer_cache, inputs)
+            h = layer(h, mask, layer_cache, inputs, _standard_mask=True)
             if return_dspark_hidden and layer_idx in target_id_set:
                 dspark_hidden[layer_idx] = h.mean(axis=2)
 

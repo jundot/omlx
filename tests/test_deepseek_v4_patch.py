@@ -119,6 +119,43 @@ class TestUtilsPatch:
         assert "x" in loaded
         assert loaded["x"].shape == (4, 4)
 
+    def test_sub4_v4_disables_compressed_native_attention(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        assert (
+            _native_ratio128_attention_enabled(
+                {"model_type": "deepseek_v4", "quantization": {"bits": 2}}
+            )
+            is False
+        )
+        assert (
+            _native_ratio128_attention_enabled(
+                {
+                    "model_type": "deepseek_v4",
+                    "text_config": {"quantization_config": {"bits": 3.5}},
+                }
+            )
+            is False
+        )
+        assert (
+            _native_ratio128_attention_enabled(
+                {
+                    "model_type": "deepseek_v4",
+                    "quantization": {"bits": 4},
+                    "text_config": {"quantization_config": {"bits": 3.5}},
+                }
+            )
+            is False
+        )
+        assert (
+            _native_ratio128_attention_enabled(
+                {"model_type": "deepseek_v4", "quantization": {"bits": 4}}
+            )
+            is True
+        )
+
 
 class TestGeneratePatch:
     """mlx_lm.generate._make_cache replaced."""
@@ -1055,6 +1092,180 @@ class TestDeepseekV4SwitchGLU:
         mx.eval(y)
 
         assert y.shape == (1, 8, 8, 16)
+
+
+class TestDeepseekV4CompressedNativeAttention:
+    @staticmethod
+    def _attention_config(dsv4):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[128],
+        )
+
+    def test_ratio128_dispatch_and_reference_fallbacks(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.CompressedAttention(self._attention_config(dsv4), 0)
+        sparse_calls = []
+        dense_masks = []
+
+        def sparse_spy(q, local_kv, pooled, pooled_indices, *args, **kwargs):
+            sparse_calls.append((local_kv.shape, pooled.shape, pooled_indices))
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        def dense_spy(q, key, value, *args, **kwargs):
+            dense_masks.append(kwargs["mask"])
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
+        monkeypatch.setattr(dsv4, "scaled_dot_product_attention", dense_spy)
+
+        x = mx.random.normal((1, 129, 16), dtype=mx.bfloat16)
+        y = layer(x, _standard_mask=True)
+        mx.eval(y, sparse_calls[0][2])
+
+        assert y.shape == (1, 129, 16)
+        assert sparse_calls[0][0] == (1, 1, 129, 8)
+        assert sparse_calls[0][1] == (1, 1, 8)
+        assert sparse_calls[0][2].tolist() == [[[0]] * 129]
+        assert dense_masks == []
+
+        monkeypatch.setattr(
+            dsv4.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: mx.zeros(
+                (x.shape[0], 1, self.head_dim), dtype=x.dtype
+            ),
+        )
+        layer(x[:, :1], _standard_mask=True)
+        assert len(sparse_calls) == 1
+        assert len(dense_masks) == 1
+
+        custom_mask = mx.tri(129, 129, dtype=mx.bool_)[None, None]
+        layer(x, mask=custom_mask)
+        assert len(sparse_calls) == 1
+        assert dense_masks[-1].shape == (1, 1, 129, 130)
+
+        low_bit_config = self._attention_config(dsv4)
+        low_bit_config.use_native_ratio128_attention = False
+        low_bit_layer = dsv4.CompressedAttention(low_bit_config, 0)
+        low_bit_layer(x, _standard_mask=True)
+        assert len(sparse_calls) == 1
+        assert len(dense_masks) == 3
+
+    @pytest.mark.parametrize(
+        ("dtype_name", "max_tolerance"),
+        (("float16", 0.004), ("bfloat16", 0.032)),
+    )
+    def test_ratio128_native_attention_matches_causal_reference(
+        self, applied_patch, dtype_name, max_tolerance
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        mx.random.seed(41)
+        dtype = getattr(mx, dtype_name)
+        offset, length, local_window, compress_ratio = 255, 17, 128, 128
+        local_start = max(0, offset - local_window)
+        local_length = offset - local_start + length
+        pooled_length = (offset + length) // compress_ratio
+        q = mx.random.normal((1, 64, length, 512), dtype=dtype)
+        local_kv = mx.random.normal((1, 1, local_length, 512), dtype=dtype)
+        pooled = mx.random.normal((1, pooled_length, 512), dtype=dtype)
+        topk = mx.broadcast_to(
+            mx.arange(pooled_length, dtype=mx.uint32)[None, None],
+            (1, length, pooled_length),
+        )
+        sinks = mx.random.normal((64,), dtype=dtype)
+        query_rows = mx.arange(length)[:, None]
+        local_positions = mx.arange(local_length)[None]
+        local_end = local_length - length + query_rows + 1
+        local_start_rows = mx.maximum(0, local_end - local_window)
+        pooled_positions = (mx.arange(pooled_length)[None] + 1) * compress_ratio - 1
+        local_mask = (local_positions >= local_start_rows) & (
+            local_positions < local_end
+        )
+        pooled_mask = pooled_positions <= offset + query_rows
+        scale = 512**-0.5
+        native_available = fast.has_symbol("deepseek_v4_sparse_attention")
+
+        previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+        try:
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
+            actual = dsv4._sparse_pooled_attention(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                local_mask,
+                pooled_mask,
+                scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=compress_ratio,
+                local_window=local_window,
+            )
+            mx.eval(actual)
+            if native_available:
+                assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
+
+            if native_available:
+                dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+                expected = dsv4._sparse_pooled_attention(
+                    q,
+                    local_kv,
+                    pooled,
+                    topk,
+                    local_mask,
+                    pooled_mask,
+                    scale,
+                    sinks,
+                )
+            else:
+                full_kv = mx.concatenate([local_kv, pooled[:, None]], axis=2)
+                full_mask = dsv4._extend_mask(local_mask, pooled_mask, full_kv.shape[2])
+                expected = dsv4.scaled_dot_product_attention(
+                    q,
+                    full_kv,
+                    full_kv,
+                    cache=None,
+                    scale=scale,
+                    mask=full_mask,
+                    sinks=sinks,
+                )
+            mx.eval(expected)
+        finally:
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = previous
+
+        max_abs = mx.max(
+            mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
+        )
+        assert mx.allclose(actual, expected, atol=0.02, rtol=0.02).item()
+        assert float(max_abs.item()) <= max_tolerance
 
 
 class TestPreLoadDispatch:
