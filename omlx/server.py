@@ -5741,6 +5741,7 @@ async def create_response(
         # Handle text.format (structured output)
         response_format = None
         compiled_grammar = None
+        response_format_warning = None
         if request.text and request.text.format:
             fmt = request.text.format
             if fmt.type == "json_object":
@@ -5770,6 +5771,11 @@ async def create_response(
                     reasoning_parser=reasoning_parser,
                 )
                 if compiled_grammar is None:
+                    # Non-strict formats still degrade to prompt injection, so
+                    # surface it to the caller with the same Warning response
+                    # header /v1/chat/completions uses; the log line alone only
+                    # ever reaches the operator (#1241).
+                    response_format_warning = _response_format_warning_header(rf)
                     json_instruction = build_json_system_prompt(rf)
                     if json_instruction:
                         messages = _inject_json_instruction(messages, json_instruction)
@@ -5909,6 +5915,9 @@ async def create_response(
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
+            sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+            if response_format_warning:
+                sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
                     _with_sse_keepalive(
@@ -5930,7 +5939,7 @@ async def create_response(
                     lease,
                 ),
                 media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                headers=sse_headers,
             )
 
         # Non-streaming with keepalive during prefill
@@ -6070,12 +6079,16 @@ async def create_response(
 
             return response_obj.model_dump_json()
 
+        json_headers = (
+            {"Warning": response_format_warning} if response_format_warning else None
+        )
         return StreamingResponse(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_responses_api()),
                 lease,
             ),
             media_type="application/json",
+            headers=json_headers,
         )
 
     except BaseException:
