@@ -13193,6 +13193,24 @@
         }
       }
     },
+    "server.host.ipv4_only" : {
+      "comment" : "Listen-address popup option for binding to IPv4 interfaces only",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "0.0.0.0 (IPv4 only)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "0.0.0.0 (только IPv4)"
+          }
+        }
+      }
+    },
     "server.host.local_only" : {
       "comment" : "Listen-address popup option for loopback only",
       "extractionState" : "manual",

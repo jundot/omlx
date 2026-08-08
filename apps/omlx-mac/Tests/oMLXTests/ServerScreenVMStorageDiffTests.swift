@@ -171,7 +171,7 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         XCTAssertEqual(diff.normalizedModelDir, "/Volumes/SSD/models")
     }
 
-    func testApplyConfigKeepsWildcardBindButUsesLoopbackEndpoint() {
+    func testApplyConfigKeepsIPv4WildcardButUsesLoopbackEndpoint() {
         let cfg = AppConfig(
             bindAddress: "0.0.0.0",
             port: 8080,
