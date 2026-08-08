@@ -2350,31 +2350,55 @@ class ToolCallStreamFilter:
             self._clear_pending_envelope()
             return ""
 
-        if self._suppressing_until is not None:
+        # An envelope still suppressing at EOF means the payload scan never
+        # confirmed where the value ends.  A literal close marker is then the
+        # best evidence available, so trust it rather than withholding to EOF:
+        # prose the model resumed after the envelope survives, as it did before
+        # the #2507 span scanning.  The LAST occurrence is the split point,
+        # since earlier ones can sit inside the truncated payload.
+        #
+        # Re-feeding the tail can re-enter suppression under a *different*
+        # marker pair, hence the loop.  It terminates because each pass cuts
+        # the text down to a strict suffix, and repeats at most once per
+        # distinct marker pair.
+        recovered = ""
+        while self._suppressing_until is not None:
+            marker = self._suppressing_until
             self._pending_envelope_parts.append(self._buffer)
             candidate = "".join(self._pending_envelope_parts)
             start_marker = self._pending_start_marker or "<unknown>"
             self._buffer = ""
             self._suppressing_until = None
             self._clear_pending_envelope()
-            if candidate:
-                self._recovery_candidate = candidate
-                logger.warning(
-                    "Unclosed tool-call envelope at end of stream; "
-                    "withheld %d characters are available for content recovery "
-                    "(start_marker=%.80r)",
-                    len(candidate),
-                    start_marker,
-                )
-            return ""
+
+            close_idx = (
+                -1
+                if marker == "__suppress_permanently__"
+                else candidate.rfind(marker)
+            )
+            if close_idx < 0:
+                if candidate:
+                    self._recovery_candidate = candidate
+                    logger.warning(
+                        "Unclosed tool-call envelope at end of stream; "
+                        "withheld %d characters are available for content "
+                        "recovery (start_marker=%.80r)",
+                        len(candidate),
+                        start_marker,
+                    )
+                return recovered
+
+            recovered += self.feed(candidate[close_idx + len(marker) :])
+            if self._suppressing:
+                return recovered
 
         keep = self._partial_suffix_len(self._buffer)
         if keep >= len(self._buffer):
             tail = self._buffer
             self._buffer = ""
             if self._should_drop_tail_at_finish(tail):
-                return ""
-            return tail
+                return recovered
+            return recovered + tail
 
         if keep:
             buf = self._buffer[:-keep]
@@ -2387,7 +2411,7 @@ class ToolCallStreamFilter:
         for close in self._stray_close_markers:
             if close in buf:
                 buf = buf.replace(close, "")
-        return buf
+        return recovered + buf
 
 
 def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:

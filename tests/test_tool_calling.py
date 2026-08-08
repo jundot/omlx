@@ -1210,6 +1210,70 @@ def test_closed_paired_envelope_never_creates_recovery_candidate(
     assert "Unclosed tool-call envelope" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+@pytest.mark.parametrize("chunked", [False, True])
+def test_malformed_payload_keeps_prose_after_a_real_close_marker(
+    start_marker, end_marker, tokenizer, chunked
+):
+    """A payload that never parses must not swallow the prose after its close.
+
+    The payload scan cannot confirm where a malformed value ends, but the
+    literal close marker still bounds the envelope, so trailing text stays
+    visible instead of being withheld to EOF.
+    """
+    f = ToolCallStreamFilter(tokenizer)
+    text = "Before " + start_marker + '{"name":"f"' + end_marker + " After"
+
+    if chunked:
+        visible = "".join(f.feed(ch) for ch in text)
+    else:
+        visible = f.feed(text)
+    visible += f.finish()
+
+    assert visible == "Before  After"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_embedded_close_marker_still_bounds_the_envelope():
+    """The #2507 case must not regress: a marker inside JSON is not the close."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'Before <tool_call>{"name":"f","arguments":'
+        '{"x":"</tool_call>"}}</tool_call> After'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "Before  After"
+
+
+def test_payload_without_any_close_marker_is_still_withheld():
+    """No close marker at all means the envelope tail stays hidden."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    visible = f.feed('Before <tool_call>{"name":"f" After') + f.finish()
+
+    assert visible == "Before "
+    assert f.take_recovery_candidate() == '<tool_call>{"name":"f" After'
+
+
+def test_close_marker_fallback_rescans_the_recovered_tail():
+    """Prose recovered after a close marker is re-filtered, not emitted raw."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f"</tool_call> B '
+        "<|tool_call_start|>second<|tool_call_end|> C"
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
 def test_only_last_unclosed_envelope_becomes_recovery_candidate():
     """Completed earlier calls stay hidden when a later call is unterminated."""
     f = ToolCallStreamFilter(_make_tokenizer())
