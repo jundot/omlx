@@ -1166,6 +1166,8 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         layer = dsv4.CompressedAttention(self._attention_config(dsv4), 0)
         sparse_calls = []
@@ -1181,6 +1183,7 @@ class TestDeepseekV4CompressedNativeAttention:
 
         monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
         monkeypatch.setattr(dsv4, "scaled_dot_product_attention", dense_spy)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
 
         x = mx.random.normal((1, 129, 16), dtype=mx.bfloat16)
         y = layer(x, _standard_mask=True)
@@ -1192,6 +1195,17 @@ class TestDeepseekV4CompressedNativeAttention:
         assert sparse_calls[0][2].tolist() == [[[0]] * 129]
         assert dense_masks == []
 
+        monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+        layer(x, _standard_mask=True)
+        assert len(sparse_calls) == 1
+        assert len(dense_masks) == 1
+
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", lambda *a, **k: None)
+        layer(x, _standard_mask=True)
+        assert len(dense_masks) == 2
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
+
         monkeypatch.setattr(
             dsv4.Compressor,
             "__call__",
@@ -1201,7 +1215,7 @@ class TestDeepseekV4CompressedNativeAttention:
         )
         layer(x[:, :1], _standard_mask=True)
         assert len(sparse_calls) == 1
-        assert len(dense_masks) == 1
+        assert len(dense_masks) == 3
 
         custom_mask = mx.tri(129, 129, dtype=mx.bool_)[None, None]
         layer(x, mask=custom_mask)
@@ -1213,7 +1227,30 @@ class TestDeepseekV4CompressedNativeAttention:
         low_bit_layer = dsv4.CompressedAttention(low_bit_config, 0)
         low_bit_layer(x, _standard_mask=True)
         assert len(sparse_calls) == 1
-        assert len(dense_masks) == 3
+        assert len(dense_masks) == 5
+
+    def test_native_only_sparse_attention_rejects_unsupported_shape_without_gather(
+        self, applied_patch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        result = dsv4._sparse_pooled_attention(
+            mx.zeros((1, 2, 5, 8), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 5, 8), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 8), dtype=mx.bfloat16),
+            mx.zeros((1, 5, 1), dtype=mx.uint32),
+            None,
+            None,
+            8**-0.5,
+            mx.zeros((2,), dtype=mx.bfloat16),
+            q_offset=0,
+            compress_ratio=128,
+            local_window=128,
+            native_only=True,
+        )
+
+        assert result is None
 
     @pytest.mark.parametrize(
         ("dtype_name", "max_tolerance"),
@@ -1256,7 +1293,8 @@ class TestDeepseekV4CompressedNativeAttention:
         )
         pooled_mask = pooled_positions <= offset + query_rows
         scale = 512**-0.5
-        native_available = fast.has_symbol("deepseek_v4_sparse_attention")
+        if not fast.has_symbol("deepseek_v4_sparse_attention"):
+            pytest.skip("deepseek_v4_sparse_attention native kernel is unavailable")
 
         previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
         try:
@@ -1273,35 +1311,23 @@ class TestDeepseekV4CompressedNativeAttention:
                 q_offset=offset,
                 compress_ratio=compress_ratio,
                 local_window=local_window,
+                native_only=True,
             )
+            assert actual is not None
             mx.eval(actual)
-            if native_available:
-                assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
+            assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
 
-            if native_available:
-                dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
-                expected = dsv4._sparse_pooled_attention(
-                    q,
-                    local_kv,
-                    pooled,
-                    topk,
-                    local_mask,
-                    pooled_mask,
-                    scale,
-                    sinks,
-                )
-            else:
-                full_kv = mx.concatenate([local_kv, pooled[:, None]], axis=2)
-                full_mask = dsv4._extend_mask(local_mask, pooled_mask, full_kv.shape[2])
-                expected = dsv4.scaled_dot_product_attention(
-                    q,
-                    full_kv,
-                    full_kv,
-                    cache=None,
-                    scale=scale,
-                    mask=full_mask,
-                    sinks=sinks,
-                )
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+            expected = dsv4._sparse_pooled_attention(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                local_mask,
+                pooled_mask,
+                scale,
+                sinks,
+            )
             mx.eval(expected)
         finally:
             dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = previous

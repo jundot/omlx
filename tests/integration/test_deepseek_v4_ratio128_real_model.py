@@ -3,7 +3,8 @@
 
 These tests never download models. They load explicitly selected local
 checkpoints through oMLX's public text-model loader and execute a 257-token
-prefill so every ratio-128 layer has pooled KV rows to attend to.
+prefill plus a 17-token cached continuation so every ratio-128 layer exercises
+pooled KV masks at both zero and nonzero offsets.
 
 Run each checkpoint in its own process to keep the memory boundary explicit:
 
@@ -37,6 +38,7 @@ pytestmark = [
 ]
 
 _PREFILL_TOKENS = 257
+_CONTINUATION_TOKENS = 17
 
 
 def _configured_checkpoint(environment_variable: str, *, expect_sub4: bool) -> Path:
@@ -102,7 +104,8 @@ def test_real_checkpoint_prefill_selects_ratio128_attention_policy(
             "deepseek_v4_sparse_attention kernel."
         )
 
-    model = tokenizer = logits = last_logits = None
+    model = tokenizer = cache = logits = last_logits = None
+    continuation_logits = continuation_last_logits = None
     try:
         model, tokenizer = load_text_model(str(model_path))
         assert model.args.use_native_ratio128_attention is expect_native
@@ -156,22 +159,33 @@ def test_real_checkpoint_prefill_selects_ratio128_attention_policy(
             False,
         )
 
+        cache = model.make_cache()
         input_ids = mx.arange(_PREFILL_TOKENS, dtype=mx.int32)[None]
-        logits = model(input_ids)
+        logits = model(input_ids, cache=cache)
         last_logits = logits[:, -1]
-        mx.eval(last_logits)
+        continuation_ids = mx.arange(
+            _PREFILL_TOKENS,
+            _PREFILL_TOKENS + _CONTINUATION_TOKENS,
+            dtype=mx.int32,
+        )[None]
+        continuation_logits = model(continuation_ids, cache=cache)
+        continuation_last_logits = continuation_logits[:, -1]
+        mx.eval(last_logits, continuation_last_logits)
 
         ratio128_layers = sum(ratio == 128 for ratio in model.args.compress_ratios)
         assert last_logits.shape == (1, model.args.vocab_size)
+        assert continuation_last_logits.shape == (1, model.args.vocab_size)
         assert mx.all(mx.isfinite(last_logits)).item()
+        assert mx.all(mx.isfinite(continuation_last_logits)).item()
         if expect_native:
-            assert ratio128_helper_calls == ratio128_layers
-            assert ratio128_native_calls == ratio128_layers
+            assert ratio128_helper_calls == ratio128_layers * 2
+            assert ratio128_native_calls == ratio128_layers * 2
             assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
         else:
             assert ratio128_helper_calls == 0
             assert ratio128_native_calls == 0
     finally:
-        last_logits = logits = tokenizer = model = None
+        continuation_last_logits = continuation_logits = None
+        last_logits = logits = cache = tokenizer = model = None
         gc.collect()
         mx.clear_cache()

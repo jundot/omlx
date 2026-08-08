@@ -608,6 +608,21 @@ def _sparse_pooled_ring_attention(
     ).astype(q.dtype)
 
 
+def _native_sparse_attention_available() -> bool:
+    """Return whether ratio-128 dispatch may attempt the native kernel."""
+    global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+
+    if _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+        return False
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        return glm_fast.has_symbol("deepseek_v4_sparse_attention")
+    except Exception:
+        _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+        return False
+
+
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -621,7 +636,8 @@ def _sparse_pooled_attention(
     compress_ratio: Optional[int] = None,
     local_window: Optional[int] = None,
     decode_consistent: bool = False,
-) -> mx.array:
+    native_only: bool = False,
+) -> Optional[mx.array]:
     global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
 
     B, H, L, D = q.shape
@@ -662,6 +678,9 @@ def _sparse_pooled_attention(
                 )
         except Exception:
             _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+
+    if native_only:
+        return None
 
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
@@ -1603,12 +1622,15 @@ class CompressedAttention(nn.Module):
             )
         # The native kernel reconstructs the model's causal/sliding masks
         # from offsets; direct callers with custom masks stay on dense SDPA.
+        out = None
         if (
             self.config.use_native_ratio128_attention
+            and self.compress_ratio == 128
             and _standard_mask
             and pooled.shape[1] > 0
             and L > 4
             and not (self.dspark and B == 1 and L == 1)
+            and _native_sparse_attention_available()
         ):
             pooled_indices = mx.broadcast_to(
                 mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
@@ -1627,8 +1649,9 @@ class CompressedAttention(nn.Module):
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
                 decode_consistent=self.dspark,
+                native_only=True,
             )
-        else:
+        if out is None:
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
