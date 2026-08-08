@@ -3,6 +3,7 @@
 
 import importlib
 import inspect
+import json
 import sys
 from types import SimpleNamespace
 
@@ -155,6 +156,45 @@ class TestUtilsPatch:
             )
             is True
         )
+
+    @pytest.mark.parametrize(
+        ("bits", "expected_enabled"),
+        ((4, True), (2, False)),
+        ids=("four-bit-native", "sub-four-bit-reference"),
+    )
+    def test_load_model_propagates_ratio128_attention_policy_to_model_args(
+        self, tmp_path, applied_patch, bits, expected_enabled
+    ):
+        import mlx.nn as nn
+        from mlx_lm.utils import load_model
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        config = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 1,
+            "compress_ratios": [128],
+            "quantization": {
+                "bits": bits,
+                "group_size": 8,
+                "mode": "affine",
+            },
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        class CapturingModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.args = args
+
+        model, loaded_config = load_model(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (CapturingModel, dsv4.ModelArgs),
+        )
+
+        assert model.args.use_native_ratio128_attention is expected_enabled
+        assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
 
 class TestGeneratePatch:
@@ -1179,8 +1219,13 @@ class TestDeepseekV4CompressedNativeAttention:
         ("dtype_name", "max_tolerance"),
         (("float16", 0.004), ("bfloat16", 0.032)),
     )
-    def test_ratio128_native_attention_matches_causal_reference(
-        self, applied_patch, dtype_name, max_tolerance
+    @pytest.mark.parametrize(
+        ("offset", "length"),
+        ((255, 17), (32_895, 17)),
+        ids=("two-pooled-rows", "257-pooled-rows"),
+    )
+    def test_ratio128_native_attention_matches_causal_reference_across_pool_tiles(
+        self, applied_patch, dtype_name, max_tolerance, offset, length
     ):
         import mlx.core as mx
 
@@ -1189,7 +1234,7 @@ class TestDeepseekV4CompressedNativeAttention:
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         mx.random.seed(41)
         dtype = getattr(mx, dtype_name)
-        offset, length, local_window, compress_ratio = 255, 17, 128, 128
+        local_window, compress_ratio = 128, 128
         local_start = max(0, offset - local_window)
         local_length = offset - local_start + length
         pooled_length = (offset + length) // compress_ratio
