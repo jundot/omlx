@@ -14260,7 +14260,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "quant.error.cancel_failed"
+            "value" : "取消量化任务失败：%@"
           }
         }
       }
@@ -14277,7 +14277,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "quant.error.load_models"
+            "value" : "加载模型失败：%@"
           }
         }
       }
@@ -14294,7 +14294,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "quant.error.remove_failed"
+            "value" : "移除量化任务失败：%@"
           }
         }
       }
@@ -14335,7 +14335,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "quant.error.start_failed"
+            "value" : "启动量化失败：%@"
           }
         }
       }
@@ -15960,7 +15960,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "quant.upload.error.cancel_failed"
+            "value" : "取消上传失败：%@"
           }
         }
       }
@@ -16001,7 +16001,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "quant.upload.error.remove_failed"
+            "value" : "移除上传任务失败：%@"
           }
         }
       }
