@@ -507,11 +507,12 @@ class _CacheFreshnessWait:
 
 
 # ---------------------------------------------------------------------------
-# Monkey-patch GenerationBatch._step to call grammar accept_token() after
-# sampling.  In the pipelined _step(), logits processors fill the bitmask
-# (constrain NEXT token) but can't know which token was just sampled.
-# After _original_step returns, self._next_tokens holds the freshly sampled
-# tokens.  We eval them synchronously and accept in grammar processors.
+# Monkey-patch GenerationBatch._step to feed grammar processors the token
+# that was sampled from their bitmask.  In the pipelined _step(), logits
+# processors fill the bitmask (constrain the NEXT token) but can't know which
+# token was just drawn from it; only the step can, via self._next_tokens.
+# The accept runs at the TOP of the following step, where _next_tokens is
+# about to become the model input anyway — see _omlx_advance_grammar_rows.
 # ---------------------------------------------------------------------------
 # Authoritative per-uid row state for the generation batch.
 #
@@ -678,6 +679,49 @@ def _omlx_realign_generation_batch_rows(self) -> None:
     self.samplers = new_samplers
 
 
+def _omlx_advance_grammar_rows(self) -> None:
+    """Accept the token each grammar row sampled during the previous step.
+
+    ``_next_tokens`` still holds the previous step's samples here, and the
+    original step is what promotes them to the model input, so this is both
+    the last point at which the matcher can still be advanced in time for
+    the next bitmask and the first at which reading the ids costs nothing:
+    the forward pass about to run needs them evaluated regardless.
+
+    Doing it here rather than immediately after the previous dispatch is
+    what keeps mlx-lm's one-step lookahead intact.  The old placement forced
+    ``mx.eval`` on the freshly dispatched samples, so every bit of host work
+    that follows a step — ``next()``'s epilogue, stop-token matching,
+    ``filter``, detokenisation, the output collector, SSE streaming — ran
+    with the GPU idle instead of behind it.  That serialisation, not the
+    bitmask itself, is where constrained decoding lost its throughput.
+    """
+    from .api.grammar import GrammarConstraintProcessor
+
+    rows = [
+        (e, proc)
+        for e, procs in enumerate(self.logits_processors)
+        for proc in procs
+        if isinstance(proc, GrammarConstraintProcessor) and proc.pending
+    ]
+    if not rows:
+        return
+
+    # filter([]) leaves _next_tokens as None (mlx-lm generate.py), and a row
+    # count that disagrees with uids means the positional state is mid-drift;
+    # in both cases there is no id this row can be told to accept.
+    next_tokens = self._next_tokens
+    if next_tokens is None or not (
+        len(next_tokens) == len(self.uids) == len(self.logits_processors)
+    ):
+        return
+
+    mx.eval(next_tokens)
+    sampled = next_tokens.tolist()
+    for e, proc in rows:
+        proc.accept_token(sampled[e])
+
+
 _original_generation_batch_step = GenerationBatch._step
 
 
@@ -711,28 +755,12 @@ def _patched_generation_batch_step(self):
     # See #934 / #1747.
     _omlx_realign_generation_batch_rows(self)
 
-    result = _original_generation_batch_step(self)
+    # Must run after the realignment: it reads self.logits_processors[e] as
+    # the row state for uids[e], which is exactly what the realignment above
+    # is there to guarantee.
+    _omlx_advance_grammar_rows(self)
 
-    # self._next_tokens contains the just-sampled tokens (async eval pending).
-    # We need to accept them NOW so the next __call__ fills the correct bitmask.
-    if any(self.logits_processors):
-        from .api.grammar import GrammarConstraintProcessor
-
-        has_grammar = any(
-            isinstance(p, GrammarConstraintProcessor)
-            for procs in self.logits_processors
-            for p in procs
-        )
-        if has_grammar:
-            # Force eval of the sampled tokens so we can read them.
-            mx.eval(self._next_tokens)
-            sampled = self._next_tokens.tolist()
-            for e in range(len(self.uids)):
-                for proc in self.logits_processors[e]:
-                    if isinstance(proc, GrammarConstraintProcessor):
-                        proc.accept_token(sampled[e])
-
-    return result
+    return _original_generation_batch_step(self)
 
 
 GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows

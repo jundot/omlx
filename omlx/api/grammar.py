@@ -78,6 +78,7 @@ class GrammarConstraintProcessor:
         self._bitmask = np.full((1, bitmask_width), -1, dtype=np.int32)
         self._terminated = False
         self._first_call = True
+        self._pending = False
 
     # ------------------------------------------------------------------
     # Per-request mode (original interface)
@@ -86,13 +87,16 @@ class GrammarConstraintProcessor:
     def __call__(self, tokens, logits: mx.array) -> mx.array:
         """Fill bitmask and apply to logits.
 
-        Accept is handled by the monkey-patched GenerationBatch._step()
-        which reads _next_tokens after sampling and calls accept_token().
-        This method only fills the bitmask and applies it.
+        Accept is handled by the monkey-patched GenerationBatch._step(),
+        which is the only place that can see which token was sampled from
+        the result.  This method only fills the bitmask, applies it, and
+        records that a token is now in flight for this row (see
+        :attr:`pending`).
         """
         if self._terminated:
             return logits
 
+        self._pending = True
         self._bitmask.fill(-1)
         self._matcher.fill_next_token_bitmask(self._bitmask)
 
@@ -101,12 +105,24 @@ class GrammarConstraintProcessor:
 
     def accept_token(self, token_id: int) -> None:
         """Accept a generated token to advance matcher state."""
+        self._pending = False
         if self._terminated:
             return
         if not self._matcher.accept_token(token_id):
             logger.warning("GrammarMatcher rejected token %d", token_id)
         if self._matcher.is_terminated():
             self._terminated = True
+
+    @property
+    def pending(self) -> bool:
+        """True when a token was sampled for this row and not yet accepted.
+
+        The flag lives on the processor rather than on the generation batch
+        because ``GenerationBatch.extend()`` merges rows primed by a
+        *different* batch instance, each with its own token already sampled;
+        only per-row state survives that merge and the matching ``filter()``.
+        """
+        return self._pending
 
     # ------------------------------------------------------------------
     # Batched mode helpers

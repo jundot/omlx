@@ -35,6 +35,12 @@ requires_xgrammar = pytest.mark.skipif(
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Index of "</s>" in the mock vocabularies below; xgrammar's TokenizerInfo
+# recognises it as the stop token, and a grammar only terminates once the
+# stop token itself has been accepted.
+_STOP_TOKEN_ID = 2
+
+
 def _make_engine(*, grammar_compiler=None, tokenizer=None):
     """Create a lightweight mock engine."""
     engine = MagicMock()
@@ -857,6 +863,50 @@ class TestGrammarConstraintProcessor:
         cg = comp.compile_grammar('root ::= ""')
         proc = GrammarConstraintProcessor(cg, vocab_size)
         assert proc.is_terminated is False
+
+    def test_call_marks_the_row_pending(self, compiler):
+        """The scheduler accepts at the top of the *next* step, so the
+        processor must remember that a token is in flight for its row."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        cg = comp.compile_grammar('root ::= "{}"')
+        proc = GrammarConstraintProcessor(cg, vocab_size)
+        assert proc.pending is False
+
+        proc(mx.array([]), mx.zeros((1, vocab_size)))
+        assert proc.pending is True
+
+    def test_accept_token_clears_pending(self, compiler):
+        """One accept per sampled token: the flag must not survive it, or a
+        later step would feed the matcher the same id twice."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        cg = comp.compile_grammar('root ::= "{}"')
+        proc = GrammarConstraintProcessor(cg, vocab_size)
+
+        proc(mx.array([]), mx.zeros((1, vocab_size)))
+        proc.accept_token(ord("{"))
+        assert proc.pending is False
+
+    def test_terminated_row_is_never_pending(self, compiler):
+        """A terminated matcher stops masking; it must also stop asking to
+        be advanced, because fill_next_token_bitmask would then raise."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        cg = comp.compile_grammar('root ::= "{"')
+        proc = GrammarConstraintProcessor(cg, vocab_size)
+
+        proc(mx.array([]), mx.zeros((1, vocab_size)))
+        proc.accept_token(ord("{"))
+        proc(mx.array([]), mx.zeros((1, vocab_size)))
+        proc.accept_token(_STOP_TOKEN_ID)
+        assert proc.is_terminated is True
+
+        proc(mx.array([]), mx.zeros((1, vocab_size)))
+        assert proc.pending is False
 
 
 # =========================================================================
