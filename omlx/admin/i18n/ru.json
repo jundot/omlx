@@ -860,6 +860,8 @@
   "chat.shortcut_stop": "Остановить генерацию",
   "chat.shortcut_help": "Показать эту справку",
   "chat.theme_label": "Тема",
+  "chat.enhanced_readability": "Enhanced Readability",
+  "chat.enhanced_readability_desc": "Boosts text contrast and sets the minimum font size to 12px (except formulas).",
   "chat.chat_history_label": "История чатов",
   "chat.clear_all_history": "Очистить всю историю",
   "chat.download_chats": "Скачать чаты",

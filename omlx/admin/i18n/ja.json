@@ -860,6 +860,8 @@
   "chat.shortcut_stop": "生成を停止",
   "chat.shortcut_help": "このヘルプを表示",
   "chat.theme_label": "テーマ",
+  "chat.enhanced_readability": "Enhanced Readability",
+  "chat.enhanced_readability_desc": "Boosts text contrast and sets the minimum font size to 12px (except formulas).",
   "chat.chat_history_label": "チャット履歴",
   "chat.clear_all_history": "全履歴を削除",
   "chat.download_chats": "チャットをダウンロード",

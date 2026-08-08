@@ -860,6 +860,8 @@
   "chat.shortcut_stop": "停止生成",
   "chat.shortcut_help": "显示此帮助",
   "chat.theme_label": "主题",
+  "chat.enhanced_readability": "Enhanced Readability",
+  "chat.enhanced_readability_desc": "Boosts text contrast and sets the minimum font size to 12px (except formulas).",
   "chat.chat_history_label": "聊天记录",
   "chat.clear_all_history": "清除所有历史",
   "chat.download_chats": "下载聊天记录",
