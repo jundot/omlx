@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for memory_monitor module (SSD-only mode)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -723,3 +724,74 @@ class TestSetModelInfoFromModelRotating:
         # rotating term would double-count.
         assert monitor._num_kv_cache_layers == 0
         assert monitor._rotating_layer_specs == ((30, 512),)
+        assert monitor.estimate_prompt_kv_bytes(100_000) == 0
+
+
+class TestDeepSeekV4PrefillMemoryProfile:
+    @staticmethod
+    def _config():
+        return SimpleNamespace(
+            model_type="deepseek_v4",
+            num_hidden_layers=43,
+            num_attention_heads=64,
+            num_key_value_heads=1,
+            head_dim=512,
+            sliding_window=128,
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=512,
+            compress_ratios=[0, 0] + [4, 128] * 20 + [4],
+        )
+
+    def _monitor(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = self._config()
+        profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+        assert profile is not None
+        monitor = MemoryMonitor(max_kv_cache_memory=256 * 1024**3)
+        monitor.set_model_info(
+            num_layers=43,
+            num_kv_heads=1,
+            head_dim=512,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=0,
+            compute_dtype_size=2,
+            rotating_layer_specs=[(43, 128)],
+            prefill_memory_profile=profile,
+        )
+        return monitor
+
+    def test_resident_bytes_follow_local_and_pooled_cache_shapes(self):
+        monitor = self._monitor()
+        tokens = 200_000
+        chunk = 2048
+
+        local = 43 * (128 + chunk - 1) * 512
+        ratio4_main = (tokens // 4) * 512 + 4 * 4 * 1024
+        ratio4_index = (tokens // 4) * 128 + 4 * 4 * 256
+        ratio128_main = (tokens // 128) * 512 + 2 * 128 * 512
+        expected = (local + 21 * (ratio4_main + ratio4_index) + 20 * ratio128_main) * 2
+
+        assert (
+            monitor.estimate_resident_kv_bytes(tokens, chunk_tokens=chunk) == expected
+        )
+        assert expected < 2 * 1024**3
+
+    def test_prefill_transient_does_not_charge_dense_full_context_sdpa(self):
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        monitor = self._monitor()
+        profiled = monitor.estimate_chunk_transient_bytes(2048, 199_999)
+        dense = estimate_unfused_sdpa_call_bytes(64, 2048, 199_999, 512, 2)
+
+        assert 0 < profiled < 20 * 1024**3
+        assert profiled < dense / 4
+
+    def test_non_v4_config_keeps_generic_estimator(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = self._config()
+        config.model_type = "llama"
+        assert make_prefill_memory_profile(config, compute_dtype_size=2) is None

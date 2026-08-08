@@ -494,6 +494,98 @@ def test_sanitize_stacks_fp8_expert_weights_and_sidecars():
     assert not any(key.endswith("weight_scale_inv") for key in sanitized)
 
 
+def test_sanitize_preserves_packed_mxfp4_expert_weights():
+    bailing_hybrid = _load_patch_module()
+    config = _minimal_config(
+        hidden_size=64,
+        intermediate_size=128,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "routed_experts_quant_method": "mxfp4",
+            "routed_experts_group_size": 32,
+        },
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    weights = {}
+    expected = []
+    for expert in range(2):
+        prefix = f"model.layers.1.mlp.experts.{expert}.gate_proj"
+        source = mx.linspace(-1.0, 1.0, 16 * 64).reshape(16, 64) * (expert + 1)
+        packed, scales = mx.quantize(
+            source,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        weights[f"{prefix}.weight"] = packed.view(mx.int8)
+        weights[f"{prefix}.weight_scale_inv"] = scales
+        expected.append(
+            mx.dequantize(
+                packed,
+                scales,
+                None,
+                group_size=32,
+                bits=4,
+                mode="mxfp4",
+            )
+        )
+
+    sanitized = model.sanitize(weights)
+    prefix = "model.layers.1.mlp.switch_mlp.gate_proj"
+    restored = mx.dequantize(
+        sanitized[f"{prefix}.weight"],
+        sanitized[f"{prefix}.scales"],
+        None,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+    expected = mx.stack(expected)
+    mx.eval(restored, expected)
+
+    assert sanitized[f"{prefix}.weight"].shape == (2, 16, 8)
+    assert sanitized[f"{prefix}.weight"].dtype == mx.uint32
+    assert sanitized[f"{prefix}.scales"].shape == (2, 16, 2)
+    assert sanitized[f"{prefix}.scales"].dtype == mx.uint8
+    assert not any(key.endswith("weight_scale_inv") for key in sanitized)
+    assert mx.array_equal(restored, expected)
+
+
+def test_sanitize_decodes_e8m0_fp8_block_scales():
+    bailing_hybrid = _load_patch_module()
+    config = _minimal_config(
+        hidden_size=64,
+        intermediate_size=128,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    )
+    model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    source = mx.linspace(-1.0, 1.0, 16 * 64).reshape(16, 64)
+    fp8 = mx.to_fp8(source)
+    weight_key = "model.layers.0.attention.q_proj.weight"
+
+    sanitized = model.sanitize(
+        {
+            weight_key: fp8,
+            f"{weight_key}_scale_inv": mx.array([[126]], dtype=mx.uint8),
+        }
+    )
+    restored = mx.dequantize(
+        sanitized[weight_key],
+        sanitized[weight_key.replace("weight", "scales")],
+        sanitized[weight_key.replace("weight", "biases")],
+        group_size=64,
+        bits=8,
+    )
+    expected = mx.from_fp8(fp8, dtype=mx.bfloat16) * 0.5
+    mx.eval(restored, expected)
+
+    assert mx.allclose(restored, expected, rtol=2e-2, atol=5e-3)
+
+
 def test_bailing_fp8_config_normalizes_to_affine_runtime_quantization():
     from omlx.utils.model_loading import normalize_bailing_hybrid_fp8_quant
 
@@ -506,6 +598,36 @@ def test_bailing_fp8_config_normalizes_to_affine_runtime_quantization():
 
     assert normalize_bailing_hybrid_fp8_quant(config) is config
     assert config["quantization"] == {"group_size": 64, "bits": 8}
+
+
+def test_bailing_mixed_fp4_config_adds_routed_expert_overrides():
+    from omlx.utils.model_loading import normalize_bailing_hybrid_fp8_quant
+
+    config = _minimal_config(
+        num_hidden_layers=3,
+        first_k_dense_replace=1,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "routed_experts_quant_method": "mxfp4",
+            "routed_experts_group_size": 32,
+        },
+    )
+
+    assert normalize_bailing_hybrid_fp8_quant(config) is config
+    quantization = config["quantization"]
+    assert quantization["group_size"] == 64
+    assert quantization["bits"] == 8
+    assert "model.layers.0.mlp.switch_mlp.gate_proj" not in quantization
+    expected = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    for layer_idx in (1, 2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            assert (
+                quantization[
+                    f"model.layers.{layer_idx}.mlp.switch_mlp.{projection}"
+                ]
+                == expected
+            )
 
 
 def test_fp8_checkpoint_loads_strictly_as_quantized_model(tmp_path):
@@ -542,6 +664,66 @@ def test_fp8_checkpoint_loads_strictly_as_quantized_model(tmp_path):
 
     assert loaded_config["quantization"] == {"group_size": 64, "bits": 8}
     assert isinstance(loaded.model.layers[0].attention.q_proj, nn.QuantizedLinear)
+    assert logits.shape == (1, 3, config["vocab_size"])
+
+
+def test_mixed_fp4_checkpoint_loads_strictly(tmp_path):
+    bailing_hybrid = _load_patch_module()
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    config = _minimal_config(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        quantization_config={
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "routed_experts_quant_method": "mxfp4",
+            "routed_experts_group_size": 32,
+        },
+    )
+    source_model = bailing_hybrid.Model(bailing_hybrid.ModelArgs.from_dict(config))
+    weights = dict(tree_flatten(source_model.parameters()))
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        runtime_key = f"model.layers.1.mlp.switch_mlp.{projection}.weight"
+        expert_weights = weights.pop(runtime_key)
+        for expert, expert_weight in enumerate(expert_weights):
+            packed, scales = mx.quantize(
+                expert_weight,
+                group_size=32,
+                bits=4,
+                mode="mxfp4",
+            )
+            checkpoint_prefix = (
+                f"model.layers.1.mlp.experts.{expert}.{projection}"
+            )
+            weights[f"{checkpoint_prefix}.weight"] = packed.view(mx.int8)
+            weights[f"{checkpoint_prefix}.weight_scale_inv"] = scales
+
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    from mlx_lm.utils import load_model
+
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(tmp_path))
+    loaded, loaded_config = load_model(tmp_path, strict=True)
+    logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+    mx.eval(logits)
+
+    quantization = loaded_config["quantization"]
+    expected = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    assert (
+        quantization["model.layers.1.mlp.switch_mlp.gate_proj"] == expected
+    )
+    assert isinstance(
+        loaded.model.layers[1].mlp.switch_mlp.gate_proj,
+        QuantizedSwitchLinear,
+    )
+    assert loaded.model.layers[1].mlp.switch_mlp.gate_proj.mode == "mxfp4"
     assert logits.shape == (1, 3, config["vocab_size"])
 
 

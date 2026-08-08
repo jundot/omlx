@@ -24,6 +24,9 @@ class _FakeEntry:
         self.engine = None
         self.is_pinned = False
         self.is_loading = False
+        self.load_failed = False
+        self.load_failure_message = None
+        self.load_failure_at = None
         self.model_path = "/fake"
 
 
@@ -49,6 +52,15 @@ class _FakePool:
 
     def get_model_ids(self):
         return list(self._entries)
+
+    def _engine_runtime_signature(self, model_id, runtime_settings=None):
+        return ()
+
+    @staticmethod
+    def _clear_load_failure(entry):
+        entry.load_failed = False
+        entry.load_failure_message = None
+        entry.load_failure_at = None
 
 
 class _FakeServerState:

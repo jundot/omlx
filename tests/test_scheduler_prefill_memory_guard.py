@@ -762,15 +762,18 @@ def test_admission_estimate_is_the_single_formula():
             num_prompt_tokens=32768, cached_tokens=0, current=0
         )
     assert est is not None
-    floor = min(max(1, scheduler._prefill_min_chunk_tokens), 32768)
+    floor = min(max(1, scheduler._prefill_min_chunk_tokens), 32767)
+    pre_chunk_kv_len = 32767 - floor
     assert est.floor_chunk == floor
-    assert est.kv_len == 32767
+    assert est.kv_len == pre_chunk_kv_len
     assert est.kv_exact == int(
         scheduler.memory_monitor.estimate_resident_kv_bytes(
             32768, chunk_tokens=floor
         )
     )
-    assert est.transient == int(scheduler._admission_transient_bound(floor, 32767))
+    assert est.transient == int(
+        scheduler._admission_transient_bound(floor, pre_chunk_kv_len)
+    )
     assert est.estimated == est.kv_exact + est.transient
 
 
@@ -808,7 +811,8 @@ def test_admission_charges_full_step_under_speed_priority():
     )
     assert est_speed.transient == int(
         scheduler._admission_transient_bound(
-            scheduler.config.prefill_step_size, 32767
+            scheduler.config.prefill_step_size,
+            32767 - scheduler.config.prefill_step_size,
         )
     )
     # The full-step charge is strictly more conservative.
@@ -820,7 +824,65 @@ def test_admission_charges_full_step_under_speed_priority():
             num_prompt_tokens=1024, cached_tokens=0, current=0
         )
     assert est_small is not None
-    assert est_small.floor_chunk == 1024
+    assert est_small.floor_chunk == 1023
+
+
+def test_deepseek_v4_200k_admission_uses_profile_instead_of_81_gib_dense_charge():
+    """Issue #2521: V4's local + pooled sparse cache must not be priced as
+    43 full-context K/V layers followed by a dense 200K SDPA."""
+    from mlx_lm.models.cache import RotatingKVCache
+
+    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+    config = _ModelConfig(
+        num_hidden_layers=43,
+        num_key_value_heads=1,
+        num_attention_heads=64,
+        head_dim=512,
+    )
+    config.model_type = "deepseek_v4"
+    config.sliding_window = 128
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    config.index_topk = 512
+    config.compress_ratios = [0, 0] + [4, 128] * 20 + [4]
+
+    model = MagicMock()
+    model.layers = []
+    model.config = config
+    model.make_cache = lambda: [RotatingKVCache(max_size=128) for _ in range(43)]
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
+        ),
+    )
+    scheduler._prefill_speed_priority = True
+
+    gib = 1024**3
+    current = int(156.05 * gib)
+    limit = int(235.96 * gib)
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=200_000,
+        cached_tokens=0,
+        current=current,
+    )
+    assert est is not None
+    assert est.estimated < limit
+    assert est.kv_exact < 2 * gib
+    assert est.transient < 20 * gib
+
+    old_kv = 200_000 * 43 * 512 * 2 * 2 + 43 * (128 + 2048 - 1) * 512 * 2 * 2
+    old_sdpa = estimate_unfused_sdpa_call_bytes(64, 2048, 202_047, 512, 2)
+    old_chunk_kv = 2048 * 43 * 512 * 2 * 2
+    old_peak = old_kv + (old_sdpa + old_chunk_kv) * 1.3
+    assert old_peak / gib == pytest.approx(81.25, abs=0.02)
+    assert current + old_peak > limit
 
 
 def test_preflight_charges_observed_max_transient():

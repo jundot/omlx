@@ -38,6 +38,12 @@ def vlm_mtp_processor_conflicts(data: dict) -> list:
     back to BatchGenerator and the toggle would never engage (#2399).
     Neutral values (repetition 1.0, presence 0.0) build no processor and do
     not conflict.
+
+    ``thinking_budget_enabled`` is intentionally absent: the vlm_mtp path
+    applies ``ThinkingBudgetProcessor`` at verify time via
+    ``MTPProcessingSampler`` (see omlx/speculative/processing_sampler.py),
+    so a thinking-budget default no longer forces the BatchGenerator
+    fallback.
     """
     conflicts = []
     rep = data.get("repetition_penalty")
@@ -46,8 +52,6 @@ def vlm_mtp_processor_conflicts(data: dict) -> list:
     pres = data.get("presence_penalty")
     if pres is not None and pres != 0.0:
         conflicts.append("presence_penalty")
-    if data.get("thinking_budget_enabled"):
-        conflicts.append("thinking_budget_enabled")
     if data.get("guided_grammar_enabled"):
         conflicts.append("guided_grammar_enabled")
     return conflicts
@@ -302,12 +306,13 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
-            # Grammar / thinking budget / penalty defaults materialize as
-            # per-request logits processors, which the vlm_mtp decode path
-            # cannot apply — every request would fall back to
-            # BatchGenerator and the toggle would silently never engage
-            # (#2399). Reject the combo at construction time like the
-            # speculative-path conflicts above.
+            # Grammar / penalty defaults materialize as per-request logits
+            # processors, which the vlm_mtp decode path cannot apply —
+            # every request would fall back to BatchGenerator and the
+            # toggle would silently never engage (#2399). Reject the combo
+            # at construction time like the speculative-path conflicts
+            # above. Thinking budget is exempt: it is applied at verify
+            # time via MTPProcessingSampler.
             processor_conflicts = vlm_mtp_processor_conflicts(self.to_dict())
             if processor_conflicts:
                 raise ValueError(

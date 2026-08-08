@@ -18,6 +18,9 @@ from omlx.engine_core import get_mlx_executor
 
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
+_PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
+_PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
+
 # Per-process record of (engine_class_name, method) pairs that have
 # already logged a "scheduler unreachable" warning. The warning marks a
 # wrapper-chain misconfiguration — a deployment bug rather than a
@@ -59,6 +62,96 @@ def _warn_scheduler_unreachable_once(
         method,
         suffix,
     )
+
+
+async def _run_scheduler_preflight_with_cleanup_retry(
+    scheduler: Any,
+    *,
+    num_prompt_tokens: int,
+    request_id: str | None,
+    eviction_callback: Any | None,
+    executor: Any | None = None,
+) -> None:
+    """Run route preflight after transient post-request cleanup settles.
+
+    A finished request can remain resident while its asynchronous cache store
+    owns the extracted KV and while the scheduler's deferred Metal clear is
+    pending. Charging a new request against that temporary footprint produces
+    a false rejection. Only defer a preflight that would otherwise need
+    eviction or rejection; requests that already fit keep the fast path.
+
+    Cleanup remains owned by ``Scheduler.step()``. This helper never drains
+    request state, synchronizes a stream, or clears the Metal pool, so active
+    batched work is not interrupted.
+    """
+    deadline = time.monotonic() + _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S
+    waited_for_cleanup = False
+
+    while True:
+        eviction_request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+        if eviction_request is None:
+            scheduler.preflight_or_raise(
+                num_prompt_tokens=num_prompt_tokens,
+                request_id=request_id,
+            )
+            return
+
+        cleanup_pending_fn = getattr(
+            scheduler, "has_pending_route_preflight_cleanup", None
+        )
+        cleanup_pending = (
+            cleanup_pending_fn() is True if callable(cleanup_pending_fn) else False
+        )
+        now = time.monotonic()
+        if cleanup_pending and now < deadline:
+            if not waited_for_cleanup:
+                waited_for_cleanup = True
+                _preflight_logger.debug(
+                    "Deferring preflight rejection for request %s until "
+                    "post-request cache cleanup settles",
+                    request_id or "preflight",
+                )
+            await asyncio.sleep(_PREFLIGHT_CLEANUP_POLL_INTERVAL_S)
+            continue
+
+        # Dropping the last Request/KV references and clearing MLX's pool do
+        # not make macOS phys_footprint settle atomically. Once a transient
+        # rejection has observed pending cleanup, keep re-measuring for the
+        # same bounded window even after the scheduler bookkeeping is clear.
+        # This also avoids evicting an idle model for bytes that IOKit is
+        # already returning asynchronously.
+        if waited_for_cleanup and now < deadline:
+            refresh_usage = getattr(
+                scheduler, "refresh_route_preflight_usage", None
+            )
+            if executor is not None and callable(refresh_usage):
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(executor, refresh_usage)
+            await asyncio.sleep(_PREFLIGHT_CLEANUP_POLL_INTERVAL_S)
+            continue
+
+        if cleanup_pending and waited_for_cleanup:
+            _preflight_logger.warning(
+                "Post-request cache cleanup did not settle within %.1fs before "
+                "preflight for request %s; using the current memory snapshot",
+                _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S,
+                request_id or "preflight",
+            )
+
+        if eviction_callback is not None:
+            _preflight_logger.info(
+                "Running preflight LRU eviction for request %s",
+                eviction_request.request_id,
+            )
+            await eviction_callback(eviction_request)
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+        return
 
 
 @dataclass

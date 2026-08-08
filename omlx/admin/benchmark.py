@@ -671,6 +671,7 @@ async def _run_single_test(
         max_tokens=max_tokens,
         temperature=0.0,
         top_p=1.0,
+        skip_cache_store=True,
     ):
         # Detect first generated token via completion_tokens count,
         # not new_text. Some models (e.g. Harmony/gpt-oss) produce
@@ -816,6 +817,7 @@ async def _run_batch_test(
         request_id = await engine_core.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            skip_cache_store=True,
         )
 
         async for output in engine_core.stream_outputs(request_id):

@@ -384,6 +384,33 @@ class TestRunSingleTest:
         engine.stream_generate.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_skips_cache_store(self):
+        class RecordingEngine:
+            def __init__(self):
+                self.kwargs = None
+
+            async def stream_generate(self, **kwargs):
+                self.kwargs = kwargs
+                yield SimpleNamespace(
+                    completion_tokens=1,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        engine = RecordingEngine()
+        await _run_single_test(
+            engine,
+            prompt=[0] * 1024,
+            max_tokens=1,
+            pp_len=1024,
+        )
+
+        assert engine.kwargs["skip_cache_store"] is True
+
+    @pytest.mark.asyncio
     async def test_rejects_engine_reported_prompt_length(self):
         class MismatchedEngine:
             async def stream_generate(self, **kwargs):
@@ -526,10 +553,14 @@ class TestRunBatchTest:
         class Core:
             def __init__(self):
                 self.prompts = {}
+                self.skip_cache_store = []
 
-            async def add_request(self, prompt, sampling_params):
+            async def add_request(
+                self, prompt, sampling_params, skip_cache_store=False
+            ):
                 request_id = f"request-{len(self.prompts)}"
                 self.prompts[request_id] = prompt
+                self.skip_cache_store.append(skip_cache_store)
                 return request_id
 
             async def stream_outputs(self, request_id):
@@ -553,6 +584,7 @@ class TestRunBatchTest:
         )
 
         assert list(core.prompts.values()) == prompts
+        assert core.skip_cache_store == [True, True]
         assert metrics["batch_size"] == 2
 
     @pytest.mark.asyncio

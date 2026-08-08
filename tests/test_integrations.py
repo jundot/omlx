@@ -915,7 +915,7 @@ class TestHermesIntegration:
         assert "context_length" not in model_config
         assert "max_tokens" not in model_config
 
-    def test_configure_uses_hermes_min_context_length(self, tmp_path):
+    def test_configure_preserves_actual_context_length(self, tmp_path):
         config_path = tmp_path / "config.yaml"
 
         hermes = HermesIntegration()
@@ -930,7 +930,78 @@ class TestHermesIntegration:
             )
 
         model_config = yaml.safe_load(config_path.read_text())["model"]
-        assert model_config["context_length"] == 64000
+        assert model_config["context_length"] == 32768
+
+    def test_model_disabled_reason_below_64k(self):
+        hermes = HermesIntegration()
+
+        reason = hermes.model_disabled_reason(
+            {"id": "small-model", "max_context_window": 32768}
+        )
+
+        assert reason is not None
+        assert "at least 64K" in reason
+        assert "32,768" in reason
+
+    def test_model_disabled_reason_allows_64k(self):
+        hermes = HermesIntegration()
+
+        assert (
+            hermes.model_disabled_reason(
+                {"id": "supported-model", "max_context_window": 64000}
+            )
+            is None
+        )
+
+    def test_select_model_rejects_disabled_choice(self, capsys):
+        hermes = HermesIntegration()
+
+        with (
+            patch("omlx.integrations.base.sys.stdout.isatty", return_value=False),
+            patch("builtins.input", side_effect=["1", "2"]),
+        ):
+            selected = hermes.select_model(
+                [
+                    {"id": "small-model", "max_context_window": 32768},
+                    {"id": "supported-model", "max_context_window": 64000},
+                ]
+            )
+
+        assert selected == "supported-model"
+        output = capsys.readouterr().out
+        assert "small-model" in output
+        assert "unavailable" in output
+        assert "Cannot select small-model" in output
+
+    def test_launch_rejects_context_below_64k_and_records_actual_value(
+        self, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.execvpe") as execvpe,
+            pytest.raises(SystemExit) as exc,
+        ):
+            hermes.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="small-model",
+                    context_window=32768,
+                    max_tokens=8192,
+                )
+            )
+
+        assert exc.value.code == 1
+        execvpe.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Cannot launch Hermes Agent" in output
+        assert "at least 64K" in output
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["model"]["context_length"] == 32768
 
     def test_launch_sets_config_and_execs(self, tmp_path):
         config_path = tmp_path / "config.yaml"

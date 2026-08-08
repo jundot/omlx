@@ -13,7 +13,9 @@ the exception into HTTP 400. We exercise the contract by:
 - Confirming the exception type propagates.
 """
 
-from unittest.mock import MagicMock
+import concurrent.futures
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -151,8 +153,6 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
 
 @pytest.mark.asyncio
 async def test_batched_engine_preflight_runs_eviction_before_final_check():
-    from types import SimpleNamespace
-
     from omlx.engine.batched import BatchedEngine
 
     scheduler = MagicMock()
@@ -187,6 +187,88 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
         request_id="req-evict",
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypatch):
+    """A rejection caused by finished-request residue must be re-measured.
+
+    The second estimate represents the scheduler state after its normal async
+    remove and deferred Metal clear. It now fits, so no idle model should be
+    evicted and the route must not return a false HTTP 400.
+    """
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = MagicMock()
+    transient_rejection = SimpleNamespace(request_id="req-cleanup")
+    scheduler.preflight_eviction_request.side_effect = [
+        transient_rejection,
+        transient_rejection,
+        None,
+    ]
+    scheduler.has_pending_route_preflight_cleanup.side_effect = [True, False]
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("omlx.engine.base.asyncio.sleep", _no_sleep)
+    evict = AsyncMock(return_value=True)
+    engine = BatchedEngine(
+        model_name="test-model",
+        prefill_eviction_callback=evict,
+    )
+
+    await engine._preflight_or_raise_with_eviction(
+        scheduler,
+        num_prompt_tokens=60_000,
+        request_id="req-next",
+    )
+
+    assert scheduler.preflight_eviction_request.call_count == 3
+    assert scheduler.has_pending_route_preflight_cleanup.call_count == 2
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=60_000,
+        request_id="req-next",
+    )
+    evict.assert_not_awaited()
+
+
+def test_scheduler_route_preflight_cleanup_signal():
+    scheduler = _make_scheduler()
+    assert scheduler.has_pending_route_preflight_cleanup() is False
+
+    future = concurrent.futures.Future()
+    scheduler._pending_async_removes.append((1, "req-old", future))
+    assert scheduler.has_pending_route_preflight_cleanup() is True
+
+    scheduler._pending_async_removes.clear()
+    scheduler._deferred_clear_at = scheduler._step_counter + 1
+    assert scheduler.has_pending_route_preflight_cleanup() is True
+
+    scheduler._deferred_clear_at = None
+    assert scheduler.has_pending_route_preflight_cleanup() is False
+
+
+def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch):
+    scheduler = _make_scheduler()
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    request = MagicMock()
+    request._extracted_cache = object()
+    request.prompt_cache = object()
+    scheduler.requests["req-old"] = request
+    scheduler._pending_async_removes.append((1, "req-old", future))
+    scheduler.uid_to_request_id[1] = "req-old"
+    scheduler.request_id_to_uid["req-old"] = 1
+    monkeypatch.setattr(scheduler, "_remove_uid_from_active_batch", MagicMock())
+
+    assert scheduler._drain_pending_async_removes() is True
+
+    assert request._extracted_cache is None
+    assert request.prompt_cache is None
+    assert scheduler._deferred_clear_at == (
+        scheduler._step_counter + scheduler._DEFERRED_CLEAR_DELAY
+    )
 
 
 @pytest.mark.asyncio

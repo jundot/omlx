@@ -15,6 +15,18 @@ from omlx.utils.install import get_cli_command_prefix
 HERMES_MIN_CONTEXT_LENGTH = 64_000
 
 
+def hermes_agent_model_disabled_reason(model_info: dict) -> str | None:
+    context_window = model_info.get("max_context_window")
+    if not isinstance(context_window, int):
+        return None
+    if context_window >= HERMES_MIN_CONTEXT_LENGTH:
+        return None
+    return (
+        "Hermes Agent requires at least 64K effective context "
+        f"(configured: {context_window:,} tokens)"
+    )
+
+
 class HermesIntegration(Integration):
     """Hermes Agent integration that writes ~/.hermes/config.yaml."""
 
@@ -38,6 +50,9 @@ class HermesIntegration(Integration):
             f"{get_cli_command_prefix()} "
             f"launch hermes --model {ctx.model or 'select-a-model'}"
         )
+
+    def model_disabled_reason(self, model_info: dict) -> str | None:
+        return hermes_agent_model_disabled_reason(model_info)
 
     def _read_config(self, config_path: Path) -> dict:
         existing: dict = {}
@@ -106,18 +121,7 @@ class HermesIntegration(Integration):
         if ctx.model:
             model_config["default"] = ctx.model
         if ctx.context_window is not None:
-            if ctx.context_window < HERMES_MIN_CONTEXT_LENGTH:
-                print(
-                    "Warning: Hermes Agent requires at least "
-                    f"{HERMES_MIN_CONTEXT_LENGTH:,} context tokens; "
-                    f"oMLX reports {ctx.context_window:,}. Writing the Hermes "
-                    "minimum so the agent can start. Increase oMLX Sampling "
-                    "max_context_window for long sessions."
-                )
-            model_config["context_length"] = max(
-                ctx.context_window,
-                HERMES_MIN_CONTEXT_LENGTH,
-            )
+            model_config["context_length"] = ctx.context_window
         else:
             model_config.pop("context_length", None)
         if ctx.max_tokens is not None:
@@ -136,6 +140,19 @@ class HermesIntegration(Integration):
 
     def launch(self, ctx: IntegrationContext) -> None:
         self.configure(ctx)
+
+        disabled_reason = self.model_disabled_reason(
+            {"id": ctx.model, "max_context_window": ctx.context_window}
+        )
+        if disabled_reason:
+            print(f"Cannot launch Hermes Agent with model '{ctx.model}'.")
+            print(disabled_reason)
+            print(
+                "Choose a model with at least 64K effective context, or increase "
+                "its configured max_context_window only when the model and "
+                "available memory support it."
+            )
+            raise SystemExit(1)
 
         env = self._scrubbed_env()
 

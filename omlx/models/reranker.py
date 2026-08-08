@@ -26,6 +26,7 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
+from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
@@ -117,6 +118,7 @@ class MLXRerankerModel:
         self._doc_embed_token_id: int | None = None
         self._query_embed_token_id: int | None = None
         self._jina_projector = None
+        self._is_jina_v35 = False
         self._prefix_tokens: list[int] | None = None
         self._suffix_tokens: list[int] | None = None
         self._is_compiled = False
@@ -135,6 +137,48 @@ class MLXRerankerModel:
             return architectures[0] if architectures else None
         except (json.JSONDecodeError, IOError):
             return None
+
+    def _detect_jina_v35(self) -> bool:
+        """Detect and validate the config features required by Jina v3.5."""
+        config_path = Path(self.model_name) / "config.json"
+        try:
+            config = json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError) as error:
+            raise ValueError(
+                f"Could not read Jina reranker config: {config_path}"
+            ) from error
+
+        layer_types = config.get("layer_types")
+        if layer_types is None:
+            return False
+        if not isinstance(layer_types, list) or not layer_types:
+            raise ValueError("Jina layer_types must be a non-empty list when present.")
+
+        num_hidden_layers = config.get("num_hidden_layers")
+        if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+            raise ValueError("Jina layer_types require a positive num_hidden_layers.")
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"len(layer_types)={len(layer_types)} != "
+                f"num_hidden_layers={num_hidden_layers}"
+            )
+
+        supported_types = {"full_attention", "sliding_attention"}
+        unsupported_types = sorted(set(layer_types) - supported_types)
+        if unsupported_types:
+            raise ValueError(
+                f"Unsupported Jina attention layer types: {unsupported_types}"
+            )
+
+        if "sliding_attention" in layer_types:
+            sliding_window = config.get("sliding_window")
+            if not isinstance(sliding_window, int) or sliding_window <= 0:
+                raise ValueError(
+                    "Jina sliding_attention layers require a positive "
+                    "sliding_window."
+                )
+
+        return True
 
     def _load_xlm_roberta(self) -> Tuple[Any, Any]:
         """Load XLMRoberta model using omlx native implementation."""
@@ -446,6 +490,14 @@ class MLXRerankerModel:
             maybe_load_custom_quantization,
         )
 
+        self._is_jina_v35 = self._detect_jina_v35()
+
+        # Jina v3.5 declares per-layer sliding/full attention, which the pinned
+        # mlx-lm Qwen3 loader otherwise silently ignores. Jina v3 has neither
+        # layer_types nor sliding-window attention and keeps its stock path.
+        if self._is_jina_v35 and apply_qwen3_sliding_window_patch():
+            logger.info("Qwen3 sliding-window patch applied for %s", self.model_name)
+
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
         custom_loaded = maybe_load_custom_quantization(
@@ -483,7 +535,8 @@ class MLXRerankerModel:
 
         logger.info(
             f"Jina reranker tokens: embed_token={doc_embed_token_id}, "
-            f"rerank_token={query_embed_token_id}"
+            f"rerank_token={query_embed_token_id}, "
+            f"scoring={'v3.5' if self._is_jina_v35 else 'v3'}"
         )
 
         return model, tokenizer
@@ -573,37 +626,51 @@ class MLXRerankerModel:
         # raises "TypeError: data type 'bfloat16' not understood".
         weights = mx.load(str(projector_path))
 
-        required_keys = ("linear1.weight", "linear2.weight")
-        missing_keys = [key for key in required_keys if key not in weights]
-        if missing_keys:
+        # v3 ships two named nn.Linear submodules ("linear1"/"linear2").
+        # v3.5 exports the same fc1 -> ReLU -> fc2 stack from an nn.Sequential
+        # container, so the keys are auto-named by list index instead
+        # ("projector.0"/"projector.2", index 1 is ReLU). Confirmed against
+        # upstream's own remap in _load_projector:
+        # https://huggingface.co/jinaai/jina-reranker-v3.5-mlx/blob/3dd4ac901ccdcac85abe3815df0a0aaaf44e4a21/modeling.py
+        key_schemes = (
+            ("linear1.weight", "linear2.weight"),
+            ("projector.0.weight", "projector.2.weight"),
+        )
+        first_key = second_key = None
+        for scheme in key_schemes:
+            if all(key in weights for key in scheme):
+                first_key, second_key = scheme
+                break
+
+        if first_key is None:
             raise ValueError(
-                f"Jina projector is malformed: missing keys {missing_keys} in "
-                f"{projector_path}. "
+                "Jina projector is malformed: none of the expected key schemes "
+                f"{key_schemes} were fully present in {projector_path}. "
                 f"Available keys: {sorted(weights.keys())}"
             )
 
-        linear1_weight = weights["linear1.weight"]
-        linear2_weight = weights["linear2.weight"]
+        linear1_weight = weights[first_key]
+        linear2_weight = weights[second_key]
 
         if len(linear1_weight.shape) != 2 or len(linear2_weight.shape) != 2:
             raise ValueError(
                 "Jina projector weights must be 2D matrices: "
-                f"linear1.weight={linear1_weight.shape}, "
-                f"linear2.weight={linear2_weight.shape}."
+                f"{first_key}={linear1_weight.shape}, "
+                f"{second_key}={linear2_weight.shape}."
             )
 
         if linear1_weight.shape != (512, 1024) or linear2_weight.shape != (512, 512):
             raise ValueError(
                 "Unexpected Jina projector shapes. Expected "
-                "linear1.weight=(512, 1024) and linear2.weight=(512, 512), "
-                f"got linear1.weight={linear1_weight.shape}, "
-                f"linear2.weight={linear2_weight.shape}."
+                f"{first_key}=(512, 1024) and {second_key}=(512, 512), "
+                f"got {first_key}={linear1_weight.shape}, "
+                f"{second_key}={linear2_weight.shape}."
             )
 
         def _project(x):
             if x.shape[-1] != linear1_weight.shape[1]:
                 raise ValueError(
-                    "Jina projector input dim mismatch for linear1: "
+                    "Jina projector input dim mismatch for first layer: "
                     f"input={x.shape[-1]}, expected={linear1_weight.shape[1]}."
                 )
             hidden = x @ mx.transpose(linear1_weight)
@@ -635,10 +702,11 @@ class MLXRerankerModel:
             self._sanitize_jina_text(instruction) if instruction is not None else None
         )
 
+        early_query_anchor = "<|rerank_token|>" if self._is_jina_v35 else ""
         user_content = (
             f"I will provide you with {len(sanitized_docs)} passages, each indicated "
             f"by a numerical identifier. Rank the passages based on their relevance "
-            f"to query: {sanitized_query}\n"
+            f"to query: {sanitized_query}{early_query_anchor}\n"
         )
         if sanitized_instruction:
             user_content += f"<instruct>\n{sanitized_instruction}\n</instruct>\n"
@@ -710,6 +778,19 @@ class MLXRerankerModel:
         denom = mx.maximum(doc_norms * query_norm, eps)
         numer = mx.sum(doc_vecs * query_vec, axis=-1)
         return numer / denom
+
+    def _fuse_query_vectors(self, query_vecs: list, weights: list[float]) -> mx.array:
+        """Weighted-average fusion of per-chunk query vectors.
+
+        Weight is each chunk's block_weight (max normalized cosine score) -
+        chunks where the model found a strong match count more toward the
+        final fused query representation. Mirrors the reference
+        jina-reranker-v3.5-mlx rerank()'s weighted average over per-block
+        query embeddings.
+        """
+        stacked = mx.stack(query_vecs, axis=0)
+        weight_array = mx.array(weights, dtype=stacked.dtype).reshape(-1, 1)
+        return (stacked * weight_array).sum(axis=0) / weight_array.sum()
 
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
@@ -855,6 +936,7 @@ class MLXRerankerModel:
         self._doc_embed_token_id = None
         self._query_embed_token_id = None
         self._jina_projector = None
+        self._is_jina_v35 = False
         self._prefix_tokens = None
         self._suffix_tokens = None
 
@@ -1025,11 +1107,12 @@ class MLXRerankerModel:
         max_length: int = 8192,
     ) -> RerankOutput:
         """
-        Rerank using Jina v3 listwise embedding-based scoring.
+        Rerank using the config-selected Jina v3 or v3.5 scoring strategy.
 
-        Builds multi-document prompts, extracts hidden states at special token
-        positions, applies the projector, and computes query-document cosine
-        similarities. Uses deterministic greedy chunking under max_length.
+        Jina v3 uses one late query token and scores each chunk independently.
+        Jina v3.5 uses dual query tokens, reads the late position, and fuses
+        per-chunk query vectors before final scoring. Both use deterministic
+        greedy chunking under max_length.
         """
         tokenizer = self.processor
         doc_embed_token_id = self._doc_embed_token_id
@@ -1105,6 +1188,13 @@ class MLXRerankerModel:
         scores = [0.0] * len(documents)
         total_tokens = 0
         start = 0
+        # Accumulated across all chunks for the block-fusion pass below: each
+        # chunk's query vector + weight, and every doc vector in original
+        # document order (via all_doc_indices, since chunks are variable-size).
+        chunk_query_vecs: list[mx.array] = []
+        chunk_weights: list[float] = []
+        all_doc_indices: list[int] = []
+        all_doc_vecs: list[mx.array] = []
         while start < len(sanitized_docs):
             chunk_doc_indices: list[int] = []
             chunk_docs: list[str] = []
@@ -1149,9 +1239,13 @@ class MLXRerankerModel:
                 for pos, token_id in enumerate(chunk_input_ids)
                 if token_id == query_embed_token_id
             ]
-            if not query_positions:
+            expected_query_positions = 2 if self._is_jina_v35 else 1
+            if len(query_positions) != expected_query_positions:
+                scoring_version = "v3.5" if self._is_jina_v35 else "v3"
                 raise ValueError(
-                    "Jina prompt does not contain '<|rerank_token|>' in tokenized input."
+                    f"Jina {scoring_version} prompt must contain "
+                    f"{expected_query_positions} '<|rerank_token|>' position(s); "
+                    f"found {len(query_positions)} in tokenized input."
                 )
 
             doc_positions = [
@@ -1166,20 +1260,47 @@ class MLXRerankerModel:
                 )
 
             selected_doc_positions = doc_positions[: len(chunk_docs)]
-            query_hidden = hidden_states[0, query_positions[0], :]
+            # v3 reads its only query position. v3.5 dual matching reads the
+            # late position; the early position is an attention anchor.
+            query_position = query_positions[-1]
+            query_hidden = hidden_states[0, query_position, :]
             doc_hidden = hidden_states[0, selected_doc_positions, :]
 
             query_vec = projector(query_hidden)
             doc_vecs = projector(doc_hidden)
-            similarities = self._cosine_similarity(query_vec, doc_vecs)
-            mx.eval(similarities)
+            if self._is_jina_v35:
+                # v3.5 reference scoring upcasts projector output before
+                # cosine and fusion math. Preserve v3's original dtype path.
+                query_vec = query_vec.astype(mx.float32)
+                doc_vecs = doc_vecs.astype(mx.float32)
+            cos_scores = self._cosine_similarity(query_vec, doc_vecs)
+            mx.eval(cos_scores)
 
-            chunk_scores = similarities.tolist()
-            for original_idx, score in zip(chunk_doc_indices, chunk_scores):
-                scores[original_idx] = float(score)
+            if self._is_jina_v35:
+                block_weight = float(((1.0 + cos_scores) / 2.0).max())
+                chunk_query_vecs.append(query_vec)
+                chunk_weights.append(block_weight)
+                all_doc_indices.extend(chunk_doc_indices)
+                all_doc_vecs.append(doc_vecs)
+            else:
+                for original_idx, score in zip(chunk_doc_indices, cos_scores.tolist()):
+                    scores[original_idx] = float(score)
 
             total_tokens += len(chunk_input_ids)
             start = cursor
+
+        if self._is_jina_v35:
+            fused_query_vec = self._fuse_query_vectors(chunk_query_vecs, chunk_weights)
+            stacked_doc_vecs = mx.concatenate(all_doc_vecs, axis=0)
+            final_similarities = self._cosine_similarity(
+                fused_query_vec, stacked_doc_vecs
+            )
+            mx.eval(final_similarities)
+
+            for original_idx, score in zip(
+                all_doc_indices, final_similarities.tolist()
+            ):
+                scores[original_idx] = float(score)
 
         # Sort by score descending
         indexed_scores = list(enumerate(scores))

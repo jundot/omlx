@@ -255,6 +255,43 @@ class _MTPResetBindingProxy:
         return self._drafter.reset(target_model, *args, **kwargs)
 
 
+def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
+    """True when mlx-vlm's round loop will see ``speculative_logits_from_hidden``.
+
+    The positioned ``sample_target`` verify path — the application point for
+    per-request logits processors on the vlm_mtp path — is only consulted
+    when the object mlx-vlm resolves as ``lm`` exposes
+    ``speculative_logits_from_hidden``. That object is not the inner
+    language model: ``run_vlm_mtp_decode`` wraps adapters in
+    ``_VLMAdapterMTPProxy``, which for mRoPE adapters (Qwen VLMs)
+    intentionally hides the inner model's ``speculative_*`` fast paths so
+    verify keeps mRoPE position handling. Checking the inner model
+    directly would report the hook as available while the round loop
+    falls back to plain vectorized sampling — silently dropping the
+    processors (#2399).
+
+    This helper mirrors the proxy's visibility rules exactly; the
+    equivalence is pinned by tests against the real proxy resolution.
+    """
+    adapter_lm = getattr(target_language_model, "_language_model", None)
+    if adapter_lm is None:
+        # No adapter: the model itself is handed to the round loop, and
+        # mlx-vlm resolves ``lm = model.language_model`` when present.
+        inner = getattr(target_language_model, "language_model", None)
+        lm = inner if inner is not None else target_language_model
+        return hasattr(lm, "speculative_logits_from_hidden")
+    # Adapter case: rounds receive _VLMAdapterMTPProxy, which hides
+    # ``language_model`` outside drafter reset, so mlx-vlm uses the proxy
+    # itself as ``lm``. Attribute lookup tries the adapter first, then
+    # falls through to the inner model — unless the adapter uses mRoPE,
+    # in which case ``speculative_*`` names are blocked at the proxy.
+    if hasattr(target_language_model, "speculative_logits_from_hidden"):
+        return True
+    if bool(getattr(target_language_model, "_uses_mrope", False)):
+        return False
+    return hasattr(adapter_lm, "speculative_logits_from_hidden")
+
+
 def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     """Load an MTP drafter (gemma4_assistant or qwen3_5_mtp); return None
     and log if the artifact is the wrong kind. Soft-fails so a misconfigured

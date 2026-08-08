@@ -314,6 +314,16 @@ class Gemma4OutputParserSession:
         if self._detokenizer is not None:
             self._detokenizer.reset()
 
+    def notify_prefilled_thought(self) -> None:
+        """Start the session inside a thought block opened by the prompt.
+
+        Gemma 4's chat template opens the thought channel in the prompt when
+        generation continues after a tool response. The model therefore
+        starts by emitting the thought body and never generates the opening
+        marker that normally sets ``_in_thought``.
+        """
+        self._in_thought = True
+
     def _append_text(
         self,
         stream_parts: list[str],
