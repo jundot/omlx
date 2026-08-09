@@ -95,16 +95,14 @@ class TrellisSwitchMLP(nn.Module):
         # inputs and materialize its output before any dependent op, otherwise
         # lazy graph nodes alias/reuse storage and corrupt the result.
         scaled = x * rin
-        mx.eval(scaled)
+        mx.eval(scaled)                      # kernel inputs must be materialized
         xh = _had128(scaled)
         mx.eval(xh)
         p = _fast.eschamoe_gather_qgemm(
             mx.asarray(xh, mx.float32), proj.escha_code, eids, K
         )
-        mx.eval(p)
-        y = _had128(p) * rout
-        mx.eval(y)
-        return y
+        return _had128(p) * rout             # output stays lazy (per-layer eval
+                                             # in omlx/streaming)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         return self.forward(x, indices)
