@@ -312,6 +312,8 @@ class CacheSettings:
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    gdn_ssd_split_enabled: bool = False
+    gdn_ssd_pending_max_size: str = "512MB"
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -351,6 +353,8 @@ class CacheSettings:
         return {
             "enabled": self.enabled,
             "hot_cache_only": self.hot_cache_only,
+            "gdn_ssd_split_enabled": self.gdn_ssd_split_enabled,
+            "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -367,6 +371,10 @@ class CacheSettings:
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
+            gdn_ssd_split_enabled=data.get("gdn_ssd_split_enabled", False),
+            gdn_ssd_pending_max_size=data.get(
+                "gdn_ssd_pending_max_size", "512MB"
+            ),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -963,6 +971,14 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
+        if gdn_ssd_split := os.getenv("OMLX_GDN_SSD_SPLIT_ENABLED"):
+            self.cache.gdn_ssd_split_enabled = gdn_ssd_split.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
+            self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -1336,6 +1352,18 @@ class GlobalSettings:
             )
 
         # Cache validation
+        if self.cache.gdn_ssd_split_enabled and self.cache.hot_cache_only:
+            errors.append(
+                "gdn_ssd_split_enabled cannot be used with hot_cache_only"
+            )
+
+        try:
+            gdn_pending_size = parse_size(self.cache.gdn_ssd_pending_max_size)
+            if gdn_pending_size <= 0:
+                errors.append("gdn_ssd_pending_max_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid gdn_ssd_pending_max_size: {e}")
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -1471,6 +1499,10 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            gdn_ssd_split_enabled=self.cache.gdn_ssd_split_enabled,
+            gdn_ssd_pending_max_bytes=parse_size(
+                self.cache.gdn_ssd_pending_max_size
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

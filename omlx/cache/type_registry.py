@@ -146,6 +146,13 @@ class CacheTypeRegistry:
         )
 
     @classmethod
+    def is_arrays_family(cls, class_name: str) -> bool:
+        """Check whether a class name belongs to the ArraysCache family."""
+        if class_name == "SizedArraysCache":
+            return True
+        return cls._class_name_map.get(class_name) == CacheType.ARRAYS_CACHE
+
+    @classmethod
     def detect_cache_type(cls, cache_obj: Any) -> CacheType:
         """Detect cache type from object.
 

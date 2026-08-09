@@ -125,6 +125,94 @@ class TestBoundarySnapshotSSDStore:
     def test_load_nonexistent_returns_none(self):
         assert self.store.load("req-1", 999) is None
 
+    def test_request_path_is_opaque_and_token_count_is_validated(self):
+        escaped_request = "../../outside/request"
+        file_path = self.store._file_path(escaped_request, 1024)
+
+        assert file_path.parent.parent == self.store._snapshot_dir
+        assert file_path.parent.name != escaped_request
+        assert len(file_path.parent.name) == 64
+        assert file_path == self.store._file_path(escaped_request, 1024)
+
+        assert not self.store.save(
+            escaped_request,
+            "../../outside-token",
+            [MagicMock()],
+            _mock_extract_cache_states,
+        )
+        assert not (self.base_dir / "outside").exists()
+
+    def test_symlinked_staging_and_load_paths_are_rejected(self):
+        outside_dir = self.base_dir / "outside"
+        outside_dir.mkdir()
+        request_dir = self.store._request_dir("req-symlink")
+        request_dir.symlink_to(outside_dir, target_is_directory=True)
+
+        assert not self.store.save(
+            "req-symlink", 1024, [MagicMock()], _mock_extract_cache_states
+        )
+        assert not (outside_dir / "1024.safetensors").exists()
+
+        request_dir.unlink()
+        request_dir.mkdir()
+        outside_file = outside_dir / "snapshot.safetensors"
+        outside_file.write_text("not a snapshot")
+        self.store._file_path("req-symlink", 1024).symlink_to(outside_file)
+        load_link = self.base_dir / "outside-link.safetensors"
+        load_link.symlink_to(outside_file)
+
+        assert self.store.load("req-symlink", 1024) is None
+        assert self.store.load_file(load_link) is None
+
+    def test_inline_write_cannot_recreate_cleaned_request(self):
+        """Cleanup between inline publication and execution must win."""
+        import threading
+
+        request_id = "req-inline-race"
+        token_count = 1024
+        pw_key = (request_id, token_count)
+        tensors_raw = {"tensor": (b"x", "uint8", [1])}
+        metadata = {"num_layers": "0", "layer_info": "[]"}
+        file_path = self.store._file_path(request_id, token_count)
+        pending = {
+            "tensors_raw": tensors_raw,
+            "metadata": metadata,
+            "raw_size": 0,
+            "inline": True,
+        }
+        with self.store._pending_cond:
+            self.store._pending_writes[pw_key] = pending
+            with self.store._registry_lock:
+                self.store._file_registry.setdefault(request_id, {})[
+                    token_count
+                ] = file_path
+
+        ready = threading.Event()
+        release = threading.Event()
+        result = []
+
+        def delayed_inline():
+            ready.set()
+            release.wait(timeout=5.0)
+            result.append(
+                self.store._write_inline(
+                    pw_key, tensors_raw, metadata, file_path
+                )
+            )
+
+        thread = threading.Thread(target=delayed_inline)
+        thread.start()
+        assert ready.wait(timeout=5.0)
+
+        self.store.cleanup_request(request_id)
+        release.set()
+        thread.join(timeout=5.0)
+
+        assert result == [False]
+        assert not file_path.exists()
+        with self.store._cancelled_lock:
+            assert request_id not in self.store._cancelled_requests
+
     def test_cleanup_request_removes_files(self):
         self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
         self.store.save("req-1", 2048, [MagicMock()], _mock_extract_cache_states)
@@ -288,7 +376,7 @@ class TestBoundarySnapshotSSDStore:
         time.sleep(1.0)
 
         # No files should have been written for req-1.
-        req_dir = self.store._snapshot_dir / "req-1"
+        req_dir = self.store._request_dir("req-1")
         assert not req_dir.exists()
 
     def test_cleanup_all_drains_queue(self):
@@ -654,18 +742,10 @@ class TestBoundarySnapshotSSDStore:
                 "_cancelled_requests entry defeated the new write"
             )
 
-    def test_save_queue_full_rolls_back_pending_and_registry(self):
-        """When the writer queue is saturated, ``save()`` must roll back
-        its pending_writes / file_registry entries and return False.
-        Otherwise a later ``cleanup_request`` for the same rid would
-        count this orphan entry into ``_cancelled_requests`` while no
-        queue item ever exists to decrement it — the rid would stay
-        pinned in the cancelled set and every subsequent save under
-        that rid would be silently discarded by the ``_is_cancelled``
-        gates.
-        """
-        from unittest.mock import patch
+    def test_save_queue_full_writes_inline_without_ram_fallback(self):
+        """Queue saturation performs one synchronous durable write."""
         import queue as _queue
+        from unittest.mock import patch
 
         def _full(*args, **kwargs):
             raise _queue.Full
@@ -678,17 +758,16 @@ class TestBoundarySnapshotSSDStore:
                 _mock_extract_cache_states,
             )
 
-        assert ok is False, (
-            "save() must return False when the queue is full so the "
-            "caller knows the write was dropped"
-        )
+        assert ok is True
         with self.store._pending_lock:
             assert ("req-qfull", 2048) not in self.store._pending_writes
+            assert self.store._pending_bytes == 0
         with self.store._registry_lock:
-            assert "req-qfull" not in self.store._file_registry
+            staged = self.store._file_registry["req-qfull"][2048]
+        assert staged.exists()
 
-        # cleanup_request on the same rid must NOT pin the counter.
         self.store.cleanup_request("req-qfull")
+        assert not staged.exists()
         with self.store._cancelled_lock:
             assert "req-qfull" not in self.store._cancelled_requests
 

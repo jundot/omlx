@@ -32,11 +32,39 @@ from omlx.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
     SchedulingPolicy,
+    _BoundarySnapshotProvider,
     _PrefillState,
     _PreflightRejection,
     _StoreCacheGate,
     _VLMMTPDecodeState,
 )
+
+
+def test_boundary_snapshot_provider_removes_failed_promotion(tmp_path):
+    staged = tmp_path / "detached.safetensors"
+    staged.write_bytes(b"checkpoint")
+    store = MagicMock()
+    store.take_staged_file.return_value = staged
+    manager = MagicMock()
+    manager.cache_signature_for.return_value = "signature"
+    manager.commit_gdn_checkpoint_file.return_value = None
+    provider = _BoundarySnapshotProvider(
+        store,
+        "request",
+        [2048],
+        {},
+        paged_ssd_manager=manager,
+    )
+
+    assert not provider.commit_gdn_checkpoint(
+        2048,
+        b"source",
+        layer_cache_types=["ArraysCache"],
+        layer_meta_states=[()],
+        model_name="model",
+        block_size=2048,
+    )
+    assert not staged.exists()
 
 
 class _ParserStopFactory:

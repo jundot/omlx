@@ -165,6 +165,7 @@ class BlockAwarePrefixCache(CacheManager):
         model: Any,
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
+        gdn_ssd_split_enabled: bool = False,
     ):
         """
         Initialize block-aware prefix cache.
@@ -179,6 +180,8 @@ class BlockAwarePrefixCache(CacheManager):
         self.paged_cache = paged_cache_manager
         self.paged_ssd_cache = paged_ssd_cache_manager
         self.block_size = paged_cache_manager.block_size
+        self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._gdn_checkpoint_loader: Callable[[Any], list[dict[str, Any]] | None] | None = None
 
         # Expected number of layers for cache validation
         self.expected_num_layers = self._get_model_num_layers(model)
@@ -223,6 +226,35 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_tokens_restored = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
+        self._gdn_checkpoint_loads = 0
+        self._gdn_checkpoint_walkbacks = 0
+        self._last_gdn_restore: dict[str, Any] | None = None
+
+    def set_gdn_checkpoint_loader(
+        self,
+        loader: Callable[[Any], list[dict[str, Any]] | None] | None,
+    ) -> None:
+        """Attach the scheduler-owned recurrent checkpoint deserializer."""
+        self._gdn_checkpoint_loader = loader
+
+    def _gdn_split_layout_supported(
+        self, layer_cache_types: list[str] | tuple[str, ...] | None
+    ) -> bool:
+        """Return whether top-level ArraysCache sidecars are safe to use."""
+        if not self._gdn_ssd_split_enabled or not layer_cache_types:
+            return False
+        saw_arrays = False
+        for type_name in layer_cache_types:
+            if CacheTypeRegistry.is_arrays_family(type_name):
+                saw_arrays = True
+                continue
+            if type_name == "CacheList" or CacheTypeRegistry.is_rotating_family(type_name):
+                return False
+            if not CacheTypeRegistry.get_handler_by_class_name(
+                type_name
+            ).supports_block_slicing:
+                return False
+        return saw_arrays
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -589,6 +621,8 @@ class BlockAwarePrefixCache(CacheManager):
                 layer_state.get("meta_state", ()) for layer_state in cache_data
             ]
 
+        split_gdn_layout = self._gdn_split_layout_supported(layer_cache_types)
+
         # Get or create block table
         block_table = self.paged_cache.get_block_table(request_id)
         if not block_table:
@@ -744,6 +778,20 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 break
 
+            if split_gdn_layout and (
+                not has_boundary_snapshot
+                or not callable(
+                    getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
+                )
+            ):
+                logger.warning(
+                    "Stopping split-GDN prefix store for %s at %d tokens: "
+                    "boundary sidecar commit is unavailable",
+                    request_id,
+                    global_start,
+                )
+                break
+
             # Compute parent hash for chain-based lookup
             parent_hash = None
             if block_table.block_ids:
@@ -844,7 +892,11 @@ class BlockAwarePrefixCache(CacheManager):
                 # below does not apply when a snapshot covers this block.
                 block_boundary_tc = existing_tokens + end_idx
                 snapshot_cache_data = None
-                if boundary_snapshots and block_boundary_tc in boundary_snapshots:
+                if (
+                    not split_gdn_layout
+                    and boundary_snapshots
+                    and block_boundary_tc in boundary_snapshots
+                ):
                     snapshot_cache_data = boundary_snapshots[block_boundary_tc]
 
                 # Continuity check applies only when we will slice live
@@ -883,6 +935,7 @@ class BlockAwarePrefixCache(CacheManager):
                     model_cache_config,
                     is_last_block=is_last_block,
                     snapshot_cache_data=snapshot_cache_data,
+                    externalize_arrays=split_gdn_layout,
                 )
 
                 if block_kv_data and block.block_hash:
@@ -923,6 +976,7 @@ class BlockAwarePrefixCache(CacheManager):
                             model_name=self.paged_cache.model_name,
                             layer_cache_types=layer_cache_types,
                             layer_meta_states=block_meta,
+                            replace_existing=False,
                         )
                     else:
                         saved = self.paged_ssd_cache.save_block(
@@ -933,8 +987,71 @@ class BlockAwarePrefixCache(CacheManager):
                             layer_cache_types=layer_cache_types,
                             layer_meta_states=block_meta,
                             hot_cache_write_back=False,
+                            replace_existing=False,
                         )
                     if saved:
+                        if split_gdn_layout:
+                            commit_checkpoint = getattr(
+                                boundary_snapshots, "commit_gdn_checkpoint", None
+                            )
+                            checkpoint_committed = False
+                            if callable(commit_checkpoint):
+                                try:
+                                    checkpoint_committed = bool(
+                                        commit_checkpoint(
+                                            block_boundary_tc,
+                                            block.block_hash,
+                                            layer_cache_types=layer_cache_types,
+                                            layer_meta_states=layer_meta_states,
+                                            model_name=self.paged_cache.model_name,
+                                            block_size=self.block_size,
+                                        )
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to commit split-GDN checkpoint "
+                                        "for block %s",
+                                        block.block_id,
+                                    )
+                            if not checkpoint_committed:
+                                logger.warning(
+                                    "Rejecting split-GDN placeholder block %s "
+                                    "because its recurrent checkpoint was not "
+                                    "committed",
+                                    block.block_id,
+                                )
+                                block_removed = False
+                                delete_block = getattr(
+                                    self.paged_ssd_cache, "delete_block", None
+                                )
+                                if callable(delete_block):
+                                    try:
+                                        block_removed = bool(
+                                            delete_block(block.block_hash)
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "Failed to delete rejected split-GDN "
+                                            "block %s",
+                                            block.block_id,
+                                        )
+                                if not block_removed:
+                                    forget_block = getattr(
+                                        self.paged_ssd_cache, "forget_block", None
+                                    )
+                                    if callable(forget_block):
+                                        try:
+                                            forget_block(block.block_hash)
+                                        except Exception:
+                                            logger.exception(
+                                                "Failed to forget rejected split-GDN "
+                                                "block %s",
+                                                block.block_id,
+                                            )
+                                self.paged_cache.free_block(block.block_id)
+                                block_table.block_ids.pop()
+                                block_table.num_tokens -= len(block_tokens)
+                                break
                         blocks_saved_to_ssd += 1
                         if is_last_block:
                             tip_block_saved = True
@@ -1036,6 +1153,39 @@ class BlockAwarePrefixCache(CacheManager):
         the only durable copy.
         """
         if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        # Exact-prefix storage has no boundary-snapshot provider to commit
+        # the recurrent state. Refuse split-GDN entries before store_cache()
+        # allocates a terminal block; otherwise the terminal would contain
+        # only the structural ArraysCache placeholder and could never be
+        # reconstructed.
+        exact_layer_cache_types = None
+        if model_cache_config:
+            exact_layer_cache_types = model_cache_config.get_type_names()
+        elif (
+            cache_data
+            and isinstance(cache_data[0], dict)
+            and "state" in cache_data[0]
+        ):
+            exact_layer_cache_types = [
+                (
+                    layer_state.get(
+                        "class_name", layer_state.get("cache_type", "KVCache")
+                    )
+                    if layer_state.get("class_name", "")
+                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    else layer_state.get("cache_type", "KVCache")
+                )
+                for layer_state in cache_data
+            ]
+        if self._gdn_split_layout_supported(exact_layer_cache_types):
+            logger.info(
+                "Skipping exact-prefix store for %s: split-GDN terminal "
+                "sidecar commit is unavailable",
+                request_id,
+            )
+            self._exact_prefix_store_failures += 1
             return None
 
         block_table = self.store_cache(
@@ -1388,6 +1538,7 @@ class BlockAwarePrefixCache(CacheManager):
         model_cache_config: ModelCacheConfig | None = None,
         is_last_block: bool = False,
         snapshot_cache_data: list[dict[str, Any]] | None = None,
+        externalize_arrays: bool = False,
     ) -> list[tuple[Any, Any]] | None:
         """
         Extract tensor slices for a single block from cache data.
@@ -1803,6 +1954,13 @@ class BlockAwarePrefixCache(CacheManager):
                                 block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         else:
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                elif externalize_arrays and CacheTypeRegistry.is_arrays_family(
+                    cache_type_name
+                ):
+                    # Split-GDN blocks keep only the structural placeholder;
+                    # the complete recurrent state is committed separately
+                    # from the boundary snapshot by store_cache().
+                    block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                 else:
                     # Other non-sliceable cache (ArraysCache/MambaCache or
                     # model-specific caches such as MiniMax M3). N-tuple
@@ -2423,6 +2581,147 @@ class BlockAwarePrefixCache(CacheManager):
             if not all_block_data:
                 return None
 
+            # Split-GDN restore: select the newest endpoint whose KV prefix is
+            # contiguous and whose recurrent sidecar matches the live cache
+            # signature.  Only that one sidecar is materialized; historical
+            # GDN checkpoints stay on SSD.
+            if self._gdn_split_layout_supported(layer_cache_types):
+                # This is a per-attempt diagnostic.  Clear the previous
+                # successful restore before looking for a new endpoint so an
+                # admin poll cannot attribute an old endpoint to a miss.
+                self._last_gdn_restore = None
+                signature_builder = getattr(
+                    self.paged_ssd_cache, "cache_signature_for", None
+                )
+                sidecar_getter = getattr(
+                    self.paged_ssd_cache, "get_gdn_checkpoint_file", None
+                )
+                if not callable(signature_builder) or not callable(sidecar_getter):
+                    logger.warning(
+                        "Split GDN cache enabled but sidecar manager API is unavailable"
+                    )
+                    return None
+
+                cache_signature = signature_builder(
+                    model_name=self.paged_cache.model_name,
+                    num_layers=len(layer_cache_types or []),
+                    block_size=self.block_size,
+                    layer_cache_types=layer_cache_types,
+                )
+                chosen_idx = None
+                chosen_snapshot = None
+                chosen_diagnostic = None
+                for idx in range(len(block_table.block_ids) - 1, -1, -1):
+                    block = self.paged_cache.allocated_blocks.get(
+                        block_table.block_ids[idx]
+                    )
+                    if block is None or block.block_hash is None:
+                        continue
+                    checkpoint_path = sidecar_getter(
+                        block.block_hash, cache_signature
+                    )
+                    if checkpoint_path is None:
+                        continue
+                    if self._gdn_checkpoint_loader is None:
+                        logger.warning(
+                            "Split GDN cache enabled without checkpoint loader"
+                        )
+                        return None
+                    load_started = time.perf_counter()
+                    snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                    load_latency_ms = (time.perf_counter() - load_started) * 1000.0
+                    if snapshot is None:
+                        forgetter = getattr(
+                            self.paged_ssd_cache,
+                            "forget_gdn_checkpoint",
+                            None,
+                        )
+                        if callable(forgetter):
+                            forgetter(block.block_hash, cache_signature)
+                        continue
+                    chosen_idx = idx
+                    chosen_snapshot = snapshot
+                    chosen_endpoint_tokens = sum(
+                        self.paged_cache.allocated_blocks[bid].token_count
+                        for bid in block_table.block_ids[: idx + 1]
+                        if bid in self.paged_cache.allocated_blocks
+                    )
+                    source_hash = block.block_hash
+                    chosen_diagnostic = {
+                        "chosen_endpoint_tokens": chosen_endpoint_tokens,
+                        "checkpoint_load_latency_ms": round(load_latency_ms, 3),
+                        "walkback_blocks": len(all_block_data) - idx - 1,
+                        # Only a short content hash is exposed; the sidecar
+                        # path remains an internal implementation detail.
+                        "source_block_hash": (
+                            source_hash.hex()[:16]
+                            if isinstance(source_hash, (bytes, bytearray))
+                            else str(source_hash)[:16]
+                        ),
+                    }
+                    break
+
+                if chosen_idx is None or chosen_snapshot is None:
+                    logger.info(
+                        "Split GDN restore found no compatible recurrent checkpoint"
+                    )
+                    return None
+
+                if chosen_idx + 1 < len(all_block_data):
+                    self._gdn_checkpoint_walkbacks += (
+                        len(all_block_data) - chosen_idx - 1
+                    )
+                    for bid in block_table.block_ids[chosen_idx + 1 :]:
+                        self.paged_cache.free_block(bid)
+                    all_block_data = all_block_data[: chosen_idx + 1]
+                    block_table.block_ids = block_table.block_ids[: chosen_idx + 1]
+                    block_table.num_tokens = sum(
+                        self.paged_cache.allocated_blocks[bid].token_count
+                        for bid in block_table.block_ids
+                        if bid in self.paged_cache.allocated_blocks
+                    )
+                    valid_token_count = block_table.num_tokens
+                    all_block_meta_states = all_block_meta_states[: chosen_idx + 1]
+
+                if chosen_idx < len(all_block_meta_states):
+                    last_block_meta_states = all_block_meta_states[chosen_idx]
+
+                # Overlay only Arrays-family layer payloads on the endpoint
+                # block. Sliceable KV layers continue to come exclusively
+                # from the main hot/SSD block chain.
+                endpoint_data = all_block_data[-1]
+                endpoint_meta = list(last_block_meta_states or [])
+                for layer_idx, type_name in enumerate(layer_cache_types or []):
+                    if not CacheTypeRegistry.is_arrays_family(type_name):
+                        continue
+                    if layer_idx >= len(chosen_snapshot):
+                        return None
+                    layer_state = chosen_snapshot[layer_idx]
+                    if not isinstance(layer_state, dict):
+                        return None
+                    state = layer_state.get("state", ())
+                    if not isinstance(state, (list, tuple)) or len(state) < 2:
+                        return None
+                    if len(state) == 2:
+                        endpoint_data[layer_idx] = (state[0], state[1])
+                    else:
+                        endpoint_data[layer_idx] = (
+                            "__nstate__",
+                            type_name,
+                            list(state),
+                        )
+                    while len(endpoint_meta) <= layer_idx:
+                        endpoint_meta.append(())
+                    endpoint_meta[layer_idx] = layer_state.get("meta_state", ())
+                last_block_meta_states = endpoint_meta
+                if all_block_meta_states:
+                    all_block_meta_states[-1] = endpoint_meta
+                # Publish the per-attempt diagnostic only after the snapshot
+                # has passed structural validation and has been overlaid on
+                # every Arrays-family layer.  A malformed sidecar must not be
+                # observable as a successful restore.
+                self._last_gdn_restore = chosen_diagnostic
+                self._gdn_checkpoint_loads += 1
             # Get number of layers from first block
             num_layers = len(all_block_data[0])
             if num_layers == 0:
@@ -3941,6 +4240,13 @@ class BlockAwarePrefixCache(CacheManager):
             "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
             "exact_prefix_stores": self._exact_prefix_stores,
             "exact_prefix_store_failures": self._exact_prefix_store_failures,
+            "gdn_checkpoint_loads": self._gdn_checkpoint_loads,
+            "gdn_checkpoint_walkbacks": self._gdn_checkpoint_walkbacks,
+            "gdn_last_restore": (
+                dict(self._last_gdn_restore)
+                if self._last_gdn_restore is not None
+                else None
+            ),
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -3961,6 +4267,9 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_tokens_restored = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
+        self._gdn_checkpoint_loads = 0
+        self._gdn_checkpoint_walkbacks = 0
+        self._last_gdn_restore = None
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:

@@ -110,6 +110,8 @@ class PagedSSDCacheConfig:
     cache_dir: Optional[Path] = None
     max_size: str = "100GB"
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    gdn_ssd_split_enabled: bool = False
+    gdn_ssd_pending_max_size: str = "512MB"
 
     @property
     def max_size_bytes(self) -> int:
@@ -180,6 +182,13 @@ class OMLXConfig:
 
         # Paged SSD cache settings
         config.paged_ssd_cache.hot_cache_only = os.getenv("OMLX_HOT_CACHE_ONLY", "false").lower() == "true"
+        config.paged_ssd_cache.gdn_ssd_split_enabled = os.getenv(
+            "OMLX_GDN_SSD_SPLIT_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        config.paged_ssd_cache.gdn_ssd_pending_max_size = os.getenv(
+            "OMLX_GDN_SSD_PENDING_MAX_SIZE",
+            config.paged_ssd_cache.gdn_ssd_pending_max_size,
+        )
         paged_ssd_dir = os.getenv("OMLX_PAGED_SSD_CACHE_DIR")
         if paged_ssd_dir:
             config.paged_ssd_cache.enabled = True
@@ -297,5 +306,18 @@ class OMLXConfig:
         if self.paged_ssd_cache.enabled:
             if not self.paged_ssd_cache.cache_dir:
                 errors.append("Paged SSD cache enabled but no cache_dir specified")
+        if (
+            self.paged_ssd_cache.gdn_ssd_split_enabled
+            and self.paged_ssd_cache.hot_cache_only
+        ):
+            errors.append(
+                "gdn_ssd_split_enabled cannot be used with hot_cache_only"
+            )
+        try:
+            pending_size = parse_size(self.paged_ssd_cache.gdn_ssd_pending_max_size)
+            if pending_size <= 0:
+                errors.append("gdn_ssd_pending_max_size must be positive")
+        except (AttributeError, TypeError, ValueError) as exc:
+            errors.append(f"Invalid gdn_ssd_pending_max_size: {exc}")
 
         return errors

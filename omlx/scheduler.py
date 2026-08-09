@@ -22,7 +22,7 @@ import time
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1433,6 +1433,10 @@ class SchedulerConfig:
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
+    # Store top-level ArraysCache recurrent state as SSD sidecars while the
+    # ordinary block retains only KV/sliceable payloads.
+    gdn_ssd_split_enabled: bool = False
+    gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -1481,11 +1485,13 @@ class _BoundarySnapshotProvider:
         request_id: str,
         valid_tcs: list[int],
         in_memory_snapshots: dict[int, Any],
+        paged_ssd_manager: Any | None = None,
     ) -> None:
         self._store = store
         self._request_id = request_id
         self._valid_tcs = set(valid_tcs)
         self._in_memory = in_memory_snapshots
+        self._paged_ssd_manager = paged_ssd_manager
 
     def __contains__(self, tc: int) -> bool:
         return tc in self._valid_tcs
@@ -1510,6 +1516,46 @@ class _BoundarySnapshotProvider:
             snap = self._in_memory.get(tc)
             if snap is not None:
                 yield snap
+
+    def commit_gdn_checkpoint(
+        self,
+        token_count: int,
+        source_block_hash: bytes,
+        *,
+        layer_cache_types: list[str] | None,
+        layer_meta_states: list[Any] | None,
+        model_name: str,
+        block_size: int,
+    ) -> bool:
+        """Promote one request-local boundary snapshot to durable sidecar storage."""
+        if self._store is None or self._paged_ssd_manager is None:
+            return False
+        staged_path = self._store.take_staged_file(self._request_id, token_count)
+        if staged_path is None:
+            return False
+        try:
+            signature = self._paged_ssd_manager.cache_signature_for(
+                model_name=model_name,
+                num_layers=len(layer_cache_types or []),
+                block_size=block_size,
+                layer_cache_types=layer_cache_types or [],
+            )
+            committed = self._paged_ssd_manager.commit_gdn_checkpoint_file(
+                source_block_hash,
+                staged_path,
+                token_count=token_count,
+                model_name=model_name,
+                cache_signature=signature,
+                block_size=block_size,
+            )
+            if committed is None:
+                with suppress(OSError):
+                    staged_path.unlink()
+            return committed is not None
+        except Exception:
+            with suppress(OSError):
+                staged_path.unlink()
+            return False
 
 
 class Scheduler:
@@ -1898,6 +1944,7 @@ class Scheduler:
             self.block_aware_cache = BlockAwarePrefixCache(
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
+                gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -6063,6 +6110,7 @@ class Scheduler:
             request_id=request_id,
             valid_tcs=provider_tcs,
             in_memory_snapshots=extracted_in_memory,
+            paged_ssd_manager=self.paged_ssd_cache_manager,
         )
 
         token_sequence = (
@@ -11685,6 +11733,7 @@ class Scheduler:
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_budget=self.config.hot_cache_budget,
+                gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
                 expected_block_size=self.config.paged_cache_block_size,
@@ -11710,8 +11759,13 @@ class Scheduler:
             if BoundarySnapshotSSDStore is not None and not self.config.hot_cache_only:
                 try:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
-                        base_dir=Path(self.config.paged_ssd_cache_dir)
+                        base_dir=Path(self.config.paged_ssd_cache_dir),
+                        pending_max_bytes=self.config.gdn_ssd_pending_max_bytes,
                     )
+                    if self.block_aware_cache is not None:
+                        self.block_aware_cache.set_gdn_checkpoint_loader(
+                            self._boundary_snapshot_store.load_file
+                        )
                 except Exception as e:
                     logger.debug(
                         "Failed to initialize boundary snapshot SSD store: %s", e

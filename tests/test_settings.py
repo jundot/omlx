@@ -406,6 +406,8 @@ class TestCacheSettings:
         assert result == {
             "enabled": False,
             "hot_cache_only": False,
+            "gdn_ssd_split_enabled": False,
+            "gdn_ssd_pending_max_size": "512MB",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",

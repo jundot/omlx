@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -162,7 +163,7 @@ _CACHE_FORMAT_VERSION = "3"
 # sees a uniform shape. New writes use V3 unless a PoolingCache block carries
 # the V4 append-only delta representation.
 _READABLE_CACHE_FORMAT_VERSIONS = frozenset(
-    {"2", "3", POOLING_CACHE_DELTA_FORMAT_VERSION}
+    {"2", "3", "5", POOLING_CACHE_DELTA_FORMAT_VERSION}
 )
 
 
@@ -234,6 +235,7 @@ def _cache_compat_signature(
     layer_cache_types: list[str] | None = None,
     turboquant_kv_bits: float | None = None,
     cachelist_subtypes: dict[str, list[str]] | None = None,
+    payload_layout: str | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -257,7 +259,29 @@ def _cache_compat_signature(
     # so other signatures stay byte-identical to the previous format.
     if cachelist_subtypes:
         payload["cachelist_subtypes"] = cachelist_subtypes
+    if payload_layout is not None:
+        payload["payload_layout"] = payload_layout
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def cache_signature_for(
+    *,
+    model_name: str,
+    num_layers: int,
+    block_size: int,
+    layer_cache_types: list[str],
+    turboquant_kv_bits: float | None = None,
+    cachelist_subtypes: dict[str, list[str]] | None = None,
+) -> str:
+    """Build the legacy/embedded cache compatibility signature."""
+    return _cache_compat_signature(
+        model_name=model_name,
+        num_layers=num_layers,
+        block_size=block_size,
+        layer_cache_types=layer_cache_types,
+        turboquant_kv_bits=turboquant_kv_bits,
+        cachelist_subtypes=cachelist_subtypes,
+    )
 
 
 def _signature_turboquant_bits(cache_signature: str) -> float | None:
@@ -1169,6 +1193,140 @@ class PagedSSDCacheIndex:
 
 
 @dataclass
+class GDNCheckpointMetadata:
+    """Metadata for a durable GDN checkpoint sidecar.
+
+    Sidecars intentionally have no safetensors payload inspection path.  The
+    source hash and signature digest are encoded in the directory/file name;
+    size and LRU state come from ``stat`` and are kept in this in-memory index.
+    The descriptive fields are retained for the lifetime of the manager for
+    diagnostics, but are not required to restore the sidecar.
+    """
+
+    source_block_hash: bytes
+    cache_signature_digest: str
+    file_path: Path
+    file_size: int
+    token_count: int
+    model_name: str
+    block_size: int
+    created_at: float
+    last_access: float
+
+    @property
+    def key(self) -> tuple[str, bytes]:
+        return (self.cache_signature_digest, self.source_block_hash)
+
+    def touch(self) -> None:
+        self.last_access = time.time()
+
+
+class GDNCheckpointIndex:
+    """Thread-safe size/LRU index for durable GDN sidecar files."""
+
+    def __init__(self, max_size_bytes: int):
+        self._index: dict[tuple[str, bytes], GDNCheckpointMetadata] = {}
+        self._lru: OrderedDict[tuple[str, bytes], float] = OrderedDict()
+        self._total_size = 0
+        self._max_size = max_size_bytes
+        self._lock = threading.RLock()
+
+    def add(self, metadata: GDNCheckpointMetadata) -> None:
+        with self._lock:
+            key = metadata.key
+            old = self._index.pop(key, None)
+            if old is not None:
+                self._total_size -= old.file_size
+                self._lru.pop(key, None)
+            self._index[key] = metadata
+            self._lru[key] = metadata.last_access
+            self._total_size += metadata.file_size
+
+    def get(
+        self, source_block_hash: bytes, cache_signature_digest: str
+    ) -> GDNCheckpointMetadata | None:
+        with self._lock:
+            return self._index.get((cache_signature_digest, source_block_hash))
+
+    def remove(
+        self, source_block_hash: bytes, cache_signature_digest: str
+    ) -> GDNCheckpointMetadata | None:
+        with self._lock:
+            key = (cache_signature_digest, source_block_hash)
+            metadata = self._index.pop(key, None)
+            if metadata is None:
+                return None
+            self._lru.pop(key, None)
+            self._total_size -= metadata.file_size
+            return metadata
+
+    def remove_key(
+        self, key: tuple[str, bytes]
+    ) -> GDNCheckpointMetadata | None:
+        with self._lock:
+            metadata = self._index.pop(key, None)
+            if metadata is None:
+                return None
+            self._lru.pop(key, None)
+            self._total_size -= metadata.file_size
+            return metadata
+
+    def touch(self, source_block_hash: bytes, cache_signature_digest: str) -> None:
+        with self._lock:
+            key = (cache_signature_digest, source_block_hash)
+            metadata = self._index.get(key)
+            if metadata is None:
+                return
+            metadata.touch()
+            self._lru.move_to_end(key)
+            self._lru[key] = metadata.last_access
+
+    def get_lru_entries(self, count: int) -> list[GDNCheckpointMetadata]:
+        with self._lock:
+            result = []
+            for key in list(self._lru)[:count]:
+                metadata = self._index.get(key)
+                if metadata is not None:
+                    result.append(metadata)
+            return result
+
+    def sort_lru_by_last_access(self) -> None:
+        with self._lock:
+            self._lru = OrderedDict(
+                sorted(
+                    (
+                        (key, self._index[key].last_access)
+                        for key in self._lru
+                        if key in self._index
+                    ),
+                    key=lambda item: (item[1], item[0][0], item[0][1]),
+                )
+            )
+
+    def contains(self, source_block_hash: bytes, cache_signature_digest: str) -> bool:
+        with self._lock:
+            return (cache_signature_digest, source_block_hash) in self._index
+
+    @property
+    def total_size(self) -> int:
+        with self._lock:
+            return self._total_size
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._index)
+
+    def get_all_keys(self) -> list[tuple[str, bytes]]:
+        with self._lock:
+            return list(self._index)
+
+    def get_all_metadata(self) -> list[GDNCheckpointMetadata]:
+        with self._lock:
+            return list(self._index.values())
+
+
+@dataclass
 class _HotCacheBudgetEntry:
     owner: Any
     block_hash: bytes
@@ -1348,6 +1506,8 @@ class PagedSSDCacheManager(CacheManager):
 
     # Subdirectory prefixes (hash first char)
     SUBDIR_CHARS = "0123456789abcdef"
+    _GDN_SIDECAR_DIRNAME = "_gdn_sidecars"
+    _GDN_SIGNATURE_DIGEST_LENGTH = 64
 
     def __init__(
         self,
@@ -1362,6 +1522,7 @@ class PagedSSDCacheManager(CacheManager):
         expected_block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
         expected_kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
         expected_layer_cache_types: list[str] | None = None,
+        gdn_ssd_split_enabled: bool = False,
     ):
         """
         Initialize the SSD cache manager.
@@ -1408,11 +1569,16 @@ class PagedSSDCacheManager(CacheManager):
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
+        self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
         self._expected_block_size = expected_block_size
         self._expected_layer_cache_types = expected_layer_cache_types
+        self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._payload_layout = (
+            "split_recurrent_v1" if self._gdn_ssd_split_enabled else "embedded"
+        )
         # TurboQuant bit depth requests will quantize at; learned together
         # with the layer signature via ``set_expected_layer_signature``
         # (the depth is only known once the engine has applied the model's
@@ -1768,13 +1934,57 @@ class PagedSSDCacheManager(CacheManager):
         filename = f"{hash_hex}.safetensors"
         return self._cache_dir / subdir / filename
 
+    @staticmethod
+    def _gdn_signature_digest(cache_signature: str) -> str:
+        """Return the stable directory component for a cache signature."""
+        return hashlib.sha256(cache_signature.encode("utf-8")).hexdigest()
+
+    def _get_gdn_sidecar_path(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> Path:
+        """Return the durable sidecar path for a source block/signature pair."""
+        signature_digest = self._gdn_signature_digest(cache_signature)
+        return (
+            self._cache_dir
+            / self._GDN_SIDECAR_DIRNAME
+            / signature_digest
+            / f"{source_block_hash.hex()}.safetensors"
+        )
+
+    def _is_safe_gdn_sidecar_file(self, file_path: Path) -> bool:
+        """Reject sidecars that escape the cache root through symlinks."""
+        if self._cache_dir is None:
+            return False
+        sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        if (
+            sidecar_root.is_symlink()
+            or file_path.parent.is_symlink()
+            or file_path.is_symlink()
+        ):
+            return False
+        try:
+            file_path.resolve(strict=True).relative_to(
+                self._cache_dir.resolve(strict=True)
+            )
+        except (OSError, ValueError):
+            return False
+        return file_path.is_file()
+
     def _tracked_ssd_size(self) -> int:
         """Return all SSD cache bytes tracked for this shared cache directory."""
-        return self._index.total_size + self._incompatible_index.total_size
+        return (
+            self._index.total_size
+            + self._incompatible_index.total_size
+            + self._gdn_sidecar_index.total_size
+        )
 
     def _tracked_ssd_count(self) -> int:
         """Return compatible plus incompatible tracked SSD cache file count."""
-        return self._index.count + self._incompatible_index.count
+        return (
+            self._index.count
+            + self._incompatible_index.count
+            + self._gdn_sidecar_index.count
+        )
 
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
@@ -1816,16 +2026,25 @@ class PagedSSDCacheManager(CacheManager):
 
         self._index.sort_lru_by_last_access()
         self._incompatible_index.sort_lru_by_last_access()
+        sidecars_indexed, sidecars_skipped, sidecars_bytes = (
+            self._scan_existing_gdn_sidecars()
+        )
+        self._gdn_sidecar_index.sort_lru_by_last_access()
 
         log_msg = (
             f"SSD cache scan complete: scanned={scanned}, indexed={indexed}, "
-            f"errors={errors}, total_size={format_bytes(self._index.total_size)}"
+            f"errors={errors}, total_size={format_bytes(self._tracked_ssd_size())}, "
+            f"gdn_sidecars={sidecars_indexed}"
         )
         if skipped_incompatible > 0:
             log_msg += (
                 f", skipped_incompatible={skipped_incompatible} blocks "
                 f"({format_bytes(skipped_incompatible_bytes)})"
             )
+        if sidecars_skipped > 0:
+            log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
+        if sidecars_bytes > 0:
+            log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
@@ -1833,6 +2052,174 @@ class PagedSSDCacheManager(CacheManager):
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
             self._enforce_size_limit_for_new_block(0, unbounded=True)
+
+    def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
+        """Index existing sidecars from path/stat metadata without loading them."""
+        if self._cache_dir is None:
+            return 0, 0, 0
+        root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        if root.is_symlink() or not root.is_dir():
+            return 0, 0, 0
+
+        indexed = skipped = total_bytes = 0
+        for signature_dir in root.iterdir():
+            if signature_dir.is_symlink() or not signature_dir.is_dir():
+                continue
+            digest = signature_dir.name
+            if len(digest) != self._GDN_SIGNATURE_DIGEST_LENGTH:
+                skipped += 1
+                continue
+            try:
+                bytes.fromhex(digest)
+            except ValueError:
+                skipped += 1
+                continue
+            for file_path in signature_dir.glob("*.safetensors"):
+                try:
+                    source_hash = bytes.fromhex(file_path.stem)
+                    if (
+                        not source_hash
+                        or file_path.is_symlink()
+                        or not file_path.is_file()
+                    ):
+                        raise ValueError("invalid sidecar source hash or file")
+                    stat_result = file_path.stat()
+                    self._gdn_sidecar_index.add(
+                        GDNCheckpointMetadata(
+                            source_block_hash=source_hash,
+                            cache_signature_digest=digest,
+                            file_path=file_path,
+                            file_size=stat_result.st_size,
+                            token_count=0,
+                            model_name="",
+                            block_size=0,
+                            created_at=stat_result.st_ctime,
+                            last_access=stat_result.st_mtime,
+                        )
+                    )
+                    indexed += 1
+                    total_bytes += stat_result.st_size
+                except (OSError, ValueError) as exc:
+                    skipped += 1
+                    logger.debug("Skipping GDN sidecar %s: %s", file_path, exc)
+        return indexed, skipped, total_bytes
+
+    def commit_gdn_checkpoint_file(
+        self,
+        source_block_hash: bytes,
+        staged_path: Path,
+        *,
+        token_count: int,
+        model_name: str,
+        cache_signature: str,
+        block_size: int,
+    ) -> Path | None:
+        """Atomically promote a request-local recurrent snapshot to SSD."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return None
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return None
+        staged_path = Path(staged_path)
+        try:
+            staged_stat = staged_path.stat()
+            if staged_path.is_symlink() or not staged_path.is_file():
+                return None
+        except OSError:
+            return None
+
+        signature_digest = self._gdn_signature_digest(cache_signature)
+        final_path = self._get_gdn_sidecar_path(source_block_hash, cache_signature)
+        with self._lock:
+            try:
+                sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+                sidecar_root.mkdir(parents=True, exist_ok=True)
+                if (
+                    sidecar_root.is_symlink()
+                    or sidecar_root.resolve(strict=True).parent
+                    != self._cache_dir.resolve(strict=True)
+                ):
+                    logger.warning("Rejecting unsafe GDN sidecar root")
+                    return None
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    final_path.parent.is_symlink()
+                    or final_path.parent.resolve(strict=True).parent
+                    != sidecar_root.resolve(strict=True)
+                ):
+                    logger.warning("Rejecting unsafe GDN sidecar destination")
+                    return None
+                if staged_stat.st_dev != final_path.parent.stat().st_dev:
+                    logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
+                    return None
+                old = self._gdn_sidecar_index.get(
+                    source_block_hash, signature_digest
+                )
+                old_size = old.file_size if old is not None else 0
+                self._enforce_size_limit_for_new_block(
+                    max(0, staged_stat.st_size - old_size)
+                )
+                # Replacing an existing path is atomic on the same filesystem.
+                # Keep the old file and index entry intact until promotion
+                # succeeds so a failed write cannot destroy a valid checkpoint.
+                os.replace(staged_path, final_path)
+                committed_at = time.time()
+                self._gdn_sidecar_index.add(
+                    GDNCheckpointMetadata(
+                        source_block_hash=source_block_hash,
+                        cache_signature_digest=signature_digest,
+                        file_path=final_path,
+                        file_size=staged_stat.st_size,
+                        token_count=int(token_count),
+                        model_name=model_name,
+                        block_size=int(block_size),
+                        created_at=committed_at,
+                        last_access=committed_at,
+                    )
+                )
+                return final_path
+            except OSError as exc:
+                logger.warning("Failed to commit GDN sidecar: %s", exc)
+                return None
+
+    def get_gdn_checkpoint_file(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> Path | None:
+        """Return an indexed sidecar path and update its LRU timestamp."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return None
+        digest = self._gdn_signature_digest(cache_signature)
+        with self._lock:
+            metadata = self._gdn_sidecar_index.get(source_block_hash, digest)
+            if (
+                metadata is None
+                or not self._is_safe_gdn_sidecar_file(metadata.file_path)
+            ):
+                if metadata is not None:
+                    self._gdn_sidecar_index.remove(source_block_hash, digest)
+                return None
+            self._gdn_sidecar_index.touch(source_block_hash, digest)
+            with contextlib.suppress(OSError):
+                os.utime(metadata.file_path, None)
+            return metadata.file_path
+
+    def has_gdn_checkpoint(self, source_block_hash: bytes, cache_signature: str) -> bool:
+        return self.get_gdn_checkpoint_file(source_block_hash, cache_signature) is not None
+
+    def forget_gdn_checkpoint(self, source_block_hash: bytes, cache_signature: str) -> bool:
+        """Remove one durable recurrent sidecar."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return False
+        digest = self._gdn_signature_digest(cache_signature)
+        with self._lock:
+            metadata = self._gdn_sidecar_index.remove(source_block_hash, digest)
+            if metadata is None:
+                return False
+            try:
+                metadata.file_path.unlink(missing_ok=True)
+                return True
+            except OSError:
+                self._gdn_sidecar_index.add(metadata)
+                return False
 
     def _is_compatible_block(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a block can be indexed for this manager."""
@@ -1875,6 +2262,11 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 not expected_signature or metadata.cache_signature == expected_signature
             )
+
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("payload_layout", "embedded") != self._payload_layout:
+            return False
 
         if self._expected_model_name:
             if payload.get("model_name", "") != self._expected_model_name:
@@ -1947,6 +2339,18 @@ class PagedSSDCacheManager(CacheManager):
     def signature_mismatch_reason(self, cache_signature: str) -> str | None:
         """Describe the first expectation-gated signature mismatch."""
         cache_signature = cache_signature or ""
+        try:
+            signature_payload = json.loads(cache_signature) if cache_signature else {}
+        except (TypeError, ValueError):
+            signature_payload = {}
+        if not isinstance(signature_payload, dict):
+            return "invalid cache signature payload"
+        actual_layout = signature_payload.get("payload_layout", "embedded")
+        if actual_layout != self._payload_layout:
+            return (
+                f"payload layout: expected {self._payload_layout}, "
+                f"got {actual_layout}"
+            )
         if not self._signature_bits_match(cache_signature):
             actual_bits = _signature_turboquant_bits(cache_signature)
             actual = "missing" if actual_bits is None else str(actual_bits)
@@ -1999,6 +2403,36 @@ class PagedSSDCacheManager(CacheManager):
             layer_cache_types=self._expected_layer_cache_types,
             turboquant_kv_bits=self._expected_turboquant_kv_bits,
             cachelist_subtypes=self._expected_cachelist_subtypes,
+            payload_layout=self._payload_layout,
+        )
+
+    def cache_signature_for(
+        self,
+        *,
+        model_name: str,
+        num_layers: int,
+        block_size: int,
+        layer_cache_types: list[str],
+        turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
+    ) -> str:
+        """Build the exact compatibility signature used by this manager."""
+        return _cache_compat_signature(
+            model_name=model_name,
+            num_layers=num_layers,
+            block_size=block_size,
+            layer_cache_types=layer_cache_types,
+            turboquant_kv_bits=(
+                self._expected_turboquant_kv_bits
+                if turboquant_kv_bits is None
+                else turboquant_kv_bits
+            ),
+            cachelist_subtypes=(
+                self._expected_cachelist_subtypes
+                if cachelist_subtypes is None
+                else cachelist_subtypes
+            ),
+            payload_layout=self._payload_layout,
         )
 
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
@@ -2227,6 +2661,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types: list[str] | None = None,
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
+        replace_existing: bool = False,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -2272,7 +2707,11 @@ class PagedSSDCacheManager(CacheManager):
         # layout. Replace an indexed block written by an older cache schema
         # instead of treating it as an unconditional hit (#2487).
         indexed_metadata = self._index.get(block_hash)
-        if indexed_metadata is not None and self._is_compatible_block(indexed_metadata):
+        if (
+            indexed_metadata is not None
+            and not replace_existing
+            and self._is_compatible_block(indexed_metadata)
+        ):
             self._index.touch(block_hash)
             self._stats["hits"] += 1
             return True
@@ -2472,12 +2911,15 @@ class PagedSSDCacheManager(CacheManager):
                 cachelist_subtypes=_block_cachelist_subtypes(
                     cache_data, layer_cache_types, layer_meta_states
                 ),
+                payload_layout=self._payload_layout,
             )
 
             # Prepare metadata
             metadata = {
                 "omlx_cache_format_version": (
-                    POOLING_CACHE_DELTA_FORMAT_VERSION
+                    "5"
+                    if self._gdn_ssd_split_enabled
+                    else POOLING_CACHE_DELTA_FORMAT_VERSION
                     if has_pooling_cache_delta
                     else _CACHE_FORMAT_VERSION
                 ),
@@ -2487,6 +2929,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": model_name,
                 "block_size": str(block_size),
                 "cache_signature": cache_signature,
+                "payload_layout": self._payload_layout,
                 "created_at": str(time.time()),
             }
 
@@ -3592,9 +4035,9 @@ class PagedSSDCacheManager(CacheManager):
         self,
         target_size: int,
         max_count: int | None = None,
-    ) -> list[tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata]]:
+    ) -> list[tuple[Any, Any]]:
         """Remove oldest tracked SSD entries from their indexes until target."""
-        evicted: list[tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata]] = []
+        evicted: list[tuple[Any, Any]] = []
 
         while self._tracked_ssd_size() > target_size:
             if max_count is not None and len(evicted) >= max_count:
@@ -3602,24 +4045,23 @@ class PagedSSDCacheManager(CacheManager):
 
             compatible = self._index.get_lru_entries(1)
             incompatible = self._incompatible_index.get_lru_entries(1)
-            if not compatible and not incompatible:
+            sidecars = self._gdn_sidecar_index.get_lru_entries(1)
+            if not compatible and not incompatible and not sidecars:
                 break
 
-            if compatible and incompatible:
-                if incompatible[0].last_access <= compatible[0].last_access:
-                    source_index = self._incompatible_index
-                    candidate = incompatible[0]
-                else:
-                    source_index = self._index
-                    candidate = compatible[0]
-            elif incompatible:
-                source_index = self._incompatible_index
-                candidate = incompatible[0]
-            else:
-                source_index = self._index
-                candidate = compatible[0]
-
-            metadata = source_index.remove(candidate.block_hash)
+            candidates = []
+            if compatible:
+                candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))
+            if incompatible:
+                candidates.append((incompatible[0].last_access, 1, self._incompatible_index, incompatible[0]))
+            if sidecars:
+                candidates.append((sidecars[0].last_access, 2, self._gdn_sidecar_index, sidecars[0]))
+            _, _, source_index, candidate = min(candidates, key=lambda item: (item[0], item[1]))
+            metadata = (
+                source_index.remove_key(candidate.key)
+                if source_index is self._gdn_sidecar_index
+                else source_index.remove(candidate.block_hash)
+            )
             if metadata is not None:
                 evicted.append((source_index, metadata))
 
@@ -3725,8 +4167,8 @@ class PagedSSDCacheManager(CacheManager):
 
     def _unlink_evicted(
         self,
-        metadata: PagedSSDBlockMetadata,
-        source_index: PagedSSDCacheIndex | None = None,
+        metadata: Any,
+        source_index: Any | None = None,
     ) -> None:
         """Delete an evicted block file from disk.
 
@@ -3828,6 +4270,16 @@ class PagedSSDCacheManager(CacheManager):
             for block_hash in dict.fromkeys(block_hashes):
                 if self.delete_block(block_hash):
                     count += 1
+
+            for key in list(self._gdn_sidecar_index.get_all_keys()):
+                metadata = self._gdn_sidecar_index.remove_key(key)
+                if metadata is None:
+                    continue
+                try:
+                    metadata.file_path.unlink(missing_ok=True)
+                    count += 1
+                except OSError:
+                    self._gdn_sidecar_index.add(metadata)
 
             logger.info(f"Cleared SSD cache: deleted {count} files")
             return count
@@ -3963,8 +4415,20 @@ class PagedSSDCacheManager(CacheManager):
                 "hot_cache_max_formatted": format_bytes(
                     self._effective_hot_cache_max_bytes()
                 ),
+                "gdn_sidecar_count": self._gdn_sidecar_index.count,
+                "gdn_sidecar_size_bytes": self._gdn_sidecar_index.total_size,
                 **self._stats,
             }
+
+    @property
+    def gdn_sidecar_count(self) -> int:
+        """Number of durable recurrent checkpoint files in the SSD tier."""
+        return self._gdn_sidecar_index.count
+
+    @property
+    def gdn_sidecar_size_bytes(self) -> int:
+        """Tracked durable recurrent checkpoint bytes."""
+        return self._gdn_sidecar_index.total_size
 
     def close(self) -> None:
         """Close the SSD cache manager, flushing hot cache and pending writes."""
