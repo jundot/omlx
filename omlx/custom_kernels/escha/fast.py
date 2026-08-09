@@ -108,6 +108,7 @@ if (lane == 0u) {
     dst[row * uint(OUT) + o] = acc;
 }"""
 _kernel_cache: dict[tuple[int, int, int], object] = {}
+_fused_cache: dict = {}
 _qmv_cache: dict[tuple[int, int, int], object] = {}
 _IMPORT_ERROR = None
 
@@ -224,6 +225,38 @@ def eschamoe_gather_qmv(xh, code, eids, K):
         output_dtypes=[mx.float32],
     )
     return out
+
+
+
+_FUSED_HDR = '\n\ninline void had_shared(threadgroup float* sh, uint off, uint nb, uint lane, uint grp) {\n    uint b = grp % nb;                       // uniform barrier participation\n    uint base = off + b * 128u;\n    for (uint s = 1u; s < 128u; s <<= 1u) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        float v = sh[base + lane];\n        float o = sh[base + (lane ^ s)];\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        sh[base + lane] = (lane & s) ? o - v : v + o;\n    }\n}\n\ninline float2 pair_vals(const device short* tile, uint t, uint Kk, constant uint* cb) {\n    uint b0 = 2u * t * Kk + Kk + 256u * Kk - 16u;\n    uint b2 = b0 + Kk + 16u;\n    uint i0 = (b0 / 32u) % uint(8 * Kk);\n    uint i1w = (b2 - 1u) / 32u;\n    uint s1 = (i1w + 1u) * 32u - b2;\n    uint i1 = i1w % uint(8 * Kk);\n    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);\n    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);\n    ulong pair = (ulong(w0) << 32) | ulong(wb);\n    uint w1 = uint(pair >> s1);\n    uint x0 = ((w1 >> Kk) & 0xFFFFu) * cb[0] + cb[1];\n    x0 = (x0 & cb[2]) ^ cb[3];\n    uint x1 = (w1 & 0xFFFFu) * cb[0] + cb[1];\n    x1 = (x1 & cb[2]) ^ cb[3];\n    half2 h0 = as_type<half2>(x0);\n    half2 h1 = as_type<half2>(x1);\n    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));\n}\n'
+_FUSED_BODY = '\nthreadgroup float x_sh[2048];\nthreadgroup float gu_sh[1024];\nthreadgroup float a_sh[512];\nconstexpr float INV_SQRT128 = 0.08838834764;\n\nuint row = thread_position_in_grid.y;\nuint tid = thread_position_in_grid.x;\nuint lane = tid & 127u;\nuint grp = tid >> 7u;\nuint e = eids[row];\n\nfor (uint i = tid; i < 2048u; i += 1024u) x_sh[i] = xh1[row * 2048u + i];\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n\nconst device short* base1 = code1 + (ulong)e * 128ul * 64ul * 32ul;\nuint c = tid;                                   // 1024 threads -> one gu col each\nuint tn = c >> 4u;\nuint cs = c & 15u;\nuint cb2 = (cs >> 3) & 1u;\nuint c7 = cs & 7u;\nfloat acc = 0.0f;\nfor (uint tk = 0u; tk < 128u; ++tk) {\n    const device short* tile = base1 + (tk * 64u + tn) * 32u;\n    for (uint q = 0u; q < 4u; ++q) {\n        for (uint rh = 0u; rh < 2u; ++rh) {\n            uint t = 4u * (4u * c7 + q) + 2u * cb2 + rh;\n            float2 vv = pair_vals(tile, t, 2u, cb);\n            uint r0 = 8u * rh + 2u * q;\n            uint k0 = tk * 16u + r0;\n            acc = fma(x_sh[k0], vv.x, acc);\n            acc = fma(x_sh[k0 + 1u], vv.y, acc);\n        }\n    }\n}\ngu_sh[c] = acc;\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nhad_shared(gu_sh, 0u, 8u, lane, grp);\nthreadgroup_barrier(mem_flags::mem_threadgroup);\ngu_sh[tid] = gu_sh[tid] * INV_SQRT128 * rout1[row * 1024u + tid];\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nif (tid < 512u) {\n    float gate = gu_sh[tid];\n    float up = gu_sh[tid + 512u];\n    float sg = gate / (1.0f + metal::exp(-gate));\n    a_sh[tid] = sg * up * rin2[row * 512u + tid];\n}\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nhad_shared(a_sh, 0u, 4u, lane, grp);\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nif (tid < 512u) a_sh[tid] *= INV_SQRT128;\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n\nconst device short* base2 = code2 + (ulong)e * 32ul * 128ul * 48ul;\nfor (uint cc = 0u; cc < 2u; ++cc) {\n    uint c2 = tid + cc * 1024u;\n    uint tn2 = c2 >> 4u;\n    uint cs2 = c2 & 15u;\n    uint cb22 = (cs2 >> 3) & 1u;\n    uint c72 = cs2 & 7u;\n    float acc2 = 0.0f;\n    for (uint tk = 0u; tk < 32u; ++tk) {\n        const device short* tile = base2 + (tk * 128u + tn2) * 48u;\n        for (uint q = 0u; q < 4u; ++q) {\n            for (uint rh = 0u; rh < 2u; ++rh) {\n                uint t = 4u * (4u * c72 + q) + 2u * cb22 + rh;\n                float2 vv = pair_vals(tile, t, 3u, cb);\n                uint r0 = 8u * rh + 2u * q;\n                uint k0 = tk * 16u + r0;\n                acc2 = fma(a_sh[k0], vv.x, acc2);\n                acc2 = fma(a_sh[k0 + 1u], vv.y, acc2);\n            }\n        }\n    }\n    dst[row * 2048u + c2] = acc2;\n}\n'
+
+
+def eschamoe_fused_layer(xh1, code1, code2, eids, rout1, rin2, rout2):
+    """One kernel per MoE layer: decode gate_up (2-bit) -> in-group had ->
+    SwiGLU -> decode down (3-bit) -> GEMMs. Returns y_pre [rows, 2048]; the
+    host applies the final had128(* rout2). 8 inputs, 1 output, 512 threads
+    per row."""
+    kern = _fused_cache.get(None)
+    if kern is None:
+        kern = mx.fast.metal_kernel(
+            name="escha_fused_layer",
+            input_names=["xh1", "code1", "code2", "eids", "rout1", "rin2", "rout2", "cb"],
+            output_names=["dst"],
+            header=_FUSED_HDR,
+            source=_FUSED_BODY,
+        )
+        _fused_cache[None] = kern
+    rows = xh1.shape[0]
+    cb = mx.array([MCG_MULT, MCG_ADD, MCG_MASK, MCG_XOR], mx.uint32)
+    (dst,) = kern(
+        inputs=[xh1, code1, code2, eids, rout1, rin2, rout2, cb],
+        grid=(1024, rows, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(rows, 2048)],
+        output_dtypes=[mx.float32],
+    )
+    return dst
 
 
 # --------------------------------------------------------------------------

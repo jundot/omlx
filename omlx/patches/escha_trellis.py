@@ -81,17 +81,17 @@ class _DenseExpertCache(nn.Module):
 
 
 class TrellisSwitchMLP(nn.Module):
-    """Routed experts: 2-bit gate_up + 3-bit down trellis via dense LRU caches."""
+    """Routed experts: one fused kernel per layer (gate_up decode -> in-group
+    had -> SwiGLU -> down decode -> GEMM). Host keeps ONE input materialization
+    per layer (xh1) and one trailing had(* rout2)."""
 
     def __init__(self, num_experts: int, hidden: int, intermediate: int):
         super().__init__()
-        self.gate_up_proj = _DenseExpertCache(num_experts, hidden, 2 * intermediate, K=2, cap=16)
-        self.down_proj = _DenseExpertCache(num_experts, intermediate, hidden, K=3, cap=16)
+        self.gate_up_proj = _DenseExpertCache(num_experts, hidden, 2 * intermediate, K=2)
+        self.down_proj = _DenseExpertCache(num_experts, intermediate, hidden, K=3)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        return self.forward(x, indices)
-
-    def forward(self, x: mx.array, indices: mx.array) -> mx.array:
+        from omlx.custom_kernels.escha import fast as _fast
         lead = x.shape[:-1]
         k = indices.shape[-1]
         N = 1
@@ -100,12 +100,26 @@ class TrellisSwitchMLP(nn.Module):
         x2 = x.reshape(N, -1)
         inds2 = indices.reshape(N, k)
         xg = mx.repeat(x2, k, axis=0)
-        eids = inds2.reshape(-1)
-        gu = self.gate_up_proj(xg, eids)          # [M, 2I] (qmv per-row)
-        gate, up = gu[..., :512], gu[..., 512:]
-        act = silu(gate) * up
-        out = self.down_proj(act, eids)           # [M, H] (down evals its xh)
-        return out.reshape(*lead, k, -1)
+        eids = inds2.reshape(-1).astype(mx.uint32)
+
+        rin1 = self.gate_up_proj.escha_rin[eids].astype(mx.float32)
+        rout1 = self.gate_up_proj.escha_rout[eids].astype(mx.float32)
+        rin2 = self.down_proj.escha_rin[eids].astype(mx.float32)
+        rout2 = self.down_proj.escha_rout[eids].astype(mx.float32)
+
+        xh1 = _had128(xg * rin1)
+        # No per-layer materialization: the fused kernel has no intra-layer
+        # kernel dependency, so all 40 layers can share one lazy graph (one
+        # sync per step) without corruption.  (ESCHA_FORCE_EVAL=1 re-enables
+        # the conservative per-layer sync for debugging.)
+        if __import__("os").environ.get("ESCHA_FORCE_EVAL"):
+            mx.eval(xh1)
+        ypre = _fast.eschamoe_fused_layer(
+            xh1, self.gate_up_proj.escha_code, self.down_proj.escha_code,
+            eids, rout1, rin2, rout2,
+        )
+        y = _had128(ypre) * rout2
+        return y.reshape(*lead, k, -1)
 
 
 class _EschaSparseMoeBlock(nn.Module):
