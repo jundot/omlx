@@ -52,6 +52,9 @@ CFG = dict(
     qk_nope_head_dim=32,
     v_head_dim=32,
     moe_shared_expert_intermediate_size=64,
+    # Required by the vendored ModelArgs; CI exercises that path (the
+    # bundled mlx-lm build supplies its own bailing_hybrid locally).
+    group_norm_size=1,
 )
 
 
