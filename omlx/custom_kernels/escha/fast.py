@@ -18,6 +18,7 @@ reference ``ref_trellis`` here matches the kernel to one f16 rounding step
 """
 from __future__ import annotations
 
+import math
 import re
 
 import mlx.core as mx
@@ -30,11 +31,85 @@ MCG_ADD = 0
 MCG_MASK = 0x8FFF8FFF
 MCG_XOR = 0x3B603B60
 
+_QMV_MSL = """constexpr int WORDS = 8 * K;
+constexpr int IN = TK * 16;
+constexpr int OUT = TN * 16;
+
+threadgroup float x_sh[TK * 16];
+
+uint row = threadgroup_position_in_grid.y;
+uint tid = thread_index_in_threadgroup;
+uint sg = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+// Stage the transformed activation row of this expert.
+for (uint i = tid; i < uint(IN); i += 128u) {
+    x_sh[i] = xh[row * uint(IN) + i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+uint o = threadgroup_position_in_grid.x * 4u + sg;
+if (o >= uint(OUT)) {
+    return;
+}
+
+// Split the output index into a tile column and a slot column.
+uint tn = o >> 4;
+uint c = o & 15u;
+uint cb2 = (c >> 3) & 1u;
+uint c7 = c & 7u;
+
+const device short* base =
+    code + ulong(eids[row]) * ulong(TK) * ulong(TN) * ulong(16 * K);
+
+// Each lane owns one code pair. The pair index inverts the closed form
+// of tile_perm for a fixed column. One pair gives two adjacent rows.
+uint q = lane & 3u;
+uint rh = (lane >> 2) & 1u;
+uint t = 4u * (4u * c7 + q) + 2u * cb2 + rh;
+uint r0 = 8u * rh + 2u * q;
+
+// The bit offsets copy unpack_tile. The wrap term 256 * K comes before
+// the term -16. Thus the unsigned value stays 0 or more.
+uint b0 = 2u * t * uint(K) + uint(K) + 256u * uint(K) - 16u;
+uint b2 = b0 + uint(K) + 16u;
+uint i0 = (b0 / 32u) % uint(WORDS);
+uint i1w = (b2 - 1u) / 32u;
+uint s1 = (i1w + 1u) * 32u - b2;
+uint i1 = i1w % uint(WORDS);
+
+float acc = 0.0f;
+for (uint tk = lane >> 3; tk < uint(TK); tk += 4u) {
+    const device short* tile = base + (tk * uint(TN) + tn) * uint(16 * K);
+    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+
+    // The 64-bit funnel makes the shift safe when s1 is 0.
+    ulong pair = (ulong(w0) << 32) | ulong(wb);
+    uint w1 = uint(pair >> s1);
+
+    // The codebook hash. Refer to the tile decode kernel. The half cast
+    // repeats the f16 round of the CPU decode.
+    uint x0 = ((w1 >> uint(K)) & 0xFFFFu) * cb[0] + cb[1];
+    x0 = (x0 & cb[2]) ^ cb[3];
+    uint x1 = (w1 & 0xFFFFu) * cb[0] + cb[1];
+    x1 = (x1 & cb[2]) ^ cb[3];
+    half2 h0 = as_type<half2>(x0);
+    half2 h1 = as_type<half2>(x1);
+    float v0 = float(h0.x) + float(h0.y);
+    float v1 = float(h1.x) + float(h1.y);
+
+    acc = fma(x_sh[tk * 16u + r0], v0, acc);
+    acc = fma(x_sh[tk * 16u + r0 + 1u], v1, acc);
+}
+
+acc = simd_sum(acc);
+if (lane == 0u) {
+    dst[row * uint(OUT) + o] = acc;
+}"""
+_kernel_cache: dict[tuple[int, int, int], object] = {}
+_qmv_cache: dict[tuple[int, int, int], object] = {}
 _IMPORT_ERROR = None
-try:
-    _kernel_cache: dict[tuple[int, int, int], object] = {}
-except Exception as exc:  # pragma: no cover
-    _IMPORT_ERROR = exc
 
 
 def is_native_available() -> bool:
@@ -109,12 +184,115 @@ def eschamoe_gather_qgemm(
     )
     (out,) = kernel(
         inputs=[xh, code, eids, cb],
-        grid=(TN * 128, (rows + 31) // 32, 1),
+        grid=(math.ceil(TN * 16 / 128) * 128, (rows + 31) // 32, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(rows, TN * 16)],
         output_dtypes=[mx.float32],
     )
     return out
+
+
+
+def eschamoe_gather_qmv(xh, code, eids, K):
+    """Small-batch variant: one threadgroup per row. Efficient for decode
+    (one token -> 8 routed rows); same decode contract as the GEMM kernel."""
+    if K not in (2, 3):
+        raise ValueError(f"eschamoe trellis K must be 2 or 3, got {K}")
+    rows, IN = xh.shape
+    TK, TN = code.shape[1], code.shape[2]
+    groups_x = (TN * 16 + 3) // 4
+    cb = mx.array([MCG_MULT, MCG_ADD, MCG_MASK, MCG_XOR], mx.uint32)
+    kern = _qmv_cache.get((K, TK, TN))
+    if kern is None:
+        body = re.sub(r"\bK\b", str(K), _QMV_MSL)
+        body = re.sub(r"\bTK\b", str(TK), body)
+        body = re.sub(r"\bTN\b", str(TN), body)
+        header = "#include <metal_stdlib>\nusing namespace metal;\n"
+        kern = mx.fast.metal_kernel(
+            name="escha_qmv",
+            input_names=["xh", "code", "eids", "cb"],
+            output_names=["dst"],
+            header=header,
+            source=body,
+        )
+        _qmv_cache[(K, TK, TN)] = kern
+    (out,) = kern(
+        inputs=[xh, code, eids, cb],
+        grid=(groups_x * 128, rows, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, TN * 16)],
+        output_dtypes=[mx.float32],
+    )
+    return out
+
+
+# --------------------------------------------------------------------------
+# Pure-MLX batch decode: convert packed codes to dense baked weights.
+# (No custom kernel -- use for decode-on-first-use caches and tests.)
+# --------------------------------------------------------------------------
+
+def decode_3inst_mx(codes):
+    x = codes.astype(mx.uint32) * mx.array(0xCBAC1FED, mx.uint32)
+    x = (x & mx.array(0x8FFF8FFF, mx.uint32)) ^ mx.array(0x3B603B60, mx.uint32)
+    lo = x & mx.array(0xFFFF, mx.uint32)
+    hi = (x >> mx.array(16, mx.uint32)) & mx.array(0xFFFF, mx.uint32)
+    vals = []
+    for b in (lo, hi):
+        bf = b.astype(mx.float32)
+        s = mx.floor(bf / 32768.0)
+        e = mx.floor((bf % 32768.0) / 1024.0)
+        m = bf % 1024.0
+        mant = m + mx.where(e > 0, 1024.0, 0.0)
+        exp2 = mx.where(e == 0, -24.0, e - 25.0)
+        vals.append((1.0 - 2.0 * s) * mant * mx.power(2.0, exp2))
+    return vals[0] + vals[1]
+
+
+def _had_axis(w, axis):
+    """H128 blocks along `axis` of [N, a, b]; pure mlx ops."""
+    w = mx.moveaxis(w, axis, -1)
+    lead = w.shape[:-1]
+    n = w.shape[-1]
+    y = w.reshape(*lead, n // 128, 128)
+    y = mx.matmul(y.reshape(-1, n // 128, 128), _h128_constant())
+    return mx.moveaxis(y.reshape(*lead, n), -1, axis)
+
+
+_H128C = None
+
+
+def _h128_constant():
+    global _H128C
+    if _H128C is None:
+        h = mx.array([[1.0]])
+        while h.shape[0] < 128:
+            h = mx.concatenate([mx.concatenate([h, h], 1), mx.concatenate([h, -h], 1)], 0)
+        _H128C = h * (1.0 / (128.0 ** 0.5))
+    return _H128C
+
+
+def decode_experts_dense(code, rin, rout, K):
+    """Batch decode + bake routed experts.
+
+    Args:
+        code: int16 [n, TK, TN, 16K] packed codes.
+        rin: f16 [n, in]; rout: f16 [n, out].
+    Returns:
+        bf16 [n, out, in] dense expert matrices
+        (W = (H Wt H * rin * rout).T, matching the reference runtime).
+    """
+    import numpy as _np
+    n = code.shape[0]
+    codes = mx.array(_unpack_trellis(_np.asarray(code), K))     # uint16
+    vals = decode_3inst_mx(codes.astype(mx.uint32))            # [n,tk,tn,256]
+    perm = mx.array(_PERM_INV, mx.int32)
+    idx = mx.broadcast_to(perm[None, None, None, :], vals.shape)
+    tiles = mx.take_along_axis(vals, idx, axis=-1)
+    tk, tn = code.shape[1], code.shape[2]
+    wt = tiles.reshape(n, tk, tn, 16, 16).transpose(0, 1, 3, 2, 4).reshape(n, tk * 16, tn * 16)
+    wt = _had_axis(_had_axis(wt, 1), 2)
+    wt = wt * rin[:, :, None].astype(mx.float32) * rout[:, None, :].astype(mx.float32)
+    return mx.transpose(wt, (0, 2, 1)).astype(mx.bfloat16)
 
 
 # --------------------------------------------------------------------------
@@ -134,6 +312,16 @@ def _tensor_core_perm():
 
 
 _PERM = _tensor_core_perm()
+
+
+def _perm_inverse():
+    inv = [0] * 256
+    for i, j in enumerate(_PERM):
+        inv[j] = i
+    return inv
+
+
+_PERM_INV = _perm_inverse()
 
 
 def _unpack_trellis(packed, k):
