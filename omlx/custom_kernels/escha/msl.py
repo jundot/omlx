@@ -165,10 +165,10 @@ while (done != valid) {
                 uint h1 = (w1 & 0xFFFFu) * cb[0] + cb[1];
                 half2 v0 = as_type<half2>((h0 & cb[2]) ^ cb[3]);
                 half2 v1 = as_type<half2>((h1 & cb[2]) ^ cb[3]);
-                w_sh[woff[0] + tb * 16u] =
-                    float(half(float(v0.x) + float(v0.y)));
-                w_sh[woff[1] + tb * 16u] =
-                    float(half(float(v1.x) + float(v1.y)));
+                // No half-round here: garbage codes in structurally dead experts
+                // decode to values > f16 max and would overflow to inf/NaN.
+                w_sh[woff[0] + tb * 16u] = float(v0.x) + float(v0.y);
+                w_sh[woff[1] + tb * 16u] = float(v1.x) + float(v1.y);
             } else {
                 w_sh[woff[0] + tb * 16u] = 0.0f;
                 w_sh[woff[1] + tb * 16u] = 0.0f;
