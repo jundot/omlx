@@ -68,6 +68,11 @@ class ModelArgs(BaseModelArgs):
     kda_lower_bound: Optional[float] = None
     short_conv_kernel_size: int = 4
     quantization_config: Optional[Dict[str, Any]] = None
+    # Ling is trained with a clamped SwiGLU on its late layers; the limits
+    # are per-layer and differ for routed vs shared experts. 0 means "no
+    # clamp on this layer".
+    expert_swiglu_limit_list: Optional[list] = None
+    share_expert_swiglu_limit_list: Optional[list] = None
 
 
 def recurrent_gla(
@@ -112,16 +117,63 @@ class GroupRMSNorm(nn.Module):
         return self.weight * mx.flatten(x, -2)
 
 
+# Marks this build as implementing Ling's SwiGLU clamp in-source, so
+# omlx.patches.bailing_hybrid.swiglu_clamp leaves it alone.
+_omlx_swiglu_clamp_native = True
+
+
+def layer_swiglu_limit(limit_list, layer_idx: int) -> Optional[float]:
+    """Per-layer SwiGLU clamp, or None when absent or zero."""
+    if not limit_list or layer_idx >= len(limit_list):
+        return None
+    limit = limit_list[layer_idx]
+    if limit in (None, 0):
+        return None
+    return float(limit)
+
+
+def clamped_swiglu(gate: mx.array, x: mx.array, limit: float) -> mx.array:
+    """SwiGLU with Ling's trained clamp.
+
+    ``silu(gate).clamp(max=limit) * x.clamp(-limit, limit)``, matching
+    vLLM's ``SwigluStepAndMul`` (see BailingMoeV3MLP in inclusionAI's vLLM
+    port). Without it the late layers run unclamped and activations there
+    can run away.
+    """
+    return mx.minimum(nn.silu(gate), limit) * mx.clip(x, -limit, limit)
+
+
+class ClampedSwiGLU(nn.Module):
+    """SwitchGLU-signature activation: ``__call__(x_up, x_gate)``."""
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = float(limit)
+
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return clamped_swiglu(gate, x, self.limit)
+
+
 class MLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
+    def __init__(
+        self,
+        args: ModelArgs,
+        intermediate_size: Optional[int] = None,
+        swiglu_limit: Optional[float] = None,
+    ):
         super().__init__()
         dim = intermediate_size if intermediate_size is not None else args.intermediate_size
         self.gate_proj = nn.Linear(args.hidden_size, dim, bias=args.use_bias)
         self.up_proj = nn.Linear(args.hidden_size, dim, bias=args.use_bias)
         self.down_proj = nn.Linear(dim, args.hidden_size, bias=args.use_bias)
+        self.swiglu_limit = swiglu_limit
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        if self.swiglu_limit:
+            return self.down_proj(clamped_swiglu(gate, up, self.swiglu_limit))
+        return self.down_proj(swiglu(gate, up))
 
 
 class MultiLatentAttention(nn.Module):
@@ -548,7 +600,7 @@ class Gate(nn.Module):
 
 
 class SparseMoeBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int = 0):
         super().__init__()
         self.num_experts_per_tok = args.num_experts_per_tok
         self.switch_mlp = SwitchGLU(
@@ -557,9 +609,19 @@ class SparseMoeBlock(nn.Module):
             args.num_experts,
             bias=args.use_bias,
         )
+        expert_limit = layer_swiglu_limit(args.expert_swiglu_limit_list, layer_idx)
+        if expert_limit:
+            self.switch_mlp.activation = ClampedSwiGLU(expert_limit)
         self.gate = Gate(args)
+        shared_limit = layer_swiglu_limit(
+            args.share_expert_swiglu_limit_list, layer_idx
+        )
         self.shared_experts = (
-            MLP(args, intermediate_size=args.moe_intermediate_size * args.num_shared_experts)
+            MLP(
+                args,
+                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
+                swiglu_limit=shared_limit,
+            )
             if args.num_shared_experts > 0
             else None
         )
@@ -588,9 +650,14 @@ class DecoderLayer(nn.Module):
             self.attention = LinearAttention(args, layer_idx=layer_idx)
 
         if args.num_experts is not None and layer_idx >= args.first_k_dense_replace:
-            self.mlp = SparseMoeBlock(args)
+            self.mlp = SparseMoeBlock(args, layer_idx=layer_idx)
         else:
-            self.mlp = MLP(args)
+            self.mlp = MLP(
+                args,
+                swiglu_limit=layer_swiglu_limit(
+                    args.expert_swiglu_limit_list, layer_idx
+                ),
+            )
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)

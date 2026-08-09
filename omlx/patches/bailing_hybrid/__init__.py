@@ -76,6 +76,23 @@ def apply_bailing_hybrid_patch() -> bool:
         applied = False
 
     _APPLIED = True
+
+    # Whichever build ended up live, make sure Ling's trained SwiGLU clamp is
+    # in force. The vendored copy implements it in-source; an mlx-lm build
+    # that already ships bailing_hybrid does not.
+    try:
+        from .swiglu_clamp import ensure_swiglu_clamp
+
+        module = importlib.import_module(_MODULE_NAME)
+        if ensure_swiglu_clamp(module):
+            logger.info("Ling SwiGLU clamp installed on %s", _MODULE_NAME)
+    except Exception:
+        logger.warning(
+            "Could not install Ling SwiGLU clamp; the model will run "
+            "unclamped and lose accuracy",
+            exc_info=True,
+        )
+
     if applied:
         logger.info(
             "Ling 3.0 Flash mlx-lm patch applied (branch head %s)",
