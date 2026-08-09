@@ -88,8 +88,8 @@ class TestBoundarySnapshotSSDStore:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             if file_path.exists():
-                with store._pending_lock:
-                    store._pending_writes.pop((request_id, token_count), None)
+                with store._pending_cond:
+                    store._remove_pending_locked((request_id, token_count))
                 return file_path
             time.sleep(0.02)
         raise AssertionError(f"snapshot was not written: {file_path}")
@@ -121,6 +121,73 @@ class TestBoundarySnapshotSSDStore:
         assert self.store.has("req-1", 2048)
         assert not self.store.has("req-1", 4096)
         assert not self.store.has("req-2", 2048)
+
+    def test_duplicate_boundary_save_coalesces_without_double_reservation(self):
+        """A deterministic duplicate must reuse the in-flight generation."""
+        import threading
+        import time
+        from unittest.mock import patch
+
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "req-duplicate"
+        token_count = 1024
+        first_writer_started = threading.Event()
+        release_first_writer = threading.Event()
+        original_write = mod._write_safetensors_no_mx
+
+        def slow_first_write(*args, **kwargs):
+            if not first_writer_started.is_set():
+                first_writer_started.set()
+                assert release_first_writer.wait(timeout=5.0)
+            return original_write(*args, **kwargs)
+
+        def extracted_with(value: float):
+            def _extract(_cache):
+                return [{
+                    "state": (mx.array([value], dtype=mx.float32),),
+                    "meta_state": (),
+                    "class_name": "ArraysCache",
+                    "cache_type": "ArraysCache",
+                }], None
+
+            return _extract
+
+        with patch.object(
+            mod, "_write_safetensors_no_mx", side_effect=slow_first_write
+        ):
+            assert self.store.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                extracted_with(1.0),
+            )
+            assert first_writer_started.wait(timeout=5.0)
+            pending_before = self.store.pending_bytes
+            assert pending_before > 0
+            assert self.store.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                extracted_with(2.0),
+            )
+            assert self.store.pending_bytes == pending_before
+            release_first_writer.set()
+
+            deadline = time.monotonic() + 5.0
+            pw_key = (request_id, token_count)
+            while time.monotonic() < deadline:
+                with self.store._pending_lock:
+                    if pw_key not in self.store._pending_writes:
+                        break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("latest boundary write did not drain")
+
+        loaded = self.store.load(request_id, token_count)
+        assert loaded is not None
+        assert float(np.asarray(loaded[0]["state"][0])[0]) == 1.0
+        assert self.store.pending_bytes == 0
 
     def test_load_nonexistent_returns_none(self):
         assert self.store.load("req-1", 999) is None
@@ -179,6 +246,7 @@ class TestBoundarySnapshotSSDStore:
             "metadata": metadata,
             "raw_size": 0,
             "inline": True,
+            "reservation_released": False,
         }
         with self.store._pending_cond:
             self.store._pending_writes[pw_key] = pending
@@ -195,9 +263,7 @@ class TestBoundarySnapshotSSDStore:
             ready.set()
             release.wait(timeout=5.0)
             result.append(
-                self.store._write_inline(
-                    pw_key, tensors_raw, metadata, file_path
-                )
+                self.store._write_inline(pw_key, pending, file_path)
             )
 
         thread = threading.Thread(target=delayed_inline)
@@ -235,6 +301,54 @@ class TestBoundarySnapshotSSDStore:
         assert not self.store.has("req-2", 2048)
         # Session directory still exists (recreated).
         assert self.store._snapshot_dir.exists()
+
+    def test_take_staged_file_survives_concurrent_cleanup_all(self):
+        """Caller-owned promotion files must outlive session cleanup."""
+        import threading
+        from unittest.mock import patch
+
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "req-promote"
+        token_count = 1024
+        staged_path = self.store._file_path(request_id, token_count)
+        staged_path.parent.mkdir(parents=True)
+        staged_path.write_bytes(b"checkpoint")
+        with self.store._registry_lock:
+            self.store._file_registry.setdefault(request_id, {})[
+                token_count
+            ] = staged_path
+
+        moved = threading.Event()
+        release_take = threading.Event()
+        original_replace = mod.os.replace
+        result: list[Path | None] = []
+
+        def pause_after_move(source, destination):
+            replaced = original_replace(source, destination)
+            moved.set()
+            assert release_take.wait(timeout=5.0)
+            return replaced
+
+        def take_file():
+            result.append(
+                self.store.take_staged_file(request_id, token_count)
+            )
+
+        with patch.object(mod.os, "replace", side_effect=pause_after_move):
+            thread = threading.Thread(target=take_file)
+            thread.start()
+            assert moved.wait(timeout=5.0)
+            self.store.cleanup_all()
+            release_take.set()
+            thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(result) == 1
+        detached_path = result[0]
+        assert detached_path is not None
+        assert detached_path.parent == self.store._snapshot_root / "_promote"
+        assert detached_path.read_bytes() == b"checkpoint"
 
     def test_load_from_disk_after_pending_writes_cleared(self):
         """After background writer completes, load should read from disk."""
@@ -572,11 +686,19 @@ class TestBoundarySnapshotSSDStore:
                     "counter dropped on timeout — late-rename rescue "
                     "would be defeated"
                 )
+            # The writer still owns the raw buffer, so its reservation must
+            # remain visible until the cancellation path releases that buffer.
+            assert self.store.pending_bytes > 0
 
             # Let the writer finish; rescue then drops the counter via
             # _is_cancelled → _dec_cancelled.
             release_writer.set()
-            time.sleep(0.5)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if self.store.pending_bytes == 0:
+                    break
+                time.sleep(0.02)
+            assert self.store.pending_bytes == 0
 
     def test_cleanup_request_timeout_drains_counter_on_writer_early_return(
         self,

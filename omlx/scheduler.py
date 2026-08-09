@@ -8269,6 +8269,25 @@ class Scheduler:
         if request is None:
             return False
 
+        # A finished request remains in self.requests while its async
+        # store_cache worker owns boundary snapshots and cache buffers. Do not
+        # run abort cleanup concurrently with that worker: the normal deferred
+        # drain will release the batch row, snapshots, and Request once the
+        # future completes. If it completed between steps, drain it now before
+        # deciding whether there is anything left to abort.
+        store_future = self._inflight_store_futures.get(request_id)
+        if store_future is not None:
+            if not store_future.done():
+                logger.debug(
+                    "Deferring abort cleanup for %s until async store_cache completes",
+                    request_id,
+                )
+                return False
+            self._drain_pending_async_removes()
+            request = self.requests.get(request_id)
+            if request is None:
+                return False
+
         self._clear_request_admission_bookkeeping(request_id)
 
         # Remove from waiting queue
@@ -11129,6 +11148,29 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
+        # A store_cache worker may still be loading request-local boundary
+        # snapshots or publishing blocks. reset() clears both namespaces, so
+        # use the same bounded teardown barrier as shutdown() before aborting
+        # requests or clearing caches. The drain performs the request-local
+        # cleanup only after every future has completed.
+        inflight = list(self._inflight_store_futures.values())
+        if inflight:
+            logger.info(
+                "Waiting for %d inflight async store_cache future(s) before reset...",
+                len(inflight),
+            )
+            _done, not_done = concurrent.futures.wait(
+                inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+            )
+            if not_done:
+                fatal_exit(
+                    "Scheduler reset timed out after "
+                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for "
+                    f"{len(not_done)} async store_cache future(s)"
+                )
+                return
+            self._drain_pending_async_removes()
+
         # Drain any pending deferred aborts
         self._pending_abort_ids.clear()
 

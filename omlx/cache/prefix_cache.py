@@ -256,6 +256,89 @@ class BlockAwarePrefixCache(CacheManager):
                 return False
         return saw_arrays
 
+    @staticmethod
+    def _validated_gdn_snapshot_layers(
+        snapshot: Any,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> dict[int, tuple[Any, Any]] | None:
+        """Return validated Arrays-family payloads, or reject the snapshot."""
+        if not isinstance(snapshot, (list, tuple)):
+            return None
+
+        payloads: dict[int, tuple[Any, Any]] = {}
+        for layer_idx, type_name in enumerate(layer_cache_types or []):
+            if not CacheTypeRegistry.is_arrays_family(type_name):
+                continue
+            if layer_idx >= len(snapshot):
+                return None
+            layer_state = snapshot[layer_idx]
+            if not isinstance(layer_state, dict):
+                return None
+            state = layer_state.get("state", ())
+            if not isinstance(state, (list, tuple)) or len(state) < 2:
+                return None
+            if len(state) == 2:
+                cache_data = (state[0], state[1])
+            else:
+                cache_data = ("__nstate__", type_name, list(state))
+            payloads[layer_idx] = (cache_data, layer_state.get("meta_state", ()))
+        return payloads
+
+    def _has_split_gdn_checkpoint(
+        self,
+        block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> bool:
+        """Return whether a recurrent sidecar exists for this exact layout."""
+        manager = self.paged_ssd_cache
+        signature_builder = getattr(manager, "cache_signature_for", None)
+        checkpoint_checker = getattr(manager, "has_gdn_checkpoint", None)
+        if not callable(signature_builder) or not callable(checkpoint_checker):
+            return False
+        try:
+            cache_signature = signature_builder(
+                model_name=self.paged_cache.model_name,
+                num_layers=len(layer_cache_types or []),
+                block_size=self.block_size,
+                layer_cache_types=layer_cache_types or [],
+            )
+            return bool(checkpoint_checker(block_hash, cache_signature))
+        except Exception:
+            logger.exception("Failed to query split-GDN checkpoint availability")
+            return False
+
+    def _commit_split_gdn_checkpoint(
+        self,
+        boundary_snapshots: Any,
+        token_count: int,
+        block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+    ) -> bool:
+        """Commit one staged recurrent checkpoint through its provider."""
+        commit_checkpoint = getattr(
+            boundary_snapshots, "commit_gdn_checkpoint", None
+        )
+        if not callable(commit_checkpoint):
+            return False
+        try:
+            return bool(
+                commit_checkpoint(
+                    token_count,
+                    block_hash,
+                    layer_cache_types=layer_cache_types,
+                    layer_meta_states=layer_meta_states,
+                    model_name=self.paged_cache.model_name,
+                    block_size=self.block_size,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to commit split-GDN checkpoint for block hash %s",
+                block_hash.hex()[:16],
+            )
+            return False
+
     def _get_model_num_layers(self, model: Any) -> int:
         """
         Get the expected number of *cache layers* for validation.
@@ -778,11 +861,8 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 break
 
-            if split_gdn_layout and (
-                not has_boundary_snapshot
-                or not callable(
-                    getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
-                )
+            if split_gdn_layout and not callable(
+                getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
             ):
                 logger.warning(
                     "Stopping split-GDN prefix store for %s at %d tokens: "
@@ -820,6 +900,25 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_keys=block_extra_keys,
                 )
                 if existing_block:
+                    if split_gdn_layout and not self._has_split_gdn_checkpoint(
+                        existing_block.block_hash, layer_cache_types
+                    ):
+                        checkpoint_committed = self._commit_split_gdn_checkpoint(
+                            boundary_snapshots,
+                            global_end,
+                            existing_block.block_hash,
+                            layer_cache_types,
+                            layer_meta_states,
+                        )
+                        if not checkpoint_committed:
+                            logger.warning(
+                                "Stopping split-GDN prefix store for %s at %d "
+                                "tokens: deduplicated block has no recurrent "
+                                "checkpoint",
+                                request_id,
+                                global_start,
+                            )
+                            break
                     # Reuse existing block
                     self.paged_cache.increment_ref(existing_block.block_id)
                     block_table.block_ids.append(existing_block.block_id)
@@ -991,28 +1090,15 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                     if saved:
                         if split_gdn_layout:
-                            commit_checkpoint = getattr(
-                                boundary_snapshots, "commit_gdn_checkpoint", None
+                            checkpoint_committed = (
+                                self._commit_split_gdn_checkpoint(
+                                    boundary_snapshots,
+                                    block_boundary_tc,
+                                    block.block_hash,
+                                    layer_cache_types,
+                                    layer_meta_states,
+                                )
                             )
-                            checkpoint_committed = False
-                            if callable(commit_checkpoint):
-                                try:
-                                    checkpoint_committed = bool(
-                                        commit_checkpoint(
-                                            block_boundary_tc,
-                                            block.block_hash,
-                                            layer_cache_types=layer_cache_types,
-                                            layer_meta_states=layer_meta_states,
-                                            model_name=self.paged_cache.model_name,
-                                            block_size=self.block_size,
-                                        )
-                                    )
-                                except Exception:
-                                    logger.exception(
-                                        "Failed to commit split-GDN checkpoint "
-                                        "for block %s",
-                                        block.block_id,
-                                    )
                             if not checkpoint_committed:
                                 logger.warning(
                                     "Rejecting split-GDN placeholder block %s "
@@ -2609,7 +2695,7 @@ class BlockAwarePrefixCache(CacheManager):
                     layer_cache_types=layer_cache_types,
                 )
                 chosen_idx = None
-                chosen_snapshot = None
+                chosen_payloads = None
                 chosen_diagnostic = None
                 for idx in range(len(block_table.block_ids) - 1, -1, -1):
                     block = self.paged_cache.allocated_blocks.get(
@@ -2639,8 +2725,25 @@ class BlockAwarePrefixCache(CacheManager):
                         if callable(forgetter):
                             forgetter(block.block_hash, cache_signature)
                         continue
+                    candidate_payloads = self._validated_gdn_snapshot_layers(
+                        snapshot, layer_cache_types
+                    )
+                    if candidate_payloads is None:
+                        logger.warning(
+                            "Ignoring structurally invalid recurrent checkpoint "
+                            "for block %s",
+                            block.block_id,
+                        )
+                        forgetter = getattr(
+                            self.paged_ssd_cache,
+                            "forget_gdn_checkpoint",
+                            None,
+                        )
+                        if callable(forgetter):
+                            forgetter(block.block_hash, cache_signature)
+                        continue
                     chosen_idx = idx
-                    chosen_snapshot = snapshot
+                    chosen_payloads = candidate_payloads
                     chosen_endpoint_tokens = sum(
                         self.paged_cache.allocated_blocks[bid].token_count
                         for bid in block_table.block_ids[: idx + 1]
@@ -2661,7 +2764,7 @@ class BlockAwarePrefixCache(CacheManager):
                     }
                     break
 
-                if chosen_idx is None or chosen_snapshot is None:
+                if chosen_idx is None or chosen_payloads is None:
                     logger.info(
                         "Split GDN restore found no compatible recurrent checkpoint"
                     )
@@ -2691,28 +2794,11 @@ class BlockAwarePrefixCache(CacheManager):
                 # from the main hot/SSD block chain.
                 endpoint_data = all_block_data[-1]
                 endpoint_meta = list(last_block_meta_states or [])
-                for layer_idx, type_name in enumerate(layer_cache_types or []):
-                    if not CacheTypeRegistry.is_arrays_family(type_name):
-                        continue
-                    if layer_idx >= len(chosen_snapshot):
-                        return None
-                    layer_state = chosen_snapshot[layer_idx]
-                    if not isinstance(layer_state, dict):
-                        return None
-                    state = layer_state.get("state", ())
-                    if not isinstance(state, (list, tuple)) or len(state) < 2:
-                        return None
-                    if len(state) == 2:
-                        endpoint_data[layer_idx] = (state[0], state[1])
-                    else:
-                        endpoint_data[layer_idx] = (
-                            "__nstate__",
-                            type_name,
-                            list(state),
-                        )
+                for layer_idx, (cache_data, meta_state) in chosen_payloads.items():
+                    endpoint_data[layer_idx] = cache_data
                     while len(endpoint_meta) <= layer_idx:
                         endpoint_meta.append(())
-                    endpoint_meta[layer_idx] = layer_state.get("meta_state", ())
+                    endpoint_meta[layer_idx] = meta_state
                 last_block_meta_states = endpoint_meta
                 if all_block_meta_states:
                     all_block_meta_states[-1] = endpoint_meta

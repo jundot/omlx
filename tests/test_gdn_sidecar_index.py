@@ -7,6 +7,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from omlx.cache.paged_ssd_cache import (
     _READABLE_CACHE_FORMAT_VERSIONS,
     PagedSSDBlockMetadata,
@@ -70,10 +72,10 @@ def test_failed_replacement_preserves_existing_sidecar(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     source_hash = b"source-block"
     signature = "signature-v1"
-    manager = _make_manager(cache_dir)
+    manager = _make_manager(cache_dir, max_size=25)
     try:
         first_stage = tmp_path / "first.stage"
-        first_stage.write_bytes(b"valid-checkpoint")
+        first_stage.write_bytes(b"o" * 10)
         final_path = manager.commit_gdn_checkpoint_file(
             source_hash,
             first_stage,
@@ -84,8 +86,22 @@ def test_failed_replacement_preserves_existing_sidecar(tmp_path, monkeypatch):
         )
         assert final_path is not None
 
+        # Make replacement pressure evict one LRU entry. The destination is
+        # oldest, so an unprotected replacement would unlink it before the
+        # promotion attempt and have nothing to restore when os.replace fails.
+        other_stage = tmp_path / "other.stage"
+        other_stage.write_bytes(b"d" * 11)
+        assert manager.commit_gdn_checkpoint_file(
+            b"other-block",
+            other_stage,
+            token_count=2048,
+            model_name="model",
+            cache_signature=signature,
+            block_size=2048,
+        ) is not None
+
         replacement = tmp_path / "replacement.stage"
-        replacement.write_bytes(b"incomplete-replacement")
+        replacement.write_bytes(b"n" * 15)
 
         def fail_replace(_source, _destination):
             raise OSError("simulated promotion failure")
@@ -103,12 +119,48 @@ def test_failed_replacement_preserves_existing_sidecar(tmp_path, monkeypatch):
             is None
         )
 
-        assert final_path.read_bytes() == b"valid-checkpoint"
+        assert final_path.read_bytes() == b"o" * 10
         assert replacement.exists()
         assert manager.has_gdn_checkpoint(source_hash, signature)
-        assert manager._gdn_sidecar_index.total_size == len(b"valid-checkpoint")
+        assert manager._gdn_sidecar_index.total_size == 10
     finally:
         manager.close()
+
+
+def test_commit_refreshes_mtime_for_restart_lru(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    source_hash = b"source-block"
+    signature = "signature-v1"
+    staged = tmp_path / "old.stage"
+    staged.write_bytes(b"checkpoint")
+    committed_at = 1_700_000_000.0
+    os.utime(staged, (committed_at - 86_400, committed_at - 86_400))
+
+    manager = _make_manager(cache_dir)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(time, "time", lambda: committed_at)
+            final_path = manager.commit_gdn_checkpoint_file(
+                source_hash,
+                staged,
+                token_count=2048,
+                model_name="model",
+                cache_signature=signature,
+                block_size=2048,
+            )
+        assert final_path is not None
+        assert final_path.stat().st_mtime == pytest.approx(committed_at)
+    finally:
+        manager.close()
+
+    restarted = _make_manager(cache_dir)
+    try:
+        digest = hashlib.sha256(signature.encode()).hexdigest()
+        metadata = restarted._gdn_sidecar_index.get(source_hash, digest)
+        assert metadata is not None
+        assert metadata.last_access == pytest.approx(committed_at)
+    finally:
+        restarted.close()
 
 
 def test_commit_rejects_symlink_source_and_destination(tmp_path):
@@ -207,6 +259,54 @@ def test_lookup_rejects_sidecar_root_replaced_by_symlink(tmp_path):
 
         assert manager.get_gdn_checkpoint_file(source_hash, signature) is None
         assert external_file.read_bytes() == b"external"
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("operation", ["forget", "lru", "clear"])
+def test_sidecar_deletion_rejects_swapped_root_symlink(tmp_path, operation):
+    cache_dir = tmp_path / "cache"
+    signature = "signature-v1"
+    source_hash = b"source"
+    payload = b"owned-checkpoint"
+    manager = _make_manager(cache_dir)
+    try:
+        staged = tmp_path / "staged"
+        staged.write_bytes(payload)
+        final_path = manager.commit_gdn_checkpoint_file(
+            source_hash,
+            staged,
+            token_count=2048,
+            model_name="model",
+            cache_signature=signature,
+            block_size=2048,
+        )
+        assert final_path is not None
+
+        sidecar_root = cache_dir / "_gdn_sidecars"
+        saved_root = tmp_path / "saved-sidecars"
+        sidecar_root.rename(saved_root)
+        original_file = saved_root / final_path.parent.name / final_path.name
+        external_root = tmp_path / "external-sidecars"
+        external_file = external_root / final_path.parent.name / final_path.name
+        external_file.parent.mkdir(parents=True)
+        external_file.write_bytes(b"external-file")
+        sidecar_root.symlink_to(external_root, target_is_directory=True)
+
+        if operation == "forget":
+            assert not manager.forget_gdn_checkpoint(source_hash, signature)
+        elif operation == "lru":
+            manager._max_size = 0
+            manager.enforce_size_limit()
+        else:
+            assert manager.clear() == 0
+
+        assert external_file.read_bytes() == b"external-file"
+        assert original_file.read_bytes() == payload
+        # Unsafe deletion is a failed deletion. Keep conservative accounting
+        # until the original cache namespace is restored or restarted.
+        assert manager._gdn_sidecar_index.count == 1
+        assert manager._gdn_sidecar_index.total_size == len(payload)
     finally:
         manager.close()
 

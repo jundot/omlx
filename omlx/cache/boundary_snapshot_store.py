@@ -191,6 +191,12 @@ class BoundarySnapshotSSDStore:
             return False
 
         try:
+            pw_key = (request_id, token_count)
+            file_path = self._file_path(request_id, token_count)
+            with self._pending_lock:
+                if pw_key in self._pending_writes:
+                    return True
+
             # 1. Extract dict-format states on inference thread.
             extracted, model_cache_config = extract_cache_states_fn(snapshot_cache)
             if not extracted:
@@ -217,8 +223,6 @@ class BoundarySnapshotSSDStore:
             # allowed to exceed the configured cap when the queue is empty;
             # this guarantees forward progress for unusually wide recurrent
             # states without allowing a second checkpoint to accumulate.
-            pw_key = (request_id, token_count)
-            file_path = self._file_path(request_id, token_count)
             temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
             if not self._is_safe_snapshot_path(file_path) or temp_path.is_symlink():
                 raise ValueError("unsafe boundary snapshot staging path")
@@ -226,6 +230,12 @@ class BoundarySnapshotSSDStore:
             wait_started = time.monotonic()
             deadline = wait_started + _PENDING_RESERVATION_TIMEOUT_S
             with self._pending_cond:
+                # The same request/token boundary is deterministic. Coalesce a
+                # duplicate capture with the generation already queued instead
+                # of retaining two raw buffers or letting stale writer cleanup
+                # race a replacement generation.
+                if pw_key in self._pending_writes:
+                    return True
                 while (
                     self._pending_writes
                     and self._pending_bytes + raw_size > self._pending_max_bytes
@@ -240,11 +250,13 @@ class BoundarySnapshotSSDStore:
                     0.0, (time.monotonic() - wait_started) * 1000.0
                 )
                 if not inline_write:
-                    self._pending_writes[pw_key] = {
+                    pending = {
                         "tensors_raw": tensors_raw,
                         "metadata": metadata,
                         "raw_size": raw_size,
+                        "reservation_released": False,
                     }
+                    self._pending_writes[pw_key] = pending
                     self._pending_bytes += raw_size
                     self._pending_peak_bytes = max(
                         self._pending_peak_bytes, self._pending_bytes
@@ -256,12 +268,14 @@ class BoundarySnapshotSSDStore:
                     # bytes were already excluded from the reservation, so
                     # keep raw_size at zero here; the local tensors_raw is
                     # the only extra reference held by this synchronous path.
-                    self._pending_writes[pw_key] = {
+                    pending = {
                         "tensors_raw": tensors_raw,
                         "metadata": metadata,
                         "raw_size": 0,
                         "inline": True,
+                        "reservation_released": False,
                     }
+                    self._pending_writes[pw_key] = pending
 
                 # Publish the registry entry while the pending marker is
                 # still locked.  cleanup_request takes the same lock before
@@ -277,12 +291,10 @@ class BoundarySnapshotSSDStore:
             # write this one snapshot inline and return only once it is on
             # disk (or fail the checkpoint cleanly).
             if inline_write:
-                return self._write_inline(
-                    pw_key, tensors_raw, metadata, file_path
-                )
+                return self._write_inline(pw_key, pending, file_path)
 
             try:
-                self._write_queue.put_nowait((pw_key, tensors_raw, metadata, file_path))
+                self._write_queue.put_nowait((pw_key, pending, file_path))
             except queue.Full:
                 logger.warning(
                     "Boundary snapshot write queue full, writing "
@@ -290,9 +302,7 @@ class BoundarySnapshotSSDStore:
                     request_id,
                     token_count,
                 )
-                return self._write_inline(
-                    pw_key, tensors_raw, metadata, file_path
-                )
+                return self._write_inline(pw_key, pending, file_path)
 
             return True
 
@@ -401,7 +411,9 @@ class BoundarySnapshotSSDStore:
             return None
 
         with self._pending_cond:
-            while pw_key in self._pending_writes and not file_path.is_file():
+            # Wait for the latest generation, even if an older generation has
+            # already materialized the shared final path.
+            while pw_key in self._pending_writes:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -424,7 +436,11 @@ class BoundarySnapshotSSDStore:
         # Move out of the request directory before returning ownership.
         # cleanup_request() removes that directory recursively, so registry
         # detachment alone is not enough to prevent a completion/abort race.
-        detached_dir = self._snapshot_dir / "_promote"
+        # Keep caller-owned promotion files outside the session directory:
+        # cleanup_all() removes and recreates that directory atomically.
+        # reset_boundary_snapshot_root() still reclaims abandoned promotions
+        # at the next server lifecycle boundary.
+        detached_dir = self._snapshot_root / "_promote"
         detached_path = detached_dir / f"{uuid.uuid4().hex}.safetensors"
         try:
             if not self._is_safe_snapshot_path(detached_dir):
@@ -539,7 +555,9 @@ class BoundarySnapshotSSDStore:
             keys_to_remove = [k for k in self._pending_writes if k[0] == request_id]
             count = len(keys_to_remove)
             for key in keys_to_remove:
-                self._remove_pending_locked(key)
+                # The queue/inline owner still holds the raw buffer and releases
+                # its reservation when it observes cancellation.
+                self._remove_pending_locked(key, release_reservation=False)
             if count > 0:
                 with self._cancelled_lock:
                     self._cancelled_requests[request_id] = (
@@ -610,6 +628,7 @@ class BoundarySnapshotSSDStore:
         # items after the directory is deleted. Put_nowait the sentinel
         # back so shutdown still sees it; on Full just drop and let
         # shutdown re-issue.
+        drained_items = []
         while True:
             try:
                 item = self._write_queue.get_nowait()
@@ -625,6 +644,7 @@ class BoundarySnapshotSSDStore:
                             "cleanup_all: dropped writer-sentinel on Full"
                         )
                     break
+                drained_items.append(item)
             except queue.Empty:
                 break
 
@@ -649,8 +669,18 @@ class BoundarySnapshotSSDStore:
                     self._CLEANUP_ALL_TIMEOUT_S,
                 )
             with self._pending_cond:
+                for pw_key, pending, _file_path in drained_items:
+                    self._remove_pending_if_current_locked(
+                        pw_key,
+                        pending,
+                        release_reservation=False,
+                    )
+                    self._release_pending_reservation_locked(pending)
+                # Remaining entries are owned by an in-flight writer or an
+                # inline caller waiting on _writer_busy. Hide them from loads,
+                # but retain their reservations until those owners release the
+                # raw buffers.
                 self._pending_writes.clear()
-                self._pending_bytes = 0
                 self._pending_cond.notify_all()
             with self._registry_lock:
                 self._file_registry.clear()
@@ -737,15 +767,42 @@ class BoundarySnapshotSSDStore:
                 return False
         return True
 
-    def _remove_pending_locked(self, pw_key: tuple[str, int]) -> dict | None:
+    def _release_pending_reservation_locked(self, pending: dict) -> None:
+        """Release one generation's byte reservation exactly once."""
+        if pending.get("reservation_released", False):
+            return
+        pending["reservation_released"] = True
+        self._pending_bytes = max(
+            0, self._pending_bytes - int(pending.get("raw_size", 0))
+        )
+        self._pending_cond.notify_all()
+
+    def _remove_pending_locked(
+        self,
+        pw_key: tuple[str, int],
+        *,
+        release_reservation: bool = True,
+    ) -> dict | None:
         """Remove one pending entry while ``_pending_lock`` is held."""
         pending = self._pending_writes.pop(pw_key, None)
-        if pending is not None:
-            self._pending_bytes = max(
-                0, self._pending_bytes - int(pending.get("raw_size", 0))
-            )
-            self._pending_cond.notify_all()
+        if pending is not None and release_reservation:
+            self._release_pending_reservation_locked(pending)
         return pending
+
+    def _remove_pending_if_current_locked(
+        self,
+        pw_key: tuple[str, int],
+        pending: dict,
+        *,
+        release_reservation: bool = True,
+    ) -> bool:
+        """Remove ``pending`` only if it is still this key's generation."""
+        if self._pending_writes.get(pw_key) is not pending:
+            return False
+        self._remove_pending_locked(
+            pw_key, release_reservation=release_reservation
+        )
+        return True
 
     def _drop_registry_entry(self, request_id: str, token_count: int) -> None:
         with self._registry_lock:
@@ -759,13 +816,13 @@ class BoundarySnapshotSSDStore:
     def _write_inline(
         self,
         pw_key: tuple[str, int],
-        tensors_raw: dict,
-        metadata: dict,
+        pending: dict,
         file_path: Path,
     ) -> bool:
         """Write one staging file synchronously without retaining a fallback."""
+        tensors_raw = pending["tensors_raw"]
+        metadata = pending["metadata"]
         temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
-        pending = None
         owns_pending = False
         wrote_file = False
         try:
@@ -775,8 +832,6 @@ class BoundarySnapshotSSDStore:
                     owns_pending = candidate is not None and candidate.get(
                         "tensors_raw"
                     ) is tensors_raw
-                    if owns_pending:
-                        pending = candidate
                 if not owns_pending:
                     # cleanup_request may have removed the inline marker and
                     # consumed its cancellation counter before this writer
@@ -849,14 +904,18 @@ class BoundarySnapshotSSDStore:
                         path.unlink()
                 except Exception:
                     pass
-            self._drop_registry_entry(pw_key[0], pw_key[1])
             return False
         finally:
-            if pending is not None and not wrote_file:
-                with self._pending_cond:
-                    current = self._pending_writes.get(pw_key)
-                    if current is pending:
-                        self._remove_pending_locked(pw_key)
+            removed = False
+            with self._pending_cond:
+                if not wrote_file:
+                    removed = self._remove_pending_if_current_locked(
+                        pw_key,
+                        pending,
+                        release_reservation=False,
+                    )
+                self._release_pending_reservation_locked(pending)
+            if removed:
                 self._drop_registry_entry(pw_key[0], pw_key[1])
 
     def _writer_loop(self) -> None:
@@ -887,22 +946,20 @@ class BoundarySnapshotSSDStore:
                 item = None
 
     def _process_write_item(self, item) -> None:
-        """Process one (pw_key, tensors_raw, metadata, file_path) queue item.
+        """Process one (pw_key, pending, file_path) queue item.
 
         Extracted from ``_writer_loop`` so the busy-lock can wrap it
         cleanly. Called only on the writer thread.
         """
-        pw_key, tensors_raw, metadata, file_path = item
+        pw_key, pending, file_path = item
+        tensors_raw = pending["tensors_raw"]
+        metadata = pending["metadata"]
 
-        # If cleanup_all or cleanup_request cleared this key from
-        # _pending_writes while the item was in the writer's local hand
-        # (i.e. between ``get()`` and entering ``with _writer_busy``),
-        # treat the write as cancelled. This closes the late-rename
-        # window where cleanup runs entirely between the writer's pull
-        # and its busy-lock acquisition.
+        # If cleanup cleared this key, or a newer save superseded this queue
+        # item, do not write or clear the latest generation.
         with self._pending_lock:
-            cleared_by_cleanup = pw_key not in self._pending_writes
-        if cleared_by_cleanup:
+            owns_pending = self._pending_writes.get(pw_key) is pending
+        if not owns_pending:
             # If a timed-out cleanup_request bumped ``_cancelled_requests``
             # before clearing pending_writes, this item is one of the N
             # the counter is waiting on. Without this decrement the
@@ -912,12 +969,17 @@ class BoundarySnapshotSSDStore:
             # later reuse of the same string) to be silently discarded.
             if self._is_cancelled(pw_key[0]):
                 self._dec_cancelled(pw_key[0])
+            with self._pending_cond:
+                self._release_pending_reservation_locked(pending)
             return
 
         # Skip writes for cancelled/cleaned-up requests.
         if self._is_cancelled(pw_key[0]):
             with self._pending_cond:
-                self._remove_pending_locked(pw_key)
+                self._remove_pending_if_current_locked(
+                    pw_key, pending, release_reservation=False
+                )
+                self._release_pending_reservation_locked(pending)
             try:
                 req_dir = file_path.parent
                 if req_dir.exists():
@@ -956,7 +1018,9 @@ class BoundarySnapshotSSDStore:
                 except Exception:
                     pass
                 with self._pending_cond:
-                    self._remove_pending_locked(pw_key)
+                    self._remove_pending_if_current_locked(
+                        pw_key, pending, release_reservation=False
+                    )
                 self._dec_cancelled(pw_key[0])
                 return
 
@@ -1006,9 +1070,18 @@ class BoundarySnapshotSSDStore:
             # write attempt finishes they must be released even on failure;
             # retaining them would recreate the unbounded RAM fallback this
             # store exists to avoid.
+            removed = False
             with self._pending_cond:
-                self._remove_pending_locked(pw_key)
-            if not self._is_safe_snapshot_path(file_path) or not file_path.is_file():
+                removed = self._remove_pending_if_current_locked(
+                    pw_key,
+                    pending,
+                    release_reservation=False,
+                )
+                self._release_pending_reservation_locked(pending)
+            if removed and (
+                not self._is_safe_snapshot_path(file_path)
+                or not file_path.is_file()
+            ):
                 self._drop_registry_entry(pw_key[0], pw_key[1])
 
     def _serialize_extracted(

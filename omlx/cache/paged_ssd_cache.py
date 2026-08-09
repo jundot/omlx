@@ -24,6 +24,7 @@ import logging
 import os
 import queue
 import shutil
+import stat
 import struct
 import threading
 import time
@@ -1970,6 +1971,83 @@ class PagedSSDCacheManager(CacheManager):
             return False
         return file_path.is_file()
 
+    def _unlink_gdn_sidecar_file(self, metadata: GDNCheckpointMetadata) -> bool:
+        """Unlink one indexed sidecar without following swapped parent symlinks.
+
+        The index stores a pathname that was safe when it was discovered or
+        committed.  A later replacement of ``_gdn_sidecars`` (or its signature
+        directory) with a symlink must not turn forget/LRU/clear into an unlink
+        outside the cache.  Open both directories without following symlinks,
+        validate the leaf with ``lstat`` semantics, then unlink relative to the
+        already-open directory descriptor.
+
+        Returns ``False`` for an unsafe path. A missing file is treated as
+        successfully absent. Other OS errors are raised so callers can restore
+        the index entry and retry later.
+        """
+        if self._cache_dir is None:
+            return False
+
+        digest = metadata.cache_signature_digest
+        if len(digest) != self._GDN_SIGNATURE_DIGEST_LENGTH:
+            return False
+        try:
+            bytes.fromhex(digest)
+        except ValueError:
+            return False
+
+        sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        file_name = f"{metadata.source_block_hash.hex()}.safetensors"
+        expected_path = sidecar_root / digest / file_name
+        if Path(metadata.file_path) != expected_path:
+            logger.warning(
+                "Refusing to unlink unexpected GDN sidecar path: %s",
+                metadata.file_path,
+            )
+            return False
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        root_fd = signature_fd = None
+        try:
+            root_fd = os.open(sidecar_root, directory_flags)
+            signature_fd = os.open(digest, directory_flags, dir_fd=root_fd)
+            try:
+                file_stat = os.stat(
+                    file_name,
+                    dir_fd=signature_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return True
+            if not stat.S_ISREG(file_stat.st_mode):
+                logger.warning(
+                    "Refusing to unlink non-regular GDN sidecar: %s",
+                    expected_path,
+                )
+                return False
+            try:
+                os.unlink(file_name, dir_fd=signature_fd)
+            except FileNotFoundError:
+                return True
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                logger.warning(
+                    "Refusing to unlink through unsafe GDN sidecar path: %s",
+                    expected_path,
+                )
+                return False
+            raise
+        finally:
+            if signature_fd is not None:
+                os.close(signature_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
     def _tracked_ssd_size(self) -> int:
         """Return all SSD cache bytes tracked for this shared cache directory."""
         return (
@@ -2151,32 +2229,43 @@ class PagedSSDCacheManager(CacheManager):
                 if staged_stat.st_dev != final_path.parent.stat().st_dev:
                     logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
                     return None
-                old = self._gdn_sidecar_index.get(
+                old = self._gdn_sidecar_index.remove(
                     source_block_hash, signature_digest
                 )
-                old_size = old.file_size if old is not None else 0
-                self._enforce_size_limit_for_new_block(
-                    max(0, staged_stat.st_size - old_size)
-                )
-                # Replacing an existing path is atomic on the same filesystem.
-                # Keep the old file and index entry intact until promotion
-                # succeeds so a failed write cannot destroy a valid checkpoint.
-                os.replace(staged_path, final_path)
-                committed_at = time.time()
-                self._gdn_sidecar_index.add(
-                    GDNCheckpointMetadata(
-                        source_block_hash=source_block_hash,
-                        cache_signature_digest=signature_digest,
-                        file_path=final_path,
-                        file_size=staged_stat.st_size,
-                        token_count=int(token_count),
-                        model_name=model_name,
-                        block_size=int(block_size),
-                        created_at=committed_at,
-                        last_access=committed_at,
+                try:
+                    # Temporarily remove the destination from LRU accounting so
+                    # size enforcement cannot evict/unlink the checkpoint being
+                    # replaced. Account for the full incoming file while the old
+                    # entry is protected; on promotion failure the old metadata
+                    # is restored below and its file remains intact.
+                    self._enforce_size_limit_for_new_block(staged_stat.st_size)
+                    os.replace(staged_path, final_path)
+                    committed_at = time.time()
+                    # os.replace preserves the staging file's timestamps. Stamp
+                    # the actual commit/access time so a restart reconstructs LRU
+                    # order from a meaningful mtime rather than stale staging age.
+                    with contextlib.suppress(OSError):
+                        os.utime(final_path, (committed_at, committed_at))
+                    self._gdn_sidecar_index.add(
+                        GDNCheckpointMetadata(
+                            source_block_hash=source_block_hash,
+                            cache_signature_digest=signature_digest,
+                            file_path=final_path,
+                            file_size=staged_stat.st_size,
+                            token_count=int(token_count),
+                            model_name=model_name,
+                            block_size=int(block_size),
+                            created_at=committed_at,
+                            last_access=committed_at,
+                        )
                     )
-                )
-                return final_path
+                    return final_path
+                except OSError:
+                    if old is not None and self._is_safe_gdn_sidecar_file(
+                        old.file_path
+                    ):
+                        self._gdn_sidecar_index.add(old)
+                    raise
             except OSError as exc:
                 logger.warning("Failed to commit GDN sidecar: %s", exc)
                 return None
@@ -2215,8 +2304,10 @@ class PagedSSDCacheManager(CacheManager):
             if metadata is None:
                 return False
             try:
-                metadata.file_path.unlink(missing_ok=True)
-                return True
+                deleted = self._unlink_gdn_sidecar_file(metadata)
+                if not deleted:
+                    self._gdn_sidecar_index.add(metadata)
+                return deleted
             except OSError:
                 self._gdn_sidecar_index.add(metadata)
                 return False
@@ -4179,7 +4270,14 @@ class PagedSSDCacheManager(CacheManager):
         space that does not exist on disk).
         """
         try:
-            metadata.file_path.unlink(missing_ok=True)
+            if isinstance(metadata, GDNCheckpointMetadata):
+                if not self._unlink_gdn_sidecar_file(metadata):
+                    restore_index = source_index or self._gdn_sidecar_index
+                    restore_index.add(metadata)
+                    self._stats["evict_unlink_failures"] += 1
+                    return
+            else:
+                metadata.file_path.unlink(missing_ok=True)
             self._stats["evictions"] += 1
         except OSError as e:
             restore_index = source_index or self._index
@@ -4276,8 +4374,10 @@ class PagedSSDCacheManager(CacheManager):
                 if metadata is None:
                     continue
                 try:
-                    metadata.file_path.unlink(missing_ok=True)
-                    count += 1
+                    if self._unlink_gdn_sidecar_file(metadata):
+                        count += 1
+                    else:
+                        self._gdn_sidecar_index.add(metadata)
                 except OSError:
                     self._gdn_sidecar_index.add(metadata)
 

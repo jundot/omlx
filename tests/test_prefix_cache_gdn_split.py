@@ -91,7 +91,7 @@ def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
         provider = _BoundarySnapshotProvider(
             boundary,
             request_id,
-            boundaries,
+            boundaries[:-1],
             {},
             paged_ssd_manager=ssd,
         )
@@ -160,6 +160,258 @@ def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
         assert prefix.get_stats_dict()["gdn_checkpoint_loads"] == 0
         assert prefix.get_stats_dict()["gdn_checkpoint_walkbacks"] == 0
         prefix.release_cache("restore-walkback")
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_split_store_commits_single_final_sidecar_outside_provider_index(tmp_path):
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+    )
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+
+    try:
+        request_id = "single-final-boundary"
+        extracted = _hybrid_extracted(BLOCK_SIZE, float(BLOCK_SIZE))
+        assert boundary.save(
+            request_id,
+            BLOCK_SIZE,
+            [MagicMock()],
+            lambda _snapshot: (extracted, None),
+        )
+        # Scheduler excludes the latest snapshot from the provider's mapping;
+        # it is still staged and must be committed for the final block.
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            [],
+            {},
+            paged_ssd_manager=ssd,
+        )
+        tokens = list(range(BLOCK_SIZE))
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            extracted,
+            boundary_snapshots=provider,
+        )
+
+        assert stored is not None and stored.num_tokens == BLOCK_SIZE
+        block_hash = _block_hashes(prefix, stored)[0]
+        signature = ssd.cache_signature_for(
+            model_name="hybrid-model",
+            num_layers=2,
+            block_size=BLOCK_SIZE,
+            layer_cache_types=LAYER_TYPES,
+        )
+        assert ssd.has_gdn_checkpoint(block_hash, signature)
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_split_dedup_recreates_evicted_sidecar(tmp_path):
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+    )
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+
+    try:
+        tokens = list(range(12))
+        boundaries = [4, 8, 12]
+        for token_count in boundaries:
+            extracted = _hybrid_extracted(token_count, float(token_count))
+            assert boundary.save(
+                "dedup-original",
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+        original_provider = _BoundarySnapshotProvider(
+            boundary,
+            "dedup-original",
+            boundaries[:-1],
+            {},
+            paged_ssd_manager=ssd,
+        )
+        original = prefix.store_cache(
+            "dedup-original",
+            tokens,
+            _hybrid_extracted(12, 12.0),
+            boundary_snapshots=original_provider,
+        )
+        assert original is not None and original.num_tokens == 12
+        hashes = _block_hashes(prefix, original)
+        signature = ssd.cache_signature_for(
+            model_name="hybrid-model",
+            num_layers=2,
+            block_size=BLOCK_SIZE,
+            layer_cache_types=LAYER_TYPES,
+        )
+        assert ssd.forget_gdn_checkpoint(hashes[-1], signature)
+
+        replacement = _hybrid_extracted(12, 12.0)
+        assert boundary.save(
+            "dedup-repair",
+            12,
+            [MagicMock()],
+            lambda _snapshot: (replacement, None),
+        )
+        repair_provider = _BoundarySnapshotProvider(
+            boundary,
+            "dedup-repair",
+            [],
+            {},
+            paged_ssd_manager=ssd,
+        )
+        repaired = prefix.store_cache(
+            "dedup-repair",
+            tokens,
+            replacement,
+            boundary_snapshots=repair_provider,
+        )
+
+        assert repaired is not None and repaired.num_tokens == 12
+        assert _block_hashes(prefix, repaired) == hashes
+        assert ssd.has_gdn_checkpoint(hashes[-1], signature)
+        hit_table, remaining = prefix.fetch_cache("dedup-restored", tokens)
+        assert hit_table is not None and remaining == []
+        restored = prefix.reconstruct_cache(hit_table)
+        assert restored is not None
+        assert hit_table.num_tokens == 12
+        assert float(restored[1].state[0][0, 0, 0]) == 12.0
+        prefix.release_cache("dedup-restored")
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_split_restore_walks_back_from_structurally_invalid_sidecar(tmp_path):
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+    )
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+
+    try:
+        request_id = "store-invalid-newest"
+        boundaries = [4, 8, 12]
+        for token_count in boundaries:
+            extracted = _hybrid_extracted(token_count, float(token_count))
+            assert boundary.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            boundaries,
+            {},
+            paged_ssd_manager=ssd,
+        )
+        tokens = list(range(12))
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            _hybrid_extracted(12, 12.0),
+            boundary_snapshots=provider,
+        )
+        assert stored is not None and stored.num_tokens == 12
+        hashes = _block_hashes(prefix, stored)
+        signature = ssd.cache_signature_for(
+            model_name="hybrid-model",
+            num_layers=2,
+            block_size=BLOCK_SIZE,
+            layer_cache_types=LAYER_TYPES,
+        )
+        newest_path = ssd.get_gdn_checkpoint_file(hashes[-1], signature)
+        assert newest_path is not None
+
+        def load_with_invalid_newest(path):
+            snapshot = boundary.load_file(path)
+            assert snapshot is not None
+            if path == newest_path:
+                # The container is readable, but the recurrent state is not.
+                snapshot[1]["state"] = (snapshot[1]["state"][0],)
+            return snapshot
+
+        prefix.set_gdn_checkpoint_loader(load_with_invalid_newest)
+        hit_table, remaining = prefix.fetch_cache("restore-invalid-newest", tokens)
+        assert hit_table is not None and remaining == []
+        restored = prefix.reconstruct_cache(hit_table)
+
+        assert restored is not None
+        assert hit_table.num_tokens == 8
+        assert restored[0].state[0].shape[2] == 8
+        assert restored[1].size() == 8
+        assert float(restored[1].state[0][0, 0, 0]) == 8.0
+        assert not ssd.has_gdn_checkpoint(hashes[-1], signature)
+        diagnostic = prefix.get_stats_dict()["gdn_last_restore"]
+        assert diagnostic["chosen_endpoint_tokens"] == 8
+        assert diagnostic["walkback_blocks"] == 1
+        prefix.release_cache("restore-invalid-newest")
     finally:
         boundary.shutdown()
         ssd.close()

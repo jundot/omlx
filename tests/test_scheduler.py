@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import threading
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -1283,6 +1284,38 @@ class TestSchedulerAbortRequest:
         # stepping until it fires.
         assert scheduler.has_requests() is True
 
+    def test_abort_defers_cleanup_while_async_store_is_pending(
+        self, mock_model, mock_tokenizer
+    ):
+        """Abort must not delete snapshots still owned by store_cache."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-store-pending",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.set_finished(RequestStatus.FINISHED_STOPPED)
+        scheduler.requests[request.request_id] = request
+
+        future = concurrent.futures.Future()
+        scheduler._inflight_store_futures[request.request_id] = future
+        scheduler._pending_async_removes.append(
+            (123, request.request_id, future)
+        )
+        snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store = snapshot_store
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._do_abort_request(request.request_id) is False
+        assert request.request_id in scheduler.requests
+        snapshot_store.cleanup_request.assert_not_called()
+        scheduler.block_aware_cache.clear_request_entry.assert_not_called()
+
+        future.set_result(None)
+        assert scheduler._drain_pending_async_removes() is True
+        snapshot_store.cleanup_request.assert_called_once_with(request.request_id)
+        assert request.request_id not in scheduler.requests
+
 
 class TestPrefillAbortInterrupt:
     """Tests for prefill abort interrupt via _check_pending_aborts_for_uids."""
@@ -1712,7 +1745,8 @@ class TestSchedulerReset:
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
-        fake_future = MagicMock()
+        fake_future = concurrent.futures.Future()
+        fake_future.set_result(None)
         scheduler._pending_async_removes.append((999, "req-leaked", fake_future))
         scheduler._inflight_store_futures["req-leaked"] = fake_future
 
@@ -1720,6 +1754,112 @@ class TestSchedulerReset:
 
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
+
+    def test_reset_waits_for_store_worker_before_snapshot_and_cache_cleanup(
+        self, mock_model, mock_tokenizer
+    ):
+        """reset() must cross the store-future barrier before destructive cleanup."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-reset-barrier",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.set_finished(RequestStatus.FINISHED_STOPPED)
+        request._extracted_cache = object()
+        scheduler.requests[request.request_id] = request
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        wait_entered = threading.Event()
+        order = []
+
+        def blocked_store_worker():
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+            order.append("worker_done")
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(blocked_store_worker)
+        assert worker_started.wait(timeout=2)
+        scheduler._inflight_store_futures[request.request_id] = future
+        scheduler._pending_async_removes.append(
+            (321, request.request_id, future)
+        )
+
+        snapshot_store = MagicMock()
+        snapshot_store.cleanup_request.side_effect = lambda _rid: order.append(
+            "cleanup_request"
+        )
+        snapshot_store.cleanup_all.side_effect = lambda: order.append("cleanup_all")
+        scheduler._boundary_snapshot_store = snapshot_store
+        prefix_cache = MagicMock()
+        prefix_cache.clear.side_effect = lambda: order.append("cache_clear")
+        scheduler.block_aware_cache = prefix_cache
+
+        real_wait = concurrent.futures.wait
+
+        def wait_at_barrier(fs, timeout=None):
+            wait_entered.set()
+            return real_wait(fs, timeout=timeout)
+
+        reset_errors = []
+
+        def run_reset():
+            try:
+                scheduler.reset()
+            except BaseException as exc:  # surfaced on the test thread below
+                reset_errors.append(exc)
+
+        reset_thread = threading.Thread(target=run_reset)
+        try:
+            with patch(
+                "omlx.scheduler.concurrent.futures.wait",
+                side_effect=wait_at_barrier,
+            ):
+                reset_thread.start()
+                assert wait_entered.wait(timeout=2)
+                snapshot_store.cleanup_request.assert_not_called()
+                snapshot_store.cleanup_all.assert_not_called()
+                prefix_cache.clear.assert_not_called()
+
+                release_worker.set()
+                reset_thread.join(timeout=5)
+        finally:
+            release_worker.set()
+            reset_thread.join(timeout=5)
+            executor.shutdown(wait=True)
+
+        assert not reset_thread.is_alive()
+        assert reset_errors == []
+        assert order == [
+            "worker_done",
+            "cleanup_request",
+            "cleanup_all",
+            "cache_clear",
+        ]
+
+    def test_reset_fatal_exits_when_store_cache_worker_times_out(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store worker cannot make reset wait forever or clear caches."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        future = concurrent.futures.Future()
+        scheduler._inflight_store_futures["req-stuck"] = future
+        snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store = snapshot_store
+        scheduler.block_aware_cache = MagicMock()
+
+        with (
+            patch("concurrent.futures.wait", return_value=(set(), {future})),
+            patch("omlx.scheduler.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            scheduler.reset()
+
+        assert "Scheduler reset timed out after 60s" in fatal.call_args.args[0]
+        snapshot_store.cleanup_all.assert_not_called()
+        scheduler.block_aware_cache.clear.assert_not_called()
 
     def test_shutdown_drains_after_bounded_wait(self, mock_model, mock_tokenizer):
         """shutdown() must drain pending removes after the bounded wait.
