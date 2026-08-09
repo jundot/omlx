@@ -57,6 +57,15 @@ class PrefillTransientTracker:
         # gates, matching the floor-chunk charge they price. Never used
         # for chunk sizing.
         self._observed_max_bytes: int = 0
+        # Net process footprint released by negative post-chunk deltas. MLX may
+        # need to allocate that pool again on the next chunk, so the scheduler
+        # prices it once until a positive measurement confirms reallocation.
+        self._recent_reclaim_bytes: int = 0
+
+    def record_reclaim(self, reclaimed_bytes: int) -> None:
+        """Accumulate footprint released since the last positive sample."""
+        if reclaimed_bytes > 0:
+            self._recent_reclaim_bytes += int(reclaimed_bytes)
 
     def update(
         self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
@@ -86,6 +95,8 @@ class PrefillTransientTracker:
             return
         if transient_bytes <= 0:
             return
+
+        self._recent_reclaim_bytes = 0
 
         # The very first sample after a model load carries weight page-fault
         # and load-residue noise, so it seeds the EWMA but is excluded from
@@ -165,6 +176,11 @@ class PrefillTransientTracker:
         """Largest accepted chunk transient this session (0 if none yet)."""
         return self._observed_max_bytes
 
+    @property
+    def recent_reclaim_bytes(self) -> int:
+        """Footprint released since the last positive chunk measurement."""
+        return self._recent_reclaim_bytes
+
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
         self._ewma_per_token = 0.0
@@ -172,3 +188,4 @@ class PrefillTransientTracker:
         self._last_delta_bytes = 0
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
+        self._recent_reclaim_bytes = 0

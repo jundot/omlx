@@ -3478,6 +3478,8 @@ class Scheduler:
         if n_tokens <= 0:
             return 0.0
         per_token = 0.0
+        static_per_token = 0.0
+        recent_reclaim = 0
         tracker = self._prefill_transient_tracker
         if tracker is not None:
             if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
@@ -3486,13 +3488,20 @@ class Scheduler:
                 )
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
+            recent_reclaim = tracker.recent_reclaim_bytes
         if self.memory_monitor is not None:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens
             )
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
-            per_token = max(per_token, float(static) / n_tokens)
-        return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+            static_per_token = float(static) / n_tokens
+            per_token = max(per_token, static_per_token)
+        base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+        reallocation_prediction = (
+            static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+            + recent_reclaim
+        )
+        return max(base_prediction, reallocation_prediction)
 
     def _admission_transient_bound(self, n_tokens: int, kv_len: int) -> float:
         """Transient charge for admission and the guard's pass/abort gates.
@@ -4230,6 +4239,11 @@ class Scheduler:
         has to stay conservative. Keeping kv_len in the log is what made that
         analysis possible.
 
+        Negative deltas remain excluded from the per-token EWMA, but their
+        released footprint is retained until the next positive sample. The
+        next predictor prices that one-shot reallocation risk without treating
+        it as a negative per-token cost.
+
         Under speed priority, only a complete requested step is representative
         of the full-size chunks used for admission. A shorter tail or
         boundary-alignment chunk must not replace the last full-step sample:
@@ -4251,8 +4265,10 @@ class Scheduler:
             )
             return
         if delta <= 0:
+            self._prefill_transient_tracker.record_reclaim(-delta)
             logger.debug(
-                "[throttle:%s] measure rid=%s n=%d delta=%dB (skipped: <=0)",
+                "[throttle:%s] measure rid=%s n=%d delta=%dB "
+                "(excluded from EWMA; tracked as reclaim)",
                 loop_label,
                 request_id,
                 n_tokens,
