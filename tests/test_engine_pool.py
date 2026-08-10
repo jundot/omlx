@@ -585,6 +585,79 @@ class TestVLMFallback:
         assert entry.engine is mock_batched_engine
 
     @pytest.mark.asyncio
+    async def test_vlm_fallback_reports_lost_vision(
+        self, small_mock_model_dir, caplog
+    ):
+        """A VLM that falls back to LLM serves text only; say so loudly.
+
+        Regression guard: the fallback used to log a single WARNING and leave
+        no other trace, so a vision model quietly became text-only and
+        presented to callers as "I don't see an image attached" -- which reads
+        as a bad vision tower rather than a failed load.
+        """
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock(
+            side_effect=Exception("Received 2 parameters not in model")
+        )
+        mock_vlm_engine.stop = AsyncMock()
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
+            caplog.at_level(logging.ERROR, logger="omlx.engine_pool"),
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.capability_degraded is True
+        assert "vision" in (entry.capability_degraded_reason or "").lower()
+
+        # Logged at ERROR, not WARNING -- a warning is too easy to miss.
+        assert any(
+            r.levelno == logging.ERROR and "TEXT ONLY" in r.getMessage()
+            for r in caplog.records
+        ), "expected an ERROR naming the capability loss"
+
+        # And queryable, not log-only.
+        status = next(
+            m for m in pool.get_status()["models"] if m["id"] == "model-a"
+        )
+        assert status["capability_degraded"] is True
+        assert status["capability_degraded_reason"]
+
+    @pytest.mark.asyncio
+    async def test_successful_vlm_load_is_not_degraded(self, small_mock_model_dir):
+        """A VLM that loads cleanly must not be flagged."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        # Stale flag from an earlier failed load must be cleared at load start.
+        entry.capability_degraded = True
+        entry.capability_degraded_reason = "stale"
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.capability_degraded is False
+        assert entry.capability_degraded_reason is None
+
+    @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
         """Test that non-VLM engine failures propagate normally."""
         pool = _make_pool(ceiling=10 * 1024**3)

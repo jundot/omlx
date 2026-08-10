@@ -1922,6 +1922,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             ),
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
+            "capability_degraded": model_info.get("capability_degraded", False),
+            "capability_degraded_reason": model_info.get("capability_degraded_reason"),
             "config_model_type": model_info.get("config_model_type", ""),
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.

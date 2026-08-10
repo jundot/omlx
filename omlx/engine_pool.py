@@ -114,6 +114,13 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Set when a model loaded, but not with the capabilities it was discovered
+    # to have -- currently only the VLM -> LLM fallback, which leaves a vision
+    # model serving text only. Without this the loss is visible in one log line
+    # and nowhere else, and presents to the caller as the model simply not
+    # seeing images.
+    capability_degraded: bool = False
+    capability_degraded_reason: str | None = None
 
 
 class EnginePool:
@@ -1664,6 +1671,10 @@ class EnginePool:
         load_completed = False
         entry_detached = False
         entry.abort_loading = False
+        # Cleared at load start, not on success: the VLM -> LLM fallback sets it
+        # mid-load and the success path runs afterwards.
+        entry.capability_degraded = False
+        entry.capability_degraded_reason = None
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
@@ -1904,10 +1915,18 @@ class EnginePool:
                         f"(fallback from force_lm)"
                     )
                 elif entry.engine_type == "vlm":
-                    # VLM loading failed -- fall back to LLM (BatchedEngine)
-                    logger.warning(
-                        f"VLM loading failed for {model_id}, "
-                        f"falling back to LLM: {start_error}"
+                    # VLM loading failed -- fall back to LLM (BatchedEngine).
+                    # The model still serves text, so this stays a fallback
+                    # rather than a hard failure: mlx-vlm does not implement
+                    # every architecture that declares a vision sub-config.
+                    # But the model loses vision, so log it at ERROR and record
+                    # it on the entry -- a WARNING alone is indistinguishable
+                    # from a weak vision tower once requests start returning
+                    # "I don't see an image attached".
+                    logger.error(
+                        f"VLM loading failed for {model_id}, falling back to "
+                        f"LLM: the model will serve TEXT ONLY and image inputs "
+                        f"will be ignored. Cause: {start_error}"
                     )
                     try:
                         await engine.stop()
@@ -1937,8 +1956,14 @@ class EnginePool:
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
+                    entry.capability_degraded = True
+                    entry.capability_degraded_reason = (
+                        "vision unavailable: VLM engine failed to load, serving "
+                        f"text only ({start_error})"
+                    )
                     logger.info(
-                        f"Successfully loaded {model_id} as LLM " f"(fallback from VLM)"
+                        f"Successfully loaded {model_id} as LLM "
+                        f"(fallback from VLM, vision disabled)"
                     )
                 else:
                     raise
@@ -2184,6 +2209,8 @@ class EnginePool:
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
+                    "capability_degraded": e.capability_degraded,
+                    "capability_degraded_reason": e.capability_degraded_reason,
                     "config_model_type": e.config_model_type,
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
