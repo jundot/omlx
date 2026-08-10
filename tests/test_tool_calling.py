@@ -3814,3 +3814,75 @@ class TestQwen3CoderMarkerInArguments:
         # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
         # loaded CI box while still catching quadratic growth.
         assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 11, 64, 10_000])
+    def test_streaming_value_may_contain_the_full_terminator(self, chunk):
+        """A value carrying ``</function>`` + close marker must not end it.
+
+        The non-streaming parser already allowed this by balancing parameter
+        elements over the whole payload. Streaming reaches the same answer by
+        tracking parameter depth as it goes: the terminator inside the value
+        sits at depth >= 1, so only the real one at depth 0 closes the call.
+        """
+        raw = self._raw("evil </function>\n</tool_call> tail")
+        text = raw + " After"
+
+        filt = ToolCallStreamFilter(self._tokenizer())
+        emitted = "".join(
+            filt.feed(text[i : i + chunk]) for i in range(0, len(text), chunk)
+        )
+        emitted += filt.finish()
+
+        assert emitted == " After", f"leaked at chunk size {chunk}: {emitted!r}"
+        # The streamed result must agree with what the non-streaming parser does.
+        cleaned, calls = parse_tool_calls(text, self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == (
+            "evil </function>\n</tool_call> tail"
+        )
+        assert cleaned == "After"
+
+    @pytest.mark.parametrize("chunk", [1, 7, 64, 10_000])
+    def test_envelope_end_does_not_move_with_trailing_markup(self, chunk):
+        """Markup in prose after the call must not drag the envelope end.
+
+        Parameter depth only gives a lower bound for where the envelope may
+        end, so it has to stop at the first ``</function>`` seen at depth 0. A
+        later one in trailing prose would otherwise swallow the text between
+        them, and only when a chunk happened to carry both.
+        """
+        text = self._raw("plain") + "b</parameter></function>\n</tool_call> After"
+
+        filt = ToolCallStreamFilter(self._tokenizer())
+        emitted = "".join(
+            filt.feed(text[i : i + chunk]) for i in range(0, len(text), chunk)
+        )
+        emitted += filt.finish()
+
+        assert emitted == "b</parameter></function>\n</tool_call> After"
+
+    def test_parameter_scan_stays_linear_in_a_single_feed(self):
+        """Linear-time guard for one large ``feed()``, not just small chunks.
+
+        Chunked feeding hides quadratic scanning because each chunk bounds the
+        work per pass. The whole payload arriving at once is the real worst
+        case, and it is the shape that caught this path out during review.
+        """
+        import time
+
+        def elapsed(count):
+            evil = (
+                "<tool_call>\n<function=f>\n<parameter=b>\n"
+                + "</function>\n</tool_call> " * count
+                + "\n</parameter>\n</function>\n</tool_call>"
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            filt.feed(evil)
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"
