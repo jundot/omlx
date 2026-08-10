@@ -115,12 +115,13 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.3 (474f8e1) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # dflash-mlx v0.1.10+omlx.4 (3b2a88b) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
-    # fired upstream) and the single-host-sync decode cycle (one D2H transfer
-    # per cycle instead of four syncs plus a hard eval). Also supports current
-    # Gemma 4 unified target exports.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@474f8e1ba95864f5bb0759cd1b9a13c80abc5ce3",
+    # fired upstream), the single-host-sync decode cycle (one D2H transfer
+    # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
+    # target exports, and Muse Glimmer target/drafter support (bundled
+    # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch).
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@3b2a88b0739e22aa612de4cc462bb68665dd63ba",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 
