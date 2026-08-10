@@ -3938,3 +3938,32 @@ class TestDeepNestingNeverEscapesParseChain:
             "<tool_call>" + "[" * 100000 + "</tool_call>", tok
         )
         assert calls is None
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_deep_nesting_does_not_take_down_a_neighboring_tool_call(error):
+    """One unparseable call must not lose the valid call beside it (#2545).
+
+    The parse loop runs per match, so a payload that breaks the decoder has
+    to fail that match alone and leave the rest of the batch intact.
+    """
+    def parser(text, tools):
+        if "[" in text:
+            raise error("nested too deeply")
+        return json.loads(text)
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = parser
+
+    cleaned, calls = parse_tool_calls(
+        "<tool_call>" + "[" * 500 + "</tool_call>"
+        '<tool_call>{"name": "good", "arguments": {"a": 1}}</tool_call>',
+        tok,
+    )
+
+    assert [c.function.name for c in calls] == ["good"]
+    # The broken envelope's markup must not leak into content either.
+    assert cleaned == ""
