@@ -3814,3 +3814,127 @@ class TestQwen3CoderMarkerInArguments:
         # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
         # loaded CI box while still catching quadratic growth.
         assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+
+class TestDeepNestingNeverEscapesParseChain:
+    """Deep nesting must degrade to a parse failure, not raise (#2545).
+
+    The interpreter decides *which* error deep input produces, and it varies
+    by version: on 3.14 ``json.loads`` already returns a JSONDecodeError that
+    the old excepts caught, while ``ast`` raises SyntaxError. On earlier
+    versions RecursionError is the mode. Testing with genuinely deep input
+    therefore proves nothing portable, so these tests inject the error at the
+    decoder instead and assert the chain still degrades cleanly on every
+    version.
+    """
+
+    ERRORS = [RecursionError, SyntaxError]
+
+    @staticmethod
+    def _tokenizer(parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parser
+        return tok
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_native_parser_raising_does_not_escape(self, error):
+        """A real parser hitting the limit internally must not escape.
+
+        This is the path #2545 is really about: glm47, kimi_k2 and
+        qwen3_coder call ``json.loads`` inside the parser, so the error
+        surfaces at the parser call rather than at a decode site in this
+        module. Recovering via the XML fallback is a fine outcome; raising
+        is not.
+        """
+        def boom(text, tools):
+            raise error("nested too deeply")
+
+        # Recoverable payload: the fallback picks it up, nothing escapes.
+        _, calls = parse_tool_calls(
+            '<tool_call>{"name": "f"}</tool_call>', self._tokenizer(boom)
+        )
+        assert calls is not None and calls[0].function.name == "f"
+
+        # Unrecoverable payload: drops to no tool calls, still no raise.
+        _, calls = parse_tool_calls(
+            "<tool_call>" + "[" * 500 + "</tool_call>", self._tokenizer(boom)
+        )
+        assert calls is None
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_json_loads_raising_does_not_escape(self, monkeypatch, error):
+        """Every json.loads site in the chain sits behind a guard."""
+        import omlx.api.tool_calling as mod
+
+        real = json.loads
+
+        def boom(s, *a, **k):
+            raise error("nested too deeply")
+
+        monkeypatch.setattr(mod.json, "loads", boom)
+        try:
+            # Each of these reaches a different decode site.
+            mod._parse_xml_tool_calls("<tool_call>{}</tool_call>")
+            mod.extract_json_from_text('{"a": 1}')
+            parse_tool_calls("plain text, no markup", self._tokenizer(None))
+        finally:
+            monkeypatch.setattr(mod.json, "loads", real)
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_gemma4_args_reject_hard_instead_of_retrying_legacy(
+        self, monkeypatch, error
+    ):
+        """Deep nesting must not fall through to the unbounded legacy parser.
+
+        The legacy path ignores the length/depth bounds on purpose, so routing
+        a payload that broke a decoder into it would hand the exact input the
+        bounds exist to stop to the parser that does not apply them.
+        """
+        import omlx.api.tool_calling as mod
+
+        def boom(_args):
+            raise error("nested too deeply")
+
+        called = []
+        monkeypatch.setattr(mod, "_gemma4_transcode_to_json", boom)
+        monkeypatch.setattr(
+            mod,
+            "_gemma4_args_to_json_legacy",
+            lambda a: called.append(a) or {},
+        )
+
+        with pytest.raises(mod._Gemma4ArgsTooComplexError):
+            mod._gemma4_args_to_json_robust('{"a": 1}')
+        assert called == [], "legacy parser must not see deep-nested args"
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_gemma4_legacy_raising_is_converted(self, monkeypatch, error):
+        """The legacy parser is unbounded, so guard its decoders too."""
+        import omlx.api.tool_calling as mod
+
+        def transcode_fails(_args):
+            raise ValueError("ambiguous, retry with legacy")
+
+        def legacy_boom(_args):
+            raise error("nested too deeply")
+
+        monkeypatch.setattr(mod, "_gemma4_transcode_to_json", transcode_fails)
+        monkeypatch.setattr(mod, "_gemma4_args_to_json_legacy", legacy_boom)
+
+        with pytest.raises(mod._Gemma4ArgsTooComplexError):
+            mod._gemma4_args_to_json_robust('{"a": 1}')
+
+    def test_reported_repro_does_not_raise(self):
+        """The issue's original repro, kept as a smoke test.
+
+        It no longer raises on 3.14 because json.loads returns a decode error
+        there, so it is a regression guard rather than the proof.
+        """
+        tok = self._tokenizer(lambda text, tools: json.loads(text))
+        cleaned, calls = parse_tool_calls(
+            "<tool_call>" + "[" * 100000 + "</tool_call>", tok
+        )
+        assert calls is None

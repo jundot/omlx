@@ -107,7 +107,7 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     if isinstance(arguments, str):
         try:
             parsed = json.loads(arguments)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             parsed = None
         if isinstance(parsed, dict):
             return json.dumps(parsed, ensure_ascii=False)
@@ -198,7 +198,7 @@ def _repair_json_value(val: str) -> Optional[Any]:
         out.append(stack.pop())
     try:
         return json.loads("".join(out), strict=False)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
         return None
 
 
@@ -216,7 +216,7 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
         # Undeclared param, union type list, or anyOf: legacy behavior.
         try:
             return json.loads(val)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
     if val.strip().lower() == "null":
         return None
@@ -231,7 +231,7 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
         if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
             try:
                 decoded = json.loads(stripped)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
                 decoded = None
             if isinstance(decoded, str):
                 return decoded
@@ -253,13 +253,13 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             pass
     try:
         return json.loads(val, strict=False)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
         pass
     try:
         literal = ast.literal_eval(val)
         if isinstance(literal, (dict, list, tuple)):
             return list(literal) if isinstance(literal, tuple) else literal
-    except (ValueError, SyntaxError, TypeError, MemoryError):
+    except (ValueError, SyntaxError, TypeError, MemoryError, *_DEEP_NEST_ERRORS):
         pass
     if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
         repaired = _repair_json_value(val)
@@ -286,6 +286,18 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
 # tolerance already used when parsing tool-call JSON elsewhere in this module,
 # so boundary detection never rejects a payload the parser would have accepted.
 _TOOL_CALL_JSON_DECODER = json.JSONDecoder(strict=False)
+
+# Deeply nested model output breaks the decoders in a version-dependent way:
+# `json.loads` raises RecursionError on some Python versions and a plain
+# JSONDecodeError on others, while `ast.literal_eval`/`ast.parse` raise
+# SyntaxError or RecursionError depending on where the compiler gives up.
+# Neither RecursionError nor SyntaxError is a ValueError, so both slip past
+# excepts written for decode errors and escape the parse chain (#2545).
+# Model output is untrusted and attacker-influenceable, so a breach has to be
+# a clean parse failure on the existing drop path, never a raised exception.
+# Added to every decode-site except in this module rather than relying on the
+# bounds, because only some of these paths are bounded.
+_DEEP_NEST_ERRORS = (RecursionError, SyntaxError)
 
 # Boundary detection is a hint, not the real parse, so it is cheap to bound.
 # Same rationale as _GEMMA4_MAX_ARGS_LEN below: model output is untrusted and
@@ -318,7 +330,7 @@ def _json_value_end(text: str, start: int) -> Optional[int]:
         return None
     try:
         _, end = _TOOL_CALL_JSON_DECODER.raw_decode(text, idx)
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, *_DEEP_NEST_ERRORS):
         return None
     return end
 
@@ -550,7 +562,7 @@ def _parse_xml_tool_calls(
                 )
             )
             continue
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
             pass
 
         # Qwen/Llama format: <function=name><parameter=key>value</parameter></function>
@@ -706,7 +718,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     )
                 )
                 continue
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
             pass
 
         # Hermes bracket format: [func_name(arg1=val1), other_tool(arg2=val2)]
@@ -714,7 +726,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         # strings or nested lists/dicts do not split calls incorrectly.
         try:
             parsed_expr = ast.parse(content, mode="eval").body
-        except SyntaxError:
+        except (SyntaxError, *_DEEP_NEST_ERRORS):
             parsed_expr = None
 
         calls = parsed_expr.elts if isinstance(parsed_expr, ast.List) else [parsed_expr]
@@ -735,7 +747,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     continue
                 try:
                     arguments[kw.arg] = ast.literal_eval(kw.value)
-                except (ValueError, SyntaxError):
+                except (ValueError, SyntaxError, *_DEEP_NEST_ERRORS):
                     arguments[kw.arg] = ast.unparse(kw.value)
 
             tool_calls.append(
@@ -780,7 +792,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         args_str = match.group(2)
         try:
             arguments = json.loads(args_str)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             arguments = {"raw": args_str}
         tool_calls.append(
             ToolCall(
@@ -1019,12 +1031,27 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
         # these bounds and would parse the input anyway, defeating the DoS
         # guard, so it must NOT see oversized/deeply-nested args.
         raise
+    except _DEEP_NEST_ERRORS as exc:
+        # Nesting deep enough to break a decoder is a bound breach in all but
+        # name, so it takes the reject-hard path above rather than the legacy
+        # retry below (#2545).  Falling through would hand the very input the
+        # bounds exist to stop to the parser that ignores them.
+        raise _Gemma4ArgsTooComplexError(
+            "Gemma 4 args nested too deeply to decode"
+        ) from exc
     except (ValueError, json.JSONDecodeError):
         # The legacy path's NUL-placeholder forge vector is reintroduced
         # ONLY for ambiguous input the strict transcoder could not parse
         # (e.g. bare multi-comma markdown values, #1837); the common path
         # keeps the transcoder's no-placeholder, injection-safe guarantee.
-        return _gemma4_args_to_json_legacy(args_str)
+        try:
+            return _gemma4_args_to_json_legacy(args_str)
+        except _DEEP_NEST_ERRORS as exc:
+            # The legacy parser is deliberately unbounded, so it is the one
+            # place a deep payload can still reach a raw decoder.
+            raise _Gemma4ArgsTooComplexError(
+                "Gemma 4 args nested too deeply to decode"
+            ) from exc
 
 
 def _gemma4_transcode_to_json(args_str: str) -> dict:
@@ -1216,7 +1243,7 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 try:
                     json.loads(value)  # already a valid scalar (number, ...)
                     out.append(value)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
                     out.append(json.dumps(value))
             expect = "delim"
         else:  # expect == "delim"
@@ -1285,7 +1312,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     # 4. Try json.loads — works when all values are already valid JSON primitives
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
     # 5. Quote bare string values that are not numbers, booleans, or null
@@ -1297,7 +1324,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
         try:
             json.loads(value)
             return f": {value}{suffix}"
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return f": {json.dumps(value)}{suffix}"
 
     # Keep the pre-step-5 text: if step 5 fails, its partial quoting has
@@ -1308,7 +1335,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     )
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
     # 6. Last resort: key-anchored value capture. Bare values that
@@ -1337,7 +1364,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
             raw_value = raw_value.rstrip().rstrip(",").rstrip()
         try:
             result[km.group(1)] = json.loads(raw_value)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             result[km.group(1)] = raw_value
     return result
 
@@ -1550,6 +1577,11 @@ def _parse_tool_calls_impl(
                     KeyError,
                     SyntaxError,
                     TypeError,
+                    # The parser is third-party code that decodes internally
+                    # (glm47, kimi_k2 and qwen3_coder all call json.loads), so
+                    # deep nesting surfaces here rather than at a decode site
+                    # in this module (#2545).
+                    *_DEEP_NEST_ERRORS,
                 ) as primary_err:
                     # Gemma 4 only: try robust fallback that handles bare
                     # string values and colons in function names.
@@ -2744,7 +2776,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     # Strategy 1: Try to parse entire text as JSON
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
     # Strategy 2: Extract from markdown code blocks
@@ -2754,7 +2786,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     for match in matches:
         try:
             return json.loads(match.strip())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
             continue
 
     # Strategy 3: Find JSON object or array in text
@@ -2768,7 +2800,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         if match:
             try:
                 return json.loads(match.group(1))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
                 continue
 
     return None
