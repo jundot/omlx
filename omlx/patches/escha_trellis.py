@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _ESCHA_MODE = False
+_IN_MTP = False
 _ORIGINAL_SPARSE_MOE_BLOCK = None
 
 
@@ -173,11 +174,33 @@ def apply_escha_trellis_patch() -> bool:
         _ORIGINAL_SPARSE_MOE_BLOCK = _q35.SparseMoeBlock
 
         def _sparse_moe_factory(args):
-            if _ESCHA_MODE:
+            if _ESCHA_MODE and not _IN_MTP:
                 return _EschaSparseMoeBlock(args)
             return _ORIGINAL_SPARSE_MOE_BLOCK(args)
 
         _q35.SparseMoeBlock = _sparse_moe_factory
+
+        # The MTP head's decoder layer also builds a SparseMoeBlock, but with
+        # regular dense affine weights (not trellis codes): exclude it.
+        try:
+            from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+            apply_mlx_lm_mtp_patch()      # idempotent; registers MTPDecoderLayer
+        except Exception:
+            pass
+        _mtp_dl = getattr(_q35, "MTPDecoderLayer", None)
+        if _mtp_dl is not None and not getattr(_mtp_dl, "_omlx_escha_guarded", False):
+            _mtp_dl_orig_init = _mtp_dl.__init__
+
+            def _mtp_guarded_init(self, args, _orig=_mtp_dl_orig_init):
+                global _IN_MTP
+                _IN_MTP = True
+                try:
+                    _orig(self, args)
+                finally:
+                    _IN_MTP = False
+
+            _mtp_dl.__init__ = _mtp_guarded_init
+            _mtp_dl._omlx_escha_guarded = True
 
         for _mod in ("qwen3_5", "qwen3_5_moe"):
             try:
