@@ -524,6 +524,14 @@ def maybe_apply_pre_load_patches(
             depth = getattr(model_settings, "mtp_num_draft_tokens", None)
             if depth:
                 set_mtp_depth(int(depth))
+            fixed = getattr(model_settings, "mtp_fixed_draft_depth", None)
+            if fixed:
+                from ..patches.mlx_lm_mtp import batch_generator as _bg
+
+                _bg.set_fixed_draft_depth(int(fixed))
+                logger.info(
+                    "MTP fixed draft depth %s for %s", fixed, model_name
+                )
             elif model_type.startswith("nemotron_h"):
                 # The stock nemotron_h head is depth-1 trained; the adaptive
                 # controller's exploration costs ~10% throughput vs fixed

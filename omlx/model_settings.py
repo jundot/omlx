@@ -247,6 +247,10 @@ class ModelSettings:
     # An adaptive controller picks 1..max per sequence from rolling
     # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
     mtp_num_draft_tokens: Optional[int] = None
+    # When set, bypass the adaptive depth controller and always draft this
+    # many tokens per cycle (1..8). Useful for models whose draft/verify
+    # economics the controller under-estimates.
+    mtp_fixed_draft_depth: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp

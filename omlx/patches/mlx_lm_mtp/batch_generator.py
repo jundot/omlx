@@ -1595,6 +1595,15 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     )
 
 
+_FIXED_DEPTH_FLAG = 0
+
+
+def set_fixed_draft_depth(depth: int) -> None:
+    """Disable the adaptive controller: draft exactly `depth` tokens per cycle."""
+    global _FIXED_DEPTH_FLAG
+    _FIXED_DEPTH_FLAG = max(1, min(8, int(depth)))
+
+
 class _DepthController:
     """Adaptive draft-depth selection.
 
@@ -2262,7 +2271,10 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if depth > 1:
+        fixed_depth = _FIXED_DEPTH_FLAG
+        if fixed_depth:
+            state.depth = fixed_depth
+        if depth > 1 and not fixed_depth:
             state.controller = _DepthController(
                 depth,
                 marginal_ms=getattr(
