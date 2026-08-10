@@ -35,3 +35,28 @@ def test_vlm_mtp_draft_filter_keeps_mtp_fallback():
 
     assert "VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES.has(configType)" in body
     assert "assistant|(^|[-_/\\s])mtp" in body
+
+
+def test_dflash_draft_filter_claims_muse_glimmer_assistant():
+    js = _dashboard_js()
+    body = _method_block(
+        js,
+        "isDflashDraftModel(model) {",
+        "isVlmMtpDraftModel(",
+    )
+
+    # Meta's Muse Glimmer DFlash drafter is named "-assistant" and carries
+    # no "dflash" name token; routing keys on config_model_type.
+    assert "DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)" in body
+    assert "dflash($|[-_/\\s])" in body
+    assert "'muse_glimmer_assistant'" in js.split(
+        "DFLASH_DRAFTER_CONFIG_MODEL_TYPES = new Set([", 1
+    )[1].split("])", 1)[0]
+
+
+def test_vlm_mtp_set_does_not_claim_muse_glimmer_assistant():
+    js = _dashboard_js()
+    vlm_mtp_set = js.split(
+        "VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([", 1
+    )[1].split("])", 1)[0]
+    assert "muse_glimmer_assistant" not in vlm_mtp_set

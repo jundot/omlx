@@ -67,12 +67,13 @@ DFlashEngine is a `BaseEngine` implementation that:
 
 ### Dependency
 
-- `dflash-mlx` pinned to `jundot/dflash-mlx@474f8e1` (v0.1.10+omlx.3)
-- Listed as required dependency in `pyproject.toml` and `packaging/venvstacks.toml`
+- `dflash-mlx` pinned to `jundot/dflash-mlx` (v0.1.10+omlx.4)
+- Listed as required dependency in `pyproject.toml`; the mac-app release
+  lockfiles are regenerated from it by the packaging pipeline
 
 ### Supported models
 
-DFlash upstream registers `QwenGdnTargetOps` and `Gemma4TargetOps`. oMLX also registers a Laguna backend and the `DFlashLagunaForCausalLM` drafter used by Poolside's official checkpoints:
+DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOps`. oMLX also registers a Laguna backend and the `DFlashLagunaForCausalLM` drafter used by Poolside's official checkpoints:
 
 | Target model | Draft checkpoint |
 |--------------|-----------------|
@@ -93,6 +94,7 @@ DFlash upstream registers `QwenGdnTargetOps` and `Gemma4TargetOps`. oMLX also re
 | poolside/Laguna-XS-2.1-NVFP4-mlx | poolside/Laguna-XS-2.1-DFlash-NVFP4 |
 | poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
 | poolside/Laguna-S-2.1-NVFP4-mlx | poolside/Laguna-S-2.1-DFlash-NVFP4 |
+| meta-models/Muse-Glimmer-30B | meta-models/Muse-Glimmer-30B-assistant |
 
 Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
 
@@ -116,7 +118,7 @@ are deliberately disabled for Laguna until they have dedicated
 numerical-parity coverage; ordinary adaptive DFlash verification remains
 available.
 
-Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding via mlx-vlm — do not mix these in the DFlash toggle.
+Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also ships an `-assistant` variant (e.g. `gemma-4-26B-A4B-it-assistant`) that targets MTP speculative decoding via mlx-vlm — do not mix these in the DFlash toggle. Meta breaks this naming convention: `Muse-Glimmer-30B-assistant` IS a DFlash drafter (block-diffusion, `block_size` 16), not an MTP checkpoint. Drafter routing therefore keys on `config_model_type` (`muse_glimmer_assistant` is in the dashboard's DFlash drafter set), not on the checkpoint name. The Muse Glimmer target is a VLM: DFlash drives its text backbone through dflash-mlx's bundled text-only mlx-lm module, and image requests divert to the VLM fallback engine as usual.
 
 ### Per-model settings
 

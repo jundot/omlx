@@ -795,6 +795,28 @@ class TestDFlashCompatibility:
         assert compatible is True
         assert reason == ""
 
+    def test_muse_glimmer_is_compatible(self, tmp_path):
+        """Muse Glimmer VLMs run text-only through dflash-mlx's bundled module."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "muse_glimmer")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
+    def test_muse_glimmer_assistant_is_not_a_target(self, tmp_path):
+        """The drafter checkpoint must not pass the target gate."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, "muse_glimmer_assistant")
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is False
+        assert "Muse Glimmer" in reason
+
     def test_laguna_is_compatible(self, tmp_path):
         """oMLX supplies the target and gated-drafter adapters for Laguna."""
         try:

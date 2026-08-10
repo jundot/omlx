@@ -50,7 +50,8 @@ logger = logging.getLogger(__name__)
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10 registers QwenGdnTargetOps and Gemma4TargetOps; oMLX adds a
+    DFlash 0.1.10+omlx.4 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    MuseGlimmerTargetOps; oMLX adds a
     Laguna target/draft adapter. The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
@@ -64,6 +65,13 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     checkpoints through the same ``gemma4`` module — the vision/audio
     towers are dropped in sanitize and the text stack DFlash drives is
     identical, which live-testing against z-lab's 12B drafter confirmed.
+
+    ``muse_glimmer`` is a VLM at the top level, but dflash-mlx ships a
+    text-only mlx-lm module for it (vision weights dropped in sanitize);
+    image requests keep flowing through the VLM fallback engine. Note
+    Meta named its DFlash drafter ``-assistant`` — drafter routing keys
+    on ``config_model_type == "muse_glimmer_assistant"``, not on oMLX's
+    historical "-assistant means MTP" name convention.
 
     Returns:
         (is_compatible, reason). ``reason`` is empty when compatible.
@@ -82,10 +90,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_qwen = "qwen" in model_type
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
-    if not (is_qwen or is_gemma4 or is_laguna):
+    is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, and Laguna models "
-            f"(model_type='{cfg.get('model_type', '')}')"
+            f"DFlash supports only Qwen, Gemma4, Laguna, and Muse Glimmer "
+            f"models (model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
 
