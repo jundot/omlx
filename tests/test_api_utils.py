@@ -625,6 +625,16 @@ class TestUsesNativeReasoningContent:
             preserve_thinking_default=True,
         )
 
+    def test_detects_muse_glimmer(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="muse_glimmer",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="muse_glimmer",
+        )
+
     def test_plain_model_is_not_native(self):
         assert not uses_native_reasoning_content("llama-3")
 

@@ -702,6 +702,17 @@ def _is_inkling_model(
     return "inkling" in model_name.lower()
 
 
+def _is_muse_glimmer_model(
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+) -> bool:
+    model_type = model_config.get("model_type") if model_config else None
+    if model_type == "muse_glimmer":
+        return True
+    lowered = model_name.lower()
+    return "muse" in lowered and "glimmer" in lowered
+
+
 def _append_missing_json_object_closers(payload: str) -> str | None:
     """Append missing object closers without counting braces in strings."""
     depth = 0
@@ -1276,6 +1287,47 @@ def detect_output_parser(
                 _INKLING_MESSAGE_MODEL + _INKLING_CONTENT_TEXT
             ),
             protocol_marker_texts=_INKLING_MARKERS,
+        )
+
+    if _is_muse_glimmer_model(model_name, model_config):
+        from .muse_glimmer import (
+            _MUSE_END_OF_TEXT,
+            _MUSE_EOM,
+            _MUSE_EOT,
+            _MUSE_MARKERS,
+            _MUSE_MESSAGE,
+            _MUSE_START,
+            MuseGlimmerOutputParserSession,
+        )
+
+        muse_stop_ids = set()
+        for stop_marker in (_MUSE_EOT, _MUSE_END_OF_TEXT):
+            stop_id = _token_id_for_text(tokenizer, stop_marker)
+            if stop_id is not None:
+                muse_stop_ids.add(stop_id)
+
+        return OutputParserFactory(
+            kind="muse_glimmer",
+            create_session=lambda session_tokenizer: MuseGlimmerOutputParserSession(
+                session_tokenizer,
+                model_path=session_model_path,
+            ),
+            create_session_with_tools=lambda session_tokenizer, tools: (
+                MuseGlimmerOutputParserSession(
+                    session_tokenizer,
+                    model_path=session_model_path,
+                    tools=tools,
+                )
+            ),
+            stop_token_ids=muse_stop_ids,
+            thinking_start_output_text="<think>\n",
+            # A forced thinking close ends the reasoning message and opens
+            # the visible-answer message.
+            thinking_end_text=_MUSE_EOM,
+            thinking_end_trailing_text=(
+                _MUSE_START + "assistant to=user" + _MUSE_MESSAGE
+            ),
+            protocol_marker_texts=_MUSE_MARKERS,
         )
 
     if _is_minimax_m3_model(model_name, model_config):

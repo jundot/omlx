@@ -482,6 +482,59 @@ class TestUniversalQuantPredicate:
         assert result is True  # should not crash on None > 0
 
 
+class TestMuseGlimmerQuantPredicate:
+    """Muse Glimmer (dense VLM, gated attention) predicate behavior."""
+
+    @pytest.fixture
+    def muse_config(self):
+        return {
+            "model_type": "muse_glimmer",
+            "num_hidden_layers": 52,
+            "hidden_size": 6656,
+        }
+
+    @pytest.fixture
+    def module(self):
+        return MagicMock(spec=[])
+
+    def test_vision_stack_not_quantized(self, muse_config, module):
+        # Sanitized runtime paths: vision_tower.* / vision_adapter.* /
+        # vision_projection.* — all must stay fp16 via _is_vision_tensor.
+        for path in (
+            "vision_tower.layers.0.attn.q_proj",
+            "vision_adapter.fc1",
+            "vision_projection",
+            "vision_tower.patch_embedder.patch_embedding",
+        ):
+            assert universal_quant_predicate(path, module, muse_config) is False
+
+    def test_embed_tokens_quantized(self, muse_config, module):
+        # NormedEmbedding must go through to_quantized (the vendored
+        # QuantizedNormedEmbedding keeps embed_norm; a False here would
+        # leave a 2.7 GB fp16 embedding in every oQ artifact).
+        result = universal_quant_predicate(
+            "language_model.model.embed_tokens", module, muse_config
+        )
+        assert result is not False
+
+    def test_attention_gate_proj_quantized(self, muse_config, module):
+        # Muse's attention output gate is self_attn.gate_proj — it must not
+        # be caught by the MoE-router fp16 rule (which matches mlp gates).
+        result = universal_quant_predicate(
+            "language_model.model.layers.10.self_attn.gate_proj",
+            module,
+            muse_config,
+        )
+        assert result is not False
+
+    def test_lm_head_protected(self, muse_config, module):
+        result = universal_quant_predicate(
+            "language_model.lm_head", module, muse_config
+        )
+        assert result is not False
+        assert isinstance(result, dict) and result["bits"] >= 6
+
+
 # =============================================================================
 # Test helper functions
 # =============================================================================

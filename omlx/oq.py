@@ -3734,6 +3734,12 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     )
 
                     apply_mlx_vlm_inkling_compat_patch()
+                if model_type == "muse_glimmer":
+                    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
+                        apply_mlx_vlm_muse_glimmer_compat_patch,
+                    )
+
+                    apply_mlx_vlm_muse_glimmer_compat_patch()
             except Exception as patch_err:
                 logger.debug(f"MiniMax M3 mlx-vlm patch not applied: {patch_err}")
 

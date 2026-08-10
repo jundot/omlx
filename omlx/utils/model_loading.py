@@ -469,6 +469,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "muse_glimmer":
+        from ..patches.mlx_vlm_muse_glimmer_compat import (
+            apply_mlx_vlm_muse_glimmer_compat_patch,
+        )
+
+        if apply_mlx_vlm_muse_glimmer_compat_patch():
+            logger.info(
+                "Muse Glimmer mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a

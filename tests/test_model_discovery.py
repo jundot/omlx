@@ -377,6 +377,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_muse_glimmer_as_vlm(self, tmp_path):
+        """Meta Muse Glimmer 30B is served by mlx-vlm."""
+        config = {
+            "model_type": "muse_glimmer",
+            "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "vision_config": {"model_type": "muse_glimmer_vision"},
+            "text_config": {"model_type": "muse_glimmer_text"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_minimax_m3_vl_as_vlm(self, tmp_path):
         """MiniMax M3 VL is served by mlx-vlm."""
         config = {
