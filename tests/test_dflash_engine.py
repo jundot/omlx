@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for DFlash engine integration."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -323,6 +324,58 @@ class TestDFlashEngineInit:
             pytest.raises(RuntimeError, match="claim failed"),
         ):
             await engine._evict_dflash_and_start_fallback()
+
+        fallback.start.assert_awaited_once()
+        fallback.stop.assert_awaited_once()
+        process_owner.close.assert_called_once_with()
+        assert engine._fallback_engine is None
+        assert engine._in_fallback_mode is False
+        assert engine._loaded is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_fallback_claim_releases_engine_for_retry(self) -> None:
+        from omlx.engine.dflash import DFlashEngine
+
+        process_owner = MagicMock()
+        scheduler = SimpleNamespace(_metal_process_owner=process_owner)
+        fallback = MagicMock(scheduler=scheduler)
+        fallback.start = AsyncMock()
+        fallback.stop = AsyncMock()
+        loop = MagicMock()
+        loop.run_in_executor = AsyncMock()
+        claim_started = asyncio.Event()
+        claim_blocked = asyncio.Event()
+
+        async def claim_until_cancelled() -> None:
+            claim_started.set()
+            await claim_blocked.wait()
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._loaded = True
+        engine._claim_fallback_mid_prefill_process = claim_until_cancelled
+
+        with (
+            patch("dflash_mlx.cache.manager.shutdown_runtime_cache_manager"),
+            patch("omlx.patches.dflash_lifecycle.restore_dflash_class_patches"),
+            patch("omlx.engine.dflash.asyncio.get_running_loop", return_value=loop),
+            patch(
+                "omlx.engine.dflash.mx.get_active_memory",
+                side_effect=(100, 0),
+            ),
+            patch("omlx.engine.dflash.gc.collect"),
+            patch(
+                "omlx.engine.batched.BatchedEngine",
+                return_value=fallback,
+            ),
+        ):
+            task = asyncio.create_task(engine._evict_dflash_and_start_fallback())
+            await claim_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         fallback.start.assert_awaited_once()
         fallback.stop.assert_awaited_once()

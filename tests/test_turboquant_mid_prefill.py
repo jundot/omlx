@@ -2194,6 +2194,29 @@ def test_phase_widths_and_transient_histories_remain_separate() -> None:
     assert scheduler._prefill_transient_tracker.last_delta_bytes == 100
     assert scheduler._prefill_tq_transient_tracker.last_delta_bytes == 200
 
+    scheduler._prefill_transient_tracker.record_reclaim(300)
+    scheduler._record_chunk_transient(
+        1,
+        1_000,
+        600,
+        request_id="tq-reclaim",
+        loop_label="unit",
+        phase=_PrefillKVPhase.TURBOQUANT,
+    )
+    assert scheduler._prefill_transient_tracker.recent_reclaim_bytes == 300
+    assert scheduler._prefill_tq_transient_tracker.recent_reclaim_bytes == 400
+
+    scheduler._record_chunk_transient(
+        1,
+        600,
+        601,
+        request_id="tq-growth",
+        loop_label="unit",
+        phase=_PrefillKVPhase.TURBOQUANT,
+    )
+    assert scheduler._prefill_transient_tracker.recent_reclaim_bytes == 300
+    assert scheduler._prefill_tq_transient_tracker.recent_reclaim_bytes == 0
+
 
 def test_reclaim_ledger_is_shared_across_dense_and_turboquant_phases() -> None:
     scheduler = _make_scheduler()

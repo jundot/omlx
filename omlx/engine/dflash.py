@@ -837,12 +837,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         try:
             await fallback_engine.start()
             await self._claim_fallback_mid_prefill_process()
-        except Exception:
+        except BaseException:
+            # Cancellation can arrive after start registered an EngineCore or
+            # while the pool claim is pending. It must take the same cleanup
+            # path as an ordinary claim failure.
             scheduler = self.scheduler
             process_owner = getattr(scheduler, "_metal_process_owner", None)
             try:
                 await fallback_engine.stop()
-            except Exception:
+            except BaseException:
                 logger.warning(
                     "Failed to stop rejected DFlash fallback engine",
                     exc_info=True,

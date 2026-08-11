@@ -5394,6 +5394,19 @@ class Scheduler:
         a small residual allocation into a false multi-gigabyte admission
         charge.
         """
+        tracker_selector = getattr(
+            self,
+            "_prefill_transient_tracker_for_phase",
+            None,
+        )
+        if callable(tracker_selector):
+            tracker = tracker_selector(phase)
+        elif phase is _PrefillKVPhase.TURBOQUANT:
+            tracker = getattr(self, "_prefill_tq_transient_tracker", None)
+        else:
+            tracker = getattr(self, "_prefill_transient_tracker", None)
+        if tracker is None:
+            return
         delta = post_bytes - pre_bytes
         # The reclaim ledger sees every measurement, including samples the
         # EWMA gates below skip: a release on a sub-floor tail must still be
@@ -5401,9 +5414,9 @@ class Scheduler:
         # drops the one-shot charge — leaving it armed after the footprint
         # recovered would double count against the guard's gates.
         if delta <= 0:
-            self._prefill_transient_tracker.record_reclaim(-delta)
+            tracker.record_reclaim(-delta)
         else:
-            self._prefill_transient_tracker.clear_reclaim()
+            tracker.clear_reclaim()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
             logger.debug(
@@ -5440,19 +5453,6 @@ class Scheduler:
                 delta / 1024**2,
                 requested_step,
             )
-            return
-        tracker_selector = getattr(
-            self,
-            "_prefill_transient_tracker_for_phase",
-            None,
-        )
-        if callable(tracker_selector):
-            tracker = tracker_selector(phase)
-        elif phase is _PrefillKVPhase.TURBOQUANT:
-            tracker = getattr(self, "_prefill_tq_transient_tracker", None)
-        else:
-            tracker = getattr(self, "_prefill_transient_tracker", None)
-        if tracker is None:
             return
         tracker.update(n_tokens, delta, floor_sample=n_tokens <= min_chunk)
         logger.debug(
