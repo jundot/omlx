@@ -46,6 +46,30 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+# oMLX's native-kernel models (DeepSeek V4, GLM-5.2) carry their own
+# SwitchGLU / QuantizedSwitchLinear classes under omlx.patches.* — same
+# structure, same checkpoint naming (stacked [E, ...] + weight/scales/
+# biases), different class identity. Include them (guarded) so the
+# type-based walk covers the native-kernel families too; the store's
+# per-layer verification still decides what actually wraps.
+try:  # pragma: no cover - import is environment-dependent
+    from omlx.patches.deepseek_v4.switch_layers import (  # type: ignore
+        QuantizedSwitchLinear as Ds4QuantizedSwitchLinear,
+        SwitchGLU as Ds4SwitchGLU,
+    )
+except Exception:  # pragma: no cover
+    Ds4QuantizedSwitchLinear = ()
+    Ds4SwitchGLU = ()
+
+_SWITCH_GLU_CLASSES = tuple(
+    cls for cls in (SwitchGLU, Ds4SwitchGLU) if isinstance(cls, type)
+)
+_QSL_CLASSES = tuple(
+    cls
+    for cls in (QuantizedSwitchLinear, Ds4QuantizedSwitchLinear)
+    if isinstance(cls, type)
+)
+
 from ..scheduler import _sync_and_clear_cache
 
 logger = logging.getLogger(__name__)
@@ -304,8 +328,12 @@ class OffloadSwitchGLU(nn.Module):
             out = _scatter_unsort(out, inv, indices.shape)
         return out.squeeze(-2)
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        # A single call must have every expert it routes to resident AT ONCE:
+    def __call__(self, x: mx.array, indices: mx.array, scores=None) -> mx.array:
+        # ``scores`` is accepted (and ignored) for native-kernel families
+        # whose MoE (e.g. DeepseekV4MoE) performs the weighted expert sum
+        # outside the switch module — same contract as their stock
+        # SwitchGLU. A single call must have every expert it routes to
+        # resident AT ONCE:
         # a long prefill can route to more distinct experts than the cache
         # holds, in which case earlier installs would be evicted before the
         # gather runs and their slots would read garbage. Chunk the token axis
@@ -450,6 +478,14 @@ def _resolve_store_view(
         )
 
     stacked = _GLUStoreView(store, path)
+    if not stacked.has("gate_proj", "weight"):
+        # oMLX's native-kernel families (DeepSeek V4, GLM-5.2) are not
+        # wrapped in an outer container, so their module-tree path lacks the
+        # checkpoint's leading "model." segment (checkpoints use
+        # ``model.layers.N.ffn.switch_mlp.*``). Retry with the prefix.
+        prefixed = _GLUStoreView(store, f"model.{path}")
+        if prefixed.has("gate_proj", "weight"):
+            stacked = prefixed
     parent = path.rsplit(".", 1)[0] if "." in path else ""
     view = (
         stacked
