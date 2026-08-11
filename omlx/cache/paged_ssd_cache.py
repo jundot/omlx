@@ -3217,7 +3217,7 @@ class PagedSSDCacheManager(CacheManager):
             #   etc.) has been migrated to emit ``__nstate__`` markers yet.
             arrays = {}
             has_pooling_cache_delta = False
-            cache_list_meta = {}  # Per-layer sidecar metadata (sub_count, state_count, etc.)
+            cache_list_meta: dict[str, Any] = {}
 
             # Shim; module-level to avoid a recursive-closure refcount
             # cycle pinning `arrays` — see _store_nstate_elements_flat.

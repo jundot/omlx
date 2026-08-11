@@ -1023,9 +1023,9 @@ class BoundarySnapshotSSDStore:
                         self._remove_pending_locked(pw_key)
                 return True
         except Exception as exc:
-            policy_failure = isinstance(exc, DarwinNoCacheError)
-            if policy_failure:
-                self._record_write_policy_failure(exc)
+            policy_failure = exc if isinstance(exc, DarwinNoCacheError) else None
+            if policy_failure is not None:
+                self._record_write_policy_failure(policy_failure)
             else:
                 logger.warning(
                     "Inline boundary snapshot write failed for %s/%d: %s",
@@ -1039,7 +1039,7 @@ class BoundarySnapshotSSDStore:
                         path.unlink()
                 except Exception:
                     pass
-            if policy_failure:
+            if policy_failure is not None:
                 raise
             return False
         finally:

@@ -114,7 +114,7 @@ def _turboquant_mse_bit_widths(bits: float) -> tuple[int, int]:
 def _quantized_mse_vector_bytes(head_dim: int, bits: int) -> int:
     """Return one packed MSE vector's norm and uint32 index bytes."""
     packed_words = (head_dim * bits + 31) // 32
-    return mx.float16.size + packed_words * mx.uint32.size
+    return int(mx.float16.size + packed_words * mx.uint32.size)
 
 
 def turboquant_mse_bytes_per_element(head_dim: int, bits: float) -> float:
@@ -266,7 +266,7 @@ def _layer_conversion_peak_bytes(
         source_elements * mx.float32.size * _CONVERSION_WORKSPACE_ARRAYS_PER_SOURCE
     )
     codec_tables = 2 * (key_dim * key_dim + value_dim * value_dim) * mx.float32.size
-    return final_state + slice_state + workspace + codec_tables
+    return int(final_state + slice_state + workspace + codec_tables)
 
 
 def _validate_dense_kv_state(keys: mx.array, values: mx.array) -> int:

@@ -2245,12 +2245,14 @@ class TestAsyncBackgroundWrite:
                     _raise_oserror,
                 )
 
-        with patch("builtins.open", return_value=_RecordingFile()) as mocked_open:
-            with pytest.raises(DarwinNoCacheError):
-                _write_safetensors_no_mx(
-                    "/tmp/nocache-failure.safetensors",
-                    {"tensor": (b"payload", "U8", [7])},
-                )
+        with (
+            patch("builtins.open", return_value=_RecordingFile()) as mocked_open,
+            pytest.raises(DarwinNoCacheError),
+        ):
+            _write_safetensors_no_mx(
+                "/tmp/nocache-failure.safetensors",
+                {"tensor": (b"payload", "U8", [7])},
+            )
 
         assert mocked_open.call_count == 1
         assert writes == []
