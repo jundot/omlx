@@ -105,32 +105,60 @@ class CheckpointExpertStore:
         _, dtype, shape, _ = self._specs[name]
         return shape, dtype
 
-    def fetch_expert(self, name: str, expert: int) -> mx.array:
-        shard, dtype, shape, offset = self._specs[name]
+    def _read(self, name: str, start_elem: int, n_elems: int,
+              out_shape: tuple[int, ...]) -> mx.array:
+        shard, dtype, _, offset = self._specs[name]
         np_dtype, mx_view = _DTYPES[dtype]
-        slab_elems = int(np.prod(shape[1:]))
-        slab_bytes = slab_elems * np.dtype(np_dtype).itemsize
+        itemsize = np.dtype(np_dtype).itemsize
         mm = self._mm.get(shard)
         if mm is None:
             mm = self._mm[shard] = np.memmap(shard, dtype=np.uint8, mode="r")
-        start = offset + expert * slab_bytes
-        raw = np.array(mm[start : start + slab_bytes])  # copy: one slab only
-        out = mx.array(raw.view(np_dtype).reshape(shape[1:]))
+        start = offset + start_elem * itemsize
+        raw = np.array(mm[start : start + n_elems * itemsize])  # one copy
+        out = mx.array(raw.view(np_dtype).reshape(out_shape))
         return out.view(mx_view) if mx_view is not None else out
+
+    def fetch_expert(self, name: str, expert: int) -> mx.array:
+        """One expert's slab of a stacked ``[num_experts, ...]`` tensor."""
+        _, _, shape, _ = self._specs[name]
+        slab = int(np.prod(shape[1:]))
+        return self._read(name, expert * slab, slab, shape[1:])
+
+    def fetch_tensor(self, name: str) -> mx.array:
+        """A whole tensor (per-expert checkpoint layouts)."""
+        _, _, shape, _ = self._specs[name]
+        return self._read(name, 0, int(np.prod(shape)), shape)
 
 
 class _GLUStoreView:
-    """Adapt the flat store to one SwitchGLU's tensor-name prefix."""
+    """Adapt the flat store to one SwitchGLU's checkpoint naming scheme.
 
-    def __init__(self, store: CheckpointExpertStore, prefix: str):
+    Two layouts exist in the wild. Newer conversions store experts stacked
+    under the module-tree name (``<glu>.gate_proj.weight`` with shape
+    ``[E, ...]``). Older ones store one tensor per expert under the GLU's
+    parent (``<parent>.experts.<e>.gate_proj.weight``), which mlx-lm's
+    ``sanitize()`` stacks at load — so the stacked names never exist in the
+    file. The view hides the difference from :class:`ExpertCache`.
+    """
+
+    def __init__(self, store: CheckpointExpertStore, prefix: str,
+                 per_expert: bool = False):
         self._store = store
-        self._prefix = prefix
+        self._prefix = prefix  # stacked: the GLU path; per-expert: its parent
+        self._per_expert = per_expert
+
+    def _name(self, proj: str, field: str, expert: int) -> str:
+        if self._per_expert:
+            return f"{self._prefix}.experts.{expert}.{proj}.{field}"
+        return f"{self._prefix}.{proj}.{field}"
 
     def has(self, proj: str, field: str) -> bool:
-        return self._store.has(f"{self._prefix}.{proj}.{field}")
+        return self._store.has(self._name(proj, field, 0))
 
     def fetch(self, proj: str, field: str, expert: int) -> mx.array:
-        return self._store.fetch_expert(f"{self._prefix}.{proj}.{field}", expert)
+        if self._per_expert:
+            return self._store.fetch_tensor(self._name(proj, field, expert))
+        return self._store.fetch_expert(self._name(proj, field, 0), expert)
 
 
 class ExpertCache:
@@ -364,32 +392,62 @@ def _iter_switch_glus(model):
     yield from walk(None, None, model, "")
 
 
-def _coverage(glu: SwitchGLU, store: CheckpointExpertStore, path: str) -> str | None:
-    """Return None if the store fully covers this GLU, else the reason not."""
+def _resolve_store_view(
+    glu: SwitchGLU, store: CheckpointExpertStore, path: str
+) -> tuple[_GLUStoreView | None, str | None]:
+    """Validate coverage and return a view in whichever naming scheme the
+    checkpoint uses, or ``(None, reason)``.
+
+    Stacked scheme: tensors live under the GLU's own tree path with shape
+    ``[E, ...]``. Per-expert scheme: one tensor per expert under the GLU's
+    parent (``<parent>.experts.<e>.<proj>.<field>`` — the layout mlx-lm's
+    ``sanitize()`` stacks at load, e.g. OLMoE / Qwen2-MoE conversions);
+    every expert's tensor is verified. Anything else — including layouts
+    that also rename the projections, like Mixtral's ``w1/w2/w3`` — is
+    reported for a graceful skip. Unknown storage dtypes are rejected here
+    so the failure mode stays "runs resident" instead of a fetch-time
+    KeyError mid-generation.
+    """
     n = None
+    fields_of: dict[str, list[str]] = {}
     for proj in _PROJS:
         lin = getattr(glu, proj, None)
         if not isinstance(lin, QuantizedSwitchLinear):
-            return f"{proj} is not QuantizedSwitchLinear"
+            return None, f"{proj} is not QuantizedSwitchLinear"
         if "bias" in lin:
-            return f"{proj} has per-expert bias (unsupported)"
+            return None, f"{proj} has per-expert bias (unsupported)"
         n = lin["weight"].shape[0] if n is None else n
-        fields = ["weight", "scales"] + (
+        fields_of[proj] = ["weight", "scales"] + (
             ["biases"] if lin.get("biases") is not None else []
         )
-        for field in fields:
-            name = f"{path}.{proj}.{field}"
-            if not store.has(name):
-                return f"checkpoint has no tensor {name!r}"
-            shape, dtype = store.spec(name)
-            if tuple(lin[field].shape) != shape:
-                return f"{name!r} shape {shape} != module " f"{tuple(lin[field].shape)}"
-            if dtype not in _DTYPES:
-                # Unknown storage format: skipping here keeps the failure
-                # mode "runs resident" instead of a fetch-time KeyError in
-                # the middle of a generation.
-                return f"{name!r} has unsupported dtype {dtype!r}"
-    return None
+
+    stacked = _GLUStoreView(store, path)
+    parent = path.rsplit(".", 1)[0] if "." in path else ""
+    view = (
+        stacked
+        if stacked.has("gate_proj", "weight")
+        else _GLUStoreView(store, parent, per_expert=True)
+    )
+
+    for proj in _PROJS:
+        lin = getattr(glu, proj)
+        for field in fields_of[proj]:
+            module_shape = tuple(lin[field].shape)
+            if view is stacked:
+                checks = [(view._name(proj, field, 0), module_shape)]
+            else:
+                checks = [
+                    (view._name(proj, field, e), module_shape[1:]) for e in range(n)
+                ]
+            for name, want_shape in checks:
+                if not store.has(name):
+                    return None, f"checkpoint has no tensor {name!r}"
+                shape, dtype = store.spec(name)
+                if shape != want_shape:
+                    return None, f"{name!r} shape {shape} != expected {want_shape}"
+                if dtype not in _DTYPES:
+                    return None, f"{name!r} has unsupported dtype {dtype!r}"
+    return view, None
 
 
 def apply_moe_expert_offload(
@@ -415,25 +473,24 @@ def apply_moe_expert_offload(
     wrapped = 0
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
-        reason = _coverage(glu, store, path)
-        if reason is not None:
+        view, reason = _resolve_store_view(glu, store, path)
+        if view is None:
             logger.info("moe expert offload: skipping %s (%s)", path, reason)
             continue
         n_experts = glu.gate_proj["weight"].shape[0]
         capacity = max(8, min(n_experts, round(n_experts * resident_fraction)))
         layer_bytes = sum(
-            int(np.prod(store.spec(f"{path}.{p}.{f}")[0][1:]))
-            * np.dtype(_DTYPES[store.spec(f"{path}.{p}.{f}")[1]][0]).itemsize
-            * n_experts
+            int(np.prod(lin[f].shape)) * lin[f].dtype.size
             for p in _PROJS
+            for lin in (getattr(glu, p),)
             for f in (
                 ["weight", "scales"]
-                + (["biases"] if store.has(f"{path}.{p}.biases") else [])
+                + (["biases"] if lin.get("biases") is not None else [])
             )
         )
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
-        new = OffloadSwitchGLU(glu, capacity, _GLUStoreView(store, path))
+        new = OffloadSwitchGLU(glu, capacity, view)
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
