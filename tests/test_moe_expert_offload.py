@@ -213,6 +213,80 @@ class TestApplyAndForward:
         )
         assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
 
+    def test_per_expert_checkpoint_layout(self, tmp_path):
+        """OLMoE/Qwen2-MoE-style checkpoints store one tensor per expert
+        under the GLU's parent; sanitize() stacks them at load so the
+        stacked names never exist in the file. The store view must detect
+        the layout and stay bit-exact through it."""
+        glu = _make_glu(seed=5)
+        tensors = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(glu, proj)
+            for field in ("weight", "scales", "biases"):
+                if lin.get(field) is None:
+                    continue
+                for e in range(E):
+                    tensors[f"layers.0.mlp.experts.{e}.{proj}.{field}"] = lin[field][e]
+        _save_checkpoint(tmp_path, tensors)
+
+        class _MLP(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.switch_mlp = g
+
+        class _OlmoeLayer(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.mlp = _MLP(g)
+
+        class _OlmoeModel(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.layers = [_OlmoeLayer(g)]
+
+        model = _OlmoeModel(glu)
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = glu(x, i)
+        mx.eval(ref)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        wrapped = model.layers[0].mlp.switch_mlp
+        assert isinstance(wrapped, OffloadSwitchGLU)
+        got = wrapped(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+
+    def test_per_expert_layout_with_missing_expert_skips(self, tmp_path):
+        """A per-expert checkpoint missing any single expert tensor must
+        skip the layer — every expert is verified, not just expert 0."""
+        glu = _make_glu(seed=6)
+        tensors = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(glu, proj)
+            for field in ("weight", "scales", "biases"):
+                if lin.get(field) is None:
+                    continue
+                for e in range(E):
+                    tensors[f"layers.0.mlp.experts.{e}.{proj}.{field}"] = lin[field][e]
+        del tensors[f"layers.0.mlp.experts.{E - 2}.up_proj.scales"]
+        _save_checkpoint(tmp_path, tensors)
+
+        class _MLP(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.switch_mlp = g
+
+        class _OlmoeLayer(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.mlp = _MLP(g)
+
+        class _OlmoeModel(nn.Module):
+            def __init__(self, g):
+                super().__init__()
+                self.layers = [_OlmoeLayer(g)]
+
+        assert apply_moe_expert_offload(_OlmoeModel(glu), tmp_path, 0.25) == 0
+
     def test_skips_unknown_dtype(self, tmp_path):
         """A checkpoint field in an unrecognized storage format must skip the
         layer at coverage time, not KeyError at the first cache miss."""

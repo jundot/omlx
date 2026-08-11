@@ -61,15 +61,20 @@ residency.
 
 Targets any model whose MoE layers use upstream mlx-lm `SwitchGLU` with
 quantized expert projections (~40 model files: Qwen MoE families, Gemma
-MoE, Mixtral, Llama-4, Kimi, OLMoE, gpt-oss, and more). End-to-end verified
-on `gemma-4-26b-a4b-it-4bit`. Every layer is verified against the
-checkpoint (tensor names, shapes, storage dtypes, quantized projections)
-before wrapping; anything unmatched — non-quantized projections, fused
-`gate_up_proj`, per-expert `bias`, tensor names the checkpoint does not
-contain, unknown quantization formats — is skipped with a logged reason and
-runs resident as before, so the failure mode for an unverified family is
-"no offload", never "wrong outputs". DeepSeek-V4 and GLM-5.2 use oMLX's
-native switch kernels and are a planned follow-up on the same store.
+MoE, Mixtral, Llama-4, Kimi, OLMoE, gpt-oss, and more), in both checkpoint
+layouts found in the wild — stacked `[num_experts, ...]` tensors, and the
+older one-tensor-per-expert layout that mlx-lm's `sanitize()` stacks at
+load. End-to-end verified on `gemma-4-26b-a4b-it-4bit` (stacked) and
+`OLMoE-1B-7B-0125-Instruct-4bit` (per-expert; 3.89 GB → 1.17 GB at 25%
+residency, generations bit-identical). Every layer is verified against the
+checkpoint (tensor names — all experts individually in the per-expert
+layout — shapes, storage dtypes, quantized projections) before wrapping;
+anything unmatched — non-quantized projections, fused `gate_up_proj`,
+per-expert `bias`, renamed projections such as Mixtral's `w1/w2/w3`,
+unknown quantization formats — is skipped with a logged reason and runs
+resident as before, so the failure mode for an unverified family is "no
+offload", never "wrong outputs". DeepSeek-V4 and GLM-5.2 use oMLX's native
+switch kernels and are a planned follow-up on the same store.
 
 When offload wraps layers, the Qwen gate/up fusion is skipped automatically:
 fusion rewrites stock expert weights in RAM, which cannot apply to experts
