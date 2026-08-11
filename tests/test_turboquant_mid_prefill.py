@@ -1527,6 +1527,7 @@ def test_post_conversion_oom_requeue_does_not_repeat_mid_prefill_conversion(
     cap = _configure_pressure(scheduler)
     scheduler._prefill_eviction_callback_configured = False
     scheduler._memory_limit_bytes = cap // 2
+    scheduler._prefill_speed_priority = True
     cache = _dense_cache()
     tokens = list(range(9))
     request = _make_request(f"{path}-post-conversion-oom", tokens, cache)

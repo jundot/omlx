@@ -5896,7 +5896,6 @@ class Scheduler:
                 and state.prefill_context.mid_triggered
                 and state.prefill_context.phase is _PrefillKVPhase.TURBOQUANT
             )
-            self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
         if state.prefill_context is None:
