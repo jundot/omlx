@@ -50,22 +50,26 @@ def main():
         cfg.pop("quantization", None)
         json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
         cfg = json.load(open(os.path.join(args.out, "config.json")))
-    q = {"group_size": args.group_size, "bits": args.bits, "mode": "affine"}
-    n_layers = cfg["text_config"]["num_hidden_layers"]
-    for l in range(n_layers):
-        if args.expert_format == "affine":
-            q[f"language_model.model.layers.{l}.mlp.switch_mlp.gate_proj"] = {"group_size": 64, "bits": 2}
-            q[f"language_model.model.layers.{l}.mlp.switch_mlp.up_proj"] = {"group_size": 64, "bits": 2}
-            q[f"language_model.model.layers.{l}.mlp.switch_mlp.down_proj"] = {"group_size": 64, "bits": 3}
-        for m in ("mlp.gate", "mlp.shared_expert_gate"):
-            q[f"language_model.model.layers.{l}.{m}"] = {"group_size": 64, "bits": args.gate_bits}
-    cfg["quantization"] = q
     if args.expert_format == "trellis":
+        # Dense linears are shipped pre-packed as bit-exact affine-Q8 and the
+        # router gates are fp16, so mlx-lm must NOT re-quantize anything at
+        # load: the quantization block stays empty.
+        cfg["quantization"] = {}
         cfg["quantization_config"] = {
             "quant_method": "eschamoe",
             "bits": 2.0,
             "format_version": "2.0",
         }
+    else:
+        q = {"group_size": args.group_size, "bits": args.bits, "mode": "affine"}
+        n_layers = cfg["text_config"]["num_hidden_layers"]
+        for l in range(n_layers):
+            q[f"language_model.model.layers.{l}.mlp.switch_mlp.gate_proj"] = {"group_size": 64, "bits": 2}
+            q[f"language_model.model.layers.{l}.mlp.switch_mlp.up_proj"] = {"group_size": 64, "bits": 2}
+            q[f"language_model.model.layers.{l}.mlp.switch_mlp.down_proj"] = {"group_size": 64, "bits": 3}
+            for m in ("mlp.gate", "mlp.shared_expert_gate"):
+                q[f"language_model.model.layers.{l}.{m}"] = {"group_size": 64, "bits": args.gate_bits}
+        cfg["quantization"] = q
     cfg["architectures"] = ["Qwen3_5MoeForConditionalGeneration"]
     json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
 

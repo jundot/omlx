@@ -36,28 +36,20 @@ _ORIGINAL_SPARSE_MOE_BLOCK = None
 
 
 
-_H128 = None
-
-
-def _h128() -> mx.array:
-    global _H128
-    if _H128 is None:
-        h = mx.array([[1.0]])
-        while h.shape[0] < 128:
-            h = mx.concatenate(
-                [mx.concatenate([h, h], 1), mx.concatenate([h, -h], 1)], 0
-            )
-        _H128 = h * (1.0 / (128.0 ** 0.5))
-    return _H128
+# RS = 1/sqrt(128) — the exact f32 constant the escha format pins
+_RS = 0.088388347648
 
 
 def _had128(x: mx.array) -> mx.array:
-    """Blockwise-128 orthonormal Hadamard along the last axis."""
+    """Blockwise-128 Hadamard along the last axis, bit-exact with the escha
+    reference (native `mx.hadamard_transform` with the RS scale folded in;
+    matches EschaLabs/escha-mlx `moe.had_blocks`, which applies H with
+    scale=1.0 and multiplies by RS separately)."""
     n = x.shape[-1]
     lead = x.shape[:-1]
-    y = x.reshape(*lead, n // 128, 128)
-    y = mx.matmul(y.reshape(-1, n // 128, 128), _h128())
-    return mx.moveaxis(y.reshape(*lead, n), -1, 1) if False else y.reshape(*lead, n)
+    y = x.reshape(-1, n // 128, 128)
+    y = mx.hadamard_transform(y, scale=_RS)
+    return y.reshape(*lead, n)
 
 
 class _DenseExpertCache(nn.Module):
@@ -154,6 +146,33 @@ class _EschaSparseMoeBlock(nn.Module):
         return y + shared_y
 
 
+def configure_wired_limit() -> None:
+    """Honour ESCHA_MLX_WIRED_GB, matching EschaLabs/escha-mlx.
+
+    MLX's `set_wired_limit` defaults to 0 (nothing wired). Harmless while the
+    trellis working set sits comfortably under Metal's recommended size, but
+    once it nears the cap without a wired limit the chip thrashes with no
+    error message -- the official runtime measured a ~23x cliff on a 24 GB Mac
+    (5.9 tok/s unwired vs 136 wired at ~19 GB working set). Left OFF by
+    default: wiring reduces the memory the OS can reclaim, so only opt in when
+    the working set is expected to approach the recommended cap (or set it for
+    the engine under high concurrency).
+    """
+    import os as _os
+
+    if not hasattr(mx, "set_wired_limit"):
+        return
+    gb = _os.environ.get("ESCHA_MLX_WIRED_GB")
+    if not gb:
+        logger.debug("ESCHA_MLX_WIRED_GB unset; leaving wired limit at default")
+        return
+    try:
+        mx.set_wired_limit(int(float(gb) * 1e9))
+        logger.info("ESCHA_MLX_WIRED_GB=%s -> mx.set_wired_limit", gb)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("could not set wired limit: %s", exc)
+
+
 def set_escha_mode(flag: bool) -> None:
     global _ESCHA_MODE
     _ESCHA_MODE = bool(flag)
@@ -221,6 +240,7 @@ def apply_escha_trellis_patch() -> bool:
                 continue
 
         _PATCHED = True
+        configure_wired_limit()
         logger.info("escha trellis patch installed (idempotent)")
         return True
     except Exception as exc:  # pragma: no cover

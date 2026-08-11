@@ -199,6 +199,28 @@ def deq_int8(q8, scale):
     return q8.astype(np.float32) * scale[:, None].astype(np.float32)
 
 
+def pack_q8(w8, scale, group_size=128):
+    """Bit-exact affine-Q8 repack of the escha int8 w8a16 contract (lossless).
+
+    q = w8 + 128 (unsigned, one XOR), MLX packs uint32 little-endian == memory
+    order. scales/biases are per-output-channel constants (per row), so a
+    larger group just stores the constant fewer times. f32 (NOT f16) scales
+    make MLX's affine dequant bit-exact: dequant = f32(scale)*q - 128*f32(scale)
+    = f32(scale*w8), and because the affine side equals the escha contract the
+    w8a16 values are preserved exactly. Mirrors EschaLabs/escha-mlx quant.py.
+    """
+    w8 = np.ascontiguousarray(w8)
+    n, k = w8.shape
+    assert k % group_size == 0 and k % 4 == 0, (n, k, group_size)
+    q = w8.reshape(n, k).view(np.uint8)     # int8 view; +128 == ^0x80 (2's comp)
+    packed = (q ^ np.uint8(0x80)).reshape(n, k).view(np.uint32)  # [N, K/4]
+    s32 = scale.astype(np.float32)[:, None]
+    ng = k // group_size
+    scales = np.repeat(s32, ng, axis=1)                     # f32 [N, ng]
+    biases = np.repeat((np.float32(-128.0) * s32), ng, axis=1)
+    return packed, scales, biases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
@@ -255,6 +277,25 @@ def main():
     def emit_copy(module, arr, bare=False):
         emit(module if bare else f"{module}.weight", to_bf16(arr))
 
+    def emit_q8(module, w8, scale, group_size=128):
+        """Bit-exact affine-Q8: keeps the escha int8 values exactly (lossless)."""
+        packed, scales, biases = pack_q8(w8, scale, group_size)
+        emit(f"{module}.weight", mx.array(packed))
+        emit(f"{module}.scales", mx.array(scales))
+        emit(f"{module}.biases", mx.array(biases))
+
+    def emit_q8_chunked(module, w8, scale, rows=32768, group_size=128):
+        if args.no_quant:
+            emit(f"{module}.weight", to_bf16(deq_int8(w8, scale)))
+            return
+        ws, ss, bs = [], [], []
+        for i in range(0, w8.shape[0], rows):
+            packed, scales, biases = pack_q8(w8[i:i + rows], scale[i:i + rows], group_size)
+            ws.append(mx.array(packed)); ss.append(mx.array(scales)); bs.append(mx.array(biases))
+        emit(f"{module}.weight", mx.concatenate(ws))
+        emit(f"{module}.scales", mx.concatenate(ss))
+        emit(f"{module}.biases", mx.concatenate(bs))
+
     TARGET = "language_model.model"
 
     if args.shared_only:
@@ -291,14 +332,15 @@ def main():
             else:
                 emit_q(f"{TARGET}.layers.{l}.mlp.switch_mlp.down_proj", W, bits=3)
             del W
-        g = get(f"{pre}.mlp.gate.weight")
-        emit_q(f"{TARGET}.layers.{l}.mlp.gate", g, bits=args.gate_bits, gs=64)
+        # Router gates stay fp16 (bit-exact to the source; tiny). The shared
+        # expert is int8 + per-row scale -> bit-exact affine-Q8 (group 128).
+        emit_copy(f"{TARGET}.layers.{l}.mlp.gate", get(f"{pre}.mlp.gate.weight"))
         for nm in ("gate_proj", "up_proj", "down_proj"):
-            q8 = get(f"{pre}.mlp.shared_expert.{nm}.weight_int8")
-            sc = get(f"{pre}.mlp.shared_expert.{nm}.weight_scale")
-            emit_q(f"{TARGET}.layers.{l}.mlp.shared_expert.{nm}", deq_int8(q8, sc), bits=4)
-        sg = get(f"{pre}.mlp.shared_expert_gate.weight")
-        emit_q(f"{TARGET}.layers.{l}.mlp.shared_expert_gate", sg, bits=args.gate_bits, gs=64)
+            emit_q8(f"{TARGET}.layers.{l}.mlp.shared_expert.{nm}",
+                    get(f"{pre}.mlp.shared_expert.{nm}.weight_int8"),
+                    get(f"{pre}.mlp.shared_expert.{nm}.weight_scale"))
+        emit_copy(f"{TARGET}.layers.{l}.mlp.shared_expert_gate",
+                  get(f"{pre}.mlp.shared_expert_gate.weight"))
         # Qwen3.6 stores RMSNorm weights shifted (true = stored + 1). Bake the
         # shift in, mirroring mlx-lm qwen3_5.sanitize's norm handling.
         for nm in ("input_layernorm", "post_attention_layernorm"):
@@ -311,20 +353,18 @@ def main():
             emit_copy(f"{la}.dt_bias", get(f"{sp}.dt_bias"), bare=True)
             emit_copy(f"{la}.conv1d", get(f"{sp}.conv1d.weight").transpose(0, 2, 1))
             for nm in ("in_proj_a", "in_proj_b"):
-                emit_q(f"{la}.{nm}", get(f"{sp}.{nm}.weight"), bits=4)
+                emit_copy(f"{la}.{nm}", get(f"{sp}.{nm}.weight"))
             for nm in ("in_proj_qkv", "in_proj_z", "out_proj"):
-                q8 = get(f"{sp}.{nm}.weight_int8")
-                sc = get(f"{sp}.{nm}.weight_scale")
-                emit_q(f"{la}.{nm}", deq_int8(q8, sc), bits=4)
+                emit_q8(f"{la}.{nm}", get(f"{sp}.{nm}.weight_int8"),
+                        get(f"{sp}.{nm}.weight_scale"))
         else:
             sa = f"{TARGET}.layers.{l}.self_attn"
             sp = f"{pre}.self_attn"
             for nm in ("q_norm", "k_norm"):
                 emit_copy(f"{sa}.{nm}", get(f"{sp}.{nm}.weight") + 1.0)
             for nm in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                q8 = get(f"{sp}.{nm}.weight_int8")
-                sc = get(f"{sp}.{nm}.weight_scale")
-                emit_q(f"{sa}.{nm}", deq_int8(q8, sc), bits=4)
+                emit_q8(f"{sa}.{nm}", get(f"{sp}.{nm}.weight_int8"),
+                        get(f"{sp}.{nm}.weight_scale"))
         print(f"layer {l:02d} done in {time.time() - t:.1f}s", flush=True)
         if args.layer is None and not args.shared_only:
             flush(f"part-L{li:02d}.safetensors")
@@ -335,25 +375,12 @@ def main():
     # ---- shared / head ----
     emit_copy(f"{TARGET}.norm", get("model.language_model.norm.weight") + 1.0)
 
-    def emit_q_chunked(module, q8, scale, rows=65536, bits=4):
-        if args.no_quant:
-            emit(f"{module}.weight", to_bf16(deq_int8(q8, scale)))
-            return
-        ws, ss, bs = [], [], []
-        for i in range(0, q8.shape[0], rows):
-            w, s, b = quantize(to_bf16(deq_int8(q8[i:i + rows], scale[i:i + rows])),
-                               args.group_size, bits)
-            ws.append(w); ss.append(s); bs.append(b)
-        emit(f"{module}.weight", mx.concatenate(ws))
-        emit(f"{module}.scales", mx.concatenate(ss))
-        emit(f"{module}.biases", mx.concatenate(bs))
-
     emb = get("model.language_model.embed_tokens.weight_int8")
     esc = get("model.language_model.embed_tokens.weight_scale")
-    emit_q_chunked(f"{TARGET}.embed_tokens", emb, esc)
+    emit_q8_chunked(f"{TARGET}.embed_tokens", emb, esc)
     lm = get("lm_head.weight_int8")
     lsc = get("lm_head.weight_scale")
-    emit_q_chunked("language_model.lm_head", lm, lsc)
+    emit_q8_chunked("language_model.lm_head", lm, lsc)
     if args.shared_only:
         flush(part_name)
         return
