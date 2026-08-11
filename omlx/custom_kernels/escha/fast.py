@@ -228,8 +228,177 @@ def eschamoe_gather_qmv(xh, code, eids, K):
 
 
 
-_FUSED_HDR = '\nconstant uint CB0 = 0xCBAC1FEDu;\nconstant uint CB2 = 0x8FFF8FFFu;\nconstant uint CB3 = 0x3B603B60u;\n\n\ninline void had_shared(threadgroup float* sh, uint off, uint nb, uint lane, uint grp) {\n    uint b = grp % nb;                       // uniform barrier participation\n    uint base = off + b * 128u;\n    for (uint s = 1u; s < 128u; s <<= 1u) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        float v = sh[base + lane];\n        float o = sh[base + (lane ^ s)];\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        sh[base + lane] = (lane & s) ? o - v : v + o;\n    }\n}\n\ninline float2 pair_vals(const device short* tile, uint t, uint Kk, constant uint* cb) {\n    uint b0 = 2u * t * Kk + Kk + 256u * Kk - 16u;\n    uint b2 = b0 + Kk + 16u;\n    uint i0 = (b0 / 32u) % uint(8 * Kk);\n    uint i1w = (b2 - 1u) / 32u;\n    uint s1 = (i1w + 1u) * 32u - b2;\n    uint i1 = i1w % uint(8 * Kk);\n    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);\n    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);\n    ulong pair = (ulong(w0) << 32) | ulong(wb);\n    uint w1 = uint(pair >> s1);\n    uint x0 = ((w1 >> Kk) & 0xFFFFu) * cb[0] + cb[1];\n    x0 = (x0 & cb[2]) ^ cb[3];\n    uint x1 = (w1 & 0xFFFFu) * cb[0] + cb[1];\n    x1 = (x1 & cb[2]) ^ cb[3];\n    half2 h0 = as_type<half2>(x0);\n    half2 h1 = as_type<half2>(x1);\n    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));\n}\n\ninline float2 pair_vals_tile(const device short* tile, uint i0, uint i1, uint s1) {\n    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);\n    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);\n    ulong pair = (ulong(w0) << 32) | ulong(wb);\n    uint w1 = uint(pair >> s1);\n    uint x0 = ((w1 >> 2u) & 0xFFFFu) * CB0;\n    x0 = (x0 & CB2) ^ CB3;\n    uint x1 = (w1 & 0xFFFFu) * CB0;\n    x1 = (x1 & CB2) ^ CB3;\n    half2 h0 = as_type<half2>(x0);\n    half2 h1 = as_type<half2>(x1);\n    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));\n}\n\ninline float2 pair_vals_idx(const device short* tile, uint i0, uint i1, uint s1) {\n    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);\n    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);\n    ulong pair = (ulong(w0) << 32) | ulong(wb);\n    uint w1 = uint(pair >> s1);\n    uint x0 = ((w1 >> 2u) & 0xFFFFu) * CB0;\n    x0 = (x0 & CB2) ^ CB3;\n    uint x1 = (w1 & 0xFFFFu) * CB0;\n    x1 = (x1 & CB2) ^ CB3;\n    half2 h0 = as_type<half2>(x0);\n    half2 h1 = as_type<half2>(x1);\n    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));\n}\n\ninline float2 pair_vals_idx3(const device short* tile, uint i0, uint i1, uint s1) {\n    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);\n    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);\n    ulong pair = (ulong(w0) << 32) | ulong(wb);\n    uint w1 = uint(pair >> s1);\n    uint x0 = ((w1 >> 3u) & 0xFFFFu) * CB0;\n    x0 = (x0 & CB2) ^ CB3;\n    uint x1 = (w1 & 0xFFFFu) * CB0;\n    x1 = (x1 & CB2) ^ CB3;\n    half2 h0 = as_type<half2>(x0);\n    half2 h1 = as_type<half2>(x1);\n    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));\n}\n'
-_FUSED_BODY = '\nthreadgroup float x_sh[2048];\nthreadgroup float gu_sh[1024];\nthreadgroup float a_sh[512];\nconstexpr float INV_SQRT128 = 0.08838834764;\n\nuint row = thread_position_in_grid.y;\nuint tid = thread_position_in_grid.x;\nuint lane = tid & 127u;\nuint grp = tid >> 7u;\nuint e = eids[row];\n\nfor (uint i = tid; i < 2048u; i += 1024u) x_sh[i] = xh1[row * 2048u + i];\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n\nconst device short* base1 = code1 + (ulong)e * 128ul * 64ul * 32ul;\nuint c = tid;                                   // 1024 threads -> one gu col each\nuint tn = c >> 4u;\nuint cs = c & 15u;\nuint cb2 = (cs >> 3) & 1u;\nuint c7 = cs & 7u;\nfloat acc = 0.0f;\nfor (uint tk = 0u; tk < 128u; ++tk) {\n    const device short* tile = base1 + (tk * 64u + tn) * 32u;\n    for (uint q = 0u; q < 4u; ++q) {\n        for (uint rh = 0u; rh < 2u; ++rh) {\n            uint t = 4u * (4u * c7 + q) + 2u * cb2 + rh;\n            uint b0 = 2u * t * 2u + 2u + 512u - 16u;\n            uint b2 = b0 + 2u + 16u;\n            uint i0 = (b0 / 32u) % 16u;\n            uint i1w = (b2 - 1u) / 32u;\n            uint s1 = (i1w + 1u) * 32u - b2;\n            uint i1 = i1w % 16u;\n            float2 vv = pair_vals_idx(tile, i0, i1, s1);\n            uint r0 = 8u * rh + 2u * q;\n            uint k0 = tk * 16u + r0;\n            acc = fma(x_sh[k0], vv.x, acc);\n            acc = fma(x_sh[k0 + 1u], vv.y, acc);\n        }\n    }\n}\ngu_sh[c] = acc;\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nhad_shared(gu_sh, 0u, 8u, lane, grp);\nthreadgroup_barrier(mem_flags::mem_threadgroup);\ngu_sh[tid] = gu_sh[tid] * INV_SQRT128 * rout1[row * 1024u + tid];\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nif (tid < 512u) {\n    float gate = gu_sh[tid];\n    float up = gu_sh[tid + 512u];\n    float sg = gate / (1.0f + metal::exp(-gate));\n    a_sh[tid] = sg * up * rin2[row * 512u + tid];\n}\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nhad_shared(a_sh, 0u, 4u, lane, grp);\nthreadgroup_barrier(mem_flags::mem_threadgroup);\nif (tid < 512u) a_sh[tid] *= INV_SQRT128;\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n\nconst device short* base2 = code2 + (ulong)e * 32ul * 128ul * 48ul;\nfor (uint cc = 0u; cc < 2u; ++cc) {\n    uint c2 = tid + cc * 1024u;\n    uint tn2 = c2 >> 4u;\n    uint cs2 = c2 & 15u;\n    uint cb22 = (cs2 >> 3) & 1u;\n    uint c72 = cs2 & 7u;\n    uint d0f[8]; uint d1f[8]; uint ds1f[8];\n    for (uint m = 0u; m < 8u; ++m) {\n        uint q = m >> 1u;\n        uint rh = m & 1u;\n        uint t = 4u * (4u * c72 + q) + 2u * cb22 + rh;\n        uint b0 = 2u * t * 3u + 3u + 768u - 16u;\n        uint b2 = b0 + 3u + 16u;\n        d0f[m] = (b0 / 32u) % 24u;\n        d1f[m] = ((b2 - 1u) / 32u) % 24u;\n        ds1f[m] = (((b2 - 1u) / 32u) + 1u) * 32u - b2;\n    }\n    float acc2 = 0.0f;\n    for (uint tk = 0u; tk < 32u; ++tk) {\n        const device short* tile = base2 + (tk * 128u + tn2) * 48u;\n        for (uint m = 0u; m < 8u; ++m) {\n            float2 vv = pair_vals_idx3(tile, d0f[m], d1f[m], ds1f[m]);\n            uint r0 = 8u * (m & 1u) + 2u * (m >> 1u);\n            uint k0 = tk * 16u + r0;\n            acc2 = fma(a_sh[k0], vv.x, acc2);\n            acc2 = fma(a_sh[k0 + 1u], vv.y, acc2);\n        }\n    }\n    dst[row * 2048u + c2] = acc2;\n}\n'
+_FUSED_HDR = """
+constant uint CB0 = 0xCBAC1FEDu;
+constant uint CB2 = 0x8FFF8FFFu;
+constant uint CB3 = 0x3B603B60u;
+
+
+inline void had_shared(threadgroup float* sh, uint off, uint nb, uint lane, uint grp) {
+    uint b = grp % nb;                       // uniform barrier participation
+    uint base = off + b * 128u;
+    for (uint s = 1u; s < 128u; s <<= 1u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float v = sh[base + lane];
+        float o = sh[base + (lane ^ s)];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sh[base + lane] = (lane & s) ? o - v : v + o;
+    }
+}
+
+inline float2 pair_vals(const device short* tile, uint t, uint Kk, constant uint* cb) {
+    uint b0 = 2u * t * Kk + Kk + 256u * Kk - 16u;
+    uint b2 = b0 + Kk + 16u;
+    uint i0 = (b0 / 32u) % uint(8 * Kk);
+    uint i1w = (b2 - 1u) / 32u;
+    uint s1 = (i1w + 1u) * 32u - b2;
+    uint i1 = i1w % uint(8 * Kk);
+    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+    ulong pair = (ulong(w0) << 32) | ulong(wb);
+    uint w1 = uint(pair >> s1);
+    uint x0 = ((w1 >> Kk) & 0xFFFFu) * cb[0] + cb[1];
+    x0 = (x0 & cb[2]) ^ cb[3];
+    uint x1 = (w1 & 0xFFFFu) * cb[0] + cb[1];
+    x1 = (x1 & cb[2]) ^ cb[3];
+    half2 h0 = as_type<half2>(x0);
+    half2 h1 = as_type<half2>(x1);
+    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));
+}
+
+inline float2 pair_vals_tile(const device short* tile, uint i0, uint i1, uint s1) {
+    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+    ulong pair = (ulong(w0) << 32) | ulong(wb);
+    uint w1 = uint(pair >> s1);
+    uint x0 = ((w1 >> 2u) & 0xFFFFu) * CB0;
+    x0 = (x0 & CB2) ^ CB3;
+    uint x1 = (w1 & 0xFFFFu) * CB0;
+    x1 = (x1 & CB2) ^ CB3;
+    half2 h0 = as_type<half2>(x0);
+    half2 h1 = as_type<half2>(x1);
+    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));
+}
+
+inline float2 pair_vals_idx(const device short* tile, uint i0, uint i1, uint s1) {
+    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+    ulong pair = (ulong(w0) << 32) | ulong(wb);
+    uint w1 = uint(pair >> s1);
+    uint x0 = ((w1 >> 2u) & 0xFFFFu) * CB0;
+    x0 = (x0 & CB2) ^ CB3;
+    uint x1 = (w1 & 0xFFFFu) * CB0;
+    x1 = (x1 & CB2) ^ CB3;
+    half2 h0 = as_type<half2>(x0);
+    half2 h1 = as_type<half2>(x1);
+    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));
+}
+
+inline float2 pair_vals_idx3(const device short* tile, uint i0, uint i1, uint s1) {
+    uint w0 = uint(ushort(tile[2u * i0])) | (uint(ushort(tile[2u * i0 + 1u])) << 16);
+    uint wb = uint(ushort(tile[2u * i1])) | (uint(ushort(tile[2u * i1 + 1u])) << 16);
+    ulong pair = (ulong(w0) << 32) | ulong(wb);
+    uint w1 = uint(pair >> s1);
+    uint x0 = ((w1 >> 3u) & 0xFFFFu) * CB0;
+    x0 = (x0 & CB2) ^ CB3;
+    uint x1 = (w1 & 0xFFFFu) * CB0;
+    x1 = (x1 & CB2) ^ CB3;
+    half2 h0 = as_type<half2>(x0);
+    half2 h1 = as_type<half2>(x1);
+    return float2(float(h0.x) + float(h0.y), float(h1.x) + float(h1.y));
+}
+"""
+_FUSED_BODY = """
+threadgroup float x_sh[2048];
+threadgroup float gu_sh[1024];
+threadgroup float a_sh[512];
+constexpr float INV_SQRT128 = 0.08838834764;
+
+uint row = thread_position_in_grid.y;
+uint tid = thread_position_in_grid.x;
+uint lane = tid & 127u;
+uint grp = tid >> 7u;
+uint e = eids[row];
+
+for (uint i = tid; i < 2048u; i += 1024u) x_sh[i] = xh1[row * 2048u + i];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+const device short* base1 = code1 + (ulong)e * 128ul * 64ul * 32ul;
+uint c = tid;                                   // 1024 threads -> one gu col each
+uint tn = c >> 4u;
+uint cs = c & 15u;
+uint cb2 = (cs >> 3) & 1u;
+uint c7 = cs & 7u;
+float acc = 0.0f;
+for (uint tk = 0u; tk < 128u; ++tk) {
+    const device short* tile = base1 + (tk * 64u + tn) * 32u;
+    for (uint q = 0u; q < 4u; ++q) {
+        for (uint rh = 0u; rh < 2u; ++rh) {
+            uint t = 4u * (4u * c7 + q) + 2u * cb2 + rh;
+            uint b0 = 2u * t * 2u + 2u + 512u - 16u;
+            uint b2 = b0 + 2u + 16u;
+            uint i0 = (b0 / 32u) % 16u;
+            uint i1w = (b2 - 1u) / 32u;
+            uint s1 = (i1w + 1u) * 32u - b2;
+            uint i1 = i1w % 16u;
+            float2 vv = pair_vals_idx(tile, i0, i1, s1);
+            uint r0 = 8u * rh + 2u * q;
+            uint k0 = tk * 16u + r0;
+            acc = fma(x_sh[k0], vv.x, acc);
+            acc = fma(x_sh[k0 + 1u], vv.y, acc);
+        }
+    }
+}
+gu_sh[c] = acc;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+had_shared(gu_sh, 0u, 8u, lane, grp);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+gu_sh[tid] = gu_sh[tid] * INV_SQRT128 * rout1[row * 1024u + tid];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (tid < 512u) {
+    float gate = gu_sh[tid];
+    float up = gu_sh[tid + 512u];
+    float sg = gate / (1.0f + metal::exp(-gate));
+    a_sh[tid] = sg * up * rin2[row * 512u + tid];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+had_shared(a_sh, 0u, 4u, lane, grp);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (tid < 512u) a_sh[tid] *= INV_SQRT128;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+const device short* base2 = code2 + (ulong)e * 32ul * 128ul * 48ul;
+for (uint cc = 0u; cc < 2u; ++cc) {
+    uint c2 = tid + cc * 1024u;
+    uint tn2 = c2 >> 4u;
+    uint cs2 = c2 & 15u;
+    uint cb22 = (cs2 >> 3) & 1u;
+    uint c72 = cs2 & 7u;
+    uint d0f[8]; uint d1f[8]; uint ds1f[8];
+    for (uint m = 0u; m < 8u; ++m) {
+        uint q = m >> 1u;
+        uint rh = m & 1u;
+        uint t = 4u * (4u * c72 + q) + 2u * cb22 + rh;
+        uint b0 = 2u * t * 3u + 3u + 768u - 16u;
+        uint b2 = b0 + 3u + 16u;
+        d0f[m] = (b0 / 32u) % 24u;
+        d1f[m] = ((b2 - 1u) / 32u) % 24u;
+        ds1f[m] = (((b2 - 1u) / 32u) + 1u) * 32u - b2;
+    }
+    float acc2 = 0.0f;
+    for (uint tk = 0u; tk < 32u; ++tk) {
+        const device short* tile = base2 + (tk * 128u + tn2) * 48u;
+        for (uint m = 0u; m < 8u; ++m) {
+            float2 vv = pair_vals_idx3(tile, d0f[m], d1f[m], ds1f[m]);
+            uint r0 = 8u * (m & 1u) + 2u * (m >> 1u);
+            uint k0 = tk * 16u + r0;
+            acc2 = fma(a_sh[k0], vv.x, acc2);
+            acc2 = fma(a_sh[k0 + 1u], vv.y, acc2);
+        }
+    }
+    dst[row * 2048u + c2] = acc2;
+}
+"""
 
 
 def eschamoe_fused_layer(xh1, code1, code2, eids, rout1, rin2, rout2):
