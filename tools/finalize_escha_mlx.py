@@ -52,9 +52,13 @@ def main():
         cfg = json.load(open(os.path.join(args.out, "config.json")))
     if args.expert_format == "trellis":
         # Dense linears are shipped pre-packed as bit-exact affine-Q8 and the
-        # router gates are fp16, so mlx-lm must NOT re-quantize anything at
-        # load: the quantization block stays empty.
-        cfg["quantization"] = {}
+        # router gates are fp16. A minimal quantization block (group/bits only,
+        # no per-layer entries) is still REQUIRED: mlx-lm only builds the
+        # QuantizedLinear module *structure* when `quantization` is present
+        # (class_predicate matches modules that ship a `*.scales` key), then
+        # `load_weights` overwrites it with the stored Q8 values verbatim. So
+        # no values are re-quantized and the w8a16 contract is preserved.
+        cfg["quantization"] = {"group_size": 128, "bits": 8, "mode": "affine"}
         cfg["quantization_config"] = {
             "quant_method": "eschamoe",
             "bits": 2.0,
