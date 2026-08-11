@@ -93,6 +93,38 @@ class MLXEmbeddingModel:
         self._is_compiled = False
         self._compiled_embed = None
         self._remap_input_ids_to_inputs = False
+        self._pooling_mode: Optional[str] = None
+
+    def _detect_pooling_mode(self) -> Optional[str]:
+        """Read the pooling mode the checkpoint declares, if any.
+
+        sentence-transformers exports describe their pipeline in ``modules.json``
+        and store the pooling configuration in ``1_Pooling/config.json``. Reading
+        it lets us honour what the checkpoint asks for instead of guessing from
+        the model family, which does not scale (see #1817, #2350).
+
+        Returns ``"cls"``, ``"mean"``, ``"lasttoken"`` or ``None`` when the
+        checkpoint says nothing — in which case the existing behaviour applies.
+        """
+        try:
+            cfg_path = Path(self.model_name) / "1_Pooling" / "config.json"
+            if not cfg_path.is_file():
+                return None
+            with open(cfg_path) as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError) as e:
+            logger.debug(f"Could not read pooling config for {self.model_name}: {e}")
+            return None
+
+        for key, mode in (
+            ("pooling_mode_cls_token", "cls"),
+            ("pooling_mode_lasttoken", "lasttoken"),
+            ("pooling_mode_mean_tokens", "mean"),
+        ):
+            if cfg.get(key):
+                logger.info(f"Pooling mode declared by checkpoint: {mode}")
+                return mode
+        return None
 
     def _load_native(self) -> bool:
         """
@@ -201,6 +233,8 @@ class MLXEmbeddingModel:
         if self._loaded:
             return
 
+        self._pooling_mode = self._detect_pooling_mode()
+
         # 1. Try native loading first (xlm_roberta, bert)
         if self._load_native():
             return
@@ -250,6 +284,19 @@ class MLXEmbeddingModel:
 
     def _extract_embeddings_array(self, outputs):
         """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
+        # Honour the checkpoint's own declaration first. Some MLX conversions of
+        # sentence-transformers models expose a mean-pooled ``text_embeds`` while
+        # the checkpoint was trained for CLS pooling (e.g. BGE-M3), which silently
+        # degrades retrieval instead of failing. Mode is resolved once at load().
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if self._pooling_mode and last_hidden is not None and last_hidden.ndim == 3:
+            if self._pooling_mode == "cls":
+                return last_hidden[:, 0, :]
+            if self._pooling_mode == "lasttoken":
+                return last_hidden[:, -1, :]
+            if self._pooling_mode == "mean":
+                return mx.mean(last_hidden, axis=1)
+
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
             embeddings = outputs.text_embeds
         elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:

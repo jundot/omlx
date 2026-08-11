@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import math
+import mlx.core as mx
 import numpy as np
 import struct
 import tempfile
@@ -1821,3 +1822,61 @@ class TestNativeQwen2Embedding:
 
         assert first_token_drift(is_causal=True) < 1e-6, "causal leaked future token"
         assert first_token_drift(is_causal=False) > 1e-3, "bidirectional did not attend forward"
+
+
+class TestDeclaredPoolingMode:
+    """Pooling mode declared by sentence-transformers checkpoints (#1817, #2350)."""
+
+    @staticmethod
+    def _model(tmp_path, pooling_config=None):
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        if pooling_config is not None:
+            pool_dir = Path(tmp_path) / "1_Pooling"
+            pool_dir.mkdir(parents=True, exist_ok=True)
+            (pool_dir / "config.json").write_text(json.dumps(pooling_config))
+        return MLXEmbeddingModel(str(tmp_path))
+
+    @staticmethod
+    def _outputs():
+        """Distinct rows so each pooling mode yields a different vector."""
+        hidden = mx.array([[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]])   # (1, 3, 2)
+        return SimpleNamespace(
+            last_hidden_state=hidden,
+            text_embeds=mx.array([[9.0, 9.0]]),      # sentinel: must not be used
+            pooler_output=None,
+        )
+
+    def test_cls_pooling_is_honoured(self, tmp_path):
+        m = self._model(tmp_path, {"pooling_mode_cls_token": True})
+        m._pooling_mode = m._detect_pooling_mode()
+        assert m._pooling_mode == "cls"
+        assert np.allclose(np.array(m._extract_embeddings_array(self._outputs())), [[1.0, 0.0]])
+
+    def test_lasttoken_pooling_is_honoured(self, tmp_path):
+        m = self._model(tmp_path, {"pooling_mode_lasttoken": True})
+        m._pooling_mode = m._detect_pooling_mode()
+        assert np.allclose(np.array(m._extract_embeddings_array(self._outputs())), [[1.0, 1.0]])
+
+    def test_mean_pooling_is_honoured(self, tmp_path):
+        m = self._model(tmp_path, {"pooling_mode_mean_tokens": True})
+        m._pooling_mode = m._detect_pooling_mode()
+        assert np.allclose(
+            np.array(m._extract_embeddings_array(self._outputs())), [[2 / 3, 2 / 3]]
+        )
+
+    def test_no_declaration_keeps_current_behaviour(self, tmp_path):
+        """No 1_Pooling directory: text_embeds still wins, exactly as before."""
+        m = self._model(tmp_path)
+        m._pooling_mode = m._detect_pooling_mode()
+        assert m._pooling_mode is None
+        assert np.allclose(np.array(m._extract_embeddings_array(self._outputs())), [[9.0, 9.0]])
+
+    def test_malformed_config_is_ignored(self, tmp_path):
+        """A broken config must not break loading — fall back, never raise."""
+        pool_dir = Path(tmp_path) / "1_Pooling"
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        (pool_dir / "config.json").write_text("{not json")
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        assert MLXEmbeddingModel(str(tmp_path))._detect_pooling_mode() is None
