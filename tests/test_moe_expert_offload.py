@@ -213,6 +213,26 @@ class TestApplyAndForward:
         )
         assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
 
+    def test_skips_unknown_dtype(self, tmp_path):
+        """A checkpoint field in an unrecognized storage format must skip the
+        layer at coverage time, not KeyError at the first cache miss."""
+        import json as _json
+        import struct as _struct
+
+        glus = [_make_glu(seed=0)]
+        _save_checkpoint(tmp_path, _glu_tensors(glus[0], "layers.0.experts.switch_glu"))
+        # Rewrite one field's header dtype tag to something unsupported.
+        # data_offsets are relative to the data section, so a resized header
+        # keeps them valid.
+        p = tmp_path / "model.safetensors"
+        raw = p.read_bytes()
+        n = _struct.unpack("<Q", raw[:8])[0]
+        header = _json.loads(raw[8 : 8 + n])
+        header["layers.0.experts.switch_glu.up_proj.scales"]["dtype"] = "F64"
+        new_header = _json.dumps(header).encode()
+        p.write_bytes(_struct.pack("<Q", len(new_header)) + new_header + raw[8 + n :])
+        assert apply_moe_expert_offload(_MiniMoE(glus), tmp_path, 0.25) == 0
+
     def test_kill_switch(self, tmp_path, monkeypatch):
         model, _ = self._wrapped_model(tmp_path)
         monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
