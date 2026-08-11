@@ -121,11 +121,24 @@
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
                     markitdown_pdf_processing_engine: 'markitdown',
+                    web_search_provider: 'ddgs',
+                    web_search_brave_api_key: '',
+                    web_search_searxng_url: '',
+                    web_search_ddgs_backends: '',
+                    web_search_max_results: 3,
+                    web_search_content_mode: 'snippet',
+                    web_search_content_truncate: true,
+                    web_search_content_max_chars: 20000,
                 },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
+
+            // Web search "Test search" button state
+            webSearchTest: { running: false, ok: null, message: '' },
+            // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
+            ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
             // Cache slider (0-100%)
             cachePercent: 10,
@@ -2565,6 +2578,14 @@
                             markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
                             markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
                             markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
+                            web_search_provider: this.globalSettings.integrations.web_search_provider,
+                            web_search_brave_api_key: this.globalSettings.integrations.web_search_brave_api_key,
+                            web_search_searxng_url: this.globalSettings.integrations.web_search_searxng_url,
+                            web_search_ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends,
+                            web_search_max_results: this.globalSettings.integrations.web_search_max_results,
+                            web_search_content_mode: this.globalSettings.integrations.web_search_content_mode,
+                            web_search_content_truncate: this.globalSettings.integrations.web_search_content_truncate,
+                            web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                         }),
                     });
                     if (!response.ok) {
@@ -2572,6 +2593,57 @@
                     }
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                }
+            },
+
+            ddgsBackendChecked(name) {
+                return (this.globalSettings.integrations.web_search_ddgs_backends || '')
+                    .split(',').map(s => s.trim()).filter(Boolean).includes(name);
+            },
+
+            toggleDdgsBackend(name) {
+                const current = (this.globalSettings.integrations.web_search_ddgs_backends || '')
+                    .split(',').map(s => s.trim()).filter(Boolean);
+                const next = current.includes(name)
+                    ? current.filter(b => b !== name)
+                    : [...current, name];
+                this.globalSettings.integrations.web_search_ddgs_backends = next.join(',');
+                this.saveIntegrationSettings();
+            },
+
+            async testWebSearch() {
+                if (this.webSearchTest.running) return;
+                this.webSearchTest = { running: true, ok: null, message: '' };
+                try {
+                    const response = await fetch('/admin/api/web-search/test', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: this.globalSettings.integrations.web_search_provider,
+                            brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
+                            searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
+                            ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                        }),
+                    });
+                    const payload = await response.json();
+                    if (payload.ok) {
+                        this.webSearchTest = {
+                            running: false,
+                            ok: true,
+                            message: window.t('settings.integrations.websearch.test_success')
+                                .replace('{count}', (payload.results || []).length),
+                        };
+                    } else {
+                        const message = payload.error?.message
+                            || window.t('settings.integrations.websearch.test_failed');
+                        this.webSearchTest = { running: false, ok: false, message };
+                    }
+                } catch (err) {
+                    this.webSearchTest = {
+                        running: false,
+                        ok: false,
+                        message: window.t('settings.integrations.websearch.test_failed'),
+                    };
                 }
             },
 

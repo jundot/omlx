@@ -527,6 +527,13 @@ from .api.mcp_routes import set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
+# Include web search routes (chat UI built-in web_search / fetch_url tools)
+from .api.websearch_routes import router as websearch_router
+from .api.websearch_routes import set_global_settings_getter as _set_websearch_settings
+
+_set_websearch_settings(lambda: _server_state.global_settings)
+app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
+
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
 # would always import successfully — we need an explicit mlx-audio check.

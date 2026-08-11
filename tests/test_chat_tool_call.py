@@ -258,3 +258,153 @@ class TestChatToolCallSafety:
         aborted = getattr(getattr(controller, "signal", None), "aborted", None)
         # None is falsy, so recursion should proceed
         assert not aborted
+
+
+class TestBuiltinWebToolDispatch:
+    """Python equivalent of the built-in web tool gating added to chat.html.
+
+    Mirrors webSearchReady / webSearchToolsActive / builtinWebRoute /
+    activeTools so the JS contract stays pinned by tests.
+    """
+
+    ROUTES = {"web_search": "/v1/web/search", "fetch_url": "/v1/web/fetch"}
+
+    @staticmethod
+    def web_search_ready(settings):
+        provider = settings.get("provider", "ddgs")
+        if provider == "brave":
+            return settings.get("braveKeySet", False)
+        if provider == "searxng":
+            return settings.get("searxngUrlSet", False)
+        if provider == "ddgs_custom":
+            return settings.get("ddgsBackendsSet", False)
+        return True
+
+    def tools_active(self, enabled, settings):
+        return enabled and self.web_search_ready(settings)
+
+    def builtin_web_route(self, name, enabled, settings):
+        if not self.tools_active(enabled, settings):
+            return None
+        return self.ROUTES.get(name)
+
+    def active_tools(self, enabled, settings, builtin_tools, mcp_tools):
+        if not self.tools_active(enabled, settings):
+            return mcp_tools
+        builtin_names = set(self.ROUTES)
+        return builtin_tools + [
+            t for t in mcp_tools if t["function"]["name"] not in builtin_names
+        ]
+
+    @staticmethod
+    def _tool(name):
+        return {"type": "function", "function": {"name": name}}
+
+    def test_toggle_off_keeps_mcp_tools_and_routing(self):
+        settings = {"provider": "duckduckgo"}
+        mcp_tools = [self._tool("web_search"), self._tool("other")]
+        assert self.active_tools(False, settings, [self._tool("web_search")], mcp_tools) == mcp_tools
+        # An MCP tool named web_search keeps going to /v1/mcp/execute
+        assert self.builtin_web_route("web_search", False, settings) is None
+
+    def test_toggle_on_builtin_wins_name_collision(self):
+        settings = {"provider": "duckduckgo"}
+        builtin = [self._tool("web_search"), self._tool("fetch_url")]
+        mcp_tools = [self._tool("web_search"), self._tool("other")]
+        tools = self.active_tools(True, settings, builtin, mcp_tools)
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["web_search", "fetch_url", "other"]
+
+    def test_builtin_routes_when_active(self):
+        settings = {"provider": "duckduckgo"}
+        assert self.builtin_web_route("web_search", True, settings) == "/v1/web/search"
+        assert self.builtin_web_route("fetch_url", True, settings) == "/v1/web/fetch"
+        assert self.builtin_web_route("other", True, settings) is None
+
+    def test_brave_without_key_is_inactive(self):
+        settings = {"provider": "brave", "braveKeySet": False}
+        assert self.tools_active(True, settings) is False
+        settings["braveKeySet"] = True
+        assert self.tools_active(True, settings) is True
+
+    def test_searxng_without_url_is_inactive(self):
+        settings = {"provider": "searxng", "searxngUrlSet": False}
+        assert self.tools_active(True, settings) is False
+        settings["searxngUrlSet"] = True
+        assert self.tools_active(True, settings) is True
+
+    def test_ddgs_total_and_duckduckgo_need_no_config(self):
+        assert self.tools_active(True, {"provider": "ddgs"}) is True
+        assert self.tools_active(True, {"provider": "duckduckgo"}) is True
+
+    def test_ddgs_custom_needs_backend_selection(self):
+        settings = {"provider": "ddgs_custom", "ddgsBackendsSet": False}
+        assert self.tools_active(True, settings) is False
+        settings["ddgsBackendsSet"] = True
+        assert self.tools_active(True, settings) is True
+
+
+class TestToolRoundSegmentChain:
+    """Mirror of splitTurnSegments/getActiveVariantChain from chat.html.
+
+    Regression guard for the tool-round visibility bug: intermediate
+    assistant tool_calls turns must stay _ui:false. A visible assistant
+    message is a variant segment boundary, so a visible tool-round turn
+    splits the turn and the active chain sent to the API loses the
+    tool_calls turn — the orphan tool message then corrupts chat
+    templates (observed as garbage output on DeepSeek-V4).
+    """
+
+    @staticmethod
+    def split_turn_segments(turn):
+        segments, current = [], []
+        for m in turn:
+            current.append(m)
+            if m["role"] == "assistant" and m.get("_ui") is not False:
+                segments.append(current)
+                current = []
+        if current:
+            segments.append(current)
+        return segments or [turn]
+
+    def active_chain(self, turn, active_id=None):
+        segments = self.split_turn_segments(turn)
+        if len(segments) <= 1:
+            return turn
+        if active_id:
+            for segment in segments:
+                if any(m.get("id") == active_id for m in segment):
+                    return segment
+        return segments[-1]
+
+    def test_hidden_tool_round_keeps_full_chain(self):
+        turn = [
+            {"id": "t1", "role": "assistant", "tool_calls": [{}],
+             "_ui": False, "_toolRound": True},
+            {"id": "r1", "role": "tool", "_ui": False},
+            {"id": "a1", "role": "assistant", "content": "final"},
+        ]
+        chain = self.active_chain(turn, active_id="a1")
+        assert [m["id"] for m in chain] == ["t1", "r1", "a1"]
+
+    def test_visible_tool_round_drops_tool_calls_turn(self):
+        # Documents the failure mode this guard exists for.
+        turn = [
+            {"id": "t1", "role": "assistant", "tool_calls": [{}],
+             "_toolRound": True},
+            {"id": "r1", "role": "tool", "_ui": False},
+            {"id": "a1", "role": "assistant", "content": "final"},
+        ]
+        chain = self.active_chain(turn, active_id="a1")
+        assert [m["id"] for m in chain] == ["r1", "a1"]
+
+    def test_mid_loop_last_segment_is_complete_without_final_answer(self):
+        # During recursion (final answer not pushed yet) the last segment
+        # must still contain the tool_calls turn and its result.
+        turn = [
+            {"id": "t1", "role": "assistant", "tool_calls": [{}],
+             "_ui": False, "_toolRound": True},
+            {"id": "r1", "role": "tool", "_ui": False},
+        ]
+        chain = self.active_chain(turn)
+        assert [m["id"] for m in chain] == ["t1", "r1"]

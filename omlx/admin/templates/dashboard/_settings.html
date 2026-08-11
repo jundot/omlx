@@ -1040,6 +1040,142 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.websearch.section_label') }}</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">DDGS · duckduckgo · brave · searxng</span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.provider') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.provider_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.web_search_provider"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="ddgs">DDGS Total</option>
+                                        <option value="ddgs_custom">DDGS Custom</option>
+                                        <option value="duckduckgo">DuckDuckGo</option>
+                                        <option value="brave">Brave Search</option>
+                                        <option value="searxng">SearXNG</option>
+                                    </select>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'ddgs_custom'"
+                                     class="flex flex-col gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.ddgs_backends') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.ddgs_backends_hint') }}</p>
+                                    </div>
+                                    <div class="flex flex-wrap gap-2">
+                                        <template x-for="backend in ddgsBackendList" :key="backend">
+                                            <label class="flex items-center gap-1.5 px-3 py-1.5 text-sm border rounded-lg cursor-pointer transition-colors"
+                                                   :class="ddgsBackendChecked(backend) ? 'border-neutral-900 bg-neutral-100 text-neutral-900' : 'border-neutral-200 text-neutral-500 hover:bg-neutral-50'">
+                                                <input type="checkbox" class="sr-only"
+                                                       :checked="ddgsBackendChecked(backend)"
+                                                       @change="toggleDdgsBackend(backend)">
+                                                <span x-text="backend"></span>
+                                            </label>
+                                        </template>
+                                    </div>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'brave'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.brave_api_key') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.brave_api_key_hint') }}</p>
+                                    </div>
+                                    <input type="password"
+                                           x-model="globalSettings.integrations.web_search_brave_api_key"
+                                           @change="saveIntegrationSettings()"
+                                           autocomplete="off"
+                                           class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'searxng'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.searxng_url') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.searxng_url_hint') }}</p>
+                                    </div>
+                                    <input type="url"
+                                           x-model="globalSettings.integrations.web_search_searxng_url"
+                                           @change="saveIntegrationSettings()"
+                                           placeholder="http://localhost:8888"
+                                           class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.max_results') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.max_results_hint') }}</p>
+                                    </div>
+                                    <input type="number"
+                                           min="1" max="10"
+                                           x-model.number="globalSettings.integrations.web_search_max_results"
+                                           @change="saveIntegrationSettings()"
+                                           class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.content_mode') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_mode_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.web_search_content_mode"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="snippet">{{ t('settings.integrations.websearch.content_mode_snippet') }}</option>
+                                        <option value="full">{{ t('settings.integrations.websearch.content_mode_full') }}</option>
+                                    </select>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_content_mode === 'full'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.content_truncate') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_truncate_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.integrations.web_search_content_truncate = !globalSettings.integrations.web_search_content_truncate; saveIntegrationSettings()"
+                                            :class="globalSettings.integrations.web_search_content_truncate ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.web_search_content_truncate ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_content_mode === 'full' && globalSettings.integrations.web_search_content_truncate"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.content_max_chars') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_max_chars_hint') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number"
+                                               min="1000" step="1000"
+                                               x-model.number="globalSettings.integrations.web_search_content_max_chars"
+                                               @change="saveIntegrationSettings()"
+                                               class="w-28 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <span class="text-sm text-neutral-400">{{ t('settings.integrations.websearch.chars_suffix') }}</span>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div class="min-w-0">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.test_label') }}</label>
+                                        <p x-show="webSearchTest.message"
+                                           :class="webSearchTest.ok ? 'text-emerald-600' : 'text-red-500'"
+                                           class="text-xs mt-0.5 break-words"
+                                           x-text="webSearchTest.message"></p>
+                                    </div>
+                                    <button type="button"
+                                            @click="testWebSearch()"
+                                            :disabled="webSearchTest.running"
+                                            class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0">
+                                        <span x-show="!webSearchTest.running">{{ t('settings.integrations.websearch.test_button') }}</span>
+                                        <span x-show="webSearchTest.running">{{ t('settings.integrations.websearch.testing') }}</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
