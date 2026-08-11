@@ -300,6 +300,7 @@ class BatchedEngine(BaseEngine):
         # modules here is what keeps non-resident experts from ever
         # materializing. Runs on the MLX executor because it allocates the
         # resident slot tensors (#1304).
+        moe_offload_wrapped = 0
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import apply_moe_expert_offload
 
@@ -310,7 +311,7 @@ class BatchedEngine(BaseEngine):
                     0.25,
                 )
             )
-            await loop.run_in_executor(
+            moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
                 apply_moe_expert_offload,
                 self._model,
@@ -328,7 +329,16 @@ class BatchedEngine(BaseEngine):
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
         # executor because it rewrites weights in place.
-        if (
+        if moe_offload_wrapped:
+            # Fusion concatenates the stock SwitchGLU gate/up weights in RAM,
+            # which cannot apply to experts that were never materialized; the
+            # offloaded modules aren't stock SwitchGLU anyway, so fusion
+            # would find nothing. Skip it explicitly and say why.
+            logger.info(
+                "moe expert offload active (%d layers): skipping gate/up fusion",
+                moe_offload_wrapped,
+            )
+        elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
         ):
