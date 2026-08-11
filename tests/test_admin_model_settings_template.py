@@ -303,3 +303,14 @@ def test_js_embedded_translations_escape_apostrophes():
         r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
     )
     assert unsafe == []
+
+
+def test_moe_expert_offload_toggle_present_and_unmutexed():
+    """The offload toggle binds both fields and is never disabled by other
+    features — apply_moe_expert_offload degrades gracefully per layer, so
+    there is no UI mutex."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" not in section
