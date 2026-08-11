@@ -3876,10 +3876,16 @@ class TestDeepNestingNeverEscapesParseChain:
 
         monkeypatch.setattr(mod.json, "loads", boom)
         try:
-            # Each of these reaches a different decode site.
+            # Each of these reaches a different decode site. The third runs a
+            # real parser so a decoder is actually exercised: an earlier
+            # version of this test passed plain text with tool_parser=None,
+            # which reached no decoder at all (caught by DiscoStew6082).
             mod._parse_xml_tool_calls("<tool_call>{}</tool_call>")
             mod.extract_json_from_text('{"a": 1}')
-            parse_tool_calls("plain text, no markup", self._tokenizer(None))
+            parse_tool_calls(
+                '<tool_call>{"name": "f", "arguments": {}}</tool_call>',
+                self._tokenizer(lambda text, tools: real(text)),
+            )
         finally:
             monkeypatch.setattr(mod.json, "loads", real)
 
@@ -3967,3 +3973,67 @@ def test_deep_nesting_does_not_take_down_a_neighboring_tool_call(error):
     assert [c.function.name for c in calls] == ["good"]
     # The broken envelope's markup must not leak into content either.
     assert cleaned == ""
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
+        "<ns:tool_call><function=f><parameter=x>{}</parameter></function>"
+        "</ns:tool_call>",
+    ],
+    ids=["xml-fallback", "qwen-xml", "glm-xml", "namespaced-xml"],
+)
+def test_serialization_after_a_successful_decode_does_not_escape(
+    monkeypatch, error, text
+):
+    """The re-serialize step is a second decode from a deeper frame (#2545).
+
+    ``json.dumps`` recurses per nesting level just as the decoders do, and it
+    runs *after* a value has already parsed, further down the stack. A value
+    nested just under the limit when it decoded can therefore breach it here.
+    DiscoStew6082 hit this at depth ~987 on 3.11, past the first guard.
+
+    Injecting at ``json.dumps`` rather than nesting for real keeps this
+    meaningful on 3.14, where the interpreter does not raise at these depths.
+    """
+    import omlx.api.tool_calling as mod
+
+    nested = "[" * 400 + "0" + "]" * 400
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    payload = text.replace("{}", nested)
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        # Must not raise. Dropping the call is fine; escaping is not.
+        if "ns:tool_call" in payload:
+            mod._parse_namespaced_tool_calls(payload, "ns")
+        else:
+            mod._parse_xml_tool_calls(payload)
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_serialize_arguments_degrades_instead_of_raising(monkeypatch, error):
+    """``_serialize_tool_call_arguments`` is the choke point for that step."""
+    import omlx.api.tool_calling as mod
+
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        assert mod._serialize_tool_call_arguments({"x": 1}) == "{}"
+        assert mod._serialize_tool_call_arguments('{"x": 1}') == "{}"
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)

@@ -100,8 +100,16 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     coerced to "{}" here so we never hand the client a non-JSON value that
     the next turn's template would crash on.
     """
+    # `json.dumps` recurses per nesting level just as the decoders do, and it
+    # runs after a value has already decoded successfully, from a deeper stack
+    # frame. A value nested just under the limit at decode time can therefore
+    # breach it here (#2545, found by DiscoStew6082 at depth ~987 on 3.11).
+    # Falling through to the "{}" path below keeps that a clean coercion.
     if isinstance(arguments, dict):
-        return json.dumps(arguments, ensure_ascii=False)
+        try:
+            return json.dumps(arguments, ensure_ascii=False)
+        except _DEEP_NEST_ERRORS:
+            arguments = "<nested too deeply to serialize>"
     # mlx-vlm / mlx-lm gemma4 parser returns a JSON-object string per the
     # OpenAI spec. Accept it when it parses back to a dict.
     if isinstance(arguments, str):
@@ -110,7 +118,10 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             parsed = None
         if isinstance(parsed, dict):
-            return json.dumps(parsed, ensure_ascii=False)
+            try:
+                return json.dumps(parsed, ensure_ascii=False)
+            except _DEEP_NEST_ERRORS:
+                pass
     logger.warning(
         "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
         "coercing to empty object to keep downstream template safe.",
@@ -584,7 +595,7 @@ def _parse_xml_tool_calls(
                     type="function",
                     function=FunctionCall(
                         name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -611,7 +622,7 @@ def _parse_xml_tool_calls(
                     type="function",
                     function=FunctionCall(
                         name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -667,7 +678,7 @@ def _parse_namespaced_tool_calls(
                     type="function",
                     function=FunctionCall(
                         name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -756,7 +767,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     type="function",
                     function=FunctionCall(
                         name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
+                        arguments=_serialize_tool_call_arguments(arguments),
                     ),
                 )
             )
@@ -800,7 +811,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
                 type="function",
                 function=FunctionCall(
                     name=name,
-                    arguments=json.dumps(arguments, ensure_ascii=False),
+                    arguments=_serialize_tool_call_arguments(arguments),
                 ),
             )
         )
