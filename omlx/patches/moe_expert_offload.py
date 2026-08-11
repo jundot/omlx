@@ -305,6 +305,38 @@ class OffloadSwitchGLU(nn.Module):
         return out.reshape(indices.shape + (x.shape[-1],))
 
 
+def _resolve_model_dir(model_path: str | Path) -> Path | None:
+    """Resolve a model name to its local checkpoint directory.
+
+    Local directories pass through; hub repo ids resolve against the local
+    HF cache only (the model was just loaded from it, so it is present) —
+    this never triggers a download.
+    """
+    p = Path(model_path)
+    if p.is_dir():
+        return p
+    try:
+        from huggingface_hub import snapshot_download
+
+        # Restrict to the shards (all the store reads) so an mlx-lm-style
+        # partial cache — model files only, no README etc. — resolves. A
+        # patternless local_files_only lookup would demand the repo's full
+        # file list and fail on exactly such caches.
+        return Path(
+            snapshot_download(
+                str(model_path),
+                allow_patterns=["*.safetensors"],
+                local_files_only=True,
+            )
+        )
+    except Exception:
+        logger.warning(
+            "moe expert offload: cannot resolve %r to a local " "checkpoint directory",
+            str(model_path),
+        )
+        return None
+
+
 def _iter_switch_glus(model):
     """Yield ``(parent, key, module, tree_path)`` for every stock SwitchGLU.
 
@@ -367,9 +399,12 @@ def apply_moe_expert_offload(
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
-    store = CheckpointExpertStore(model_path)
+    model_dir = _resolve_model_dir(model_path)
+    if model_dir is None:
+        return 0
+    store = CheckpointExpertStore(model_dir)
     if not store:
-        logger.warning("moe expert offload: no safetensors under %s", model_path)
+        logger.warning("moe expert offload: no safetensors under %s", model_dir)
         return 0
 
     wrapped = 0

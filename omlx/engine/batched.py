@@ -270,6 +270,13 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                # With expert offload the load stays lazy so the wrap below
+                # can drop non-resident expert tensors BEFORE anything
+                # materializes them; materialize_lazy_state then evaluates
+                # what remains. Without offload, load eagerly as before.
+                lazy=bool(
+                    getattr(self._model_settings, "moe_expert_offload_enabled", False)
+                ),
             )
 
         loop = asyncio.get_running_loop()
@@ -284,6 +291,31 @@ class BatchedEngine(BaseEngine):
         )
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
+
+        # MoE expert offload: replace covered SwitchGLU layers with a
+        # fetch-on-miss LRU cache streaming experts from the checkpoint's
+        # own safetensors. Must run BEFORE materialize_lazy_state — the load
+        # above stayed lazy when this is enabled, and dropping the stock
+        # modules here is what keeps non-resident experts from ever
+        # materializing. Runs on the MLX executor because it allocates the
+        # resident slot tensors (#1304).
+        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
+            from ..patches.moe_expert_offload import apply_moe_expert_offload
+
+            fraction = float(
+                getattr(
+                    self._model_settings,
+                    "moe_expert_offload_resident_fraction",
+                    0.25,
+                )
+            )
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_moe_expert_offload,
+                self._model,
+                self._model_name,
+                fraction,
+            )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
@@ -510,9 +542,7 @@ class BatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug(
-                    "Qwen MoE weighted-sum patch not applied", exc_info=True
-                )
+                logger.debug("Qwen MoE weighted-sum patch not applied", exc_info=True)
 
         if (
             getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
