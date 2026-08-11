@@ -131,6 +131,38 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     return "{}"
 
 
+def _build_tool_call(name: str, arguments: Any) -> Optional[ToolCall]:
+    """Build a ToolCall, dropping this one call if validation cannot finish.
+
+    ``FunctionCall`` re-parses the arguments string while validating it, which
+    is a *third* decode of a value the parser already decoded and serialized,
+    and it runs from a deeper stack frame than either (#2545).  Recursion
+    limits are about remaining stack rather than input depth, so a value that
+    was fine at both earlier steps can still breach the limit here.
+
+    Validation failure has to drop this one call and leave the rest of the
+    batch alone, the same way an unparseable match does, rather than escape
+    the parse chain.
+    """
+    try:
+        return ToolCall(
+            id=f"call_{uuid.uuid4().hex[:8]}",
+            type="function",
+            function=FunctionCall(
+                name=name,
+                arguments=_serialize_tool_call_arguments(arguments),
+            ),
+        )
+    except (ValueError, *_DEEP_NEST_ERRORS) as exc:
+        logger.warning(
+            "Dropping tool call %.80r: arguments failed validation (%s: %s)",
+            name,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
 @dataclass(frozen=True)
 class ToolCallExtraction:
     """Parsed tool-call result plus sanitized reasoning text."""
@@ -562,16 +594,9 @@ def _parse_xml_tool_calls(
             parsed = json.loads(content, strict=False)
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=name,
-                        arguments=_serialize_tool_call_arguments(arguments),
-                    ),
-                )
-            )
+            _built = _build_tool_call(name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
             continue
         except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
             pass
@@ -589,16 +614,9 @@ def _parse_xml_tool_calls(
             arguments = {}
             for key, val in _iter_xml_parameters(params_text):
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=_serialize_tool_call_arguments(arguments),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
             continue
 
         # GLM XML format: func_name<arg_key>k</arg_key><arg_value>v</arg_value>...
@@ -616,16 +634,9 @@ def _parse_xml_tool_calls(
             arguments = {}
             for k, v in zip(arg_keys, arg_values):
                 arguments[k] = _coerce_param_value(v, k, props, func_name)
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=_serialize_tool_call_arguments(arguments),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
 
     if not tool_calls:
         return text, None
@@ -672,16 +683,9 @@ def _parse_namespaced_tool_calls(
                 key = pm.group(1)
                 val = pm.group(2).strip()
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=_serialize_tool_call_arguments(arguments),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
 
     if not tool_calls:
         return text, None
@@ -718,16 +722,9 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
             if name:
-                tool_calls.append(
-                    ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
-                        type="function",
-                        function=FunctionCall(
-                            name=name,
-                            arguments=_serialize_tool_call_arguments(arguments),
-                        ),
-                    )
-                )
+                _built = _build_tool_call(name, arguments)
+                if _built is not None:
+                    tool_calls.append(_built)
                 continue
         except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
             pass
@@ -761,16 +758,9 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                 except (ValueError, SyntaxError, *_DEEP_NEST_ERRORS):
                     arguments[kw.arg] = ast.unparse(kw.value)
 
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=_serialize_tool_call_arguments(arguments),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
 
     if not tool_calls:
         return text, None
@@ -805,16 +795,9 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
             arguments = json.loads(args_str)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             arguments = {"raw": args_str}
-        tool_calls.append(
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name,
-                    arguments=_serialize_tool_call_arguments(arguments),
-                ),
-            )
-        )
+        _built = _build_tool_call(name, arguments)
+        if _built is not None:
+            tool_calls.append(_built)
         matched_spans.append(match.span())
 
     # Match without args (model-generated simplified form)
@@ -1571,16 +1554,9 @@ def _parse_tool_calls_impl(
                     for p in items:
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
-                        tool_calls.append(
-                            ToolCall(
-                                id=f"call_{uuid.uuid4().hex[:8]}",
-                                type="function",
-                                function=FunctionCall(
-                                    name=name,
-                                    arguments=_serialize_tool_call_arguments(arguments),
-                                ),
-                            )
-                        )
+                        _built = _build_tool_call(name, arguments)
+                        if _built is not None:
+                            tool_calls.append(_built)
                 except (
                     ValueError,
                     json.JSONDecodeError,
@@ -1608,18 +1584,9 @@ def _parse_tool_calls_impl(
                             for p in items:
                                 name = p.get("name", "")
                                 arguments = p.get("arguments", {})
-                                tool_calls.append(
-                                    ToolCall(
-                                        id=f"call_{uuid.uuid4().hex[:8]}",
-                                        type="function",
-                                        function=FunctionCall(
-                                            name=name,
-                                            arguments=_serialize_tool_call_arguments(
-                                                arguments
-                                            ),
-                                        ),
-                                    )
-                                )
+                                _built = _build_tool_call(name, arguments)
+                                if _built is not None:
+                                    tool_calls.append(_built)
                             gemma4_handled = True
                         except (
                             ValueError,

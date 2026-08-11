@@ -3983,8 +3983,12 @@ def test_deep_nesting_does_not_take_down_a_neighboring_tool_call(error):
         "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
         "</function>\n</tool_call>",
         "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
-        "<ns:tool_call><function=f><parameter=x>{}</parameter></function>"
-        "</ns:tool_call>",
+        # Real namespaced grammar. An earlier version of this fixture used
+        # <function=..><parameter=..>, which _parse_namespaced_tool_calls does
+        # not accept, so it parsed zero calls and exercised nothing
+        # (caught by DiscoStew6082).
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
     ],
     ids=["xml-fallback", "qwen-xml", "glm-xml", "namespaced-xml"],
 )
@@ -4037,3 +4041,87 @@ def test_serialize_arguments_degrades_instead_of_raising(monkeypatch, error):
         assert mod._serialize_tool_call_arguments('{"x": 1}') == "{}"
     finally:
         monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+    ],
+    ids=["compact-xml", "qwen-xml", "namespaced-xml"],
+)
+def test_balanced_depth_sweep_through_public_entry(template):
+    """Real nesting swept across the recursion boundary (#2545).
+
+    Unlike the injected tests, this uses genuinely deep input and so only
+    bites on Python 3.11 through 3.13, where ``json.loads`` still raises
+    RecursionError. CI covers exactly those versions. It sweeps rather than
+    picking a depth because the boundary moves with how much stack the caller
+    has already used, which is why a single hand-picked depth reproduced for
+    DiscoStew6082 and not for me.
+
+    Any outcome except an escaping exception is acceptable: parsing the call,
+    or dropping it with a warning.
+    """
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    for depth in range(940, 1041):
+        nested = "[" * depth + "0" + "]" * depth
+        try:
+            parse_tool_calls(template.replace("{}", nested), tok)
+        except (RecursionError, SyntaxError) as exc:
+            pytest.fail(f"escaped at depth {depth}: {type(exc).__name__}: {exc}")
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError, ValueError])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+        '<|tool_call_start|>{"name": "f", "arguments": {"x": 1}}<|tool_call_end|>',
+    ],
+    ids=["compact-xml", "qwen-xml", "glm-xml", "namespaced-xml", "hermes"],
+)
+def test_functioncall_validation_failure_drops_one_call(
+    monkeypatch, error, template
+):
+    """The third decode lives in openai_models, not this module (#2545).
+
+    ``FunctionCall`` re-parses the arguments string while validating it, from
+    a deeper frame than either the parse or the serialize that preceded it, so
+    a value fine at both can still breach the limit there. DiscoStew6082 hit
+    this on 3.11 at depth ~989 after the serialize guard was already in place.
+
+    Injected here because the real-depth version only bites on 3.11 to 3.13.
+    ValueError is included because that is what the validator raises for
+    ordinary malformed arguments, and it escaped the parse chain too.
+    """
+    import omlx.api.openai_models as om
+
+    def boom(_v):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(om, "_coerce_tool_call_arguments", boom)
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    # Must not raise. Dropping the call with a warning is the contract.
+    _, calls = parse_tool_calls(template.replace("{}", "1"), tok)
+    assert not calls
