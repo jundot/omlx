@@ -1586,6 +1586,35 @@ class TestClaudeCodeIntegration:
         assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env
 
+    def test_launch_keeps_cross_session_messaging_enabled(self):
+        # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC also disables the
+        # feature-flag evaluation that cross-session messaging depends on,
+        # so the launched session must not set it (or any of the other
+        # opt-outs that gate the same feature flag).
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        env = captured["env"]
+        for var in (
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "DISABLE_TELEMETRY",
+            "DO_NOT_TRACK",
+            "DISABLE_GROWTHBOOK",
+        ):
+            assert var not in env
+
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()
         captured = {}

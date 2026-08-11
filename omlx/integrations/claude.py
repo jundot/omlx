@@ -69,8 +69,10 @@ class ClaudeCodeIntegration(Integration):
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
         # Large timeout for local model inference (model loading + generation).
         env["API_TIMEOUT_MS"] = "3000000"
-        # Disable telemetry and non-essential background traffic.
-        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        # Non-essential traffic (telemetry, growthbook) is deliberately left
+        # enabled: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC also disables the
+        # feature-flag evaluation that cross-session messaging depends on,
+        # which would make the launched session invisible to ListAgents.
 
         opus_model = ctx.opus_model or ctx.model
         sonnet_model = ctx.sonnet_model or ctx.model
