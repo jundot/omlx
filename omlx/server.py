@@ -2644,6 +2644,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         if is_markitdown_model(model_id):
             m["max_context_window"] = None
             m["max_tokens"] = None
+            m["is_favorite"] = False
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
@@ -2663,8 +2664,11 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             base_ms = sm.get_settings(source_model_id)
             if base_ms and base_ms.model_alias and source_model_id == model_id:
                 m["model_alias"] = base_ms.model_alias
+            m["is_favorite"] = base_ms is not None and base_ms.is_favorite
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
+        else:
+            m["is_favorite"] = False
         m["max_tokens"] = max_tokens
     return status
 
