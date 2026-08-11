@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -26,13 +27,14 @@ import queue
 import shutil
 import stat
 import struct
+import sys
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 
@@ -837,6 +839,41 @@ def _restore_tensor_from_bytes(
     return arr.reshape(shape)
 
 
+class DarwinNoCacheError(OSError):
+    """Darwin refused the required cache-bypass policy for an SSD write."""
+
+
+def _enable_darwin_nocache(fd: int) -> None:
+    """Require ``F_NOCACHE`` on Darwin before any bytes reach the file."""
+    if sys.platform != "darwin":
+        return
+    try:
+        command = fcntl.F_NOCACHE
+    except AttributeError as exc:
+        raise DarwinNoCacheError("fcntl.F_NOCACHE is unavailable on Darwin") from exc
+    try:
+        result = fcntl.fcntl(fd, command, 1)
+    except OSError as exc:
+        raise DarwinNoCacheError(
+            exc.errno,
+            f"failed to enable F_NOCACHE: {exc}",
+        ) from exc
+    if result != 0:
+        raise DarwinNoCacheError(f"F_NOCACHE returned nonzero status {result}")
+
+
+def _write_all(file_obj: BinaryIO, data: bytes) -> None:
+    """Write every byte or raise if an unbuffered descriptor stops progressing."""
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        written = file_obj.write(view[offset:])
+        remaining = len(view) - offset
+        if written is None or written <= 0 or written > remaining:
+            raise OSError(errno.EIO, "unbuffered SSD write made invalid progress")
+        offset += written
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -846,6 +883,9 @@ def _write_safetensors_no_mx(
 
     Safe to call from background threads. Produces files fully compatible
     with mx.load(path, return_metadata=True).
+
+    Darwin requires ``F_NOCACHE`` on the data descriptor before the first byte.
+    Policy setup failure aborts the write without a cached retry.
 
     The safetensors binary format:
       [8 bytes: header_size as little-endian uint64]
@@ -882,11 +922,17 @@ def _write_safetensors_no_mx(
     pad = (8 - len(header_json) % 8) % 8
     header_json += b" " * pad
 
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(header_json)))
-        f.write(header_json)
-        for d in all_data:
-            f.write(d)
+    try:
+        with open(path, "wb", buffering=0) as file_obj:
+            _enable_darwin_nocache(file_obj.fileno())
+            _write_all(file_obj, struct.pack("<Q", len(header_json)))
+            _write_all(file_obj, header_json)
+            for data in all_data:
+                _write_all(file_obj, data)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
 
     return 8 + len(header_json) + offset
 

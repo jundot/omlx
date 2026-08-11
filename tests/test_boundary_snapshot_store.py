@@ -893,6 +893,107 @@ class TestBoundarySnapshotSSDStore:
         with self.store._cancelled_lock:
             assert "req-qfull" not in self.store._cancelled_requests
 
+    def test_darwin_nocache_policy_failure_is_fatal_and_releases_pending(
+        self,
+    ) -> None:
+        import threading
+        import time
+        from unittest.mock import patch
+
+        import omlx.cache.boundary_snapshot_store as mod
+        from omlx.cache.paged_ssd_cache import DarwinNoCacheError
+
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+
+        def _fail_policy(*_args: object, **_kwargs: object) -> None:
+            writer_entered.set()
+            assert release_writer.wait(timeout=5.0)
+            raise DarwinNoCacheError("F_NOCACHE rejected")
+
+        request_id = "req-nocache-failure"
+        token_count = 2048
+        file_path = self.store._file_path(request_id, token_count)
+        temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+
+        with patch.object(
+            mod,
+            "_write_safetensors_no_mx",
+            side_effect=_fail_policy,
+        ):
+            assert self.store.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                _mock_extract_cache_states,
+            )
+            assert writer_entered.wait(timeout=5.0)
+            take_waiting = threading.Event()
+            take_errors: list[BaseException] = []
+            take_results: list[Path | None] = []
+            original_wait = self.store._pending_cond.wait
+
+            def _record_wait(timeout: float | None = None) -> bool:
+                take_waiting.set()
+                return original_wait(timeout=timeout)
+
+            def _take_staged_file() -> None:
+                try:
+                    take_results.append(
+                        self.store.take_staged_file(
+                            request_id,
+                            token_count,
+                            timeout_s=5.0,
+                        )
+                    )
+                except BaseException as exc:
+                    take_errors.append(exc)
+
+            with patch.object(
+                self.store._pending_cond,
+                "wait",
+                side_effect=_record_wait,
+            ):
+                taker = threading.Thread(target=_take_staged_file)
+                taker.start()
+                try:
+                    assert take_waiting.wait(timeout=5.0)
+                finally:
+                    release_writer.set()
+                taker.join(timeout=5.0)
+
+            assert not taker.is_alive()
+            assert take_results == []
+            assert len(take_errors) == 1
+            assert isinstance(take_errors[0], DarwinNoCacheError)
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with self.store._pending_lock:
+                    failed = self.store._fatal_write_error is not None
+                    released = (
+                        self.store._pending_bytes == 0
+                        and not self.store._pending_writes
+                    )
+                with self.store._registry_lock:
+                    dropped = request_id not in self.store._file_registry
+                if failed and released and dropped:
+                    break
+                time.sleep(0.02)
+
+            assert failed
+            assert released
+            assert not file_path.exists()
+            assert not temp_path.exists()
+            assert dropped
+            with pytest.raises(DarwinNoCacheError, match="F_NOCACHE rejected"):
+                self.store.save(
+                    "req-no-fallback",
+                    token_count,
+                    [MagicMock()],
+                    _mock_extract_cache_states,
+                )
+
     def test_cancelled_requests_dict_is_thread_safe(self):
         """Concurrent cleanup_request + writer should not race on
         _cancelled_requests. Without locking, the counter underflows or
