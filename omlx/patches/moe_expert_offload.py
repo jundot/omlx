@@ -381,9 +381,14 @@ def _coverage(glu: SwitchGLU, store: CheckpointExpertStore, path: str) -> str | 
             name = f"{path}.{proj}.{field}"
             if not store.has(name):
                 return f"checkpoint has no tensor {name!r}"
-            shape, _ = store.spec(name)
+            shape, dtype = store.spec(name)
             if tuple(lin[field].shape) != shape:
                 return f"{name!r} shape {shape} != module " f"{tuple(lin[field].shape)}"
+            if dtype not in _DTYPES:
+                # Unknown storage format: skipping here keeps the failure
+                # mode "runs resident" instead of a fetch-time KeyError in
+                # the middle of a generation.
+                return f"{name!r} has unsupported dtype {dtype!r}"
     return None
 
 
