@@ -353,6 +353,75 @@ class ExpertCache:
             pass  # older MLX
         return len(victims)
 
+    @property
+    def native_kind(self) -> str | None:
+        """'affine'/'mxfp4' when the resident cache tensors qualify for the
+        native block kernels (mirrors the stock QuantizedSwitchLinear
+        conditions: sorted path, group/bits/mode, uint32 packed weights,
+        matching scales dtype, custom-kernel symbols present). None ->
+        plain gather_qmm fallback, exactly like the stock non-native path.
+        """
+        try:
+            from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        except Exception:
+            return None
+        rw, rs, rb = self.resident["gate_proj"]
+        if (
+            # NOTE: the C++ binding hardcodes the envelope
+            # (fused_moe.cpp: supported_deepseek_affine -> group_size == 64
+            # && bits in (2, 3)); group 128 throws in the primitive
+            # constructor. The Metal shader is generic, but extending the
+            # envelope means editing + rebuilding the C++ first, then a
+            # warm-cache-controlled A/B (a naive cold/warm comparison is
+            # confounded by the expert-install cost). Keep the stock
+            # envelope here; the generic extension is its own PR.
+            self.group == 64
+            and self.bits in (2, 3)
+            and self.mode == "affine"
+            and rb is not None
+            and rw.dtype == mx.uint32
+            and rs.dtype in (mx.float16, mx.bfloat16)
+            and glm_fast.has_symbol("deepseek_affine_gather_qmm_blocks")
+        ):
+            return "affine"
+        if (
+            self.group == 32
+            and self.bits == 4
+            and self.mode == "mxfp4"
+            and rw.dtype == mx.uint32
+            and rs.dtype == mx.uint8
+            and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks")
+        ):
+            return "mxfp4"
+        return None
+
+    def qmm_native(
+        self,
+        name: str,
+        x: mx.array,
+        block_meta,
+        block_count,
+        block_variant,
+        kind: str,
+    ) -> mx.array:
+        """Native block-kernel gather over the resident slot tensors.
+
+        ``block_meta`` is built from *slot* ids (see ``_forward``), so the
+        kernel gathers from the cache's pre-stacked tensors exactly like the
+        stock path gathers from the full expert tensor.
+        """
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        rw, rs, rb = self.resident[name]
+        if kind == "mxfp4":
+            return glm_fast.deepseek_mxfp4_gather_qmm_blocks(
+                x, rw, rs, block_meta, block_count, block_variant
+            )
+        return glm_fast.deepseek_affine_gather_qmm_blocks(
+            x, rw, rs, rb, block_meta, block_count, self.group, self.bits,
+            block_variant,
+        )
+
     def qmm(
         self, name: str, x: mx.array, slots: mx.array, sorted_indices: bool = False
     ) -> mx.array:
@@ -404,9 +473,42 @@ class OffloadSwitchGLU(nn.Module):
         inv = None
         if do_sort:
             x, slots, inv = _gather_sort(x, slots)
-        up = c.qmm("up_proj", x, slots, do_sort)
-        gate = c.qmm("gate_proj", x, slots, do_sort)
-        out = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
+        # Native block kernels (prefill/sorted path): when the cache's
+        # quantized format qualifies, build block_meta from *slot* ids and
+        # run the same kernels the resident model would — the fast oQ
+        # dequant path instead of the generic gather_qmm fallback.
+        kind = c.native_kind if do_sort else None
+        if kind is not None and os.environ.get("OMLX_MOE_OFFLOAD_DISABLE_NATIVE") == "1":
+            kind = None  # A/B knob: force the gather_qmm fallback
+        block_plan = None
+        if kind is not None and x.dtype in (mx.float16, mx.bfloat16):
+            try:
+                from omlx.patches.deepseek_v4.switch_layers import (
+                    _block_config,
+                    _build_mxfp4_blocks,
+                )
+
+                block_bm, block_variant = _block_config(slots.size, kind)
+                block_meta, block_count = _build_mxfp4_blocks(
+                    slots, c.capacity, block_bm
+                )
+                block_plan = (block_meta, block_count, block_variant)
+            except Exception:
+                block_plan = None  # fall back to gather_qmm
+        if block_plan is not None:
+            block_meta, block_count, block_variant = block_plan
+            up = c.qmm_native("up_proj", x, block_meta, block_count, block_variant, kind)
+            gate = c.qmm_native(
+                "gate_proj", x, block_meta, block_count, block_variant, kind
+            )
+            out = c.qmm_native(
+                "down_proj", self.activation(up, gate),
+                block_meta, block_count, block_variant, kind,
+            )
+        else:
+            up = c.qmm("up_proj", x, slots, do_sort)
+            gate = c.qmm("gate_proj", x, slots, do_sort)
+            out = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
         if do_sort:
             out = _scatter_unsort(out, inv, indices.shape)
         return out.squeeze(-2)
