@@ -5407,16 +5407,15 @@ class Scheduler:
             tracker = getattr(self, "_prefill_transient_tracker", None)
         if tracker is None:
             return
+        # MLX owns one process-wide buffer pool. Dense and TurboQuant keep
+        # separate EWMA histories, but the dense tracker is the sole reclaim
+        # ledger owner so a release is charged and consumed exactly once.
+        reclaim_tracker = getattr(self, "_prefill_transient_tracker", tracker)
         delta = post_bytes - pre_bytes
-        # The reclaim ledger sees every measurement, including samples the
-        # EWMA gates below skip: a release on a sub-floor tail must still be
-        # priced, and any positive growth confirms the pool reallocation and
-        # drops the one-shot charge — leaving it armed after the footprint
-        # recovered would double count against the guard's gates.
         if delta <= 0:
-            tracker.record_reclaim(-delta)
+            reclaim_tracker.record_reclaim(-delta)
         else:
-            tracker.clear_reclaim()
+            reclaim_tracker.clear_reclaim()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
             logger.debug(
