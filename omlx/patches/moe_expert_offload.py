@@ -40,7 +40,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.switch_layers import (
-    QuantizedSwitchLinear,
     SwitchGLU,
     _gather_sort,
     _scatter_unsort,
@@ -374,6 +373,20 @@ def _resolve_model_dir(model_path: str | Path) -> Path | None:
         return None
 
 
+def _is_stock_switch_glu(obj) -> bool:
+    # mlx-lm and mlx-vlm each define their own SwitchGLU class; match by
+    # name + shape of the contract, not identity, so the VLM-served path
+    # (the default for Gemma 4 checkpoints) is covered. OffloadSwitchGLU
+    # has a different name, so re-wrapping is naturally excluded.
+    return type(obj).__name__ == "SwitchGLU" and hasattr(obj, "activation")
+
+
+def _is_quantized_switch_linear(lin) -> bool:
+    return type(lin).__name__ == "QuantizedSwitchLinear" and all(
+        hasattr(lin, a) for a in ("group_size", "bits", "mode")
+    )
+
+
 def _iter_switch_glus(model):
     """Yield ``(parent, key, module, tree_path)`` for every stock SwitchGLU.
 
@@ -388,7 +401,7 @@ def _iter_switch_glus(model):
         if id(obj) in seen:
             return
         seen.add(id(obj))
-        if type(obj) is SwitchGLU:
+        if _is_stock_switch_glu(obj):
             yield (parent, key, obj, path)
             return
         if isinstance(obj, dict):  # includes nn.Module
@@ -421,8 +434,8 @@ def _resolve_store_view(
     fields_of: dict[str, list[str]] = {}
     for proj in _PROJS:
         lin = getattr(glu, proj, None)
-        if not isinstance(lin, QuantizedSwitchLinear):
-            return None, f"{proj} is not QuantizedSwitchLinear"
+        if lin is None or not _is_quantized_switch_linear(lin):
+            return None, f"{proj} is not a QuantizedSwitchLinear"
         if "bias" in lin:
             return None, f"{proj} has per-expert bias (unsupported)"
         n = lin["weight"].shape[0] if n is None else n

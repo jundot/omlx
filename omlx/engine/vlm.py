@@ -1593,6 +1593,16 @@ class VLMBatchedEngine(BaseEngine):
                     return vlm_load(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
+                        # Expert offload wraps BEFORE materialization so
+                        # non-resident experts never load; keep the load
+                        # lazy only when the feature is on.
+                        lazy=bool(
+                            getattr(
+                                self._model_settings,
+                                "moe_expert_offload_enabled",
+                                False,
+                            )
+                        ),
                     )
 
         loop = asyncio.get_running_loop()
@@ -1624,6 +1634,30 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_name,
                 )
 
+        # MoE expert offload for the VLM path: Gemma 4 checkpoints are
+        # detected as VLMs, so this — not BatchedEngine — is their default
+        # engine. Same sequence as batched.py: wrap on the MLX executor
+        # BEFORE materialize so non-resident experts never load.
+        moe_offload_wrapped = 0
+        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
+            from ..patches.moe_expert_offload import apply_moe_expert_offload
+
+            fraction = float(
+                getattr(
+                    self._model_settings,
+                    "moe_expert_offload_resident_fraction",
+                    0.25,
+                )
+            )
+            moe_offload_wrapped = await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_moe_expert_offload,
+                self._vlm_model,
+                self._model_name,
+                fraction,
+            )
+        self._moe_offload_wrapped = moe_offload_wrapped
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
@@ -1653,7 +1687,13 @@ class VLMBatchedEngine(BaseEngine):
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
         # the MLX executor because it rewrites weights in place.
-        if (
+        if getattr(self, "_moe_offload_wrapped", 0):
+            logger.info(
+                "moe expert offload active (%d layers): skipping gate/up "
+                "fusion on the VLM path",
+                self._moe_offload_wrapped,
+            )
+        elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
         ):
