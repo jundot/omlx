@@ -147,6 +147,12 @@ class CheckpointExpertStore:
         out = mx.array(raw.view(np_dtype).reshape(out_shape))
         return out.view(mx_view) if mx_view is not None else out
 
+    def fetch_range(self, name: str, lo: int, hi: int) -> mx.array:
+        """Contiguous span ``[lo, hi)`` of a stacked tensor, one read."""
+        _, _, shape, _ = self._specs[name]
+        slab = int(np.prod(shape[1:]))
+        return self._read(name, lo * slab, (hi - lo) * slab, (hi - lo,) + shape[1:])
+
     def fetch_expert(self, name: str, expert: int) -> mx.array:
         """One expert's slab of a stacked ``[num_experts, ...]`` tensor."""
         _, _, shape, _ = self._specs[name]
@@ -183,6 +189,12 @@ class _GLUStoreView:
 
     def has(self, proj: str, field: str) -> bool:
         return self._store.has(self._name(proj, field, 0))
+
+    def fetch_range(self, proj: str, field: str, lo: int, hi: int) -> mx.array:
+        """Contiguous span ``[lo, hi)`` of one field's stacked tensor."""
+        if self._per_expert:
+            raise NotImplementedError("per-expert layouts have no contiguous span")
+        return self._store.fetch_range(self._name(proj, field, 0), lo, hi)
 
     def fetch(self, proj: str, field: str, expert: int) -> mx.array:
         if self._per_expert:
@@ -261,6 +273,81 @@ class ExpertCache:
         self.warm = len(self.slot_of) == self.n_experts
         return slot
 
+    def _install_many(self, missing: list, protected: set = frozenset()) -> None:
+        """Batch-install missing experts: clustered range reads + one
+        indexed write per projection (stacked layouts).
+
+        The transfer volume is unchanged (the same slabs move), but the
+        per-op Python/launch overhead collapses: a decode step installs
+        ~100 experts (~300 small reads+writes) which measured ~900 ms on
+        M5 Pro 48 GB — vs ~73 ms/step with zero installs. Reads are
+        clustered on consecutive experts (gap <= 8) so a sparse miss set
+        doesn't pull the whole [min, max] span.
+
+        ``protected``: experts needed by the current call that are already
+        resident must never be evicted here — ``missing`` is computed once
+        up front, so an evicted-but-needed expert would read a stale slot
+        (map -> -1). The chunked path guarantees distinct <= capacity, so
+        there is always enough evictable headroom.
+        """
+        if isinstance(protected, frozenset):
+            protected = set(protected)
+        missing = sorted(set(missing))
+        slots = []
+        for e in missing:
+            if self.free:
+                slot = self.free.pop()
+            else:
+                victim = next(
+                    (v for v in self.slot_of if v not in self.pinned and v not in protected),
+                    None,
+                )
+                old_e = next(iter(self.slot_of)) if victim is None else victim
+                slot = self.slot_of.pop(old_e)
+                self.map[old_e] = -1
+            slots.append(slot)
+        clusters = []
+        cur = [missing[0]]
+        for a, b in zip(missing, missing[1:]):
+            if b - a <= 8:
+                cur.append(b)
+            else:
+                clusters.append(cur)
+                cur = [b]
+        clusters.append(cur)
+        slot_arr = mx.array(slots)
+        for name in self.projs:
+            rw, rs, rb = self.resident[name]
+            w_parts, s_parts, b_parts = [], [], []
+            for cl in clusters:
+                w_parts.append(
+                    mx.take(
+                        self.disk.fetch_range(name, "weight", cl[0], cl[-1] + 1),
+                        mx.array([e - cl[0] for e in cl]), axis=0,
+                    )
+                )
+                s_parts.append(
+                    mx.take(
+                        self.disk.fetch_range(name, "scales", cl[0], cl[-1] + 1),
+                        mx.array([e - cl[0] for e in cl]), axis=0,
+                    )
+                )
+                if rb is not None and self.disk.has(name, "biases"):
+                    b_parts.append(
+                        mx.take(
+                            self.disk.fetch_range(name, "biases", cl[0], cl[-1] + 1),
+                            mx.array([e - cl[0] for e in cl]), axis=0,
+                        )
+                    )
+            rw[slot_arr] = mx.concatenate(w_parts, axis=0)
+            rs[slot_arr] = mx.concatenate(s_parts, axis=0)
+            if b_parts:
+                rb[slot_arr] = mx.concatenate(b_parts, axis=0)
+        for e, s in zip(missing, slots):
+            self.slot_of[e] = s
+            self.map[e] = s
+        self.warm = len(self.slot_of) == self.n_experts
+
     def ensure(self, idx: mx.array) -> set:
         """Make every expert in ``idx`` resident; returns the host id set.
 
@@ -275,13 +362,19 @@ class ExpertCache:
         needed = set(int(e) for e in idx.reshape(-1).tolist())
         for e in needed:
             self.usage[e] += 1
+        missing = [e for e in needed if e not in self.slot_of]
+        self.hits += len(needed) - len(missing)
+        self.misses += len(missing)
+        if missing:
+            if self.disk._per_expert:
+                for e in missing:
+                    self._install(e)
+            else:
+                self._install_many(missing, needed)
+        for e in needed:
             if e in self.slot_of:
                 slot = self.slot_of.pop(e)  # re-insert: LRU order
                 self.slot_of[e] = slot
-                self.hits += 1
-            else:
-                self.misses += 1
-                self._install(e)
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
@@ -303,7 +396,13 @@ class ExpertCache:
                 self.hits += 1
             else:
                 self.misses += 1
-                self._install(e)
+        missing = [e for e in needed if e not in self.slot_of]
+        if missing:
+            if self.disk._per_expert:
+                for e in missing:
+                    self._install(e)
+            else:
+                self._install_many(missing)
 
     def pin_hot(self, n: int) -> None:
         """Pin the ``n`` most-routed experts (learned hot set).
