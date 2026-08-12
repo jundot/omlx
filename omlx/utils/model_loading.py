@@ -476,6 +476,24 @@ def maybe_apply_pre_load_patches(
         if apply_deepseek_v4_patch():
             logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
 
+    # Escha-W2 trellis checkpoints (tools/convert_escha_mlx.py --expert-format
+    # trellis): routed experts ship as packed EXL3 codes decoded on the fly by
+    # a Metal kernel. Swap qwen3_5_moe's SparseMoeBlock before mlx_lm builds
+    # the tree so the escha_code/rin/rout buffers bind under strict load.
+    qc = config.get("quantization_config") or {}
+    if (
+        model_type == "qwen3_5_moe"
+        and isinstance(qc, dict)
+        and qc.get("quant_method") == "eschamoe"
+    ):
+        try:
+            from ..patches.escha_trellis import apply_escha_trellis_patch
+
+            if apply_escha_trellis_patch():
+                logger.info("Escha trellis pre-load patch applied for %s", model_name)
+        except Exception as exc:  # pragma: no cover - degrade to affine fallback
+            logger.debug("escha trellis patch failed: %s", exc)
+
     if model_type == "step3p7":
         from ..patches.step3p7 import apply_step3p7_patch
 
@@ -629,6 +647,14 @@ def maybe_apply_pre_load_patches(
             depth = getattr(model_settings, "mtp_num_draft_tokens", None)
             if depth:
                 set_mtp_depth(int(depth))
+            fixed = getattr(model_settings, "mtp_fixed_draft_depth", None)
+            if fixed:
+                from ..patches.mlx_lm_mtp import batch_generator as _bg
+
+                _bg.set_fixed_draft_depth(int(fixed))
+                logger.info(
+                    "MTP fixed draft depth %s for %s", fixed, model_name
+                )
             elif model_type.startswith("nemotron_h"):
                 # The stock nemotron_h head is depth-1 trained; the adaptive
                 # controller's exploration costs ~10% throughput vs fixed

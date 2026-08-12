@@ -436,3 +436,22 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
+
+
+## Multi-Token Prediction (MTP)
+
+An MTP head is bundled (`model-mtp.safetensors`, bf16 weights from
+`mlx-community/Qwen3.6-35B-A3B-MTP-bf16`) and loads through oMLX's native MTP
+pipeline (`mtp_enabled` in model settings). Measured impact on decode
+throughput: **none** (46.4 vs 47.1 tok/s, warm, 128-token window). The trellis
+decode cost is per-row and scales with the number of tokens in the verify
+batch, so speculative verification does not amortize it for this checkpoint;
+MTP is supported but off by default.
+
+## Performance (Apple Silicon, single stream, warm)
+
+| path | tok/s |
+|---|---|
+| affine build (`...-W2-2bit`) | ~112 |
+| trellis native (`...-W2-trellis`, near-lossless) | ~54 |
+| trellis + MTP | ~46 (no net gain) |
