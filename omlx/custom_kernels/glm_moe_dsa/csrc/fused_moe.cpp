@@ -92,7 +92,15 @@ int affine_bytes_per_pack(int bits) {
 }
 
 bool supported_deepseek_affine(int group_size, int bits) {
-  return group_size == 64 && (bits == 2 || bits == 3);
+  // Group 128 / bits 2 verified bit-exact vs the gather_qmm fallback on
+  // DeepSeek-V4-Flash-0731-2.4bit-mixed (the oQ 2.4bit-mixed quant the
+  // oQ tooling ships): the Metal dequant loop is generic over group_size
+  // (static_assert BCOLS <= group_size; group_stride = BROWS * src_ld /
+  // group_size), and the uint32 packing is bits-driven only, so a wider
+  // group needs no shader change. Other (group, bits) combos stay on the
+  // fallback until A/B-verified against gather_qmm.
+  return (group_size == 64 && (bits == 2 || bits == 3)) ||
+         (group_size == 128 && bits == 2);
 }
 
 int affine_packed_row_bytes(int K, int bits) {
