@@ -1749,6 +1749,22 @@ class PagedSSDCacheManager(CacheManager):
             f"existing_files={self._index.count}{disk_info}"
         )
 
+    def set_expected_block_payload_bytes(self, payload_bytes: int) -> None:
+        """Resize the writer queue from one conservative serialized block size."""
+        if payload_bytes <= 0:
+            raise ValueError("expected block payload must be positive")
+        block_tokens = max(1, int(self._expected_block_size_tokens))
+        per_token = max(1, (int(payload_bytes) + block_tokens - 1) // block_tokens)
+        cap = _compute_max_pending_writes(
+            block_size_tokens=block_tokens,
+            kv_bytes_per_token=per_token,
+        )
+        with self._write_queue.mutex:
+            self._expected_kv_bytes_per_token = per_token
+            self._max_pending_writes = cap
+            self._write_queue.maxsize = cap
+            self._write_queue.not_full.notify_all()
+
     # --- Hot cache helpers ---
 
     @staticmethod
@@ -3140,7 +3156,6 @@ class PagedSSDCacheManager(CacheManager):
         file_path = self._get_file_path(block_hash)
 
         try:
-
             # Prepare arrays for safetensors. Three layer_data shapes are
             # accepted:
             # - ``('__nstate__', class_name, [elem0, elem1, ...])`` — V3
@@ -3156,9 +3171,7 @@ class PagedSSDCacheManager(CacheManager):
             #   etc.) has been migrated to emit ``__nstate__`` markers yet.
             arrays = {}
             has_pooling_cache_delta = False
-            cache_list_meta = (
-                {}
-            )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
+            cache_list_meta = {}  # Per-layer sidecar metadata (sub_count, state_count, etc.)
 
             # Shim; module-level to avoid a recursive-closure refcount
             # cycle pinning `arrays` — see _store_nstate_elements_flat.
@@ -3856,8 +3869,7 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
             logger.debug(
-                f"Loaded block with metadata from hot cache: "
-                f"{block_hash.hex()[:16]}..."
+                f"Loaded block with metadata from hot cache: {block_hash.hex()[:16]}..."
             )
             return cache_data, metadata_dict
 
@@ -4197,17 +4209,13 @@ class PagedSSDCacheManager(CacheManager):
 
         new_signature = list(layer_cache_types)
         new_canonical = _canonicalize_layer_cache_types(new_signature)
-        new_bits = (
-            float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
-        )
+        new_bits = float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
 
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
             bits_changed = new_bits != self._expected_turboquant_kv_bits
-            subtypes_changed = (
-                cachelist_subtypes != self._expected_cachelist_subtypes
-            )
+            subtypes_changed = cachelist_subtypes != self._expected_cachelist_subtypes
             if (
                 old_canonical == new_canonical
                 and not bits_changed

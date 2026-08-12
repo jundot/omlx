@@ -128,9 +128,7 @@ def _format_phase_timings(phase_timings_us: object) -> str:
 # Precision suffixes Poolside uses for drafts trained against a quantized
 # target ("Laguna-S-2.1-DFlash-NVFP4" etc.). Anything else after "-DFlash-"
 # (e.g. z-lab's "-b16" block-size suffix) makes no precision claim.
-_DRAFT_PRECISION_TAGS = frozenset(
-    {"NVFP4", "INT4", "INT8", "FP8", "FP4", "MXFP4"}
-)
+_DRAFT_PRECISION_TAGS = frozenset({"NVFP4", "INT4", "INT8", "FP8", "FP4", "MXFP4"})
 
 
 def _canonical_precision_tag(value: object) -> str | None:
@@ -307,6 +305,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         fallback_engine_type: str = "batched",
         scheduler_config: Any | None = None,
         omlx_ssd_cache_dir: str | Path | None = None,
+        prefill_eviction_callback: Any | None = None,
+        mid_prefill_process_claim_callback: Any | None = None,
     ):
         super().__init__()
         self._model_name = model_name
@@ -326,6 +326,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._omlx_ssd_cache_dir = (
             Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None
         )
+        self._prefill_eviction_callback = prefill_eviction_callback
+        self._mid_prefill_process_claim_callback = mid_prefill_process_claim_callback
 
         self._target_model = None
         self._target_ops = None
@@ -734,6 +736,21 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         except Exception as exc:
             logger.debug(f"dflash cache end_request failed: {exc}")
 
+    async def _claim_fallback_mid_prefill_process(self) -> None:
+        scheduler = self.scheduler
+        if (
+            scheduler is None
+            or getattr(scheduler, "_turboquant_mid_prefill", False) is not True
+        ):
+            return
+        claim_callback = self._mid_prefill_process_claim_callback
+        if not callable(claim_callback):
+            raise RuntimeError(
+                "TurboQuant mid-prefill DFlash fallback requires an "
+                "EnginePool-owned process-exclusive Metal lane"
+            )
+        await claim_callback(scheduler)
+
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
@@ -797,24 +814,53 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         else:
             logger.warning("DFlash model eviction: memory settle timed out")
 
-        # Start fallback engine
+        # Start fallback engine.
         if self._fallback_engine_type == "vlm":
             from .vlm import VLMBatchedEngine
 
-            self._fallback_engine = VLMBatchedEngine(
+            fallback_engine: BaseEngine = VLMBatchedEngine(
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
+                prefill_eviction_callback=self._prefill_eviction_callback,
             )
         else:
             from .batched import BatchedEngine
 
-            self._fallback_engine = BatchedEngine(
+            fallback_engine = BatchedEngine(
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
+                prefill_eviction_callback=self._prefill_eviction_callback,
             )
-        await self._fallback_engine.start()
+        self._fallback_engine = fallback_engine
+        try:
+            await fallback_engine.start()
+            await self._claim_fallback_mid_prefill_process()
+        except Exception:
+            scheduler = self.scheduler
+            process_owner = getattr(scheduler, "_metal_process_owner", None)
+            try:
+                await fallback_engine.stop()
+            except Exception:
+                logger.warning(
+                    "Failed to stop rejected DFlash fallback engine",
+                    exc_info=True,
+                )
+            finally:
+                close_process_owner = getattr(process_owner, "close", None)
+                if callable(close_process_owner):
+                    try:
+                        close_process_owner()
+                    except Exception:
+                        logger.warning(
+                            "Failed to close rejected DFlash fallback owner",
+                            exc_info=True,
+                        )
+                self._fallback_engine = None
+                self._in_fallback_mode = False
+                self._loaded = False
+            raise
         self._in_fallback_mode = True
         logger.info(f"DFlash fallback engine started: {self._fallback_engine_type}")
 
@@ -939,7 +985,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tools: list | None = None,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Prefill-memory preflight for chat requests.
 
         DFlash bypasses the scheduler, so it implements the front-door guard
@@ -952,10 +998,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if not self._loaded:
             await self.start()
         if self._in_fallback_mode and self._fallback_engine is not None:
-            await self._fallback_engine.preflight_chat(
+            return await self._fallback_engine.preflight_chat(
                 messages, tools=tools, request_id=request_id, **kwargs
             )
-            return
         if self._prefill_guard is None:
             _warn_scheduler_unreachable_once(
                 self, "preflight_chat", "primary-mode prefill guard unavailable"
@@ -990,15 +1035,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         prompt: str,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Prefill-memory preflight for plain completions. See ``preflight_chat``."""
         if not self._loaded:
             await self.start()
         if self._in_fallback_mode and self._fallback_engine is not None:
-            await self._fallback_engine.preflight_completion(
+            return await self._fallback_engine.preflight_completion(
                 prompt, request_id=request_id, **kwargs
             )
-            return
         if self._prefill_guard is None:
             _warn_scheduler_unreachable_once(
                 self,

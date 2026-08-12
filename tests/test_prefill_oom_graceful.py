@@ -138,9 +138,7 @@ def _throttle_ctx(
         ns, Scheduler
     )
     ns._prefill_abort_cap = Scheduler._prefill_abort_cap.__get__(ns, Scheduler)
-    ns._prefill_sizing_target = Scheduler._prefill_sizing_target.__get__(
-        ns, Scheduler
-    )
+    ns._prefill_sizing_target = Scheduler._prefill_sizing_target.__get__(ns, Scheduler)
     ns._prefill_abort_description = Scheduler._prefill_abort_description.__get__(
         ns, Scheduler
     )
@@ -677,14 +675,10 @@ def test_record_chunk_transient_marks_floor_samples_only():
     # First sample is always excluded from the max (seed noise).
     ns._record_chunk_transient(32, 0, 100, request_id="r", loop_label="unit")
     # Big chunk: EWMA only, never the max.
-    ns._record_chunk_transient(
-        2048, 0, 3 * 1024**3, request_id="r", loop_label="unit"
-    )
+    ns._record_chunk_transient(2048, 0, 3 * 1024**3, request_id="r", loop_label="unit")
     assert tracker.observed_max_bytes == 0
     # Floor chunk: enters the max.
-    ns._record_chunk_transient(
-        32, 0, 200 * 1024**2, request_id="r", loop_label="unit"
-    )
+    ns._record_chunk_transient(32, 0, 200 * 1024**2, request_id="r", loop_label="unit")
     assert tracker.observed_max_bytes == 200 * 1024**2
 
 
@@ -727,9 +721,7 @@ def test_record_chunk_transient_skips_partial_speed_sample():
     assert tracker.last_n_tokens == 2048
     assert tracker.last_delta_bytes == full_delta
     predicted = Scheduler._predicted_chunk_transient(ns, 2048, 65_000)
-    assert predicted == pytest.approx(
-        full_delta * Scheduler._PREFILL_TRANSIENT_SAFETY
-    )
+    assert predicted == pytest.approx(full_delta * Scheduler._PREFILL_TRANSIENT_SAFETY)
 
 
 def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
@@ -1045,9 +1037,13 @@ def test_guard_shrink_math_unchanged_by_observed_max():
 
 
 class TestMaybeRecordFixedStateBytes:
-    def _ns(self, armed=True):
+    def _ns(self, armed: bool = True) -> SimpleNamespace:
+        monitor = MagicMock()
+        monitor.estimate_paged_writer_block_memory.return_value = 654_321
         ns = SimpleNamespace(
-            memory_monitor=MagicMock(),
+            memory_monitor=monitor,
+            paged_ssd_cache_manager=MagicMock(),
+            config=SimpleNamespace(paged_cache_block_size=256),
             _fixed_state_measure_armed=armed,
             _fixed_state_recorded=False,
         )
@@ -1069,6 +1065,12 @@ class TestMaybeRecordFixedStateBytes:
         caches = [self._arrays_cache([100, 200]), self._arrays_cache([300])]
         ns._maybe_record_fixed_state_bytes(caches)
         ns.memory_monitor.set_fixed_state_bytes.assert_called_once_with(600)
+        ns.memory_monitor.estimate_paged_writer_block_memory.assert_called_once_with(
+            256
+        )
+        ns.paged_ssd_cache_manager.set_expected_block_payload_bytes.assert_called_once_with(
+            654_321
+        )
         assert ns._fixed_state_recorded is True
         # Second call is a no-op flag check.
         ns._maybe_record_fixed_state_bytes(caches)
@@ -1088,12 +1090,9 @@ class TestMaybeRecordFixedStateBytes:
 
     def test_zero_total_marks_recorded_without_setting(self):
         ns = self._ns()
-        ns._maybe_record_fixed_state_bytes(
-            [type("KVCache", (), {"state": []})()]
-        )
+        ns._maybe_record_fixed_state_bytes([type("KVCache", (), {"state": []})()])
         ns.memory_monitor.set_fixed_state_bytes.assert_not_called()
         assert ns._fixed_state_recorded is True
-
 
 
 # --------------------------------------------------------------------------

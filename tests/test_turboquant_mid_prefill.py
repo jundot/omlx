@@ -219,6 +219,7 @@ def _configure_pressure(
     scheduler._admission_transient_bound = MethodType(_bound, scheduler)
     return cap
 
+
 def _configure_sizing_band(scheduler: Scheduler) -> tuple[int, int]:
     mib = 1024**2
     cap = 10 * mib
@@ -948,6 +949,7 @@ def test_guard_evicts_once_before_converting() -> None:
             prefill_context=context,
         )
     assert exc.value.request.reason == "turboquant_mid_prefill"
+    assert exc.value.request.processed_tokens == 4
     assert request.prefill_eviction_retries == 1
     assert context.conversion_attempted is False
     assert request.turboquant_mid_prefill_attempted is False
@@ -999,6 +1001,7 @@ def test_guard_skips_eviction_pause_without_callback() -> None:
     assert request.prefill_eviction_retries == 0
     assert context.phase is _PrefillKVPhase.TURBOQUANT
     assert context.memory_after_bytes < cap
+
 
 def test_sizing_target_pressure_triggers_conversion_before_abort_cap() -> None:
     scheduler = _make_scheduler(step_size=4)
@@ -1107,6 +1110,7 @@ def test_organic_pressure_triggers_eviction_pause_then_retry_converts() -> None:
     assert isinstance(cache[0], TurboQuantKVCache)
     assert isinstance(cache[1], KVCache)
 
+
 def test_empty_fresh_cache_resizes_without_conversion() -> None:
     scheduler = _make_scheduler(step_size=4)
     _configure_sizing_band(scheduler)
@@ -1173,6 +1177,7 @@ def test_flag_off_guard_never_converts() -> None:
     assert context.conversion_attempted is False
     assert request.turboquant_mid_prefill_attempted is False
     assert all(isinstance(cache_obj, KVCache) for cache_obj in cache)
+
 
 def test_flag_off_finalization_uses_ordinary_direct_converter() -> None:
     scheduler = _make_scheduler()
@@ -2060,6 +2065,7 @@ def test_complete_turboquant_prefix_extends_without_reconversion() -> None:
     assert scheduler._classify_prefill_cache(cache)[0] is _PrefillKVPhase.TURBOQUANT
     assert cache[0].offset == cache[1].offset == 6
 
+
 def test_qwen_style_hybrid_turboquant_prefix_restores_and_extends() -> None:
     scheduler = _make_scheduler(step_size=4)
     scheduler._memory_hard_limit_bytes = 0
@@ -2139,6 +2145,7 @@ def test_phase_widths_and_transient_histories_remain_separate() -> None:
     assert scheduler._prefill_tq_transient_tracker.samples == 1
     assert scheduler._prefill_transient_tracker.last_delta_bytes == 100
     assert scheduler._prefill_tq_transient_tracker.last_delta_bytes == 200
+
 
 def test_first_qwen_q8_suffix_uses_structural_workspace_bound() -> None:
     workspace = estimate_turboquant_prefill_attention_workspace_bytes(

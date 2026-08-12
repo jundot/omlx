@@ -90,9 +90,7 @@ def register_attention_bias_transient(dtype_size: float | None) -> None:
     model load/swap: the setting is process-wide, like the tiled head_dim
     registry above."""
     global _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE
-    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = (
-        float(dtype_size) if dtype_size else None
-    )
+    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = float(dtype_size) if dtype_size else None
 
 
 def estimate_unfused_sdpa_call_bytes(
@@ -587,6 +585,29 @@ class MemoryMonitor:
 
         return total
 
+    def estimate_paged_writer_block_memory(self, block_size: int) -> float:
+        """Estimate one queued SSD block, including boundary snapshot state."""
+        if block_size <= 0:
+            return 0
+
+        total = self.estimate_block_memory(block_size)
+        if self._prefill_memory_profile is not None:
+            profile_bytes = self._prefill_memory_profile.estimate_resident_kv_bytes(
+                block_size,
+                chunk_tokens=block_size,
+            )
+            total = max(total, profile_bytes)
+
+        if self._rotating_layer_specs:
+            kv_heads = self._num_kv_heads or 0
+            dim = self._head_dim or 0
+            if kv_heads and dim:
+                per_token = kv_heads * dim * self._score_dtype_size * 2
+                for count, window in self._rotating_layer_specs:
+                    total += count * (window + block_size - 1) * per_token
+
+        return total + self._fixed_state_bytes
+
     def estimate_prompt_kv_bytes(
         self, num_tokens: int, *, dtype_size: float | None = None
     ) -> float:
@@ -727,7 +748,9 @@ class MemoryMonitor:
             and query_tokens > 1
             and kv_len >= _SDPA_TILED_MIN_KV_LEN
         ):
-            tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            tile_scores = (
+                n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            )
             return output + tile_scores + bias
 
         return (
@@ -1213,9 +1236,7 @@ _ROTATING_CACHE_CLASS_NAMES = frozenset(
 )
 # Fixed-state recurrent caches (GDN/Mamba). Matches
 # Scheduler._cache_tree_has_arrays_cache plus mlx-lm's MambaCache.
-_ARRAYS_CACHE_CLASS_NAMES = frozenset(
-    {"ArraysCache", "SizedArraysCache", "MambaCache"}
-)
+_ARRAYS_CACHE_CLASS_NAMES = frozenset({"ArraysCache", "SizedArraysCache", "MambaCache"})
 
 
 def collect_kv_layer_specs(
@@ -1544,7 +1565,10 @@ def raise_if_prefill_exceeds(
         request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
     logger.warning(
         "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
-        num_prompt_tokens, cached_tokens, request_id, message,
+        num_prompt_tokens,
+        cached_tokens,
+        request_id,
+        message,
     )
     raise PrefillMemoryExceededError(
         message=message,
