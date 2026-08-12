@@ -25,6 +25,7 @@
         'max_tool_result_tokens',
         'index_cache_freq',
         'turboquant_kv_enabled',
+        'turboquant_mid_prefill',
         'turboquant_kv_bits',
         'turboquant_skip_last',
         'specprefill_enabled',
@@ -6577,6 +6578,11 @@
                         }
                         continue;
                     }
+                    if (k === 'turboquant_mid_prefill') {
+                        out.turboquant_mid_prefill = !!ms.turboquant_kv_enabled
+                            && !!ms.turboquant_mid_prefill;
+                        continue;
+                    }
                     if (k === 'guided_grammar_enabled') {
                         out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
                         continue;
@@ -6941,6 +6947,7 @@
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
+                    turboquant_mid_prefill: s.turboquant_mid_prefill || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
@@ -7482,6 +7489,8 @@
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
                                 turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
+                                turboquant_mid_prefill: this.modelSettings.turboquant_kv_enabled
+                                    && !!this.modelSettings.turboquant_mid_prefill,
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
@@ -7566,6 +7575,7 @@
                                     guided_grammar: null,
                                     max_tool_result_tokens: 0,
                                     turboquant_kv_enabled: false,
+                                    turboquant_mid_prefill: false,
                                     turboquant_kv_bits: 4,
                                     specprefill_enabled: false,
                                     specprefill_draft_model: null,
@@ -7654,6 +7664,7 @@
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
+                        this.modelSettings.turboquant_mid_prefill = false;
                         this.modelSettings.turboquant_kv_bits = 4;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;

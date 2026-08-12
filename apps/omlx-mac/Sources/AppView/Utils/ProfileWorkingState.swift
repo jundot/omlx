@@ -129,6 +129,7 @@ enum ProfileSettingsKey {
     static let trustRemoteCode = "trust_remote_code"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
     static let turboquantKvBits = "turboquant_kv_bits"
+    static let turboquantMidPrefill = "turboquant_mid_prefill"
     static let indexCacheFreq = "index_cache_freq"
     static let specprefillEnabled = "specprefill_enabled"
     static let specprefillDraftModel = "specprefill_draft_model"

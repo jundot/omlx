@@ -1111,6 +1111,15 @@ private struct ExperimentalSection: View {
                         .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
             }
+            if vm.showsTurboquantMidPrefill {
+                Row(label: turboquantMidPrefillLabel,
+                    sublabel: turboquantMidPrefillHelp) {
+                    Toggle(turboquantMidPrefillLabel,
+                           isOn: vm.bindProfile($vm.turboquantMidPrefill))
+                        .labelsHidden().toggleStyle(.switch)
+                        .help(turboquantMidPrefillHelp)
+                }
+            }
 
             // IndexCache (DSA-only — surface to the user that the row
             // only applies to models whose config matches the DSA set).
@@ -1370,8 +1379,20 @@ private struct ExperimentalSection: View {
     private var turboquantSublabel: String {
         if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.turboquant.sub",
-                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-                      comment: "Sublabel describing TurboQuant KV cache")
+                      defaultValue: "Convert the KV cache after prefill for generation. Saves memory at a small quality cost.",
+                      comment: "Sublabel describing the normal TurboQuant KV cache conversion path")
+    }
+
+    private var turboquantMidPrefillLabel: String {
+        String(localized: "settings.experimental.turboquant.mid_prefill.label",
+               defaultValue: "Convert under prefill pressure",
+               comment: "Subordinate TurboQuant row label for converting the KV cache when a full prefill chunk cannot fit")
+    }
+
+    private var turboquantMidPrefillHelp: String {
+        String(localized: "settings.experimental.turboquant.mid_prefill.sub",
+               defaultValue: "When a full prefill chunk cannot fit, convert the growing KV cache once and continue with TurboQuant. Requires this to be the only loaded model. Adds a one-time pause and may slow the rest of prefill.",
+               comment: "Help text for converting the TurboQuant KV cache once under prefill memory pressure")
     }
 
     private var specprefillSublabel: String {

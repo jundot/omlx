@@ -60,6 +60,73 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(values.contains("model-MTPLX-runtime"))
     }
 
+    func testTurboquantMidPrefillDefaultsFalseAndHidden() {
+        let vm = ModelSettingsScreenVM()
+
+        XCTAssertFalse(vm.turboquantMidPrefill)
+        XCTAssertFalse(vm.showsTurboquantMidPrefill)
+        XCTAssertEqual(ProfileSettingsKey.turboquantMidPrefill, "turboquant_mid_prefill")
+    }
+
+    func testTurboquantMidPrefillProfileStateRoundTripsWhenParentEnabled() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "text-model", configModelType: "qwen3_5")
+        vm.turboquantKvEnabled = true
+        vm.turboquantMidPrefill = true
+
+        let settings = vm.currentSettingsDict()
+
+        XCTAssertTrue(vm.showsTurboquantMidPrefill)
+        XCTAssertEqual(
+            settings["turboquant_mid_prefill"]?.value as? Bool,
+            true
+        )
+        XCTAssertTrue(turboquantMidPrefillDetailIsActive(settings))
+    }
+
+    func testTurboquantMidPrefillIsInertWhenParentDisabled() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "text-model", configModelType: "qwen3_5")
+        vm.turboquantKvEnabled = false
+        vm.turboquantMidPrefill = true
+
+        let settings = vm.currentSettingsDict()
+
+        XCTAssertFalse(vm.showsTurboquantMidPrefill)
+        XCTAssertEqual(
+            settings["turboquant_mid_prefill"]?.value as? Bool,
+            false
+        )
+        XCTAssertFalse(turboquantMidPrefillDetailIsActive(settings))
+    }
+
+    func testTurboquantMidPrefillIsExcludedForDiffusion() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "diffusion-model", configModelType: "diffusion_gemma")
+        vm.turboquantKvEnabled = true
+        vm.turboquantMidPrefill = true
+
+        let settings = vm.currentSettingsDict()
+
+        XCTAssertFalse(vm.showsTurboquantMidPrefill)
+        XCTAssertNil(settings["turboquant_mid_prefill"])
+        XCTAssertFalse(turboquantMidPrefillDetailIsActive(settings))
+    }
+
+    func testTurboquantProfileDetailRequiresBothFlags() {
+        let parentOnly: [String: AnyCodable] = [
+            ProfileSettingsKey.turboquantKvEnabled: AnyCodable(true),
+            ProfileSettingsKey.turboquantMidPrefill: AnyCodable(false),
+        ]
+        let childOnly: [String: AnyCodable] = [
+            ProfileSettingsKey.turboquantKvEnabled: AnyCodable(false),
+            ProfileSettingsKey.turboquantMidPrefill: AnyCodable(true),
+        ]
+
+        XCTAssertFalse(turboquantMidPrefillDetailIsActive(parentOnly))
+        XCTAssertFalse(turboquantMidPrefillDetailIsActive(childOnly))
+    }
+
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {
         ModelDTO(
             id: id,

@@ -11,6 +11,7 @@
                 "max_context_window": 131072,
                 "force_sampling": false,
                 "turboquant_kv_enabled": false,
+                "turboquant_mid_prefill": false,
                 "dflash_enabled": false,
                 "max_tokens": 262144,
                 "thinking_budget_tokens": 8192,

@@ -73,6 +73,9 @@ final class LocalizationSmokeTests: XCTestCase {
         "bench.context.header.title", "bench.context.section.configuration",
         // Settings + helpers
         "settings.section.basic", "settings.advanced.experimental.section",
+        "settings.experimental.turboquant.mid_prefill.label",
+        "settings.experimental.turboquant.mid_prefill.sub",
+        "profile.detail.acceleration.turboquant.mid_prefill",
         "appearance.row.menubar_icon", "appearance.row.menubar_icon.restore",
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",

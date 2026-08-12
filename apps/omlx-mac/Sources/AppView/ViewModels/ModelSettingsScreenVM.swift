@@ -34,7 +34,7 @@ final class ModelSettingsScreenVM {
         case trustRemoteCode
         case reasoningParser
         case chatTemplateKwargs
-        case turboquantKvEnabled, turboquantKvBits
+        case turboquantKvEnabled, turboquantKvBits, turboquantMidPrefill
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
@@ -253,6 +253,7 @@ final class ModelSettingsScreenVM {
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool = false
     var turboquantKvBits: String = "4"
+    var turboquantMidPrefill: Bool = false
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -329,6 +330,10 @@ final class ModelSettingsScreenVM {
         return Self.diffusionConfigModelTypes.contains(type)
     }
 
+    var showsTurboquantMidPrefill: Bool {
+        !isDiffusionModel && turboquantKvEnabled
+    }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
@@ -339,7 +344,7 @@ final class ModelSettingsScreenVM {
             return true
         case .forceSampling, .reasoningParser:
             return true
-        case .turboquantKvEnabled, .turboquantKvBits:
+        case .turboquantKvEnabled, .turboquantKvBits, .turboquantMidPrefill:
             return true
         case .indexCacheEnabled, .indexCacheFreq:
             return true
@@ -462,6 +467,9 @@ final class ModelSettingsScreenVM {
                 )
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
+                self.turboquantMidPrefill = !self.isDiffusionModel
+                    && self.turboquantKvEnabled
+                    && (s?.turboquantMidPrefill ?? false)
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -594,6 +602,8 @@ final class ModelSettingsScreenVM {
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
+        case .turboquantMidPrefill:
+            patch.turboquantMidPrefill = turboquantKvEnabled && turboquantMidPrefill
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:
@@ -886,6 +896,10 @@ final class ModelSettingsScreenVM {
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
             }
+            putBool(
+                ProfileSettingsKey.turboquantMidPrefill,
+                turboquantKvEnabled && turboquantMidPrefill
+            )
             if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
                 out[ProfileSettingsKey.indexCacheFreq] = AnyCodable(n)
             }

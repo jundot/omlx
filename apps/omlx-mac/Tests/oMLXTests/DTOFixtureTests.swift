@@ -125,7 +125,39 @@ final class DTOFixtureTests: XCTestCase {
         if let first = list.models.first {
             XCTAssertFalse(first.id.isEmpty, "ModelDTO.id must be non-empty.")
             XCTAssertEqual(first.displayName, "deepsweet/Qwen3.6-27B-UD-MLX-4bit")
+            XCTAssertEqual(first.settings?.turboquantMidPrefill, false)
         }
+    }
+
+    func testTurboquantMidPrefillResponseAllowsMissingField() throws {
+        let data = Data(#"{}"#.utf8)
+
+        let settings = try Self.makeDecoder().decode(ModelSettingsDTO.self, from: data)
+
+        XCTAssertNil(settings.turboquantMidPrefill)
+    }
+
+    func testTurboquantMidPrefillResponseDecodesPresentTrue() throws {
+        let data = Data(#"{"turboquant_mid_prefill":true}"#.utf8)
+
+        let settings = try Self.makeDecoder().decode(ModelSettingsDTO.self, from: data)
+
+        XCTAssertEqual(settings.turboquantMidPrefill, true)
+    }
+
+    func testTurboquantMidPrefillPatchUsesExactWireKey() throws {
+        var patch = ModelSettingsPatch()
+        patch.turboquantMidPrefill = true
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let body = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
+        )
+
+        XCTAssertEqual(body.count, 1)
+        XCTAssertEqual(body["turboquant_mid_prefill"] as? Bool, true)
+        XCTAssertNil(body["turboquantMidPrefill"])
     }
 
     // MARK: - Profile list (per-model)
@@ -135,6 +167,10 @@ final class DTOFixtureTests: XCTestCase {
         let resp = try Self.makeDecoder().decode(ProfileListResponse.self, from: data)
         XCTAssertNotNil(resp.profiles,
                         "Profiles array must be present even when empty.")
+        XCTAssertEqual(
+            resp.profiles.first?.settings?[ProfileSettingsKey.turboquantMidPrefill]?.value as? Bool,
+            false
+        )
     }
 
     // MARK: - Profile templates
