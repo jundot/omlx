@@ -1586,11 +1586,10 @@ class TestClaudeCodeIntegration:
         assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env
 
-    def test_launch_keeps_cross_session_messaging_enabled(self):
-        # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC also disables the
-        # feature-flag evaluation that cross-session messaging depends on,
-        # so the launched session must not set it (or any of the other
-        # opt-outs that gate the same feature flag).
+    def test_launch_disables_nonessential_traffic_by_default(self):
+        # Cross-session messaging is opt-in (--cross-session) because
+        # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the privacy-oriented
+        # default for a launch aimed at a local model.
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1607,13 +1606,66 @@ class TestClaudeCodeIntegration:
             cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
 
         env = captured["env"]
+        assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
         for var in (
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-            "DISABLE_TELEMETRY",
-            "DO_NOT_TRACK",
-            "DISABLE_GROWTHBOOK",
+            "DISABLE_AUTOUPDATER",
+            "DISABLE_ERROR_REPORTING",
+            "DISABLE_FEEDBACK_COMMAND",
+            "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
         ):
             assert var not in env
+
+    def test_launch_cross_session_enables_messaging_traffic(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", cross_session=True)
+            )
+
+        env = captured["env"]
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in env
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["DISABLE_ERROR_REPORTING"] == "1"
+        assert env["DISABLE_FEEDBACK_COMMAND"] == "1"
+        assert env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] == "1"
+
+    def test_launch_cross_session_warns_when_user_env_blocks_messaging(self, capsys):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch(
+                "omlx.integrations.claude.os.environ",
+                {"PATH": "/usr/bin", "DO_NOT_TRACK": "1"},
+            ),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", cross_session=True)
+            )
+
+        # The user's own opt-out is preserved, not silently overridden.
+        assert captured["env"]["DO_NOT_TRACK"] == "1"
+        output = capsys.readouterr().out
+        assert "DO_NOT_TRACK" in output
+        assert "cross-session messaging will remain unavailable" in output
 
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()

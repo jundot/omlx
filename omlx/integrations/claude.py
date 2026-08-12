@@ -11,6 +11,20 @@ from omlx.utils.install import get_cli_command_prefix
 
 CLAUDE_CODE_MIN_CONTEXT_WINDOW = 48 * 1024
 
+# Third-party opt-outs that, like CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, also
+# gate the feature-flag evaluation cross-session messaging depends on. Checked
+# rather than overridden: if the user already set one of these themselves, we
+# respect that choice instead of silently re-enabling Anthropic-bound traffic.
+_CROSS_SESSION_BLOCKING_VARS = (
+    "DISABLE_TELEMETRY",
+    "DO_NOT_TRACK",
+    "DISABLE_GROWTHBOOK",
+)
+
+
+def _env_flag_set(env: dict[str, str], name: str) -> bool:
+    return env.get(name, "").strip().lower() not in ("", "0", "false", "no")
+
 
 def claude_code_model_disabled_reason(model_info: dict) -> str | None:
     context_window = model_info.get("max_context_window")
@@ -69,10 +83,34 @@ class ClaudeCodeIntegration(Integration):
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
         # Large timeout for local model inference (model loading + generation).
         env["API_TIMEOUT_MS"] = "3000000"
-        # Non-essential traffic (telemetry, growthbook) is deliberately left
-        # enabled: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC also disables the
-        # feature-flag evaluation that cross-session messaging depends on,
-        # which would make the launched session invisible to ListAgents.
+
+        if ctx.cross_session:
+            # Cross-session messaging (ListAgents/SendMessage) needs telemetry
+            # and feature-flag traffic enabled, so
+            # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is deliberately left
+            # unset here. Unrelated Anthropic-bound services stay off via
+            # their own granular opt-outs instead.
+            env["DISABLE_AUTOUPDATER"] = "1"
+            env["DISABLE_ERROR_REPORTING"] = "1"
+            env["DISABLE_FEEDBACK_COMMAND"] = "1"
+            env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] = "1"
+
+            blocking = [
+                var for var in _CROSS_SESSION_BLOCKING_VARS if _env_flag_set(env, var)
+            ]
+            if blocking:
+                print(
+                    f"Warning: {', '.join(blocking)} is set in your environment; "
+                    "cross-session messaging will remain unavailable despite "
+                    "--cross-session. Unset it to enable messaging."
+                )
+        else:
+            # Disable telemetry and non-essential background traffic. This
+            # also disables the feature-flag evaluation that cross-session
+            # messaging (ListAgents/SendMessage) depends on, so the launched
+            # session won't be reachable from other Claude Code sessions on
+            # this machine — pass --cross-session to allow that instead.
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
         opus_model = ctx.opus_model or ctx.model
         sonnet_model = ctx.sonnet_model or ctx.model

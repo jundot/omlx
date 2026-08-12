@@ -531,6 +531,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         reasoning=model_info.get("enable_thinking"),
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
+        cross_session=getattr(args, "cross_session", False),
     )
 
     # Launch
@@ -1081,6 +1082,17 @@ Example directory structure:
         type=str,
         default=None,
         help="Claude Code Haiku tier model (Claude integration only)",
+    )
+    launch_parser.add_argument(
+        "--cross-session",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow the launched session to be reachable via Claude Code's "
+            "cross-session messaging (ListAgents/SendMessage). This requires "
+            "enabling telemetry and feature-flag traffic to Anthropic that is "
+            "otherwise kept disabled by default (Claude integration only)."
+        ),
     )
 
     # Diagnose command
