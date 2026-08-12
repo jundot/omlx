@@ -154,7 +154,13 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
-from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.thinking import (
+    ThinkingParser,
+    _CLOSE_TAG,
+    extract_thinking,
+    prompt_opens_thinking,
+    reclassify_truncated_thinking,
+)
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -3592,7 +3598,9 @@ async def create_chat_completion(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = _reclassify_truncated_thinking(
+                raw_text, output.finish_reason, engine, messages, chat_kwargs
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -4339,6 +4347,33 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _reclassify_truncated_thinking(
+    raw_text: str,
+    finish_reason: str | None,
+    engine: BaseEngine,
+    messages: list,
+    chat_kwargs: dict,
+) -> tuple[str, str]:
+    """Return (thinking_content, regular_content) for a non-streaming result.
+
+    Computes whether the prompt opened a thinking block, then defers the
+    truncated-generation reclassification to
+    ``reclassify_truncated_thinking`` (see issue #2457).
+    """
+    try:
+        prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+            engine, messages, chat_kwargs
+        )
+        start_in_thinking, _ = prompt_opens_thinking(
+            engine.tokenizer, prompt, prompt_token_ids=prompt_token_ids
+        )
+    except Exception:
+        start_in_thinking = False
+    return reclassify_truncated_thinking(
+        raw_text, finish_reason, start_in_thinking
+    )
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4461,7 +4496,10 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None
+            and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -4941,7 +4979,10 @@ async def stream_anthropic_messages(
         return
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        truncated=last_output is not None
+        and last_output.finish_reason == "length"
+    )
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5479,7 +5520,9 @@ async def create_anthropic_message(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = _reclassify_truncated_thinking(
+                raw_text, output.finish_reason, engine, messages, chat_kwargs
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -5965,7 +6008,9 @@ async def create_response(
 
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = _reclassify_truncated_thinking(
+                raw_text, output.finish_reason, engine, messages, chat_kwargs
+            )
 
             # Parse tool calls
             if output.tool_calls:
@@ -6388,7 +6433,10 @@ async def stream_responses_api(
 
     # Flush remaining content from parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None
+            and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
