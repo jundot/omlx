@@ -213,6 +213,30 @@ class TestApplyAndForward:
         )
         assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
 
+    def test_mixed_bit_projections(self, tmp_path):
+        """oQ-style mixed quantization: 4-bit gate/up over an 8-bit down
+        projection. Each projection must use its own group_size/bits/mode —
+        inheriting gate_proj's parameters breaks gather_qmm on the others."""
+        mx.random.seed(13)
+        glu = SwitchGLU(D, INTER, E)
+        glu.gate_proj = glu.gate_proj.to_quantized(group_size=32, bits=4)
+        glu.up_proj = glu.up_proj.to_quantized(group_size=32, bits=4)
+        glu.down_proj = glu.down_proj.to_quantized(group_size=32, bits=8)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        xp, ip = mx.random.normal((3, 9, D)), _ri(3, 9, K)
+        ref_d, ref_p = model(x, i), model(xp, ip)
+        mx.eval(ref_d, ref_p)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        cache = model.layers[0].experts.switch_glu.cache
+        assert cache.qparams["gate_proj"] == (32, 4, "affine")
+        assert cache.qparams["down_proj"] == (32, 8, "affine")
+        got_d, got_p = model(x, i), model(xp, ip)
+        mx.eval(got_d, got_p)
+        assert bool(mx.array_equal(ref_d, got_d))
+        assert bool(mx.array_equal(ref_p, got_p))
+
     def test_per_expert_checkpoint_layout(self, tmp_path):
         """OLMoE/Qwen2-MoE-style checkpoints store one tensor per expert
         under the GLU's parent; sanitize() stacks them at load so the
