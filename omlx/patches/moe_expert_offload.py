@@ -31,6 +31,7 @@ assertion policy).
 from __future__ import annotations
 
 import json
+import concurrent.futures
 import logging
 import os
 import re
@@ -99,6 +100,17 @@ class CheckpointExpertStore:
     def __init__(self, model_path: str | Path):
         self._specs: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
         self._mm: dict[Path, np.memmap] = {}
+        # background slab prefetch (v3): reads overlap GPU compute; the
+        # main thread consumes from _prefetch_queue at fetch time.
+        self._prefetch_off = os.environ.get("OMLX_MOE_OFFLOAD_DISABLE_READ_PREFETCH") == "1"
+        self._prefetch_queue: dict = {}
+        self._prefetch_hits = 0
+        self._pool = None
+        if not self._prefetch_off:
+            workers = int(os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH_WORKERS", "2"))
+            self._pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="omlx-expert-prefetch"
+            )
         model_path = Path(model_path)
         for shard in sorted(model_path.glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -138,6 +150,40 @@ class CheckpointExpertStore:
         out = mx.array(raw.view(np_dtype).reshape(out_shape))
         return out.view(mx_view) if mx_view is not None else out
 
+    def _read_cached(self, name: str, expert: int) -> mx.array | None:
+        """Consume a background-prefetched slab, if one is pending."""
+        if not self._prefetch_queue:
+            return None
+        key = (name, expert)
+        arr = self._prefetch_queue.pop(key, None)
+        if arr is not None:
+            self._prefetch_hits += 1
+        return arr
+
+    def prefetch(self, name: str, expert: int) -> None:
+        """Read a slab on a background thread (overlaps GPU compute).
+
+        The mmap read + numpy copy + mx.array host-side creation runs
+        off the main thread; the main thread's later ``fetch`` consumes
+        the result from the queue (the host->device transfer still
+        happens in the main thread, bandwidth-bound).
+        """
+        if not self._pool or self._prefetch_off:
+            return
+        key = (name, expert)
+        if key in self._prefetch_queue:
+            return
+        slab = int(np.prod(self._specs[name][2][1:]))
+        self._prefetch_queue[key] = None  # placeholder: no duplicate submits
+        self._pool.submit(self._prefetch_work, name, expert, slab)
+
+    def _prefetch_work(self, name: str, expert: int, slab: int) -> None:
+        try:
+            arr = self._read(name, expert * slab, slab, self._specs[name][2][1:])
+            self._prefetch_queue[(name, expert)] = arr
+        except Exception:
+            self._prefetch_queue.pop((name, expert), None)
+
     def fetch_range(self, name: str, lo: int, hi: int) -> mx.array:
         """Contiguous span ``[lo, hi)`` of a stacked tensor, one read."""
         _, _, shape, _ = self._specs[name]
@@ -146,6 +192,9 @@ class CheckpointExpertStore:
 
     def fetch_expert(self, name: str, expert: int) -> mx.array:
         """One expert's slab of a stacked ``[num_experts, ...]`` tensor."""
+        cached = self._read_cached(name, expert)
+        if cached is not None:
+            return cached
         _, _, shape, _ = self._specs[name]
         slab = int(np.prod(shape[1:]))
         return self._read(name, expert * slab, slab, shape[1:])
@@ -180,6 +229,14 @@ class _GLUStoreView:
 
     def has(self, proj: str, field: str) -> bool:
         return self._store.has(self._name(proj, field, 0))
+
+    def prefetch(self, proj: str, field: str, expert: int) -> None:
+        """Background-read one slab (overlaps GPU compute)."""
+        self._store.prefetch(self._name(proj, field, 0), expert)
+
+    def fetch_cached(self, proj: str, field: str, expert: int) -> mx.array | None:
+        """Consume a background-prefetched slab, if present."""
+        return self._store._read_cached(self._name(proj, field, 0), expert)
 
     def fetch_range(self, proj: str, field: str, lo: int, hi: int) -> mx.array:
         """Contiguous span ``[lo, hi)`` of one field's stacked tensor."""
@@ -240,6 +297,7 @@ class ExpertCache:
         self.warm = False
         self.usage = np.zeros(self.n_experts, dtype=np.int64)  # routing heat
         self.pinned: set = set()  # learned hot set, never evicted
+        self._prefetching: set = set()  # dedupe for background reads
 
     def _install(self, e: int) -> int:
         if self.free:
@@ -307,33 +365,70 @@ class ExpertCache:
                 cur = [b]
         clusters.append(cur)
         slot_arr = mx.array(slots)
-        for name in self.projs:
-            rw, rs, rb = self.resident[name]
-            w_parts, s_parts, b_parts = [], [], []
-            for cl in clusters:
-                w_parts.append(
-                    mx.take(
-                        self.disk.fetch_range(name, "weight", cl[0], cl[-1] + 1),
-                        mx.array([e - cl[0] for e in cl]), axis=0,
-                    )
-                )
-                s_parts.append(
-                    mx.take(
-                        self.disk.fetch_range(name, "scales", cl[0], cl[-1] + 1),
-                        mx.array([e - cl[0] for e in cl]), axis=0,
-                    )
-                )
-                if rb is not None and self.disk.has(name, "biases"):
-                    b_parts.append(
+        use_b = self.resident[self.projs[0]][2] is not None
+        # consume background-prefetched slabs first (order = missing order);
+        # the rest go through clustered range reads. Parts are per-projection
+        # so each resident tensor gets one indexed write.
+        parts: dict[str, dict[str, list]] = {
+            name: {"w": [], "s": [], "b": []} for name in self.projs
+        }
+        uncached = []
+        for e in missing:
+            got = {}
+            ready = True
+            for name in self.projs:
+                w = self.disk.fetch_cached(name, "weight", e)
+                s = self.disk.fetch_cached(name, "scales", e)
+                b = self.disk.fetch_cached(name, "biases", e) if use_b else None
+                if w is None or s is None or (use_b and b is None):
+                    ready = False
+                    break
+                got[name] = (w, s, b)
+            if ready:
+                for name in self.projs:
+                    w, s, b = got[name]
+                    parts[name]["w"].append(w)
+                    parts[name]["s"].append(s)
+                    parts[name]["b"].append(b)
+            else:
+                uncached.append(e)
+        if uncached:
+            clusters = []
+            cur = [uncached[0]]
+            for a, bb in zip(uncached, uncached[1:]):
+                if bb - a <= 8:
+                    cur.append(bb)
+                else:
+                    clusters.append(cur)
+                    cur = [bb]
+            clusters.append(cur)
+            for name in self.projs:
+                for cl in clusters:
+                    parts[name]["w"].append(
                         mx.take(
-                            self.disk.fetch_range(name, "biases", cl[0], cl[-1] + 1),
+                            self.disk.fetch_range(name, "weight", cl[0], cl[-1] + 1),
                             mx.array([e - cl[0] for e in cl]), axis=0,
                         )
                     )
-            rw[slot_arr] = mx.concatenate(w_parts, axis=0)
-            rs[slot_arr] = mx.concatenate(s_parts, axis=0)
-            if b_parts:
-                rb[slot_arr] = mx.concatenate(b_parts, axis=0)
+                    parts[name]["s"].append(
+                        mx.take(
+                            self.disk.fetch_range(name, "scales", cl[0], cl[-1] + 1),
+                            mx.array([e - cl[0] for e in cl]), axis=0,
+                        )
+                    )
+                    if use_b:
+                        parts[name]["b"].append(
+                            mx.take(
+                                self.disk.fetch_range(name, "biases", cl[0], cl[-1] + 1),
+                                mx.array([e - cl[0] for e in cl]), axis=0,
+                            )
+                        )
+        for name in self.projs:
+            rw, rs, rb = self.resident[name]
+            rw[slot_arr] = mx.concatenate(parts[name]["w"], axis=0)
+            rs[slot_arr] = mx.concatenate(parts[name]["s"], axis=0)
+            if use_b:
+                rb[slot_arr] = mx.concatenate(parts[name]["b"], axis=0)
         for e, s in zip(missing, slots):
             self.slot_of[e] = s
             self.map[e] = s
@@ -394,6 +489,28 @@ class ExpertCache:
                     self._install(e)
             else:
                 self._install_many(missing)
+
+    def prefetch_next(self, experts: set) -> None:
+        """Submit background reads for next-step candidates (prev-step
+        routing, temporal locality). Non-resident experts only; deduped
+        with a bounded seen-set."""
+        pool = getattr(self.disk._store, "_pool", None)
+        if pool is None:
+            return
+        for e in experts:
+            if e in self.slot_of:
+                continue
+            key = ("next", e)
+            if key in self._prefetching:
+                continue
+            if len(self._prefetching) > 2048:
+                self._prefetching.clear()
+            self._prefetching.add(key)
+            for name in self.projs:
+                self.disk.prefetch(name, "weight", e)
+                self.disk.prefetch(name, "scales", e)
+                if self.resident[name][2] is not None:
+                    self.disk.prefetch(name, "biases", e)
 
     def pin_hot(self, n: int) -> None:
         """Pin the ``n`` most-routed experts (learned hot set).
@@ -653,6 +770,7 @@ class OffloadSwitchGLU(nn.Module):
         # prefill's wide working set makes prev-step data meaningless).
         if n_tok == 1 and self._prefetch and self._prev is not None:
             c.ensure_host(self._prev)
+            c.prefetch_next(self._prev)  # background reads for next step
         if n_tok * k <= c.capacity or n_tok == 1:
             return self._forward(x, indices)
         distinct = len(set(int(e) for e in flat_i.reshape(-1).tolist()))
