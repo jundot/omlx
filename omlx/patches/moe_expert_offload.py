@@ -645,8 +645,14 @@ class ExpertCache:
             return glm_fast.deepseek_mxfp4_gather_qmm_blocks(
                 x, rw, rs, block_meta, block_count, block_variant
             )
+        g, b, _ = self.qparams[name]  # per-projection metadata (mixed-bit safe)
+        # the block-list kernels require scales/biases to match the input
+        # dtype; the stock path handles bf16 activations over f16 metadata
+        # with the use_f16_moe cast — mirror it here.
+        if x.dtype != rs.dtype:
+            x = x.astype(rs.dtype)
         return glm_fast.deepseek_affine_gather_qmm_blocks(
-            x, rw, rs, rb, block_meta, block_count, self.group, self.bits,
+            x, rw, rs, rb, block_meta, block_count, g, b,
             block_variant,
         )
 
