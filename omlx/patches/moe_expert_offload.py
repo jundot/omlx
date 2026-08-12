@@ -190,9 +190,17 @@ class ExpertCache:
                     else mx.zeros((self.capacity,) + b.shape[1:], dtype=b.dtype)
                 ),
             ]
-        self.group = glu.gate_proj.group_size
-        self.bits = glu.gate_proj.bits
-        self.mode = glu.gate_proj.mode
+        # Per-projection quantization metadata: mixed-bit checkpoints (e.g.
+        # oQ profiles with 8-bit down_proj over 4-bit gate/up) are valid and
+        # must not inherit gate_proj's parameters.
+        self.qparams = {
+            name: (
+                getattr(glu, name).group_size,
+                getattr(glu, name).bits,
+                getattr(glu, name).mode,
+            )
+            for name in self.projs
+        }
         self.slot_of: dict[int, int] = {}  # expert id -> slot, LRU ordered
         self.free = list(range(self.capacity))
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
@@ -249,6 +257,7 @@ class ExpertCache:
         # stock SwitchGLU's sort decision so the kernel choice — and with it
         # the numerics — matches the path the resident model would take.
         rw, rs, rb = self.resident[name]
+        group_size, bits, mode = self.qparams[name]
         return mx.gather_qmm(
             x,
             rw,
@@ -256,9 +265,9 @@ class ExpertCache:
             rb,
             rhs_indices=slots,
             transpose=True,
-            group_size=self.group,
-            bits=self.bits,
-            mode=self.mode,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
             sorted_indices=sorted_indices,
         )
 
