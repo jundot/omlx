@@ -153,13 +153,18 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0):
+def _call(ns, requested, kv_len=0, processed_tokens=0):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
     ):
         return Scheduler._adaptive_chunk_size(
-            ns, requested, request_id="r", loop_label="test", kv_len=kv_len
+            ns,
+            requested,
+            request_id="r",
+            loop_label="test",
+            kv_len=kv_len,
+            processed_tokens=processed_tokens,
         )
 
 
@@ -178,13 +183,14 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
     )
 
     with pytest.raises(_PrefillEvictionNeeded) as exc:
-        _call(ns, 2048)
+        _call(ns, 2048, processed_tokens=64)
 
     assert request.prefill_eviction_retries == 1
     assert exc.value.request.request_id == "r"
     assert exc.value.request.model_id == "model-b"
     assert exc.value.request.requested_tokens == 2048
     assert exc.value.request.reason == "adaptive_prefill_throttle"
+    assert exc.value.request.processed_tokens == 64
 
     # The same request does not loop on eviction; it falls back to throttling.
     result = _call(ns, 2048)
@@ -390,13 +396,14 @@ def test_guard_requests_eviction_before_capacity_rejection():
                 ns,
                 256,
                 kv_len=122_000,
-                progress=0,
+                progress=128,
                 loop_label="test",
                 request_id="r",
             )
 
     assert request.prefill_eviction_retries == 1
     assert exc.value.request.reason == "prefill_safety_cap"
+    assert exc.value.request.processed_tokens == 128
 
 
 def test_guard_custom_margin_allows_95_percent_of_ceiling():

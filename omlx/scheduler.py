@@ -4127,6 +4127,7 @@ class Scheduler:
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
                 prefill_context=prefill_context,
+                processed_tokens=processed_tokens,
             )
 
             # Pre-chunk safety guard: NEVER submit a chunk whose predicted peak
@@ -4754,6 +4755,7 @@ class Scheduler:
                 loop_label=loop_label,
                 kv_len=kv_len,
                 prefill_context=prefill_context,
+                processed_tokens=progress,
             )
             return self._guard_prefill_chunk(
                 resized,
@@ -4777,6 +4779,7 @@ class Scheduler:
                 loop_label=loop_label,
                 kv_len=kv_len,
                 prefill_context=prefill_context,
+                processed_tokens=progress,
                 defer_mid_prefill_conversion=False,
             )
             if resized < n_tokens:
@@ -4809,6 +4812,7 @@ class Scheduler:
                     predicted_transient=int(min_transient),
                     requested_tokens=min_chunk,
                     reason="prefill_safety_cap",
+                    processed_tokens=progress,
                 )
             logger.warning(
                 "[guard:%s] context too large at progress=%d kv_len=%d: "
@@ -4911,6 +4915,7 @@ class Scheduler:
         kv_len: int = 0,
         prefill_context: _PrefillContext | None = None,
         defer_mid_prefill_conversion: bool = True,
+        processed_tokens: int = 0,
     ) -> int:
         """Size the next prefill chunk so its predicted peak stays under a
         safety margin below the hard cap.
@@ -5015,6 +5020,7 @@ class Scheduler:
                     predicted_transient=int(per_token * requested),
                     requested_tokens=requested,
                     reason="adaptive_prefill_throttle",
+                    processed_tokens=processed_tokens,
                 )
             conversion_available = getattr(
                 self,
@@ -5892,6 +5898,7 @@ class Scheduler:
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
             prefill_context=state.prefill_context,
+            processed_tokens=state.tokens_processed,
         )
 
         # Pre-chunk safety guard (mirrors the external loop): never submit a
