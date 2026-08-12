@@ -14,13 +14,14 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import validate_image_data_uri
+from .base_model import last_token_pool, mean_pooling, normalize_embeddings
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
@@ -94,37 +95,106 @@ class MLXEmbeddingModel:
         self._compiled_embed = None
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
+        self._pooling_source: str = "not resolved"
 
-    def _detect_pooling_mode(self) -> Optional[str]:
-        """Read the pooling mode the checkpoint declares, if any.
+    # Fallbacks for MLX conversions that dropped the sentence-transformers
+    # metadata. Reviewed against the concrete checkpoints on the Hub: none of
+    # the MLX BGE-M3 / Qwen3-Embedding / Qwen3-VL-Embedding repos ship
+    # ``1_Pooling/config.json``, so detection alone never fires for exactly the
+    # models this fix is meant to serve.
+    _FAMILY_POOLING = (
+        ("qwen3-vl-embedding", "lasttoken"),
+        ("qwen3-embedding", "lasttoken"),
+        ("bge-m3", "cls"),
+    )
 
-        sentence-transformers exports describe their pipeline in ``modules.json``
-        and store the pooling configuration in ``1_Pooling/config.json``. Reading
-        it lets us honour what the checkpoint asks for instead of guessing from
-        the model family, which does not scale (see #1817, #2350).
+    def _pooling_config_path(self, model_path: Path) -> Optional[Path]:
+        """Locate the Pooling module through ``modules.json``.
 
-        Returns ``"cls"``, ``"mean"``, ``"lasttoken"`` or ``None`` when the
-        checkpoint says nothing — in which case the existing behaviour applies.
+        sentence-transformers describes its pipeline there; the Pooling module
+        carries its own directory in ``path`` (usually ``1_Pooling``, but not
+        always). Hardcoding ``1_Pooling`` misses non-standard exports, and some
+        MLX repos keep the ``modules.json`` entry while dropping the directory
+        itself -- so the path is also checked for existence.
         """
-        try:
-            cfg_path = Path(self.model_name) / "1_Pooling" / "config.json"
-            if not cfg_path.is_file():
-                return None
-            with open(cfg_path) as fh:
-                cfg = json.load(fh)
-        except (OSError, ValueError) as e:
-            logger.debug(f"Could not read pooling config for {self.model_name}: {e}")
-            return None
+        modules_path = model_path / "modules.json"
+        if modules_path.is_file():
+            try:
+                with open(modules_path) as fh:
+                    modules = json.load(fh)
+                for module in modules if isinstance(modules, list) else []:
+                    if "Pooling" in str(module.get("type", "")):
+                        candidate = model_path / str(module.get("path", ""))
+                        cfg = candidate / "config.json"
+                        if cfg.is_file():
+                            return cfg
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not read modules.json for {self.model_name}: {e}")
+        # Fall back to the conventional location for exports without modules.json.
+        conventional = model_path / "1_Pooling" / "config.json"
+        return conventional if conventional.is_file() else None
 
+    @staticmethod
+    def _pooling_mode_from_config(cfg: Dict[str, Any]) -> Optional[str]:
+        """Read either config dialect.
+
+        Recent sentence-transformers releases write a single
+        ``{"pooling_mode": "lasttoken"}`` string; older ones set one boolean per
+        mode. Qwen3-VL-Embedding uses the newer form, so a boolean-only parser
+        silently ignores a pooling config that is actually present.
+        """
+        declared = cfg.get("pooling_mode")
+        if isinstance(declared, str):
+            alias = {
+                "cls": "cls",
+                "mean": "mean",
+                "lasttoken": "lasttoken",
+                "last_token": "lasttoken",
+            }
+            mode = alias.get(declared.strip().lower())
+            if mode:
+                return mode
         for key, mode in (
             ("pooling_mode_cls_token", "cls"),
             ("pooling_mode_lasttoken", "lasttoken"),
             ("pooling_mode_mean_tokens", "mean"),
         ):
             if cfg.get(key):
-                logger.info(f"Pooling mode declared by checkpoint: {mode}")
                 return mode
         return None
+
+    def _resolve_pooling_mode(self) -> Tuple[Optional[str], str]:
+        """Resolve the pooling mode and report where it came from.
+
+        Returns ``(mode, source)``. ``source`` is logged at load time so an
+        operator can tell a declared mode from an inferred one without reading
+        the code -- silent pooling changes are exactly what makes retrieval
+        quality drift unnoticed.
+        """
+        model_path = Path(self.model_name)
+        cfg_path = self._pooling_config_path(model_path)
+        if cfg_path is not None:
+            try:
+                with open(cfg_path) as fh:
+                    cfg = json.load(fh)
+                mode = self._pooling_mode_from_config(cfg)
+                if mode:
+                    return mode, str(cfg_path.relative_to(model_path))
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not read pooling config for {self.model_name}: {e}")
+
+        haystack = str(self.model_name).lower()
+        config_path = model_path / "config.json"
+        if config_path.is_file():
+            try:
+                with open(config_path) as fh:
+                    haystack += " " + str(json.load(fh).get("_name_or_path", "")).lower()
+            except (OSError, ValueError):
+                pass
+        for needle, mode in self._FAMILY_POOLING:
+            if needle in haystack:
+                return mode, f"known family ({needle})"
+        return None, "not declared"
 
     def _load_native(self) -> bool:
         """
@@ -233,7 +303,12 @@ class MLXEmbeddingModel:
         if self._loaded:
             return
 
-        self._pooling_mode = self._detect_pooling_mode()
+        self._pooling_mode, self._pooling_source = self._resolve_pooling_mode()
+        if self._pooling_mode:
+            logger.info(
+                f"Embedding pooling for {self.model_name}: "
+                f"{self._pooling_mode} (source: {self._pooling_source})"
+            )
 
         # 1. Try native loading first (xlm_roberta, bert)
         if self._load_native():
@@ -282,20 +357,30 @@ class MLXEmbeddingModel:
             logger.error(f"Failed to load embedding model: {e}")
             raise
 
-    def _extract_embeddings_array(self, outputs):
+    def _extract_embeddings_array(self, outputs, attention_mask=None):
         """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
         # Honour the checkpoint's own declaration first. Some MLX conversions of
         # sentence-transformers models expose a mean-pooled ``text_embeds`` while
         # the checkpoint was trained for CLS pooling (e.g. BGE-M3), which silently
         # degrades retrieval instead of failing. Mode is resolved once at load().
+        #
+        # Pooling goes through the existing mask-aware helpers: a bare
+        # ``[:, -1]`` is only correct under left padding and an unmasked
+        # ``mean(axis=1)`` averages pad tokens in, both of which corrupt vectors
+        # in mixed-length batches while single inputs still look fine. The
+        # result is L2-normalized like every other path out of this method.
         last_hidden = getattr(outputs, "last_hidden_state", None)
         if self._pooling_mode and last_hidden is not None and last_hidden.ndim == 3:
             if self._pooling_mode == "cls":
-                return last_hidden[:, 0, :]
+                return normalize_embeddings(last_hidden[:, 0, :])
             if self._pooling_mode == "lasttoken":
-                return last_hidden[:, -1, :]
-            if self._pooling_mode == "mean":
-                return mx.mean(last_hidden, axis=1)
+                return normalize_embeddings(
+                    last_token_pool(last_hidden, attention_mask)
+                )
+            if self._pooling_mode == "mean" and attention_mask is not None:
+                return normalize_embeddings(
+                    mean_pooling(last_hidden, attention_mask)
+                )
 
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
             embeddings = outputs.text_embeds
@@ -542,7 +627,10 @@ class MLXEmbeddingModel:
         try:
             def _compiled_embed(inputs):
                 outputs = base_model(**self._adapt_model_inputs_for_call(inputs))
-                return self._extract_embeddings_array(outputs)
+                # The mask travels with the request; mask-aware pooling needs it.
+                return self._extract_embeddings_array(
+                    outputs, inputs.get("attention_mask")
+                )
 
             self._compiled_embed = mx.compile(_compiled_embed)
 
@@ -678,7 +766,9 @@ class MLXEmbeddingModel:
                 attention_mask = mx.array(masks)
 
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings_array = self._extract_embeddings_array(outputs)
+            embeddings_array = self._extract_embeddings_array(
+                outputs, attention_mask
+            )
             total_tokens = self._count_prepared_tokens(
                 {"attention_mask": attention_mask, "input_ids": input_ids}
             )

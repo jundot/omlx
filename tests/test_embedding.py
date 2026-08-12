@@ -5,7 +5,6 @@ import asyncio
 import base64
 import json
 import math
-import mlx.core as mx
 import numpy as np
 import struct
 import tempfile
@@ -1825,58 +1824,129 @@ class TestNativeQwen2Embedding:
 
 
 class TestDeclaredPoolingMode:
-    """Pooling mode declared by sentence-transformers checkpoints (#1817, #2350)."""
+    """Pooling mode declared by sentence-transformers checkpoints (#1817, #2350).
+
+    Reviewed on real Hub checkpoints: the MLX conversions of BGE-M3,
+    Qwen3-Embedding and Qwen3-VL-Embedding do **not** ship
+    ``1_Pooling/config.json``, so detection alone never fires for the very
+    models this fix targets. Hence the modules.json lookup, both config
+    dialects, and the known-family fallback are each covered here.
+    """
 
     @staticmethod
-    def _model(tmp_path, pooling_config=None):
+    def _model(tmp_path, pooling_config=None, pool_dir_name="1_Pooling",
+               modules=None, name_or_path=None):
+        import json
+        from pathlib import Path
+
         from omlx.models.embedding import MLXEmbeddingModel
 
+        root = Path(tmp_path)
         if pooling_config is not None:
-            pool_dir = Path(tmp_path) / "1_Pooling"
-            pool_dir.mkdir(parents=True, exist_ok=True)
-            (pool_dir / "config.json").write_text(json.dumps(pooling_config))
-        return MLXEmbeddingModel(str(tmp_path))
+            d = root / pool_dir_name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text(json.dumps(pooling_config))
+        if modules is not None:
+            (root / "modules.json").write_text(json.dumps(modules))
+        if name_or_path is not None:
+            (root / "config.json").write_text(json.dumps({"_name_or_path": name_or_path}))
+        return MLXEmbeddingModel(str(root))
 
     @staticmethod
-    def _outputs():
-        """Distinct rows so each pooling mode yields a different vector."""
-        hidden = mx.array([[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]])   # (1, 3, 2)
+    def _outputs(hidden):
+        from types import SimpleNamespace
+
         return SimpleNamespace(
             last_hidden_state=hidden,
-            text_embeds=mx.array([[9.0, 9.0]]),      # sentinel: must not be used
+            # Sentinel: if pooling is honoured, this pre-pooled tensor is unused.
+            text_embeds=mx.array([[9.0] * hidden.shape[-1]] * hidden.shape[0]),
             pooler_output=None,
         )
 
-    def test_cls_pooling_is_honoured(self, tmp_path):
-        m = self._model(tmp_path, {"pooling_mode_cls_token": True})
-        m._pooling_mode = m._detect_pooling_mode()
-        assert m._pooling_mode == "cls"
-        assert np.allclose(np.array(m._extract_embeddings_array(self._outputs())), [[1.0, 0.0]])
-
-    def test_lasttoken_pooling_is_honoured(self, tmp_path):
-        m = self._model(tmp_path, {"pooling_mode_lasttoken": True})
-        m._pooling_mode = m._detect_pooling_mode()
-        assert np.allclose(np.array(m._extract_embeddings_array(self._outputs())), [[1.0, 1.0]])
-
-    def test_mean_pooling_is_honoured(self, tmp_path):
-        m = self._model(tmp_path, {"pooling_mode_mean_tokens": True})
-        m._pooling_mode = m._detect_pooling_mode()
-        assert np.allclose(
-            np.array(m._extract_embeddings_array(self._outputs())), [[2 / 3, 2 / 3]]
+    # ── resolution ────────────────────────────────────────────────────────
+    def test_modules_json_locates_a_non_standard_pooling_dir(self, tmp_path):
+        m = self._model(
+            tmp_path,
+            pooling_config={"pooling_mode_cls_token": True},
+            pool_dir_name="2_Pooling",
+            modules=[{"idx": 1, "type": "sentence_transformers.models.Pooling",
+                      "path": "2_Pooling"}],
         )
+        mode, source = m._resolve_pooling_mode()
+        assert mode == "cls"
+        assert "2_Pooling" in source
 
-    def test_no_declaration_keeps_current_behaviour(self, tmp_path):
-        """No 1_Pooling directory: text_embeds still wins, exactly as before."""
-        m = self._model(tmp_path)
-        m._pooling_mode = m._detect_pooling_mode()
-        assert m._pooling_mode is None
-        assert np.allclose(np.array(m._extract_embeddings_array(self._outputs())), [[9.0, 9.0]])
+    def test_pooling_mode_string_dialect(self, tmp_path):
+        """Qwen3-VL uses {"pooling_mode": "lasttoken"} — a boolean-only parser misses it."""
+        m = self._model(tmp_path, {"pooling_mode": "lasttoken"})
+        assert m._resolve_pooling_mode()[0] == "lasttoken"
 
-    def test_malformed_config_is_ignored(self, tmp_path):
-        """A broken config must not break loading — fall back, never raise."""
-        pool_dir = Path(tmp_path) / "1_Pooling"
-        pool_dir.mkdir(parents=True, exist_ok=True)
-        (pool_dir / "config.json").write_text("{not json")
+    def test_legacy_boolean_dialect(self, tmp_path):
+        m = self._model(tmp_path, {"pooling_mode_mean_tokens": True})
+        assert m._resolve_pooling_mode()[0] == "mean"
+
+    def test_missing_pooling_dir_falls_back_to_family(self, tmp_path):
+        """MLX BGE-M3 keeps the modules.json entry but drops the directory."""
+        d = tmp_path / "bge-m3-mlx-fp16"
+        d.mkdir()
+        m = self._model(
+            d, modules=[{"idx": 1, "type": "sentence_transformers.models.Pooling",
+                         "path": "1_Pooling"}])
+        mode, source = m._resolve_pooling_mode()
+        assert mode == "cls"
+        assert "known family" in source
+
+    def test_family_fallback_reads_config_name(self, tmp_path):
+        m = self._model(tmp_path, name_or_path="Qwen/Qwen3-Embedding-0.6B")
+        assert m._resolve_pooling_mode()[0] == "lasttoken"
+
+    def test_unknown_model_declares_nothing(self, tmp_path):
+        mode, source = self._model(tmp_path)._resolve_pooling_mode()
+        assert mode is None and source == "not declared"
+
+    def test_malformed_config_does_not_raise(self, tmp_path):
+        (tmp_path / "1_Pooling").mkdir()
+        (tmp_path / "1_Pooling" / "config.json").write_text("{ not json")
         from omlx.models.embedding import MLXEmbeddingModel
 
-        assert MLXEmbeddingModel(str(tmp_path))._detect_pooling_mode() is None
+        assert MLXEmbeddingModel(str(tmp_path))._resolve_pooling_mode()[0] is None
+
+    # ── pooling itself ────────────────────────────────────────────────────
+    def test_cls_is_normalized(self, tmp_path):
+        m = self._model(tmp_path, {"pooling_mode_cls_token": True})
+        m._pooling_mode, m._pooling_source = m._resolve_pooling_mode()
+        hidden = mx.array([[[3.0, 4.0], [0.0, 1.0]]])
+        out = np.array(m._extract_embeddings_array(
+            self._outputs(hidden), mx.ones((1, 2), dtype=mx.int32)))
+        # CLS row is (3, 4); L2-normalized it is (0.6, 0.8) — not the raw row,
+        # and not the text_embeds sentinel.
+        assert np.allclose(out, [[0.6, 0.8]])
+
+    def test_mixed_length_batch_matches_single_inputs(self, tmp_path):
+        """The regression that unmasked pooling hides: single inputs look fine.
+
+        Batched with padding, an unmasked mean averages the pad rows in and a
+        bare ``[:, -1]`` reads a pad token. Both must equal the single-input
+        result.
+        """
+        for declared, mode in (({"pooling_mode_mean_tokens": True}, "mean"),
+                               ({"pooling_mode": "lasttoken"}, "lasttoken")):
+            m = self._model(tmp_path / mode, declared)
+            m._pooling_mode, m._pooling_source = m._resolve_pooling_mode()
+            assert m._pooling_mode == mode
+
+            # Sequence A has 2 real tokens, B has 3. A is right-padded with a
+            # deliberately extreme row so any leak is visible.
+            a = [[1.0, 0.0], [0.0, 2.0], [99.0, 99.0]]
+            b = [[1.0, 1.0], [2.0, 0.0], [0.0, 3.0]]
+            batch = mx.array([a, b])
+            mask = mx.array([[1, 1, 0], [1, 1, 1]], dtype=mx.int32)
+            batched = np.array(m._extract_embeddings_array(self._outputs(batch), mask))
+
+            alone = []
+            for rows, keep in ((a, 2), (b, 3)):
+                single = mx.array([rows[:keep]])
+                alone.append(np.array(m._extract_embeddings_array(
+                    self._outputs(single),
+                    mx.ones((1, keep), dtype=mx.int32)))[0])
+            assert np.allclose(batched, np.stack(alone), atol=1e-5), mode
