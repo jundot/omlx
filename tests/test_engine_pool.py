@@ -410,6 +410,41 @@ class TestTurboQuantProcessClaim:
         assert entry.load_failure_at is None
 
     @pytest.mark.asyncio
+    async def test_claim_cancellation_stops_and_unpublishes_engine(
+        self, small_mock_model_dir: Path
+    ) -> None:
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+
+        process_owner = MagicMock()
+        process_owner.close = MagicMock()
+        scheduler = MagicMock(
+            _turboquant_mid_prefill=True,
+            _metal_process_owner=process_owner,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        pool._resolve_scheduler_from_engine = MagicMock(return_value=scheduler)
+        pool._claim_turboquant_mid_prefill_process = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await pool._load_engine("model-a")
+
+        mock_engine.stop.assert_awaited_once()
+        process_owner.close.assert_called_once_with()
+        assert entry.engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
     async def test_claim_rejects_loaded_embedding_engine(
         self,
         small_mock_model_dir: Path,
