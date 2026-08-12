@@ -480,7 +480,7 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
         estimate_chunk_transient_bytes=lambda _n, _kv: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
-        estimate_prompt_kv_bytes=lambda _n: 0,
+        estimate_prompt_kv_bytes=lambda _n, *, dtype_size=None: 0,
     )
     ns = _throttle_ctx(
         current=97.23 * _GB,
@@ -526,7 +526,7 @@ def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
         estimate_chunk_transient_bytes=lambda _n, _kv: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
-        estimate_prompt_kv_bytes=lambda _n: 0,
+        estimate_prompt_kv_bytes=lambda _n, *, dtype_size=None: 0,
     )
     ns = _throttle_ctx(
         current=99.12 * _GB,

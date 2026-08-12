@@ -2148,6 +2148,43 @@ def test_phase_widths_and_transient_histories_remain_separate() -> None:
     assert scheduler._prefill_tq_transient_tracker.last_delta_bytes == 200
 
 
+def test_reclaim_ledger_is_shared_across_dense_and_turboquant_phases() -> None:
+    scheduler = _make_scheduler()
+    scheduler._prefill_min_chunk_tokens = 1
+    released = 300
+    scheduler._record_chunk_transient(
+        1,
+        1_000,
+        1_000 - released,
+        request_id="dense-release",
+        loop_label="unit",
+        phase=_PrefillKVPhase.DENSE,
+    )
+
+    assert scheduler._prefill_transient_tracker.recent_reclaim_bytes == released
+    assert scheduler._prefill_tq_transient_tracker.recent_reclaim_bytes == 0
+    assert (
+        scheduler._predicted_chunk_transient(
+            1,
+            1,
+            phase=_PrefillKVPhase.TURBOQUANT,
+        )
+        >= released
+    )
+
+    scheduler._record_chunk_transient(
+        1,
+        1_000 - released,
+        1_001,
+        request_id="tq-growth",
+        loop_label="unit",
+        phase=_PrefillKVPhase.TURBOQUANT,
+    )
+
+    assert scheduler._prefill_transient_tracker.recent_reclaim_bytes == 0
+    assert scheduler._prefill_tq_transient_tracker.recent_reclaim_bytes == 0
+
+
 def test_first_qwen_q8_suffix_uses_structural_workspace_bound() -> None:
     workspace = estimate_turboquant_prefill_attention_workspace_bytes(
         query_tokens=2048,

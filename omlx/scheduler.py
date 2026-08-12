@@ -4406,7 +4406,10 @@ class Scheduler:
             return 0.0
         per_token = 0.0
         static_per_token = 0.0
-        recent_reclaim = 0
+        # Reclaim tracks the process-wide MLX buffer pool, not one KV phase.
+        # The dense tracker remains its single owner; dense/TurboQuant EWMA,
+        # last-sample, and observed-max histories stay phase-local.
+        recent_reclaim = self._prefill_transient_tracker.recent_reclaim_bytes
         tracker_selector = getattr(
             self,
             "_prefill_transient_tracker_for_phase",
@@ -4425,7 +4428,6 @@ class Scheduler:
                 )
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
-            recent_reclaim = tracker.recent_reclaim_bytes
         if self.memory_monitor is not None:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens
