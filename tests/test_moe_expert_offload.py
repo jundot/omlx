@@ -331,6 +331,31 @@ class TestApplyAndForward:
         p.write_bytes(_struct.pack("<Q", len(new_header)) + new_header + raw[8 + n :])
         assert apply_moe_expert_offload(_MiniMoE(glus), tmp_path, 0.25) == 0
 
+    def test_vlm_class_name_matching(self, tmp_path):
+        """mlx-vlm ships its own SwitchGLU class: discovery must match by
+        name/contract, not identity, or the default VLM-served path (Gemma 4)
+        silently never offloads. Simulated with a distinct class object that
+        carries the same name."""
+        base = _make_glu(seed=7)
+        real = type(base)
+        ns = {
+            k: v for k, v in vars(real).items() if k not in ("__dict__", "__weakref__")
+        }
+        VlmSwitchGLU = type("SwitchGLU", (nn.Module,), ns)
+        glu = VlmSwitchGLU.__new__(VlmSwitchGLU)
+        glu.__dict__.update(base.__dict__)
+        dict.update(glu, base)
+        assert not isinstance(glu, real) and type(glu).__name__ == "SwitchGLU"
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
+        ref = model(x, i)
+        mx.eval(ref)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        got = model(x, i)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+
     def test_kill_switch(self, tmp_path, monkeypatch):
         model, _ = self._wrapped_model(tmp_path)
         monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")

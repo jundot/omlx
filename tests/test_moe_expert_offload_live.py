@@ -124,3 +124,41 @@ def test_offloaded_generation_matches_resident():
         f"only {identical}/{len(PROMPTS)} generations identical to resident — "
         "beyond rounding-fork territory"
     )
+
+
+def test_vlm_dispatch_gemma4():
+    """Gemma 4 checkpoints default to the VLM engine, which loads through
+    mlx-vlm's OWN model classes — including its own SwitchGLU definition, a
+    different class object from mlx-lm's. Load through that exact path and
+    require discovery to wrap the MoE layers (type-identity matching wraps
+    zero here) and the wrapped forward to produce finite logits with real
+    cache traffic."""
+    pytest.importorskip("mlx_vlm")
+    from mlx_vlm.utils import load as vlm_load
+
+    from omlx.patches.moe_expert_offload import (
+        apply_moe_expert_offload,
+        moe_offload_stats,
+    )
+    from omlx.utils.model_loading import materialize_lazy_state
+
+    model, processor = vlm_load(MODEL_REPO, lazy=True)
+    wrapped = apply_moe_expert_offload(model, MODEL_REPO, RESIDENT_FRACTION)
+    assert wrapped > 0, (
+        "no SwitchGLU wrapped through the mlx-vlm load path — "
+        "VLM dispatch regression (class-name matching)"
+    )
+    materialize_lazy_state(model)
+
+    tok = getattr(processor, "tokenizer", processor)
+    ids = tok("The capital of France is")["input_ids"]
+    lm = getattr(model, "language_model", model)
+    out = lm(mx.array([ids]))
+    logits = getattr(out, "logits", out)
+    mx.eval(logits)
+    assert bool(mx.isfinite(logits).all())
+
+    stats = moe_offload_stats(model)
+    assert stats["layers"] == wrapped
+    assert stats["hits"] + stats["misses"] > 0, "offloaded experts never ran"
+    _teardown(model, processor)
