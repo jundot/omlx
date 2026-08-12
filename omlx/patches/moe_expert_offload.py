@@ -61,15 +61,6 @@ except Exception:  # pragma: no cover
     Ds4QuantizedSwitchLinear = ()
     Ds4SwitchGLU = ()
 
-_SWITCH_GLU_CLASSES = tuple(
-    cls for cls in (SwitchGLU, Ds4SwitchGLU) if isinstance(cls, type)
-)
-_QSL_CLASSES = tuple(
-    cls
-    for cls in (QuantizedSwitchLinear, Ds4QuantizedSwitchLinear)
-    if isinstance(cls, type)
-)
-
 from ..scheduler import _sync_and_clear_cache
 
 logger = logging.getLogger(__name__)
@@ -505,9 +496,9 @@ class ExpertCache:
         ):
             return "affine"
         if (
-            self.group == 32
-            and self.bits == 4
-            and self.mode == "mxfp4"
+            g == 32
+            and b == 4
+            and m == "mxfp4"
             and rw.dtype == mx.uint32
             and rs.dtype == mx.uint8
             and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks")
