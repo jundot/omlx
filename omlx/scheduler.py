@@ -10089,7 +10089,35 @@ class Scheduler:
 
         hard_limit = self._admission_limit_bytes()
         peak = est.kv_exact + est.transient
-
+        safety_rejection = self._preflight_safety_rejection(
+            est=est,
+            current_usage_bytes=current,
+        )
+        if (
+            (est.estimated > hard_limit or safety_rejection is not None)
+            and _conversion_coordinator.process_exclusive(
+                getattr(self, "_metal_process_owner", None)
+            )
+        ):
+            # A process-exclusive engine has no external victim. Reclaim its
+            # completed work on the owning executor and price the request from
+            # a fresh footprint before rejecting restored TurboQuant or other
+            # non-conversion-eligible caches.
+            current = self._reclaim_same_engine_prefill_headroom()
+            refreshed = self._admission_estimate(
+                num_prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                current=current,
+                phase=phase,
+            )
+            if refreshed is None:
+                return None
+            est = refreshed
+            peak = est.kv_exact + est.transient
+            safety_rejection = self._preflight_safety_rejection(
+                est=est,
+                current_usage_bytes=current,
+            )
         if est.estimated > hard_limit:
             # Try LRU eviction first (upstream's predictive-throttle
             # path): if eviction can free enough headroom this raises
@@ -10123,10 +10151,6 @@ class Scheduler:
                 estimated_bytes=int(est.estimated),
                 limit_bytes=int(hard_limit),
             )
-        safety_rejection = self._preflight_safety_rejection(
-            est=est,
-            current_usage_bytes=current,
-        )
         if safety_rejection is not None:
             self._raise_prefill_eviction_if_available(
                 request_id=request.request_id,

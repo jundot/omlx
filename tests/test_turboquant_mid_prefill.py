@@ -1337,6 +1337,46 @@ def test_flag_off_restored_prefix_uses_turboquant_suffix_workspace() -> None:
     assert cache[0].offset == cache[1].offset == 6
 
 
+def test_restored_turboquant_preflight_reclaims_before_rejection() -> None:
+    scheduler = _make_scheduler(step_size=4)
+    scheduler._prefill_memory_guard = True
+    scheduler._prefill_eviction_callback_configured = True
+    scheduler._memory_hard_limit_bytes = 100
+    scheduler._memory_abort_limit_bytes = 100
+    scheduler._prefill_abort_margin = 1.0
+    cache = _dense_cache(tokens=4)
+    scheduler._apply_turboquant_kv_convert(cache)
+    request = _make_request("restored-reclaim", list(range(9)), cache)
+    request.cached_tokens = 4
+    scheduler.requests[request.request_id] = request
+    usage_samples = iter((90, 10))
+    scheduler._current_usage_bytes = MagicMock(side_effect=usage_samples)
+    scheduler._reclaim_same_engine_prefill_headroom = MagicMock(return_value=10)
+
+    def _estimate(
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int,
+        current: int,
+        phase: _PrefillKVPhase,
+    ) -> Any:
+        del num_prompt_tokens, cached_tokens
+        assert phase is _PrefillKVPhase.TURBOQUANT
+        return SimpleNamespace(
+            kv_exact=20,
+            transient=20,
+            floor_chunk=1,
+            kv_len=7,
+            estimated=current + 40,
+        )
+
+    scheduler._admission_estimate = MagicMock(side_effect=_estimate)
+
+    assert scheduler._preflight_memory_check(request) is None
+    scheduler._reclaim_same_engine_prefill_headroom.assert_called_once_with()
+    assert request.prefill_eviction_retries == 0
+
+
 def test_mid_prefill_defers_dense_preflight_to_guard() -> None:
     scheduler = _make_scheduler(step_size=4)
     cap = _configure_pressure(scheduler, pressure_after_tokens=0)
