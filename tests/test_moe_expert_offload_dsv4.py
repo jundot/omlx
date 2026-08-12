@@ -174,3 +174,77 @@ def test_cache_exercised(dsv4_model):
         stats = moe_offload_stats(model)
         assert stats["layers"] == _N_LAYERS
         assert stats["misses"] > 0, "cache never exercised"
+
+
+def test_shrink_after_prefill_preserves_outputs(dsv4_model):
+    """Page-cache cooperation: post-prefill shrink keeps outputs identical."""
+    import os
+
+    from omlx.patches.moe_expert_offload import OffloadSwitchGLU
+
+    model = dsv4_model
+    twin = copy.deepcopy(model)
+    with tempfile.TemporaryDirectory() as tmp:
+        _dump_checkpoint(model, Path(tmp))
+        os.environ["OMLX_MOE_OFFLOAD_SHRINK_AFTER_PREFILL"] = "0.5"
+        try:
+            # 0.75 -> capacity 12 (> the 8 floor), so the 0.5 shrink
+            # actually releases slots down to 8
+            assert apply_moe_expert_offload(model, tmp, resident_fraction=0.75) > 0
+        finally:
+            os.environ.pop("OMLX_MOE_OFFLOAD_SHRINK_AFTER_PREFILL", None)
+
+        # prefill-style call with a wide expert working set (20 distinct >
+        # capacity 12) forces the chunked path, which triggers the shrink.
+        # Chunked prefill re-sorts per chunk, so the contract is the PR's
+        # rounding-bounded one (~1e-3), not bit-exactness (decode below is).
+        x = mx.random.normal((1, 40, 64))
+        wide = mx.array([[i % 16, (i + 1) % 16] for i in range(40)])  # (40, 2)
+        a = model.layers[0].ffn.switch_mlp(x, wide)
+        b = twin.layers[0].ffn.switch_mlp(x, wide)
+        mx.eval(a, b)
+        a_np, b_np = np.array(a), np.array(b)
+        assert np.allclose(a_np, b_np, rtol=1e-3, atol=1e-3), (
+            "prefill changed by shrink beyond kernel rounding"
+        )
+
+        # shrink actually released slots (12 -> 8)
+        cache = model.layers[0].ffn.switch_mlp.cache
+        assert isinstance(model.layers[0].ffn.switch_mlp, OffloadSwitchGLU)
+        assert cache.capacity == 8, cache.capacity
+
+        # decode after shrink stays bit-exact
+        x = mx.random.normal((1, 8, 64))
+        narrow = mx.array([[0, 1]] * 8)
+        a = model.layers[0].ffn.switch_mlp(x, narrow)
+        b = twin.layers[0].ffn.switch_mlp(x, narrow)
+        mx.eval(a, b)
+        assert np.array_equal(np.array(a), np.array(b)), "post-shrink decode differs"
+
+
+def test_pin_hot_survives_eviction(dsv4_model):
+    """Learned hot-pin: most-routed experts must survive LRU pressure.
+
+    Exercised at the cache level (direct ensure calls) because the tiny
+    model's gate routes to the same experts regardless of input tokens —
+    the model-level hammer never forces evictions.
+    """
+    model = dsv4_model
+    with tempfile.TemporaryDirectory() as tmp:
+        _dump_checkpoint(model, Path(tmp))
+        assert apply_moe_expert_offload(model, tmp, resident_fraction=0.25) > 0
+        cache = model.layers[0].ffn.switch_mlp.cache
+
+        # skew usage toward experts 0..3, then pin the top 4
+        for _ in range(5):
+            cache.ensure(mx.array([0, 1, 2, 3]))
+        cache.pin_hot(4)
+        pinned = set(cache.pinned)
+        assert pinned == {0, 1, 2, 3}, pinned
+
+        # hammer with distinct experts: 4 free slots, then evictions
+        for e in (4, 6, 8, 10, 12, 14):
+            cache.ensure(mx.array([e]))
+
+        still = pinned & set(cache.slot_of)
+        assert still == pinned, f"pinned experts evicted: {pinned - still}"

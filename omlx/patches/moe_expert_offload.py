@@ -235,12 +235,17 @@ class ExpertCache:
         self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.hits = self.misses = 0
         self.warm = False
+        self.usage = np.zeros(self.n_experts, dtype=np.int64)  # routing heat
+        self.pinned: set = set()  # learned hot set, never evicted
 
     def _install(self, e: int) -> int:
         if self.free:
             slot = self.free.pop()
         else:
-            old_e = next(iter(self.slot_of))  # LRU victim
+            # LRU victim, skipping the learned pinned set (pinning is
+            # advisory: if every resident expert is pinned, evict LRU).
+            victim = next((e for e in self.slot_of if e not in self.pinned), None)
+            old_e = next(iter(self.slot_of)) if victim is None else victim
             slot = self.slot_of.pop(old_e)
             self.map[old_e] = -1
         for name in self.projs:
@@ -267,6 +272,7 @@ class ExpertCache:
             return
         needed = set(int(e) for e in idx.reshape(-1).tolist())
         for e in needed:
+            self.usage[e] += 1
             if e in self.slot_of:
                 slot = self.slot_of.pop(e)  # re-insert: LRU order
                 self.slot_of[e] = slot
@@ -278,6 +284,74 @@ class ExpertCache:
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
         # per-chunk eval in __call__, which is a different mechanism.
+
+    def pin_hot(self, n: int) -> None:
+        """Pin the ``n`` most-routed experts (learned hot set).
+
+        Routing heat accumulates in :meth:`ensure`; pinning the top-n makes
+        them immune to LRU eviction. On agent workloads the hot set is
+        small and stable, so a pinned working set turns most decode fetches
+        into hits (Colibri's learned-pin pattern, oMLX-side).
+        """
+        if n <= 0:
+            return
+        # argsort (not argpartition): deterministic under usage ties (e.g.
+        # experts that were never routed — all-zero usage), so the pinned
+        # set is stable and reproducible; 256 experts/layer is small.
+        hot = np.argsort(-self.usage)[:n]
+        self.pinned.update(int(e) for e in hot)
+
+    def shrink(self, keep_fraction: float = 0.5) -> int:
+        """Release resident slots after a prefill burst; returns freed count.
+
+        Prefill touches a wide expert working set. Keeping it all wired on
+        a memory-constrained machine evicts the OS file-cache pages the
+        store's mmap reads rely on, and decode misses then degrade to raw
+        disk reads instead of page-cache hits (measured on M5 Pro 48 GB:
+        +3 GiB of wired expert cache -> decode 6.5 -> 2.2 t/s). Rebuilding
+        the resident buffers at the hot-subset size frees the wired memory
+        back to the OS, so the page cache serves the next misses at RAM
+        speed (the ds4-ssd post-prefill bank-shrink pattern).
+        """
+        if self.warm or self.capacity <= 8:
+            return 0
+        keep = max(8, min(self.capacity, int(self.capacity * keep_fraction)))
+        victims = [e for e in self.slot_of if e not in self.pinned][
+            : max(0, len(self.slot_of) - keep)
+        ]
+        if not victims:
+            return 0
+        for e in victims:
+            del self.slot_of[e]
+            self.map[e] = -1
+        new_cap = len(self.slot_of)
+        for name in self.projs:
+            rw, rs, rb = self.resident[name]
+            nw = mx.zeros((new_cap,) + rw.shape[1:], dtype=rw.dtype)
+            ns = mx.zeros((new_cap,) + rs.shape[1:], dtype=rs.dtype)
+            nb = (
+                None
+                if rb is None
+                else mx.zeros((new_cap,) + rb.shape[1:], dtype=rb.dtype)
+            )
+            for i, e in enumerate(self.slot_of):
+                old = self.slot_of[e]
+                nw[i] = rw[old]
+                ns[i] = rs[old]
+                if nb is not None and rb is not None:
+                    nb[i] = rb[old]
+            self.resident[name] = [nw, ns, nb]
+        self.slot_of = {e: i for i, e in enumerate(self.slot_of)}
+        self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
+        for e, s in self.slot_of.items():
+            self.map[e] = s
+        self.capacity = new_cap
+        self.free = []
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            pass  # older MLX
+        return len(victims)
 
     def qmm(
         self, name: str, x: mx.array, slots: mx.array, sorted_indices: bool = False
@@ -304,10 +378,19 @@ class ExpertCache:
 class OffloadSwitchGLU(nn.Module):
     """SwitchGLU whose experts live in an :class:`ExpertCache`."""
 
-    def __init__(self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView):
+    def __init__(
+        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView,
+        shrink_after_prefill: float = 0.0,
+    ):
         super().__init__()
         self.cache = ExpertCache(glu, capacity, disk)
         self.activation = glu.activation
+        # 0 = keep the full prefill working set wired; (0, 1] = after a
+        # chunked (prefill) call, shrink the resident set to that fraction
+        # of capacity so the OS page cache can serve decode misses (see
+        # ExpertCache.shrink). Default off: behavioral change, tune per
+        # machine class.
+        self.shrink_after_prefill = shrink_after_prefill
 
     def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
         c = self.cache
@@ -372,6 +455,10 @@ class OffloadSwitchGLU(nn.Module):
             mx.eval(o)
             outs.append(o)
         out = mx.concatenate(outs, axis=0)
+        if self.shrink_after_prefill > 0:
+            # prefill burst is over: release the wide working set back to
+            # the OS so decode misses hit the page cache (see shrink())
+            self.cache.shrink(self.shrink_after_prefill)
         return out.reshape(indices.shape + (x.shape[-1],))
 
 
@@ -554,7 +641,12 @@ def apply_moe_expert_offload(
         )
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
-        new = OffloadSwitchGLU(glu, capacity, view)
+        new = OffloadSwitchGLU(
+            glu, capacity, view,
+            shrink_after_prefill=float(
+                os.environ.get("OMLX_MOE_OFFLOAD_SHRINK_AFTER_PREFILL", "0")
+            ),
+        )
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
