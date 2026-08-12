@@ -261,15 +261,17 @@ class ExpertCache:
         self.warm = len(self.slot_of) == self.n_experts
         return slot
 
-    def ensure(self, idx: mx.array) -> None:
-        """Make every expert in ``idx`` resident.
+    def ensure(self, idx: mx.array) -> set:
+        """Make every expert in ``idx`` resident; returns the host id set.
 
         The ``.tolist()`` is a device->host readback and therefore a sync per
         MoE layer per step. Removing it needs prefetch (resolve layer L+1's
-        residency during layer L's compute) — deliberately not in v1.
+        residency during layer L's compute) — the prev-step prefetch in
+        ``OffloadSwitchGLU.__call__`` is the v1 approximation (host-side
+        indices, no readback, installs queued a step early).
         """
         if self.warm:  # nothing can miss; skip it
-            return
+            return set(int(e) for e in idx.reshape(-1).tolist())
         needed = set(int(e) for e in idx.reshape(-1).tolist())
         for e in needed:
             self.usage[e] += 1
@@ -284,6 +286,24 @@ class ExpertCache:
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
         # per-chunk eval in __call__, which is a different mechanism.
+        return needed
+
+    def ensure_host(self, needed: set) -> None:
+        """Install from a host id set — no device readback.
+
+        The async-prefetch path: prev-step routing ids are already on the
+        host, so their installs queue into the graph a step early (evaluated
+        with the current step) instead of paying a per-layer sync. Same
+        LRU/hits/misses bookkeeping as :meth:`ensure`.
+        """
+        for e in needed:
+            if e in self.slot_of:
+                slot = self.slot_of.pop(e)  # re-insert: LRU order
+                self.slot_of[e] = slot
+                self.hits += 1
+            else:
+                self.misses += 1
+                self._install(e)
 
     def pin_hot(self, n: int) -> None:
         """Pin the ``n`` most-routed experts (learned hot set).
@@ -366,18 +386,19 @@ class ExpertCache:
         except Exception:
             return None
         rw, rs, rb = self.resident["gate_proj"]
+        # All projections must share one qualifying (group, bits, mode):
+        # the block-list kernels dispatch a single format for the whole GLU.
+        # Mixed-bit GLUs (e.g. 3-bit gate/up with an 8-bit down) fall back
+        # to gather_qmm — same contract as the stock all() on native_kinds.
+        if len(set(self.qparams.values())) != 1:
+            return None
+        g, b, m = next(iter(self.qparams.values()))
         if (
-            # NOTE: the C++ binding hardcodes the envelope
-            # (fused_moe.cpp: supported_deepseek_affine -> group_size == 64
-            # && bits in (2, 3)); group 128 throws in the primitive
-            # constructor. The Metal shader is generic, but extending the
-            # envelope means editing + rebuilding the C++ first, then a
-            # warm-cache-controlled A/B (a naive cold/warm comparison is
-            # confounded by the expert-install cost). Keep the stock
-            # envelope here; the generic extension is its own PR.
-            self.group == 64
-            and self.bits in (2, 3)
-            and self.mode == "affine"
+            # The C++ binding admits (128, 2) alongside the stock
+            # (64, 2)/(64, 3) — fused_moe.cpp supported_deepseek_affine,
+            # verified bit-exact vs gather_qmm on the real 2.4bit-mixed.
+            (g, b) in ((64, 2), (64, 3), (128, 2))
+            and m == "affine"
             and rb is not None
             and rw.dtype == mx.uint32
             and rs.dtype in (mx.float16, mx.bfloat16)
@@ -460,10 +481,19 @@ class OffloadSwitchGLU(nn.Module):
         # ExpertCache.shrink). Default off: behavioral change, tune per
         # machine class.
         self.shrink_after_prefill = shrink_after_prefill
+        # v1 async prefetch: prev-step routing ids installed host-side a step
+        # early (see __call__/_forward). A/B knob OMLX_MOE_OFFLOAD_DISABLE_PREFETCH.
+        self._prefetch = (
+            os.environ.get("OMLX_MOE_OFFLOAD_DISABLE_PREFETCH") != "1"
+        )
+        self._prev: set | None = None
 
     def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
         c = self.cache
-        c.ensure(indices)
+        needed = c.ensure(indices)
+        if needed and indices.size <= 64:
+            # decode-sized: record for the next step's host-side prefetch
+            self._prev = needed
         slots = mx.take(c.map, indices)
         x = mx.expand_dims(x, (-2, -3))
         # Mirror the stock SwitchGLU's sort rule exactly (threshold and all):
@@ -527,6 +557,12 @@ class OffloadSwitchGLU(nn.Module):
         c = self.cache
         flat_i = indices.reshape(-1, indices.shape[-1])
         n_tok, k = flat_i.shape
+        # v1 async prefetch: prev-step routing ids are host-side (recorded in
+        # _forward), so install them with no readback — the writes join this
+        # step's graph and are resident for the next step. Decode-only (a
+        # prefill's wide working set makes prev-step data meaningless).
+        if n_tok == 1 and self._prefetch and self._prev is not None:
+            c.ensure_host(self._prev)
         if n_tok * k <= c.capacity or n_tok == 1:
             return self._forward(x, indices)
         distinct = len(set(int(e) for e in flat_i.reshape(-1).tolist()))
