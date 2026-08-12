@@ -5,6 +5,7 @@ Tests for tool calling parsing and conversion utilities.
 Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
+import ast
 import json
 import logging
 import re
@@ -4026,8 +4027,14 @@ def test_serialization_after_a_successful_decode_does_not_escape(
 
 
 @pytest.mark.parametrize("error", [RecursionError, SyntaxError])
-def test_serialize_arguments_degrades_instead_of_raising(monkeypatch, error):
-    """``_serialize_tool_call_arguments`` is the choke point for that step."""
+def test_serialize_arguments_raises_so_the_caller_can_drop(monkeypatch, error):
+    """``_serialize_tool_call_arguments`` propagates rather than emptying.
+
+    An earlier version of this test asserted it returned "{}" here. That was
+    wrong: it produced a runnable tool call with its arguments silently
+    removed. The failure has to reach ``_build_tool_call`` so the call is
+    dropped (jundot's review on #2593).
+    """
     import omlx.api.tool_calling as mod
 
     real_dumps = json.dumps
@@ -4037,8 +4044,10 @@ def test_serialize_arguments_degrades_instead_of_raising(monkeypatch, error):
 
     monkeypatch.setattr(mod.json, "dumps", boom)
     try:
-        assert mod._serialize_tool_call_arguments({"x": 1}) == "{}"
-        assert mod._serialize_tool_call_arguments('{"x": 1}') == "{}"
+        with pytest.raises(error):
+            mod._serialize_tool_call_arguments({"x": 1})
+        with pytest.raises(error):
+            mod._serialize_tool_call_arguments('{"x": 1}')
     finally:
         monkeypatch.setattr(mod.json, "dumps", real_dumps)
 
@@ -4125,3 +4134,84 @@ def test_functioncall_validation_failure_drops_one_call(
     # Must not raise. Dropping the call with a warning is the contract.
     _, calls = parse_tool_calls(template.replace("{}", "1"), tok)
     assert not calls
+
+
+@pytest.mark.parametrize("chain", [200, 400, 800])
+def test_hermes_chained_expression_does_not_escape(chain):
+    """`ast.unparse` recurses too, and runs after `ast.parse` succeeded (#2545).
+
+    A long chained expression parses fine, fails `ast.literal_eval` because it
+    is not a literal, then breaches the limit in the `ast.unparse` fallback
+    that renders it back to source. jundot found this on the Hermes path after
+    the decoder, serializer and validator layers were all guarded.
+
+    Real nesting rather than injection, so it only bites on 3.11 to 3.13,
+    which is what CI runs.
+    """
+    expr = "+".join(["1"] * chain)
+    text = f"<|tool_call_start|>f(x={expr})<|tool_call_end|>"
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    # Must not raise through the public entry point.
+    parse_tool_calls(text, tok)
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_unrepresentable_argument_drops_the_call(monkeypatch, error):
+    """An argument we cannot render drops the call, not just the argument."""
+    import omlx.api.tool_calling as mod
+
+    real_unparse = ast.unparse
+
+    def boom(node):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.ast, "unparse", boom)
+    # `1+1` is not a literal, so literal_eval fails and unparse is the fallback.
+    cleaned, calls = mod._parse_hermes_tool_calls(
+        "<|tool_call_start|>f(x=1+1)<|tool_call_end|>"
+    )
+    monkeypatch.setattr(mod.ast, "unparse", real_unparse)
+
+    assert not calls, "a call missing an argument must not be emitted"
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_serialization_failure_drops_the_call_rather_than_emptying_it(
+    monkeypatch, error
+):
+    """A serialize failure must not yield a runnable call with no arguments.
+
+    Coercing to "{}" here would hand back a tool call that still executes with
+    its arguments silently removed, so a `write_file` would fire with nothing
+    to write. That is worse than dropping it. Distinct from the non-object
+    coercion below, which is a benign parser quirk (jundot's review on #2593).
+    """
+    import omlx.api.tool_calling as mod
+
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        built = mod._build_tool_call("write_file", {"path": "a", "content": "b"})
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+    assert built is None, "must drop, not emit a call with emptied arguments"
+
+
+def test_non_object_arguments_still_coerce_to_empty_object():
+    """The benign coercion is unchanged: a parser quirk, not lost data."""
+    import omlx.api.tool_calling as mod
+
+    assert mod._serialize_tool_call_arguments([1, 2]) == "{}"
+    assert mod._serialize_tool_call_arguments("not json") == "{}"
+    assert mod._serialize_tool_call_arguments({"a": 1}) == '{"a": 1}'

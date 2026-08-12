@@ -104,12 +104,17 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     # runs after a value has already decoded successfully, from a deeper stack
     # frame. A value nested just under the limit at decode time can therefore
     # breach it here (#2545, found by DiscoStew6082 at depth ~987 on 3.11).
-    # Falling through to the "{}" path below keeps that a clean coercion.
+    #
+    # A breach is deliberately NOT coerced to "{}" like a non-object value is.
+    # The two are different failures: a non-object is a parser quirk we can
+    # safely normalize, whereas failing to serialize means we HAVE the
+    # arguments and cannot render them. Returning "{}" there would hand back a
+    # runnable tool call with its arguments silently removed, so `write_file`
+    # would still fire with nothing to write. Let it raise instead, so
+    # `_build_tool_call` drops that one call with a warning, which is what the
+    # issue asks for (jundot's review on #2593).
     if isinstance(arguments, dict):
-        try:
-            return json.dumps(arguments, ensure_ascii=False)
-        except _DEEP_NEST_ERRORS:
-            arguments = "<nested too deeply to serialize>"
+        return json.dumps(arguments, ensure_ascii=False)
     # mlx-vlm / mlx-lm gemma4 parser returns a JSON-object string per the
     # OpenAI spec. Accept it when it parses back to a dict.
     if isinstance(arguments, str):
@@ -118,10 +123,7 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             parsed = None
         if isinstance(parsed, dict):
-            try:
-                return json.dumps(parsed, ensure_ascii=False)
-            except _DEEP_NEST_ERRORS:
-                pass
+            return json.dumps(parsed, ensure_ascii=False)
     logger.warning(
         "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
         "coercing to empty object to keep downstream template safe.",
@@ -745,18 +747,41 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             if isinstance(call.func, ast.Name):
                 func_name = call.func.id
             elif isinstance(call.func, ast.Attribute):
-                func_name = ast.unparse(call.func)
+                try:
+                    func_name = ast.unparse(call.func)
+                except _DEEP_NEST_ERRORS:
+                    continue
             else:
                 continue
 
             arguments = {}
+            unrepresentable = False
             for kw in call.keywords:
                 if kw.arg is None:
                     continue
                 try:
                     arguments[kw.arg] = ast.literal_eval(kw.value)
                 except (ValueError, SyntaxError, *_DEEP_NEST_ERRORS):
-                    arguments[kw.arg] = ast.unparse(kw.value)
+                    # Fall back to the source text. `ast.unparse` walks the
+                    # tree recursively, so an expression `ast.parse` built
+                    # successfully can still breach the limit being rendered
+                    # back out, from a deeper frame (#2545). An argument we
+                    # cannot represent drops the whole call rather than
+                    # yielding one that is missing it.
+                    try:
+                        arguments[kw.arg] = ast.unparse(kw.value)
+                    except _DEEP_NEST_ERRORS:
+                        unrepresentable = True
+                        break
+
+            if unrepresentable:
+                logger.warning(
+                    "Dropping tool call %.80r: argument %.40r could not be "
+                    "represented (nested too deeply)",
+                    func_name,
+                    kw.arg,
+                )
+                continue
 
             _built = _build_tool_call(func_name, arguments)
             if _built is not None:
