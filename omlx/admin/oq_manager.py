@@ -165,6 +165,7 @@ class OQManager:
         """Scan all model dirs. Returns (source_models, all_models)."""
 
         def _scan() -> tuple[list[dict], list[dict]]:
+            from ..model_discovery import _resolve_hf_cache_entry
             from ..oq import estimate_memory, validate_quantizable
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
@@ -183,16 +184,24 @@ class OQManager:
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
-                        candidates.append(subdir)
+                        candidates.append((subdir, subdir.name, None))
                     else:
-                        for child in sorted(subdir.iterdir()):
-                            if child.is_dir() and (child / "config.json").exists():
-                                candidates.append(child)
+                        # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+                        hf_resolved = _resolve_hf_cache_entry(subdir)
+                        if hf_resolved is not None:
+                            candidates.append(
+                                (hf_resolved.snapshot_path, hf_resolved.model_id,
+                                 hf_resolved.source_repo_id)
+                            )
+                        else:
+                            for child in sorted(subdir.iterdir()):
+                                if child.is_dir() and (child / "config.json").exists():
+                                    candidates.append((child, child.name, None))
 
-                    for path in candidates:
-                        if path.name in seen:
+                    for path, display_name, source_repo_id in candidates:
+                        if display_name in seen:
                             continue
-                        seen.add(path.name)
+                        seen.add(display_name)
                         try:
                             with open(path / "config.json") as f:
                                 config = json.load(f)
@@ -203,13 +212,23 @@ class OQManager:
                                 size = sum(f.stat().st_size for f in path.glob("*.bin"))
                             if size == 0:
                                 continue
+                            # Skip models without model_type — MLX needs it to
+                            # resolve the model class, so quantizing them would
+                            # produce an unloadable checkpoint.
+                            mt = (
+                                config.get("model_type", "")
+                                or config.get("text_config", {}).get("model_type", "")
+                            )
+                            if not mt:
+                                continue
                             tc = config.get("text_config", {})
                             has_mtp = _has_mtp_heads(
                                 config
                             ) and _checkpoint_has_mtp_weights(path)
                             info = {
-                                "name": path.name,
+                                "name": display_name,
                                 "path": str(path),
+                                "source_repo_id": source_repo_id,
                                 "size": size,
                                 "size_formatted": _format_size(size),
                                 "model_type": config.get("model_type", "")
