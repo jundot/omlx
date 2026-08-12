@@ -237,6 +237,46 @@ class TestBaseNonStreamingEngine:
         assert actual_methods == abstract_methods
 
 
+def test_batched_scheduler_mid_prefill_requires_active_turboquant() -> None:
+    from omlx.engine.batched import _configure_turboquant_scheduler
+
+    inactive_scheduler = MagicMock()
+    _configure_turboquant_scheduler(
+        inactive_scheduler,
+        SimpleNamespace(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        ),
+    )
+    assert inactive_scheduler._turboquant_mid_prefill is False
+    inactive_scheduler._set_model_info_for_monitor.assert_not_called()
+
+    child_disabled_scheduler = MagicMock()
+    _configure_turboquant_scheduler(
+        child_disabled_scheduler,
+        SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=False,
+        ),
+    )
+    assert child_disabled_scheduler._turboquant_mid_prefill is False
+
+    active_scheduler = MagicMock()
+    _configure_turboquant_scheduler(
+        active_scheduler,
+        SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+            turboquant_kv_bits=3,
+            turboquant_skip_last=False,
+        ),
+    )
+    assert active_scheduler._turboquant_mid_prefill is True
+    assert active_scheduler._turboquant_kv_bits == 3
+    assert active_scheduler._turboquant_skip_last is False
+    active_scheduler._set_model_info_for_monitor.assert_called_once_with()
+
+
 class TestBatchedEngineInitialization:
     """Tests for BatchedEngine initialization."""
 
@@ -907,6 +947,55 @@ class TestBatchedEngineSpecPrefillForwarding:
         await engine.generate("a prompt", tools=tools)
 
         assert engine._engine.generate.call_args.kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_preflight_eviction_attempt(self) -> None:
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate(
+            "a prompt",
+            prefill_eviction_callback_attempted=True,
+        )
+
+        assert (
+            engine._engine.generate.call_args.kwargs[
+                "prefill_eviction_callback_attempted"
+            ]
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_preflight_eviction_attempt(self) -> None:
+        from omlx.engine.batched import BatchedEngine
+
+        captured: dict[str, Any] = {}
+        fake_engine = FakeStreamingCore()
+
+        async def _record_add_request(**kwargs: Any) -> str:
+            captured.update(kwargs)
+            return "request-1"
+
+        fake_engine.add_request = _record_add_request
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate(
+            "a prompt",
+            prefill_eviction_callback_attempted=True,
+        )
+        try:
+            await stream.__anext__()
+        finally:
+            await stream.aclose()
+
+        assert captured["prefill_eviction_callback_attempted"] is True
 
     @pytest.mark.asyncio
     async def test_generate_omits_specprefill_when_absent(self):

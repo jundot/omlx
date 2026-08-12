@@ -210,6 +210,12 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    prefill_started_at: float | None = (
+        None  # First external/chunked prefill attempt; survives LRU retries
+    )
+    turboquant_mid_prefill_attempted: bool = (
+        False  # Durable across prefill-OOM requeues; one attempt per request
+    )
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

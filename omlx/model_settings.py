@@ -107,6 +107,7 @@ class ModelSettings:
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
+        turboquant_mid_prefill: Convert the growing KV cache when prefill cannot fit.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
@@ -194,6 +195,7 @@ class ModelSettings:
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
+    turboquant_mid_prefill: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)

@@ -934,6 +934,16 @@ class TestDeriveFeatureFlags:
             {"key": "turboquant_kv", "label": "TurboQuant KV"}
         ]
 
+    def test_mid_prefill_does_not_create_a_separate_feature_flag(self) -> None:
+        settings = SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_kv_bits=4,
+            turboquant_mid_prefill=True,
+        )
+        assert _derive_feature_flags(settings) == [
+            {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}
+        ]
+
     def test_index_cache_freq_is_not_a_flag(self):
         # It is a layer stride, not an on/off accelerator — tagging a run
         # "accelerated" for it would mislead the leaderboard.
@@ -964,6 +974,7 @@ class TestFilterUploadedSettings:
             )
         )
         assert out["turboquant_kv_bits"] == 4
+        assert out["turboquant_mid_prefill"] is False
         assert out["mtp_num_draft_tokens"] == 3
         assert out["index_cache_freq"] == 4
         assert out["guided_grammar_enabled"] is True
@@ -1031,15 +1042,20 @@ class TestFilterUploadedSettings:
         assert _filter_uploaded_settings(SimpleNamespace()) is None
 
     def test_oversized_snapshot_falls_back_to_accelerator_flags(self):
-        # The fallback keeps every accelerator toggle, disabled ones included:
-        # knowing a feature was off is as useful as knowing it was on.
-        settings = self._settings(mtp_enabled=True, turboquant_kv_enabled=True)
+        # The fallback keeps every accelerator toggle, disabled ones included,
+        # plus the mid-prefill child setting needed to interpret TurboQuant runs.
+        settings = self._settings(
+            mtp_enabled=True,
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+        )
         with patch("omlx.admin.benchmark._MAX_UPLOADED_SETTINGS_BYTES", 10):
             out = _filter_uploaded_settings(settings)
         assert out == {
             "dflash_enabled": False,
             "specprefill_enabled": False,
             "turboquant_kv_enabled": True,
+            "turboquant_mid_prefill": True,
             "mtp_enabled": True,
             "vlm_mtp_enabled": False,
         }

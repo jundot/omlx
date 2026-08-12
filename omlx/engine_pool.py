@@ -369,6 +369,10 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add(
+                "turboquant_mid_prefill",
+                bool(data.get("turboquant_mid_prefill", False)),
+            )
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -1661,6 +1665,12 @@ class EnginePool:
         distributed = self._distributed_deployment_for_entry(entry) is not None
         resident_size = self._entry_resident_size(entry)
         pre_unload_active = 0 if distributed else mx.get_active_memory()
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        process_owner = (
+            getattr(scheduler, "_metal_process_owner", None)
+            if scheduler is not None
+            else None
+        )
 
         try:
             await entry.engine.stop()
@@ -1676,6 +1686,17 @@ class EnginePool:
                 self._wake_process_memory_enforcer()
                 raise
             logger.warning(f"Error stopping engine for {model_id}: {e}")
+        finally:
+            close_process_owner = getattr(process_owner, "close", None)
+            if callable(close_process_owner):
+                try:
+                    close_process_owner()
+                except Exception:
+                    logger.warning(
+                        "Error closing engine owner for %s",
+                        model_id,
+                        exc_info=True,
+                    )
 
         # #1595: the immediate-abort stop() above tears the engine down without the normal
         # per-request completion callbacks, so a non-streaming engine's active_requests
@@ -2318,6 +2339,7 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
+
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
             entry.actual_size = observed_delta or resident_size
@@ -2357,6 +2379,56 @@ class EnginePool:
                     "the request.",
                 )
 
+            scheduler = self._resolve_scheduler_from_engine(engine)
+            if (
+                scheduler is not None
+                and getattr(scheduler, "_turboquant_mid_prefill", False) is True
+            ):
+                process_owner = getattr(
+                    scheduler,
+                    "_metal_process_owner",
+                    None,
+                )
+                claim_process = getattr(
+                    process_owner,
+                    "claim_turboquant_mid_prefill_process",
+                    None,
+                )
+                try:
+                    if not callable(claim_process):
+                        raise RuntimeError(
+                            "TurboQuant mid-prefill requires an EngineCore-owned "
+                            "process-exclusive Metal lane"
+                        )
+                    await claim_process()
+                except Exception:
+                    entry.engine = None
+                    self._current_model_memory = max(
+                        0,
+                        self._current_model_memory - entry.estimated_size,
+                    )
+                    load_completed = False
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        logger.warning(
+                            "Failed to stop non-exclusive mid-prefill engine %s",
+                            model_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        close_process_owner = getattr(process_owner, "close", None)
+                        if callable(close_process_owner):
+                            try:
+                                close_process_owner()
+                            except Exception:
+                                logger.warning(
+                                    "Failed to close non-exclusive mid-prefill "
+                                    "owner for %s",
+                                    model_id,
+                                    exc_info=True,
+                                )
+                    raise
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(actual: {format_size(entry.actual_size)}, "

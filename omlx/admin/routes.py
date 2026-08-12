@@ -128,6 +128,7 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
+    turboquant_mid_prefill: bool | None = None
     turboquant_kv_bits: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
@@ -532,6 +533,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["thinking_budget_enabled"] = False
     settings["guided_grammar_enabled"] = False
     settings["turboquant_kv_enabled"] = False
+    settings["turboquant_mid_prefill"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
     settings["specprefill_enabled"] = False
@@ -607,6 +609,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
 
     settings.index_cache_freq = None
     settings.turboquant_kv_enabled = False
+    settings.turboquant_mid_prefill = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
     settings.specprefill_enabled = False
@@ -2305,6 +2308,10 @@ async def update_model_settings(
     # TurboQuant KV cache settings
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
+    if "turboquant_mid_prefill" in sent:
+        current_settings.turboquant_mid_prefill = (
+            request.turboquant_mid_prefill or False
+        )
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     # SpecPrefill settings

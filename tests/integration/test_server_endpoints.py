@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -853,6 +854,116 @@ class TestCompletionEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "choices" in data
+
+    def test_completion_forwards_scalar_preflight_eviction_attempt(
+        self,
+        client: TestClient,
+        mock_llm_engine: MockBaseEngine,
+    ) -> None:
+        mock_llm_engine.preflight_completion = AsyncMock(return_value=True)
+        mock_llm_engine.generate = AsyncMock(
+            return_value=MockGenerationOutput(text="Generated response.")
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={"model": "test-model", "prompt": "First prompt"},
+        )
+
+        assert response.status_code == 200
+        assert (
+            mock_llm_engine.generate.call_args.kwargs[
+                "prefill_eviction_callback_attempted"
+            ]
+            is True
+        )
+
+    def test_completion_keeps_list_preflight_attempts_prompt_local(
+        self,
+        client: TestClient,
+        mock_llm_engine: MockBaseEngine,
+    ) -> None:
+        mock_llm_engine.preflight_completion = AsyncMock(
+            side_effect=[True, None],
+        )
+        mock_llm_engine.generate = AsyncMock(
+            side_effect=[
+                MockGenerationOutput(text="First response."),
+                MockGenerationOutput(text="Second response."),
+            ]
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": ["First prompt", "Second prompt"],
+            },
+        )
+
+        assert response.status_code == 200
+        first_kwargs = mock_llm_engine.generate.call_args_list[0].kwargs
+        second_kwargs = mock_llm_engine.generate.call_args_list[1].kwargs
+        assert first_kwargs["prefill_eviction_callback_attempted"] is True
+        assert "prefill_eviction_callback_attempted" not in second_kwargs
+
+    def test_completion_stream_forwards_preflight_eviction_attempt(
+        self,
+        client: TestClient,
+        mock_llm_engine: MockBaseEngine,
+    ) -> None:
+        captured: dict[str, object] = {}
+        mock_llm_engine.preflight_completion = AsyncMock(return_value=True)
+
+        async def _recording_stream_generate(
+            prompt: str,
+            **kwargs: object,
+        ) -> AsyncIterator[MockGenerationOutput]:
+            captured.update(kwargs)
+            yield MockGenerationOutput(
+                text="Hi",
+                new_text="Hi",
+                finished=True,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.stream_generate = _recording_stream_generate
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Stream prompt",
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["prefill_eviction_callback_attempted"] is True
+
+    def test_completion_preflight_failure_does_not_generate(
+        self,
+        client: TestClient,
+        mock_llm_engine: MockBaseEngine,
+    ) -> None:
+        from omlx.exceptions import PrefillMemoryExceededError
+
+        mock_llm_engine.preflight_completion = AsyncMock(
+            side_effect=PrefillMemoryExceededError(
+                message="rejected after callback",
+                request_id="failed-completion",
+            )
+        )
+        mock_llm_engine.generate = AsyncMock()
+
+        response = client.post(
+            "/v1/completions",
+            json={"model": "test-model", "prompt": "Rejected prompt"},
+            headers={"x-request-id": "failed-completion"},
+        )
+
+        assert response.status_code == 400
+        mock_llm_engine.generate.assert_not_awaited()
 
     def test_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine

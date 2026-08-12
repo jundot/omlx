@@ -171,7 +171,6 @@ class TestModelSettings:
         assert settings.temperature == 0.8
         assert settings.chat_template_kwargs == {"reasoning_effort": "high"}
 
-
     def test_ttl_seconds_default(self):
         """Test ttl_seconds defaults to None."""
         settings = ModelSettings()
@@ -257,6 +256,17 @@ class TestModelSettings:
         assert d["turboquant_skip_last"] is False
         restored = ModelSettings.from_dict(d)
         assert restored.turboquant_skip_last is False
+
+    def test_turboquant_mid_prefill_defaults_false_for_legacy_records(self) -> None:
+        settings = ModelSettings.from_dict({"turboquant_kv_enabled": True})
+        assert settings.turboquant_mid_prefill is False
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_turboquant_mid_prefill_roundtrip(self, enabled: bool) -> None:
+        original = ModelSettings(turboquant_mid_prefill=enabled)
+        serialized = original.to_dict()
+        assert serialized["turboquant_mid_prefill"] is enabled
+        assert ModelSettings.from_dict(serialized).turboquant_mid_prefill is enabled
 
     def test_native_mtp_allows_turboquant(self):
         settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)

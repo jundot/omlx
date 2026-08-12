@@ -339,6 +339,45 @@ class TestOrphanedLoadSafetyNet:
         assert pool.get_entry("model-a").load_failure_message is None
 
 
+class TestTurboQuantProcessClaim:
+    """Tests for fail-closed process ownership during engine loading."""
+
+    @pytest.mark.asyncio
+    async def test_claim_failure_closes_owner_when_wrapper_stop_fails(
+        self, small_mock_model_dir
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+
+        process_owner = MagicMock()
+        process_owner.claim_turboquant_mid_prefill_process = AsyncMock(
+            side_effect=RuntimeError("exclusive unavailable")
+        )
+        scheduler = MagicMock(
+            _turboquant_mid_prefill=True,
+            _metal_process_owner=process_owner,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock(side_effect=RuntimeError("stop failed"))
+
+        pool._resolve_scheduler_from_engine = MagicMock(return_value=scheduler)
+        pool._schedule_failed_load_reclaim = MagicMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(ModelUnavailableError, match="exclusive unavailable"),
+        ):
+            await pool._load_engine("model-a")
+
+        mock_engine.stop.assert_awaited_once()
+        process_owner.close.assert_called_once_with()
+        assert entry.engine is None
+        assert pool._current_model_memory == 0
+
+
 class TestEnginePoolErrors:
     """Tests for EnginePool error handling."""
 
@@ -1203,6 +1242,36 @@ class TestEnginePoolAsync:
         assert pure_signature == pure_think_signature
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
+
+    def test_turboquant_mid_prefill_only_affects_active_signature(
+        self, pool_with_mock_engines: EnginePool
+    ) -> None:
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        off_false = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=False,
+        )
+        off_true = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        )
+        on_false = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=False,
+        )
+        on_true = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+        )
+
+        assert pool._engine_runtime_signature(
+            "model-a", off_false
+        ) == pool._engine_runtime_signature("model-a", off_true)
+        assert pool._engine_runtime_signature(
+            "model-a", on_false
+        ) != pool._engine_runtime_signature("model-a", on_true)
 
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(

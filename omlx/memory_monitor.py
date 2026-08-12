@@ -572,7 +572,9 @@ class MemoryMonitor:
 
         return total
 
-    def estimate_prompt_kv_bytes(self, num_tokens: int) -> float:
+    def estimate_prompt_kv_bytes(
+        self, num_tokens: int, *, dtype_size: float | None = None
+    ) -> float:
         """
         Estimate KV cache memory for a prompt of given length.
 
@@ -581,6 +583,8 @@ class MemoryMonitor:
 
         Args:
             num_tokens: Number of prompt tokens.
+            dtype_size: Optional stored-KV bytes per element for this request
+                phase. Defaults to the model-level cache width.
 
         Returns:
             Estimated KV cache memory in bytes.
@@ -599,7 +603,7 @@ class MemoryMonitor:
             layers = self._num_layers or 0
         kv_heads = self._num_kv_heads or 0
         dim = self._head_dim or 0
-        dtype = self._dtype_size
+        dtype = self._dtype_size if dtype_size is None else float(dtype_size)
 
         if not (layers and kv_heads and dim):
             return 0
@@ -612,7 +616,11 @@ class MemoryMonitor:
         return num_tokens * per_token
 
     def estimate_resident_kv_bytes(
-        self, num_tokens: int, *, chunk_tokens: int = 1
+        self,
+        num_tokens: int,
+        *,
+        chunk_tokens: int = 1,
+        dtype_size: float | None = None,
     ) -> float:
         """Exact-shape resident KV bytes a prefill of ``num_tokens`` adds.
 
@@ -639,7 +647,7 @@ class MemoryMonitor:
             return self._prefill_memory_profile.estimate_resident_kv_bytes(
                 num_tokens, chunk_tokens=chunk_tokens
             )
-        total = self.estimate_prompt_kv_bytes(num_tokens)
+        total = self.estimate_prompt_kv_bytes(num_tokens, dtype_size=dtype_size)
 
         if self._rotating_layer_specs:
             kv_heads = self._num_kv_heads or 0
@@ -715,7 +723,12 @@ class MemoryMonitor:
         )
 
     def estimate_prefill_peak_bytes(
-        self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
+        self,
+        new_tokens: int,
+        chunk_size: int,
+        *,
+        cached_tokens: int = 0,
+        dtype_size: float | None = None,
     ) -> float:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
@@ -749,6 +762,8 @@ class MemoryMonitor:
                 still typecheck — but they get the under-counting behavior
                 this method was designed to fix, so always pass it when the
                 value is available.
+            dtype_size: Optional stored-KV bytes per element for this request
+                phase. SDPA activation width remains the compute dtype.
 
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
@@ -778,7 +793,11 @@ class MemoryMonitor:
         # The cached portion is already counted in the caller's current-usage
         # baseline. Resident math includes window-capped sliding-window
         # layers and measured fixed state, not just full-attention KVCache.
-        kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
+        kv = self.estimate_resident_kv_bytes(
+            new_tokens,
+            chunk_tokens=eff_chunk,
+            dtype_size=dtype_size,
+        )
         return attn + kv
 
     def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
@@ -802,6 +821,29 @@ class MemoryMonitor:
                 n_tokens, kv_len
             )
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
+
+    def estimate_turboquant_prefill_attention_bytes(
+        self,
+        query_tokens: int,
+        kv_len: int,
+        *,
+        bits: float,
+    ) -> int:
+        """Return the source-structural long-prefill TurboQuant workspace."""
+        from .turboquant_kv import (
+            estimate_turboquant_prefill_attention_workspace_bytes,
+        )
+
+        return estimate_turboquant_prefill_attention_workspace_bytes(
+            query_tokens=query_tokens,
+            kv_len=kv_len,
+            num_query_heads=self._num_attention_heads or 0,
+            num_kv_heads=self._num_kv_heads or 0,
+            head_dim=self._head_dim or 0,
+            bits=bits,
+            compute_dtype_size=self._score_dtype_size,
+            causal=True,
+        )
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """

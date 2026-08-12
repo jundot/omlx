@@ -50,6 +50,7 @@ from .utils.compile_cache import (
 )
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.hardware import format_bytes
+from .utils.metal_sync import _conversion_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,25 @@ def _init_mlx_thread() -> None:
 
     logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
 
+class _ProcessGuardedMLXExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Reject global Metal work while a mid-prefill engine owns the process."""
+
+    @staticmethod
+    def _run_guarded(fn: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
+        _conversion_coordinator.assert_background_metal_allowed()
+        return fn(*args, **kwargs)
+
+    def submit(
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> concurrent.futures.Future[Any]:
+        return super().submit(self._run_guarded, fn, args, kwargs)
+
+
+def _claim_turboquant_mid_prefill_process(owner: Any) -> None:
+    """Drain the global executor stream, then make ``owner`` process-exclusive."""
+    mx.synchronize()
+    _conversion_coordinator.claim_process_exclusive(owner)
+
 
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
@@ -139,7 +159,7 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """
     global _global_mlx_executor
     if _global_mlx_executor is None:
-        _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
+        _global_mlx_executor = _ProcessGuardedMLXExecutor(
             max_workers=1,
             thread_name_prefix="mlx-global",
             initializer=_init_mlx_thread,
@@ -222,34 +242,60 @@ class EngineCore:
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
+        self._metal_registration_active = False
+        self._mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        _conversion_coordinator.register_engine(self)
+        self._metal_registration_active = True
 
-        # Acquire model ownership
+        # Acquire model ownership and finish construction while the process
+        # registration blocks a concurrent mid-prefill claim. Any constructor
+        # failure must release that registration immediately; a traceback can
+        # otherwise retain this half-built engine and block all later loads.
         registry = get_registry()
-        registry.acquire(
-            model=model,
-            engine=self,
-            engine_id=self._engine_id,
-            force=force_model_ownership,
-        )
-        self._owns_model = True
+        try:
+            registry.acquire(
+                model=model,
+                engine=self,
+                engine_id=self._engine_id,
+                force=force_model_ownership,
+            )
+            self._owns_model = True
 
-        # Per-engine executor with dedicated mx.Stream (#1248).
-        # Each EngineCore gets its own thread + GPU stream so different
-        # models can run scheduler.step() concurrently.
-        self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
-        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
-        )
+            # Per-engine executor with dedicated mx.Stream (#1248).
+            # Each EngineCore gets its own thread + GPU stream so different
+            # models can run scheduler.step() concurrently.
+            self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
+            self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
+            )
 
-        # Create scheduler with per-engine stream
-        scheduler_config = self.config.scheduler_config or SchedulerConfig()
-        self.scheduler = Scheduler(
-            model=model,
-            tokenizer=tokenizer,
-            config=scheduler_config,
-            stream=self._mlx_stream,
-        )
+            # Create scheduler with per-engine stream
+            scheduler_config = self.config.scheduler_config or SchedulerConfig()
+            self.scheduler = Scheduler(
+                model=model,
+                tokenizer=tokenizer,
+                config=scheduler_config,
+                stream=self._mlx_stream,
+            )
+            self.scheduler._metal_process_owner = self
+        except BaseException:
+            if self._mlx_executor is not None:
+                self._mlx_executor.shutdown(wait=False)
+                self._mlx_executor = None
+            if self._owns_model:
+                try:
+                    registry.release(self.model, self._engine_id)
+                except Exception:
+                    logger.warning(
+                        "Engine %s: model release failed during initialization",
+                        self._engine_id,
+                        exc_info=True,
+                    )
+                self._owns_model = False
+            _conversion_coordinator.unregister_engine(self)
+            self._metal_registration_active = False
+            raise
 
         # Output collectors for low-latency streaming (vLLM pattern)
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
@@ -303,6 +349,15 @@ class EngineCore:
         self._wake_event = None
         self._loop = None
         logger.info("Engine stopped")
+
+    async def claim_turboquant_mid_prefill_process(self) -> None:
+        """Claim process-exclusive Metal access after all load work completes."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            _claim_turboquant_mid_prefill_process,
+            self,
+        )
 
     def is_running(self) -> bool:
         """Check if engine is running."""
@@ -546,6 +601,7 @@ class EngineCore:
         specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        prefill_eviction_callback_attempted: bool = False,
     ) -> str:
         """
         Add a request for processing.
@@ -562,6 +618,8 @@ class EngineCore:
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
+            prefill_eviction_callback_attempted: Whether route preflight already
+                invoked the async LRU callback for this request.
 
         Returns:
             The request ID
@@ -585,6 +643,7 @@ class EngineCore:
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
+            prefill_eviction_retries=int(prefill_eviction_callback_attempted),
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -1223,6 +1282,10 @@ class EngineCore:
                 _immortal_mlx_executors.append(self._mlx_executor)
                 _immortal_mlx_streams.append(self._mlx_stream)
             self._mlx_executor = None
+
+        if getattr(self, "_metal_registration_active", False):
+            _conversion_coordinator.unregister_engine(self)
+            self._metal_registration_active = False
 
         logger.debug(f"Engine {self._engine_id} closed")
 

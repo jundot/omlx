@@ -18,13 +18,18 @@ from functools import cache
 from typing import Optional
 
 import mlx.core as mx
+from ..turboquant_kv import (
+    TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS,
+    TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS,
+)
+
 
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _LONG_PREFILL_QUANTIZED_THRESHOLD = 8192
-_LONG_PREFILL_QUERY_BLOCK_SIZE = 256
-_LONG_PREFILL_KEY_CHUNK_SIZE = 16384
+_LONG_PREFILL_QUERY_BLOCK_SIZE = TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS
+_LONG_PREFILL_KEY_CHUNK_SIZE = TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS
 # MTP verify is a decode-shaped multi-row call (q_len = 1 + draft depth <= 9).
 # Above this floor a multi-row call is genuine (chunked) prefill.
 _DECODE_MULTIROW_MAX_Q_LEN = 15
@@ -621,10 +626,11 @@ def apply_turboquant_attention_patch() -> bool:
                 total_tokens = _state_length(keys_state)
             except Exception:
                 total_tokens = 0
-            if (
-                total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD
-                and hasattr(real_cache, "quantized_attention")
-            ):
+            if total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD:
+                if not hasattr(real_cache, "quantized_attention"):
+                    raise RuntimeError(
+                        "Long TurboQuant prefill requires quantized attention"
+                    )
                 old_query_block_size = getattr(
                     real_cache, "prefill_query_block_size", None
                 )
@@ -642,12 +648,6 @@ def apply_turboquant_attention_patch() -> bool:
                         values_state=values,
                         scale=scale,
                         mask=mask,
-                    )
-                except Exception:
-                    logger.debug(
-                        "TurboQuant quantized prefill attention failed; "
-                        "falling back to dequantize+SDPA",
-                        exc_info=True,
                     )
                 finally:
                     if old_query_block_size is not None:

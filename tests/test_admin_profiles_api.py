@@ -252,6 +252,7 @@ class TestProfileRoutes:
                     "guided_grammar": 'root ::= "YES"',
                     "max_tool_result_tokens": 4096,
                     "turboquant_kv_enabled": True,
+                    "turboquant_mid_prefill": True,
                     "specprefill_enabled": True,
                     "dflash_enabled": True,
                     "mtp_enabled": True,
@@ -276,6 +277,7 @@ class TestProfileRoutes:
         # output parsing), so its settings are preserved.
         assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
+        assert settings["turboquant_mid_prefill"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
         assert settings["mtp_enabled"] is False
@@ -297,6 +299,7 @@ class TestProfileRoutes:
         assert "model_specific" in data
         assert "temperature" in data["universal"]
         assert "turboquant_kv_enabled" in data["model_specific"]
+        assert "turboquant_mid_prefill" in data["model_specific"]
 
     def test_also_save_as_template(self, client):
         c, mgr = client
@@ -565,6 +568,32 @@ class TestModelsResponseActiveProfile:
         assert entry["settings"]["guided_grammar_enabled"] is True
         assert entry["settings"]["guided_grammar"] == 'root ::= "YES"'
 
+    def test_mid_prefill_partial_update_round_trips_without_clobbering(
+        self, client: tuple[TestClient, ModelSettingsManager]
+    ) -> None:
+        c, _ = client
+
+        enabled = c.put(
+            "/admin/api/models/model-a/settings",
+            json={"turboquant_mid_prefill": True},
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["settings"]["turboquant_mid_prefill"] is True
+
+        unrelated = c.put(
+            "/admin/api/models/model-a/settings",
+            json={"max_tokens": 64},
+        )
+        assert unrelated.status_code == 200
+        assert unrelated.json()["settings"]["turboquant_mid_prefill"] is True
+
+        disabled = c.put(
+            "/admin/api/models/model-a/settings",
+            json={"turboquant_mid_prefill": False},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["settings"]["turboquant_mid_prefill"] is False
+
     def test_diffusion_settings_update_sanitizes_unsupported_fields(self, client):
         c, _ = client
         pool = admin_routes._get_engine_pool()
@@ -586,6 +615,7 @@ class TestModelsResponseActiveProfile:
                 "guided_grammar": 'root ::= "YES"',
                 "max_tool_result_tokens": 4096,
                 "turboquant_kv_enabled": True,
+                "turboquant_mid_prefill": True,
                 "specprefill_enabled": True,
                 "dflash_enabled": True,
                 "dflash_in_memory_cache": False,
@@ -606,6 +636,7 @@ class TestModelsResponseActiveProfile:
         # Tool calling works on the diffusion lane; setting preserved.
         assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
+        assert settings["turboquant_mid_prefill"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
         assert settings["dflash_in_memory_cache"] is True
@@ -630,6 +661,29 @@ class TestActiveProfileDriftClearing:
         r = c.put("/admin/api/models/model-a/settings", json={"temperature": 0.0})
         assert r.status_code == 200
         assert r.json()["settings"]["active_profile_name"] == "coding"
+
+    def test_active_profile_merge_adds_mid_prefill_default(
+        self, client: tuple[TestClient, ModelSettingsManager]
+    ) -> None:
+        c, mgr = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"temperature": 0.0},
+            },
+        )
+        c.post("/admin/api/models/model-a/profiles/coding/apply")
+
+        response = c.put(
+            "/admin/api/models/model-a/settings",
+            json={"temperature": 0.0},
+        )
+
+        assert response.status_code == 200
+        profile = mgr.get_profile("model-a", "coding")
+        assert profile["settings"]["turboquant_mid_prefill"] is False
 
     def test_active_cleared_on_drift(self, client):
         c, mgr = client

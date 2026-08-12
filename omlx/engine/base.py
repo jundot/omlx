@@ -71,7 +71,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request_id: str | None,
     eviction_callback: Any | None,
     executor: Any | None = None,
-) -> None:
+) -> bool:
     """Run route preflight after transient post-request cleanup settles.
 
     A finished request can remain resident while its asynchronous cache store
@@ -86,6 +86,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     """
     deadline = time.monotonic() + _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S
     waited_for_cleanup = False
+    callback_attempted = False
 
     while True:
         eviction_request = scheduler.preflight_eviction_request(
@@ -97,7 +98,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 num_prompt_tokens=num_prompt_tokens,
                 request_id=request_id,
             )
-            return
+            return callback_attempted
 
         cleanup_pending_fn = getattr(
             scheduler, "has_pending_route_preflight_cleanup", None
@@ -146,12 +147,13 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 "Running preflight LRU eviction for request %s",
                 eviction_request.request_id,
             )
+            callback_attempted = True
             await eviction_callback(eviction_request)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
         )
-        return
+        return callback_attempted
 
 
 @dataclass
@@ -410,7 +412,7 @@ class BaseEngine(ABC):
         tools: Optional[list] = None,
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Optional prefill-memory preflight check for chat requests.
 
         Default no-op; engines that implement the prefill memory guard
@@ -418,6 +420,10 @@ class BaseEngine(ABC):
         actual estimation logic. The base no-op lets simpler engines
         (SimpleEngine, embedding/reranker engines, test stubs) be
         invoked from the server endpoints without additional wrapping.
+
+        An implementation may return ``True`` when route preflight actually
+        invoked an eviction callback and admission must consume that request's
+        retry budget. ``None`` retains the legacy no-op contract.
         """
         return None
 
@@ -426,10 +432,12 @@ class BaseEngine(ABC):
         prompt: str,
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Optional prefill-memory preflight check for completion requests.
 
-        See :meth:`preflight_chat` for the rationale.
+        Implementations may report a route-level eviction callback attempt
+        using the same request-local contract as :meth:`preflight_chat`.
+        ``None`` retains the legacy no-op behavior.
         """
         return None
 
