@@ -24,7 +24,6 @@ from omlx.scheduler import (
     Scheduler,
     SchedulerConfig,
     _PrefillAbortedError,
-    _PrefillEvictionNeeded,
     _PrefillKVPhase,
 )
 from omlx.turboquant_kv import (

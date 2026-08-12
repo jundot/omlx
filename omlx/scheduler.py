@@ -4730,40 +4730,41 @@ class Scheduler:
             "_mid_prefill_conversion_available",
             None,
         )
-        if callable(conversion_available) and conversion_available(
-            prefill_context,
-            prompt_cache,
-            request_obj,
+        if (
+            callable(conversion_available)
+            and conversion_available(
+                prefill_context,
+                prompt_cache,
+                request_obj,
+            )
+            and request_obj is not None
+            and prompt_cache is not None
+            and prefill_context is not None
         ):
-            if (
-                request_obj is not None
-                and prompt_cache is not None
-                and prefill_context is not None
-            ):
-                self._attempt_mid_prefill_conversion(
-                    request=request_obj,
-                    prompt_cache=prompt_cache,
-                    context=prefill_context,
-                    processed_tokens=progress,
-                    safety_cap=cap,
-                )
-                resized = self._adaptive_chunk_size(
-                    n_tokens,
-                    request_id=request_id or prefill_context.request_id,
-                    loop_label=loop_label,
-                    kv_len=kv_len,
-                    prefill_context=prefill_context,
-                )
-                return self._guard_prefill_chunk(
-                    resized,
-                    kv_len=kv_len,
-                    progress=progress,
-                    loop_label=loop_label,
-                    request_id=request_id,
-                    request=request_obj,
-                    prompt_cache=prompt_cache,
-                    prefill_context=prefill_context,
-                )
+            self._attempt_mid_prefill_conversion(
+                request=request_obj,
+                prompt_cache=prompt_cache,
+                context=prefill_context,
+                processed_tokens=progress,
+                safety_cap=cap,
+            )
+            resized = self._adaptive_chunk_size(
+                n_tokens,
+                request_id=request_id or prefill_context.request_id,
+                loop_label=loop_label,
+                kv_len=kv_len,
+                prefill_context=prefill_context,
+            )
+            return self._guard_prefill_chunk(
+                resized,
+                kv_len=kv_len,
+                progress=progress,
+                loop_label=loop_label,
+                request_id=request_id,
+                request=request_obj,
+                prompt_cache=prompt_cache,
+                prefill_context=prefill_context,
+            )
 
         if current + full_transient <= cap:
             # Adaptive sizing may have preserved this candidate solely so the
