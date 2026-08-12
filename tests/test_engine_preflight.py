@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
@@ -29,6 +30,9 @@ _TINY_PNG_DATA_URI = (
     "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
 
+_CACHE_PROBE_MISSING = object()
+_CACHE_PROBE_FAILURE = object()
+
 # ---------------------------------------------------------------------------
 # Scheduler.preflight_or_raise / _preflight_memory_check_tokens
 # ---------------------------------------------------------------------------
@@ -37,24 +41,29 @@ _TINY_PNG_DATA_URI = (
 class _ModelConfig:
     def __init__(
         self,
-        num_hidden_layers=32,
-        num_key_value_heads=8,
-        num_attention_heads=32,
-        head_dim=192,
-    ):
+        num_hidden_layers: int = 32,
+        num_key_value_heads: int = 8,
+        num_attention_heads: int = 32,
+        head_dim: int = 192,
+    ) -> None:
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
 
 
-def _make_scheduler():
+def _make_scheduler(cache_probe: object = _CACHE_PROBE_MISSING) -> Scheduler:
     from omlx.scheduler import SchedulerConfig
 
     model = MagicMock()
     model.layers = []
     model.config = _ModelConfig()
-    del model.make_cache
+    if cache_probe is _CACHE_PROBE_MISSING:
+        del model.make_cache
+    elif cache_probe is _CACHE_PROBE_FAILURE:
+        model.make_cache.side_effect = RuntimeError("cache probe failed")
+    else:
+        model.make_cache.return_value = cache_probe
 
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
@@ -115,6 +124,151 @@ class TestPreflightOrRaise:
         monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
 
         scheduler.preflight_or_raise(num_prompt_tokens=10_000, cached_tokens=10_000)
+
+
+@pytest.mark.parametrize(
+    ("cache_probe", "expected"),
+    [
+        pytest.param([KVCache(), KVCache()], True, id="dense-targets"),
+        pytest.param(
+            [KVCache(), RotatingKVCache(max_size=128)],
+            True,
+            id="dense-target-with-pass-through",
+        ),
+        pytest.param(
+            [RotatingKVCache(max_size=128)],
+            False,
+            id="no-turboquant-targets",
+        ),
+        pytest.param(
+            [KVCache(), object()],
+            False,
+            id="unsupported-list-member",
+        ),
+        pytest.param([], False, id="empty-list"),
+        pytest.param(object(), None, id="invalid-output"),
+        pytest.param(_CACHE_PROBE_MISSING, None, id="missing-factory"),
+        pytest.param(_CACHE_PROBE_FAILURE, None, id="failing-factory"),
+    ],
+)
+def test_scheduler_records_confirmed_preflight_conversion_eligibility(
+    cache_probe: object,
+    expected: bool | None,
+) -> None:
+    scheduler = _make_scheduler(cache_probe)
+
+    assert scheduler._turboquant_preflight_conversion_eligible is expected
+
+
+@pytest.mark.parametrize(
+    ("conversion_eligible", "should_defer"),
+    [
+        pytest.param(True, True, id="confirmed"),
+        pytest.param(False, False, id="unsupported"),
+        pytest.param(None, False, id="unknown"),
+    ],
+)
+def test_forced_overshoot_defers_only_confirmed_conversion_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    conversion_eligible: bool | None,
+    should_defer: bool,
+) -> None:
+    import omlx.scheduler as scheduler_mod
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    scheduler._turboquant_mid_prefill = True
+    scheduler._turboquant_kv_bits = 4.0
+    scheduler._prefill_tq_kv_dtype_size = 1.0
+    scheduler._turboquant_preflight_conversion_eligible = conversion_eligible
+
+    def _zero_memory() -> int:
+        return 0
+
+    def _exclusive(_owner: object) -> bool:
+        return True
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", _zero_memory)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", _zero_memory)
+    monkeypatch.setattr(
+        scheduler_mod._conversion_coordinator,
+        "process_exclusive",
+        _exclusive,
+    )
+
+    if should_defer:
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=65536,
+            request_id="confirmed-layout",
+        )
+    else:
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(
+                num_prompt_tokens=65536,
+                request_id="unconfirmed-layout",
+            )
+
+
+@pytest.mark.parametrize(
+    ("recorded_eligibility", "prompt_cache", "should_defer"),
+    [
+        pytest.param(
+            False,
+            [KVCache(), KVCache()],
+            True,
+            id="actual-dense-overrides-recorded-unsupported",
+        ),
+        pytest.param(
+            True,
+            [RotatingKVCache(max_size=128)],
+            False,
+            id="actual-unsupported-overrides-recorded-dense",
+        ),
+    ],
+)
+def test_request_cache_layout_overrides_recorded_preflight_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_eligibility: bool,
+    prompt_cache: list[object],
+    should_defer: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    import omlx.scheduler as scheduler_mod
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    scheduler._prefill_eviction_callback_configured = False
+    scheduler._turboquant_mid_prefill = True
+    scheduler._turboquant_kv_bits = 4.0
+    scheduler._prefill_tq_kv_dtype_size = 1.0
+    scheduler._turboquant_preflight_conversion_eligible = recorded_eligibility
+    request = SimpleNamespace(
+        request_id="actual-layout",
+        num_prompt_tokens=65536,
+        cached_tokens=0,
+        prompt_cache=prompt_cache,
+        turboquant_mid_prefill_attempted=False,
+    )
+
+    def _zero_memory() -> int:
+        return 0
+
+    def _exclusive(_owner: object) -> bool:
+        return True
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", _zero_memory)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", _zero_memory)
+    monkeypatch.setattr(
+        scheduler_mod._conversion_coordinator,
+        "process_exclusive",
+        _exclusive,
+    )
+
+    rejection = scheduler._preflight_memory_check(request)
+    assert (rejection is None) is should_defer
 
 
 # ---------------------------------------------------------------------------

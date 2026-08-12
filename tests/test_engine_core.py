@@ -14,6 +14,7 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -134,10 +135,9 @@ class TestEngineCoreInitialization:
             finally:
                 engine.close()
 
-
     def test_failed_init_releases_process_registration(
-        self, mock_model, mock_tokenizer
-    ):
+        self, mock_model: Any, mock_tokenizer: Any
+    ) -> None:
         from omlx.utils.metal_sync import _conversion_coordinator
 
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -1409,11 +1409,17 @@ class TestGlobalMLXExecutor:
     @pytest.mark.asyncio
     async def test_mid_prefill_claim_blocks_other_metal_lanes(
         self,
-        mock_model,
-        mock_tokenizer,
-    ):
+        mock_model: Any,
+        mock_tokenizer: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         from omlx.engine_core import get_mlx_executor
+        from omlx.utils.metal_sync import _ConversionCoordinator
 
+        monkeypatch.setattr(
+            "omlx.engine_core._conversion_coordinator",
+            _ConversionCoordinator(),
+        )
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)

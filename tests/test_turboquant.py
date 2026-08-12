@@ -1,5 +1,7 @@
 """Tests for TurboQuant KV cache (mlx-vlm backend + omlx BatchTurboQuantKVCache)."""
 
+from typing import Any
+
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import BatchKVCache, KVCache
@@ -484,9 +486,10 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
     assert calls[0][1] is vs
     assert calls[0][2] == 256
 
+
 def test_attention_patch_executes_real_q8_multi_token_quantized_suffix(
-    monkeypatch,
-):
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mlx_lm.models import base as mlx_base
     from mlx_vlm import turboquant as mlx_turboquant
 
@@ -511,22 +514,22 @@ def test_attention_patch_executes_real_q8_multi_token_quantized_suffix(
     quantized_blocks = []
     unpack_calls = []
 
-    def spy_prefill(self, *args, **kwargs):
+    def spy_prefill(self: TurboQuantKVCache, *args: Any, **kwargs: Any) -> Any:
         result = original_prefill(self, *args, **kwargs)
         prefill_results.append(result)
         return result
 
-    def spy_quantized(self, *args, **kwargs):
+    def spy_quantized(self: TurboQuantKVCache, *args: Any, **kwargs: Any) -> Any:
         quantized_blocks.append(
             (self.prefill_query_block_size, self.prefill_key_chunk_size)
         )
         return original_quantized(self, *args, **kwargs)
 
-    def fail_dequantize(*args, **kwargs):
+    def fail_dequantize(*args: Any, **kwargs: Any) -> None:
         del args, kwargs
         pytest.fail("full-cache dequantize fallback ran")
 
-    def spy_unpack(packed, bits, length):
+    def spy_unpack(packed: Any, bits: int, length: int) -> Any:
         unpack_calls.append((bits, length))
         return original_unpack(packed, bits, length)
 
@@ -556,8 +559,8 @@ def test_attention_patch_executes_real_q8_multi_token_quantized_suffix(
 
 
 def test_attention_patch_fails_closed_when_long_quantized_prefill_fails(
-    monkeypatch,
-):
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mlx_lm.models import base as mlx_base
 
     from omlx.patches import turboquant_attention as tq_attention
@@ -576,11 +579,15 @@ def test_attention_patch_fails_closed_when_long_quantized_prefill_fails(
     original_key_chunk = tq.prefill_key_chunk_size
     calls = {"quantized": 0, "dequantize": 0}
 
-    def failing_quantized_attention(self, *args, **kwargs):
+    def failing_quantized_attention(
+        self: TurboQuantKVCache, *args: Any, **kwargs: Any
+    ) -> None:
+        del self, args, kwargs
         calls["quantized"] += 1
         raise RuntimeError("forced quantized prefill failure")
 
-    def fail_dequantize(self, *args, **kwargs):
+    def fail_dequantize(self: TurboQuantKVCache, *args: Any, **kwargs: Any) -> None:
+        del self, args, kwargs
         calls["dequantize"] += 1
         pytest.fail("long prefill must not fall back to full-cache dequantize")
 

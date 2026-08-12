@@ -57,6 +57,9 @@ class _AppendModel:
         )
         self.calls = 0
 
+    def make_cache(self) -> list[Any]:
+        return [KVCache(), KVCache()]
+
     def __call__(
         self,
         tokens: mx.array,
@@ -1037,6 +1040,73 @@ def test_sizing_target_pressure_triggers_conversion_before_abort_cap() -> None:
     assert request.turboquant_mid_prefill_attempted is True
 
 
+def test_organic_pressure_triggers_eviction_pause_then_retry_converts() -> None:
+    scheduler = _make_scheduler(step_size=4)
+    cap = _configure_pressure(scheduler)
+    cache = _dense_cache(tokens=4)
+    request = _make_request("organic-flow", list(range(9)), cache)
+    scheduler.requests[request.request_id] = request
+    context = scheduler._new_prefill_context(
+        request,
+        cache,
+        loop_label="external",
+    )
+
+    candidate = scheduler._adaptive_chunk_size(
+        4,
+        request_id=request.request_id,
+        loop_label="external",
+        kv_len=4,
+        prefill_context=context,
+    )
+    assert candidate == 4
+
+    with pytest.raises(_PrefillEvictionNeeded) as exc:
+        scheduler._guard_prefill_chunk(
+            candidate,
+            kv_len=4,
+            progress=4,
+            loop_label="external",
+            request_id=request.request_id,
+            request=request,
+            prompt_cache=cache,
+            prefill_context=context,
+        )
+
+    assert exc.value.request.reason == "turboquant_mid_prefill"
+    assert request.prefill_eviction_retries == 1
+    assert context.conversion_attempted is False
+    assert request.turboquant_mid_prefill_attempted is False
+    assert all(isinstance(cache_obj, KVCache) for cache_obj in cache)
+
+    retry_candidate = scheduler._adaptive_chunk_size(
+        4,
+        request_id=request.request_id,
+        loop_label="external",
+        kv_len=4,
+        prefill_context=context,
+    )
+    assert retry_candidate == 4
+
+    result = scheduler._guard_prefill_chunk(
+        retry_candidate,
+        kv_len=4,
+        progress=4,
+        loop_label="external",
+        request_id=request.request_id,
+        request=request,
+        prompt_cache=cache,
+        prefill_context=context,
+    )
+
+    assert result == 4
+    assert context.phase is _PrefillKVPhase.TURBOQUANT
+    assert context.trigger_tokens == 4
+    assert request.turboquant_mid_prefill_attempted is True
+    assert context.memory_after_bytes < cap
+    assert isinstance(cache[0], TurboQuantKVCache)
+    assert isinstance(cache[1], KVCache)
+
 def test_empty_fresh_cache_resizes_without_conversion() -> None:
     scheduler = _make_scheduler(step_size=4)
     _configure_sizing_band(scheduler)
@@ -1647,10 +1717,12 @@ def test_summary_uses_post_conversion_wall_clock(
     mx.eval(converted_first.keys, converted_first.values)
     clock_values = iter((10.0, 12.0, 14.0, 20.0))
     observed_clock_values: list[float] = []
+    events: list[str] = []
 
     def _clock() -> float:
         value = next(clock_values)
         observed_clock_values.append(value)
+        events.append(f"clock:{value}")
         return value
 
     def _current_usage(
@@ -1660,6 +1732,10 @@ def test_summary_uses_post_conversion_wall_clock(
         del self, refresh_mlx_active
         return 1024**3
 
+    def _sync_and_clear(stream: Any) -> None:
+        del stream
+        events.append("sync")
+
     def _convert(
         prompt_cache: list[Any],
         *,
@@ -1667,6 +1743,7 @@ def test_summary_uses_post_conversion_wall_clock(
         log_result: bool = True,
     ) -> TurboQuantConversionStats:
         del check_cancelled, log_result
+        events.append("convert")
         prompt_cache[0] = converted_first
         return TurboQuantConversionStats(
             converted_layers=1,
@@ -1678,6 +1755,7 @@ def test_summary_uses_post_conversion_wall_clock(
         )
 
     monkeypatch.setattr("omlx.scheduler.time.perf_counter", _clock)
+    monkeypatch.setattr("omlx.scheduler._sync_and_clear_cache", _sync_and_clear)
     scheduler._current_usage_bytes = MethodType(_current_usage, scheduler)
     scheduler._apply_turboquant_kv_convert_sliced = _convert
     first_context = scheduler._new_prefill_context(
@@ -1710,6 +1788,14 @@ def test_summary_uses_post_conversion_wall_clock(
         message for message in caplog.messages if "mid-prefill complete" in message
     )
     assert observed_clock_values == [10.0, 12.0, 14.0, 20.0]
+    assert events == [
+        "clock:10.0",
+        "clock:12.0",
+        "convert",
+        "sync",
+        "clock:14.0",
+        "clock:20.0",
+    ]
     assert context.conversion_completed_at == 14.0
     assert "conversion_pause=2.000s" in summary_log
     assert "post_trigger_prefill_tps=0.67 tok/s" in summary_log

@@ -24,6 +24,8 @@ from typing import Any
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
 
+from ..exceptions import TurboQuantProcessExclusiveError
+
 # Module-level alias so callers can fall back to mlx-lm's default stream
 # when no per-engine stream is provided.
 _default_generation_stream = generation_stream
@@ -70,7 +72,7 @@ class _ConversionCoordinator:
         with self._condition:
             exclusive_owner = self._exclusive_owner_unlocked()
             if exclusive_owner is not None and exclusive_owner is not owner:
-                raise RuntimeError(
+                raise TurboQuantProcessExclusiveError(
                     "TurboQuant mid-prefill requires process-exclusive Metal "
                     "access; unload the mid-prefill model before loading "
                     "another engine"
@@ -92,19 +94,19 @@ class _ConversionCoordinator:
                 raise RuntimeError("mid-prefill owner is not a registered engine")
             exclusive_owner = self._exclusive_owner_unlocked()
             if exclusive_owner is not None and exclusive_owner is not owner:
-                raise RuntimeError(
+                raise TurboQuantProcessExclusiveError(
                     "another engine already owns process-exclusive Metal access"
                 )
             other_engines = [
                 engine for engine in self._registered_engines if engine is not owner
             ]
             if other_engines:
-                raise RuntimeError(
+                raise TurboQuantProcessExclusiveError(
                     "TurboQuant mid-prefill requires process-exclusive Metal "
                     "access; unload all other engines before enabling it"
                 )
             if self._background_metal_operations:
-                raise RuntimeError(
+                raise TurboQuantProcessExclusiveError(
                     "TurboQuant mid-prefill cannot start while an independent "
                     "Metal operation is active"
                 )
@@ -123,7 +125,7 @@ class _ConversionCoordinator:
         """Reject a global-executor task while a mid-prefill engine is live."""
         with self._condition:
             if self._exclusive_owner_unlocked() is not None:
-                raise RuntimeError(
+                raise TurboQuantProcessExclusiveError(
                     "Independent Metal work is unavailable while a "
                     "TurboQuant mid-prefill engine owns the process"
                 )
@@ -133,7 +135,7 @@ class _ConversionCoordinator:
         """Track a non-executor Metal worker such as oQ quantization."""
         with self._condition:
             if self._exclusive_owner_unlocked() is not None:
-                raise RuntimeError(
+                raise TurboQuantProcessExclusiveError(
                     "Independent Metal work is unavailable while a "
                     "TurboQuant mid-prefill engine owns the process"
                 )

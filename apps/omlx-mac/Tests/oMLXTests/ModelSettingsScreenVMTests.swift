@@ -84,7 +84,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(turboquantMidPrefillDetailIsActive(settings))
     }
 
-    func testTurboquantMidPrefillIsInertWhenParentDisabled() {
+    func testTurboquantMidPrefillStaysSavedButInertWhenParentDisabled() {
         let vm = ModelSettingsScreenVM()
         vm.model = makeModel(id: "text-model", configModelType: "qwen3_5")
         vm.turboquantKvEnabled = false
@@ -95,7 +95,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(vm.showsTurboquantMidPrefill)
         XCTAssertEqual(
             settings["turboquant_mid_prefill"]?.value as? Bool,
-            false
+            true
         )
         XCTAssertFalse(turboquantMidPrefillDetailIsActive(settings))
     }

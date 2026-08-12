@@ -46,6 +46,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    TurboQuantProcessExclusiveError,
     describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
@@ -1888,13 +1889,18 @@ class EnginePool:
             # barrier's small-model tolerance floor.
             target = pre_load_memory + 2 * 1024**3
             current = 0
+            blocked_rounds = 0
             for _round in range(6):
                 await asyncio.sleep(0.5 if _round == 0 else 1.0)
                 gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                try:
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+                except TurboQuantProcessExclusiveError:
+                    blocked_rounds += 1
+                    continue
                 current = max(mx.get_active_memory(), get_phys_footprint())
                 if current <= target:
                     logger.info(
@@ -1904,6 +1910,15 @@ class EnginePool:
                     )
                     self._wake_process_memory_enforcer()
                     return
+            if blocked_rounds == 6:
+                logger.warning(
+                    "Post-failed-load reclaim for '%s' remained blocked for "
+                    "all 6 rounds by process-exclusive TurboQuant Metal "
+                    "ownership; deferred buffers remain until exclusivity ends.",
+                    model_id,
+                )
+                self._wake_process_memory_enforcer()
+                return
             logger.warning(
                 f"Post-failed-load reclaim for '{model_id}' did not settle: "
                 f"current={format_size(current)} "
@@ -2027,6 +2042,8 @@ class EnginePool:
                         logger.info(
                             f"DFlash enabled for {model_id}, draft={dflash_draft}"
                         )
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except ImportError:
                         logger.warning(
                             f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
@@ -2127,6 +2144,8 @@ class EnginePool:
 
             try:
                 await engine.start()
+            except TurboQuantProcessExclusiveError:
+                raise
             except Exception as start_error:
                 if _is_dflash_engine:
                     # DFlash engine failed to start -- fall back to the
@@ -2164,6 +2183,8 @@ class EnginePool:
                         )
                     try:
                         await engine.start()
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"DFlash load failed: {start_error}; "
@@ -2202,6 +2223,8 @@ class EnginePool:
                     )
                     try:
                         await engine.start()
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -2238,6 +2261,8 @@ class EnginePool:
                     )
                     try:
                         await engine.start()
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
@@ -2447,6 +2472,12 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if isinstance(exc, TurboQuantProcessExclusiveError):
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' cannot load while process-exclusive "
+                    f"Metal access is unavailable: {exc}",
+                ) from exc
             if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(

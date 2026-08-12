@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -940,6 +940,107 @@ class TestCompletionEndpoint:
 
         assert response.status_code == 200
         assert captured["prefill_eviction_callback_attempted"] is True
+
+    def test_completion_stream_rejects_unsupported_turboquant_layout_before_start(
+        self,
+        client: TestClient,
+        mock_llm_engine: MockBaseEngine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mlx_lm.models.cache import RotatingKVCache
+
+        import omlx.scheduler as scheduler_mod
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        model = MagicMock()
+        model.layers = []
+        model.config = SimpleNamespace(
+            model_type="unit",
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            hidden_size=64,
+            head_dim=32,
+        )
+        model.make_cache.return_value = [RotatingKVCache(max_size=128)]
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                max_num_seqs=1,
+                prefill_step_size=2048,
+                paged_cache_block_size=0,
+            ),
+        )
+        assert scheduler._turboquant_preflight_conversion_eligible is False
+
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_hard_limit_bytes = 1
+        scheduler._prefill_eviction_callback_configured = False
+        scheduler._turboquant_mid_prefill = True
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler._prefill_tq_kv_dtype_size = 1.0
+
+        def _zero_usage(*, refresh_mlx_active: bool = True) -> int:
+            del refresh_mlx_active
+            return 0
+
+        def _exclusive(_owner: object) -> bool:
+            return True
+
+        monkeypatch.setattr(scheduler, "_current_usage_bytes", _zero_usage)
+        monkeypatch.setattr(
+            scheduler_mod._conversion_coordinator,
+            "process_exclusive",
+            _exclusive,
+        )
+
+        async def _preflight_completion(
+            prompt: str,
+            *,
+            request_id: str | None = None,
+            **kwargs: object,
+        ) -> bool | None:
+            del prompt, kwargs
+            scheduler.preflight_or_raise(
+                num_prompt_tokens=65536,
+                request_id=request_id,
+            )
+            return None
+
+        stream_started = False
+
+        async def _stream_generate(
+            prompt: str,
+            **kwargs: object,
+        ) -> AsyncIterator[MockGenerationOutput]:
+            nonlocal stream_started
+            del prompt, kwargs
+            stream_started = True
+            yield MockGenerationOutput(text="must not stream")
+
+        mock_llm_engine.preflight_completion = _preflight_completion
+        mock_llm_engine.stream_generate = _stream_generate
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Rejected stream prompt",
+                "stream": True,
+            },
+            headers={"x-request-id": "unsupported-layout"},
+        )
+
+        assert response.status_code == 400
+        assert response.headers["content-type"].startswith("application/json")
+        body = response.json()
+        assert body["error"]["code"] == "prefill_memory_exceeded"
+        assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
+        assert body["error"]["estimated_bytes"] > body["error"]["limit_bytes"]
+        assert stream_started is False
 
     def test_completion_preflight_failure_does_not_generate(
         self,

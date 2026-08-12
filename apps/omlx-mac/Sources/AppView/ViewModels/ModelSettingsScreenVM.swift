@@ -468,7 +468,6 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.turboquantMidPrefill = !self.isDiffusionModel
-                    && self.turboquantKvEnabled
                     && (s?.turboquantMidPrefill ?? false)
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
@@ -603,7 +602,7 @@ final class ModelSettingsScreenVM {
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
         case .turboquantMidPrefill:
-            patch.turboquantMidPrefill = turboquantKvEnabled && turboquantMidPrefill
+            patch.turboquantMidPrefill = turboquantMidPrefill
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:
@@ -898,7 +897,7 @@ final class ModelSettingsScreenVM {
             }
             putBool(
                 ProfileSettingsKey.turboquantMidPrefill,
-                turboquantKvEnabled && turboquantMidPrefill
+                turboquantMidPrefill
             )
             if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
                 out[ProfileSettingsKey.indexCacheFreq] = AnyCodable(n)

@@ -138,6 +138,9 @@ def _throttle_ctx(
         ns, Scheduler
     )
     ns._prefill_abort_cap = Scheduler._prefill_abort_cap.__get__(ns, Scheduler)
+    ns._prefill_sizing_target = Scheduler._prefill_sizing_target.__get__(
+        ns, Scheduler
+    )
     ns._prefill_abort_description = Scheduler._prefill_abort_description.__get__(
         ns, Scheduler
     )

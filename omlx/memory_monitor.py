@@ -542,19 +542,34 @@ class MemoryMonitor:
         Estimate memory usage for a KV cache block.
 
         Args:
-            block_size: Number of tokens in the block
-            num_layers: Override stored num_layers
-            num_kv_heads: Override stored num_kv_heads
-            head_dim: Override stored head_dim
-            dtype_size: Override stored dtype_size
+            block_size: Number of tokens in the block.
+            num_layers: Override the number of full-attention KV cache layers.
+            num_kv_heads: Override stored num_kv_heads.
+            head_dim: Override stored head_dim.
+            dtype_size: Override stored dtype_size.
 
         Returns:
             Estimated memory in bytes for one block.
         """
-        layers = num_layers or self._num_layers or 32  # Default for ~7B model
-        kv_heads = num_kv_heads or self._num_kv_heads or 8
-        dim = head_dim or self._head_dim or 128
-        dtype = dtype_size or self._dtype_size
+        if num_layers is not None:
+            layers = num_layers
+        elif self._num_kv_cache_layers is not None:
+            layers = self._num_kv_cache_layers
+        elif self._num_layers is not None:
+            layers = self._num_layers
+        else:
+            layers = 32  # Default for ~7B model
+        kv_heads = (
+            num_kv_heads
+            if num_kv_heads is not None
+            else (self._num_kv_heads if self._num_kv_heads is not None else 8)
+        )
+        dim = (
+            head_dim
+            if head_dim is not None
+            else (self._head_dim if self._head_dim is not None else 128)
+        )
+        dtype = self._dtype_size if dtype_size is None else dtype_size
 
         if (
             self._kv_bytes_per_token_override is not None

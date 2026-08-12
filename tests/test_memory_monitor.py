@@ -669,15 +669,31 @@ class TestEstimateResidentKvBytes:
         m.set_fixed_state_bytes(999)
         assert m.estimate_resident_kv_bytes(0) == 0
 
-    def test_prompt_kv_and_block_memory_bytes_unchanged(self):
-        """Regression pin: the throttle static term and the paged-SSD
-        writer-cap input must not move with the resident-KV extension."""
+    def test_prompt_kv_and_block_memory_use_full_attention_layers(self) -> None:
+        """Per-block estimates must not charge recurrent layers as KV."""
         m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
         per_layer_token = 8 * 128 * 2 * 2
-        # estimate_prompt_kv_bytes: full (num_kv_cache_layers) only.
         assert m.estimate_prompt_kv_bytes(1000) == 1000 * 5 * per_layer_token
-        # estimate_block_memory: all num_layers, ignores layer classes.
-        assert m.estimate_block_memory(1) == 30 * 8 * 128 * 2 * 2
+        assert m.estimate_block_memory(1) == 5 * per_layer_token
+
+    def test_zero_full_attention_layers_do_not_fall_back_to_all_layers(self) -> None:
+        m = self._make(num_kv_cache_layers=0, rotating_layer_specs=[(30, 1024)])
+        assert m.estimate_prompt_kv_bytes(1000) == 0
+        assert m.estimate_block_memory(64) == 0
+
+    def test_qwen_hybrid_turboquant_block_uses_sixteen_kv_layers(self) -> None:
+        tq_width = (2 + 64 * 4) / 256
+        weighted_width = (15 * tq_width + 2) / 16
+        m = self._make(
+            num_layers=64,
+            num_kv_cache_layers=16,
+            num_kv_heads=4,
+            head_dim=256,
+            dtype_size=weighted_width,
+            rotating_layer_specs=(),
+        )
+        expected = 64 * 16 * 4 * 256 * weighted_width * 2
+        assert m.estimate_block_memory(64) == expected
 
 
 class TestSetModelInfoFromModelRotating:
