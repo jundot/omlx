@@ -1217,6 +1217,33 @@ def _apply_processors(processors, prev_tokens, logits_2d):
     return logits_2d
 
 
+def _snap_snapshotable(procs):
+    """Checkpoint state of processors exposing ``snapshot_state`` (budget).
+
+    Returns ``None`` when no processor supports position-keyed rewind, so
+    callers can skip the restore unconditionally (the DSpark path applies
+    processors to speculative draft positions; only the budget processor
+    tracks position-sensitive mutable state today).
+    """
+    if not procs:
+        return None
+    snaps = [p.snapshot_state() for p in procs if hasattr(p, "snapshot_state")]
+    return snaps or None
+
+
+def _restore_snapshotable(procs, snaps) -> None:
+    """Rewind processors previously checkpointed by :func:`_snap_snapshotable`."""
+    if not procs or not snaps:
+        return
+    it = iter(snaps)
+    for p in procs:
+        if hasattr(p, "restore_state"):
+            try:
+                p.restore_state(next(it))
+            except StopIteration:
+                return
+
+
 def _logprobs(logits_2d):
     import mlx.core as mx
 
@@ -2045,6 +2072,12 @@ def _dspark_next_drafts(
     draft_accept_lps: List[Any] = []
     previous = anchor.reshape(1)
 
+    # Drafts are speculative — processor calls shape the draft
+    # distribution but must not advance the thinking budget (they would
+    # count tokens that are only emitted if verified later). Checkpoint
+    # before the loop and rewind after.
+    snap = _snap_snapshotable(procs)
+
     for idx in range(depth):
         bias, _ = host.dspark_markov(previous)
         logits_2d = logits[:, idx, :] + bias
@@ -2060,6 +2093,8 @@ def _dspark_next_drafts(
         draft_lps.append(lp_2d.squeeze(0))
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         previous = token.reshape(1)
+
+    _restore_snapshotable(procs, snap)
 
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
@@ -2157,6 +2192,10 @@ def _chain_next_drafts(
     chain_cache = state.mtp_cache
     if state.head_clone and depth > 1:
         chain_cache = _clone_mtp_head_cache(state.mtp_cache)
+
+    # Speculative draft shaping — see _dspark_next_drafts.
+    snap = _snap_snapshotable(procs)
+
     for j in range(depth):
         logits_2d = logits[:, -1, :]
         if procs is not None and prev_buf is not None:
@@ -2179,6 +2218,8 @@ def _chain_next_drafts(
             return_hidden=True,
         )
         h = head_hidden[:, -1:]
+
+    _restore_snapshotable(procs, snap)
 
     if draft_toks:
         state.drafts = mx.concatenate(draft_toks)
@@ -2304,11 +2345,14 @@ def _post_init_mtp(gen_batch: Any) -> None:
     next_ids = next_main_tok.reshape(1, 1)
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
+    # The seed draft is speculative — shape but do not count.
+    snap = _snap_snapshotable(procs)
     if procs is not None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
         mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
+    _restore_snapshotable(procs, snap)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -2690,13 +2734,19 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         n_confirmed=1,
     )
     rows = logits[0]  # (k+1, vocab)
+    row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
-        rows = mx.stack(
-            [
+        applied = []
+        for j in range(k + 1):
+            applied.append(
                 _apply_processors(procs, prev_rows[j], rows[j : j + 1]).squeeze(0)
-                for j in range(k + 1)
-            ]
-        )
+            )
+            # Checkpoint after each row: rows 0..m correspond to the m+1
+            # tokens actually emitted this cycle (m accepted drafts + the
+            # bonus/verify correction). Rows m+1..k are speculative — they
+            # predict rejected drafts and are re-verified next cycle.
+            row_snaps[j] = _snap_snapshotable(procs)
+        rows = mx.stack(applied)
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
 
     if k == 0:
@@ -2799,6 +2849,16 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
                 m = clamped
         emit_last_id = draft_ids[m]
         emit_last_lp = combined_lp[m]
+
+    # Rewind budget-capable processors to the last emitted position.
+    # Rows 0..m produced the m+1 emitted tokens (m accepted drafts + the
+    # bonus/verify correction); rows m+1..k predicted rejected drafts that
+    # are re-verified next cycle, so their processor calls must be undone
+    # (they would over-count the thinking budget / corrupt state). Mirrors
+    # MTPProcessingSampler's position-keyed snapshot/restore on vlm_mtp.
+    # Uses the FINAL m (after the model clamp and boundary alignment above).
+    if m < k and row_snaps[m] is not None:
+        _restore_snapshotable(procs, row_snaps[m])
 
     # A clamp can put the final verify token on the boundary, while a full
     # accept can put its bonus token there. Neither token is present in the
@@ -3003,8 +3063,12 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
+    verify_snap = None
     if procs is not None:
         verify_logits = _apply_processors(procs, prev_main, verify_logits)
+        # Checkpoint after the verify row: it produced the one token that is
+        # ALWAYS emitted (draft on accept, verify correction on reject).
+        verify_snap = _snap_snapshotable(procs)
         bonus_logits = _apply_processors(procs, prev_draft, bonus_logits)
     # Batched logprobs: one logsumexp over (2, vocab) instead of two over
     # (1, vocab). Shaves one reduction per cycle on the vocab dimension.
@@ -3084,6 +3148,11 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     # Reject path.
     state.stats.rejects += 1
     t0 = time.perf_counter()
+    # The bonus row's processor call was speculative (its token is not
+    # emitted on reject) — rewind to the verify-row checkpoint. Mirrors the
+    # chain cycle's restore-on-partial-accept.
+    if procs is not None and verify_snap is not None:
+        _restore_snapshotable(procs, verify_snap)
     # accepted=0 means only the confirmed token (verify position) is kept;
     # block_size=2 covers both the confirmed and the rejected draft.
     if not _rollback_after_reject(
@@ -3160,9 +3229,12 @@ def _step_mtp(
         hidden_at_position, next_ids, state.mtp_cache
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
+    # The draft is speculative — shape it but do not advance the budget.
+    snap = _snap_snapshotable(procs)
     if procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
         mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
+    _restore_snapshotable(procs, snap)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
     # Filtered draft lp — what the sampler actually drew from. The next
