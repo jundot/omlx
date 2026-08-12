@@ -2243,7 +2243,7 @@ def test_first_qwen_q8_suffix_uses_structural_workspace_bound() -> None:
         compute_dtype_size=2,
         causal=True,
     )
-    assert workspace == 1_408_012_288
+    assert workspace == 2_687_666_176
 
     scheduler = _make_scheduler(step_size=2048)
     scheduler._turboquant_kv_bits = 8.0
