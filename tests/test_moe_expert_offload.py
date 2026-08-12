@@ -356,6 +356,29 @@ class TestApplyAndForward:
         mx.eval(got)
         assert bool(mx.array_equal(ref, got))
 
+    def test_admission_estimate(self, tmp_path):
+        """Offload-aware admission: expert bytes scale by the resident
+        fraction; non-expert bytes are untouched; failures fall back to the
+        plain size."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        glu = _make_glu(seed=8)
+        # switch_mlp, not switch_glu: matching is by stacked 3-D proj shape,
+        # not by any particular container name.
+        tensors = _glu_tensors(glu, "layers.0.mlp.switch_mlp")
+        tensors["lm_head.weight"] = mx.zeros((256, D), dtype=mx.float32)
+        _save_checkpoint(tmp_path, tensors)
+        expert_bytes = sum(
+            v.size * v.dtype.size for k, v in tensors.items() if ".switch_mlp." in k
+        )
+        full = 10**9
+        est = estimate_offload_admission_bytes(tmp_path, full, 0.25)
+        assert est == full - int(expert_bytes * 0.75)
+        # unknown path -> conservative fallback
+        assert estimate_offload_admission_bytes("/nonexistent", full, 0.25) == full
+
     def test_kill_switch(self, tmp_path, monkeypatch):
         model, _ = self._wrapped_model(tmp_path)
         monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")

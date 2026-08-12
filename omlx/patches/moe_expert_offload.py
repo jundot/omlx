@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import struct
 from pathlib import Path
 
@@ -50,6 +51,8 @@ from ..scheduler import _sync_and_clear_cache
 logger = logging.getLogger(__name__)
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
+
+_PER_EXPERT_RE = re.compile(r"\.experts\.\d+\.")
 
 # safetensors dtype tag -> (numpy transport dtype, mlx dtype to view as).
 # bf16 has no numpy equivalent, so it travels as raw uint16 and is
@@ -533,6 +536,45 @@ def apply_moe_expert_offload(
             resident_bytes / 1e9,
         )
     return wrapped
+
+
+def estimate_offload_admission_bytes(
+    model_path: str | Path, full_size: int, resident_fraction: float = 0.25
+) -> int:
+    """Admission-time size estimate with offload active.
+
+    Scans safetensors headers (no load) for expert tensors in either
+    supported layout — stacked 3-D ``{gate,up,down}_proj`` tensors under any
+    container name (``switch_glu``, ``switch_mlp``, ...) or per-expert
+    ``.experts.<n>.`` names — and subtracts the non-resident share. Falls
+    back to ``full_size`` on any failure — admission must never get more
+    permissive by accident than the plain estimate would be conservative.
+    """
+    try:
+        model_dir = _resolve_model_dir(model_path)
+        if model_dir is None:
+            return full_size
+        expert_bytes = 0
+        for shard in sorted(Path(model_dir).glob("*.safetensors")):
+            with open(shard, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            for name, spec in header.items():
+                if name == "__metadata__":
+                    continue
+                stacked = len(spec.get("shape", ())) == 3 and any(
+                    f".{p}." in name for p in _PROJS
+                )
+                if stacked or _PER_EXPERT_RE.search(name):
+                    b0, b1 = spec["data_offsets"]
+                    expert_bytes += b1 - b0
+        if expert_bytes <= 0:
+            return full_size
+        saved = int(expert_bytes * (1.0 - resident_fraction))
+        return max(full_size - saved, full_size - expert_bytes)
+    except Exception:
+        logger.debug("offload admission estimate failed", exc_info=True)
+        return full_size
 
 
 def moe_offload_stats(model) -> dict:
