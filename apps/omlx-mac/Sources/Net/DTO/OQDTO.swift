@@ -17,6 +17,7 @@ import Foundation
 struct OQModelInfo: Codable, Equatable, Sendable, Identifiable {
     let path: String
     let name: String
+    let sourceRepoId: String?
     let size: Int64
     let sizeFormatted: String
     let modelType: String

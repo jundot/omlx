@@ -248,7 +248,7 @@ private struct SourceModelSection: View {
                                               defaultValue: "Select a model…",
                                               comment: "Placeholder option in the source-model dropdown"))]
         opts += models.map { m in
-            PopupOption(value: m.path, label: "\(m.name) (\(m.sizeFormatted))")
+            PopupOption(value: m.path, label: "\(m.sourceRepoId ?? m.name) (\(m.sizeFormatted))")
         }
         return opts
     }
@@ -259,7 +259,7 @@ private struct SourceModelSection: View {
                                               defaultValue: "None (use source model)",
                                               comment: "Sentinel option meaning no sensitivity-model override"))]
         opts += sensitivityCandidates.map { m in
-            PopupOption(value: m.path, label: "\(m.name) (\(m.sizeFormatted))")
+            PopupOption(value: m.path, label: "\(m.sourceRepoId ?? m.name) (\(m.sizeFormatted))")
         }
         return opts
     }

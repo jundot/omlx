@@ -1307,7 +1307,7 @@
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <option value="">{{ t('models.oq.select_placeholder') }}</option>
                                             <template x-for="m in oqModels" :key="m.path">
-                                                <option :value="m.path" x-text="m.name + ' (' + m.size_formatted + ')'"></option>
+                                                <option :value="m.path" x-text="(m.source_repo_id || m.name) + ' (' + m.size_formatted + ')'"></option>
                                             </template>
                                         </select>
                                     </div>
