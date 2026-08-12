@@ -4593,6 +4593,17 @@ class Scheduler:
 
     _MAX_PREFILL_EVICTION_RETRIES = 1
 
+    def _reclaim_same_engine_prefill_headroom(self) -> int:
+        """Drop Python cycles, drain this engine, and remeasure its footprint.
+
+        ``_guard_prefill_chunk`` runs on the EngineCore-owned MLX executor, so
+        the thread-local stream passed to ``_reclaim_prefill_headroom`` is the
+        stream that submitted the request's work. Process-exclusive ownership
+        also proves that no other loaded engine can be a safe eviction victim.
+        """
+        gc.collect()
+        return self._reclaim_prefill_headroom()
+
     def _raise_prefill_eviction_if_available(
         self,
         *,
@@ -4609,6 +4620,13 @@ class Scheduler:
         if request is None:
             return
         if getattr(self, "_prefill_eviction_callback_configured", None) is False:
+            return
+        if _conversion_coordinator.process_exclusive(
+            getattr(self, "_metal_process_owner", None)
+        ):
+            # A process-exclusive engine is the sole registered engine. There
+            # cannot be a concrete external victim, so pausing would only
+            # restart work without freeing memory.
             return
         max_retries = getattr(
             self,
@@ -4686,6 +4704,20 @@ class Scheduler:
         request_obj = request
         if request_obj is None and request_id is not None:
             request_obj = getattr(self, "requests", {}).get(request_id)
+
+        process_exclusive = _conversion_coordinator.process_exclusive(
+            getattr(self, "_metal_process_owner", None)
+        )
+        if process_exclusive:
+            # The ordinary reclaim above clears completed Metal work. Before
+            # deciding between dense progress, conversion, and rejection, also
+            # collect request-local Python cycles on this engine's executor and
+            # remeasure. Exclusive ownership proves there is no other loaded
+            # model to evict, so this path must never pause or requeue.
+            current = self._reclaim_same_engine_prefill_headroom()
+            if current + full_transient <= trigger_target:
+                return n_tokens
+
         conversion_available = getattr(
             self,
             "_mid_prefill_conversion_available",
@@ -4696,19 +4728,6 @@ class Scheduler:
             prompt_cache,
             request_obj,
         ):
-            maybe_raise_eviction = getattr(
-                self, "_raise_prefill_eviction_if_available", None
-            )
-            if request_id is not None and callable(maybe_raise_eviction):
-                maybe_raise_eviction(
-                    request_id=request_id,
-                    current=current,
-                    target_cap=trigger_target,
-                    predicted_transient=int(full_transient),
-                    requested_tokens=n_tokens,
-                    reason="turboquant_mid_prefill",
-                    processed_tokens=progress,
-                )
             if (
                 request_obj is not None
                 and prompt_cache is not None
@@ -9592,6 +9611,12 @@ class Scheduler:
         """
         while self._pending_abort_ids:
             request_id = self._pending_abort_ids.pop()
+            pending_eviction = self._pending_prefill_eviction_request
+            if (
+                pending_eviction is not None
+                and pending_eviction.request_id == request_id
+            ):
+                self._pending_prefill_eviction_request = None
             self._do_abort_request(request_id)
 
     def _cleanup_prefill_abort_request(
