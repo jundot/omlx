@@ -187,3 +187,55 @@ class TestReset:
         assert t.last_delta_bytes == 0
         assert t.predict(2048) == 0
         assert t.observed_max_bytes == 0
+
+
+class TestPoolPlateau:
+    """Pool-plateau detection: consecutive non-positive deltas mean the MLX
+    pool absorbs chunk workspaces, so the net footprint stops growing."""
+
+    def test_plateau_detected_after_n_nonpositive_deltas(self):
+        t = PrefillTransientTracker("m")
+        t.update(2048, 6_000_000)  # growth-phase sample
+        assert not t.plateau_detected
+        for _ in range(4):
+            t.update(2048, 0)
+        assert not t.plateau_detected  # 4 consecutive — below threshold
+        t.update(2048, -50_000)  # 5th non-positive
+        assert t.plateau_detected
+
+    def test_positive_delta_resets_plateau(self):
+        t = PrefillTransientTracker("m")
+        for _ in range(6):
+            t.update(2048, 0)
+        assert t.plateau_detected
+        t.update(2048, 3_000_000)
+        assert not t.plateau_detected
+
+    def test_net_ewma_decays_toward_zero_at_plateau(self):
+        t = PrefillTransientTracker("m")
+        t.update(1000, 200_000)  # net 200/token (seeds)
+        t.update(1000, 0)  # net 0 -> 0.3*0 + 0.7*200 = 140
+        assert abs(t.net_bytes_per_token - 140.0) < 0.01
+        t.update(1000, 0)  # 98
+        assert abs(t.net_bytes_per_token - 98.0) < 0.01
+        t.update(1000, 100_000)  # 100 -> 0.3*100 + 0.7*98 = 98.6
+        assert abs(t.net_bytes_per_token - 98.6) < 0.01
+
+    def test_negative_delta_keeps_ewma_and_samples_semantics(self):
+        """Existing semantics preserved: negatives never touch the
+        absolute-growth EWMA or the sample count."""
+        t = PrefillTransientTracker("m")
+        t.update(1000, 100_000)
+        baseline = t.bytes_per_token
+        t.update(1000, -50_000)
+        assert t.samples == 1
+        assert t.bytes_per_token == baseline
+
+    def test_reset_clears_plateau_state(self):
+        t = PrefillTransientTracker("m")
+        for _ in range(6):
+            t.update(2048, 0)
+        assert t.plateau_detected
+        t.reset()
+        assert not t.plateau_detected
+        assert t.net_bytes_per_token == 0.0

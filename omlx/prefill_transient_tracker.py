@@ -26,6 +26,11 @@ class PrefillTransientTracker:
     """
 
     _EWMA_ALPHA = 0.3  # weight on the most recent chunk
+    # Consecutive non-positive chunk deltas that define a pool plateau.
+    # At the plateau the MLX cache pool absorbs each chunk's workspace, so
+    # the NET footprint does not grow and the absolute-growth predictors
+    # (last-delta / EWMA / static) over-predict by the growth-phase rate.
+    _PLATEAU_CHUNKS = 5
     # Candidates above this are rejected from the running max: a one-off
     # Metal/pool spike this large is not a repeatable chunk transient, and
     # charging it at admission would refuse prompts that always fit. A
@@ -61,6 +66,14 @@ class PrefillTransientTracker:
         # need to allocate that pool again on the next chunk, so the scheduler
         # prices it once until a positive measurement confirms reallocation.
         self._recent_reclaim_bytes: int = 0
+        # Consecutive non-positive chunk deltas; >= _PLATEAU_CHUNKS means the
+        # MLX pool is absorbing chunk workspaces (net footprint ~0).
+        self._plateau_streak: int = 0
+        # EWMA over EVERY chunk's net per-token delta (non-positives as 0).
+        # Measures steady-state net growth — ~0 at the pool plateau, where the
+        # absolute-growth EWMA stays stuck at the growth-phase rate.
+        self._net_ewma_per_token: float = 0.0
+        self._net_ewma_samples: int = 0
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
         """Accumulate footprint released since the last positive sample."""
@@ -83,8 +96,13 @@ class PrefillTransientTracker:
         """Record one chunk observation.
 
         Negative deltas (MLX cache pool reclaim larger than this chunk's
-        allocation) are skipped — they would bias the EWMA toward zero
-        and underestimate the next chunk's footprint.
+        allocation) are skipped from the absolute-growth EWMA — they would
+        bias it toward zero and underestimate the next chunk's footprint.
+        They DO count toward the plateau streak and the net-rate EWMA: a
+        run of non-positive deltas means the pool absorbed the chunk's
+        workspace (net footprint ~0), and sizing against the net rate then
+        re-expands chunks that the stale absolute predictors would shrink
+        needlessly.
 
         ``floor_sample`` marks a chunk at the throttle's floor size. Only
         those feed the running max: admission charges the floor chunk, and
@@ -104,8 +122,14 @@ class PrefillTransientTracker:
         if n_tokens <= 0:
             return
         if transient_bytes <= 0:
+            # Pool plateau signal: this chunk's workspace was absorbed (or
+            # the pool reclaimed more than the chunk allocated). Extend the
+            # streak and fold a zero-rate sample into the net EWMA.
+            self._plateau_streak += 1
+            self._update_net_ewma(0.0)
             return
 
+        self._plateau_streak = 0
         self._recent_reclaim_bytes = 0
 
         # The very first sample after a model load carries weight page-fault
@@ -147,9 +171,21 @@ class PrefillTransientTracker:
                 self._EWMA_ALPHA * per_token
                 + (1.0 - self._EWMA_ALPHA) * self._ewma_per_token
             )
+        self._update_net_ewma(per_token)
         self._samples += 1
         self._last_delta_bytes = transient_bytes
         self._last_n_tokens = n_tokens
+
+    def _update_net_ewma(self, per_token: float) -> None:
+        """Blend one net per-token sample (non-positive deltas as 0)."""
+        if self._net_ewma_samples == 0:
+            self._net_ewma_per_token = per_token
+        else:
+            self._net_ewma_per_token = (
+                self._EWMA_ALPHA * per_token
+                + (1.0 - self._EWMA_ALPHA) * self._net_ewma_per_token
+            )
+        self._net_ewma_samples += 1
 
     def predict(self, n_tokens: int, *, safety_factor: float = 1.2) -> int:
         """Predicted transient bytes for a chunk of `n_tokens`.
@@ -191,6 +227,26 @@ class PrefillTransientTracker:
         """Footprint released since the last positive chunk measurement."""
         return self._recent_reclaim_bytes
 
+    @property
+    def plateau_detected(self) -> bool:
+        """True after ``_PLATEAU_CHUNKS`` consecutive non-positive deltas.
+
+        The MLX pool is absorbing chunk workspaces: the net footprint is
+        ~0 while the absolute-growth predictors stay frozen at the
+        growth-phase rate.
+        """
+        return self._plateau_streak >= self._PLATEAU_CHUNKS
+
+    @property
+    def net_bytes_per_token(self) -> float:
+        """EWMA over every chunk's NET per-token delta (non-positives as 0).
+
+        Measures steady-state net footprint growth — ~0 at the pool
+        plateau, where the absolute predictors over-predict. Used by the
+        throttle to size chunks once the plateau is detected.
+        """
+        return self._net_ewma_per_token
+
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
         self._ewma_per_token = 0.0
@@ -199,3 +255,6 @@ class PrefillTransientTracker:
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
         self._recent_reclaim_bytes = 0
+        self._plateau_streak = 0
+        self._net_ewma_per_token = 0.0
+        self._net_ewma_samples = 0

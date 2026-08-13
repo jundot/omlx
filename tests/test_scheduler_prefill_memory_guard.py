@@ -947,3 +947,94 @@ def test_admission_compares_against_hard_watermark():
     scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def _grow_then_plateau_tracker(scheduler: Scheduler):
+    """Seed the scheduler's tracker with a growth-phase sample followed by
+    enough non-positive deltas to detect a pool plateau (net rate ~0)."""
+    tracker = scheduler._prefill_transient_tracker
+    tracker.update(
+        n_tokens=2048, transient_bytes=6_000_000_000
+    )  # ~2.93 MB/token growth phase
+    for _ in range(10):
+        tracker.update(n_tokens=2048, transient_bytes=0)
+    return tracker
+
+
+def test_adaptive_chunk_size_reexpands_at_pool_plateau():
+    """At the pool plateau the throttle sizes with the NET rate, so a chunk
+    the stale absolute predictors would shrink runs unchanged."""
+    scheduler = _make_scheduler()
+    scheduler._memory_limit_bytes = 2 * 1024**3
+    scheduler._memory_hard_limit_bytes = 2 * 1024**3
+    tracker = _grow_then_plateau_tracker(scheduler)
+    assert tracker.plateau_detected
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        size = scheduler._adaptive_chunk_size(
+            2048, request_id="req-plateau", loop_label="external", kv_len=330000
+        )
+    assert size == 2048
+
+
+def test_adaptive_chunk_size_still_shrinks_without_plateau():
+    """Control: without the plateau the same setup shrinks the chunk — the
+    re-expansion is attributable to the plateau detection, not the setup."""
+    scheduler = _make_scheduler()
+    scheduler._memory_limit_bytes = 2 * 1024**3
+    scheduler._memory_hard_limit_bytes = 2 * 1024**3
+    scheduler._prefill_transient_tracker.update(
+        n_tokens=2048, transient_bytes=6_000_000_000
+    )
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        size = scheduler._adaptive_chunk_size(
+            2048, request_id="req-growth", loop_label="external", kv_len=330000
+        )
+    assert size < 2048
+
+
+def test_guard_prefill_chunk_does_not_reshrink_at_plateau():
+    """The guard's secondary clamp mirrors the throttle at the plateau: a
+    re-expanded chunk is not immediately shrunk back. The abort gate stays
+    conservative (exercised via the min-chunk fit check)."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    scheduler._memory_abort_limit_bytes = 2 * 1024**3  # safety cap ~1.6 GB
+    _grow_then_plateau_tracker(scheduler)
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        size = scheduler._guard_prefill_chunk(
+            2048, kv_len=0, progress=0, loop_label="external"
+        )
+    assert size == 2048
+
+
+def test_guard_prefill_chunk_still_shrinks_without_plateau():
+    """Control: same guard setup without the plateau shrinks the chunk."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    scheduler._memory_abort_limit_bytes = 2 * 1024**3
+    scheduler._prefill_transient_tracker.update(
+        n_tokens=2048, transient_bytes=6_000_000_000
+    )
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        size = scheduler._guard_prefill_chunk(
+            2048, kv_len=0, progress=0, loop_label="external"
+        )
+    assert size < 2048

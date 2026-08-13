@@ -3928,6 +3928,18 @@ class Scheduler:
 
         # The floor fits — pick the largest chunk that still fits under the cap.
         per_token = self._predicted_chunk_transient(n_tokens, kv_len) / n_tokens
+        tracker = self._prefill_transient_tracker
+        if (
+            tracker is not None
+            and tracker.plateau_detected
+            and tracker.net_bytes_per_token > 0
+        ):
+            # Mirror the adaptive throttle: at the pool plateau the NET
+            # rate sizes the chunk (the absolute predictors are stale at
+            # the growth-phase rate), so a re-expanded chunk is not
+            # immediately shrunk back by this secondary clamp. The abort
+            # gate above stays on the conservative absolute bound.
+            per_token = tracker.net_bytes_per_token * self._PREFILL_TRANSIENT_SAFETY
         safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
         n_fit = max(min_chunk, min(n_tokens, safe_n))
         # Same quantization as the adaptive throttle: an off-grid size here
@@ -4039,6 +4051,26 @@ class Scheduler:
         # measurement so it tracks growth with kv_len instead of lagging behind
         # a long-run average.
         per_token = self._predicted_chunk_transient(requested, kv_len) / requested
+        tracker = self._prefill_transient_tracker
+        if (
+            tracker is not None
+            and tracker.plateau_detected
+            and tracker.net_bytes_per_token > 0
+        ):
+            # Pool plateau: recent chunks net ~0 footprint growth (the MLX
+            # pool absorbs their workspaces), while the absolute predictors
+            # stay frozen at the growth-phase rate. Size against the NET
+            # rate so chunks re-expand instead of shrinking needlessly for
+            # the rest of the prefill. The pre-chunk guard's abort gate
+            # still prices the conservative absolute bound, and the
+            # enforcer's pressure abort remains the backstop.
+            per_token = tracker.net_bytes_per_token * self._PREFILL_TRANSIENT_SAFETY
+            logger.debug(
+                "Prefill throttle: pool plateau detected, sizing with "
+                "net rate %.1f KB/token (was %.1f KB/token)",
+                per_token / 1024,
+                self._predicted_chunk_transient(requested, kv_len) / requested / 1024,
+            )
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
