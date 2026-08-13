@@ -5863,7 +5863,7 @@ class Scheduler:
         if state.tokens_remaining.shape[1] == 0:
             return True
 
-        _t_chunk_start = time.perf_counter()
+        _t_chunk_start = time.perf_counter() if self._decode_fairness else None
         remaining = state.tokens_remaining.shape[1]
         prefill_step_size = self._prefill_step_size_for_progress(
             state.tokens_processed, remaining
@@ -6040,14 +6040,15 @@ class Scheduler:
 
         if self._should_clear_after_chunk():
             _sync_and_clear_cache(self._stream)
-        chunk_dt = time.perf_counter() - _t_chunk_start
-        # Full-size chunks only: boundary/tail slivers under-measure, and
-        # the running max must reflect sustained capability.
-        if chunk_dt > 0.0 and n >= _CONTENDED_CHUNK_FLOOR:
-            rate = n / chunk_dt
-            if self._prefill_tps_best is None or rate > self._prefill_tps_best:
-                self._prefill_tps_best = rate
-        self._accrue_decode_debt(chunk_dt)
+        if _t_chunk_start is not None:
+            chunk_dt = time.perf_counter() - _t_chunk_start
+            # Full-size chunks only: boundary/tail slivers under-measure, and
+            # the running max must reflect sustained capability.
+            if chunk_dt > 0.0 and n >= _CONTENDED_CHUNK_FLOOR:
+                rate = n / chunk_dt
+                if self._prefill_tps_best is None or rate > self._prefill_tps_best:
+                    self._prefill_tps_best = rate
+            self._accrue_decode_debt(chunk_dt)
         return state.tokens_remaining.shape[1] == 0
 
     def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:

@@ -1889,10 +1889,11 @@ def test_summary_uses_post_conversion_wall_clock(
     assert "GiB" in summary_log
 
 
-def test_contexts_and_pretrigger_chunks_avoid_telemetry_clocks(
+def test_contexts_and_pretrigger_chunks_avoid_telemetry_clocks_when_fairness_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     enabled = _make_scheduler(step_size=4)
+    enabled._decode_fairness = False
     enabled_cache = _dense_cache()
     enabled_request = _make_request(
         "enabled-pretrigger",
@@ -1908,6 +1909,7 @@ def test_contexts_and_pretrigger_chunks_avoid_telemetry_clocks(
     assert enabled_state.prefill_context.started_at is not None
 
     disabled = _make_scheduler(step_size=4)
+    disabled._decode_fairness = False
     disabled._turboquant_mid_prefill = False
     disabled_cache = _dense_cache()
     disabled_request = _make_request(
@@ -1917,6 +1919,7 @@ def test_contexts_and_pretrigger_chunks_avoid_telemetry_clocks(
     )
 
     restored = _make_scheduler(step_size=4)
+    restored._decode_fairness = False
     restored_cache = _dense_cache(tokens=4)
     restored._apply_turboquant_kv_convert(restored_cache)
     restored_request = _make_request(
