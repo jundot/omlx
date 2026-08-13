@@ -818,9 +818,21 @@ def test_step_prefill_reclaims_before_first_guard():
         _record_chunk_transient=MagicMock(),
         _maybe_record_fixed_state_bytes=MagicMock(),
     )
-    ns._prefill_step_size_for_progress = (
-        Scheduler._prefill_step_size_for_progress.__get__(ns, Scheduler)
-    )
+    ns.running = {}
+    ns._decode_fairness = True
+    ns._decode_time_owed_s = 0.0
+    ns._decode_activity_key = "test-engine"
+    ns._prefill_tps_best = None
+    for _name in (
+        "_prefill_step_size_for_progress",
+        "_base_prefill_step_size",
+        "_contended_prefill_cap",
+        "_decode_contention",
+        "_others_decoding",
+        "_should_clear_after_chunk",
+        "_accrue_decode_debt",
+    ):
+        setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
 
     with (

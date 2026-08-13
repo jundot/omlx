@@ -441,6 +441,8 @@
   "settings.resource.embedding_batch_size": "Embedding バッチサイズ",
   "settings.resource.embedding_batch_size_hint": "1 回のフォワードパスで埋め込む入力テキストの最大数。値が大きいほどスループットは向上しますが、メモリ使用量も増加します。",
   "settings.resource.chunked_prefill": "Chunked Prefill",
+  "settings.resource.decode_fairness": "Decode Fairness",
+  "settings.resource.decode_fairness_description": "Keep token generation responsive while other requests or models prefill: prompts are chunked under contention and each chunk yields GPU time back to running decodes. Turn off to restore prefill-first scheduling.",
   "settings.resource.prefill_priority.label": "Prefill Priority",
   "settings.resource.prefill_priority.description": "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit.",
   "settings.resource.prefill_priority.max_context": "Max Context",

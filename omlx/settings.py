@@ -279,6 +279,11 @@ class SchedulerSettings:
     #   "speed" — never shrink; keep full-size steps and only admit prompts
     #     that fit at full speed (smaller effective context limit).
     prefill_priority: str = "context"
+    # When True (default), prefill yields GPU time to running decodes:
+    # prompts are force-chunked under contention, chunks are capped while
+    # any engine decodes, and each chunk accrues a decode time debt repaid
+    # before the next chunk runs. Off restores the pre-fairness behavior.
+    decode_fairness: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -304,6 +309,7 @@ class SchedulerSettings:
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
+            decode_fairness=bool(data.get("decode_fairness", True)),
         )
 
 
@@ -1526,6 +1532,7 @@ class GlobalSettings:
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
+            decode_fairness=self.scheduler.decode_fairness,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

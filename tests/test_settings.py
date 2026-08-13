@@ -334,7 +334,18 @@ class TestSchedulerSettings:
             "embedding_batch_size": 32,
             "chunked_prefill": False,
             "prefill_priority": "context",
+            "decode_fairness": True,
         }
+
+    def test_decode_fairness_from_dict(self):
+        """Defaults on; explicit false round-trips."""
+        assert SchedulerSettings.from_dict({}).decode_fairness is True
+        assert (
+            SchedulerSettings.from_dict(
+                {"decode_fairness": False}
+            ).decode_fairness
+            is False
+        )
 
     def test_prefill_priority_from_dict(self):
         """Valid values pass through; anything else falls back to context."""

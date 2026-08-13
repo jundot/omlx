@@ -441,6 +441,8 @@
   "settings.resource.embedding_batch_size": "Embedding 批大小",
   "settings.resource.embedding_batch_size_hint": "单次前向计算处理的最大 embedding 输入文本数。值越大吞吐量越高，但内存使用也越多。",
   "settings.resource.chunked_prefill": "分块预填充",
+  "settings.resource.decode_fairness": "Decode Fairness",
+  "settings.resource.decode_fairness_description": "Keep token generation responsive while other requests or models prefill: prompts are chunked under contention and each chunk yields GPU time back to running decodes. Turn off to restore prefill-first scheduling.",
   "settings.resource.prefill_priority.label": "预填充优先级",
   "settings.resource.prefill_priority.description": "最大上下文模式在内存压力下牺牲预填充速度以支持更大的提示词；速度模式保持完整预填充速度，拒绝无法容纳的提示词。",
   "settings.resource.prefill_priority.max_context": "最大上下文",
