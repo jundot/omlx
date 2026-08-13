@@ -253,6 +253,7 @@ class TestMlaKvMemoryEstimate:
         assert actual == tokens * bytes_per_token
         assert actual < standard / 20
 
+
     def test_scheduler_passes_mla_kv_override_to_monitor(self):
         sched = _make_scheduler()
         sched.memory_monitor = MagicMock()
@@ -268,6 +269,48 @@ class TestMlaKvMemoryEstimate:
         assert kwargs["num_kv_heads"] == 64
         assert kwargs["num_kv_cache_layers"] == 99
         assert kwargs["kv_bytes_per_token"] == (78 * (512 + 64) + 21 * 128) * 2
+
+
+class _DeepSeekV4MlaConfig:
+    """DeepSeek-V4-style MLA config: no ``kv_lora_rank``, ratio-compressed pooled cache."""
+
+    model_type = "deepseek_v4"
+    num_hidden_layers = 46
+    num_key_value_heads = 1
+    num_attention_heads = 64
+    hidden_size = 8192
+    q_lora_rank = 512
+    o_lora_rank = 512
+    qk_rope_head_dim = 64
+    index_head_dim = 0
+    compress_ratios = [0, 4, 128, 4, 128]
+
+
+class TestDeepSeekV4MlaKvEstimate:
+    def _v4_cache(self):
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        return [CacheList(KVCache(), KVCache()) for _ in range(2)]
+
+    def test_v4_uses_smallest_ratio_pooled_estimate(self):
+        # 2 layer caches, latent 512 + rope 64, dtype 2, smallest ratio 4:
+        # 2 * (512 + 64) * 2 / 4 = 576.0
+        bytes_per_token = estimate_mla_kv_bytes_per_token(
+            _DeepSeekV4MlaConfig(),
+            self._v4_cache(),
+            dtype_size=2,
+        )
+
+        assert bytes_per_token == 576.0
+
+    def test_v4_without_compress_ratios_returns_none(self):
+        config = _DeepSeekV4MlaConfig()
+        config.compress_ratios = None
+
+        assert (
+            estimate_mla_kv_bytes_per_token(config, self._v4_cache(), dtype_size=2)
+            is None
+        )
 
 
 class TestSetModelInfoTurboQuantDtype:

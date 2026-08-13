@@ -1232,10 +1232,8 @@ def estimate_mla_kv_bytes_per_token(
     """
     kv_lora_rank = _cfg_get(config, "kv_lora_rank")
     rope_dim = _cfg_get(config, "qk_rope_head_dim")
-    if not (_pos_int(kv_lora_rank) and _pos_int(rope_dim)):
-        return None
-
-    if cache_list is None:
+    has_latent = _pos_int(kv_lora_rank) and _pos_int(rope_dim)
+    if not has_latent and cache_list is None:
         return None
 
     main_cache_layers = 0
@@ -1259,6 +1257,28 @@ def estimate_mla_kv_bytes_per_token(
     index_head_dim = _cfg_get(config, "index_head_dim", 0) or 0
     if not _pos_int(index_head_dim):
         index_head_dim = 0
+
+    if not has_latent:
+        # DeepSeek-V4 MLA (PoolingCache): no ``kv_lora_rank`` key; the latent
+        # rank lives in q_lora_rank / o_lora_rank and the resident cache is
+        # ratio-compressed (compress_ratios), so the expanded-latent formula
+        # below would over-count by ~10x and the generic uniform-KV fallback
+        # even more (it charges num_kv_heads * head_dim expanded K/V that MLA
+        # never stores). Charge the pooled per-token cost at the most
+        # conservative (smallest) compression ratio — never under-counts, and
+        # admits the long contexts the model actually fits in.
+        latent_rank = _cfg_get(config, "q_lora_rank") or _cfg_get(config, "o_lora_rank")
+        compress_ratios = _cfg_get(config, "compress_ratios") or []
+        if _pos_int(latent_rank) and compress_ratios:
+            min_ratio = min(
+                (int(r) for r in compress_ratios if isinstance(r, int) and r > 0),
+                default=None,
+            )
+            if min_ratio:
+                return float(
+                    main_cache_layers * (latent_rank + rope_dim) * dtype_size / min_ratio
+                )
+        return None
 
     elems_per_token = (
         main_cache_layers * (kv_lora_rank + rope_dim)
