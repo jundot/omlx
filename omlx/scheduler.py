@@ -400,6 +400,20 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _align_final_prefill_chunk(chunk_len: int, remaining: int) -> int:
+    """Keep the final prefill chunk 64-aligned.
+
+    An unaligned final chunk (``remaining % 64 != 0``) misses native attention
+    kernel gates (``L % 64 == 0``) and falls back to a full ``(64, L, P)``
+    pooled-scores materialization (~20 GB at 350K context). Splitting it into a
+    64-aligned prefix + a <64-token tail keeps the native path at full length;
+    the tail's fallback cost is bounded by ``L < 64`` (~1.4 GB, pool-absorbed).
+    """
+    if chunk_len == remaining and remaining > 64 and remaining % 64 != 0:
+        return chunk_len - (remaining % 64)
+    return chunk_len
+
+
 class _PrefillAbortedError(Exception):
     """Raised when prefill is interrupted by a pending abort."""
 
@@ -3416,6 +3430,8 @@ class Scheduler:
                 request_id=request.request_id,
             )
 
+            n_to_process = _align_final_prefill_chunk(n_to_process, remaining)
+
             _throttle_pre = get_phys_footprint()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
@@ -4917,6 +4933,8 @@ class Scheduler:
             loop_label="chunked_step",
             request_id=state.request.request_id,
         )
+
+        n = _align_final_prefill_chunk(n, state.tokens_remaining.shape[1])
 
         _throttle_pre = get_phys_footprint()
         # Chunked prefill also bypasses BatchGenerator and must establish the
