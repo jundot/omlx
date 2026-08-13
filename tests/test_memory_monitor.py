@@ -636,6 +636,24 @@ class TestEstimateResidentKvBytes:
                 n, chunk_tokens=256
             ) == m.estimate_prompt_kv_bytes(n)
 
+    def test_boundary_snapshot_excludes_sliceable_full_kv(self):
+        m = self._make(num_kv_cache_layers=30)
+        assert m.estimate_boundary_snapshot_bytes(100_000, block_size=64) == 0
+
+    def test_boundary_snapshot_includes_only_rotating_and_fixed_state(self):
+        m = self._make(
+            num_kv_cache_layers=5,
+            rotating_layer_specs=[(25, 1024)],
+        )
+        m.set_fixed_state_bytes(123_456)
+        per_layer_token = 8 * 128 * 2 * 2
+        expected = 25 * 1024 * per_layer_token + 123_456
+
+        snapshot = m.estimate_boundary_snapshot_bytes(100_000, block_size=64)
+
+        assert snapshot == expected
+        assert snapshot < m.estimate_resident_kv_bytes(100_000, chunk_tokens=64)
+
     def test_hybrid_rotating_term_below_window_grows_linearly(self):
         m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
         n = 512
@@ -733,6 +751,40 @@ class TestEstimateResidentKvBytes:
         m.set_fixed_state_bytes(123_456_789)
         assert m.estimate_resident_kv_bytes(100) == base + 123_456_789
         assert m.estimate_prompt_kv_bytes(100) == prompt_kv
+
+    def test_qwen4_boundary_snapshot_uses_fixed_recurrent_state(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = SimpleNamespace(
+            model_type="qwen4_exp",
+            num_hidden_layers=48,
+            num_attention_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_n_heads=4,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+            full_attention_interval=4,
+            layer_types=None,
+        )
+        profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+        m = MemoryMonitor(max_kv_cache_memory=2 * 1024**3)
+        m.set_model_info(
+            num_layers=48,
+            num_kv_heads=2,
+            head_dim=256,
+            dtype_size=2,
+            num_attention_heads=24,
+            compute_dtype_size=2,
+            prefill_memory_profile=profile,
+        )
+        m.set_fixed_state_bytes(123_456_789)
+
+        assert (
+            m.estimate_boundary_snapshot_bytes(100_000, block_size=64)
+            == 123_456_789
+        )
 
     def test_zero_tokens_returns_zero(self):
         m = self._make(num_kv_cache_layers=30)
@@ -988,6 +1040,37 @@ class TestDeepSeekV4PrefillMemoryProfile:
             monitor.estimate_resident_kv_bytes(tokens, chunk_tokens=chunk) == expected
         )
         assert expected < 2 * 1024**3
+
+    def test_boundary_snapshot_prices_compacted_non_sliceable_state(self):
+        monitor = self._monitor()
+        tokens = 200_000
+        block_size = 64
+
+        local = 43 * 128 * 512
+        ratio4_delta_rows = tokens // 4 - (tokens - block_size) // 4
+        ratio4_remainder = tokens % 4
+        ratio4_main = (
+            ratio4_delta_rows * 512
+            + 2 * ratio4_remainder * 1024
+            + 2 * 4 * 1024
+        )
+        ratio4_index = (
+            ratio4_delta_rows * 128
+            + 2 * ratio4_remainder * 256
+            + 2 * 4 * 256
+        )
+        ratio128_delta_rows = tokens // 128 - (tokens - block_size) // 128
+        ratio128_main = ratio128_delta_rows * 512 + 2 * (tokens % 128) * 512
+        expected = (local + 21 * (ratio4_main + ratio4_index) + 20 * ratio128_main) * 2
+
+        snapshot = monitor.estimate_boundary_snapshot_bytes(
+            tokens, block_size=block_size
+        )
+
+        assert snapshot == expected
+        assert snapshot < monitor.estimate_resident_kv_bytes(
+            tokens, chunk_tokens=block_size
+        )
 
     def test_native_prefill_transient_does_not_charge_dense_full_context_sdpa(
         self, monkeypatch

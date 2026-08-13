@@ -127,6 +127,11 @@ def _throttle_ctx(
         _PREFILL_ABORT_MARGIN=Scheduler._PREFILL_ABORT_MARGIN,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
         _last_mlx_active_memory_bytes=0,
+        # Attributes _guard_prefill_chunk's writeback probe reads. Left absent
+        # (no SSD persistence) so the probe short-circuits to 0 on the stand-in.
+        _boundary_snapshot_store=None,
+        block_aware_cache=None,
+        config=SimpleNamespace(paged_cache_block_size=0),
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
     ns._snap_chunk_size = Scheduler._snap_chunk_size.__get__(ns, Scheduler)
@@ -139,6 +144,9 @@ def _throttle_ctx(
     )
     ns._prefill_abort_cap = Scheduler._prefill_abort_cap.__get__(ns, Scheduler)
     ns._prefill_abort_description = Scheduler._prefill_abort_description.__get__(
+        ns, Scheduler
+    )
+    ns._boundary_snapshot_bytes_at = Scheduler._boundary_snapshot_bytes_at.__get__(
         ns, Scheduler
     )
     ns._reclaim_to = reclaim_to
