@@ -665,7 +665,7 @@
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.mtp_compatibility_reason"></p>
                                             <button type="button"
-                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
+                                                    x-show="!modelSettings.mtp_compatible && (modelSettings.mtp_compatibility_reason || '').includes('MTPLX side-car')"
                                                     @click="importMtplxSidecar()"
                                                     :disabled="importingMtplx"
                                                     :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"

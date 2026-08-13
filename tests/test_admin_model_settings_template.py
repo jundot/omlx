@@ -1,6 +1,7 @@
 """Regression tests for admin model-settings UI gates."""
 
 import json
+import re
 from pathlib import Path
 
 
@@ -11,8 +12,23 @@ def _model_settings_template() -> str:
     ).read_text()
 
 
+def _dashboard_js() -> str:
+    root = Path(__file__).resolve().parents[1]
+    return (root / "omlx/admin/static/js/dashboard.js").read_text()
+
+
+
+
 def _section(html: str, start_marker: str, end_marker: str) -> str:
     return html.split(start_marker, 1)[1].split(end_marker, 1)[0]
+
+
+def _initial_model_settings(js: str) -> str:
+    return _section(
+        js,
+        "// Model settings modal",
+        "savingModelSettings: false",
+    )
 
 
 def test_lightning_mtp_and_turboquant_are_not_ui_mutexed() -> None:
@@ -118,6 +134,54 @@ def test_locales_include_mid_prefill_copy_and_parent_semantics() -> None:
         "and continue with TurboQuant. Requires this to be the only loaded model. "
         "Adds a one-time pause and may slow the rest of prefill."
     )
+
+
+def test_initial_model_settings_has_safe_mtp_defaults() -> None:
+    initial = _initial_model_settings(_dashboard_js())
+
+    assert "mtp_enabled: false" in initial
+    assert "mtp_compatible: false" in initial
+    assert "mtp_compatibility_reason: ''" in initial
+
+
+def test_mtplx_import_condition_guards_empty_compatibility_reason() -> None:
+    html = _model_settings_template()
+
+    assert (
+        "x-show=\"!modelSettings.mtp_compatible && "
+        "(modelSettings.mtp_compatibility_reason || '').includes("
+        "'MTPLX side-car')\""
+        in html
+    )
+
+
+def test_direct_modal_receiver_operations_have_safe_initial_values() -> None:
+    html = _model_settings_template()
+    initial = _initial_model_settings(_dashboard_js())
+    direct_receiver_fields = {
+        method_field or length_field
+        for method_field, _, length_field in re.findall(
+            r"modelSettings\.([A-Za-z_$][\w$]*)\."
+            r"(includes|some|push|splice)\s*\("
+            r"|modelSettings\.([A-Za-z_$][\w$]*)\.length\b",
+            html,
+        )
+    }
+    guarded_receiver_fields = set(
+        re.findall(
+            r"\(modelSettings\.([A-Za-z_$][\w$]*) \|\| "
+            r"(?:''|\"\")\)\.(?:includes|some|push|splice)\s*\(",
+            html,
+        )
+    )
+    receiver_fields = direct_receiver_fields | guarded_receiver_fields
+
+    assert receiver_fields == {
+        "ctKwargEntries",
+        "mtp_compatibility_reason",
+    }
+    assert "ctKwargEntries: []" in initial
+    assert "mtp_compatibility_reason: ''" in initial
 
 
 def test_reasoning_effort_offers_max_after_high() -> None:
