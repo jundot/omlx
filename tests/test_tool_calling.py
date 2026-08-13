@@ -4215,3 +4215,45 @@ def test_non_object_arguments_still_coerce_to_empty_object():
     assert mod._serialize_tool_call_arguments([1, 2]) == "{}"
     assert mod._serialize_tool_call_arguments("not json") == "{}"
     assert mod._serialize_tool_call_arguments({"a": 1}) == '{"a": 1}'
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_string_parser_output_that_cannot_decode_drops_the_call(
+    monkeypatch, error
+):
+    """The string branch loses arguments the same way the dict branch did.
+
+    Parsers that follow the OpenAI spec hand back a JSON-object *string*
+    (mlx-vlm and mlx-lm's gemma4 do). If decoding that string breaches the
+    limit, catching the error here would fall through to the "{}" coercion and
+    emit a runnable call without its arguments. Caught by DiscoStew6082 on
+    #2593 after the dict branch was already fixed.
+
+    The decode is made to fail only for this exact payload, so the downstream
+    validator still works and the drop is attributable to this branch.
+    """
+    import omlx.api.tool_calling as mod
+
+    payload = '{"path": "notes.xml", "content": "IMPORTANT"}'
+    real_loads = json.loads
+
+    def selective(s, *args, **kwargs):
+        if s == payload:
+            raise error("nested too deeply")
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(mod.json, "loads", selective)
+    try:
+        built = mod._build_tool_call("write_file", payload)
+    finally:
+        monkeypatch.setattr(mod.json, "loads", real_loads)
+
+    assert built is None, "must drop, not emit a call with emptied arguments"
+
+
+def test_malformed_string_arguments_still_coerce():
+    """Undecodable-but-shallow input stays a benign coercion, not a drop."""
+    import omlx.api.tool_calling as mod
+
+    assert mod._serialize_tool_call_arguments("not json at all") == "{}"
+    assert mod._serialize_tool_call_arguments('{"a": 1}') == '{"a": 1}'

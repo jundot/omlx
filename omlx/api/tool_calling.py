@@ -120,7 +120,15 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     if isinstance(arguments, str):
         try:
             parsed = json.loads(arguments)
-        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
+        except (json.JSONDecodeError, ValueError):
+            # Deep-nest errors are deliberately NOT caught here. Catching them
+            # sends a value we failed to decode into the "{}" coercion below,
+            # which is the same silent argument loss as the dict branch above:
+            # the parser handed us real arguments and we would return a
+            # runnable call without them. Letting it propagate reaches
+            # `_build_tool_call`, which drops that one call. Malformed JSON
+            # still coerces, since that is a parser quirk rather than lost
+            # data. (DiscoStew6082 caught this branch on #2593.)
             parsed = None
         if isinstance(parsed, dict):
             return json.dumps(parsed, ensure_ascii=False)
