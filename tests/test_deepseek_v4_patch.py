@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
 
+import hashlib
 import importlib
 import inspect
 import json
@@ -180,6 +181,439 @@ class TestUtilsPatch:
             )
             is False
         )
+
+    def test_target_only_quantization_policy_uses_model_tree_aliases(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _deepseek_v4_quantization_policy,
+        )
+
+        q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+        q2 = {"bits": 2, "group_size": 128, "mode": "affine"}
+        q3 = {"bits": 3, "group_size": 128, "mode": "affine"}
+        quantization = {
+            "embed": q8,
+            "head": q8,
+            "layers.0.attn.wkv": q8,
+            "layers.0.ffn.experts.w1": q2,
+            "layers.0.ffn.experts.w2": q3,
+            "layers.0.ffn.experts.w3": q2,
+            "layers.0.ffn.shared_experts.w1": q8,
+            "layers.0.ffn.shared_experts.w2": q8,
+            "layers.0.ffn.shared_experts.w3": q8,
+        }
+
+        embed_policy = _deepseek_v4_quantization_policy(
+            "model.embed_tokens", quantization
+        )
+        assert embed_policy == q8
+        assert _deepseek_v4_quantization_policy("lm_head", quantization) == q8
+        assert (
+            _deepseek_v4_quantization_policy("model.layers.0.attn.wkv", quantization)
+            == q8
+        )
+        assert (
+            _deepseek_v4_quantization_policy(
+                "model.layers.0.ffn.switch_mlp.gate_proj", quantization
+            )
+            == q2
+        )
+        assert (
+            _deepseek_v4_quantization_policy(
+                "model.layers.0.ffn.switch_mlp.down_proj", quantization
+            )
+            == q3
+        )
+        assert (
+            _deepseek_v4_quantization_policy(
+                "model.layers.0.ffn.switch_mlp.up_proj", quantization
+            )
+            == q2
+        )
+        assert (
+            _deepseek_v4_quantization_policy(
+                "model.layers.0.ffn.shared_experts.gate_proj", quantization
+            )
+            == q8
+        )
+        assert _deepseek_v4_quantization_policy("model.norm", quantization) is None
+
+    @staticmethod
+    def _target_only_config(quantization):
+        return {
+            "model_type": "deepseek_v4",
+            "mlx_serve_converter": {
+                "schema": "mlx-serve.dsv4-target-only-gold-view-provenance.v2"
+            },
+            "quantization": quantization,
+        }
+
+    @staticmethod
+    def _affine_policy(bits=8, group_size=64, mode="affine"):
+        return {"bits": bits, "group_size": group_size, "mode": mode}
+
+    def test_target_only_gate_requires_exact_converter_schema(self):
+        from omlx.patches.deepseek_v4.utils_patch import _is_target_only_checkpoint
+
+        assert _is_target_only_checkpoint(
+            self._target_only_config(self._affine_policy())
+        )
+        assert not _is_target_only_checkpoint(
+            {
+                "model_type": "deepseek_v4",
+                "mlx_serve_converter": {"schema": "some-other-schema"},
+            }
+        )
+        assert not _is_target_only_checkpoint(
+            {
+                "model_type": "llama",
+                "mlx_serve_converter": {
+                    "schema": "mlx-serve.dsv4-target-only-gold-view-provenance.v2"
+                },
+            }
+        )
+
+    def test_target_only_canonicalizes_fused_weights_once(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _canonicalize_target_only_weights,
+        )
+
+        weights = {
+            "embed.weight": object(),
+            "embed.scales": object(),
+            "embed.biases": object(),
+            "head.weight": object(),
+            "head.scales": object(),
+            "head.biases": object(),
+            "layers.0.ffn.experts.w1.weight": object(),
+            "layers.0.ffn.experts.w1.scales": object(),
+            "layers.0.ffn.experts.w1.biases": object(),
+            "layers.0.ffn.shared_experts.w2.weight": object(),
+            "layers.0.attn.wq_a.scales": object(),
+            "layers.0.hc_attn_fn": object(),
+            "hc_head_base": object(),
+        }
+
+        canonical = _canonicalize_target_only_weights(weights)
+
+        assert set(canonical) == {
+            "model.embed_tokens.weight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.biases",
+            "lm_head.weight",
+            "lm_head.scales",
+            "lm_head.biases",
+            "model.layers.0.ffn.switch_mlp.gate_proj.weight",
+            "model.layers.0.ffn.switch_mlp.gate_proj.scales",
+            "model.layers.0.ffn.switch_mlp.gate_proj.biases",
+            "model.layers.0.ffn.shared_experts.down_proj.weight",
+            "model.layers.0.attn.wq_a.scales",
+            "model.layers.0.attn_hc.fn",
+            "model.hc_head.base",
+        }
+
+    def test_target_only_weight_alias_collision_is_rejected(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _canonicalize_target_only_weights,
+        )
+
+        with pytest.raises(ValueError, match="aliases collide"):
+            _canonicalize_target_only_weights(
+                {
+                    "embed.weight": object(),
+                    "model.embed_tokens.weight": object(),
+                }
+            )
+
+    def test_target_only_dotted_hc_alias_collision_is_rejected(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _canonicalize_target_only_weights,
+        )
+
+        with pytest.raises(ValueError, match="aliases collide"):
+            _canonicalize_target_only_weights(
+                {
+                    "layers.0.hc_attn.base": object(),
+                    "model.layers.0.attn_hc.base": object(),
+                }
+            )
+
+    @pytest.mark.parametrize(
+        ("policy", "match"),
+        (
+            (None, "without an exact quantization policy"),
+            ({}, "non-empty object"),
+            ([], "non-empty object"),
+            ({"bits": 8, "group_size": 64}, "exactly bits"),
+            (
+                {"bits": True, "group_size": 64, "mode": "affine"},
+                "invalid bits",
+            ),
+            (
+                {"bits": 8, "group_size": 64, "mode": "mxfp4"},
+                "must use affine",
+            ),
+        ),
+        ids=("missing", "empty", "non-dict", "bad-shape", "bad-type", "bad-mode"),
+    )
+    def test_target_only_scaled_modules_require_valid_exact_policy(self, policy, match):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _target_only_quantization_policies,
+        )
+
+        quantization = self._affine_policy()
+        if policy is not None:
+            quantization["embed"] = policy
+        config = self._target_only_config(quantization)
+
+        with pytest.raises(ValueError, match=match):
+            _target_only_quantization_policies(
+                config, {"model.embed_tokens.scales": object()}
+            )
+
+    def test_target_only_quantization_alias_collision_is_rejected(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _target_only_quantization_policies,
+        )
+
+        policy = self._affine_policy()
+        quantization = {
+            **policy,
+            "embed": policy,
+            "model.embed_tokens": policy,
+        }
+        with pytest.raises(ValueError, match="aliases collide"):
+            _target_only_quantization_policies(
+                self._target_only_config(quantization),
+                {"model.embed_tokens.scales": object()},
+            )
+
+    def test_target_only_quantization_policy_without_scaled_weight_is_rejected(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _target_only_quantization_policies,
+        )
+
+        policy = self._affine_policy()
+        quantization = {**policy, "embed": policy, "head": policy}
+        with pytest.raises(ValueError, match="without quantized weights"):
+            _target_only_quantization_policies(
+                self._target_only_config(quantization),
+                {"model.embed_tokens.scales": object()},
+            )
+
+    def test_target_only_affine_triplet_rejects_missing_weight_or_bias(self):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _validate_target_only_affine_triplets,
+        )
+
+        policy = {"model.embed_tokens": self._affine_policy()}
+        triplet = {
+            "model.embed_tokens.weight": mx.zeros((2, 16), dtype=mx.uint32),
+            "model.embed_tokens.scales": mx.zeros((2, 1), dtype=mx.bfloat16),
+            "model.embed_tokens.biases": mx.zeros((2, 1), dtype=mx.bfloat16),
+        }
+        for missing in ("weight", "biases"):
+            invalid = dict(triplet)
+            invalid.pop(f"model.embed_tokens.{missing}")
+            with pytest.raises(ValueError, match=f"missing {missing}"):
+                _validate_target_only_affine_triplets(invalid, policy)
+
+    def test_target_only_orphan_weight_and_bias_require_policy_and_triplet(self):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _target_only_quantization_policies,
+            _validate_target_only_affine_triplets,
+        )
+
+        orphaned = {
+            "model.embed_tokens.weight": mx.zeros((2, 16), dtype=mx.uint32),
+            "model.embed_tokens.biases": mx.zeros((2, 1), dtype=mx.bfloat16),
+        }
+        with pytest.raises(ValueError, match="without an exact quantization policy"):
+            _target_only_quantization_policies(
+                self._target_only_config(self._affine_policy()), orphaned
+            )
+        policy = {"model.embed_tokens": self._affine_policy()}
+        with pytest.raises(ValueError, match="missing scales"):
+            _validate_target_only_affine_triplets(orphaned, policy)
+
+    def test_target_only_rejects_exact_config_mutation_before_model_construction(
+        self, tmp_path, applied_patch, monkeypatch
+    ):
+        from mlx_lm.utils import load_model
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        config = self._target_only_config(
+            {**self._affine_policy(), "embed": self._affine_policy()}
+        )
+        canonical = json.dumps(config, separators=(",", ":")).encode()
+        mutated = canonical.replace(b'"bits":8', b'"bits":4', 1)
+        assert len(mutated) == len(canonical)
+        monkeypatch.setattr(utils_patch, "_TARGET_ONLY_CONFIG_SIZE", len(canonical))
+        monkeypatch.setattr(
+            utils_patch,
+            "_TARGET_ONLY_CONFIG_SHA256",
+            hashlib.sha256(canonical).hexdigest(),
+        )
+        (tmp_path / "config.json").write_bytes(mutated)
+        (tmp_path / "model.safetensors").touch()
+        load_weights = MagicMock()
+        monkeypatch.setattr(utils_patch, "_load_safetensors", load_weights)
+        get_model_classes = MagicMock()
+
+        with pytest.raises(ValueError, match="published artifact identity"):
+            load_model(
+                tmp_path,
+                lazy=True,
+                strict=False,
+                get_model_classes=get_model_classes,
+            )
+        load_weights.assert_not_called()
+        get_model_classes.assert_not_called()
+
+    def test_target_only_rejects_bad_metadata_even_when_non_strict(
+        self, tmp_path, applied_patch, monkeypatch
+    ):
+        """``strict=False`` may relax final key matching, never target ABI."""
+        from mlx_lm.utils import load_model
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        raw_config = json.dumps(
+            self._target_only_config(self._affine_policy()), separators=(",", ":")
+        ).encode()
+        monkeypatch.setattr(utils_patch, "_TARGET_ONLY_CONFIG_SIZE", len(raw_config))
+        monkeypatch.setattr(
+            utils_patch,
+            "_TARGET_ONLY_CONFIG_SHA256",
+            hashlib.sha256(raw_config).hexdigest(),
+        )
+        (tmp_path / "config.json").write_bytes(raw_config)
+        (tmp_path / "model.safetensors").touch()
+        monkeypatch.setattr(
+            utils_patch,
+            "_load_safetensors",
+            lambda _: {"embed.scales": object()},
+        )
+        get_model_classes = MagicMock()
+
+        with pytest.raises(ValueError, match="without an exact quantization policy"):
+            load_model(
+                tmp_path,
+                lazy=True,
+                strict=False,
+                get_model_classes=get_model_classes,
+            )
+        get_model_classes.assert_not_called()
+
+    def test_target_only_rejects_incomplete_triplet_even_when_non_strict(
+        self, tmp_path, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from mlx_lm.utils import load_model
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        config = self._target_only_config(
+            {**self._affine_policy(), "embed": self._affine_policy()}
+        )
+        raw_config = json.dumps(config, separators=(",", ":")).encode()
+        monkeypatch.setattr(utils_patch, "_TARGET_ONLY_CONFIG_SIZE", len(raw_config))
+        monkeypatch.setattr(
+            utils_patch,
+            "_TARGET_ONLY_CONFIG_SHA256",
+            hashlib.sha256(raw_config).hexdigest(),
+        )
+        (tmp_path / "config.json").write_bytes(raw_config)
+        (tmp_path / "model.safetensors").touch()
+        monkeypatch.setattr(
+            utils_patch,
+            "_load_safetensors",
+            lambda _: {
+                "embed.weight": mx.zeros((2, 16), dtype=mx.uint32),
+                "embed.scales": mx.zeros((2, 1), dtype=mx.bfloat16),
+            },
+        )
+        get_model_classes = MagicMock()
+
+        with pytest.raises(ValueError, match="missing biases"):
+            load_model(
+                tmp_path,
+                lazy=True,
+                strict=False,
+                get_model_classes=get_model_classes,
+            )
+        get_model_classes.assert_not_called()
+
+    def test_target_only_forces_strict_weight_loading(
+        self, tmp_path, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx_lm.utils import load_model
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        config = self._target_only_config(
+            {**self._affine_policy(), "embed": self._affine_policy()}
+        )
+        raw_config = json.dumps(config, separators=(",", ":")).encode()
+        monkeypatch.setattr(utils_patch, "_TARGET_ONLY_CONFIG_SIZE", len(raw_config))
+        monkeypatch.setattr(
+            utils_patch,
+            "_TARGET_ONLY_CONFIG_SHA256",
+            hashlib.sha256(raw_config).hexdigest(),
+        )
+        (tmp_path / "config.json").write_bytes(raw_config)
+        (tmp_path / "model.safetensors").touch()
+        monkeypatch.setattr(
+            utils_patch,
+            "_load_safetensors",
+            lambda _: {
+                "embed.weight": mx.zeros((2, 16), dtype=mx.uint32),
+                "embed.scales": mx.zeros((2, 1), dtype=mx.bfloat16),
+                "embed.biases": mx.zeros((2, 1), dtype=mx.bfloat16),
+            },
+        )
+        original_load_config = utils_patch._utils.load_config
+
+        def production_wrapper(model_path):
+            runtime_config = original_load_config(model_path)
+            runtime_quantization = dict(runtime_config["quantization"])
+            runtime_quantization["language_model.embed"] = self._affine_policy()
+            runtime_config["quantization"] = runtime_quantization
+            return runtime_config
+
+        monkeypatch.setattr(utils_patch._utils, "load_config", production_wrapper)
+
+        class Args:
+            @classmethod
+            def from_dict(cls, _config):
+                return cls()
+
+        class CapturingModel(nn.Module):
+            def __init__(self, _args):
+                super().__init__()
+                self.weight_load_strict = None
+
+            def load_weights(self, _weights, strict=True):
+                self.weight_load_strict = strict
+                return self
+
+        model, loaded_config = load_model(
+            tmp_path,
+            lazy=True,
+            strict=False,
+            get_model_classes=lambda config: (CapturingModel, Args),
+        )
+        assert model.weight_load_strict is True
+        # The active runtime wrapper has an extra alias.  The load succeeds
+        # because target-only policy validation used raw identity-bound JSON,
+        # while the returned runtime config remains expanded.
+        assert "language_model.embed" in loaded_config["quantization"]
 
     @pytest.mark.parametrize(
         ("bits", "expected_enabled"),
@@ -1541,7 +1975,6 @@ class TestDeepSeekV4SanitizeAffineSwitchMLP:
         assert (
             out["model.layers.0.ffn.shared_experts.up_proj.scales"].dtype == mx.bfloat16
         )
-
 
 class TestDeepSeekV4SanitizeHcAliases:
     """Sanitize accepts both upstream HC key spellings for V4 checkpoints."""
