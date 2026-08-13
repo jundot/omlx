@@ -2342,6 +2342,7 @@ class TestTwoWatermarkPressureLevels:
                 "omlx.process_memory_enforcer.asyncio.to_thread",
                 side_effect=run_inline,
             ),
+            patch.object(pme.mx, "get_cache_memory", return_value=0),
         ):
             await enforcer._check_and_enforce()
 
@@ -2751,6 +2752,95 @@ class TestPressureCacheReclaim:
         with patch.object(pme.mx, "get_cache_memory", return_value=object()):
             enforcer._request_scheduler_cache_reclaim(0)
         schedulers[0].request_pressure_reclaim.assert_not_called()
+
+
+class TestHotCacheReclaimGrace:
+    """#2581: drain reclaimable MLX buffers before sacrificing hot prefixes."""
+
+    @staticmethod
+    def _pinned_scheduler_setup(enforcer, pool):
+        scheduler = MagicMock()
+        engine = MagicMock()
+        engine.scheduler = scheduler
+        entry = _make_entry("target", engine=engine, is_pinned=True)
+        pool._entries = {"target": entry}
+        pool._find_lru_victim.return_value = None
+        return scheduler
+
+    @pytest.mark.asyncio
+    async def test_hard_pressure_defers_hot_shrink_while_pool_can_drain(
+        self, mock_engine_pool
+    ):
+        budget = MagicMock()
+        budget.total_bytes = 20 * 1024**3
+        budget.max_bytes = 20 * 1024**3
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=100 * 1024**3,
+            soft_threshold=0.90,
+            hard_threshold=0.95,
+        )
+        scheduler = self._pinned_scheduler_setup(enforcer, mock_engine_pool)
+
+        with (
+            patch.object(
+                enforcer,
+                "_current_usage_bytes",
+                side_effect=[98 * 1024**3, 98 * 1024**3, 98 * 1024**3],
+            ),
+            patch.object(pme.mx, "get_cache_memory", return_value=3 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.asyncio.to_thread",
+                side_effect=AssertionError("hot cache must be preserved first"),
+            ),
+        ):
+            await enforcer._check_and_enforce()
+
+        budget.shrink_to.assert_not_called()
+        scheduler.request_pressure_reclaim.assert_called_once()
+        assert enforcer._hot_cache_reclaim_grace_polls == 1
+
+    @pytest.mark.asyncio
+    async def test_hot_shrink_resumes_after_pool_grace_is_exhausted(
+        self, mock_engine_pool
+    ):
+        budget = MagicMock()
+        budget.total_bytes = 20 * 1024**3
+        budget.max_bytes = 20 * 1024**3
+        budget.shrink_to.return_value = 8 * 1024**3
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=100 * 1024**3,
+            soft_threshold=0.90,
+            hard_threshold=0.95,
+        )
+        scheduler = self._pinned_scheduler_setup(enforcer, mock_engine_pool)
+        enforcer._hot_cache_reclaim_grace_polls = (
+            enforcer._HOT_CACHE_RECLAIM_GRACE_POLLS_MAX
+        )
+
+        async def run_inline(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with (
+            patch.object(
+                enforcer,
+                "_current_usage_bytes",
+                side_effect=[98 * 1024**3, 80 * 1024**3],
+            ),
+            patch.object(pme.mx, "get_cache_memory", return_value=3 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.asyncio.to_thread",
+                side_effect=run_inline,
+            ),
+        ):
+            await enforcer._check_and_enforce()
+
+        budget.shrink_to.assert_called_once()
+        scheduler.request_pressure_reclaim.assert_called_once()
+        assert enforcer._hot_cache_reclaim_grace_polls == 0
 
 
 class TestPublicCeilingBreakdown:

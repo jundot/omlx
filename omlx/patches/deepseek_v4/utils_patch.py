@@ -26,7 +26,7 @@ import json
 import logging
 import struct
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,22 @@ SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 _PATCHED = False
 
 
+def _contains_sub4_bits(value: Any) -> bool:
+    """Return whether a quantization tree contains a numeric sub-4-bit mode."""
+    if isinstance(value, Mapping):
+        bits = value.get("bits")
+        if (
+            isinstance(bits, (int, float))
+            and not isinstance(bits, bool)
+            and float(bits) < 4
+        ):
+            return True
+        return any(_contains_sub4_bits(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_sub4_bits(child) for child in value)
+    return False
+
+
 def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     """Keep the native ratio-128 attention path off for sub-4-bit V4."""
     if not str(config.get("model_type", "")).startswith("deepseek_v4"):
@@ -52,15 +68,7 @@ def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     if isinstance(text_config, dict):
         quantizations.append(text_config.get("quantization_config"))
 
-    for quantization in quantizations:
-        bits = quantization.get("bits") if isinstance(quantization, dict) else None
-        if (
-            isinstance(bits, (int, float))
-            and not isinstance(bits, bool)
-            and float(bits) < 4
-        ):
-            return False
-    return True
+    return not any(_contains_sub4_bits(quantization) for quantization in quantizations)
 
 
 def _load_safetensors(path: str) -> dict:

@@ -389,6 +389,11 @@ class ProcessMemoryEnforcer:
         # abort while a fat Metal buffer pool drains at the next prefill
         # chunk / step boundary. See the grace check in _check_and_enforce.
         self._busy_abort_grace_polls: int = 0
+        # Consecutive hard-pressure polls for which we preserve the hot cache
+        # while a reclaimable MLX buffer pool drains. Unlike the hot cache,
+        # those bytes can be returned to the OS without destroying useful
+        # prefix state, so they get the first bounded recovery opportunity.
+        self._hot_cache_reclaim_grace_polls: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1014,6 +1019,9 @@ class ProcessMemoryEnforcer:
     # while a reclaimable pool drains. Prefill chunks run ~5s at full step
     # size, so 5 one-second polls cover at least one chunk boundary.
     _BUSY_ABORT_GRACE_POLLS_MAX = 5
+    # Hot-prefix state gets the same bounded opportunity to survive a buffer
+    # pool drain before hard pressure trims it (#2581).
+    _HOT_CACHE_RECLAIM_GRACE_POLLS_MAX = 5
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1449,6 +1457,7 @@ class ProcessMemoryEnforcer:
             # the next one gets a fresh abort-grace budget. Must happen
             # before the ok-level early return below.
             self._busy_abort_grace_polls = 0
+            self._hot_cache_reclaim_grace_polls = 0
 
         if new_level != prev_level:
             self._pressure_level = new_level
@@ -1461,20 +1470,45 @@ class ProcessMemoryEnforcer:
             )
 
         if new_level == "hard":
-            freed_hot = await asyncio.to_thread(
-                self._shrink_hot_cache_for_pressure,
-                current,
-                soft,
+            reclaim_enabled = os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1"
+            pool_bytes = self._pool_bytes() if reclaim_enabled else 0
+            defer_hot_cache_shrink = (
+                reclaim_enabled
+                and not emergency
+                and pool_bytes > self._POOL_RECLAIM_FLOOR
+                and self._hot_cache_reclaim_grace_polls
+                < self._HOT_CACHE_RECLAIM_GRACE_POLLS_MAX
             )
-            # Return reclaimable Metal memory to the OS. The shrink above only
-            # drops mx.array references into MLX's buffer-cache pool, which is
-            # pinned by set_cache_limit(total) (the #300 panic guard), so the
-            # freed bytes never leave the process and phys_footprint does not
-            # drop — the enforcer then wrongly concludes "no evictable models"
-            # and livelocks until restart. Env gate
-            # OMLX_DISABLE_PRESSURE_RECLAIM=1 restores stock behavior.
-            if os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1":
-                self._request_scheduler_cache_reclaim(freed_hot)
+            freed_hot = 0
+            if defer_hot_cache_shrink:
+                # #2581: phys_footprint includes the reclaimable MLX pool.
+                # Draining it first preserves valuable hot-prefix blocks and
+                # gives the scheduler's step-boundary clear the same bounded
+                # grace already used before aborting busy requests.
+                self._hot_cache_reclaim_grace_polls += 1
+                self._request_scheduler_cache_reclaim(0)
+                logger.info(
+                    "Hard memory pressure: preserving hot cache while %s of "
+                    "pooled Metal buffers drain (poll %d/%d)",
+                    _format_gb(pool_bytes),
+                    self._hot_cache_reclaim_grace_polls,
+                    self._HOT_CACHE_RECLAIM_GRACE_POLLS_MAX,
+                )
+            else:
+                freed_hot = await asyncio.to_thread(
+                    self._shrink_hot_cache_for_pressure,
+                    current,
+                    soft,
+                )
+                # Return reclaimable Metal memory to the OS. The shrink above
+                # only drops mx.array references into MLX's buffer-cache pool,
+                # which is pinned by set_cache_limit(total) (the #300 panic
+                # guard), so the freed bytes never leave the process and
+                # phys_footprint does not drop — the enforcer then wrongly
+                # concludes "no evictable models" and livelocks until restart.
+                # OMLX_DISABLE_PRESSURE_RECLAIM=1 restores stock behavior.
+                if reclaim_enabled:
+                    self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
                 emergency = self._is_emergency_pressure(current, ceiling)
@@ -1495,6 +1529,9 @@ class ProcessMemoryEnforcer:
                     )
                     new_level = recovered_level
                     self._pressure_level = new_level
+                    if new_level != "hard":
+                        self._busy_abort_grace_polls = 0
+                        self._hot_cache_reclaim_grace_polls = 0
                     self._propagate_memory_limit()
 
         if new_level == "ok":
@@ -1696,6 +1733,7 @@ class ProcessMemoryEnforcer:
             # Same reset as the pre-action check: eviction inside this tick
             # may already have ended the hard episode.
             self._busy_abort_grace_polls = 0
+            self._hot_cache_reclaim_grace_polls = 0
         if post_level != self._pressure_level:
             self._pressure_level = post_level
             self._propagate_memory_limit()

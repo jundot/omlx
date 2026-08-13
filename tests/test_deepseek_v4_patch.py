@@ -157,6 +157,29 @@ class TestUtilsPatch:
             )
             is True
         )
+        assert (
+            _native_ratio128_attention_enabled(
+                {
+                    "model_type": "deepseek_v4",
+                    "quantization": {
+                        "bits": 8,
+                        "group_size": 64,
+                        "mode": "affine",
+                        "layers.0.ffn.experts.w1": {
+                            "bits": 2,
+                            "group_size": 128,
+                            "mode": "affine",
+                        },
+                        "layers.0.ffn.experts.w2": {
+                            "bits": 3,
+                            "group_size": 128,
+                            "mode": "affine",
+                        },
+                    },
+                }
+            )
+            is False
+        )
 
     @pytest.mark.parametrize(
         ("bits", "expected_enabled"),
