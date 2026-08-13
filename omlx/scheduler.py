@@ -4629,6 +4629,18 @@ class Scheduler:
             )
         return _CONTENDED_PREFILL_CHUNK
 
+    def _prefill_hold_deadline(self) -> float:
+        """Effective hold deadline: own deadline or the shared one.
+
+        The shared deadline (decode_activity registry) is what keeps two
+        engines prefilling against the same victim from covering each
+        other's hold windows with their own chunks.
+        """
+        deadline = self._prefill_hold_until
+        with suppress(Exception):
+            deadline = max(deadline, get_decode_activity().hold_until())
+        return deadline
+
     def _prefill_gate_open(self) -> bool:
         """Whether prefill chunks may advance this step.
 
@@ -4638,15 +4650,17 @@ class Scheduler:
         - Other engines' decodes repay in real time while this engine
           holds: ``_prefill_hold_until`` is a wall deadline, because their
           progress is not observable from here. Capped chunks bound how
-          long each hold has to be.
+          long each hold has to be, and the deadline is shared process-wide
+          so concurrent prefillers pause together.
         The debt resets whenever no decode is running anywhere.
         """
         if not self._decode_fairness:
             return True
-        if self.running:
-            return self._decode_time_owed_s <= 0.0
-        self._decode_time_owed_s = 0.0
-        return time.perf_counter() >= self._prefill_hold_until
+        if self.running and self._decode_time_owed_s > 0.0:
+            return False
+        if not self.running:
+            self._decode_time_owed_s = 0.0
+        return time.perf_counter() >= self._prefill_hold_deadline()
 
     def _accrue_decode_debt(self, chunk_seconds: float) -> None:
         if not self._decode_fairness:
@@ -4657,7 +4671,10 @@ class Scheduler:
         if self.running:
             self._decode_time_owed_s += share
         elif self._others_decoding():
-            self._prefill_hold_until = time.perf_counter() + share
+            deadline = time.perf_counter() + share
+            self._prefill_hold_until = deadline
+            with suppress(Exception):
+                get_decode_activity().extend_hold(deadline)
 
     def _repay_decode_debt(self, decode_seconds: float) -> None:
         if self._decode_time_owed_s <= 0.0:
@@ -9397,7 +9414,7 @@ class Scheduler:
             # while decodes wait.
             if self._decode_fairness and (
                 (self.running and self._decode_time_owed_s > 0.0)
-                or time.perf_counter() < self._prefill_hold_until
+                or time.perf_counter() < self._prefill_hold_deadline()
             ):
                 break
 

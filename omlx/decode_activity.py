@@ -19,11 +19,31 @@ import time
 
 
 class DecodeActivityRegistry:
-    """Thread-safe registry of engines currently running decode steps."""
+    """Thread-safe registry of engines currently running decode steps.
+
+    Also carries the process-global prefill hold deadline: when several
+    engines prefill against the same victim decode, per-engine holds with
+    independent phases never leave the GPU quiet at the same time, so the
+    hold window must be shared. Deadlines are ``time.perf_counter()``
+    values (the scheduler's hold clock) and self-expire, so there is
+    nothing to clean up on engine teardown.
+    """
 
     def __init__(self) -> None:
         self._active: dict[str, tuple[float, int]] = {}
+        self._hold_until = 0.0
         self._lock = threading.Lock()
+
+    def extend_hold(self, until_ts: float) -> None:
+        """Extend the shared prefill hold deadline (monotone max)."""
+        with self._lock:
+            if until_ts > self._hold_until:
+                self._hold_until = until_ts
+
+    def hold_until(self) -> float:
+        """The shared prefill hold deadline (0.0 when never set)."""
+        with self._lock:
+            return self._hold_until
 
     def publish(self, key: str, running_count: int) -> None:
         """Record *key*'s running-decode count (0 removes the entry)."""
@@ -50,6 +70,7 @@ class DecodeActivityRegistry:
     def clear(self) -> None:
         with self._lock:
             self._active.clear()
+            self._hold_until = 0.0
 
 
 _registry: DecodeActivityRegistry | None = None

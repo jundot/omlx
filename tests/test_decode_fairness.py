@@ -98,6 +98,30 @@ class TestPrefillGate:
         s._prefill_hold_until = time.perf_counter() - 0.01
         assert s._prefill_gate_open()
 
+    def test_shared_hold_blocks_other_prefillers(self):
+        import time
+
+        # Engine A accrues a hold; engine B (a different scheduler with no
+        # local hold) must pause too, or B's chunks cover A's hold window.
+        a = _make_scheduler()
+        b = _make_scheduler()
+        get_decode_activity().publish("victim-engine", 1)
+        a._accrue_decode_debt(0.5)
+        assert time.perf_counter() < a._prefill_hold_until
+        assert not b._prefill_gate_open()
+        assert b._prefill_hold_until == 0.0  # local stays untouched
+
+    def test_shared_hold_keeps_max(self):
+        import time
+
+        reg = get_decode_activity()
+        now = time.perf_counter()
+        reg.extend_hold(now + 2.0)
+        reg.extend_hold(now + 1.0)  # shorter deadline must not shrink it
+        assert reg.hold_until() == pytest.approx(now + 2.0)
+        reg.clear()
+        assert reg.hold_until() == 0.0
+
     def test_accrue_noop_when_fairness_disabled(self):
         s = _make_scheduler(decode_fairness=False)
         s.running = {"r1": MagicMock()}
