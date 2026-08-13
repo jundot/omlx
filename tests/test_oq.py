@@ -3136,6 +3136,63 @@ class TestBuildProxyForSensitivity:
         assert config["quantization"]["group_size"] == _PROXY_QUANT_GROUP_SIZE
         assert (out / "model.safetensors").exists()
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_streaming_proxy_requantizes_multidimensional_affine_expert(
+        self, tmp_path, monkeypatch
+    ):
+        """#2452: the RAM-safe proxy must dequantize affine sources first."""
+        from omlx import oq as oq_module
+
+        src = tmp_path / "src_affine"
+        out = tmp_path / "proxy_affine"
+        src.mkdir()
+        base = "model.layers.0.mlp.switch_mlp.gate_proj"
+        source_weight = (
+            mx.arange(3 * 2 * 64, dtype=mx.float32).reshape(3, 2, 64) / 41
+        ).astype(mx.bfloat16)
+        tensors = {}
+        _write_affine_triple(tensors, base, source_weight)
+        _write_safetensors(str(src / "model.safetensors"), tensors)
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "test_affine",
+                    "num_hidden_layers": 1,
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 64,
+                        "mode": "affine",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        original_quantize = oq_module.mx.quantize
+        seen_dtypes = []
+
+        def guarded_quantize(weight, *args, **kwargs):
+            seen_dtypes.append(weight.dtype)
+            assert weight.dtype != mx.uint32, "packed source reached mx.quantize"
+            return original_quantize(weight, *args, **kwargs)
+
+        monkeypatch.setattr(oq_module, "_build_model_sanitizer", lambda *_a, **_k: None)
+        monkeypatch.setattr(oq_module, "_build_non_quantizable_set", lambda _c: set())
+        monkeypatch.setattr(oq_module.mx, "quantize", guarded_quantize)
+
+        _build_streaming_proxy_for_sensitivity(str(src), out, dtype="bfloat16")
+
+        assert seen_dtypes and all(dtype != mx.uint32 for dtype in seen_dtypes)
+        output_tensors = mx.load(str(out / "model.safetensors"))
+        assert set(output_tensors) == {
+            f"{base}.weight",
+            f"{base}.scales",
+            f"{base}.biases",
+        }
+        assert output_tensors[f"{base}.weight"].shape == (3, 2, 8)
+        assert output_tensors[f"{base}.scales"].shape == (3, 2, 1)
+        assert output_tensors[f"{base}.biases"].shape == (3, 2, 1)
+
 
 class TestSensitivityRequiredEnforcement:
     """Regression tests: quantize_oq_streaming must abort when sensitivity
@@ -3350,8 +3407,32 @@ class TestSensitivityRequiredEnforcement:
 
 
 # =============================================================================
-# Test on-the-fly FP8 dequant in _LazyTensorIndex
+# Test on-the-fly dequant in _LazyTensorIndex
 # =============================================================================
+
+
+def _write_affine_triple(tensors, name, weight, *, bits=4, group_size=64):
+    """Add one normal MLX affine quantized tensor triple to a fixture.
+
+    Safetensors has no NumPy ``bfloat16`` dtype, so BF16 scales and biases
+    are written as their exact uint16 payload with an explicit header dtype.
+    """
+    qw, scales, biases = mx.quantize(
+        weight, group_size=group_size, bits=bits, mode="affine"
+    )
+    mx.eval(qw, scales, biases)
+    tensors[f"{name}.weight"] = (
+        np.asarray(qw).tobytes(),
+        list(qw.shape),
+        "U32",
+    )
+    for suffix, value in (("scales", scales), ("biases", biases)):
+        tensors[f"{name}.{suffix}"] = (
+            np.asarray(value.view(mx.uint16)).tobytes(),
+            list(value.shape),
+            "BF16",
+        )
+    return qw, scales, biases
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -3506,6 +3587,249 @@ class TestOnTheFlyFp8Dequant:
         idx = _LazyTensorIndex([path])
         assert len(idx._fp8_pairs) == 0
         assert len(idx) == 1
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestOnTheFlyAffineDequant:
+    @staticmethod
+    def _index(tmp_path, config, *, name="layer", shape=(2, 64), bits=4):
+        weight = (
+            mx.arange(int(np.prod(shape)), dtype=mx.float32).reshape(shape) / 37
+        ).astype(mx.bfloat16)
+        tensors = {}
+        refs = _write_affine_triple(tensors, name, weight, bits=bits)
+        path = str(tmp_path / f"{name.replace('.', '_')}.safetensors")
+        _write_safetensors(path, tensors)
+        return _LazyTensorIndex([path], config=config), refs
+
+    @pytest.mark.parametrize("shape", [(2, 64), (2, 2, 64)])
+    def test_affine_triple_is_one_logical_weight_with_exact_dequant(
+        self, tmp_path, shape
+    ):
+        """Normal MLX Q4 triples are reconstructed before oQ sees them."""
+        weight = (
+            mx.arange(int(np.prod(shape)), dtype=mx.float32).reshape(shape) / 37
+        ).astype(mx.bfloat16)
+        path = str(tmp_path / "affine.safetensors")
+        tensors = {}
+        qw, scales, biases = _write_affine_triple(tensors, "layer", weight)
+        _write_safetensors(path, tensors)
+
+        idx = _LazyTensorIndex(
+            [path],
+            config={
+                "quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
+            },
+        )
+
+        assert list(idx) == ["layer.weight"]
+        assert idx.logical_metadata()["layer.weight"] == (shape, "BF16")
+        decoded = idx.pop("layer.weight")
+        expected = mx.dequantize(
+            qw, scales, biases, group_size=64, bits=4, mode="affine"
+        )
+        mx.eval(decoded, expected)
+        np.testing.assert_allclose(
+            np.asarray(decoded.astype(mx.float32)),
+            np.asarray(expected.astype(mx.float32)),
+            rtol=0.0,
+            atol=1e-3,
+        )
+        assert not idx.keys()
+
+    @pytest.mark.parametrize("operation", ["pop", "set", "del"])
+    @pytest.mark.parametrize("suffix", ["weight", "scales", "biases"])
+    def test_member_mutation_invalidates_entire_triple_atomically(
+        self, tmp_path, operation, suffix
+    ):
+        config = {"quantization": {"bits": 4, "group_size": 64, "mode": "affine"}}
+        idx, _ = self._index(tmp_path, config)
+        members = {"layer.weight", "layer.scales", "layer.biases"}
+        key = f"layer.{suffix}"
+
+        if operation == "pop":
+            value = idx.pop(key)
+            assert value.dtype == mx.bfloat16
+        elif operation == "set":
+            replacement = mx.array([7.0], dtype=mx.float16)
+            idx[key] = replacement
+            assert idx[key] is replacement
+        else:
+            del idx[key]
+
+        assert idx._affine_triples == {}
+        assert idx._affine_aux_keys == set()
+        assert idx._affine_weight_by_aux == {}
+        assert members.isdisjoint(idx._index)
+        if operation == "set":
+            assert set(idx) == {key}
+            assert set(idx._overrides) == {key}
+        else:
+            assert members.isdisjoint(idx._overrides)
+            assert not idx.keys()
+
+    def test_global_defaults_and_per_layer_override_are_combined(self, tmp_path):
+        global_name = "model.layers.0.self_attn.q_proj"
+        override_name = "model.layers.0.self_attn.k_proj"
+        tensors = {}
+        global_weight = mx.arange(2 * 64, dtype=mx.float32).reshape(2, 64)
+        override_weight = global_weight + 1
+        _write_affine_triple(tensors, global_name, global_weight, bits=4)
+        _write_affine_triple(tensors, override_name, override_weight, bits=8)
+        path = str(tmp_path / "mixed_metadata.safetensors")
+        _write_safetensors(path, tensors)
+        config = {
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+                override_name: {"bits": 8},
+            }
+        }
+
+        idx = _LazyTensorIndex([path], config=config)
+
+        assert idx._affine_triples[f"{global_name}.weight"][2]["bits"] == 4
+        assert idx._affine_triples[f"{override_name}.weight"][2] == {
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+        }
+        assert idx[f"{global_name}.weight"].shape == (2, 64)
+        assert idx[f"{override_name}.weight"].shape == (2, 64)
+
+    def test_nested_text_config_quantization_metadata(self, tmp_path):
+        config = {
+            "text_config": {
+                "quantization_config": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                }
+            }
+        }
+        idx, _ = self._index(tmp_path, config)
+
+        assert idx.logical_metadata()["layer.weight"] == ((2, 64), "BF16")
+        assert idx["layer.weight"].dtype == mx.bfloat16
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            ({}, "missing quantization metadata"),
+            (
+                {
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 64,
+                        "mode": "affine",
+                    },
+                    "text_config": {
+                        "quantization_config": {
+                            "bits": 8,
+                            "group_size": 64,
+                            "mode": "affine",
+                        }
+                    },
+                },
+                "ambiguous quantization metadata",
+            ),
+            (
+                {
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 32,
+                        "mode": "affine",
+                    }
+                },
+                "geometry does not match",
+            ),
+        ],
+    )
+    def test_invalid_affine_metadata_fails_closed(self, tmp_path, config, message):
+        with pytest.raises(ValueError, match=message):
+            self._index(tmp_path, config)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQuantizeOqStreamingAffineSource:
+    def test_affine_source_never_quantizes_uint32_and_strict_loads(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression for #2452: source Q4 re-quantizes as a float weight."""
+        from omlx import oq as oq_module
+
+        src = tmp_path / "src"
+        src.mkdir()
+        base = "model.layers.0.self_attn.q_proj"
+        source_weight = (
+            mx.arange(2 * 64, dtype=mx.float32).reshape(2, 64) / 37
+        ).astype(mx.bfloat16)
+        source_tensors = {}
+        _write_affine_triple(source_tensors, base, source_weight)
+        _write_safetensors(str(src / "model.safetensors"), source_tensors)
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "test_affine",
+                    "num_hidden_layers": 1,
+                    "quantization": {
+                        "bits": 4,
+                        "group_size": 64,
+                        "mode": "affine",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        original_quantize = oq_module.mx.quantize
+        seen_dtypes = []
+
+        def guarded_quantize(weight, *args, **kwargs):
+            seen_dtypes.append(weight.dtype)
+            assert weight.dtype != mx.uint32, "packed source reached mx.quantize"
+            return original_quantize(weight, *args, **kwargs)
+
+        monkeypatch.setattr(oq_module, "_build_model_sanitizer", lambda *_a, **_k: None)
+        monkeypatch.setattr(oq_module.mx, "quantize", guarded_quantize)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            sensitivity_map_override={0: 1.0},
+        )
+
+        assert seen_dtypes
+        output_tensors = {}
+        for shard in out.glob("*.safetensors"):
+            output_tensors.update(mx.load(str(shard)))
+        expected_keys = {f"{base}.weight", f"{base}.scales", f"{base}.biases"}
+        assert set(output_tensors) == expected_keys
+
+        output_config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        quant = output_config["quantization_config"]
+        layer_quant = quant.get(base, quant)
+        projection = nn.QuantizedLinear(
+            64,
+            2,
+            bias=False,
+            group_size=layer_quant["group_size"],
+            bits=layer_quant["bits"],
+            mode=layer_quant["mode"],
+        )
+        projection.load_weights(
+            [
+                (name[len(base) + 1 :], value)
+                for name, value in output_tensors.items()
+            ],
+            strict=True,
+        )
+        downstream = projection(mx.ones((1, 64), dtype=mx.bfloat16))
+        mx.eval(downstream)
+        assert downstream.shape == (1, 2)
 
 
 # =============================================================================

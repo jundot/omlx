@@ -100,6 +100,8 @@ _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
 _NATIVE_FLOAT8_QUANT_METHODS = frozenset(("fp8", "mxfp8"))
 
+_AFFINE_SCALE_DTYPES = frozenset(("BF16", "F16", "F32"))
+
 
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
     """Return (target_bpw, hard_cap_bpw) for the given oQ level, or None."""
@@ -2761,6 +2763,11 @@ class _DiscoveredPlan:
             return self._lazy.materialize_virtual(src_key)
         if hasattr(self._lazy, "_fp8_pairs") and src_key in self._lazy._fp8_pairs:
             return self._lazy._dequant_one(src_key)
+        if (
+            hasattr(self._lazy, "_affine_triples")
+            and src_key in self._lazy._affine_triples
+        ):
+            return self._lazy._dequant_affine_one(src_key)
         meta = self._lazy._index.get(src_key)
         if meta is None:
             raise KeyError(f"source tensor {src_key!r} not in lazy index")
@@ -4250,6 +4257,9 @@ class _LazyTensorIndex:
                     )
         self._fp8_pairs = {}
         self._fp8_scale_keys = set()
+        self._affine_triples = {}
+        self._affine_aux_keys = set()
+        self._affine_weight_by_aux = {}
         self._src_quant = {}
         # Virtual tensors: logical keys computed on demand from one or more
         # on-disk tensors, for layouts the model's sanitize would otherwise
@@ -4261,6 +4271,7 @@ class _LazyTensorIndex:
         # sanitize). Always present so the view methods need no guards.
         self._overrides: dict = {}
         self._discover_fp8_pairs()
+        self._discover_affine_triples(config)
         self._register_virtual_tensors(config)
 
     def _register_virtual_tensors(self, config):
@@ -4367,6 +4378,129 @@ class _LazyTensorIndex:
                 f"FP8 on-the-fly dequant: {len(self._fp8_pairs)} weight+scale pairs detected"
             )
 
+    @staticmethod
+    def _affine_config_sections(config):
+        """Yield MLX quantization sections from a model config.
+
+        MLX stores its ordinary affine format under ``quantization``. Some
+        converted checkpoints use the equivalent ``quantization_config`` or
+        nest either one under ``text_config``. The packed tensor shape cannot
+        recover bits and group size unambiguously, so only configs that
+        declare both values are accepted.
+        """
+        if not isinstance(config, dict):
+            return
+        configs = [config]
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            configs.append(text_config)
+        for candidate in configs:
+            for key in ("quantization", "quantization_config"):
+                section = candidate.get(key)
+                if isinstance(section, dict):
+                    yield section
+
+    @classmethod
+    def _affine_params_from_config(cls, config, weight_key):
+        """Return the single declared affine layout for ``weight_key``.
+
+        Packed uint32 geometry is ambiguous without metadata: several
+        bit-width/group-size combinations can produce the same final shape.
+        Conflicting or incomplete declarations therefore fail here instead of
+        letting the packed tensor reach ``mx.quantize``.
+        """
+        base = weight_key[: -len(".weight")]
+        candidates = set()
+        for section in cls._affine_config_sections(config):
+            per_layer = section.get(base)
+            params = per_layer if isinstance(per_layer, dict) else section
+            try:
+                bits = int(params.get("bits", section.get("bits")))
+                group_size = int(
+                    params.get("group_size", section.get("group_size"))
+                )
+            except (TypeError, ValueError):
+                continue
+            mode = str(params.get("mode", section.get("mode", "affine"))).lower()
+            quant_method = str(
+                params.get("quant_method", section.get("quant_method", ""))
+            ).lower()
+            if (
+                bits in _VALID_QUANT_BITS
+                and group_size > 0
+                and mode == "affine"
+                and quant_method in ("", "affine")
+            ):
+                candidates.add((bits, group_size, mode))
+        if len(candidates) != 1:
+            detail = "missing" if not candidates else "ambiguous"
+            raise ValueError(
+                f"MLX affine source {base!r} has {detail} quantization metadata; "
+                "expected one bits/group_size/mode=affine declaration"
+            )
+        bits, group_size, mode = candidates.pop()
+        return {"bits": bits, "group_size": group_size, "mode": mode}
+
+    def _classify_affine_triple(self, wk, sk, bk, config):
+        """Validate one normal MLX ``weight/scales/biases`` affine triple."""
+        w_shape, w_dtype = self._index[wk][4], self._index[wk][5]
+        s_shape, s_dtype = self._index[sk][4], self._index[sk][5]
+        b_shape, b_dtype = self._index[bk][4], self._index[bk][5]
+        if (
+            w_dtype != "U32"
+            or s_dtype not in _AFFINE_SCALE_DTYPES
+            or b_dtype != s_dtype
+            or len(w_shape) < 2
+            or s_shape != b_shape
+            or w_shape[:-1] != s_shape[:-1]
+            or s_shape[-1] <= 0
+        ):
+            raise ValueError(
+                f"MLX affine source {wk!r} has incompatible weight/scales/biases "
+                "dtype or rank geometry"
+            )
+        info = self._affine_params_from_config(config, wk)
+        logical_width = s_shape[-1] * info["group_size"]
+        # ``mx.quantize`` packs logical values along the final dimension into
+        # uint32 words. This exact equality rejects a stale or incompatible
+        # config before we call ``mx.dequantize`` with the wrong layout.
+        if logical_width * info["bits"] != w_shape[-1] * 32:
+            raise ValueError(
+                f"MLX affine source {wk!r} geometry does not match its declared "
+                f"bits={info['bits']} group_size={info['group_size']}"
+            )
+        return info
+
+    def _discover_affine_triples(self, config):
+        """Recognise already-quantized normal MLX affine weights.
+
+        Unlike native FP8/MXFP sources, ordinary MLX affine tensors cannot be
+        passed through when the requested oQ precision is lower. They are
+        exposed as one logical floating-point weight while their packed
+        ``uint32`` weight and auxiliary scales/biases are hidden from
+        sanitizers and the streaming writer.
+        """
+        for wk in list(self._index):
+            if not wk.endswith(".weight") or self._index[wk][5] != "U32":
+                continue
+            base = wk[: -len(".weight")]
+            sk = f"{base}.scales"
+            bk = f"{base}.biases"
+            if sk not in self._index or bk not in self._index:
+                continue
+            info = self._classify_affine_triple(wk, sk, bk, config)
+            self._affine_triples[wk] = (sk, bk, info)
+            self._affine_aux_keys.update((sk, bk))
+            self._affine_weight_by_aux[sk] = wk
+            self._affine_weight_by_aux[bk] = wk
+
+        if self._affine_triples:
+            logger.info(
+                "MLX affine on-the-fly dequant: %d weight/scales/biases "
+                "triples detected",
+                len(self._affine_triples),
+            )
+
     def _classify_pair(self, wk, sk):
         """Classify a weight+scale pair into an mlx-native quantized format.
 
@@ -4457,6 +4591,46 @@ class _LazyTensorIndex:
         mx.clear_cache()
         return weight
 
+    def _dequant_affine_one(self, wk):
+        """Reconstruct one ordinary MLX affine-quantized source weight."""
+        sk, bk, info = self._affine_triples[wk]
+        weight_raw = self._load_raw(wk)
+        scale_raw = self._load_raw(sk)
+        bias_raw = self._load_raw(bk)
+        weight = mx.dequantize(
+            weight_raw,
+            scale_raw,
+            bias_raw,
+            group_size=info["group_size"],
+            bits=info["bits"],
+            mode=info["mode"],
+        )
+        mx.eval(weight)
+        del weight_raw, scale_raw, bias_raw
+        mx.clear_cache()
+        return weight
+
+    def _drop_affine_triple(self, key):
+        """Atomically remove the affine triple containing ``key``.
+
+        A detected affine triple is one logical weight backed by three source
+        tensors. Direct mutation of any member invalidates the composite, so
+        all source/override members and all bookkeeping are removed together.
+        The caller may then install a replacement for the requested key.
+        """
+        wk = self._affine_weight_by_aux.get(key, key)
+        entry = self._affine_triples.pop(wk, None)
+        if entry is None:
+            return False
+        sk, bk, _ = entry
+        self._affine_aux_keys.difference_update((sk, bk))
+        self._affine_weight_by_aux.pop(sk, None)
+        self._affine_weight_by_aux.pop(bk, None)
+        for member in (wk, sk, bk):
+            self._index.pop(member, None)
+            self._overrides.pop(member, None)
+        return True
+
     def _load_packed(self, wk):
         """Load a passthrough-capable pair in mlx packed quantized form.
 
@@ -4487,10 +4661,14 @@ class _LazyTensorIndex:
         return self._src_quant.get(key)
 
     def _is_visible(self, k):
-        return k not in self._fp8_scale_keys and k not in self._hidden
+        return (
+            k not in self._fp8_scale_keys
+            and k not in self._affine_aux_keys
+            and k not in self._hidden
+        )
 
     def logical_metadata(self):
-        """Metadata for plan discovery: FP8 weights report as BF16, scale keys hidden."""
+        """Metadata for plan discovery with packed source formats reconstructed."""
         result = {}
         for k, meta in self._index.items():
             if not self._is_visible(k):
@@ -4502,6 +4680,10 @@ class _LazyTensorIndex:
                 if info is not None and info["kind"] == "mxfp4":
                     # FP4-packed bytes: logical width is 2 values per byte.
                     shape = (shape[0], shape[1] * 2)
+            elif k in self._affine_triples:
+                _sk, _bk, info = self._affine_triples[k]
+                shape = (*shape[:-1], self._index[_sk][4][-1] * info["group_size"])
+                dtype = self._index[_sk][5]
             result[k] = (shape, dtype)
         for k, entry in self._virtual.items():
             result[k] = (entry.shape, entry.dtype)
@@ -4563,6 +4745,8 @@ class _LazyTensorIndex:
             raise KeyError(key)
         if key in self._fp8_pairs:
             return self._dequant_one(key)
+        if key in self._affine_triples:
+            return self._dequant_affine_one(key)
         return self._load_raw(key)
 
     def items(self):
@@ -4578,6 +4762,7 @@ class _LazyTensorIndex:
         return default
 
     def __setitem__(self, key, value):
+        self._drop_affine_triple(key)
         self._overrides[key] = value
         self._index.pop(key, None)
         self._fp8_pairs.pop(key, None)
@@ -4585,6 +4770,7 @@ class _LazyTensorIndex:
         self._forget_virtual(key)
 
     def __delitem__(self, key):
+        self._drop_affine_triple(key)
         if key in self._fp8_pairs:
             sk = self._fp8_pairs.pop(key)
             self._fp8_scale_keys.discard(sk)
@@ -4608,6 +4794,16 @@ class _LazyTensorIndex:
         if key in self._virtual:
             result = self.materialize_virtual(key)
             self._forget_virtual(key)
+            return result
+        affine_weight = self._affine_weight_by_aux.get(key)
+        if key in self._affine_triples or affine_weight is not None:
+            wk = affine_weight or key
+            result = (
+                self._dequant_affine_one(wk)
+                if key == wk
+                else self._load_raw(key)
+            )
+            self._drop_affine_triple(key)
             return result
         if key not in self._index:
             if default:
