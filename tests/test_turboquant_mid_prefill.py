@@ -356,7 +356,6 @@ def test_sliced_converter_matches_whole_conversion_and_appends() -> None:
     )
     assert cache[0] is sliced
     assert second.converted_layers == 0
-    assert second.already_quantized_layers == 1
 
 
 @pytest.mark.parametrize(
@@ -581,11 +580,8 @@ def test_guarded_converter_holds_buffer_lock_until_final_cleanup(
         release_converter.wait(timeout=5)
         return TurboQuantConversionStats(
             converted_layers=1,
-            already_quantized_layers=0,
             skipped_dense_layers=1,
             slices=1,
-            source_bytes=0,
-            converted_bytes=0,
         )
 
     def _no_sync(stream: Any | None = None) -> None:
@@ -1839,11 +1835,8 @@ def test_summary_uses_post_conversion_wall_clock(
         prompt_cache[0] = converted_first
         return TurboQuantConversionStats(
             converted_layers=1,
-            already_quantized_layers=0,
             skipped_dense_layers=1,
             slices=1,
-            source_bytes=0,
-            converted_bytes=0,
         )
 
     monkeypatch.setattr("omlx.scheduler.time.perf_counter", _clock)

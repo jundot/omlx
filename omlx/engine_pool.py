@@ -1507,16 +1507,16 @@ class EnginePool:
         return True
 
     def _find_lru_prefill_eviction_victim(self, *, exclude_model_id: str) -> str | None:
-        candidates = []
-        for mid, entry in self._entries.items():
-            if mid == exclude_model_id:
-                continue
-            if self._is_idle_for_prefill_eviction(entry):
-                candidates.append((entry.last_access, mid))
-        if not candidates:
-            return None
-        candidates.sort()
-        return candidates[0][1]
+        candidate = min(
+            (
+                (entry.last_access, model_id)
+                for model_id, entry in self._entries.items()
+                if model_id != exclude_model_id
+                and self._is_idle_for_prefill_eviction(entry)
+            ),
+            default=None,
+        )
+        return candidate[1] if candidate is not None else None
 
     async def _evict_idle_lru_for_prefill(
         self,

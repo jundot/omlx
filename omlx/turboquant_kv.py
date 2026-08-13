@@ -50,7 +50,6 @@ __all__ = [
     "TURBOQUANT_CONVERSION_SLICE_TOKENS",
     "TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS",
     "TURBOQUANT_PREFILL_QUERY_BLOCK_TOKENS",
-    "TurboQuantConversionStats",
     "TurboQuantKVCache",
     "BatchTurboQuantKVCache",
     "convert_kv_cache_sliced",
@@ -69,14 +68,11 @@ TURBOQUANT_PREFILL_KEY_CHUNK_TOKENS = 16384
 
 @dataclass(frozen=True, slots=True)
 class TurboQuantConversionStats:
-    """Observed shape and byte counts for one cache-list conversion."""
+    """Observed layer and slice counts for one cache-list conversion."""
 
     converted_layers: int
-    already_quantized_layers: int
     skipped_dense_layers: int
     slices: int
-    source_bytes: int
-    converted_bytes: int
 
 
 def _turboquant_family_indices(cache_list: list[Any]) -> list[int]:
@@ -90,16 +86,13 @@ def _turboquant_family_indices(cache_list: list[Any]) -> list[int]:
 
 def _turboquant_target_indices(
     cache_list: list[Any], *, skip_last: bool
-) -> tuple[set[int], int | None]:
+) -> tuple[list[int], int | None]:
     """Return conversion targets and the optional dense skip-last layer."""
-    family_indices = _turboquant_family_indices(cache_list)
+    target_indices = _turboquant_family_indices(cache_list)
     skipped_index = (
-        family_indices[-1] if skip_last and len(family_indices) > 1 else None
+        target_indices.pop() if skip_last and len(target_indices) > 1 else None
     )
-    targets = set(family_indices)
-    if skipped_index is not None:
-        targets.remove(skipped_index)
-    return targets, skipped_index
+    return target_indices, skipped_index
 
 
 def _turboquant_mse_bit_widths(bits: float) -> tuple[int, int]:
@@ -410,33 +403,24 @@ def convert_kv_cache_sliced(
         cache_list, skip_last=skip_last
     )
     converted_layers = 0
-    already_quantized_layers = 0
-    skipped_dense_layers = 0
+    skipped_dense_layers = int(
+        skipped_index is not None and isinstance(cache_list[skipped_index], KVCache)
+    )
     slices = 0
-    source_bytes = 0
-    converted_bytes = 0
 
-    for index in _turboquant_family_indices(cache_list):
+    for index in target_indices:
         cache_obj: Any | None = cache_list[index]
         keys: mx.array | None = None
         values: mx.array | None = None
         turbo_cache: TurboQuantKVCache | None = None
         converted_current_layer = False
         try:
-            if index == skipped_index:
-                if isinstance(cache_obj, KVCache):
-                    skipped_dense_layers += 1
-                continue
-            if index not in target_indices:
-                continue
             if isinstance(cache_obj, TurboQuantKVCache):
                 if not math.isclose(cache_obj.bits, validated_bits, abs_tol=1e-6):
                     raise ValueError(
                         f"TurboQuant layer {index} uses {cache_obj.bits} bits, "
                         f"expected {validated_bits}"
                     )
-                already_quantized_layers += 1
-                converted_bytes += int(cache_obj.nbytes)
                 continue
             if not isinstance(cache_obj, KVCache):
                 continue
@@ -451,7 +435,6 @@ def convert_kv_cache_sliced(
 
             keys, values = cache_obj.state
             num_tokens = _validate_dense_kv_state(keys, values)
-            source_bytes += int(keys.nbytes + values.nbytes)
 
             first_end = min(slice_tokens, num_tokens)
             _append_turboquant_slice(
@@ -529,7 +512,6 @@ def convert_kv_cache_sliced(
             )
             cache_list[index] = turbo_cache
             converted_layers += 1
-            converted_bytes += int(turbo_cache.nbytes)
             converted_current_layer = True
         finally:
             cache_obj = None
@@ -541,11 +523,8 @@ def convert_kv_cache_sliced(
 
     return TurboQuantConversionStats(
         converted_layers=converted_layers,
-        already_quantized_layers=already_quantized_layers,
         skipped_dense_layers=skipped_dense_layers,
         slices=slices,
-        source_bytes=source_bytes,
-        converted_bytes=converted_bytes,
     )
 
 

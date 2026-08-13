@@ -421,11 +421,8 @@ class _PrefillAbortedError(Exception):
         )
 
 
-def _format_and_detach_exception(exc: BaseException) -> str:
-    """Format an exception, then remove every traceback/frame reference."""
-    formatted = "".join(
-        traceback.format_exception(type(exc), exc, exc.__traceback__)
-    ).rstrip()
+def _detach_exception(exc: BaseException) -> None:
+    """Remove every traceback/frame reference from an exception chain."""
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
@@ -438,6 +435,14 @@ def _format_and_detach_exception(exc: BaseException) -> str:
         if current_traceback is not None:
             traceback.clear_frames(current_traceback)
         current = next_exception
+
+
+def _format_and_detach_exception(exc: BaseException) -> str:
+    """Format an exception, then remove every traceback/frame reference."""
+    formatted = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    ).rstrip()
+    _detach_exception(exc)
     return formatted
 
 
@@ -480,7 +485,6 @@ class _GuardedTurboQuantConversion:
     stats: TurboQuantConversionStats
     before_bytes: int
     after_bytes: int
-    estimated_peak_bytes: int
     conversion_seconds: float
     completed_at: float
 
@@ -3620,7 +3624,6 @@ class Scheduler:
         log_result: bool,
     ) -> _GuardedTurboQuantConversion:
         """Reserve and run one conversion under the process-wide exclusive gate."""
-        result: _GuardedTurboQuantConversion | None = None
         with (
             _conversion_coordinator.conversion(
                 process_owner=getattr(self, "_metal_process_owner", None)
@@ -3736,9 +3739,9 @@ class Scheduler:
                         "remained above the prefill safety cap"
                     )
             except _PrefillAbortedError as exc:
-                aborted_uids = list(exc.aborted_uids)
-                aborted_tokens = int(exc.processed_tokens)
-                _format_and_detach_exception(exc)
+                aborted_uids = exc.aborted_uids
+                aborted_tokens = exc.processed_tokens
+                _detach_exception(exc)
                 del exc
             except Exception as exc:
                 failure_traceback = _format_and_detach_exception(exc)
@@ -3746,8 +3749,6 @@ class Scheduler:
                 del exc
 
             if aborted_uids is not None:
-                stats = None
-                completed_at = None
                 self._reclaim_failed_turboquant_conversion(
                     request,
                     prompt_cache,
@@ -3765,8 +3766,6 @@ class Scheduler:
                         request.request_id,
                         failure_traceback,
                     )
-                stats = None
-                completed_at = None
                 self._reclaim_failed_turboquant_conversion(
                     request,
                     prompt_cache,
@@ -3780,18 +3779,13 @@ class Scheduler:
 
             if stats is None or completed_at is None:
                 raise RuntimeError("TurboQuant conversion produced no result")
-            result = _GuardedTurboQuantConversion(
+            return _GuardedTurboQuantConversion(
                 stats=stats,
                 before_bytes=before,
                 after_bytes=after,
-                estimated_peak_bytes=int(estimated_peak),
                 conversion_seconds=completed_at - started,
                 completed_at=completed_at,
             )
-
-        if result is None:
-            raise RuntimeError("TurboQuant conversion gate produced no result")
-        return result
 
     def _attempt_mid_prefill_conversion(
         self,
