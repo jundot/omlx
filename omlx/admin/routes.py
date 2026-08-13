@@ -408,6 +408,25 @@ def _format_cache_size(size_bytes: int) -> str:
     return f"{mb:.0f}MB"
 
 
+def _apply_if_changed(
+    request_value: Any,
+    current_value: Any,
+    settings_obj: Any,
+    attr_name: str,
+    runtime_key: str,
+    runtime_applied: list[str],
+) -> bool:
+    """Apply a global setting at runtime only if it actually changed.
+
+    Returns True if the setting was changed and added to runtime_applied.
+    """
+    if request_value is not None and request_value != current_value:
+        setattr(settings_obj, attr_name, request_value)
+        runtime_applied.append(runtime_key)
+        return True
+    return False
+
+
 def _parse_hot_cache_max_size(value: str) -> int:
     """Parse hot cache max size. Hot cache does not support an auto sentinel."""
     from ..config import parse_size
@@ -3724,24 +3743,20 @@ async def update_global_settings(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Apply cache settings
+    # Apply cache settings (only if something actually changed)
     cache_changed = False
-    if request.cache_enabled is not None:
-        global_settings.cache.enabled = request.cache_enabled
+    if _apply_if_changed(request.cache_enabled, global_settings.cache.enabled, global_settings.cache, "enabled", "cache_enabled", runtime_applied):
         cache_changed = True
-    if request.ssd_cache_dir is not None:
-        global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
+    if _apply_if_changed(request.ssd_cache_dir, global_settings.cache.ssd_cache_dir, global_settings.cache, "ssd_cache_dir", "ssd_cache_dir", runtime_applied):
         cache_changed = True
-    if request.ssd_cache_max_size is not None:
-        global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
+    if _apply_if_changed(request.ssd_cache_max_size, global_settings.cache.ssd_cache_max_size, global_settings.cache, "ssd_cache_max_size", "ssd_cache_max_size", runtime_applied):
         cache_changed = True
-    if request.hot_cache_only is not None:
-        global_settings.cache.hot_cache_only = request.hot_cache_only
-    if request.hot_cache_max_size is not None:
-        global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
+    if _apply_if_changed(request.hot_cache_only, global_settings.cache.hot_cache_only, global_settings.cache, "hot_cache_only", "hot_cache_only", runtime_applied):
         cache_changed = True
-    if request.initial_cache_blocks is not None:
-        global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
+    if _apply_if_changed(request.hot_cache_max_size, global_settings.cache.hot_cache_max_size, global_settings.cache, "hot_cache_max_size", "hot_cache_max_size", runtime_applied):
+        cache_changed = True
+    if _apply_if_changed(request.initial_cache_blocks, global_settings.cache.initial_cache_blocks, global_settings.cache, "initial_cache_blocks", "initial_cache_blocks", runtime_applied):
+        cache_changed = True
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
@@ -3765,15 +3780,16 @@ async def update_global_settings(
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
-        global_settings.huggingface.endpoint = request.hf_endpoint
-        if request.hf_endpoint:
-            os.environ["HF_ENDPOINT"] = request.hf_endpoint
-        elif "HF_ENDPOINT" in os.environ:
-            del os.environ["HF_ENDPOINT"]
-        runtime_applied.append("hf_endpoint")
-        logger.info(
-            f"HuggingFace endpoint updated to: " f"{request.hf_endpoint or '(default)'}"
-        )
+        if request.hf_endpoint != global_settings.huggingface.endpoint:
+            global_settings.huggingface.endpoint = request.hf_endpoint
+            if request.hf_endpoint:
+                os.environ["HF_ENDPOINT"] = request.hf_endpoint
+            elif "HF_ENDPOINT" in os.environ:
+                del os.environ["HF_ENDPOINT"]
+            runtime_applied.append("hf_endpoint")
+            logger.info(
+                f"HuggingFace endpoint updated to: " f"{request.hf_endpoint or '(default)'}"
+            )
     if request.hf_cache_enabled is not None:
         if global_settings.huggingface.hf_cache_enabled != request.hf_cache_enabled:
             global_settings.huggingface.hf_cache_enabled = request.hf_cache_enabled
@@ -3791,57 +3807,51 @@ async def update_global_settings(
 
     # Apply ModelScope settings (Live - immediately applied via env var)
     if request.ms_endpoint is not None:
-        global_settings.modelscope.endpoint = request.ms_endpoint
-        if request.ms_endpoint:
-            os.environ["MODELSCOPE_DOMAIN"] = request.ms_endpoint
-        elif "MODELSCOPE_DOMAIN" in os.environ:
-            del os.environ["MODELSCOPE_DOMAIN"]
-        runtime_applied.append("ms_endpoint")
-        logger.info(
-            f"ModelScope endpoint updated to: " f"{request.ms_endpoint or '(default)'}"
-        )
+        if request.ms_endpoint != global_settings.modelscope.endpoint:
+            global_settings.modelscope.endpoint = request.ms_endpoint
+            if request.ms_endpoint:
+                os.environ["MODELSCOPE_DOMAIN"] = request.ms_endpoint
+            elif "MODELSCOPE_DOMAIN" in os.environ:
+                del os.environ["MODELSCOPE_DOMAIN"]
+            runtime_applied.append("ms_endpoint")
+            logger.info(
+                f"ModelScope endpoint updated to: " f"{request.ms_endpoint or '(default)'}"
+            )
 
     # Apply network settings (Live - immediately applied via env vars)
     network_changed = False
-    if request.network_http_proxy is not None:
-        global_settings.network.http_proxy = request.network_http_proxy
+    if _apply_if_changed(request.network_http_proxy, global_settings.network.http_proxy, global_settings.network, "http_proxy", "network_http_proxy", runtime_applied):
+        network_changed = True
         if request.network_http_proxy:
             os.environ["HTTP_PROXY"] = request.network_http_proxy
             os.environ["http_proxy"] = request.network_http_proxy
         else:
             os.environ.pop("HTTP_PROXY", None)
             os.environ.pop("http_proxy", None)
+    if _apply_if_changed(request.network_https_proxy, global_settings.network.https_proxy, global_settings.network, "https_proxy", "network_https_proxy", runtime_applied):
         network_changed = True
-
-    if request.network_https_proxy is not None:
-        global_settings.network.https_proxy = request.network_https_proxy
         if request.network_https_proxy:
             os.environ["HTTPS_PROXY"] = request.network_https_proxy
             os.environ["https_proxy"] = request.network_https_proxy
         else:
             os.environ.pop("HTTPS_PROXY", None)
             os.environ.pop("https_proxy", None)
+    if _apply_if_changed(request.network_no_proxy, global_settings.network.no_proxy, global_settings.network, "no_proxy", "network_no_proxy", runtime_applied):
         network_changed = True
-
-    if request.network_no_proxy is not None:
-        global_settings.network.no_proxy = request.network_no_proxy
         if request.network_no_proxy:
             os.environ["NO_PROXY"] = request.network_no_proxy
             os.environ["no_proxy"] = request.network_no_proxy
         else:
             os.environ.pop("NO_PROXY", None)
             os.environ.pop("no_proxy", None)
+    if _apply_if_changed(request.network_ca_bundle, global_settings.network.ca_bundle, global_settings.network, "ca_bundle", "network_ca_bundle", runtime_applied):
         network_changed = True
-
-    if request.network_ca_bundle is not None:
-        global_settings.network.ca_bundle = request.network_ca_bundle
         if request.network_ca_bundle:
             os.environ["REQUESTS_CA_BUNDLE"] = request.network_ca_bundle
             os.environ["SSL_CERT_FILE"] = request.network_ca_bundle
         else:
             os.environ.pop("REQUESTS_CA_BUNDLE", None)
             os.environ.pop("SSL_CERT_FILE", None)
-        network_changed = True
 
     if network_changed:
         runtime_applied.append("network")
@@ -3849,32 +3859,22 @@ async def update_global_settings(
 
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False
-    if request.sampling_max_context_window is not None:
-        global_settings.sampling.max_context_window = (
-            request.sampling_max_context_window
-        )
+    if _apply_if_changed(request.sampling_max_context_window, global_settings.sampling.max_context_window, global_settings.sampling, "max_context_window", "sampling_max_context_window", runtime_applied):
         sampling_changed = True
     if "sampling_max_context_window_policy" in request.model_fields_set:
-        global_settings.sampling.max_context_window_policy = (
-            request.sampling_max_context_window_policy
-        )
+        if request.sampling_max_context_window_policy != global_settings.sampling.max_context_window_policy:
+            global_settings.sampling.max_context_window_policy = request.sampling_max_context_window_policy
+            runtime_applied.append("sampling_max_context_window_policy")
+            sampling_changed = True
+    if _apply_if_changed(request.sampling_max_tokens, global_settings.sampling.max_tokens, global_settings.sampling, "max_tokens", "sampling_max_tokens", runtime_applied):
         sampling_changed = True
-    if request.sampling_max_tokens is not None:
-        global_settings.sampling.max_tokens = request.sampling_max_tokens
+    if _apply_if_changed(request.sampling_temperature, global_settings.sampling.temperature, global_settings.sampling, "temperature", "sampling_temperature", runtime_applied):
         sampling_changed = True
-    if request.sampling_temperature is not None:
-        global_settings.sampling.temperature = request.sampling_temperature
+    if _apply_if_changed(request.sampling_top_p, global_settings.sampling.top_p, global_settings.sampling, "top_p", "sampling_top_p", runtime_applied):
         sampling_changed = True
-    if request.sampling_top_p is not None:
-        global_settings.sampling.top_p = request.sampling_top_p
+    if _apply_if_changed(request.sampling_top_k, global_settings.sampling.top_k, global_settings.sampling, "top_k", "sampling_top_k", runtime_applied):
         sampling_changed = True
-    if request.sampling_top_k is not None:
-        global_settings.sampling.top_k = request.sampling_top_k
-        sampling_changed = True
-    if request.sampling_repetition_penalty is not None:
-        global_settings.sampling.repetition_penalty = (
-            request.sampling_repetition_penalty
-        )
+    if _apply_if_changed(request.sampling_repetition_penalty, global_settings.sampling.repetition_penalty, global_settings.sampling, "repetition_penalty", "sampling_repetition_penalty", runtime_applied):
         sampling_changed = True
 
     if sampling_changed:
