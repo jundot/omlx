@@ -6269,7 +6269,22 @@ async def stream_responses_api(
     accumulated_text = ""
     accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser(start_in_thinking=native_reasoning)
+    # Some templates open the thinking block in the prompt itself, so the
+    # generated text starts with reasoning body and only later emits </think>.
+    start_in_thinking = native_reasoning
+    if not start_in_thinking:
+        try:
+            tokenizer = getattr(engine, "tokenizer", None)
+            if tokenizer is not None:
+                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                    engine, messages, kwargs
+                )
+                start_in_thinking, _ = prompt_opens_thinking(
+                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                )
+        except Exception as exc:
+            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
