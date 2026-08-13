@@ -385,10 +385,11 @@ class ProcessMemoryEnforcer:
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
         self._over_ceiling_polls: int = 0
-        # Consecutive hard-pressure polls we have deferred the busy-request
-        # abort while a fat Metal buffer pool drains at the next prefill
-        # chunk / step boundary. See the grace check in _check_and_enforce.
-        self._busy_abort_grace_polls: int = 0
+        # Consecutive hard-pressure polls we have deferred destructive
+        # enforcement while a fat Metal buffer pool drains at the next
+        # prefill chunk / step boundary. See the grace check in
+        # _check_and_enforce.
+        self._pressure_reclaim_grace_polls: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -487,6 +488,7 @@ class ProcessMemoryEnforcer:
         """
         if self._running:
             return
+        self._pressure_reclaim_grace_polls = 0
         if self._prefill_memory_guard:
             self._refresh_effective_metal_cap_bytes()
         self._running = True
@@ -1010,10 +1012,10 @@ class ProcessMemoryEnforcer:
     # _periodic_clear_threshold_bytes floor). Above it, a clear meaningfully
     # returns memory to the OS.
     _POOL_RECLAIM_FLOOR = 2 * 1024**3
-    # Max consecutive hard-pressure polls the busy-request abort is deferred
+    # Max consecutive hard-pressure polls destructive enforcement is deferred
     # while a reclaimable pool drains. Prefill chunks run ~5s at full step
     # size, so 5 one-second polls cover at least one chunk boundary.
-    _BUSY_ABORT_GRACE_POLLS_MAX = 5
+    _PRESSURE_RECLAIM_GRACE_POLLS_MAX = 5
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1022,7 +1024,7 @@ class ProcessMemoryEnforcer:
         except (TypeError, ValueError):
             return 0
 
-    def _request_scheduler_cache_reclaim(self, freed_hot: int) -> None:
+    def _request_scheduler_cache_reclaim(self, freed_hot: int) -> int:
         """Ask each scheduler to run its step-boundary Metal cache clear.
 
         Routes the reclaim through the scheduler's shipped, lock-protected,
@@ -1034,23 +1036,25 @@ class ProcessMemoryEnforcer:
         unlike ``request_idle_reclaim``, which never fires while requests are
         running and so cannot recover a busy server from hard pressure.
 
-        Fires when a hot-cache shrink just freed references (so the freed
-        buffers, now pooled, can be returned to the OS) OR when the MLX
-        buffer pool alone holds a meaningful amount under pressure (the
-        already-wedged case where hot cache is empty but pooled buffers are
-        stranded).
+        Fires before destructive hard-pressure enforcement when the MLX buffer
+        pool alone holds a meaningful amount, or after a hot-cache shrink just
+        freed references so those newly pooled buffers can return to the OS.
         """
         # A non-numeric reading (e.g. a wholesale-mocked mx in unit tests)
         # cannot justify a clear; _pool_bytes treats it as an empty pool.
         pool_bytes = self._pool_bytes()
         if freed_hot <= 0 and pool_bytes <= self._POOL_RECLAIM_FLOOR:
-            return
+            return 0
         requested = 0
         for entry in self._engine_pool._entries.values():
             scheduler = self._resolve_scheduler(entry)
             request = getattr(scheduler, "request_pressure_reclaim", None)
             if callable(request):
-                request()
+                try:
+                    request()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Pressure cache reclaim request failed: %s", exc)
+                    continue
                 requested += 1
         if requested:
             logger.info(
@@ -1060,6 +1064,7 @@ class ProcessMemoryEnforcer:
                 _format_gb(freed_hot),
                 _format_gb(pool_bytes),
             )
+        return requested
 
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.
@@ -1327,6 +1332,7 @@ class ProcessMemoryEnforcer:
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
         self._running = False
+        self._pressure_reclaim_grace_polls = 0
         if self._wake_event is not None:
             self._wake_event.set()
         if self._task:
@@ -1429,6 +1435,7 @@ class ProcessMemoryEnforcer:
         if ceiling <= 0:
             self._pressure_level = "ok"
             self._over_ceiling_polls = 0
+            self._pressure_reclaim_grace_polls = 0
             return
 
         current = self._current_usage_bytes()
@@ -1446,9 +1453,9 @@ class ProcessMemoryEnforcer:
 
         if new_level != "hard":
             # The hard episode ended (drain worked or the load finished):
-            # the next one gets a fresh abort-grace budget. Must happen
+            # the next one gets a fresh reclaim-grace budget. Must happen
             # before the ok-level early return below.
-            self._busy_abort_grace_polls = 0
+            self._pressure_reclaim_grace_polls = 0
 
         if new_level != prev_level:
             self._pressure_level = new_level
@@ -1461,6 +1468,34 @@ class ProcessMemoryEnforcer:
             )
 
         if new_level == "hard":
+            # When pooled Metal buffers can be returned at the next inference
+            # boundary, let that non-destructive reclaim run before shrinking
+            # shared hot cache or aborting work.  A failed / unavailable request
+            # deliberately falls through to the established shrink/enforcement
+            # path.
+            if (
+                not emergency
+                and os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1"
+                and self._pressure_reclaim_grace_polls
+                < self._PRESSURE_RECLAIM_GRACE_POLLS_MAX
+            ):
+                requested = self._request_scheduler_cache_reclaim(0)
+                if requested:
+                    self._pressure_reclaim_grace_polls += 1
+                    logger.info(
+                        "Hard memory pressure: deferring destructive enforcement "
+                        "(poll %d/%d) while pooled Metal buffers drain on %d "
+                        "scheduler(s)",
+                        self._pressure_reclaim_grace_polls,
+                        self._PRESSURE_RECLAIM_GRACE_POLLS_MAX,
+                        requested,
+                    )
+                    # This gate is non-destructive and is documented to walk
+                    # once per enforcement tick, including while hard-pressure
+                    # actions are deferred.
+                    self._walk_store_cache_caps()
+                    return
+
             freed_hot = await asyncio.to_thread(
                 self._shrink_hot_cache_for_pressure,
                 current,
@@ -1554,33 +1589,6 @@ class ProcessMemoryEnforcer:
                 if new_level == "hard":
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
-                        # Reclaim-before-abort grace: when the MLX buffer pool
-                        # alone holds more than the reclaim floor, the pressure
-                        # clear requested above can very likely recover below
-                        # the watermark without killing anything (measured:
-                        # aborts fired 0.1GB over the watermark with 3.7GB of
-                        # pooled buffers on the table). The drain runs on the
-                        # inference thread at the next prefill-chunk or step
-                        # boundary, so give it a bounded number of polls.
-                        # Never defers an emergency (at/over the ceiling).
-                        if (
-                            not emergency
-                            and self._busy_abort_grace_polls
-                            < self._BUSY_ABORT_GRACE_POLLS_MAX
-                            and self._pool_bytes() > self._POOL_RECLAIM_FLOOR
-                        ):
-                            self._busy_abort_grace_polls += 1
-                            logger.info(
-                                "Hard memory pressure on '%s': deferring "
-                                "request abort (poll %d/%d) while %s of "
-                                "pooled Metal buffers drain",
-                                busy_victim,
-                                self._busy_abort_grace_polls,
-                                self._BUSY_ABORT_GRACE_POLLS_MAX,
-                                _format_gb(self._pool_bytes()),
-                            )
-                            break
-                        self._busy_abort_grace_polls = 0
                         entry = self._engine_pool._entries.get(busy_victim)
                         aborted = 0
                         if (
@@ -1695,7 +1703,7 @@ class ProcessMemoryEnforcer:
         if post_level != "hard":
             # Same reset as the pre-action check: eviction inside this tick
             # may already have ended the hard episode.
-            self._busy_abort_grace_polls = 0
+            self._pressure_reclaim_grace_polls = 0
         if post_level != self._pressure_level:
             self._pressure_level = post_level
             self._propagate_memory_limit()
