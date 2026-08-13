@@ -163,7 +163,7 @@ def _build_tool_call(name: str, arguments: Any) -> Optional[ToolCall]:
                 arguments=_serialize_tool_call_arguments(arguments),
             ),
         )
-    except (ValueError, *_DEEP_NEST_ERRORS) as exc:
+    except (TypeError, ValueError, *_DEEP_NEST_ERRORS) as exc:
         logger.warning(
             "Dropping tool call %.80r: arguments failed validation (%s: %s)",
             name,
@@ -826,7 +826,17 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         args_str = match.group(2)
         try:
             arguments = json.loads(args_str)
-        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
+        except _DEEP_NEST_ERRORS as exc:
+            logger.warning(
+                "Dropping bracket tool call %.80r: arguments nested too deeply "
+                "to decode (%s: %s)",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            matched_spans.append(match.span())
+            continue
+        except (json.JSONDecodeError, ValueError):
             arguments = {"raw": args_str}
         _built = _build_tool_call(name, arguments)
         if _built is not None:

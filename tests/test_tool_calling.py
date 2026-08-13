@@ -4257,3 +4257,39 @@ def test_malformed_string_arguments_still_coerce():
 
     assert mod._serialize_tool_call_arguments("not json at all") == "{}"
     assert mod._serialize_tool_call_arguments('{"a": 1}') == '{"a": 1}'
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["{1, 2}", "b'abc'", "1+2j"],
+    ids=["set", "bytes", "complex"],
+)
+def test_hermes_non_json_literal_drops_only_bad_call(literal):
+    """Python literals that JSON cannot represent must not escape the parser."""
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = False
+    text = "<|tool_call_start|>[bad(x=" + literal + "), good(x=1)]<|tool_call_end|>"
+
+    cleaned, calls = parse_tool_calls(text, tok)
+
+    assert cleaned == ""
+    assert [call.function.name for call in calls] == ["good"]
+
+
+def test_bracket_deep_decode_never_runs_raw_arguments():
+    """A recursion-bound breach must drop the call, not run its raw payload."""
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = False
+
+    for depth in range(900, 1051):
+        nested = "[" * depth + "0" + "]" * depth
+        text = '[Tool call: bad({"x":' + nested + '})][Tool call: good({"x":1})]'
+
+        cleaned, calls = parse_tool_calls(text, tok)
+        names = [call.function.name for call in calls or []]
+
+        assert cleaned == ""
+        assert names.count("good") == 1
+        for call in calls or []:
+            if call.function.name == "bad":
+                assert not call.function.arguments.startswith('{"raw":')
