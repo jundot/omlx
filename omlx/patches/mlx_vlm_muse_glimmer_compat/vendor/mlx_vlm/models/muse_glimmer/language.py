@@ -28,6 +28,42 @@ def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     return x.astype(dtype)
 
 
+@mx.compile
+def _prepare_mlp_input(
+    residual: mx.array,
+    attention_output: mx.array,
+    post_attention_weight: mx.array,
+    pre_feedforward_weight: mx.array,
+    post_attention_eps: float,
+    pre_feedforward_eps: float,
+) -> tuple[mx.array, mx.array]:
+    hidden_states = residual + _centered_rms_norm(
+        attention_output,
+        post_attention_weight,
+        post_attention_eps,
+    )
+    mlp_input = _centered_rms_norm(
+        hidden_states,
+        pre_feedforward_weight,
+        pre_feedforward_eps,
+    )
+    return hidden_states, mlp_input
+
+
+@mx.compile
+def _finish_mlp(
+    residual: mx.array,
+    mlp_output: mx.array,
+    post_feedforward_weight: mx.array,
+    post_feedforward_eps: float,
+) -> mx.array:
+    return residual + _centered_rms_norm(
+        mlp_output,
+        post_feedforward_weight,
+        post_feedforward_eps,
+    )
+
+
 class RMSNormNoScale(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
@@ -49,40 +85,6 @@ class CenteredRMSNorm(nn.Module):
         # Transformers applies the centered scale in FP32 before casting back
         # to the activation dtype. Casting earlier changes BF16 decode choices.
         return _centered_rms_norm(x, self.weight, self.eps)
-
-
-# oMLX: QuantizedNormedEmbedding + NormedEmbedding.to_quantized are ported
-# from mlx-vlm PR #1839. nn.Embedding.to_quantized returns a plain
-# QuantizedEmbedding, which silently drops the weightless embed_norm and
-# feeds unnormalized embeddings into the residual stream (logits collapse
-# onto generic tokens while the model keeps generating fluent text).
-class QuantizedNormedEmbedding(nn.QuantizedEmbedding):
-    """Quantized NormedEmbedding that keeps the weightless embedding norm."""
-
-    def __call__(self, inputs: mx.array) -> mx.array:
-        return self.embed_norm(super().__call__(inputs))
-
-
-class NormedEmbedding(nn.Embedding):
-    def __init__(self, vocab_size: int, hidden_size: int, eps: float):
-        super().__init__(vocab_size, hidden_size)
-        self.embed_norm = RMSNormNoScale(eps)
-
-    def __call__(self, inputs: mx.array) -> mx.array:
-        return self.embed_norm(super().__call__(inputs))
-
-    def to_quantized(
-        self,
-        group_size: int = 64,
-        bits: int = 4,
-        mode: str = "affine",
-        **kwargs,
-    ) -> "QuantizedNormedEmbedding":
-        quantized = QuantizedNormedEmbedding.from_embedding(
-            self, group_size, bits, mode=mode
-        )
-        quantized.embed_norm = self.embed_norm
-        return quantized
 
 
 class MLP(nn.Module):
@@ -147,7 +149,11 @@ class Attention(nn.Module):
         keys = self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
         values = self.v_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
 
-        queries = (self.qk_norm(queries) * self.qk_scale_factor).transpose(0, 2, 1, 3)
+        queries = self.qk_norm(queries)
+        queries = (queries.astype(mx.float32) * self.qk_scale_factor).astype(
+            queries.dtype
+        )
+        queries = queries.transpose(0, 2, 1, 3)
         keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
@@ -197,20 +203,28 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         residual = x
         x = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
-        x = residual + self.post_attention_layernorm(x)
-
-        residual = x
-        x = self.mlp(self.pre_feedforward_layernorm(x))
-        return residual + self.post_feedforward_layernorm(x)
+        residual, mlp_input = _prepare_mlp_input(
+            residual,
+            x,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.post_attention_layernorm.eps,
+            self.pre_feedforward_layernorm.eps,
+        )
+        return _finish_mlp(
+            residual,
+            self.mlp(mlp_input),
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+        )
 
 
 class TextModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
-        self.embed_tokens = NormedEmbedding(
-            args.vocab_size, args.hidden_size, args.rms_norm_eps
-        )
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_norm = RMSNormNoScale(args.rms_norm_eps)
         self.layers = [DecoderLayer(args, idx) for idx in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.layer_types = args.layer_types
@@ -229,9 +243,9 @@ class TextModel(nn.Module):
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
     ) -> mx.array:
-        hidden_states = (
-            self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
-        )
+        hidden_states = inputs_embeds
+        if hidden_states is None:
+            hidden_states = self.embed_norm(self.embed_tokens(inputs))
         if cache is None:
             cache = [None] * len(self.layers)
 
@@ -287,16 +301,6 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
-
-    @property
-    def quant_predicate(self):
-        def predicate(_, module):
-            # NormedEmbedding has a custom forward pass which applies an RMS
-            # normalization. Replacing it with QuantizedEmbedding would drop
-            # that normalization and corrupt the language model's activations.
-            return not isinstance(module, NormedEmbedding)
-
-        return predicate
 
     def make_cache(self):
         return [

@@ -105,6 +105,8 @@ class ModelConfig(BaseModelConfig):
     projector_hidden_act: str = "gelu"
     eos_token_id: Optional[Union[int, List[int]]] = None
     vocab_size: int = 202048
+    thinking_start_token: str = "to=self<|message|>"
+    thinking_end_token: str = "<|eom|>"
 
     def __post_init__(self):
         if self.eos_token_id is None:

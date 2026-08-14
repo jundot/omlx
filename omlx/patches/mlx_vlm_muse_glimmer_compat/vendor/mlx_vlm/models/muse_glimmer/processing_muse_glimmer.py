@@ -11,6 +11,7 @@ from transformers.image_processing_utils import ImageProcessingMixin
 from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch, load_chat_template, to_mlx
+from .config import ModelConfig
 
 
 def smart_resize(height: int, width: int, patch_size: int, max_tokens: int):
@@ -132,7 +133,12 @@ class MuseGlimmerProcessor(ProcessorMixin):
         return type(argument)
 
     def __init__(
-        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
+        self,
+        image_processor=None,
+        tokenizer=None,
+        chat_template=None,
+        config=None,
+        **kwargs,
     ):
         self.image_token = "<|patch|>"
         self.image_start_token = "<|image_start|>"
@@ -142,6 +148,7 @@ class MuseGlimmerProcessor(ProcessorMixin):
         super().__init__(
             image_processor, tokenizer, chat_template=chat_template, **kwargs
         )
+        self.config = config
 
     def __call__(
         self,
@@ -199,14 +206,23 @@ class MuseGlimmerProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, PreTrainedConfig
 
         kwargs.pop("use_fast", None)
         kwargs.pop("trust_remote_code", None)
+        model_config = kwargs.pop("config", None)
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        if model_config is None:
+            config_dict, _ = PreTrainedConfig.get_config_dict(
+                pretrained_model_name_or_path, **kwargs
+            )
+            model_config = ModelConfig.from_dict(config_dict)
+        elif isinstance(model_config, dict):
+            model_config = ModelConfig.from_dict(model_config)
 
         config_path = Path(pretrained_model_name_or_path) / "processor_config.json"
         processor_config = (
@@ -226,6 +242,7 @@ class MuseGlimmerProcessor(ProcessorMixin):
             image_processor=image_processor,
             tokenizer=tokenizer,
             chat_template=getattr(tokenizer, "chat_template", None),
+            config=model_config,
         )
 
 

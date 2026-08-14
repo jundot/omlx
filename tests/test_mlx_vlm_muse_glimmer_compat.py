@@ -278,34 +278,44 @@ def test_centered_rms_norm_preserves_transformers_fp32_order(applied):
 def test_quantization_preserves_embedding_norm(applied):
     import mlx.nn as nn
 
-    from mlx_vlm.models.muse_glimmer.language import (
-        NormedEmbedding,
-        QuantizedNormedEmbedding,
+    from mlx_vlm.models.muse_glimmer.language import TextModel
+    from mlx_vlm.models.muse_glimmer.config import TextConfig
+
+    # Upstream design (mlx-vlm #1848): embed_tokens is a plain nn.Embedding
+    # and embed_norm is a separate weightless module, so quantizing the
+    # embedding cannot drop the norm (unlike the PR #1839 NormedEmbedding
+    # wrapper this test originally guarded). Verify the norm survives
+    # quantization on the real module structure and the forward path
+    # (embed_norm(embed_tokens(x))) still yields unit-RMS embeddings.
+    model = TextModel(
+        TextConfig(
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=32,
+            sliding_window=8,
+        )
     )
-
-    class Container(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = NormedEmbedding(64, 64, 1e-5)
-
-        def __call__(self, ids):
-            return self.embed_tokens(ids)
-
-    container = Container()
     # A deliberately large scale: only the norm brings this back to unit RMS.
-    container.embed_tokens.weight = mx.random.normal((64, 64)) * 5.0
+    model.embed_tokens.weight = mx.random.normal((64, 64)) * 5.0
 
     ids = mx.array([[1, 2, 3]])
-    reference = container(ids)
+    reference = model.embed_norm(model.embed_tokens(ids))
     mx.eval(reference)
 
-    nn.quantize(container, group_size=32, bits=8)
+    nn.quantize(model, group_size=32, bits=8)
 
-    quantized_embed = container.embed_tokens
-    assert isinstance(quantized_embed, QuantizedNormedEmbedding)
-    assert hasattr(quantized_embed, "embed_norm")
+    quantized_embed = model.embed_tokens
+    assert isinstance(quantized_embed, nn.QuantizedEmbedding)
+    # The norm is a separate module, not swallowed by quantization.
+    assert isinstance(model.embed_norm, nn.Module)
 
-    quantized = container(ids)
+    quantized = model.embed_norm(model.embed_tokens(ids))
     mx.eval(quantized)
     assert abs(float(mx.sqrt(mx.mean(reference**2))) - 1.0) < 1e-2
     assert abs(float(mx.sqrt(mx.mean(quantized**2))) - 1.0) < 1e-2

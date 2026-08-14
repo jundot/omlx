@@ -70,7 +70,10 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        language_model = self.language_model.model
+        inputs_embeds = language_model.embed_norm(
+            language_model.embed_tokens(input_ids)
+        )
         if pixel_values is None:
             pixel_values = kwargs.get("pixel_values_videos")
         if pixel_values is None:
@@ -119,10 +122,6 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.layers
-
-    @property
-    def quant_predicate(self):
-        return self.language_model.quant_predicate
 
     def make_cache(self):
         return self.language_model.make_cache()
