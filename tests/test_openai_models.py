@@ -530,6 +530,15 @@ class TestChatCompletionRequest:
         )
         assert req.guided_grammar == 'root ::= "YES"'
 
+    def test_reasoning_effort_accepted(self):
+        req = ChatCompletionRequest(
+            model="Qwen3.8-27B",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+
+        assert req.reasoning_effort == "xhigh"
+
 
 class TestChatCompletionResponse:
     """Tests for ChatCompletionResponse model."""

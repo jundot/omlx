@@ -18,6 +18,41 @@ import pytest
 from omlx.speculative import vlm_mtp
 
 
+def test_qwen38_block_fp8_dequantization():
+    from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
+
+    weight_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+    weights = {
+        weight_key: mx.to_fp8(mx.ones((130, 129), dtype=mx.float32)),
+        f"{weight_key}_scale_inv": mx.array(
+            [[0.5, 1.0], [2.0, 4.0]], dtype=mx.bfloat16
+        ),
+    }
+
+    out = dequantize_fp8_weights(weights)
+    expected = mx.ones((130, 129), dtype=mx.bfloat16)
+    expected[:128, :128] *= 0.5
+    expected[:128, 128:] *= 1.0
+    expected[128:, :128] *= 2.0
+    expected[128:, 128:] *= 4.0
+
+    assert not any(key.endswith("weight_scale_inv") for key in out)
+    assert out[weight_key].dtype == mx.bfloat16
+    assert mx.array_equal(out[weight_key], expected).item()
+
+
+def test_qwen38_block_fp8_rejects_invalid_scale_grid():
+    from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
+
+    with pytest.raises(ValueError, match="Invalid FP8 scale shape"):
+        dequantize_fp8_weights(
+            {
+                "proj.weight": mx.to_fp8(mx.ones((129, 129))),
+                "proj.weight_scale_inv": mx.ones((1, 2)),
+            }
+        )
+
+
 def _fake_drafter_model(model_type: str = "gemma4_assistant") -> MagicMock:
     """Build a stand-in for Gemma4AssistantDraftModel that satisfies the
     minimum API used by VLMMTPDrafter."""

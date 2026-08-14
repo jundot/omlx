@@ -171,6 +171,7 @@ from .api.utils import (
     extract_multimodal_content,
     extract_text_content,
     has_nonleading_system_message,
+    merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
@@ -3386,7 +3387,10 @@ async def create_chat_completion(
             settings_guided_grammar = _settings_guided_grammar(ms)
         merged_ct_kwargs = merge_chat_template_request_kwargs(
             ms,
-            request.chat_template_kwargs,
+            merge_reasoning_effort_chat_template_kwargs(
+                request.chat_template_kwargs,
+                request.reasoning_effort,
+            ),
         )
 
         # Extract messages - different engines need different content handling.
@@ -5893,7 +5897,14 @@ async def create_response(
             reasoning_parser = ms.reasoning_parser
         merged_ct_kwargs = merge_chat_template_request_kwargs(
             ms,
-            request.chat_template_kwargs,
+            merge_reasoning_effort_chat_template_kwargs(
+                request.chat_template_kwargs,
+                (
+                    request.reasoning.get("effort")
+                    if isinstance(request.reasoning, dict)
+                    else None
+                ),
+            ),
         )
 
         _entry = get_engine_pool().get_entry(resolved_model)
