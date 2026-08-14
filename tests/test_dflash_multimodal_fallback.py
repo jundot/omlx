@@ -15,6 +15,7 @@ After this fix:
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -411,3 +412,111 @@ class TestServerExtractionRouting:
 
         plain_engine = MagicMock(spec=[])
         assert getattr(plain_engine, "supports_multimodal_fallback", False) is False
+
+
+# -- Auto-revert after fallback idle (issue: sticky fallback regression) -------
+
+class TestAutoRevert:
+    """After an image request puts the engine in VLM fallback mode, text
+    requests should reload dflash once fallback has been idle past the
+    cooldown. While requests keep arriving, fallback stays (no churn)."""
+
+    @pytest.fixture
+    def vlm_dflash_engine(self):
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            fallback_engine_type="vlm",
+        )
+        engine._loaded = True
+        engine._tokenizer_obj = MagicMock()
+        return engine
+
+    def test_should_auto_revert_false_when_not_in_fallback(self, vlm_dflash_engine):
+        vlm_dflash_engine._in_fallback_mode = False
+        assert vlm_dflash_engine._should_auto_revert() is False
+
+    def test_should_auto_revert_false_within_cooldown(self, vlm_dflash_engine):
+        vlm_dflash_engine._in_fallback_mode = True
+        vlm_dflash_engine._last_fallback_activity_ts = time.monotonic()
+        assert vlm_dflash_engine._should_auto_revert() is False
+
+    def test_should_auto_revert_true_after_cooldown(self, vlm_dflash_engine):
+        vlm_dflash_engine._in_fallback_mode = True
+        vlm_dflash_engine._last_fallback_activity_ts = (
+            time.monotonic() - vlm_dflash_engine._fallback_cooldown_secs - 1
+        )
+        assert vlm_dflash_engine._should_auto_revert() is True
+
+    def test_should_auto_revert_false_when_cooldown_disabled(self):
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            fallback_engine_type="vlm",
+            model_settings=MagicMock(dflash_fallback_cooldown_secs=0),
+        )
+        engine._in_fallback_mode = True
+        engine._last_fallback_activity_ts = time.monotonic() - 999
+        assert engine._should_auto_revert() is False
+
+    def test_mark_fallback_activity_resets_cooldown(self, vlm_dflash_engine):
+        vlm_dflash_engine._in_fallback_mode = True
+        vlm_dflash_engine._last_fallback_activity_ts = (
+            time.monotonic() - vlm_dflash_engine._fallback_cooldown_secs - 1
+        )
+        vlm_dflash_engine._mark_fallback_activity()
+        assert vlm_dflash_engine._should_auto_revert() is False
+
+    @pytest.mark.asyncio
+    async def test_chat_text_only_auto_reverts_after_idle(self, vlm_dflash_engine):
+        """A text-only chat in fallback, idle past cooldown, reloads dflash
+        and runs on the dflash path instead of the fallback engine."""
+        mock_fallback = AsyncMock()
+        vlm_dflash_engine._fallback_engine = mock_fallback
+        vlm_dflash_engine._in_fallback_mode = True
+        vlm_dflash_engine._last_fallback_activity_ts = (
+            time.monotonic() - vlm_dflash_engine._fallback_cooldown_secs - 1
+        )
+        vlm_dflash_engine._apply_chat_template = MagicMock(return_value="formatted")
+        vlm_dflash_engine.generate = AsyncMock(return_value=MagicMock())
+
+        with patch.object(
+            vlm_dflash_engine, "_reload_dflash_from_fallback"
+        ) as mock_reload:
+            mock_reload.side_effect = lambda: setattr(
+                vlm_dflash_engine, "_in_fallback_mode", False
+            )
+            await vlm_dflash_engine.chat(_text_only_messages())
+
+        mock_reload.assert_called_once()
+        vlm_dflash_engine._apply_chat_template.assert_called_once()
+        vlm_dflash_engine.generate.assert_called_once()
+        mock_fallback.chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chat_image_stays_in_fallback_even_when_idle(self, vlm_dflash_engine):
+        """Image chats never trigger auto-revert — they need the VLM engine."""
+        mock_fallback = AsyncMock()
+        mock_fallback.chat = AsyncMock(return_value=MagicMock())
+        vlm_dflash_engine._fallback_engine = mock_fallback
+        vlm_dflash_engine._in_fallback_mode = True
+        vlm_dflash_engine._last_fallback_activity_ts = (
+            time.monotonic() - vlm_dflash_engine._fallback_cooldown_secs - 1
+        )
+
+        await vlm_dflash_engine.chat(_image_url_messages())
+
+        mock_fallback.chat.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_chat_text_within_cooldown_stays_in_fallback(self, vlm_dflash_engine):
+        """Text arriving inside the cooldown window keeps using fallback."""
+        mock_fallback = AsyncMock()
+        mock_fallback.chat = AsyncMock(return_value=MagicMock())
+        vlm_dflash_engine._fallback_engine = mock_fallback
+        vlm_dflash_engine._in_fallback_mode = True
+        vlm_dflash_engine._last_fallback_activity_ts = time.monotonic()
+
+        await vlm_dflash_engine.chat(_text_only_messages())
+
+        mock_fallback.chat.assert_called_once()

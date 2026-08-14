@@ -18,6 +18,7 @@ import math
 import re
 import threading
 import time
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -414,6 +415,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else None
         )
+        # Auto-revert cooldown: while in VLM fallback mode (image requests),
+        # reload dflash once no fallback request has been served for this
+        # many seconds. Prevents silent performance regression on mixed
+        # text/image workloads — the old design stayed in fallback forever
+        # (dflash reload measured ~1.5s, so churn is cheap). 0/None disables.
+        self._fallback_cooldown_secs = float(
+            getattr(model_settings, "dflash_fallback_cooldown_secs", 30)
+            if model_settings
+            else 30
+        )
+        self._last_fallback_activity_ts: float | None = None
 
     @property
     def model_name(self) -> str:
@@ -817,7 +829,47 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
         await self._fallback_engine.start()
         self._in_fallback_mode = True
+        self._last_fallback_activity_ts = time.monotonic()
         logger.info(f"DFlash fallback engine started: {self._fallback_engine_type}")
+
+    def _mark_fallback_activity(self) -> None:
+        """Stamp fallback activity so the auto-revert cooldown resets.
+
+        Called after the VLM fallback engine serves a request (image or
+        text while in fallback mode). While requests keep arriving within
+        the cooldown window, dflash stays evicted (avoids reload churn on
+        image batches); once idle, the next text request reloads dflash.
+        """
+        self._last_fallback_activity_ts = time.monotonic()
+
+    def _should_auto_revert(self) -> bool:
+        """True when fallback mode has been idle long enough to reload dflash."""
+        if not self._in_fallback_mode:
+            return False
+        cooldown = self._fallback_cooldown_secs
+        if not cooldown or cooldown <= 0:
+            return False
+        last = self._last_fallback_activity_ts
+        if last is None:
+            return False
+        return (time.monotonic() - last) >= cooldown
+
+    async def _reload_dflash_from_fallback(self) -> None:
+        """Stop the VLM fallback engine and reload the dflash engine.
+
+        dflash start() reloads the target + drafter (~1.5s measured) and
+        reinstalls the prefix cache (L2 SSD survives; L1 starts empty and
+        repopulates on the first request).
+        """
+        async with self._fallback_lock:
+            if not self._in_fallback_mode:
+                return
+            logger.info(
+                "DFlash auto-revert: fallback idle >= "
+                f"{self._fallback_cooldown_secs}s, reloading dflash engine"
+            )
+            await self.stop()
+            await self.start()
 
     async def stop(self) -> None:
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
@@ -841,6 +893,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._prefill_guard = None
         self._in_fallback_mode = False
         self._loaded = False
+        self._last_fallback_activity_ts = None
         # Revert class-level __call__ patches dflash installed during start().
         # Required so a subsequent Native MTP load on the same process sees
         # clean classes instead of leftover dflash hooks (issue #1388).
@@ -1375,6 +1428,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"evicting dflash models and switching to {self._fallback_engine_type} engine"
                     )
                     await self._evict_dflash_and_start_fallback()
+            self._mark_fallback_activity()
             return await self._fallback_engine.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1389,20 +1443,26 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
 
         # Already in fallback mode but short context came in.
-        # Stay in fallback mode (reloading dflash models is expensive).
+        # Stay in fallback mode (reloading dflash models is expensive) while
+        # requests keep arriving; once idle past the cooldown, reload dflash
+        # so text-only traffic runs at full speculative speed again.
         if self._in_fallback_mode:
-            return await self._fallback_engine.generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop,
-                **kwargs,
-            )
+            if self._should_auto_revert():
+                await self._reload_dflash_from_fallback()
+            else:
+                self._mark_fallback_activity()
+                return await self._fallback_engine.generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    stop=stop,
+                    **kwargs,
+                )
 
         tools = kwargs.pop("tools", None)
 
@@ -1584,6 +1644,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"evicting dflash models and switching to {self._fallback_engine_type} engine"
                     )
                     await self._evict_dflash_and_start_fallback()
+            self._mark_fallback_activity()
             async for output in self._fallback_engine.stream_generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1599,22 +1660,27 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 yield output
             return
 
-        # Already in fallback mode — stay there
+        # Already in fallback mode — reload dflash once idle past the
+        # cooldown, otherwise keep serving and stamp activity.
         if self._in_fallback_mode:
-            async for output in self._fallback_engine.stream_generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop,
-                **kwargs,
-            ):
-                yield output
-            return
+            if self._should_auto_revert():
+                await self._reload_dflash_from_fallback()
+            else:
+                self._mark_fallback_activity()
+                async for output in self._fallback_engine.stream_generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    stop=stop,
+                    **kwargs,
+                ):
+                    yield output
+                return
 
         tools = kwargs.pop("tools", None)
 
@@ -1736,18 +1802,43 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             await self.start()
 
         if self._in_fallback_mode:
-            return await self._fallback_engine.chat(
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                tools=tools,
-                **kwargs,
-            )
+            if (
+                self._fallback_engine_type == "vlm"
+                and self._has_multimodal_content(messages)
+            ):
+                # Image request: stay on the VLM fallback engine and reset
+                # the idle cooldown.
+                self._mark_fallback_activity()
+                return await self._fallback_engine.chat(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    tools=tools,
+                    **kwargs,
+                )
+            if self._should_auto_revert():
+                # Text-only chat while in fallback and idle past cooldown:
+                # reload dflash and fall through to the dflash path below.
+                await self._reload_dflash_from_fallback()
+            else:
+                self._mark_fallback_activity()
+                return await self._fallback_engine.chat(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    tools=tools,
+                    **kwargs,
+                )
 
         if self._fallback_engine_type == "vlm" and self._has_multimodal_content(
             messages
@@ -1759,6 +1850,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "switching to VLM engine"
                     )
                     await self._evict_dflash_and_start_fallback()
+            self._mark_fallback_activity()
             return await self._fallback_engine.chat(
                 messages,
                 max_tokens=max_tokens,
@@ -1812,20 +1904,47 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             await self.start()
 
         if self._in_fallback_mode:
-            async for output in self._fallback_engine.stream_chat(
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                tools=tools,
-                **kwargs,
+            if (
+                self._fallback_engine_type == "vlm"
+                and self._has_multimodal_content(messages)
             ):
-                yield output
-            return
+                # Image request: stay on the VLM fallback engine and reset
+                # the idle cooldown.
+                self._mark_fallback_activity()
+                async for output in self._fallback_engine.stream_chat(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    tools=tools,
+                    **kwargs,
+                ):
+                    yield output
+                return
+            if self._should_auto_revert():
+                # Text-only chat while in fallback and idle past cooldown:
+                # reload dflash and fall through to the dflash path below.
+                await self._reload_dflash_from_fallback()
+            else:
+                self._mark_fallback_activity()
+                async for output in self._fallback_engine.stream_chat(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    tools=tools,
+                    **kwargs,
+                ):
+                    yield output
+                return
 
         if self._fallback_engine_type == "vlm" and self._has_multimodal_content(
             messages

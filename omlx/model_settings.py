@@ -260,6 +260,10 @@ class ModelSettings:
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    # Auto-revert cooldown: while in VLM fallback mode (image requests), reload
+    # dflash once no fallback request has been served for this many seconds
+    # (0 disables auto-revert). See DFlashEngine._should_auto_revert.
+    dflash_fallback_cooldown_secs: Optional[float] = 30.0
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
