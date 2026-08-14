@@ -3604,11 +3604,15 @@ async def create_chat_completion(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking in chat template kwargs when a thinking
-        # budget is active (from request or model settings).  Some chat
+        # Auto-set enable_thinking in chat template kwargs when a positive
+        # thinking budget is active (from request or model settings). Some chat
         # templates (e.g. Gemma 4) explicitly suppress thinking unless this
         # kwarg is True.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -5489,10 +5493,14 @@ async def create_anthropic_message(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking in chat template kwargs when a thinking
-        # budget is active but enable_thinking was not already set (e.g. via
+        # Auto-set enable_thinking in chat template kwargs when a positive
+        # thinking budget is active but enable_thinking was not already set (e.g. via
         # the Anthropic thinking.type field above or model settings).
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
@@ -6032,8 +6040,12 @@ async def create_response(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking when thinking budget is active.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        # Auto-set enable_thinking when a positive thinking budget is active.
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
             merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support

@@ -1341,7 +1341,8 @@ def merge_chat_template_kwargs(
       1. ``settings.chat_template_kwargs``
       2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
       3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
-      4. thinking budget activation when ``enable_thinking`` is still unset
+      4. positive thinking budget activation when ``enable_thinking`` is still
+         unset (zero never enables thinking)
       5. the model's preserve-thinking default when it is supported and unset
     """
     merged = merge_chat_template_request_kwargs(settings, request_ct_kwargs)
@@ -1353,7 +1354,11 @@ def merge_chat_template_kwargs(
         and settings.thinking_budget_tokens
     ):
         thinking_budget = settings.thinking_budget_tokens
-    if thinking_budget is not None and "enable_thinking" not in merged:
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged
+    ):
         merged["enable_thinking"] = True
 
     if (

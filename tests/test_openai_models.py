@@ -501,6 +501,33 @@ class TestChatCompletionRequest:
         assert data["model"] == "gpt-4"
         assert data["messages"][0]["role"] == "user"
 
+    def test_top_level_enable_thinking_normalizes_to_template_kwargs(self):
+        """Top-level compatibility input must reach the template renderer."""
+        req = ChatCompletionRequest(
+            model="reasoning-model",
+            messages=[Message(role="user", content="Hello")],
+            enable_thinking=False,
+            thinking_budget=0,
+            chat_template_kwargs={"reasoning_effort": "low"},
+        )
+
+        assert req.enable_thinking is False
+        assert req.thinking_budget == 0
+        assert req.chat_template_kwargs == {
+            "enable_thinking": False,
+            "reasoning_effort": "low",
+        }
+
+    def test_top_level_enable_thinking_rejects_nested_conflict(self):
+        """Conflicting control paths must fail instead of choosing silently."""
+        with pytest.raises(ValidationError, match="enable_thinking conflicts"):
+            ChatCompletionRequest(
+                model="reasoning-model",
+                messages=[Message(role="user", content="Hello")],
+                enable_thinking=False,
+                chat_template_kwargs={"enable_thinking": True},
+            )
+
     def test_xtc_defaults_to_none(self):
         """Test XTC params default to None (not sent by client)."""
         req = ChatCompletionRequest(

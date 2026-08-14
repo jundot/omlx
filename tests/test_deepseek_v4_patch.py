@@ -1039,6 +1039,31 @@ class TestChatTemplateV4:
             "<｜begin▁of▁sentence｜>Be helpful." "<｜User｜>Hello<｜Assistant｜><think>"
         )
 
+    def test_top_level_thinking_disable_renders_chat_tail(self, applied_patch):
+        """OpenAI's top-level alias must reach V4's thinking_mode adapter.
+
+        DeepSeek V4 renders ``</think>`` in chat mode, rather than opening a
+        thinking block. This exercises the Pydantic normalization and the real
+        template adapter without loading a model.
+        """
+        from omlx.api.openai_models import ChatCompletionRequest
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        request = ChatCompletionRequest(
+            model="deepseek-v4",
+            messages=[{"role": "user", "content": "Answer only."}],
+            enable_thinking=False,
+            thinking_budget=0,
+        )
+        prompt = ct.apply_chat_template(
+            [message.model_dump(exclude_none=True) for message in request.messages],
+            add_generation_prompt=True,
+            **request.chat_template_kwargs,
+        )
+
+        assert prompt.endswith("<｜Assistant｜></think>")
+        assert not prompt.endswith("<｜Assistant｜><think>")
+
     def test_official_latest_reminder_before_user(self, applied_patch):
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 

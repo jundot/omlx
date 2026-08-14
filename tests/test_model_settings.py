@@ -641,6 +641,12 @@ class TestModelSettingsManager:
 
         assert merged == {"enable_thinking": True, "custom_flag": "request"}
 
+    def test_zero_thinking_budget_does_not_enable_thinking(self):
+        """Zero means no thinking budget activation at template-render time."""
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        assert merge_chat_template_kwargs(None, thinking_budget=0) == {}
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading

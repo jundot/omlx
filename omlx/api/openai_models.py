@@ -13,7 +13,7 @@ These models define the request and response schemas for:
 import json
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 from omlx.api.shared_models import (
     BaseUsage,
@@ -298,6 +298,10 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Convenience alias for chat_template_kwargs.enable_thinking.  Some OpenAI
+    # clients send extension fields at the request top level, so retain this
+    # explicitly instead of allowing Pydantic to discard it as an unknown key.
+    enable_thinking: Optional[bool] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)
@@ -316,6 +320,30 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def normalize_top_level_enable_thinking(self) -> "ChatCompletionRequest":
+        """Move the top-level thinking alias into template kwargs.
+
+        ``chat_template_kwargs`` remains the canonical extensibility surface.
+        Supplying both forms is allowed only when they agree, preventing a
+        request from silently rendering with an unintended thinking mode.
+        """
+        if self.enable_thinking is None:
+            return self
+
+        template_kwargs = dict(self.chat_template_kwargs or {})
+        nested_value = template_kwargs.get("enable_thinking")
+        if "enable_thinking" in template_kwargs and (
+            not isinstance(nested_value, bool) or nested_value is not self.enable_thinking
+        ):
+            raise ValueError(
+                "enable_thinking conflicts with chat_template_kwargs.enable_thinking"
+            )
+
+        template_kwargs["enable_thinking"] = self.enable_thinking
+        self.chat_template_kwargs = template_kwargs
+        return self
 
 
 class AssistantMessage(BaseModel):

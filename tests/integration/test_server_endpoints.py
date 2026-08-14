@@ -1107,6 +1107,32 @@ class TestChatCompletionEndpoint:
 
         assert response.status_code == 200
 
+    def test_zero_thinking_budget_does_not_enable_template_thinking(
+        self, client, mock_llm_engine
+    ):
+        """Zero is forwarded as a clamp, not as a request to turn thinking on."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        mock_llm_engine.chat = chat
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking_budget": 0,
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs[0]["thinking_budget"] == 0
+        assert "enable_thinking" not in recorded_chat_kwargs[0].get(
+            "chat_template_kwargs", {}
+        )
+
     def test_chat_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine
     ):
