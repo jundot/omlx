@@ -57,7 +57,7 @@
                                         @click="copyClusterCommands('pairingRecovery', [clusterGuidance.command])"
                                         class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50">
                                     <i data-lucide="copy" class="w-3 h-3"></i>
-                                    <span x-text="clusterCommandsCopied.pairingRecovery ? 'Copied!' : 'Copy'"></span>
+                                    <span x-text="clusterCommandsCopied.pairingRecovery ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                 </button>
                             </div>
                             <pre class="text-[10px] font-mono text-neutral-700 whitespace-pre-wrap break-all" x-text="clusterGuidance.command"></pre>
@@ -75,7 +75,7 @@
                                     <button type="button"
                                             @click="copyClusterCommands('pairingKeygen', [clusterGuidance.keygen_command])"
                                             class="px-2 py-1 text-[10px] font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
-                                            x-text="clusterCommandsCopied.pairingKeygen ? 'Copied!' : 'Copy'"></button>
+                                            x-text="clusterCommandsCopied.pairingKeygen ? window.t('cluster.copied') : window.t('cluster.copy')"></button>
                                 </div>
                             </details>
                         </div>
@@ -225,7 +225,7 @@
                                                     ]
                                                 )"
                                                 class="cluster-fabric__copy"
-                                                :title="'Copy endpoint and model ID'">
+                                                :title="window.t('cluster.copy_endpoint_and_model_id')">
                                             <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                             <span x-text="clusterCommandsCopied.liveEndpoint
                                                 ? 'Copied'
@@ -462,7 +462,7 @@
                                         :aria-expanded="clusterShowModelPicker"
                                         class="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-neutral-700 bg-white border border-neutral-200 rounded-xl hover:bg-neutral-50">
                                     <i data-lucide="list-filter" class="w-4 h-4"></i>
-                                    <span x-text="clusterSelectedModel() ? 'Change model' : 'Choose model'"></span>
+                                    <span x-text="clusterSelectedModel() ? window.t('cluster.change_model') : window.t('cluster.choose_model')"></span>
                                 </button>
                                 <button type="button"
                                         @click="runClusterPrimaryAction()"
@@ -483,7 +483,7 @@
                                         class="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-red-700 bg-white border border-red-200 rounded-xl hover:bg-red-50 disabled:opacity-50"
                                         data-cluster-stop-deployment>
                                     <i data-lucide="square" class="w-4 h-4"></i>
-                                    <span x-text="clusterDeactivatingId ? 'Stopping…' : 'Stop cluster'"></span>
+                                    <span x-text="clusterDeactivatingId ? window.t('cluster.stopping') : window.t('cluster.stop_cluster')"></span>
                                 </button>
                             </div>
                         </div>
@@ -711,7 +711,7 @@
                         <span x-show="clusterJoinedNodes.length" x-cloak
                               class="inline-flex shrink-0 items-center gap-2 rounded-full border border-green-200 bg-white px-3 py-1.5 text-xs font-semibold text-green-700">
                             <span class="h-2 w-2 rounded-full bg-green-500"></span>
-                            <span x-text="clusterJoinedNodes.length + ' CUDA worker' + (clusterJoinedNodes.length === 1 ? '' : 's') + ' joined'"></span>
+                            <span x-text="clusterJoinedNodes.length + ' ' + (clusterJoinedNodes.length === 1 ? window.t('cluster.cuda_worker_joined') : window.t('cluster.cuda_workers_joined'))"></span>
                         </span>
                     </div>
 
@@ -754,7 +754,7 @@
                                     class="inline-flex items-center justify-center gap-2 rounded-xl bg-neutral-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
                                     data-cluster-generate-cuda-join>
                                 <i data-lucide="key-round" class="h-4 w-4"></i>
-                                <span x-text="clusterJoinLoading ? 'Generating…' : (clusterJoinCommand ? 'Generate another' : 'Generate join command')"></span>
+                                <span x-text="clusterJoinLoading ? window.t('cluster.generating') : (clusterJoinCommand ? window.t('cluster.generate_another') : window.t('cluster.generate_join_command'))"></span>
                             </button>
                         </div>
 
@@ -776,7 +776,7 @@
                                             @click="copyClusterCommands('cudaJoin', [clusterJoinCommand])"
                                             :disabled="!clusterJoinCommandUsable()"
                                             class="rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-neutral-900 disabled:cursor-not-allowed disabled:opacity-40">
-                                        <span x-text="clusterCommandsCopied.cudaJoin ? 'Copied!' : 'Copy command'"></span>
+                                        <span x-text="clusterCommandsCopied.cudaJoin ? window.t('cluster.copied') : window.t('cluster.copy_command')"></span>
                                     </button>
                                     <button type="button"
                                             @click="revokeClusterJoinCommand()"
@@ -829,7 +829,7 @@
                             :disabled="clusterDiagnosticsLoading"
                             class="inline-flex items-center justify-center gap-2 rounded-lg border border-neutral-300 bg-white px-3 py-2 text-xs font-medium text-neutral-700 hover:bg-neutral-100 disabled:opacity-50 shrink-0">
                         <i data-lucide="download" class="w-4 h-4"></i>
-                        <span x-text="clusterDiagnosticsLoading ? 'Building report…' : 'Download diagnostic report'"></span>
+                        <span x-text="clusterDiagnosticsLoading ? window.t('cluster.building_report') : window.t('cluster.download_diagnostic_report')"></span>
                     </button>
                 </div>
 
@@ -888,7 +888,7 @@
                         <div class="text-base font-semibold text-neutral-900"
                              x-text="'MLX ' + clusterStatus.runtime.mlx_version"></div>
                         <div class="text-sm text-neutral-500 mt-1"
-                             x-text="'oMLX ' + clusterStatus.runtime.omlx_version + ' · protocol ' + clusterStatus.protocol_version"></div>
+                             x-text="'oMLX ' + clusterStatus.runtime.omlx_version + ' · ' + window.t('cluster.protocol') + ' ' + clusterStatus.protocol_version"></div>
                     </div>
                 </div>
 
@@ -932,12 +932,12 @@
                                             @click="copyClusterCommands('endpoint', [clusterPublicEndpoint()])"
                                             class="px-2.5 py-1 rounded-full text-[10px] font-semibold border border-neutral-600 text-neutral-200 hover:bg-neutral-800"
                                             :title="clusterPublicEndpoint()"
-                                            x-text="clusterCommandsCopied.endpoint ? 'Endpoint copied' : 'Copy endpoint'"></button>
+                                            x-text="clusterCommandsCopied.endpoint ? window.t('cluster.endpoint_copied') : window.t('cluster.copy_endpoint')"></button>
                                     <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wider bg-blue-500 text-white"
-                                          x-text="'This Mac · R' + job.rank"></span>
+                                          x-text="window.t('cluster.this_mac') + ' · R' + job.rank"></span>
                                     <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wider"
                                           :class="job.live ? 'bg-green-50 text-green-700' : 'bg-amber-100 text-amber-700'"
-                                          x-text="job.live ? job.phase : 'stale'"></span>
+                                          x-text="job.live ? job.phase : window.t('cluster.stale')"></span>
                                 </div>
                             </div>
                         </div>
@@ -1014,7 +1014,7 @@
                                                 ? 'bg-green-500/10 border-green-500/30 text-green-300'
                                                 : 'bg-neutral-800 border-neutral-700 text-neutral-500'"
                                               :title="capability.reason"
-                                              x-text="name.replaceAll('_', ' ') + (capability.active ? ' · on' : ' · off')"></span>
+                                              x-text="name.replaceAll('_', ' ') + ' · ' + (capability.active ? window.t('cluster.on') : window.t('cluster.off'))"></span>
                                     </template>
                                 </div>
                             </template>
@@ -1080,7 +1080,7 @@
                                                     <div class="min-w-0">
                                                         <div class="flex items-center gap-2">
                                                             <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
-                                                                  x-text="'Rank ' + assignment.rank"></span>
+                                                                  x-text="window.t('cluster.rank').replace('{rank}', assignment.rank)"></span>
                                                             <span x-show="assignment.rank === job.rank"
                                                                   class="px-1.5 py-0.5 rounded bg-blue-500 text-[9px] font-semibold uppercase">This Mac</span>
                                                         </div>
@@ -1093,7 +1093,7 @@
                                                 <div class="grid grid-cols-3 gap-3 mt-4">
                                                     <div>
                                                         <div class="text-[9px] uppercase tracking-wider text-neutral-500"
-                                                             x-text="clusterRuntimeRankStatus(job, assignment) ? 'Resident weights' : 'Planned weights'"></div>
+                                                             x-text="clusterRuntimeRankStatus(job, assignment) ? window.t('cluster.resident_weights') : window.t('cluster.planned_weights')"></div>
                                                         <div class="text-xs font-medium mt-1"
                                                              x-text="formatClusterGiB(
                                                                 clusterRuntimeRankStatus(job, assignment)?.measured_weight_bytes
@@ -1133,7 +1133,7 @@
                                                         </div>
                                                         <div>
                                                             <div class="text-[9px] uppercase tracking-wider text-neutral-500">TP rank</div>
-                                                            <div class="text-xs font-medium text-neutral-300 mt-1" x-text="'R' + assignment.tensor_parallel_rank + ' of ' + assignment.tensor_parallel_size"></div>
+                                                            <div class="text-xs font-medium text-neutral-300 mt-1" x-text="window.t('cluster.rank_of').replace('{rank}', assignment.tensor_parallel_rank).replace('{size}', assignment.tensor_parallel_size)"></div>
                                                         </div>
                                                     </div>
                                                 </template>
@@ -1236,7 +1236,7 @@
                                     <div class="col-span-2">
                                         <dt class="text-xs text-neutral-400">Interfaces</dt>
                                         <dd class="font-mono text-xs text-neutral-600 mt-1 break-all"
-                                            x-text="clusterStatus.transport.rdma.devices.join(', ') || 'None reported'"></dd>
+                                            x-text="clusterStatus.transport.rdma.devices.join(', ') || window.t('cluster.none_reported')"></dd>
                                     </div>
                                 </dl>
                             </div>
@@ -1257,7 +1257,7 @@
                                             </div>
                                             <div class="min-w-0">
                                                 <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
-                                                     x-text="'Worker · rank ' + node.rank"></div>
+                                                     x-text="window.t('cluster.worker_rank').replace('{rank}', node.rank)"></div>
                                                 <div class="font-semibold text-neutral-900 truncate"
                                                      x-text="clusterNodeHardwareLabel(node)"></div>
                                             </div>
@@ -1265,7 +1265,7 @@
                                         <span class="inline-flex items-center gap-1.5 text-xs font-medium"
                                               :class="node.online ? 'text-green-600' : 'text-amber-600'">
                                             <span class="w-2 h-2 rounded-full bg-current"></span>
-                                            <span x-text="node.online ? 'Online' : 'Checking'"></span>
+                                            <span x-text="node.online ? window.t('cluster.online') : window.t('cluster.checking')"></span>
                                         </span>
                                     </div>
 
@@ -1355,7 +1355,7 @@
                                     :disabled="clusterWorkerRunning"
                                     class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all">
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                <span x-text="clusterWorkerRunning ? 'Running…' : 'Run check'"></span>
+                                <span x-text="clusterWorkerRunning ? window.t('cluster.running') : window.t('cluster.run_check')"></span>
                             </button>
                         </div>
                         <div class="mt-5 h-12 flex items-center">
@@ -1391,7 +1391,7 @@
                                     :disabled="clusterCollectiveRunning"
                                     class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all">
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                <span x-text="clusterCollectiveRunning ? 'Running…' : 'Run check'"></span>
+                                <span x-text="clusterCollectiveRunning ? window.t('cluster.running') : window.t('cluster.run_check')"></span>
                             </button>
                         </div>
                         <div class="mt-5 h-12 flex items-center">
@@ -1427,7 +1427,7 @@
                                     :disabled="clusterPipelineRunning"
                                     class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all">
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                <span x-text="clusterPipelineRunning ? 'Running…' : 'Run check'"></span>
+                                <span x-text="clusterPipelineRunning ? window.t('cluster.running') : window.t('cluster.run_check')"></span>
                             </button>
                         </div>
                         <div class="mt-5 h-12 flex items-center">
@@ -1588,7 +1588,7 @@
                                                 :disabled="clusterSshKeyGenerating"
                                                 class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                             <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
-                                            <span x-text="clusterSshKeyGenerating ? 'Regenerating…' : 'Regenerate'"></span>
+                                            <span x-text="clusterSshKeyGenerating ? window.t('cluster.regenerating') : window.t('cluster.regenerate')"></span>
                                         </button>
                                     </div>
                                     <div class="mt-3 pt-3 border-t border-neutral-200">
@@ -1602,7 +1602,7 @@
                                                     :disabled="clusterExchangeTokenLoading || clusterPairingSecret.length < 16"
                                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                                 <i data-lucide="key" class="w-3.5 h-3.5"></i>
-                                                <span x-text="clusterExchangeTokenLoading ? 'Generating…' : 'Generate exchange token'"></span>
+                                                <span x-text="clusterExchangeTokenLoading ? window.t('cluster.generating') : window.t('cluster.generate_exchange_token')"></span>
                                             </button>
                                         </div>
                                         <template x-if="clusterExchangeToken">
@@ -1615,7 +1615,7 @@
                                                 <button @click="copyClusterExchangeToken()"
                                                         class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 whitespace-nowrap">
                                                     <i data-lucide="copy" class="w-3.5 h-3.5"></i>
-                                                    <span x-text="clusterExchangeTokenCopied ? 'Copied!' : 'Copy'"></span>
+                                                    <span x-text="clusterExchangeTokenCopied ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                                 </button>
                                             </div>
                                         </template>
@@ -1635,7 +1635,7 @@
                                                     :disabled="clusterKeyExchangeLoading || !clusterPeerExchangeToken || clusterPairingSecret.length < 16"
                                                     class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap">
                                                 <i data-lucide="link" class="w-3.5 h-3.5"></i>
-                                                <span x-text="clusterKeyExchangeLoading ? 'Pairing…' : 'Pair'"></span>
+                                                <span x-text="clusterKeyExchangeLoading ? window.t('cluster.pairing') : window.t('cluster.pair')"></span>
                                             </button>
                                         </div>
                                         <template x-if="clusterKeyExchangeResult">
@@ -1652,7 +1652,7 @@
                                                     :disabled="clusterKeychainStoring"
                                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                                 <i data-lucide="shield" class="w-3.5 h-3.5"></i>
-                                                <span x-text="clusterKeychainStoring ? 'Storing…' : 'Store in Keychain'"></span>
+                                                <span x-text="clusterKeychainStoring ? window.t('cluster.storing') : window.t('cluster.store_in_keychain')"></span>
                                             </button>
                                         </div>
                                     </div>
@@ -1669,7 +1669,7 @@
                                                 :disabled="clusterSshKeyGenerating"
                                                 class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50">
                                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
-                                            <span x-text="clusterSshKeyGenerating ? 'Generating…' : 'Generate key'"></span>
+                                            <span x-text="clusterSshKeyGenerating ? window.t('cluster.generating') : window.t('cluster.generate_key')"></span>
                                         </button>
                                     </div>
                                 </div>
@@ -1716,7 +1716,7 @@
                                     :disabled="clusterPeerProbeLoading || !clusterPeerSsh.trim()"
                                     class="inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-xl hover:bg-neutral-800 disabled:opacity-50 transition-all">
                                 <i data-lucide="scan-search" class="w-4 h-4"></i>
-                                <span x-text="clusterPeerProbeLoading ? 'Checking…' : 'Check peer'"></span>
+                                <span x-text="clusterPeerProbeLoading ? window.t('cluster.checking_ellipsis') : window.t('cluster.check_peer')"></span>
                             </button>
                         </div>
 
@@ -1725,7 +1725,7 @@
                                     :disabled="clusterFabricLoading || !clusterPeerSsh.trim()"
                                     class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                 <i data-lucide="refresh-cw" class="w-3 h-3"></i>
-                                <span x-text="clusterFabricLoading ? 'Reading…' : 'Re-read addresses'"></span>
+                                <span x-text="clusterFabricLoading ? window.t('cluster.reading') : window.t('cluster.reread_addresses')"></span>
                             </button>
                             <button x-show="clusterIpsOverridden" x-cloak
                                     @click="useDiscoveredClusterAddresses()"
@@ -1811,7 +1811,7 @@
                                     </div>
                                     <span class="text-xs font-medium"
                                           :class="clusterPeerProbe.runtime_compatible ? 'text-green-700' : 'text-red-700'"
-                                          x-text="clusterPeerProbe.runtime_compatible ? 'Runtime match' : clusterPeerProbe.runtime_mismatches.join(' · ')"></span>
+                                          x-text="clusterPeerProbe.runtime_compatible ? window.t('cluster.runtime_match') : clusterPeerProbe.runtime_mismatches.join(' · ')"></span>
                                 </div>
                             </div>
                         </template>
@@ -1908,7 +1908,7 @@
                                             :disabled="clusterCatalogueLoading"
                                             class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                         <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
-                                        <span x-text="clusterCatalogueLoading ? 'Checking fit…' : 'Check fit'"></span>
+                                        <span x-text="clusterCatalogueLoading ? window.t('cluster.checking_fit') : window.t('cluster.check_fit')"></span>
                                     </button>
                                 </div>
 
@@ -1986,7 +1986,7 @@
                                             :disabled="clusterTransportsLoading"
                                             class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                         <i data-lucide="radio" class="w-3.5 h-3.5"></i>
-                                        <span x-text="clusterTransportsLoading ? 'Detecting…' : 'Detect link'"></span>
+                                        <span x-text="clusterTransportsLoading ? window.t('cluster.detecting') : window.t('cluster.detect_link')"></span>
                                     </button>
                                 </div>
 
@@ -2036,7 +2036,7 @@
                                                     <button @click="copyClusterCommands('link', clusterLinkStatus.commands)"
                                                             class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100">
                                                         <i data-lucide="copy" class="w-3 h-3"></i>
-                                                        <span x-text="clusterCommandsCopied.link ? 'Copied!' : 'Copy'"></span>
+                                                        <span x-text="clusterCommandsCopied.link ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                                     </button>
                                                 </div>
                                                 <pre class="text-[10px] font-mono text-neutral-700 bg-white border border-neutral-200 rounded-lg p-2 overflow-x-auto"><template x-for="line in clusterLinkStatus.commands" :key="line"><div x-text="line"></div></template></pre>
@@ -2134,7 +2134,7 @@
                                                         <button @click="copyClusterCommands(clusterIssueKey(issue), [issue.remediation])"
                                                                 class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100">
                                                             <i data-lucide="copy" class="w-3 h-3"></i>
-                                                            <span x-text="clusterCommandsCopied[clusterIssueKey(issue)] ? 'Copied!' : 'Copy'"></span>
+                                                            <span x-text="clusterCommandsCopied[clusterIssueKey(issue)] ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                                         </button>
                                                     </div>
                                                     <pre class="text-[10px] font-mono text-neutral-700 bg-white border border-neutral-200 rounded-lg p-2 overflow-x-auto" x-text="issue.remediation"></pre>
@@ -2165,7 +2165,7 @@
                                                         :disabled="clusterStagingLoading"
                                                         class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 whitespace-nowrap shrink-0">
                                                     <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                    <span x-text="clusterStagingLoading ? 'Copying…' : 'Prepare now'"></span>
+                                                    <span x-text="clusterStagingLoading ? window.t('cluster.copying') : window.t('cluster.prepare_now')"></span>
                                                 </button>
                                             </div>
                                             <template x-if="clusterStagingResult">
@@ -2321,7 +2321,7 @@
                                     :disabled="clusterPlanLoading"
                                     class="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-neutral-900 rounded-xl hover:bg-neutral-800 disabled:opacity-50 transition-all flex-shrink-0">
                                 <i data-lucide="wand-sparkles" class="w-4 h-4"></i>
-                                <span x-text="clusterPlanLoading ? 'Planning…' : 'Build plan'"></span>
+                                <span x-text="clusterPlanLoading ? window.t('cluster.planning') : window.t('cluster.build_plan')"></span>
                             </button>
                         </div>
                     </div>
@@ -2345,7 +2345,7 @@
                                 :disabled="clusterBudgetsLoading"
                                 class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 shrink-0">
                             <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
-                            <span x-text="clusterBudgetsLoading ? 'Measuring…' : 'Measure devices'"></span>
+                            <span x-text="clusterBudgetsLoading ? window.t('cluster.measuring') : window.t('cluster.measure_devices')"></span>
                         </button>
                     </div>
 
@@ -2492,7 +2492,7 @@
                                                  will launch. -->
                                             <div class="flex justify-between text-[11px]">
                                                 <dt class="text-neutral-500"
-                                                    x-text="item.role === 'workstation' ? 'Held back for you' : 'Held back'"></dt>
+                                                    x-text="item.role === 'workstation' ? window.t('cluster.held_back_for_you') : window.t('cluster.held_back')"></dt>
                                                 <dd class="font-mono text-neutral-900" x-text="clusterGiB(item.reserve_bytes)"></dd>
                                             </div>
                                             <div class="flex justify-between text-[11px]">
@@ -2556,7 +2556,7 @@
                                       class="text-amber-700">Memory, role or split changed since this plan was built — build it again so you approve what launches.</span>
                                 <span x-show="clusterPreflightBlockers.length" x-cloak
                                       class="text-amber-700"
-                                      x-text="`Run the ${clusterPreflightBlockers.length === 1 ? 'command' : 'commands'} in step 2 first — a peer that cannot import what this model needs dies part-way through the load.`"></span>
+                                      x-text="clusterPreflightBlockers.length === 1 ? window.t('cluster.preflight_singular') : window.t('cluster.preflight_plural')"></span>
                                 <span x-show="clusterActivationReady()">Ready: activation re-runs planning and strict SSH preflight server-side.</span>
                             </div>
                             <button @click="activateClusterDeployment()"
