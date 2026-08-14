@@ -200,6 +200,45 @@ def test_rht_int8_roundtrip_rotates_last_axis_and_restores_fp32(tmp_path):
         store.shutdown()
 
 
+def test_rht_int16_roundtrip_rotates_last_axis_and_restores_fp32(tmp_path):
+    """RHT-int16 keeps the storage-only inverse path in fp32."""
+    store = BoundarySnapshotSSDStore(
+        tmp_path,
+        gdn_sidecar_state_dtype="rht_int16",
+    )
+    extracted = _rht_extracted()
+    source = extracted[0]["state"][1]
+    try:
+        tensors, metadata = store._serialize_extracted(extracted, "rht16", 2048)
+        info = json.loads(metadata["layer_info"])
+
+        quantized = tensors["layer_0_state_1"]
+        scale = tensors["layer_0_state_1__scale"]
+        assert quantized[1] == "I16"
+        assert quantized[2] == [1, 2, 4, 16]
+        assert scale[1] == "F32"
+        assert scale[2] == [1, 2, 4, 1]
+        assert info[0]["state_1_storage_codec"] == (
+            "rht_int16_rowwise_last_axis_v1"
+        )
+        assert info[0]["state_1_original_dtype"] == "float32"
+        assert info[0]["state_1_rht_seed"] == "0"
+        assert info[0]["state_1_rht_dim"] == "16"
+        assert metadata["gdn_sidecar_format_version"] == "2"
+
+        restored = store._deserialize(tensors, metadata)
+        assert restored is not None
+        got = restored[0]["state"][1]
+        assert got.dtype == mx.float32
+        assert got.shape == source.shape
+        numerator = mx.sqrt(mx.sum((got - source) ** 2))
+        denominator = mx.sqrt(mx.sum(source**2))
+        assert float(numerator / denominator) <= 0.001
+        assert store.gdn_state_dequantizations == 1
+    finally:
+        store.shutdown()
+
+
 def test_rht_int8_encoding_is_deterministic_and_codec_is_distinct(tmp_path):
     """Fixed RHT signs make repeated snapshots byte-identical."""
     extracted = _rht_extracted()
@@ -474,6 +513,38 @@ def test_invalid_precision_rejected(tmp_path):
         BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="fp8")
 
 
+def test_rht_int16_uses_distinct_sidecar_signature_namespace(tmp_path):
+    common = dict(
+        cache_dir=tmp_path,
+        max_size_bytes=1024**3,
+        expected_model_name="model",
+        expected_num_layers=1,
+        expected_block_size=2048,
+        expected_layer_cache_types=["ArraysCache"],
+        gdn_ssd_split_enabled=True,
+    )
+    rht8 = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int8")
+    rht16 = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int16")
+    try:
+        kwargs = dict(
+            model_name="model",
+            num_layers=1,
+            block_size=2048,
+            layer_cache_types=["ArraysCache"],
+        )
+        sig8 = rht8.gdn_cache_signature_for(**kwargs)
+        sig16 = rht16.gdn_cache_signature_for(**kwargs)
+        assert sig8 != sig16
+        assert json.loads(sig8)["gdn_sidecar_state_dtype"] == "rht_int8"
+        assert json.loads(sig16)["gdn_sidecar_state_dtype"] == "rht_int16"
+        assert rht8.cache_signature_for(**kwargs) == rht16.cache_signature_for(
+            **kwargs
+        )
+    finally:
+        rht8.close()
+        rht16.close()
+
+
 # --- P0-2: fail-closed on non-finite input and mixed-writer metadata ---
 
 
@@ -492,7 +563,7 @@ def _recurrent_extracted(recurrent) -> list[dict]:
     ]
 
 
-@pytest.mark.parametrize("mode", ["int8", "rht_int8", "bf16"])
+@pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16", "bf16"])
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, bad):
     """A corrupt recurrent state must not become a well-formed sidecar.
@@ -530,7 +601,7 @@ def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, bad):
         store.shutdown()
 
 
-@pytest.mark.parametrize("mode", ["int8", "rht_int8"])
+@pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16"])
 def test_non_finite_check_does_not_reject_extreme_finite_states(tmp_path, mode):
     """All-zero, subnormal and wide-dynamic-range rows stay encodable."""
     store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
@@ -615,17 +686,21 @@ def test_scale_dtype_must_be_exactly_fp32(tmp_path, np_dtype, dtype_str):
             dtype_str,
             shape,
         )
-        with pytest.raises(ValueError, match="invalid GDN int8 scale dtype"):
+        with pytest.raises(ValueError, match="invalid GDN .* scale dtype"):
             store._deserialize(recast, metadata)
         assert store.gdn_decode_failures == 1
     finally:
         store.shutdown()
 
 
-@pytest.mark.parametrize("mode", ["int8", "rht_int8", "bf16"])
+@pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16", "bf16"])
 @pytest.mark.parametrize("original", [None, "bfloat16", "float16", ""])
 def test_reduced_codec_requires_float32_source_dtype(tmp_path, mode, original):
-    extracted = _rht_extracted() if mode == "rht_int8" else _extracted()
+    extracted = (
+        _rht_extracted()
+        if mode in {"rht_int8", "rht_int16"}
+        else _extracted()
+    )
     store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
     try:
         tensors, metadata = store._serialize_extracted(extracted, "dtype", 2048)
@@ -903,10 +978,16 @@ def test_rht_sign_cache_is_bounded(tmp_path):
 
 
 def _codec_extracted(mode: str) -> list[dict]:
-    return _rht_extracted() if mode in {"rht_int8", "int8", "bf16"} else _extracted()
+    return (
+        _rht_extracted()
+        if mode in {"rht_int8", "rht_int16", "int8", "bf16"}
+        else _extracted()
+    )
 
 
-@pytest.mark.parametrize("mode", ["fp32", "bf16", "int8", "rht_int8"])
+@pytest.mark.parametrize(
+    "mode", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
+)
 def test_pending_raw_and_durable_file_restore_identically(tmp_path, mode):
     """The in-memory buffer and the committed file must agree bit for bit.
 
@@ -1367,10 +1448,44 @@ def test_production_shape_error_and_payload_layout(tmp_path):
     assert errors["rht_int8"] < 0.01
 
 
+def test_rht_int16_production_shape_payload_layout(tmp_path):
+    """The production 27B state shape uses two bytes plus FP32 row scales."""
+    shape = (1, 48, 128, 128)
+    mx.random.seed(1)
+    recurrent = mx.random.normal(shape, dtype=mx.float32)
+    mx.eval(recurrent)
+    store = BoundarySnapshotSSDStore(
+        tmp_path / "rht_int16", gdn_sidecar_state_dtype="rht_int16"
+    )
+    try:
+        tensors, metadata = store._serialize_extracted(
+            _recurrent_extracted(recurrent), "prod16", 2048
+        )
+        payload = tensors["layer_0_state_1"]
+        scale = tensors["layer_0_state_1__scale"]
+        assert payload[1] == "I16"
+        assert payload[2] == list(shape)
+        assert scale[1] == "F32"
+        assert scale[2] == [1, 48, 128, 1]
+        source_bytes = 4 * 48 * 128 * 128
+        assert len(payload[0]) == source_bytes // 2
+        # FP32 -> int16 payload plus one FP32 scale per row; the small scale
+        # tensor makes the full recurrent payload ratio just under 2x.
+        assert source_bytes / (len(payload[0]) + len(scale[0])) > 1.96
+        restored = store._deserialize(tensors, metadata)[0]["state"][1]
+        relative = float(
+            mx.sqrt(mx.sum((restored - recurrent) ** 2))
+            / mx.sqrt(mx.sum(recurrent**2))
+        )
+        assert relative < 0.0001
+    finally:
+        store.shutdown()
+
+
 # --- P0-6: which layer owns the split-disabled + reduced-dtype invariant ---
 
 
-@pytest.mark.parametrize("mode", ["bf16", "int8", "rht_int8"])
+@pytest.mark.parametrize("mode", ["bf16", "int8", "rht_int8", "rht_int16"])
 def test_manager_constructor_does_not_enforce_the_split_invariant(tmp_path, mode):
     """Documented layering, pinned so it cannot drift silently.
 
@@ -1393,7 +1508,9 @@ def test_manager_constructor_does_not_enforce_the_split_invariant(tmp_path, mode
         manager.close()
 
 
-@pytest.mark.parametrize("mode", ["fp32", "bf16", "int8", "rht_int8"])
+@pytest.mark.parametrize(
+    "mode", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
+)
 def test_constructors_normalize_dtype_case(tmp_path, mode):
     store = BoundarySnapshotSSDStore(
         tmp_path / f"store-{mode}", gdn_sidecar_state_dtype=mode.upper()

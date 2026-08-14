@@ -172,6 +172,7 @@ _GDN_STATE_CODEC_BY_DTYPE = {
     "bf16": "bf16_v1",
     "int8": "int8_rowwise_last_axis_v1",
     "rht_int8": "rht_int8_rowwise_last_axis_v1",
+    "rht_int16": "rht_int16_rowwise_last_axis_v1",
 }
 
 
@@ -1619,10 +1620,11 @@ class PagedSSDCacheManager(CacheManager):
             "bf16",
             "int8",
             "rht_int8",
+            "rht_int16",
         }:
             raise ValueError(
                 "gdn_sidecar_state_dtype must be one of: "
-                "fp32, bf16, int8, rht_int8"
+                "fp32, bf16, int8, rht_int8, rht_int16"
             )
         self._gdn_legacy_fp32_fallbacks = 0
         self._payload_layout = (

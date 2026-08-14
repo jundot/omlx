@@ -480,7 +480,7 @@ class TestCacheSettings:
         assert settings.to_dict()["gdn_sidecar_state_dtype"] == "rht_int8"
 
     @pytest.mark.parametrize(
-        "raw", ["RHT_INT8", "Rht_Int8", "INT8", "BF16", "FP32"]
+        "raw", ["RHT_INT8", "Rht_Int8", "RHT_INT16", "INT8", "BF16", "FP32"]
     )
     def test_from_dict_normalizes_gdn_state_dtype_case(self, raw):
         settings = CacheSettings.from_dict(
@@ -500,6 +500,7 @@ class TestCacheSettings:
             "bf16",
             "int8",
             "rht_int8",
+            "rht_int16",
         }
 
     def test_gdn_state_dtype_survives_a_dict_roundtrip(self):
@@ -1354,7 +1355,9 @@ class TestGlobalSettings:
         assert any("gdn_sidecar_state_dtype" in e for e in errors)
         assert any("gdn_ssd_split_enabled" in e for e in errors)
 
-    @pytest.mark.parametrize("dtype", ["fp32", "bf16", "int8", "rht_int8"])
+    @pytest.mark.parametrize(
+        "dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
+    )
     def test_validate_accepts_every_dtype_with_split_enabled(self, dtype):
         settings = GlobalSettings()
         settings.cache.gdn_ssd_split_enabled = True

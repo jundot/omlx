@@ -829,7 +829,9 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
         gs.save.assert_not_called()
 
-    @pytest.mark.parametrize("value", ["RHT_INT8", "Rht_Int8", "INT8", "BF16"])
+    @pytest.mark.parametrize(
+        "value", ["RHT_INT8", "Rht_Int8", "RHT_INT16", "INT8", "BF16"]
+    )
     def test_normalizes_case(self, value):
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False

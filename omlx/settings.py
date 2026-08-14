@@ -1416,10 +1416,11 @@ class GlobalSettings:
             "bf16",
             "int8",
             "rht_int8",
+            "rht_int16",
         }:
             errors.append(
                 "gdn_sidecar_state_dtype must be one of: "
-                "fp32, bf16, int8, rht_int8"
+                "fp32, bf16, int8, rht_int8, rht_int16"
             )
         elif (
             self.cache.gdn_sidecar_state_dtype != "fp32"

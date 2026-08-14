@@ -3768,13 +3768,13 @@ async def update_global_settings(
     if (
         request.gdn_sidecar_state_dtype is not None
         and request.gdn_sidecar_state_dtype.lower()
-        not in {"fp32", "bf16", "int8", "rht_int8"}
+        not in {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
     ):
         raise HTTPException(
             status_code=400,
             detail=(
                 "gdn_sidecar_state_dtype must be one of: "
-                "fp32, bf16, int8, rht_int8"
+                "fp32, bf16, int8, rht_int8, rht_int16"
             ),
         )
     current_gdn_dtype = getattr(
