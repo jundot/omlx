@@ -704,11 +704,13 @@ class TestOQManagerHfCacheDiscovery:
         await manager._active_tasks[task.task_id]
 
         assert task.model_name == "Org/MyModel"
-        assert task.output_name == "Org--MyModel-oQ4e"
-        assert Path(task.output_path) == output_dir / "Org--MyModel-oQ4e"
+        # Output name must use the bare repo name (no double-dash org prefix):
+        # huggingface_hub rejects repo_ids containing "--" on upload.
+        assert task.output_name == "MyModel-oQ4e"
+        assert Path(task.output_path) == output_dir / "MyModel-oQ4e"
         imatrix_path = Path(task.imatrix_cache_path)
         assert imatrix_path.parent == output_dir / ".oqe_imatrix"
-        assert imatrix_path.name.startswith("Org--MyModel-")
+        assert imatrix_path.name.startswith("MyModel-")
 
     @pytest.mark.asyncio
     async def test_hf_cache_excludes_bin_only_checkpoint(self, tmp_path):

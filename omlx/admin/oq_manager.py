@@ -144,8 +144,13 @@ def _source_model_names(source: Path) -> tuple[str, str]:
     if source.parent.name == "snapshots":
         decoded = _decode_hf_cache_model_id(source.parent.parent)
         if decoded is not None:
-            model_id, source_repo_id = decoded
-            return source_repo_id, model_id
+            _, source_repo_id = decoded
+            # Output base is the bare repo name from the canonical "org/repo"
+            # ID. The route-safe model_id keeps the double-dash org separator,
+            # which huggingface_hub rejects in repo_id ("Cannot have -- or ..
+            # in repo_id").
+            repo_name = source_repo_id.split("/", 1)[-1]
+            return source_repo_id, repo_name
     return source.name, source.name
 
 
