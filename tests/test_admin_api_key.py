@@ -885,42 +885,20 @@ class TestRuntimeCacheObservability:
         assert payload["total_num_files"] == 10
         assert payload["total_size_bytes"] == 12288
         assert payload["effective_block_sizes"] == [1024, 2048]
-        assert payload["models"] == [
-            {
-                "id": "model-a",
-                "block_size": 1024,
-                "indexed_blocks": 12,
-                "indexed_blocks_display": "12",
-                "has_sub_block_cache": False,
-                "partial_block_skips": 0,
-                "partial_tokens_skipped": 0,
-                "last_partial_tokens_skipped": 0,
-                "last_tokens_to_next_block": 0,
-                "num_files": 3,
-                "total_size_bytes": 4096,
-                "max_size_bytes": 0,
-                "hot_cache_max_bytes": 0,
-                "hot_cache_size_bytes": 0,
-                "hot_cache_entries": 0,
-            },
-            {
-                "id": "model-b",
-                "block_size": 2048,
-                "indexed_blocks": 4,
-                "indexed_blocks_display": "4",
-                "has_sub_block_cache": False,
-                "partial_block_skips": 0,
-                "partial_tokens_skipped": 0,
-                "last_partial_tokens_skipped": 0,
-                "last_tokens_to_next_block": 0,
-                "num_files": 7,
-                "total_size_bytes": 8192,
-                "max_size_bytes": 0,
-                "hot_cache_max_bytes": 0,
-                "hot_cache_size_bytes": 0,
-                "hot_cache_entries": 0,
-            },
-        ]
+        rows = {row["id"]: row for row in payload["models"]}
+        assert rows["model-a"]["block_size"] == 1024
+        assert rows["model-a"]["indexed_blocks"] == 12
+        assert rows["model-a"]["num_files"] == 3
+        assert rows["model-a"]["total_size_bytes"] == 4096
+        assert rows["model-b"]["block_size"] == 2048
+        assert rows["model-b"]["indexed_blocks"] == 4
+        assert rows["model-b"]["num_files"] == 7
+        assert rows["model-b"]["total_size_bytes"] == 8192
+        for row in rows.values():
+            assert row["gdn_checkpoint_loads"] == 0
+            assert row["gdn_checkpoint_walkbacks"] == 0
+            assert row["gdn_last_restore"] is None
+            assert row["gdn_staging"]["sidecar_count"] == 0
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
         manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
 

@@ -51,6 +51,26 @@ def _block_hashes(prefix_cache, table):
     ]
 
 
+def test_unsupported_gdn_layout_logs_embedded_fallback_once(tmp_path, caplog):
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=8,
+        model_name="hybrid-model",
+        initial_blocks=8,
+    )
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        gdn_ssd_split_enabled=True,
+    )
+
+    with caplog.at_level("INFO"):
+        assert not prefix._gdn_split_layout_supported(["ArraysCache", "CacheList"])
+        assert not prefix._gdn_split_layout_supported(["ArraysCache", "CacheList"])
+
+    assert caplog.text.count("falling back to embedded GDN snapshots") == 1
+
+
 def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
     cache_dir = tmp_path / "cache"
     paged = PagedCacheManager(

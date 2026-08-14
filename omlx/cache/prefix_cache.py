@@ -208,6 +208,7 @@ class BlockAwarePrefixCache(CacheManager):
         self.paged_ssd_cache = paged_ssd_cache_manager
         self.block_size = paged_cache_manager.block_size
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._gdn_split_fallback_reported = False
         self._gdn_checkpoint_loader: Callable[[Any], list[dict[str, Any]] | None] | None = None
 
         # Expected number of layers for cache validation
@@ -292,19 +293,39 @@ class BlockAwarePrefixCache(CacheManager):
     def _gdn_split_layout_supported(
         self, layer_cache_types: list[str] | tuple[str, ...] | None
     ) -> bool:
-        """Return whether top-level ArraysCache sidecars are safe to use."""
+        """Return whether the current layout is safe for external GDN state.
+
+        V1 intentionally supports only top-level ArraysCache mixed with
+        block-sliceable attention caches. Composite CacheList, pooling, and
+        rotating families stay on the legacy embedded-snapshot path.
+        """
         if not self._gdn_ssd_split_enabled or not layer_cache_types:
             return False
-        saw_arrays = False
+        saw_arrays = any(
+            CacheTypeRegistry.is_arrays_family(type_name)
+            for type_name in layer_cache_types
+        )
         for type_name in layer_cache_types:
             if CacheTypeRegistry.is_arrays_family(type_name):
-                saw_arrays = True
                 continue
             if type_name == "CacheList" or CacheTypeRegistry.is_rotating_family(type_name):
+                if saw_arrays and not self._gdn_split_fallback_reported:
+                    logger.info(
+                        "GDN SSD sidecar is unsupported for layout %s; "
+                        "falling back to embedded GDN snapshots",
+                        list(layer_cache_types),
+                    )
+                    self._gdn_split_fallback_reported = True
                 return False
-            if not CacheTypeRegistry.get_handler_by_class_name(
-                type_name
-            ).supports_block_slicing:
+            handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+            if not handler.supports_block_slicing:
+                if saw_arrays and not self._gdn_split_fallback_reported:
+                    logger.info(
+                        "GDN SSD sidecar is unsupported for layout %s; "
+                        "falling back to embedded GDN snapshots",
+                        list(layer_cache_types),
+                    )
+                    self._gdn_split_fallback_reported = True
                 return False
         return saw_arrays
 

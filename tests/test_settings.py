@@ -392,9 +392,11 @@ class TestCacheSettings:
         assert settings.enabled is True
         assert settings.ssd_cache_dir is None
         assert settings.ssd_cache_max_size == "auto"
-        assert settings.gdn_ssd_split_enabled is False
+        assert settings.gdn_ssd_split_enabled is None
+        assert settings.get_gdn_snapshot_storage() == "auto"
+        assert settings.get_gdn_ssd_split_enabled() is True
         assert settings.gdn_ssd_pending_max_size == "512MB"
-        assert settings.gdn_sidecar_state_dtype == "fp32"
+        assert settings.gdn_sidecar_state_dtype == "rht_int16"
         assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
@@ -433,8 +435,9 @@ class TestCacheSettings:
             "enabled": False,
             "hot_cache_only": False,
             "gdn_ssd_split_enabled": False,
+            "gdn_snapshot_storage": "auto",
             "gdn_ssd_pending_max_size": "512MB",
-            "gdn_sidecar_state_dtype": "fp32",
+            "gdn_sidecar_state_dtype": "rht_int16",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
@@ -468,6 +471,45 @@ class TestCacheSettings:
         assert settings.gdn_sidecar_state_dtype == "int8"
         assert settings.to_dict()["gdn_ssd_split_enabled"] is True
         assert settings.to_dict()["gdn_ssd_pending_max_size"] == "1GB"
+
+    @pytest.mark.parametrize(
+        ("legacy_split", "expected_mode"),
+        [(False, "embedded"), (True, "ssd_sidecar")],
+    )
+    def test_from_dict_preserves_legacy_mode_and_fp32_default(
+        self, legacy_split, expected_mode
+    ):
+        settings = CacheSettings.from_dict(
+            {"gdn_ssd_split_enabled": legacy_split}
+        )
+        assert settings.gdn_ssd_split_enabled is legacy_split
+        assert settings.get_gdn_snapshot_storage() == expected_mode
+        assert settings.gdn_sidecar_state_dtype == "fp32"
+
+    def test_auto_policy_survives_dict_roundtrip(self):
+        original = CacheSettings()
+        restored = CacheSettings.from_dict(original.to_dict())
+        assert restored.gdn_ssd_split_enabled is None
+        assert restored.get_gdn_snapshot_storage() == "auto"
+        assert restored.get_gdn_ssd_split_enabled() is True
+        assert restored.gdn_sidecar_state_dtype == "rht_int16"
+
+    def test_from_dict_rejects_conflicting_mode_and_legacy_bool(self):
+        settings = CacheSettings.from_dict(
+            {
+                "gdn_snapshot_storage": "embedded",
+                "gdn_ssd_split_enabled": True,
+            }
+        )
+        global_settings = GlobalSettings(cache=settings)
+        assert any("gdn_snapshot_storage" in error for error in global_settings.validate())
+
+    def test_auto_policy_embeds_when_cache_is_disabled_or_hot_only(self):
+        settings = CacheSettings(enabled=False)
+        assert settings.get_gdn_ssd_split_enabled() is False
+        settings.enabled = True
+        settings.hot_cache_only = True
+        assert settings.get_gdn_ssd_split_enabled() is False
 
     def test_from_dict_loads_rht_int8_gdn_state_dtype(self):
         settings = CacheSettings.from_dict(
@@ -1341,19 +1383,19 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("gdn_ssd_pending_max_size" in e for e in errors)
 
-    def test_validate_reduced_gdn_dtype_requires_split(self):
+    def test_reduced_gdn_dtype_is_dormant_when_embedded(self):
         settings = GlobalSettings()
+        settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "int8"
         errors = settings.validate()
-        assert any("gdn_sidecar_state_dtype" in e for e in errors)
-        assert any("gdn_ssd_split_enabled" in e for e in errors)
+        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
 
-    def test_validate_rht_int8_requires_split(self):
+    def test_rht_int8_is_dormant_when_embedded(self):
         settings = GlobalSettings()
+        settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "rht_int8"
         errors = settings.validate()
-        assert any("gdn_sidecar_state_dtype" in e for e in errors)
-        assert any("gdn_ssd_split_enabled" in e for e in errors)
+        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
 
     @pytest.mark.parametrize(
         "dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
@@ -1403,6 +1445,19 @@ class TestGlobalSettings:
         config.paged_ssd_cache.hot_cache_only = True
         errors = config.validate()
         assert any("gdn_ssd_split_enabled" in e for e in errors)
+
+    def test_legacy_config_gdn_storage_mode_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OMLX_GDN_SNAPSHOT_STORAGE": "embedded",
+                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
+            },
+            clear=False,
+        ):
+            config = OMLXConfig.from_env()
+        assert config.paged_ssd_cache.gdn_ssd_split_enabled is False
+        assert config.paged_ssd_cache.gdn_snapshot_storage == "embedded"
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""
@@ -1825,9 +1880,9 @@ class TestGlobalSettings:
         assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.embedding_batch_size == 12
         assert scheduler_config.initial_cache_blocks == 256  # default
-        assert scheduler_config.gdn_ssd_split_enabled is False
+        assert scheduler_config.gdn_ssd_split_enabled is True
         assert scheduler_config.gdn_ssd_pending_max_bytes == 512 * 1024**2
-        assert scheduler_config.gdn_sidecar_state_dtype == "fp32"
+        assert scheduler_config.gdn_sidecar_state_dtype == "rht_int16"
 
     def test_to_scheduler_config_initial_cache_blocks(self):
         """Test that initial_cache_blocks passes through to SchedulerConfig."""

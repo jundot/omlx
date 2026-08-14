@@ -1511,7 +1511,7 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
-    gdn_sidecar_state_dtype: str = "fp32"
+    gdn_sidecar_state_dtype: str = "rht_int16"
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -5945,6 +5945,26 @@ class Scheduler:
             self._cache_tree_has_stateful_non_sliceable(layer_cache)
             for layer_cache in cache_list
         )
+
+    def _gdn_split_active(self) -> bool:
+        """Return whether the current cache layout can use GDN sidecars."""
+        if not getattr(self.config, "gdn_ssd_split_enabled", False):
+            return False
+        if (
+            self.block_aware_cache is None
+            or self.paged_ssd_cache_manager is None
+            or self._boundary_snapshot_store is None
+        ):
+            return False
+        layer_types = getattr(
+            self.paged_ssd_cache_manager,
+            "_expected_layer_cache_types",
+            None,
+        )
+        supported = getattr(
+            self.block_aware_cache, "_gdn_split_layout_supported", None
+        )
+        return bool(callable(supported) and supported(layer_types))
 
     def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
         """Force the leaf KV tensors of an in-memory boundary snapshot concrete.

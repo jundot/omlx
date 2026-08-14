@@ -193,6 +193,9 @@ class TestPagedSSDCacheConfig:
         assert config.enabled is False
         assert config.cache_dir is None
         assert config.max_size == "100GB"
+        assert config.gdn_snapshot_storage == "auto"
+        assert config.effective_gdn_ssd_split_enabled is False
+        assert config.gdn_sidecar_state_dtype == "rht_int16"
 
     def test_custom_values(self):
         """Test custom configuration values."""
@@ -204,6 +207,26 @@ class TestPagedSSDCacheConfig:
         assert config.enabled is True
         assert config.cache_dir == Path("/tmp/cache")
         assert config.max_size == "50GB"
+        assert config.effective_gdn_ssd_split_enabled is True
+
+    def test_explicit_gdn_storage_modes_preserve_legacy_bool(self):
+        config = PagedSSDCacheConfig(enabled=True)
+        config.gdn_snapshot_storage = "embedded"
+        assert config.gdn_ssd_split_enabled is False
+        assert config.effective_gdn_ssd_split_enabled is False
+        config.gdn_snapshot_storage = "ssd_sidecar"
+        assert config.gdn_ssd_split_enabled is True
+        assert config.effective_gdn_ssd_split_enabled is True
+
+    def test_invalid_gdn_storage_env_warns_and_keeps_auto(self, caplog):
+        with patch.dict(
+            os.environ,
+            {"OMLX_GDN_SNAPSHOT_STORAGE": "invalid-mode"},
+            clear=False,
+        ):
+            config = OMLXConfig.from_env()
+        assert config.paged_ssd_cache.gdn_snapshot_storage == "auto"
+        assert "gdn_snapshot_storage" in caplog.text
 
     def test_max_size_bytes_property(self):
         """Test max_size_bytes property calculation."""

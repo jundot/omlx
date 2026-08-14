@@ -632,6 +632,50 @@
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">GDN snapshot storage</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                                {{ t('settings.global.restart_badge') }}
+                                            </span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-0.5">
+                                            Auto uses an SSD sidecar when SSD cache is available. Embedded follows the main KV tier and may still spill to SSD; use Hot Cache Only for RAM-only storage.
+                                        </p>
+                                    </div>
+                                    <select x-model="globalSettings.cache.gdn_snapshot_storage"
+                                            class="w-full sm:w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <option value="auto">Auto (recommended)</option>
+                                        <option value="ssd_sidecar">SSD sidecar</option>
+                                        <option value="embedded">Embedded with KV</option>
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">GDN pending write limit</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">Maximum queued serialized GDN data before writes apply backpressure.</p>
+                                    </div>
+                                    <input type="text"
+                                           x-model="globalSettings.cache.gdn_ssd_pending_max_size"
+                                           placeholder="512MB"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">GDN sidecar state precision</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">RHT-int16 is near-lossless and the default. FP32 is exact; RHT-int8 halves storage again with more reconstruction error. Restored state always runs in fp32.</p>
+                                    </div>
+                                    <select x-model="globalSettings.cache.gdn_sidecar_state_dtype"
+                                            :disabled="globalSettings.cache.gdn_snapshot_storage === 'embedded' || globalSettings.cache.hot_cache_only || !globalSettings.cache.enabled"
+                                            class="w-full sm:w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <option value="rht_int16">RHT + int16 (recommended)</option>
+                                        <option value="fp32">fp32 (exact)</option>
+                                        <option value="bf16">bf16</option>
+                                        <option value="int8">int8 row-wise</option>
+                                        <option value="rht_int8">RHT + int8 row-wise</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
 

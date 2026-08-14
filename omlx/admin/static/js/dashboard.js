@@ -101,7 +101,7 @@
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_state_dtype: 'rht_int16' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
@@ -6264,6 +6264,9 @@
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
+                    errors.push('GDN SSD sidecar requires Hot Cache Only to be disabled');
+                }
 
                 if (errors.length > 0) {
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
@@ -6316,6 +6319,9 @@
                             ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
+                            gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
+                            gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
+                            gdn_sidecar_state_dtype: this.globalSettings.cache.gdn_sidecar_state_dtype,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_context_window_policy: this.globalSettings.sampling.max_context_window_policy || null,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,

@@ -323,9 +323,47 @@ class CacheSettings:
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
-    gdn_ssd_split_enabled: bool = False
+    # None selects the policy automatically: use an SSD sidecar when the SSD
+    # cache is enabled, otherwise keep GDN state embedded with the main cache.
+    # True/False preserve the legacy explicit split/embedded choices.
+    gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
-    gdn_sidecar_state_dtype: str = "fp32"
+    gdn_sidecar_state_dtype: str = "rht_int16"
+
+    def get_gdn_snapshot_storage(self) -> str:
+        """Return the user-facing GDN storage policy."""
+        if self.gdn_ssd_split_enabled is None:
+            return "auto"
+        if self.gdn_ssd_split_enabled is True:
+            return "ssd_sidecar"
+        if self.gdn_ssd_split_enabled is False:
+            return "embedded"
+        return str(self.gdn_ssd_split_enabled)
+
+    def set_gdn_snapshot_storage(self, mode: str) -> None:
+        """Set auto/ssd_sidecar/embedded while retaining legacy plumbing."""
+        normalized = str(mode).strip().lower()
+        if normalized == "auto":
+            self.gdn_ssd_split_enabled = None
+        elif normalized in {"ssd", "ssd_sidecar"}:
+            self.gdn_ssd_split_enabled = True
+        elif normalized in {"hot", "embedded"}:
+            self.gdn_ssd_split_enabled = False
+        else:
+            raise ValueError(
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
+            )
+
+    def get_gdn_ssd_split_enabled(self) -> bool:
+        """Resolve the effective low-level SSD-sidecar switch."""
+        if self.gdn_ssd_split_enabled is True:
+            return True
+        if self.gdn_ssd_split_enabled is False:
+            return False
+        if self.gdn_ssd_split_enabled is not None:
+            return False
+        return self.enabled and not self.hot_cache_only
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -365,7 +403,10 @@ class CacheSettings:
         return {
             "enabled": self.enabled,
             "hot_cache_only": self.hot_cache_only,
-            "gdn_ssd_split_enabled": self.gdn_ssd_split_enabled,
+            # Keep the legacy effective bool for older readers while the mode
+            # key lets current readers retain the auto policy across reloads.
+            "gdn_ssd_split_enabled": self.get_gdn_ssd_split_enabled(),
+            "gdn_snapshot_storage": self.get_gdn_snapshot_storage(),
             "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
             "gdn_sidecar_state_dtype": self.gdn_sidecar_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
@@ -381,15 +422,42 @@ class CacheSettings:
         if isinstance(hot_cache_max_size, str) and hot_cache_max_size.lower() == "auto":
             hot_cache_max_size = "0"
 
+        storage_mode = data.get("gdn_snapshot_storage")
+        if storage_mode is None:
+            legacy_split = data.get("gdn_ssd_split_enabled")
+        else:
+            normalized_mode = str(storage_mode).strip().lower()
+            if normalized_mode == "auto":
+                legacy_split = None
+            elif normalized_mode in {"ssd", "ssd_sidecar"}:
+                legacy_split = True
+            elif normalized_mode in {"hot", "embedded"}:
+                legacy_split = False
+            else:
+                # Preserve the invalid value for validate() instead of making
+                # settings-file loading raise before a useful error is shown.
+                legacy_split = normalized_mode
+            legacy_value = data.get("gdn_ssd_split_enabled")
+            if (
+                normalized_mode != "auto"
+                and "gdn_ssd_split_enabled" in data
+                and legacy_value is not legacy_split
+            ):
+                legacy_split = "conflict"
+
+        legacy_settings = "gdn_ssd_split_enabled" in data and storage_mode is None
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
-            gdn_ssd_split_enabled=data.get("gdn_ssd_split_enabled", False),
+            gdn_ssd_split_enabled=legacy_split,
             gdn_ssd_pending_max_size=data.get(
                 "gdn_ssd_pending_max_size", "512MB"
             ),
             gdn_sidecar_state_dtype=str(
-                data.get("gdn_sidecar_state_dtype", "fp32")
+                data.get(
+                    "gdn_sidecar_state_dtype",
+                    "fp32" if legacy_settings else "rht_int16",
+                )
             ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
@@ -1016,7 +1084,12 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
-        if gdn_ssd_split := os.getenv("OMLX_GDN_SSD_SPLIT_ENABLED"):
+        if gdn_storage := os.getenv("OMLX_GDN_SNAPSHOT_STORAGE"):
+            try:
+                self.cache.set_gdn_snapshot_storage(gdn_storage)
+            except ValueError as exc:
+                logger.warning(str(exc))
+        elif gdn_ssd_split := os.getenv("OMLX_GDN_SSD_SPLIT_ENABLED"):
             self.cache.gdn_ssd_split_enabled = gdn_ssd_split.lower() in (
                 "true",
                 "1",
@@ -1399,7 +1472,7 @@ class GlobalSettings:
             )
 
         # Cache validation
-        if self.cache.gdn_ssd_split_enabled and self.cache.hot_cache_only:
+        if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
             errors.append(
                 "gdn_ssd_split_enabled cannot be used with hot_cache_only"
             )
@@ -1422,12 +1495,14 @@ class GlobalSettings:
                 "gdn_sidecar_state_dtype must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             )
-        elif (
-            self.cache.gdn_sidecar_state_dtype != "fp32"
-            and not self.cache.gdn_ssd_split_enabled
+        if not (
+            self.cache.gdn_ssd_split_enabled is None
+            or self.cache.gdn_ssd_split_enabled is True
+            or self.cache.gdn_ssd_split_enabled is False
         ):
             errors.append(
-                "reduced gdn_sidecar_state_dtype requires gdn_ssd_split_enabled"
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
             )
 
         if self.cache.ssd_cache_max_size.lower() != "auto":
@@ -1566,7 +1641,7 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
-            gdn_ssd_split_enabled=self.cache.gdn_ssd_split_enabled,
+            gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
             ),

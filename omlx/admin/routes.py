@@ -252,6 +252,7 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_dir: str | None = None
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
+    gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
     gdn_sidecar_state_dtype: str | None = None
@@ -931,6 +932,22 @@ async def _apply_cache_settings_runtime(
         return False, "Engine pool not initialized"
 
     pool = _server_state.engine_pool
+
+    # These settings all affect objects constructed with each scheduler. Keep
+    # the pool template synchronized before unloading existing engines.
+    pool._scheduler_config.hot_cache_only = global_settings.cache.hot_cache_only
+    pool._scheduler_config.gdn_ssd_split_enabled = (
+        global_settings.cache.get_gdn_ssd_split_enabled()
+    )
+    pool._scheduler_config.gdn_ssd_pending_max_bytes = parse_size(
+        global_settings.cache.gdn_ssd_pending_max_size
+    )
+    pool._scheduler_config.gdn_sidecar_state_dtype = (
+        global_settings.cache.gdn_sidecar_state_dtype
+    )
+    pool._scheduler_config.initial_cache_blocks = (
+        global_settings.cache.initial_cache_blocks
+    )
 
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
@@ -3302,7 +3319,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 )
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
-            "gdn_ssd_split_enabled": global_settings.cache.gdn_ssd_split_enabled,
+            "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
+            "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
             "gdn_sidecar_state_dtype": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
@@ -3729,22 +3747,62 @@ async def update_global_settings(
             _parse_hot_cache_max_size(request.hot_cache_max_size)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.initial_cache_blocks is not None and request.initial_cache_blocks <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="initial_cache_blocks must be positive",
+        )
 
     # GDN sidecar persistence requires the SSD tier. Validate the effective
     # values before mutating the live settings object so an invalid admin
     # update cannot leave an unsaved split/hot-only combination in memory.
-    current_gdn_split = getattr(global_settings.cache, "gdn_ssd_split_enabled", False)
-    current_hot_only = getattr(global_settings.cache, "hot_cache_only", False)
-    effective_gdn_split = (
-        request.gdn_ssd_split_enabled
-        if request.gdn_ssd_split_enabled is not None
-        else current_gdn_split is True
+    requested_storage = request.gdn_snapshot_storage
+    if requested_storage is not None:
+        requested_storage = requested_storage.strip().lower()
+        if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "gdn_snapshot_storage must be one of: "
+                    "auto, ssd_sidecar, embedded"
+                ),
+            )
+    if requested_storage is not None and request.gdn_ssd_split_enabled is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "gdn_snapshot_storage cannot be combined with the legacy "
+                "gdn_ssd_split_enabled field"
+            ),
+        )
+
+    current_gdn_raw = getattr(
+        global_settings.cache, "gdn_ssd_split_enabled", False
     )
+    current_hot_only = getattr(global_settings.cache, "hot_cache_only", False)
     effective_hot_only = (
         request.hot_cache_only
         if request.hot_cache_only is not None
         else current_hot_only is True
     )
+    current_cache_enabled = getattr(global_settings.cache, "enabled", True)
+    effective_cache_enabled = (
+        request.cache_enabled
+        if request.cache_enabled is not None
+        else current_cache_enabled is not False
+    )
+    if requested_storage == "auto":
+        effective_gdn_split = effective_cache_enabled and not effective_hot_only
+    elif requested_storage in {"ssd", "ssd_sidecar"}:
+        effective_gdn_split = True
+    elif requested_storage in {"hot", "embedded"}:
+        effective_gdn_split = False
+    elif request.gdn_ssd_split_enabled is not None:
+        effective_gdn_split = request.gdn_ssd_split_enabled
+    elif current_gdn_raw is None:
+        effective_gdn_split = effective_cache_enabled and not effective_hot_only
+    else:
+        effective_gdn_split = current_gdn_raw is True
     if effective_gdn_split and effective_hot_only:
         raise HTTPException(
             status_code=400,
@@ -3777,28 +3835,6 @@ async def update_global_settings(
                 "fp32, bf16, int8, rht_int8, rht_int16"
             ),
         )
-    current_gdn_dtype = getattr(
-        global_settings.cache, "gdn_sidecar_state_dtype", "fp32"
-    )
-    if not isinstance(current_gdn_dtype, str):
-        current_gdn_dtype = "fp32"
-    effective_gdn_dtype = (
-        request.gdn_sidecar_state_dtype.lower()
-        if request.gdn_sidecar_state_dtype is not None
-        else current_gdn_dtype
-    )
-    if (
-        request.gdn_sidecar_state_dtype is not None
-        or request.gdn_ssd_split_enabled is not None
-    ) and effective_gdn_dtype != "fp32" and not effective_gdn_split:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "reduced gdn_sidecar_state_dtype requires "
-                "gdn_ssd_split_enabled"
-            ),
-        )
-
     # Apply cache settings
     cache_changed = False
     if request.cache_enabled is not None:
@@ -3812,21 +3848,29 @@ async def update_global_settings(
         cache_changed = True
     if request.hot_cache_only is not None:
         global_settings.cache.hot_cache_only = request.hot_cache_only
-    if request.gdn_ssd_split_enabled is not None:
+        cache_changed = True
+    if requested_storage is not None:
+        global_settings.cache.set_gdn_snapshot_storage(requested_storage)
+        cache_changed = True
+    elif request.gdn_ssd_split_enabled is not None:
         global_settings.cache.gdn_ssd_split_enabled = request.gdn_ssd_split_enabled
+        cache_changed = True
     if request.gdn_ssd_pending_max_size is not None:
         global_settings.cache.gdn_ssd_pending_max_size = (
             request.gdn_ssd_pending_max_size
         )
+        cache_changed = True
     if request.gdn_sidecar_state_dtype is not None:
         global_settings.cache.gdn_sidecar_state_dtype = (
             request.gdn_sidecar_state_dtype.lower()
         )
+        cache_changed = True
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
+        cache_changed = True
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
