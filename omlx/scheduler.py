@@ -1511,6 +1511,7 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
+    gdn_sidecar_state_dtype: str = "fp32"
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -1608,7 +1609,12 @@ class _BoundarySnapshotProvider:
         if staged_path is None:
             return False
         try:
-            signature = self._paged_ssd_manager.cache_signature_for(
+            signature_builder = getattr(
+                self._paged_ssd_manager, "gdn_cache_signature_for", None
+            )
+            if not callable(signature_builder):
+                signature_builder = self._paged_ssd_manager.cache_signature_for
+            signature = signature_builder(
                 model_name=model_name,
                 num_layers=len(layer_cache_types or []),
                 block_size=block_size,
@@ -7605,6 +7611,29 @@ class Scheduler:
                 extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
+            # A split GDN sidecar represents state at a full block boundary.
+            # Exact-hit generation needs N-1 state, which Arrays/GDN cannot
+            # produce by trimming one token. Re-prefill only the final block.
+            if (
+                self._gdn_split_active()
+                and block_table is not None
+                and block_table.block_ids
+                and block_table.num_tokens >= len(request.prompt_token_ids)
+                and self.paged_cache_manager is not None
+            ):
+                last_block_id = block_table.block_ids.pop()
+                last_block = self.paged_cache_manager.allocated_blocks.get(
+                    last_block_id
+                )
+                last_token_count = (
+                    last_block.token_count
+                    if last_block is not None and last_block.token_count > 0
+                    else self.config.paged_cache_block_size
+                )
+                block_table.num_tokens = max(
+                    0, block_table.num_tokens - last_token_count
+                )
+                self.paged_cache_manager.free_block(last_block_id)
             if block_table and block_table.num_tokens > 0:
                 bypass_hot_cache = self._bypass_hot_cache_under_pressure()
                 if bypass_hot_cache:
@@ -12229,6 +12258,7 @@ class Scheduler:
                 expected_block_size=self.config.paged_cache_block_size,
                 expected_block_size_tokens=self.config.paged_cache_block_size,
                 expected_kv_bytes_per_token=expected_kv_bytes_per_token,
+                gdn_sidecar_state_dtype=self.config.gdn_sidecar_state_dtype,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -12251,10 +12281,18 @@ class Scheduler:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir),
                         pending_max_bytes=self.config.gdn_ssd_pending_max_bytes,
+                        gdn_sidecar_state_dtype=(
+                            self.config.gdn_sidecar_state_dtype
+                            if self.config.gdn_ssd_split_enabled
+                            else "fp32"
+                        ),
                     )
                     if self.block_aware_cache is not None:
                         self.block_aware_cache.set_gdn_checkpoint_loader(
-                            self._boundary_snapshot_store.load_file
+                            self._boundary_snapshot_store.load_file,
+                            dequantization_counter=lambda: (
+                                self._boundary_snapshot_store.gdn_state_dequantizations
+                            ),
                         )
                 except Exception as e:
                     logger.debug(
@@ -12536,6 +12574,45 @@ class Scheduler:
         if self.paged_cache_manager is not None:
             stats["indexed_blocks"] = self.paged_cache_manager.cold_block_count
             stats["block_size"] = self.config.paged_cache_block_size
+
+        if self._boundary_snapshot_store is not None:
+            stats["gdn_staging"] = {
+                "pending_bytes": self._boundary_snapshot_store.pending_bytes,
+                "pending_peak_bytes": (
+                    self._boundary_snapshot_store.pending_peak_bytes
+                ),
+                "backpressure_ms": self._boundary_snapshot_store.backpressure_ms,
+                "state_dtype": (
+                    self._boundary_snapshot_store.gdn_sidecar_state_dtype
+                ),
+                "state_dequantizations": (
+                    self._boundary_snapshot_store.gdn_state_dequantizations
+                ),
+                "encode_failures": (
+                    self._boundary_snapshot_store.gdn_encode_failures
+                ),
+                "decode_failures": (
+                    self._boundary_snapshot_store.gdn_decode_failures
+                ),
+                "capability_fallbacks": (
+                    self._boundary_snapshot_store.gdn_capability_fallbacks
+                ),
+                "legacy_fp32_fallbacks": (
+                    self.paged_ssd_cache_manager.gdn_legacy_fp32_fallbacks
+                    if self.paged_ssd_cache_manager is not None
+                    else 0
+                ),
+                "sidecar_count": (
+                    self.paged_ssd_cache_manager.gdn_sidecar_count
+                    if self.paged_ssd_cache_manager is not None
+                    else 0
+                ),
+                "sidecar_size_bytes": (
+                    self.paged_ssd_cache_manager.gdn_sidecar_size_bytes
+                    if self.paged_ssd_cache_manager is not None
+                    else 0
+                ),
+            }
 
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()

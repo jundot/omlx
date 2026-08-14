@@ -13,6 +13,7 @@ from fastapi import HTTPException
 import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 from omlx.admin.routes import GlobalSettingsRequest
+from omlx.settings import GlobalSettings
 from omlx.utils.network import (
     detect_server_aliases,
     is_valid_alias,
@@ -452,6 +453,95 @@ class TestUpdateGlobalSettingsHotCache:
         gs.save.assert_not_called()
 
 
+class TestUpdateGlobalSettingsGdnSplit:
+    """update_global_settings: persist GDN split cache plumbing safely."""
+
+    def test_saves_gdn_split_settings(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = False
+        gs.cache.gdn_ssd_pending_max_size = "512MB"
+        request = GlobalSettingsRequest(
+            gdn_ssd_split_enabled=True,
+            gdn_ssd_pending_max_size="1GB",
+        )
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_ssd_split_enabled is True
+        assert gs.cache.gdn_ssd_pending_max_size == "1GB"
+        gs.save.assert_called_once()
+
+    def test_rejects_split_with_hot_cache_only(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = True
+        gs.cache.gdn_ssd_split_enabled = False
+        request = GlobalSettingsRequest(gdn_ssd_split_enabled=True)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "hot_cache_only" in exc_info.value.detail
+        assert gs.cache.gdn_ssd_split_enabled is False
+        gs.save.assert_not_called()
+
+    def test_rejects_invalid_pending_size(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        request = GlobalSettingsRequest(gdn_ssd_pending_max_size="not-a-size")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "gdn_ssd_pending_max_size" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+
+class TestGetGlobalSettingsGdnSplit:
+    """get_global_settings: expose GDN split fields to the dashboard."""
+
+    def test_returns_gdn_split_settings(self):
+        gs = GlobalSettings()
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_ssd_pending_max_size = "768MB"
+
+        memory_info = {
+            "total_bytes": 16 * 1024**3,
+            "total_formatted": "16GB",
+            "auto_limit_formatted": "10GB",
+            "available_bytes": 8 * 1024**3,
+            "omlx_phys_footprint_bytes": 2 * 1024**3,
+            "free_memory_bytes": 4 * 1024**3,
+            "inactive_memory_bytes": 2 * 1024**3,
+            "active_memory_bytes": 2 * 1024**3,
+            "iogpu_wired_limit_bytes": 0,
+            "omlx_wired_limit_request_bytes": 0,
+        }
+        disk_info = {"total_bytes": 100 * 1024**3, "total_formatted": "100GB"}
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(admin_routes, "get_system_memory_info", return_value=memory_info),
+            patch.object(admin_routes, "get_ssd_disk_info", return_value=disk_info),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["cache"]["gdn_ssd_split_enabled"] is True
+        assert result["cache"]["gdn_ssd_pending_max_size"] == "768MB"
+
+
 class TestUpdateGlobalSettingsMidSystemCache:
     """update_global_settings: save the mid-system prefix-cache fallback toggle."""
 
@@ -675,3 +765,126 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         assert exc_info.value.status_code == 500
         pool.apply_embedding_batch_size.assert_not_awaited()
         assert gs.scheduler.embedding_batch_size == 32
+
+
+class TestUpdateGlobalSettingsGdnSidecarStateDtype:
+    """update_global_settings: GDN sidecar precision invariants.
+
+    The split-disabled + reduced-dtype invariant is owned by the layers where
+    the operator states intent (settings validation and this route). The cache
+    manager/store constructors stay permissive: they are internal, and the
+    scheduler already coerces reduced -> fp32 when split is off.
+    """
+
+    def test_accepts_rht_int8_with_split_enabled(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_sidecar_state_dtype="rht_int8")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        gs.save.assert_called_once()
+
+    def test_rejects_reduced_dtype_when_split_disabled(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = False
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_sidecar_state_dtype="rht_int8")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "gdn_ssd_split_enabled" in exc_info.value.detail
+        assert gs.cache.gdn_sidecar_state_dtype == "fp32"
+        gs.save.assert_not_called()
+
+    def test_rejects_disabling_split_while_a_reduced_dtype_is_active(self):
+        """The invariant is checked against the effective post-update pair."""
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "rht_int8"
+        request = GlobalSettingsRequest(gdn_ssd_split_enabled=False)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert gs.cache.gdn_ssd_split_enabled is True
+        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        gs.save.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["RHT_INT8", "Rht_Int8", "INT8", "BF16"])
+    def test_normalizes_case(self, value):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_sidecar_state_dtype=value)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_sidecar_state_dtype == value.lower()
+
+    @pytest.mark.parametrize("value", ["fp8", "int4", "rht", "", "rht_int8 "])
+    def test_rejects_unknown_dtype_without_mutating(self, value):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "int8"
+        request = GlobalSettingsRequest(gdn_sidecar_state_dtype=value)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "gdn_sidecar_state_dtype" in exc_info.value.detail
+        assert gs.cache.gdn_sidecar_state_dtype == "int8"
+        gs.save.assert_not_called()
+
+    def test_invalid_dtype_leaves_other_fields_in_the_same_request_untouched(self):
+        """Validation runs before any field is applied."""
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        gs.cache.gdn_ssd_pending_max_size = "512MB"
+        gs.cache.enabled = True
+        request = GlobalSettingsRequest(
+            cache_enabled=False,
+            gdn_ssd_pending_max_size="1GB",
+            gdn_sidecar_state_dtype="fp8",
+        )
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException):
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert gs.cache.enabled is True
+        assert gs.cache.gdn_ssd_pending_max_size == "512MB"
+        assert gs.cache.gdn_sidecar_state_dtype == "fp32"
+        gs.save.assert_not_called()

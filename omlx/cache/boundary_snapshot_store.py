@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -24,7 +25,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,46 @@ logger = logging.getLogger(__name__)
 _MAX_PENDING_WRITES = 128
 _DEFAULT_PENDING_MAX_BYTES = 512 * 1024 * 1024
 _PENDING_RESERVATION_TIMEOUT_S = 2.0
+_GDN_SIDECAR_FORMAT_VERSION = "2"
+_GDN_STATE_DTYPES = frozenset({"fp32", "bf16", "int8", "rht_int8"})
+_GDN_INT8_CODEC = "int8_rowwise_last_axis_v1"
+_GDN_RHT_INT8_CODEC = "rht_int8_rowwise_last_axis_v1"
+_GDN_RHT_SEED = 0
+_GDN_BF16_CODEC = "bf16_v1"
+_GDN_INT8_CODECS = frozenset({_GDN_INT8_CODEC, _GDN_RHT_INT8_CODEC})
+_GDN_REDUCED_CODECS = frozenset(_GDN_INT8_CODECS | {_GDN_BF16_CODEC})
+# Reduced codecs only ever encode the fp32 recurrent member, so a sidecar
+# claiming any other source dtype was produced by a different (or tampered)
+# writer and must not be silently reinterpreted as fp32.
+_GDN_REQUIRED_ORIGINAL_DTYPE = "float32"
+
+
+def _gdn_rht_dimension_supported(dim: int) -> bool:
+    """Report whether the RHT codec can rotate this last-axis width.
+
+    Pure metadata: the normalized Hadamard inverse is only exact for the
+    power-of-two sizes this codec versions its sign diagonal for.
+    """
+    return isinstance(dim, int) and dim > 0 and not (dim & (dim - 1))
+
+
+# One entry per distinct GDN width. A model contributes a single width, so the
+# bound only exists to keep a pathological caller from growing the cache
+# without limit; exceeding it costs recomputation, never correctness.
+@lru_cache(maxsize=32)
+def _gdn_rht_sign_values(dim: int, seed: int) -> tuple[float, ...]:
+    """Return a version-stable random-sign diagonal without touching MLX RNG."""
+    if not _gdn_rht_dimension_supported(dim):
+        raise ValueError(
+            f"GDN RHT requires a positive power-of-two last dimension, got {dim}"
+        )
+    prefix = f"omlx-gdn-rht-v1:{seed}:{dim}:".encode()
+    return tuple(
+        1.0
+        if hashlib.sha256(prefix + index.to_bytes(4, "little")).digest()[0] & 1
+        else -1.0
+        for index in range(dim)
+    )
 
 
 def reset_boundary_snapshot_root(base_dir: Path) -> None:
@@ -97,7 +139,21 @@ class BoundarySnapshotSSDStore:
         base_dir: Path,
         *,
         pending_max_bytes: int = _DEFAULT_PENDING_MAX_BYTES,
+        gdn_sidecar_state_dtype: str = "fp32",
     ) -> None:
+        state_dtype = str(gdn_sidecar_state_dtype).lower()
+        if state_dtype not in _GDN_STATE_DTYPES:
+            raise ValueError(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8"
+            )
+        self._gdn_sidecar_state_dtype = state_dtype
+        self._gdn_state_dequantizations = 0
+        self._gdn_encode_failures = 0
+        self._gdn_decode_failures = 0
+        self._gdn_capability_fallbacks = 0
+        self._gdn_capability_reported = False
+        self._gdn_dequant_lock = threading.Lock()
         self._snapshot_root = base_dir / "_boundary_snapshots"
         if self._snapshot_root.is_symlink():
             raise ValueError(
@@ -342,7 +398,16 @@ class BoundarySnapshotSSDStore:
                 tensors_raw = pending.get("tensors_raw")
                 metadata = pending.get("metadata")
                 if tensors_raw and metadata:
-                    return self._deserialize(tensors_raw, metadata)
+                    try:
+                        return self._deserialize(tensors_raw, metadata)
+                    except Exception as e:
+                        logger.debug(
+                            "Failed to decode pending boundary snapshot %s/%d: %s",
+                            request_id,
+                            token_count,
+                            e,
+                        )
+                        return None
 
         # Slow path: read from disk.
         if not file_path.is_file():
@@ -475,6 +540,34 @@ class BoundarySnapshotSSDStore:
     def backpressure_ms(self) -> float:
         with self._pending_lock:
             return self._backpressure_ms
+
+    @property
+    def gdn_sidecar_state_dtype(self) -> str:
+        return self._gdn_sidecar_state_dtype
+
+    @property
+    def gdn_state_dequantizations(self) -> int:
+        """Number of recurrent tensors restored from reduced precision."""
+        with self._gdn_dequant_lock:
+            return self._gdn_state_dequantizations
+
+    @property
+    def gdn_encode_failures(self) -> int:
+        """Recurrent tensors refused at the storage boundary (non-finite)."""
+        with self._gdn_dequant_lock:
+            return self._gdn_encode_failures
+
+    @property
+    def gdn_decode_failures(self) -> int:
+        """Sidecar states rejected on restore (corrupt or mixed-writer)."""
+        with self._gdn_dequant_lock:
+            return self._gdn_decode_failures
+
+    @property
+    def gdn_capability_fallbacks(self) -> int:
+        """Recurrent tensors stored as fp32 because the codec cannot fit them."""
+        with self._gdn_dequant_lock:
+            return self._gdn_capability_fallbacks
 
     def has(self, request_id: str, token_count: int) -> bool:
         """Check if a snapshot exists (in memory or on disk)."""
@@ -1096,6 +1189,9 @@ class BoundarySnapshotSSDStore:
         """
         arrays: dict[str, Any] = {}  # name -> mx.array
         layer_info: list[dict[str, str]] = []
+        # (reason, shape, unevaluated flag) per encoded recurrent tensor,
+        # verified in one batch below rather than one sync per layer.
+        gdn_checks: list[tuple[str, tuple[int, ...], Any]] = []
 
         for i, layer_state in enumerate(extracted):
             class_name = layer_state.get("class_name", "KVCache")
@@ -1163,13 +1259,38 @@ class BoundarySnapshotSSDStore:
                             arrays[f"layer_{i}_state_{k}"] = mx.zeros((1,))
                             info[f"zero_dim_{k}"] = _encode_shape(elem.shape)
                         else:
-                            arrays[f"layer_{i}_state_{k}"] = elem
+                            key = f"layer_{i}_state_{k}"
+                            if self._should_quantize_gdn_state(
+                                class_name,
+                                cache_type,
+                                k,
+                                elem,
+                            ):
+                                stored, scale, codec = self._encode_gdn_state(
+                                    elem, gdn_checks
+                                )
+                                arrays[key] = stored
+                                if scale is not None:
+                                    arrays[f"{key}__scale"] = scale
+                                info[f"state_{k}_storage_codec"] = codec
+                                info[f"state_{k}_original_dtype"] = "float32"
+                                if codec == _GDN_RHT_INT8_CODEC:
+                                    info[f"state_{k}_rht_seed"] = str(
+                                        _GDN_RHT_SEED
+                                    )
+                                    info[f"state_{k}_rht_dim"] = str(elem.shape[-1])
+                            else:
+                                arrays[key] = elem
                 else:
                     info["has_state"] = "false"
             else:
                 info["has_state"] = "false"
 
             layer_info.append(info)
+
+        # Reject a corrupt recurrent state before materializing the payload it
+        # would have been written into.
+        self._verify_gdn_encode_checks(gdn_checks)
 
         # Materialize lazy tensors on inference thread.
         if arrays:
@@ -1185,9 +1306,347 @@ class BoundarySnapshotSSDStore:
             "token_count": str(token_count),
             "num_layers": str(len(extracted)),
             "layer_info": json.dumps(layer_info),
+            "gdn_sidecar_format_version": _GDN_SIDECAR_FORMAT_VERSION,
         }
 
         return tensors_raw, metadata
+
+    def _should_quantize_gdn_state(
+        self,
+        class_name: str,
+        cache_type: str,
+        state_index: int,
+        tensor: Any,
+    ) -> bool:
+        """Select only the fp32 recurrent member of Arrays-family caches."""
+        eligible = bool(
+            self._gdn_sidecar_state_dtype != "fp32"
+            and state_index == 1
+            and (
+                str(class_name).endswith("ArraysCache")
+                or str(cache_type).endswith("ArraysCache")
+            )
+            and getattr(tensor, "dtype", None) == mx.float32
+            and len(getattr(tensor, "shape", ())) >= 1
+        )
+        if not eligible or self._gdn_sidecar_state_dtype != "rht_int8":
+            return eligible
+        return self._rht_supports(tensor)
+
+    def _rht_supports(self, tensor: Any) -> bool:
+        """Gate the RHT codec on a width it can invert exactly.
+
+        Unlike bf16 and plain int8, the rotation is only defined for
+        power-of-two widths. An unsupported tensor is stored as raw fp32
+        instead: it carries no codec key, so the existing "no codec" restore
+        path returns it unchanged. Failing the whole checkpoint instead would
+        make a cache-precision setting able to break inference, and silently
+        dropping it (the prior behaviour) disabled GDN sidecars for the model
+        with only a debug line to show for it.
+        """
+        shape = getattr(tensor, "shape", ())
+        dim = int(shape[-1]) if shape else 0
+        if _gdn_rht_dimension_supported(dim) and hasattr(mx, "hadamard_transform"):
+            return True
+        with self._gdn_dequant_lock:
+            self._gdn_capability_fallbacks += 1
+            first = not self._gdn_capability_reported
+            self._gdn_capability_reported = True
+        if first:
+            # Once per store: a 48-layer model would otherwise log this on
+            # every layer of every checkpoint.
+            logger.error(
+                "GDN RHT sidecars unsupported for last dimension %s "
+                "(needs a positive power of two); storing recurrent state as "
+                "fp32 instead. Set gdn_sidecar_state_dtype=int8 for a codec "
+                "with no width constraint.",
+                dim,
+            )
+        return False
+
+    def _encode_gdn_state(
+        self, tensor: Any, checks: list[tuple[str, tuple[int, ...], Any]]
+    ) -> tuple[Any, Any | None, str]:
+        """Encode an ArraysCache recurrent tensor for storage only.
+
+        int8 uses one symmetric scale per row of the last axis. This is the
+        axis measured by ``test/session116_gdn_state_distribution.py`` and is
+        1.15x-2.70x more accurate than reducing the penultimate axis on sampled
+        27B production sidecars. Scales stay fp32; their footprint is tiny and
+        this keeps the experiment focused on state quantization error.
+
+        rht_int8 first applies a normalized randomized Hadamard transform on
+        the last axis. The transform is orthogonal and inverted immediately on
+        restore, so the live recurrent state still runs in fp32 in its original
+        basis. A fixed, versioned sign diagonal avoids mutating the generation
+        RNG and keeps sidecars reproducible across processes.
+
+        A non-finite source must not be encoded. NaN survives ``round``/``clip``
+        and lands in int8 as an undefined value, and the row scale it produces
+        may still look finite, so a corrupt recurrent state would otherwise be
+        written as a well-formed sidecar and restored later as silent garbage.
+
+        The validity flags are appended to ``checks`` as unevaluated arrays
+        rather than tested here. Forcing ``bool()`` per layer costs a
+        GPU->CPU sync each time (+19 ms over the 48-layer 27B state, ~19x the
+        codec itself); the caller evaluates all flags in one batch instead.
+        """
+        checks.append(
+            (
+                "non-finite GDN recurrent state",
+                tuple(getattr(tensor, "shape", ())),
+                mx.all(mx.isfinite(tensor)),
+            )
+        )
+        if self._gdn_sidecar_state_dtype == "bf16":
+            return tensor.astype(mx.bfloat16), None, _GDN_BF16_CODEC
+
+        encoded = tensor
+        codec = _GDN_INT8_CODEC
+        if self._gdn_sidecar_state_dtype == "rht_int8":
+            encoded = self._gdn_rht_forward(tensor, _GDN_RHT_SEED)
+            codec = _GDN_RHT_INT8_CODEC
+
+        scale = mx.max(mx.abs(encoded), axis=-1, keepdims=True) / 127.0
+        scale = mx.maximum(scale, mx.array(1e-12, dtype=mx.float32))
+        # A finite source is not sufficient: the RHT is not magnitude
+        # preserving per element, so a row near the fp32 maximum can sum to inf
+        # under the Hadamard butterfly. Checking the (tiny) scale catches that
+        # before the payload is written.
+        checks.append(
+            (
+                "non-finite GDN row scale (encoded state overflowed fp32)",
+                tuple(getattr(encoded, "shape", ())),
+                mx.all(mx.isfinite(scale) & (scale > 0)),
+            )
+        )
+        quantized = mx.clip(mx.round(encoded / scale), -127, 127).astype(mx.int8)
+        return quantized, scale.astype(mx.float32), codec
+
+    def _verify_gdn_encode_checks(
+        self, checks: list[tuple[str, tuple[int, ...], Any]]
+    ) -> None:
+        """Evaluate every deferred encode check with a single sync."""
+        if not checks:
+            return
+        flags = mx.stack([flag for _reason, _shape, flag in checks])
+        mx.eval(flags)
+        if bool(mx.all(flags)):
+            return
+        reason, shape, _flag = next(
+            check for check, ok in zip(checks, flags.tolist()) if not ok
+        )
+        with self._gdn_dequant_lock:
+            self._gdn_encode_failures += 1
+        # save() degrades every failure to ``False`` at debug level, so warn
+        # here: refusing a recurrent state is a model-level event, not a
+        # routine checkpoint miss.
+        logger.warning(
+            "Skipping GDN sidecar: %s (shape=%s, codec=%s)",
+            reason,
+            shape,
+            self._gdn_sidecar_state_dtype,
+        )
+        raise ValueError(f"refusing to encode {reason} (shape={shape})")
+
+    @staticmethod
+    def _gdn_rht_forward(tensor: Any, seed: int) -> Any:
+        dim = int(tensor.shape[-1])
+        signs = mx.array(_gdn_rht_sign_values(dim, seed), dtype=mx.float32)
+        return mx.hadamard_transform(
+            tensor.astype(mx.float32) * signs,
+            scale=1.0 / math.sqrt(dim),
+        )
+
+    @staticmethod
+    def _gdn_rht_inverse(tensor: Any, seed: int) -> Any:
+        dim = int(tensor.shape[-1])
+        signs = mx.array(_gdn_rht_sign_values(dim, seed), dtype=mx.float32)
+        return (
+            mx.hadamard_transform(
+                tensor.astype(mx.float32),
+                scale=1.0 / math.sqrt(dim),
+            )
+            * signs
+        )
+
+    @staticmethod
+    def _gdn_rht_metadata(
+        info: dict[str, str], state_idx: int, tensor: Any
+    ) -> tuple[int, int]:
+        raw_seed = info.get(f"state_{state_idx}_rht_seed")
+        raw_dim = info.get(f"state_{state_idx}_rht_dim")
+        if raw_seed is None or raw_dim is None:
+            raise ValueError("missing GDN RHT metadata")
+        # ``int()`` accepts surrounding whitespace, a sign and underscore
+        # separators, so require a plain decimal literal before converting.
+        # Anything else means the metadata was not written by this codec.
+        if not (
+            isinstance(raw_seed, str)
+            and isinstance(raw_dim, str)
+            and raw_seed.isdigit()
+            and raw_dim.isdigit()
+        ):
+            raise ValueError(
+                f"invalid GDN RHT metadata literals: seed={raw_seed!r}, dim={raw_dim!r}"
+            )
+        seed = int(raw_seed)
+        dim = int(raw_dim)
+        if seed != _GDN_RHT_SEED:
+            raise ValueError(f"unsupported GDN RHT seed: {seed}")
+        if dim <= 0 or dim & (dim - 1):
+            raise ValueError(f"invalid GDN RHT dimension: {dim} is not a power of two")
+        if dim != int(tensor.shape[-1]):
+            raise ValueError(
+                f"invalid GDN RHT dimension: expected {tensor.shape[-1]}, got {dim}"
+            )
+        _gdn_rht_sign_values(dim, seed)
+        return seed, dim
+
+    @staticmethod
+    def _validate_gdn_codec_metadata(
+        info: dict[str, str], state_idx: int, codec: str
+    ) -> None:
+        """Require codec and its metadata to agree on the same state index.
+
+        Guards two mixed-writer shapes that would otherwise decode: a plain
+        int8 payload carrying RHT metadata (restored without the inverse
+        rotation, i.e. wrong basis), and a reduced codec whose source dtype is
+        not the fp32 recurrent member this codec is defined for.
+        """
+        original = info.get(f"state_{state_idx}_original_dtype")
+        if original != _GDN_REQUIRED_ORIGINAL_DTYPE:
+            raise ValueError(
+                f"invalid GDN source dtype for codec {codec}: "
+                f"expected {_GDN_REQUIRED_ORIGINAL_DTYPE}, got {original!r}"
+            )
+        if codec == _GDN_RHT_INT8_CODEC:
+            return
+        stray = [
+            key
+            for key in (
+                f"state_{state_idx}_rht_seed",
+                f"state_{state_idx}_rht_dim",
+            )
+            if key in info
+        ]
+        if stray:
+            raise ValueError(
+                f"GDN RHT metadata present under non-RHT codec {codec}: {stray}"
+            )
+
+    def _note_gdn_dequantization(self) -> None:
+        with self._gdn_dequant_lock:
+            self._gdn_state_dequantizations += 1
+
+    @contextmanager
+    def _gdn_decode_guard(self, codec: str) -> Any:
+        """Count and surface a rejected sidecar, then re-raise.
+
+        Callers turn the exception into a cache miss, so without this the
+        only trace of a corrupt or mixed-writer sidecar would be a silent
+        re-prefill.
+        """
+        try:
+            yield
+        except Exception as exc:
+            with self._gdn_dequant_lock:
+                self._gdn_decode_failures += 1
+            logger.warning("Rejected GDN sidecar (codec=%s): %s", codec, exc)
+            raise
+
+    def _decode_gdn_state_raw(
+        self,
+        tensors_raw: dict[str, tuple[bytes, str, list[int]]],
+        info: dict[str, str],
+        layer_idx: int,
+        state_idx: int,
+        tensor: Any,
+    ) -> Any:
+        codec = info.get(f"state_{state_idx}_storage_codec")
+        if not codec:
+            return tensor
+        with self._gdn_decode_guard(codec):
+            # Reject an unknown codec before reading any of its metadata: a
+            # future or foreign codec says nothing about what the accompanying
+            # keys mean, so it is the more fundamental rejection.
+            if codec not in _GDN_REDUCED_CODECS:
+                raise ValueError(f"unsupported GDN storage codec: {codec}")
+            self._validate_gdn_codec_metadata(info, state_idx, codec)
+            if codec == _GDN_BF16_CODEC:
+                self._note_gdn_dequantization()
+                return tensor.astype(mx.float32)
+            if codec in _GDN_INT8_CODECS:
+                scale_key = f"layer_{layer_idx}_state_{state_idx}__scale"
+                scale_raw = tensors_raw.get(scale_key)
+                if scale_raw is None:
+                    raise ValueError(f"missing GDN int8 scale tensor: {scale_key}")
+                raw, dtype_str, shape = scale_raw
+                scale = _restore_tensor_from_bytes(raw, dtype_str, shape)
+                self._validate_gdn_scale(tensor, scale, scale_key)
+                restored = tensor.astype(mx.float32) * scale
+                if codec == _GDN_RHT_INT8_CODEC:
+                    seed, _dim = self._gdn_rht_metadata(info, state_idx, tensor)
+                    restored = self._gdn_rht_inverse(restored, seed)
+                self._note_gdn_dequantization()
+                return restored
+            raise ValueError(f"unsupported GDN storage codec: {codec}")
+
+    def _decode_gdn_state_array(
+        self,
+        arrays: dict[str, Any],
+        info: dict[str, str],
+        layer_idx: int,
+        state_idx: int,
+        tensor: Any,
+    ) -> Any:
+        codec = info.get(f"state_{state_idx}_storage_codec")
+        if not codec:
+            return tensor
+        with self._gdn_decode_guard(codec):
+            # Reject an unknown codec before reading any of its metadata: a
+            # future or foreign codec says nothing about what the accompanying
+            # keys mean, so it is the more fundamental rejection.
+            if codec not in _GDN_REDUCED_CODECS:
+                raise ValueError(f"unsupported GDN storage codec: {codec}")
+            self._validate_gdn_codec_metadata(info, state_idx, codec)
+            if codec == _GDN_BF16_CODEC:
+                self._note_gdn_dequantization()
+                return tensor.astype(mx.float32)
+            if codec in _GDN_INT8_CODECS:
+                scale_key = f"layer_{layer_idx}_state_{state_idx}__scale"
+                scale = arrays.get(scale_key)
+                if scale is None:
+                    raise ValueError(f"missing GDN int8 scale tensor: {scale_key}")
+                self._validate_gdn_scale(tensor, scale, scale_key)
+                restored = tensor.astype(mx.float32) * scale
+                if codec == _GDN_RHT_INT8_CODEC:
+                    seed, _dim = self._gdn_rht_metadata(info, state_idx, tensor)
+                    restored = self._gdn_rht_inverse(restored, seed)
+                self._note_gdn_dequantization()
+                return restored
+            raise ValueError(f"unsupported GDN storage codec: {codec}")
+
+    @staticmethod
+    def _validate_gdn_scale(tensor: Any, scale: Any, scale_key: str) -> None:
+        expected_shape = tuple(tensor.shape[:-1]) + (1,)
+        if tuple(scale.shape) != expected_shape:
+            raise ValueError(
+                f"invalid GDN int8 scale shape for {scale_key}: "
+                f"expected {expected_shape}, got {tuple(scale.shape)}"
+            )
+        if getattr(tensor, "dtype", None) != mx.int8:
+            raise ValueError(f"invalid GDN int8 payload dtype for {scale_key}")
+        # The codec contract stores scales as fp32. Accepting a narrower dtype
+        # would silently change the reconstruction of every row, so reject it
+        # rather than upcast whatever the file happens to carry.
+        if getattr(scale, "dtype", None) != mx.float32:
+            raise ValueError(
+                f"invalid GDN int8 scale dtype for {scale_key}: "
+                f"expected float32, got {getattr(scale, 'dtype', None)}"
+            )
+        if not bool(mx.all(mx.isfinite(scale) & (scale > 0))):
+            raise ValueError(f"invalid GDN int8 scale values for {scale_key}")
 
     def _deserialize(
         self,
@@ -1199,6 +1658,8 @@ class BoundarySnapshotSSDStore:
             num_layers = int(metadata["num_layers"])
             layer_info = json.loads(metadata["layer_info"])
         except (KeyError, ValueError, json.JSONDecodeError):
+            return None
+        if metadata.get("gdn_sidecar_format_version", "1") not in {"1", "2"}:
             return None
 
         result: list[dict[str, Any]] = []
@@ -1318,7 +1779,16 @@ class BoundarySnapshotSSDStore:
                     restored = _restore_tensor_from_bytes(raw, dtype_str, [1])
                     elements.append(mx.zeros(zd_shape, dtype=restored.dtype))
                 else:
-                    elements.append(_restore_tensor_from_bytes(raw, dtype_str, shape))
+                    restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+                    elements.append(
+                        self._decode_gdn_state_raw(
+                            tensors_raw,
+                            info,
+                            layer_idx,
+                            k,
+                            restored,
+                        )
+                    )
             return tuple(elements)
 
         # V2 polyfill — legacy 2-tuple snapshot.
@@ -1354,6 +1824,8 @@ class BoundarySnapshotSSDStore:
             num_layers = int(metadata["num_layers"])
             layer_info = json.loads(metadata["layer_info"])
         except (KeyError, ValueError, json.JSONDecodeError):
+            return None
+        if metadata.get("gdn_sidecar_format_version", "1") not in {"1", "2"}:
             return None
 
         result: list[dict[str, Any]] = []
@@ -1460,7 +1932,15 @@ class BoundarySnapshotSSDStore:
                     zd_shape = tuple(int(d) for d in info[zd_marker].split(","))
                     elements.append(mx.zeros(zd_shape, dtype=tensor.dtype))
                 else:
-                    elements.append(tensor)
+                    elements.append(
+                        self._decode_gdn_state_array(
+                            arrays,
+                            info,
+                            layer_idx,
+                            k,
+                            tensor,
+                        )
+                    )
             return tuple(elements)
 
         # V2 polyfill.

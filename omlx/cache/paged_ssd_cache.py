@@ -167,6 +167,13 @@ _READABLE_CACHE_FORMAT_VERSIONS = frozenset(
     {"2", "3", "5", POOLING_CACHE_DELTA_FORMAT_VERSION}
 )
 
+_GDN_STATE_CODEC_BY_DTYPE = {
+    "fp32": "fp32",
+    "bf16": "bf16_v1",
+    "int8": "int8_rowwise_last_axis_v1",
+    "rht_int8": "rht_int8_rowwise_last_axis_v1",
+}
+
 
 # Layer cache type names whose meta_state should be clamped on save so the
 # rotating buffer's _idx never exceeds the actual buffer length. Restoring a
@@ -237,6 +244,7 @@ def _cache_compat_signature(
     turboquant_kv_bits: float | None = None,
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
+    gdn_sidecar_state_dtype: str | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -262,6 +270,8 @@ def _cache_compat_signature(
         payload["cachelist_subtypes"] = cachelist_subtypes
     if payload_layout is not None:
         payload["payload_layout"] = payload_layout
+    if gdn_sidecar_state_dtype is not None:
+        payload["gdn_sidecar_state_dtype"] = gdn_sidecar_state_dtype
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -273,8 +283,15 @@ def cache_signature_for(
     layer_cache_types: list[str],
     turboquant_kv_bits: float | None = None,
     cachelist_subtypes: dict[str, list[str]] | None = None,
+    gdn_sidecar_state_dtype: str | None = None,
 ) -> str:
-    """Build the legacy/embedded cache compatibility signature."""
+    """Build the legacy/embedded cache compatibility signature.
+
+    This is the public, stateless counterpart of
+    :meth:`PagedSSDCacheManager.cache_signature_for`.  The manager method
+    additionally stamps its configured payload layout and supplies its
+    expected TurboQuant/CacheList values when those arguments are omitted.
+    """
     return _cache_compat_signature(
         model_name=model_name,
         num_layers=num_layers,
@@ -282,6 +299,7 @@ def cache_signature_for(
         layer_cache_types=layer_cache_types,
         turboquant_kv_bits=turboquant_kv_bits,
         cachelist_subtypes=cachelist_subtypes,
+        gdn_sidecar_state_dtype=gdn_sidecar_state_dtype,
     )
 
 
@@ -1222,6 +1240,16 @@ class GDNCheckpointMetadata:
         self.last_access = time.time()
 
 
+@dataclass(frozen=True)
+class GDNCheckpointLookup:
+    """Resolved recurrent sidecar plus the namespace decision that found it."""
+
+    file_path: Path
+    requested_state_dtype: str
+    effective_state_codec: str
+    used_legacy_fp32_fallback: bool
+
+
 class GDNCheckpointIndex:
     """Thread-safe size/LRU index for durable GDN sidecar files."""
 
@@ -1524,6 +1552,7 @@ class PagedSSDCacheManager(CacheManager):
         expected_kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
         expected_layer_cache_types: list[str] | None = None,
         gdn_ssd_split_enabled: bool = False,
+        gdn_sidecar_state_dtype: str = "fp32",
     ):
         """
         Initialize the SSD cache manager.
@@ -1565,11 +1594,18 @@ class PagedSSDCacheManager(CacheManager):
             expected_layer_cache_types: Optional current cache layout. When
                 provided, blocks with a different per-layer type list are
                 skipped at startup.
+            gdn_ssd_split_enabled: Stamp new main blocks with the split GDN
+                payload layout and enable the durable-sidecar profile. The
+                file/index API itself remains available only in SSD-backed
+                mode; split blocks use format version 5.
         """
         self._cache_dir = cache_dir
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
+        # Durable GDN checkpoints are kept in a separate namespace and never
+        # promoted into the raw-byte hot cache.  They still consume the same
+        # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
@@ -1577,6 +1613,18 @@ class PagedSSDCacheManager(CacheManager):
         self._expected_block_size = expected_block_size
         self._expected_layer_cache_types = expected_layer_cache_types
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._gdn_sidecar_state_dtype = str(gdn_sidecar_state_dtype).lower()
+        if self._gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+        }:
+            raise ValueError(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8"
+            )
+        self._gdn_legacy_fp32_fallbacks = 0
         self._payload_layout = (
             "split_recurrent_v1" if self._gdn_ssd_split_enabled else "embedded"
         )
@@ -2076,7 +2124,12 @@ class PagedSSDCacheManager(CacheManager):
                 os.close(root_fd)
 
     def _tracked_ssd_size(self) -> int:
-        """Return all SSD cache bytes tracked for this shared cache directory."""
+        """Return all tracked main-KV and GDN-sidecar bytes.
+
+        Sidecars deliberately share the configured SSD budget with main KV
+        files, so a long GDN history cannot grow without participating in the
+        same size enforcement path.
+        """
         return (
             self._index.total_size
             + self._incompatible_index.total_size
@@ -2084,7 +2137,7 @@ class PagedSSDCacheManager(CacheManager):
         )
 
     def _tracked_ssd_count(self) -> int:
-        """Return compatible plus incompatible tracked SSD cache file count."""
+        """Return the count of tracked main-KV and GDN-sidecar files."""
         return (
             self._index.count
             + self._incompatible_index.count
@@ -2129,11 +2182,12 @@ class PagedSSDCacheManager(CacheManager):
                     logger.warning(f"Failed to read {file_path}: {e}")
                     errors += 1
 
-        self._index.sort_lru_by_last_access()
-        self._incompatible_index.sort_lru_by_last_access()
         sidecars_indexed, sidecars_skipped, sidecars_bytes = (
             self._scan_existing_gdn_sidecars()
         )
+
+        self._index.sort_lru_by_last_access()
+        self._incompatible_index.sort_lru_by_last_access()
         self._gdn_sidecar_index.sort_lru_by_last_access()
 
         log_msg = (
@@ -2159,14 +2213,22 @@ class PagedSSDCacheManager(CacheManager):
             self._enforce_size_limit_for_new_block(0, unbounded=True)
 
     def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
-        """Index existing sidecars from path/stat metadata without loading them."""
+        """Index existing sidecars using only path and stat metadata.
+
+        The sidecar is an opaque safetensors file.  Startup must not load or
+        rewrite it merely to rebuild the LRU index, so the signature digest and
+        source hash are recovered from the namespace path and timestamps/sizes
+        are recovered from ``stat``.
+        """
         if self._cache_dir is None:
             return 0, 0, 0
         root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
         if root.is_symlink() or not root.is_dir():
             return 0, 0, 0
 
-        indexed = skipped = total_bytes = 0
+        indexed = 0
+        skipped = 0
+        total_bytes = 0
         for signature_dir in root.iterdir():
             if signature_dir.is_symlink() or not signature_dir.is_dir():
                 continue
@@ -2189,24 +2251,23 @@ class PagedSSDCacheManager(CacheManager):
                     ):
                         raise ValueError("invalid sidecar source hash or file")
                     stat_result = file_path.stat()
-                    self._gdn_sidecar_index.add(
-                        GDNCheckpointMetadata(
-                            source_block_hash=source_hash,
-                            cache_signature_digest=digest,
-                            file_path=file_path,
-                            file_size=stat_result.st_size,
-                            token_count=0,
-                            model_name="",
-                            block_size=0,
-                            created_at=stat_result.st_ctime,
-                            last_access=stat_result.st_mtime,
-                        )
+                    metadata = GDNCheckpointMetadata(
+                        source_block_hash=source_hash,
+                        cache_signature_digest=digest,
+                        file_path=file_path,
+                        file_size=stat_result.st_size,
+                        token_count=0,
+                        model_name="",
+                        block_size=0,
+                        created_at=stat_result.st_ctime,
+                        last_access=stat_result.st_mtime,
                     )
+                    self._gdn_sidecar_index.add(metadata)
                     indexed += 1
                     total_bytes += stat_result.st_size
-                except (OSError, ValueError) as exc:
+                except (OSError, ValueError) as e:
                     skipped += 1
-                    logger.debug("Skipping GDN sidecar %s: %s", file_path, exc)
+                    logger.debug("Skipping GDN sidecar %s: %s", file_path, e)
         return indexed, skipped, total_bytes
 
     def commit_gdn_checkpoint_file(
@@ -2300,34 +2361,126 @@ class PagedSSDCacheManager(CacheManager):
     def get_gdn_checkpoint_file(
         self, source_block_hash: bytes, cache_signature: str
     ) -> Path | None:
-        """Return an indexed sidecar path and update its LRU timestamp."""
+        """Return a sidecar path and touch its in-memory/on-disk LRU state."""
+        lookup = self.get_gdn_checkpoint_file_with_diagnostic(
+            source_block_hash, cache_signature
+        )
+        return lookup.file_path if lookup is not None else None
+
+    def get_gdn_checkpoint_file_with_diagnostic(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> GDNCheckpointLookup | None:
+        """Resolve a sidecar without hiding reduced-to-FP32 fallback.
+
+        ``get_gdn_checkpoint_file`` retains its historical ``Path`` return
+        type.  Restore callers that need proof of the selected namespace use
+        this richer companion API instead.
+        """
         if self._hot_cache_only or self._cache_dir is None:
             return None
-        digest = self._gdn_signature_digest(cache_signature)
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return None
+        if not isinstance(cache_signature, str):
+            return None
+
         with self._lock:
-            metadata = self._gdn_sidecar_index.get(source_block_hash, digest)
-            if (
-                metadata is None
-                or not self._is_safe_gdn_sidecar_file(metadata.file_path)
-            ):
-                if metadata is not None:
-                    self._gdn_sidecar_index.remove(source_block_hash, digest)
+            metadata = None
+            signature_digest = ""
+            selected_candidate_index = -1
+            candidates = self._gdn_signature_candidates(cache_signature)
+            for candidate_index, candidate in enumerate(candidates):
+                candidate_digest = self._gdn_signature_digest(candidate)
+                candidate_metadata = self._gdn_sidecar_index.get(
+                    source_block_hash, candidate_digest
+                )
+                if candidate_metadata is None:
+                    continue
+                if not self._is_safe_gdn_sidecar_file(
+                    candidate_metadata.file_path
+                ):
+                    self._gdn_sidecar_index.remove(
+                        source_block_hash, candidate_digest
+                    )
+                    continue
+                metadata = candidate_metadata
+                signature_digest = candidate_digest
+                selected_candidate_index = candidate_index
+                break
+            if metadata is None:
                 return None
-            self._gdn_sidecar_index.touch(source_block_hash, digest)
-            with contextlib.suppress(OSError):
+
+            requested_state_dtype = self._gdn_state_dtype_from_signature(
+                cache_signature
+            )
+            used_legacy_fp32_fallback = selected_candidate_index > 0
+            effective_state_dtype = (
+                "fp32" if used_legacy_fp32_fallback else requested_state_dtype
+            )
+            if used_legacy_fp32_fallback:
+                self._gdn_legacy_fp32_fallbacks += 1
+
+            self._gdn_sidecar_index.touch(source_block_hash, signature_digest)
+            try:
+                # Persist the LRU touch across manager restarts without
+                # touching the opaque safetensors payload itself.
                 os.utime(metadata.file_path, None)
-            return metadata.file_path
+            except OSError as e:
+                logger.debug("Failed to persist GDN sidecar LRU touch: %s", e)
+            return GDNCheckpointLookup(
+                file_path=metadata.file_path,
+                requested_state_dtype=requested_state_dtype,
+                effective_state_codec=_GDN_STATE_CODEC_BY_DTYPE[
+                    effective_state_dtype
+                ],
+                used_legacy_fp32_fallback=used_legacy_fp32_fallback,
+            )
 
-    def has_gdn_checkpoint(self, source_block_hash: bytes, cache_signature: str) -> bool:
-        return self.get_gdn_checkpoint_file(source_block_hash, cache_signature) is not None
-
-    def forget_gdn_checkpoint(self, source_block_hash: bytes, cache_signature: str) -> bool:
-        """Remove one durable recurrent sidecar."""
+    def has_gdn_checkpoint(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> bool:
+        """Return whether an indexed, existing sidecar is available."""
         if self._hot_cache_only or self._cache_dir is None:
             return False
-        digest = self._gdn_signature_digest(cache_signature)
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return False
+        if not isinstance(cache_signature, str):
+            return False
+
         with self._lock:
-            metadata = self._gdn_sidecar_index.remove(source_block_hash, digest)
+            for candidate in self._gdn_signature_candidates(cache_signature):
+                signature_digest = self._gdn_signature_digest(candidate)
+                metadata = self._gdn_sidecar_index.get(
+                    source_block_hash, signature_digest
+                )
+                if metadata is None:
+                    continue
+                if metadata.file_path.is_file():
+                    return True
+                self._gdn_sidecar_index.remove(
+                    source_block_hash, signature_digest
+                )
+            return False
+
+    def forget_gdn_checkpoint(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> bool:
+        """Remove a sidecar from the index and delete its durable file."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return False
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return False
+        if not isinstance(cache_signature, str):
+            return False
+
+        with self._lock:
+            metadata = None
+            for candidate in self._gdn_signature_candidates(cache_signature):
+                signature_digest = self._gdn_signature_digest(candidate)
+                metadata = self._gdn_sidecar_index.remove(
+                    source_block_hash, signature_digest
+                )
+                if metadata is not None:
+                    break
             if metadata is None:
                 return False
             try:
@@ -2335,8 +2488,13 @@ class PagedSSDCacheManager(CacheManager):
                 if not deleted:
                     self._gdn_sidecar_index.add(metadata)
                 return deleted
-            except OSError:
+            except OSError as e:
+                # Restore accounting if the file could not be removed. The
+                # sidecar remains a valid cache entry and can be retried.
                 self._gdn_sidecar_index.add(metadata)
+                logger.warning(
+                    "Failed to forget GDN sidecar %s: %s", metadata.file_path, e
+                )
                 return False
 
     def _is_compatible_block(self, metadata: PagedSSDBlockMetadata) -> bool:
@@ -2357,17 +2515,24 @@ class PagedSSDCacheManager(CacheManager):
                 metadata.layer_cache_types
             ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
-        if (
-            self._expected_layer_cache_types is not None
-            and not self._is_compatible_cache_signature(metadata)
-        ):
+        # Always gate the payload layout.  A manager without any other
+        # expectation still must not index a split block as an embedded block
+        # (or vice versa).  Signatures from before layout stamping default to
+        # embedded inside ``_is_compatible_cache_signature``.
+        if not self._is_compatible_cache_signature(metadata):
             return False
         return True
 
     def _is_compatible_cache_signature(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a saved cache_signature matches enabled checks."""
         if not metadata.cache_signature:
-            return self._signature_bits_match("")
+            # Missing layout metadata is the historical embedded format. It
+            # remains readable for the embedded profile, but cannot prove a
+            # split block and therefore must not enter the split index.
+            return (
+                self._payload_layout == "embedded"
+                and self._signature_bits_match("")
+            )
 
         try:
             payload = json.loads(metadata.cache_signature)
@@ -2383,6 +2548,9 @@ class PagedSSDCacheManager(CacheManager):
 
         if not isinstance(payload, dict):
             return False
+        # Old signatures did not carry this field and are embedded combined
+        # blocks by definition. This keeps the existing 2/3/4 reader path
+        # usable while making split and embedded signatures distinct.
         if payload.get("payload_layout", "embedded") != self._payload_layout:
             return False
 
@@ -2506,24 +2674,6 @@ class PagedSSDCacheManager(CacheManager):
 
         return "CacheList sub composition mismatch"
 
-    def _expected_cache_signature(self) -> str:
-        if (
-            not self._expected_model_name
-            and self._expected_num_layers <= 0
-            and self._expected_block_size <= 0
-            and self._expected_layer_cache_types is None
-        ):
-            return ""
-        return _cache_compat_signature(
-            model_name=self._expected_model_name,
-            num_layers=self._expected_num_layers,
-            block_size=self._expected_block_size,
-            layer_cache_types=self._expected_layer_cache_types,
-            turboquant_kv_bits=self._expected_turboquant_kv_bits,
-            cachelist_subtypes=self._expected_cachelist_subtypes,
-            payload_layout=self._payload_layout,
-        )
-
     def cache_signature_for(
         self,
         *,
@@ -2534,7 +2684,11 @@ class PagedSSDCacheManager(CacheManager):
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> str:
-        """Build the exact compatibility signature used by this manager.
+        """Build a signature using this manager's expected layout settings.
+
+        Omitted TurboQuant and CacheList arguments inherit the manager's
+        expectation, which lets prefix-cache callers produce the exact same
+        signature as ``save_block`` without reaching into private fields.
 
         GDN sidecar lookups hash this signature into a directory name, so
         unlike block metadata checks there is no compare-time normalization.
@@ -2543,23 +2697,98 @@ class PagedSSDCacheManager(CacheManager):
         ``ArraysCache``, and without canonicalization the commit and restore
         paths address different sidecar directories.
         """
+        if turboquant_kv_bits is None:
+            turboquant_kv_bits = self._expected_turboquant_kv_bits
+        if cachelist_subtypes is None:
+            cachelist_subtypes = self._expected_cachelist_subtypes
         return _cache_compat_signature(
             model_name=model_name,
             num_layers=num_layers,
             block_size=block_size,
             layer_cache_types=_canonicalize_layer_cache_types(layer_cache_types)
             or [],
-            turboquant_kv_bits=(
-                self._expected_turboquant_kv_bits
-                if turboquant_kv_bits is None
-                else turboquant_kv_bits
-            ),
-            cachelist_subtypes=(
-                self._expected_cachelist_subtypes
-                if cachelist_subtypes is None
-                else cachelist_subtypes
-            ),
+            turboquant_kv_bits=turboquant_kv_bits,
+            cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
+        )
+
+    def gdn_cache_signature_for(
+        self,
+        *,
+        model_name: str,
+        num_layers: int,
+        block_size: int,
+        layer_cache_types: list[str],
+        turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
+    ) -> str:
+        """Build a sidecar namespace signature without invalidating KV blocks."""
+        base = self.cache_signature_for(
+            model_name=model_name,
+            num_layers=num_layers,
+            block_size=block_size,
+            layer_cache_types=layer_cache_types,
+            turboquant_kv_bits=turboquant_kv_bits,
+            cachelist_subtypes=cachelist_subtypes,
+        )
+        if self._gdn_sidecar_state_dtype == "fp32":
+            return base
+        payload = json.loads(base)
+        payload["gdn_sidecar_state_dtype"] = self._gdn_sidecar_state_dtype
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _gdn_signature_candidates(cache_signature: str) -> list[str]:
+        """Return current then legacy-fp32 namespace signatures.
+
+        Reduced-precision modes write to an isolated namespace so experiments
+        cannot silently reuse another arm's checkpoint. If no new checkpoint
+        exists, an old fp32 sidecar remains a valid warm-cache fallback because
+        the per-file codec metadata is backward compatible.
+        """
+        candidates = [cache_signature]
+        try:
+            payload = json.loads(cache_signature)
+        except (TypeError, ValueError):
+            return candidates
+        if not isinstance(payload, dict) or "gdn_sidecar_state_dtype" not in payload:
+            return candidates
+        payload.pop("gdn_sidecar_state_dtype", None)
+        legacy = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if legacy != cache_signature:
+            candidates.append(legacy)
+        return candidates
+
+    @staticmethod
+    def _gdn_state_dtype_from_signature(cache_signature: str) -> str:
+        """Return the requested sidecar dtype encoded by a namespace."""
+        try:
+            payload = json.loads(cache_signature)
+        except (TypeError, ValueError):
+            return "fp32"
+        if not isinstance(payload, dict):
+            return "fp32"
+        state_dtype = payload.get("gdn_sidecar_state_dtype", "fp32")
+        if state_dtype not in _GDN_STATE_CODEC_BY_DTYPE:
+            return "fp32"
+        return state_dtype
+
+    def _expected_cache_signature(self) -> str:
+        if (
+            not self._expected_model_name
+            and self._expected_num_layers <= 0
+            and self._expected_block_size <= 0
+            and self._expected_layer_cache_types is None
+            and not self._gdn_ssd_split_enabled
+        ):
+            return ""
+        return self.cache_signature_for(
+            model_name=self._expected_model_name,
+            num_layers=self._expected_num_layers,
+            block_size=self._expected_block_size,
+            layer_cache_types=self._expected_layer_cache_types,
+            turboquant_kv_bits=self._expected_turboquant_kv_bits,
+            cachelist_subtypes=self._expected_cachelist_subtypes,
         )
 
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
@@ -2819,6 +3048,10 @@ class PagedSSDCacheManager(CacheManager):
                 for reconstruction (e.g., [(offset,), (keep, max_size, offset, _idx)]).
             hot_cache_write_back: When False in SSD-backed hot-cache mode, enqueue
                 through the SSD writer path instead of retaining a hot-cache copy.
+            replace_existing: Rebuild and atomically replace an existing payload
+                for the same content hash. This is reserved for promoting a
+                non-sliceable prefix-cache placeholder into a valid boundary
+                snapshot; normal deduplicated saves must leave it False.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -2886,7 +3119,7 @@ class PagedSSDCacheManager(CacheManager):
                 self.forget_block(block_hash)
                 hot_entry = None
 
-        if hot_entry is not None:
+        if hot_entry is not None and not replace_existing:
             if hot_cache_write_back or self._hot_cache_only:
                 self._stats["hits"] += 1
                 return True
@@ -4045,6 +4278,16 @@ class PagedSSDCacheManager(CacheManager):
                 if got != expected:
                     stale.append(h)
                     continue
+                try:
+                    signature_payload = json.loads(meta.cache_signature or "{}")
+                except (TypeError, ValueError):
+                    signature_payload = {}
+                if not isinstance(signature_payload, dict) or (
+                    signature_payload.get("payload_layout", "embedded")
+                    != self._payload_layout
+                ):
+                    stale.append(h)
+                    continue
                 if not self._signature_bits_match(meta.cache_signature):
                     stale.append(h)
                     continue
@@ -4175,7 +4418,14 @@ class PagedSSDCacheManager(CacheManager):
         target_size: int,
         max_count: int | None = None,
     ) -> list[tuple[Any, Any]]:
-        """Remove oldest tracked SSD entries from their indexes until target."""
+        """Remove globally oldest tracked main or sidecar files.
+
+        Main compatible blocks, incompatible blocks, and GDN sidecars share a
+        single deterministic LRU walk.  Equal timestamps are resolved in the
+        fixed order compatible, incompatible, sidecar, then by the index's
+        stable key ordering.  This keeps the configured SSD limit safe while
+        avoiding a second, competing budget for GDN history.
+        """
         evicted: list[tuple[Any, Any]] = []
 
         while self._tracked_ssd_size() > target_size:
@@ -4185,22 +4435,27 @@ class PagedSSDCacheManager(CacheManager):
             compatible = self._index.get_lru_entries(1)
             incompatible = self._incompatible_index.get_lru_entries(1)
             sidecars = self._gdn_sidecar_index.get_lru_entries(1)
-            if not compatible and not incompatible and not sidecars:
-                break
-
-            candidates = []
+            candidates: list[tuple[float, int, Any, Any]] = []
             if compatible:
                 candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))
             if incompatible:
-                candidates.append((incompatible[0].last_access, 1, self._incompatible_index, incompatible[0]))
+                candidates.append(
+                    (incompatible[0].last_access, 1, self._incompatible_index, incompatible[0])
+                )
             if sidecars:
-                candidates.append((sidecars[0].last_access, 2, self._gdn_sidecar_index, sidecars[0]))
-            _, _, source_index, candidate = min(candidates, key=lambda item: (item[0], item[1]))
-            metadata = (
-                source_index.remove_key(candidate.key)
-                if source_index is self._gdn_sidecar_index
-                else source_index.remove(candidate.block_hash)
+                candidates.append(
+                    (sidecars[0].last_access, 2, self._gdn_sidecar_index, sidecars[0])
+                )
+            if not candidates:
+                break
+
+            _, _, source_index, candidate = min(
+                candidates, key=lambda item: (item[0], item[1])
             )
+            if source_index is self._gdn_sidecar_index:
+                metadata = source_index.remove_key(candidate.key)
+            else:
+                metadata = source_index.remove(candidate.block_hash)
             if metadata is not None:
                 evicted.append((source_index, metadata))
 
@@ -4417,8 +4672,17 @@ class PagedSSDCacheManager(CacheManager):
                 if self.delete_block(block_hash):
                     count += 1
 
-            for key in list(self._gdn_sidecar_index.get_all_keys()):
-                metadata = self._gdn_sidecar_index.remove_key(key)
+            for signature_digest, source_block_hash in list(
+                self._gdn_sidecar_index.get_all_keys()
+            ):
+                # The public API accepts the original signature, while the
+                # startup index intentionally retains only its digest.  For
+                # a full clear, remove the indexed metadata directly so no
+                # opaque payload inspection or signature reverse lookup is
+                # needed.
+                metadata = self._gdn_sidecar_index.remove_key(
+                    (signature_digest, source_block_hash)
+                )
                 if metadata is None:
                     continue
                 try:
@@ -4426,8 +4690,13 @@ class PagedSSDCacheManager(CacheManager):
                         count += 1
                     else:
                         self._gdn_sidecar_index.add(metadata)
-                except OSError:
+                except OSError as e:
                     self._gdn_sidecar_index.add(metadata)
+                    logger.warning(
+                        "Failed to clear GDN sidecar %s: %s",
+                        metadata.file_path,
+                        e,
+                    )
 
             logger.info(f"Cleared SSD cache: deleted {count} files")
             return count
@@ -4465,6 +4734,22 @@ class PagedSSDCacheManager(CacheManager):
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
             )
+
+    @property
+    def gdn_sidecar_count(self) -> int:
+        """Number of durable recurrent checkpoint files in the SSD tier."""
+        return self._gdn_sidecar_index.count
+
+    @property
+    def gdn_sidecar_size_bytes(self) -> int:
+        """Tracked durable recurrent checkpoint bytes (never hot-cached)."""
+        return self._gdn_sidecar_index.total_size
+
+    @property
+    def gdn_legacy_fp32_fallbacks(self) -> int:
+        """Number of reduced-namespace lookups resolved by legacy FP32."""
+        with self._lock:
+            return self._gdn_legacy_fp32_fallbacks
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
         """Get model-scoped SSD cache statistics.

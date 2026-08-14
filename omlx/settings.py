@@ -325,6 +325,7 @@ class CacheSettings:
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_size: str = "512MB"
+    gdn_sidecar_state_dtype: str = "fp32"
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -366,6 +367,7 @@ class CacheSettings:
             "hot_cache_only": self.hot_cache_only,
             "gdn_ssd_split_enabled": self.gdn_ssd_split_enabled,
             "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
+            "gdn_sidecar_state_dtype": self.gdn_sidecar_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -386,6 +388,9 @@ class CacheSettings:
             gdn_ssd_pending_max_size=data.get(
                 "gdn_ssd_pending_max_size", "512MB"
             ),
+            gdn_sidecar_state_dtype=str(
+                data.get("gdn_sidecar_state_dtype", "fp32")
+            ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -1019,6 +1024,8 @@ class GlobalSettings:
             )
         if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
             self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
+        if gdn_sidecar_dtype := os.getenv("OMLX_GDN_SIDECAR_STATE_DTYPE"):
+            self.cache.gdn_sidecar_state_dtype = gdn_sidecar_dtype.lower()
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -1404,6 +1411,24 @@ class GlobalSettings:
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid gdn_ssd_pending_max_size: {e}")
 
+        if self.cache.gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+        }:
+            errors.append(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8"
+            )
+        elif (
+            self.cache.gdn_sidecar_state_dtype != "fp32"
+            and not self.cache.gdn_ssd_split_enabled
+        ):
+            errors.append(
+                "reduced gdn_sidecar_state_dtype requires gdn_ssd_split_enabled"
+            )
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -1544,6 +1569,7 @@ class GlobalSettings:
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
             ),
+            gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
         )
 
     def to_dict(self) -> dict[str, Any]:

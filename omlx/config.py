@@ -112,6 +112,7 @@ class PagedSSDCacheConfig:
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_size: str = "512MB"
+    gdn_sidecar_state_dtype: str = "fp32"
 
     @property
     def max_size_bytes(self) -> int:
@@ -189,6 +190,10 @@ class OMLXConfig:
             "OMLX_GDN_SSD_PENDING_MAX_SIZE",
             config.paged_ssd_cache.gdn_ssd_pending_max_size,
         )
+        config.paged_ssd_cache.gdn_sidecar_state_dtype = os.getenv(
+            "OMLX_GDN_SIDECAR_STATE_DTYPE",
+            config.paged_ssd_cache.gdn_sidecar_state_dtype,
+        ).lower()
         paged_ssd_dir = os.getenv("OMLX_PAGED_SSD_CACHE_DIR")
         if paged_ssd_dir:
             config.paged_ssd_cache.enabled = True
@@ -319,5 +324,22 @@ class OMLXConfig:
                 errors.append("gdn_ssd_pending_max_size must be positive")
         except (AttributeError, TypeError, ValueError) as exc:
             errors.append(f"Invalid gdn_ssd_pending_max_size: {exc}")
+        if self.paged_ssd_cache.gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+        }:
+            errors.append(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8"
+            )
+        elif (
+            self.paged_ssd_cache.gdn_sidecar_state_dtype != "fp32"
+            and not self.paged_ssd_cache.gdn_ssd_split_enabled
+        ):
+            errors.append(
+                "reduced gdn_sidecar_state_dtype requires gdn_ssd_split_enabled"
+            )
 
         return errors

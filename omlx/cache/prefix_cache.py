@@ -268,13 +268,26 @@ class BlockAwarePrefixCache(CacheManager):
         self._gdn_checkpoint_loads = 0
         self._gdn_checkpoint_walkbacks = 0
         self._last_gdn_restore: dict[str, Any] | None = None
+        self._gdn_dequantization_counter: Callable[[], int] | None = None
 
     def set_gdn_checkpoint_loader(
         self,
         loader: Callable[[Any], list[dict[str, Any]] | None] | None,
+        dequantization_counter: Callable[[], int] | None = None,
     ) -> None:
         """Attach the scheduler-owned recurrent checkpoint deserializer."""
         self._gdn_checkpoint_loader = loader
+        self._gdn_dequantization_counter = dequantization_counter
+
+    def _gdn_dequantization_count(self) -> int | None:
+        """Read the store counter without making restore depend on metrics."""
+        if self._gdn_dequantization_counter is None:
+            return None
+        try:
+            return int(self._gdn_dequantization_counter())
+        except Exception:
+            logger.debug("Failed to read GDN dequantization counter", exc_info=True)
+            return None
 
     def _gdn_split_layout_supported(
         self, layer_cache_types: list[str] | tuple[str, ...] | None
@@ -330,7 +343,9 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> bool:
         """Return whether a recurrent sidecar exists for this exact layout."""
         manager = self.paged_ssd_cache
-        signature_builder = getattr(manager, "cache_signature_for", None)
+        signature_builder = getattr(manager, "gdn_cache_signature_for", None)
+        if not callable(signature_builder):
+            signature_builder = getattr(manager, "cache_signature_for", None)
         checkpoint_checker = getattr(manager, "has_gdn_checkpoint", None)
         if not callable(signature_builder) or not callable(checkpoint_checker):
             return False
@@ -2896,12 +2911,24 @@ class BlockAwarePrefixCache(CacheManager):
                 # admin poll cannot attribute an old endpoint to a miss.
                 self._last_gdn_restore = None
                 signature_builder = getattr(
-                    self.paged_ssd_cache, "cache_signature_for", None
+                    self.paged_ssd_cache, "gdn_cache_signature_for", None
+                )
+                if not callable(signature_builder):
+                    signature_builder = getattr(
+                        self.paged_ssd_cache, "cache_signature_for", None
+                    )
+                sidecar_lookup_getter = getattr(
+                    self.paged_ssd_cache,
+                    "get_gdn_checkpoint_file_with_diagnostic",
+                    None,
                 )
                 sidecar_getter = getattr(
                     self.paged_ssd_cache, "get_gdn_checkpoint_file", None
                 )
-                if not callable(signature_builder) or not callable(sidecar_getter):
+                if not callable(signature_builder) or (
+                    not callable(sidecar_lookup_getter)
+                    and not callable(sidecar_getter)
+                ):
                     logger.warning(
                         "Split GDN cache enabled but sidecar manager API is unavailable"
                     )
@@ -2922,66 +2949,118 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     if block is None or block.block_hash is None:
                         continue
-                    checkpoint_path = sidecar_getter(
-                        block.block_hash, cache_signature
-                    )
-                    if checkpoint_path is None:
-                        continue
-                    if self._gdn_checkpoint_loader is None:
-                        logger.warning(
-                            "Split GDN cache enabled without checkpoint loader"
+                    # A corrupt reduced sidecar is forgotten and the same
+                    # endpoint is retried once, allowing its legacy FP32
+                    # candidate to be selected before walking back a block.
+                    for _attempt in range(2):
+                        lookup_diagnostic = None
+                        if callable(sidecar_lookup_getter):
+                            lookup = sidecar_lookup_getter(
+                                block.block_hash, cache_signature
+                            )
+                            checkpoint_path = (
+                                getattr(lookup, "file_path", None)
+                                if lookup is not None
+                                else None
+                            )
+                            if checkpoint_path is not None:
+                                lookup_diagnostic = {
+                                    "requested_state_dtype": getattr(
+                                        lookup, "requested_state_dtype", None
+                                    ),
+                                    "effective_state_codec": getattr(
+                                        lookup, "effective_state_codec", None
+                                    ),
+                                    "used_legacy_fp32_fallback": getattr(
+                                        lookup,
+                                        "used_legacy_fp32_fallback",
+                                        None,
+                                    ),
+                                }
+                        else:
+                            checkpoint_path = sidecar_getter(
+                                block.block_hash, cache_signature
+                            )
+                        if checkpoint_path is None:
+                            break
+                        if self._gdn_checkpoint_loader is None:
+                            logger.warning(
+                                "Split GDN cache enabled without checkpoint loader"
+                            )
+                            return None
+                        load_started = time.perf_counter()
+                        dequantizations_before = self._gdn_dequantization_count()
+                        snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                        dequantizations_after = self._gdn_dequantization_count()
+                        load_latency_ms = (
+                            time.perf_counter() - load_started
+                        ) * 1000.0
+                        if snapshot is None:
+                            forgetter = getattr(
+                                self.paged_ssd_cache,
+                                "forget_gdn_checkpoint",
+                                None,
+                            )
+                            if callable(forgetter):
+                                forgetter(block.block_hash, cache_signature)
+                            continue
+                        candidate_payloads = self._validated_gdn_snapshot_layers(
+                            snapshot, layer_cache_types
                         )
-                        return None
-                    load_started = time.perf_counter()
-                    snapshot = self._gdn_checkpoint_loader(checkpoint_path)
-                    load_latency_ms = (time.perf_counter() - load_started) * 1000.0
-                    if snapshot is None:
-                        forgetter = getattr(
-                            self.paged_ssd_cache,
-                            "forget_gdn_checkpoint",
-                            None,
+                        if candidate_payloads is None:
+                            logger.warning(
+                                "Ignoring structurally invalid recurrent checkpoint "
+                                "for block %s",
+                                block.block_id,
+                            )
+                            forgetter = getattr(
+                                self.paged_ssd_cache,
+                                "forget_gdn_checkpoint",
+                                None,
+                            )
+                            if callable(forgetter):
+                                forgetter(block.block_hash, cache_signature)
+                            continue
+                        chosen_idx = idx
+                        chosen_payloads = candidate_payloads
+                        chosen_endpoint_tokens = sum(
+                            self.paged_cache.allocated_blocks[bid].token_count
+                            for bid in block_table.block_ids[: idx + 1]
+                            if bid in self.paged_cache.allocated_blocks
                         )
-                        if callable(forgetter):
-                            forgetter(block.block_hash, cache_signature)
-                        continue
-                    candidate_payloads = self._validated_gdn_snapshot_layers(
-                        snapshot, layer_cache_types
-                    )
-                    if candidate_payloads is None:
-                        logger.warning(
-                            "Ignoring structurally invalid recurrent checkpoint "
-                            "for block %s",
-                            block.block_id,
-                        )
-                        forgetter = getattr(
-                            self.paged_ssd_cache,
-                            "forget_gdn_checkpoint",
-                            None,
-                        )
-                        if callable(forgetter):
-                            forgetter(block.block_hash, cache_signature)
-                        continue
-                    chosen_idx = idx
-                    chosen_payloads = candidate_payloads
-                    chosen_endpoint_tokens = sum(
-                        self.paged_cache.allocated_blocks[bid].token_count
-                        for bid in block_table.block_ids[: idx + 1]
-                        if bid in self.paged_cache.allocated_blocks
-                    )
-                    source_hash = block.block_hash
-                    chosen_diagnostic = {
-                        "chosen_endpoint_tokens": chosen_endpoint_tokens,
-                        "checkpoint_load_latency_ms": round(load_latency_ms, 3),
-                        "walkback_blocks": len(all_block_data) - idx - 1,
-                        # Only a short content hash is exposed; the sidecar
-                        # path remains an internal implementation detail.
-                        "source_block_hash": (
-                            source_hash.hex()[:16]
-                            if isinstance(source_hash, (bytes, bytearray))
-                            else str(source_hash)[:16]
-                        ),
-                    }
-                    break
+                        source_hash = block.block_hash
+                        chosen_diagnostic = {
+                            "chosen_endpoint_tokens": chosen_endpoint_tokens,
+                            "checkpoint_load_latency_ms": round(load_latency_ms, 3),
+                            "walkback_blocks": len(all_block_data) - idx - 1,
+                            "source_block_hash": (
+                                source_hash.hex()[:16]
+                                if isinstance(source_hash, (bytes, bytearray))
+                                else str(source_hash)[:16]
+                            ),
+                            "requested_state_dtype": (
+                                lookup_diagnostic or {}
+                            ).get("requested_state_dtype"),
+                            "effective_state_codec": (
+                                lookup_diagnostic or {}
+                            ).get("effective_state_codec"),
+                            "used_legacy_fp32_fallback": (
+                                lookup_diagnostic or {}
+                            ).get("used_legacy_fp32_fallback"),
+                            "dequantized_state_count": (
+                                max(
+                                    0,
+                                    dequantizations_after
+                                    - dequantizations_before,
+                                )
+                                if dequantizations_before is not None
+                                and dequantizations_after is not None
+                                else None
+                            ),
+                        }
+                        break
+                    if chosen_idx is not None:
+                        break
 
                 if chosen_idx is None or chosen_payloads is None:
                     logger.info(
