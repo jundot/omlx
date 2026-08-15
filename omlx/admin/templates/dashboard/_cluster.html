@@ -517,7 +517,7 @@
                                                 ? 'cluster-context__preset--active'
                                                 : ''"
                                             :aria-pressed="clusterContextMode === 'auto'"
-                                            x-text="'Auto · ' + clusterTokens(
+                                            x-text="window.t('cluster.auto_prefix') + clusterTokens(
                                                 clusterContextMaximumTokens()
                                             )"></button>
                                     <template x-for="tokens in clusterContextOptions()"
@@ -1582,7 +1582,7 @@
                                                 <span class="text-xs font-medium text-neutral-700" x-text="clusterSshKey.key_type"></span>
                                             </div>
                                             <div class="text-xs text-neutral-500 mt-1 font-mono break-all" x-text="clusterSshKey.fingerprint"></div>
-                                            <div class="text-[10px] text-neutral-400 mt-1" x-text="'Created: ' + new Date(clusterSshKey.created_at * 1000).toLocaleString()"></div>
+                                            <div class="text-[10px] text-neutral-400 mt-1" x-text="window.t('cluster.created') + new Date(clusterSshKey.created_at * 1000).toLocaleString()"></div>
                                         </div>
                                         <button @click="generateClusterSshKey()"
                                                 :disabled="clusterSshKeyGenerating"
