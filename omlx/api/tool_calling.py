@@ -330,9 +330,14 @@ _XML_PARAMETER_CLOSE = "</parameter>"
 # Candidate envelope ends examined before giving up. Each candidate costs a
 # balance count over the payload, so this keeps hostile output linear.
 _XML_MAX_END_CANDIDATES = 32
-# Trailing payload context the stream filter keeps so a `</function>` split
-# across chunks is still visible when the close marker arrives.
-_XML_TAIL_KEEP = 64
+# Sentinel for "this tag has not been searched for yet", distinct from the -1
+# that str.find returns for a permanent miss.
+_UNSEARCHED = -2
+# Tags the stream filter tracks, and enough of the previously consumed payload
+# to keep so one split across two chunks is still matched. One less than the
+# longest tag is exactly sufficient.
+_XML_DEPTH_TAGS = (_XML_PARAMETER_OPEN, _XML_PARAMETER_CLOSE, _XML_FUNCTION_CLOSE)
+_XML_TAG_CARRY = max(len(tag) for tag in _XML_DEPTH_TAGS) - 1
 
 
 def _skip_ws(text: str, idx: int) -> int:
@@ -1911,24 +1916,87 @@ class ToolCallStreamFilter:
         self._json_escaped = False
         self._json_scan_off = 0
         self._json_complete_off = 0
-        # Tail of already-consumed payload, kept so a `</function>` straddling
-        # the pending/buffer boundary is still visible to the xml check.
-        self._xml_prev_tail = ""
+        # qwen3_coder parameter nesting, carried across chunks. Depth is what
+        # tells a `</function>` that really closes the call from one sitting
+        # inside a parameter value; `_xml_close_off` is where the former ended.
+        self._xml_param_depth = 0
+        self._xml_close_off = -1
+        self._xml_carry = ""
         # First payload characters, accumulated across buffer drains purely to
         # decide which dialect the payload is.
         self._payload_head = ""
 
-    def _shift_json_scan(self, dropped: int, moved: str = "") -> None:
+    def _shift_json_scan(self, dropped: int) -> None:
         """Rebase scan offsets after ``dropped`` chars leave the buffer front."""
         self._json_scan_off = max(0, self._json_scan_off - dropped)
         self._json_complete_off = max(0, self._json_complete_off - dropped)
-        if moved:
-            self._xml_prev_tail = (self._xml_prev_tail + moved)[-_XML_TAIL_KEEP:]
+        if self._xml_close_off >= 0:
+            # Clamping to 0 is right: the dropped text precedes the close, so
+            # what remains in the buffer is entirely after it.
+            self._xml_close_off = max(0, self._xml_close_off - dropped)
+
+    def _scan_xml(self, buffer: str, start: int, end: int) -> None:
+        """Track qwen3_coder parameter nesting over chars not yet seen.
+
+        Runs in the same single pass as the JSON scan and for the same reason:
+        model output is untrusted, so re-counting the accumulated payload per
+        chunk would be quadratic on a payload that repeats these tags.
+        ``_xml_carry`` holds just enough of the previous text that a tag split
+        across two chunks is still matched exactly once.
+        """
+        if self._xml_close_off >= 0:
+            # Already bounded. The first balanced `</function>` is a valid lower
+            # bound for the close marker and later tags cannot move it, so
+            # scanning on would let markup in trailing prose drag the envelope
+            # end forward, and only when a chunk happened to carry both.
+            return
+        carry = self._xml_carry
+        text = carry + buffer[start:end]
+        base = start - len(carry)
+        cursor = 0
+        # Next match per tag, so a tag with no further occurrence is not
+        # re-searched to the end of the text on every step. Without this the
+        # pass is quadratic whenever one chunk carries many of one tag and few
+        # of another, which is precisely what a hostile payload produces.
+        # The cursor only moves forward, so a cached hit stays valid until
+        # passed and a cached miss (-1) is permanent.
+        nexts: Dict[str, int] = {}
+        while True:
+            found: Optional[Tuple[int, str]] = None
+            for tag in _XML_DEPTH_TAGS:
+                idx = nexts.get(tag, _UNSEARCHED)
+                if idx == _UNSEARCHED or 0 <= idx < cursor:
+                    idx = text.find(tag, cursor)
+                    nexts[tag] = idx
+                if idx >= 0 and (found is None or idx < found[0]):
+                    found = (idx, tag)
+            if found is None:
+                break
+            idx, tag = found
+            cursor = idx + len(tag)
+            # A match lying wholly inside the carry was counted last pass.
+            if cursor <= len(carry):
+                continue
+            if tag == _XML_PARAMETER_OPEN:
+                self._xml_param_depth += 1
+            elif tag == _XML_PARAMETER_CLOSE:
+                self._xml_param_depth = max(0, self._xml_param_depth - 1)
+            elif self._xml_param_depth == 0:
+                # `</function>` outside every parameter: this is the one that
+                # closes the call, so the envelope may end at the next close
+                # marker. One inside a value sits at depth >= 1 and is skipped,
+                # which is what lets a value carry the whole terminator.
+                self._xml_close_off = base + cursor
+                break
+        self._xml_carry = text[-_XML_TAG_CARRY:]
 
     def _advance_json_scan(self, buffer: str) -> None:
         """Consume buffer chars not yet seen, updating JSON-completion state."""
         i = self._json_scan_off
         n = len(buffer)
+        # The dialect-deciding branch below consumes text before the state is
+        # known to be xml, so remember where this pass really starts.
+        xml_from = i
 
         if self._json_state == "undecided":
             # `{` settles JSON from a single character, but `<function=` needs
@@ -1982,6 +2050,9 @@ class ToolCallStreamFilter:
             # The scan loop consumes the '{' itself, raising the depth above
             # the pending '[' so the array completes on its closing ']'.
             self._json_state = "scanning" if buffer[i] == "{" else "not_json"
+
+        if self._json_state == "xml":
+            self._scan_xml(buffer, xml_from, n)
 
         if self._json_state != "scanning":
             self._json_scan_off = n
@@ -2038,28 +2109,14 @@ class ToolCallStreamFilter:
         self._advance_json_scan(buffer)
 
         if self._json_state == "xml":
-            # qwen3_coder dialect: the envelope ends with </function> right
-            # before the close marker, so a marker inside a parameter value is
-            # not preceded by one. This is a local O(1) test per candidate,
-            # unlike the non-streaming path which can also balance parameter
-            # elements because it has the whole payload at once.
-            search = 0
-            while True:
-                idx = buffer.find(marker, search)
-                if idx < 0:
-                    return -1
-                # Only the characters immediately before the marker matter, so
-                # look at a fixed window instead of slicing the whole buffer:
-                # a per-candidate full slice would be quadratic when one chunk
-                # carries many markers.
-                window_start = idx - _XML_TAIL_KEEP
-                if window_start <= 0:
-                    seen = self._xml_prev_tail + buffer[:idx]
-                else:
-                    seen = buffer[window_start:idx]
-                if seen.rstrip(" \t\r\n").endswith(_XML_FUNCTION_CLOSE):
-                    return idx
-                search = idx + len(marker)
+            # qwen3_coder dialect: the envelope ends at the `</function>` seen
+            # at parameter depth 0, so markers before it sit inside the payload
+            # and are ignored. This now matches the non-streaming parser, which
+            # also requires the parameter elements to balance; the streaming
+            # side gets there incrementally instead of over the whole payload.
+            if self._xml_close_off < 0:
+                return -1
+            return buffer.find(marker, self._xml_close_off)
 
         if self._json_state == "not_json":
             # Hermes brackets, GLM arg_key/arg_value, prose: historical
@@ -2448,12 +2505,12 @@ class ToolCallStreamFilter:
                         self._pending_envelope_parts.append(moved)
                         # Rebase the JSON scan: those chars left the buffer
                         # front but were already consumed by the scanner.
-                        self._shift_json_scan(len(moved), moved)
+                        self._shift_json_scan(len(moved))
                         self._buffer = self._buffer[-keep:]
                     else:
                         moved = self._buffer
                         self._pending_envelope_parts.append(moved)
-                        self._shift_json_scan(len(moved), moved)
+                        self._shift_json_scan(len(moved))
                         self._buffer = ""
                     break
                 self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
