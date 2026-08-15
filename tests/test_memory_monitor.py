@@ -779,9 +779,17 @@ class TestDeepSeekV4PrefillMemoryProfile:
         )
         assert expected < 2 * 1024**3
 
-    def test_prefill_transient_does_not_charge_dense_full_context_sdpa(self):
+    def test_native_prefill_transient_does_not_charge_dense_full_context_sdpa(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
         from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
 
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_eligible",
+            lambda **kwargs: True,
+        )
         monitor = self._monitor()
         profiled = monitor.estimate_chunk_transient_bytes(2048, 199_999)
         dense = estimate_unfused_sdpa_call_bytes(64, 2048, 199_999, 512, 2)

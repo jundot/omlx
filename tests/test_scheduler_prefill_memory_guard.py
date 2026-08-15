@@ -827,12 +827,21 @@ def test_admission_charges_full_step_under_speed_priority():
     assert est_small.floor_chunk == 1023
 
 
-def test_deepseek_v4_200k_admission_uses_profile_instead_of_81_gib_dense_charge():
+def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
+    monkeypatch,
+):
     """Issue #2521: V4's local + pooled sparse cache must not be priced as
     43 full-context K/V layers followed by a dense 200K SDPA."""
     from mlx_lm.models.cache import RotatingKVCache
 
+    import omlx.memory_monitor as memory_monitor
     from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+    monkeypatch.setattr(
+        memory_monitor,
+        "native_indexer_eligible",
+        lambda **kwargs: True,
+    )
 
     config = _ModelConfig(
         num_hidden_layers=43,
