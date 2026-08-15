@@ -298,7 +298,7 @@
   "settings.tab.integrations": "Integration Settings",
   "settings.global.section_label": "グローバル設定",
   "settings.global.heading": "サーバー設定",
-  "settings.global.restart_notice": "",
+  "settings.global.restart_notice": "Settings marked with",
   "settings.global.restart_badge": "再起動が必要",
   "settings.global.restart_suffix": "マークの付いた設定はサーバーの再起動が必要です。",
   "settings.integrations.section_label": "Integrations",

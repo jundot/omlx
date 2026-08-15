@@ -298,7 +298,7 @@
   "settings.tab.integrations": "통합 설정",
   "settings.global.section_label": "기본 설정",
   "settings.global.heading": "서버 설정",
-  "settings.global.restart_notice": "",
+  "settings.global.restart_notice": "Settings marked with",
   "settings.global.restart_badge": "재시작 필요",
   "settings.global.restart_suffix": "표시가 있는 설정은 서버 재시작이 필요합니다.",
   "settings.integrations.section_label": "통합",
