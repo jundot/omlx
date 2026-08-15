@@ -3133,7 +3133,7 @@
                     return window.t('cluster.uses_devices').replace('{n}', fit.nodes_required);
                 }
                 if (this.clusterRecommendedModels()[0]?.model_path === model.model_path) {
-                    return 'Best for this pool';
+                    return window.t('cluster.best_for_pool');
                 }
                 if (fit?.fits) return window.t('cluster.fits_easily');
                 return '';
@@ -3447,8 +3447,8 @@
                 // button with no reason cost an hour of "it just seems to not
                 // launch": the catalogue had rejected the plan and nothing
                 // said so.
-                if (this.clusterDeactivatingId) return 'Stopping the current deployment…';
-                if (this.clusterActivationLoading) return 'Activation is already running.';
+                if (this.clusterDeactivatingId) return window.t('cluster.stopping_deployment');
+                if (this.clusterActivationLoading) return window.t('cluster.activation_running');
                 const busy = [
                     ['clusterAutoconfigureLoading', 'measuring the workers'],
                     ['clusterLinkSetupLoading', 'setting up the link'],
@@ -3456,35 +3456,36 @@
                     ['clusterFabricLoading', 'reading the fabric'],
                     ['clusterLinkStatusLoading', 'checking the link'],
                 ].find(([flag]) => this[flag]);
-                if (busy) return `Still ${busy[1]} — wait a moment, then try again.`;
+                if (busy) return window.t('cluster.still_busy').replace('{action}', busy[1]);
                 if (this.clusterDiscoveryLoading && !this.clusterPeerSsh.trim()) {
-                    return 'Still discovering workers on the network.';
+                    return window.t('cluster.still_discovering');
                 }
                 const selected = this.clusterSelectedModel();
                 const fit = selected
                     ? this.clusterCatalogueFit(selected.model_path)
                     : null;
                 if (fit?.fits === false && !(this.clusterPrimaryDeployment() && this.clusterLiveJobs().length)) {
-                    return `This plan cannot launch — ${fit.reason || fit.summary || 'the catalogue rejected it'}. Adjust the split or memory settings.`;
+                    return window.t('cluster.plan_cannot_launch')
+                        .replace('{reason}', fit.reason || fit.summary || window.t('cluster.catalogue_rejected'));
                 }
                 return '';
             },
 
             clusterPrimaryActionLabel() {
-                if (this.clusterDeactivatingId) return 'Stopping…';
+                if (this.clusterDeactivatingId) return window.t('cluster.stopping');
                 if (this.clusterActivationLoading) {
-                    return this.clusterActivationProgress || 'Starting on every worker…';
+                    return this.clusterActivationProgress || window.t('cluster.starting_every_worker');
                 }
-                if (this.clusterLinkSetupLoading) return 'Connecting the workers…';
-                if (this.clusterAutoconfigureLoading) return 'Preparing the model…';
+                if (this.clusterLinkSetupLoading) return window.t('cluster.connecting_workers');
+                if (this.clusterAutoconfigureLoading) return window.t('cluster.preparing_model2');
                 if (this.clusterPrimaryDeployment() && this.clusterLiveJobs().length) {
-                    return 'Stop';
+                    return window.t('cluster.stop');
                 }
-                if (!this.clusterAllModels().length) return 'Get a model';
+                if (!this.clusterAllModels().length) return window.t('cluster.get_a_model');
                 if (!this.clusterPeerSsh.trim()) {
                     return this.clusterDiscoveryLoading
-                        ? 'Finding workers…'
-                        : 'Find workers';
+                        ? window.t('cluster.finding_workers')
+                        : window.t('cluster.find_workers');
                 }
                 const model = this.clusterSelectedModel();
                 if (!model) return window.t('cluster.choose_a_model');
@@ -3585,11 +3586,11 @@
                 const rankLabel = ranks.length > 1
                     ? `R${Math.min(...ranks)}–R${Math.max(...ranks)}`
                     : `R${ranks[0]}`;
-                if (node?.local) return `Coordinator · ${rankLabel}`;
+                if (node?.local) return window.t('cluster.coordinator').replace('{rank}', rankLabel);
                 if (ranks.length > 1) {
-                    return `${node?.fabricVerified ? 'Verified CUDA pair' : 'CUDA pair'} · ${rankLabel}`;
+                    return window.t('cluster.' + (node?.fabricVerified ? 'verified_cuda_pair' : 'cuda_pair')).replace('{rank}', rankLabel);
                 }
-                return `Worker · ${rankLabel}`;
+                return window.t('cluster.worker_node').replace('{rank}', rankLabel);
             },
 
             clusterWorkerPeers() {
@@ -4007,7 +4008,7 @@
                         || (Number(node.memory || 0) / (1024 ** 3));
                     let memoryLabel = available > 0
                         ? `${this.clusterMemoryGiBLabel(available)} ${window.t('cluster.usable')}`
-                        : 'Memory not measured';
+                        : window.t('cluster.memory_not_measured');
                     if (capacity > 0) {
                         memoryLabel = `${this.formatClusterGiB(measured || planned)} / `
                             + `${this.formatClusterGiB(capacity)}`;
@@ -4205,46 +4206,46 @@
                 return [
                     {
                         key: 'latency',
-                        label: 'Ring latency',
+                        label: window.t('cluster.metric_ring_latency'),
                         value: this.formatClusterLatency(latency),
                         detail: latency
-                            ? 'Latest startup probe · slowest hop'
-                            : 'Measured when the cluster starts',
+                            ? window.t('cluster.metric_probe_slowest')
+                            : window.t('cluster.metric_when_start'),
                         tone: 'violet',
                     },
                     {
                         key: 'link',
-                        label: bandwidth ? 'Collective throughput' : 'Link capacity',
+                        label: bandwidth ? window.t('cluster.metric_collective') : window.t('cluster.metric_link_capacity'),
                         value: bandwidth
                             ? this.formatClusterBandwidth(bandwidth)
                             : (linkCapacity ? `${linkCapacity} Gb/s` : '—'),
                         detail: bandwidth
-                            ? '1 MiB all-reduce · startup probe · slowest rank'
+                            ? window.t('cluster.metric_probe_slowest_rank')
                             : (linkCapacity
-                                ? 'Negotiated speed · not measured throughput'
-                                : 'Waiting for link measurement'),
+                                ? window.t('cluster.metric_negotiated')
+                                : window.t('cluster.metric_waiting_link')),
                         tone: 'cyan',
                     },
                     {
                         key: 'prefill',
-                        label: 'Prompt prefill',
+                        label: window.t('cluster.metric_prompt_prefill'),
                         value: prefillActive
                             ? (
                                 prefillTotal > 0
                                     ? `${this.formatClusterCount(prefillProcessed)} / `
                                         + `${this.formatClusterCount(prefillTotal)}`
-                                    : 'Preparing…'
+                                    : window.t('cluster.preparing')
                             )
                             : this.formatClusterRate(lastRequest?.prefill_tps),
                         detail: prefillActive
-                            ? (prefillDetail.join(' · ') || 'Preparing prompt…')
+                            ? (prefillDetail.join(' · ') || window.t('cluster.preparing_prompt'))
                             : (
                                 lastRequest
-                                    ? `${this.formatClusterCount(uncachedTokens)} new`
+                                    ? `${this.formatClusterCount(uncachedTokens)} ${window.t('cluster.stat_new')}`
                                         + (cachedTokens > 0
-                                            ? ` · ${this.formatClusterCount(cachedTokens)} cached`
+                                            ? ` · ${this.formatClusterCount(cachedTokens)} ${window.t('cluster.stat_cached')}`
                                             : '')
-                                    : 'No request yet'
+                                    : window.t('cluster.no_request_yet')
                             ),
                         progress: prefillActive && prefillTotal > 0
                             ? prefillProcessed / prefillTotal
@@ -4253,23 +4254,23 @@
                     },
                     {
                         key: 'decode',
-                        label: 'Token decode',
+                        label: window.t('cluster.metric_token_decode'),
                         value: !hasFirstToken
                             ? '—'
                             : (
                                 completionTokens > 1
                                     ? this.formatClusterRate(lastRequest?.decode_tps)
-                                    : 'Measuring…'
+                                    : window.t('cluster.measuring')
                             ),
                         detail: prefillActive
-                            ? 'Starts after prefill'
+                            ? window.t('cluster.starts_after_prefill')
                             : (
                                 requestActive && hasFirstToken
-                                    ? `${this.formatClusterCount(completionTokens)} generated · live`
+                                    ? `${this.formatClusterCount(completionTokens)} ${window.t('cluster.stat_generated_live')}`
                                     : (
                                         lastRequest
-                                            ? `${this.formatClusterCount(completionTokens)} generated`
-                                            : 'No request yet'
+                                            ? `${this.formatClusterCount(completionTokens)} ${window.t('cluster.stat_generated')}`
+                                            : window.t('cluster.no_request_yet')
                                     )
                             ),
                         progress: null,
@@ -4277,14 +4278,14 @@
                     },
                     {
                         key: 'memory',
-                        label: job ? 'Resident memory' : 'Model memory',
+                        label: job ? window.t('cluster.resident_memory') : window.t('cluster.model_memory'),
                         value: job
                             ? `${this.formatClusterGiB(resident)} / `
                                 + `${this.formatClusterGiB(capacity)}`
-                            : `${this.formatClusterGiB(capacity)} ready`,
+                            : `${this.formatClusterGiB(capacity)} ${window.t('cluster.ready')}`,
                         detail: job
-                            ? 'Weights resident / cluster capacity'
-                            : 'Usable across detected accelerators',
+                            ? window.t('cluster.weights_resident')
+                            : window.t('cluster.usable_accel'),
                         tone: 'amber',
                     },
                 ];
@@ -4294,11 +4295,13 @@
                 const metrics = this.clusterNeuralFabricMetrics();
                 const latency = metrics.find(metric => metric.key === 'latency');
                 const link = metrics.find(metric => metric.key === 'link');
-                return `Neural fabric with ${this.clusterLogicalNodes().length} visual groups `
-                    + `and ${this.clusterQuickNodes().length} execution ranks. `
-                    + `${this.clusterNeuralFabricLabel()}. `
-                    + `Ring latency ${latency?.value || 'not measured'}. `
-                    + `${link?.label || 'Link'} ${link?.value || 'not measured'}.`;
+                return window.t('cluster.fabric_aria')
+                    .replace('{groups}', this.clusterLogicalNodes().length)
+                    .replace('{ranks}', this.clusterQuickNodes().length)
+                    .replace('{state}', this.clusterNeuralFabricLabel())
+                    .replace('{latency}', latency?.value || window.t('cluster.not_measured'))
+                    .replace('{link}', link?.label || window.t('cluster.link'))
+                    .replace('{linkValue}', link?.value || window.t('cluster.not_measured'));
             },
 
             clusterMemoryNodes() {
@@ -4327,7 +4330,7 @@
                         return {
                             budget,
                             nodeId: budget.node_id || `device-${index}`,
-                            name: quick.name || budget.node_id || `Device ${index + 1}`,
+                            name: quick.name || budget.node_id || window.t('cluster.device').replace('{index}', index + 1),
                             chip: quick.chip || '',
                             accelerator: quick.accelerator || 'metal',
                             acceleratorVendor: quick.acceleratorVendor || 'apple',
@@ -4542,7 +4545,7 @@
                     return `${this.clusterStatus?.node?.hostname || 'This Mac'} · coordinator`;
                 }
                 const link = this.clusterIpsOverridden
-                    ? 'TCP ring · manual addresses'
+                    ? window.t('cluster.tcp_ring_manual')
                     : (this.clusterFabric?.backend === 'jaccl'
                         ? 'Thunderbolt RDMA'
                         : (this.clusterTransports?.transports?.[0]
@@ -5054,9 +5057,9 @@
                 if (!proposal.ready_to_activate) {
                     this.clusterAutoconfigureError = proposal.staging?.error
                         || (proposal.staging && !proposal.staging.ready
-                            ? 'The model files could not be prepared on every worker.'
+                            ? window.t('cluster.prepare_failed')
                             : proposal.preflight)
-                        || 'Resolve the setup checks below, then try Start Cluster again.';
+                        || window.t('cluster.resolve_checks');
                     return;
                 }
                 if (!proposal.activation || typeof proposal.activation !== 'object') {
@@ -5199,12 +5202,12 @@
                         ? this.clusterManualMemoryAllowanceGiB(nodeId)
                         : null;
                     if (validate) {
-                        if (!nodeId) throw new Error(`Rank ${index} needs a node name`);
+                        if (!nodeId) throw new Error(window.t('cluster.err_rank_node').replace('{index}', index));
                         if (!Number.isFinite(capacityGiB) || capacityGiB <= 0) {
-                            throw new Error(`Rank ${index} needs a positive memory budget`);
+                            throw new Error(window.t('cluster.err_rank_budget').replace('{index}', index));
                         }
                         if (!Number.isFinite(reserveGiB) || reserveGiB < 0 || reserveGiB >= capacityGiB) {
-                            throw new Error(`Rank ${index} reserve must be smaller than its budget`);
+                            throw new Error(window.t('cluster.err_rank_reserve').replace('{index}', index));
                         }
                     }
                     const measuredAutomaticReserveBytes = Number(
@@ -6039,12 +6042,12 @@
             },
 
             clusterRuntimePhaseLabel(job) {
-                if (job?.live && job.phase === 'ready') return 'Cluster ready';
-                if (job?.live) return 'Loading cluster';
+                if (job?.live && job.phase === 'ready') return window.t('cluster.phase_ready');
+                if (job?.live) return window.t('cluster.phase_loading');
                 if (['peer_lost', 'launcher_lost', 'failed'].includes(job?.phase)) {
-                    return 'Cluster stopped';
+                    return window.t('cluster.phase_stopped');
                 }
-                return 'Previous cluster run';
+                return window.t('cluster.phase_previous');
             },
 
             clusterRuntimeAssignments(job) {
@@ -6122,12 +6125,12 @@
 
             clusterStateLabel(state) {
                 return {
-                    unavailable: 'Unavailable',
-                    disabled: 'RDMA disabled',
-                    enabled_no_peer: 'Ready · no peer',
-                    peer_linked_config_pending: 'Peer linked · setup pending',
-                    rdma_ready: 'Thunderbolt RDMA ready',
-                }[state] || String(state || 'Unknown').replaceAll('_', ' ');
+                    unavailable: window.t('cluster.state_unavailable'),
+                    disabled: window.t('cluster.state_rdma_disabled'),
+                    enabled_no_peer: window.t('cluster.state_ready_no_peer'),
+                    peer_linked_config_pending: window.t('cluster.state_peer_pending'),
+                    rdma_ready: window.t('cluster.state_rdma_ready'),
+                }[state] || String(state || window.t('cluster.unknown')).replaceAll('_', ' ');
             },
 
             clusterTransportTone(state) {
