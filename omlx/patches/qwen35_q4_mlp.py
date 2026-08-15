@@ -51,6 +51,28 @@ def _has_native_qmm() -> bool:
     return _native_qmm_for_bits(4) is not None
 
 
+def _nax_qmm_is_group_size_64_only() -> bool:
+    """True when the NAX (tensor-unit) qmm path is present but gated to gs=64.
+
+    The native kernel only beats ``nn.QuantizedLinear`` when it can use NAX,
+    and the extension gates that on ``group_size == 64``::
+
+        // csrc/qwen35_prefill.cpp
+        bool nax = use_nax && group_size == 64 && is_nax_available() && ...
+
+    So on NAX hardware a group_size=128 call silently demotes to the plain
+    Metal path, which is slower than the MLX default it replaced.
+    """
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return False
+    try:
+        return bool(fast.is_nax_available()) and bool(fast.nax_qmm_kernels_built())
+    except Exception:
+        return False
+
+
 def _is_supported_affine_linear_shape(
     linear: Any,
     dtype: mx.Dtype,
@@ -68,6 +90,16 @@ def _is_supported_affine_linear_shape(
     if group_size not in (64, 128):
         return False
     if not _qmm_supports_group_size(int(group_size)):
+        return False
+    if (
+        int(group_size) == 128
+        and os.environ.get("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", "0") != "1"
+        and _nax_qmm_is_group_size_64_only()
+    ):
+        # Measured on M5 Max / oMLX 0.6.0.dev1: routing group_size=128 through
+        # the native kernel costs ~4x versus nn.QuantizedLinear, because NAX is
+        # unavailable at that group size. Set OMLX_QWEN35_Q4_MLP_ALLOW_GS128=1
+        # to route anyway.
         return False
     bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
