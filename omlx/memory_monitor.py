@@ -90,9 +90,7 @@ def register_attention_bias_transient(dtype_size: float | None) -> None:
     model load/swap: the setting is process-wide, like the tiled head_dim
     registry above."""
     global _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE
-    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = (
-        float(dtype_size) if dtype_size else None
-    )
+    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = float(dtype_size) if dtype_size else None
 
 
 def estimate_unfused_sdpa_call_bytes(
@@ -542,19 +540,34 @@ class MemoryMonitor:
         Estimate memory usage for a KV cache block.
 
         Args:
-            block_size: Number of tokens in the block
-            num_layers: Override stored num_layers
-            num_kv_heads: Override stored num_kv_heads
-            head_dim: Override stored head_dim
-            dtype_size: Override stored dtype_size
+            block_size: Number of tokens in the block.
+            num_layers: Override the number of full-attention KV cache layers.
+            num_kv_heads: Override stored num_kv_heads.
+            head_dim: Override stored head_dim.
+            dtype_size: Override stored dtype_size.
 
         Returns:
             Estimated memory in bytes for one block.
         """
-        layers = num_layers or self._num_layers or 32  # Default for ~7B model
-        kv_heads = num_kv_heads or self._num_kv_heads or 8
-        dim = head_dim or self._head_dim or 128
-        dtype = dtype_size or self._dtype_size
+        if num_layers is not None:
+            layers = num_layers
+        elif self._num_kv_cache_layers is not None:
+            layers = self._num_kv_cache_layers
+        elif self._num_layers is not None:
+            layers = self._num_layers
+        else:
+            layers = 32  # Default for ~7B model
+        kv_heads = (
+            num_kv_heads
+            if num_kv_heads is not None
+            else (self._num_kv_heads if self._num_kv_heads is not None else 8)
+        )
+        dim = (
+            head_dim
+            if head_dim is not None
+            else (self._head_dim if self._head_dim is not None else 128)
+        )
+        dtype = self._dtype_size if dtype_size is None else dtype_size
 
         if (
             self._kv_bytes_per_token_override is not None
@@ -572,7 +585,32 @@ class MemoryMonitor:
 
         return total
 
-    def estimate_prompt_kv_bytes(self, num_tokens: int) -> float:
+    def estimate_paged_writer_block_memory(self, block_size: int) -> float:
+        """Estimate one queued SSD block, including boundary snapshot state."""
+        if block_size <= 0:
+            return 0
+
+        total = self.estimate_block_memory(block_size)
+        if self._prefill_memory_profile is not None:
+            profile_bytes = self._prefill_memory_profile.estimate_resident_kv_bytes(
+                block_size,
+                chunk_tokens=block_size,
+            )
+            total = max(total, profile_bytes)
+
+        if self._rotating_layer_specs:
+            kv_heads = self._num_kv_heads or 0
+            dim = self._head_dim or 0
+            if kv_heads and dim:
+                per_token = kv_heads * dim * self._score_dtype_size * 2
+                for count, window in self._rotating_layer_specs:
+                    total += count * (window + block_size - 1) * per_token
+
+        return total + self._fixed_state_bytes
+
+    def estimate_prompt_kv_bytes(
+        self, num_tokens: int, *, dtype_size: float | None = None
+    ) -> float:
         """
         Estimate KV cache memory for a prompt of given length.
 
@@ -581,6 +619,8 @@ class MemoryMonitor:
 
         Args:
             num_tokens: Number of prompt tokens.
+            dtype_size: Optional stored-KV bytes per element for this request
+                phase. Defaults to the model-level cache width.
 
         Returns:
             Estimated KV cache memory in bytes.
@@ -599,7 +639,7 @@ class MemoryMonitor:
             layers = self._num_layers or 0
         kv_heads = self._num_kv_heads or 0
         dim = self._head_dim or 0
-        dtype = self._dtype_size
+        dtype = self._dtype_size if dtype_size is None else float(dtype_size)
 
         if not (layers and kv_heads and dim):
             return 0
@@ -612,7 +652,11 @@ class MemoryMonitor:
         return num_tokens * per_token
 
     def estimate_resident_kv_bytes(
-        self, num_tokens: int, *, chunk_tokens: int = 1
+        self,
+        num_tokens: int,
+        *,
+        chunk_tokens: int = 1,
+        dtype_size: float | None = None,
     ) -> float:
         """Exact-shape resident KV bytes a prefill of ``num_tokens`` adds.
 
@@ -639,7 +683,7 @@ class MemoryMonitor:
             return self._prefill_memory_profile.estimate_resident_kv_bytes(
                 num_tokens, chunk_tokens=chunk_tokens
             )
-        total = self.estimate_prompt_kv_bytes(num_tokens)
+        total = self.estimate_prompt_kv_bytes(num_tokens, dtype_size=dtype_size)
 
         if self._rotating_layer_specs:
             kv_heads = self._num_kv_heads or 0
@@ -704,7 +748,9 @@ class MemoryMonitor:
             and query_tokens > 1
             and kv_len >= _SDPA_TILED_MIN_KV_LEN
         ):
-            tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            tile_scores = (
+                n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            )
             return output + tile_scores + bias
 
         return (
@@ -715,7 +761,12 @@ class MemoryMonitor:
         )
 
     def estimate_prefill_peak_bytes(
-        self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
+        self,
+        new_tokens: int,
+        chunk_size: int,
+        *,
+        cached_tokens: int = 0,
+        dtype_size: float | None = None,
     ) -> float:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
@@ -749,6 +800,8 @@ class MemoryMonitor:
                 still typecheck — but they get the under-counting behavior
                 this method was designed to fix, so always pass it when the
                 value is available.
+            dtype_size: Optional stored-KV bytes per element for this request
+                phase. SDPA activation width remains the compute dtype.
 
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
@@ -778,7 +831,11 @@ class MemoryMonitor:
         # The cached portion is already counted in the caller's current-usage
         # baseline. Resident math includes window-capped sliding-window
         # layers and measured fixed state, not just full-attention KVCache.
-        kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
+        kv = self.estimate_resident_kv_bytes(
+            new_tokens,
+            chunk_tokens=eff_chunk,
+            dtype_size=dtype_size,
+        )
         return attn + kv
 
     def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
@@ -802,6 +859,29 @@ class MemoryMonitor:
                 n_tokens, kv_len
             )
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
+
+    def estimate_turboquant_prefill_attention_bytes(
+        self,
+        query_tokens: int,
+        kv_len: int,
+        *,
+        bits: float,
+    ) -> int:
+        """Return the source-structural long-prefill TurboQuant workspace."""
+        from .turboquant_kv import (
+            estimate_turboquant_prefill_attention_workspace_bytes,
+        )
+
+        return estimate_turboquant_prefill_attention_workspace_bytes(
+            query_tokens=query_tokens,
+            kv_len=kv_len,
+            num_query_heads=self._num_attention_heads or 0,
+            num_kv_heads=self._num_kv_heads or 0,
+            head_dim=self._head_dim or 0,
+            bits=bits,
+            compute_dtype_size=self._score_dtype_size,
+            causal=True,
+        )
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
@@ -1156,9 +1236,7 @@ _ROTATING_CACHE_CLASS_NAMES = frozenset(
 )
 # Fixed-state recurrent caches (GDN/Mamba). Matches
 # Scheduler._cache_tree_has_arrays_cache plus mlx-lm's MambaCache.
-_ARRAYS_CACHE_CLASS_NAMES = frozenset(
-    {"ArraysCache", "SizedArraysCache", "MambaCache"}
-)
+_ARRAYS_CACHE_CLASS_NAMES = frozenset({"ArraysCache", "SizedArraysCache", "MambaCache"})
 
 
 def collect_kv_layer_specs(
@@ -1487,7 +1565,10 @@ def raise_if_prefill_exceeds(
         request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
     logger.warning(
         "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
-        num_prompt_tokens, cached_tokens, request_id, message,
+        num_prompt_tokens,
+        cached_tokens,
+        request_id,
+        message,
     )
     raise PrefillMemoryExceededError(
         message=message,

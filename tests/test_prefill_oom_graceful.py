@@ -138,6 +138,7 @@ def _throttle_ctx(
         ns, Scheduler
     )
     ns._prefill_abort_cap = Scheduler._prefill_abort_cap.__get__(ns, Scheduler)
+    ns._prefill_sizing_target = Scheduler._prefill_sizing_target.__get__(ns, Scheduler)
     ns._prefill_abort_description = Scheduler._prefill_abort_description.__get__(
         ns, Scheduler
     )
@@ -152,13 +153,18 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0):
+def _call(ns, requested, kv_len=0, processed_tokens=0):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
     ):
         return Scheduler._adaptive_chunk_size(
-            ns, requested, request_id="r", loop_label="test", kv_len=kv_len
+            ns,
+            requested,
+            request_id="r",
+            loop_label="test",
+            kv_len=kv_len,
+            processed_tokens=processed_tokens,
         )
 
 
@@ -177,13 +183,14 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
     )
 
     with pytest.raises(_PrefillEvictionNeeded) as exc:
-        _call(ns, 2048)
+        _call(ns, 2048, processed_tokens=64)
 
     assert request.prefill_eviction_retries == 1
     assert exc.value.request.request_id == "r"
     assert exc.value.request.model_id == "model-b"
     assert exc.value.request.requested_tokens == 2048
     assert exc.value.request.reason == "adaptive_prefill_throttle"
+    assert exc.value.request.processed_tokens == 64
 
     # The same request does not loop on eviction; it falls back to throttling.
     result = _call(ns, 2048)
@@ -389,13 +396,14 @@ def test_guard_requests_eviction_before_capacity_rejection():
                 ns,
                 256,
                 kv_len=122_000,
-                progress=0,
+                progress=128,
                 loop_label="test",
                 request_id="r",
             )
 
     assert request.prefill_eviction_retries == 1
     assert exc.value.request.reason == "prefill_safety_cap"
+    assert exc.value.request.processed_tokens == 128
 
 
 def test_guard_custom_margin_allows_95_percent_of_ceiling():
@@ -479,7 +487,7 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
         estimate_chunk_transient_bytes=lambda _n, _kv: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
-        estimate_prompt_kv_bytes=lambda _n: 0,
+        estimate_prompt_kv_bytes=lambda _n, *, dtype_size=None: 0,
     )
     ns = _throttle_ctx(
         current=97.23 * _GB,
@@ -525,7 +533,7 @@ def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
         estimate_chunk_transient_bytes=lambda _n, _kv: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
-        estimate_prompt_kv_bytes=lambda _n: 0,
+        estimate_prompt_kv_bytes=lambda _n, *, dtype_size=None: 0,
     )
     ns = _throttle_ctx(
         current=99.12 * _GB,
@@ -674,14 +682,10 @@ def test_record_chunk_transient_marks_floor_samples_only():
     # First sample is always excluded from the max (seed noise).
     ns._record_chunk_transient(32, 0, 100, request_id="r", loop_label="unit")
     # Big chunk: EWMA only, never the max.
-    ns._record_chunk_transient(
-        2048, 0, 3 * 1024**3, request_id="r", loop_label="unit"
-    )
+    ns._record_chunk_transient(2048, 0, 3 * 1024**3, request_id="r", loop_label="unit")
     assert tracker.observed_max_bytes == 0
     # Floor chunk: enters the max.
-    ns._record_chunk_transient(
-        32, 0, 200 * 1024**2, request_id="r", loop_label="unit"
-    )
+    ns._record_chunk_transient(32, 0, 200 * 1024**2, request_id="r", loop_label="unit")
     assert tracker.observed_max_bytes == 200 * 1024**2
 
 
@@ -724,9 +728,7 @@ def test_record_chunk_transient_skips_partial_speed_sample():
     assert tracker.last_n_tokens == 2048
     assert tracker.last_delta_bytes == full_delta
     predicted = Scheduler._predicted_chunk_transient(ns, 2048, 65_000)
-    assert predicted == pytest.approx(
-        full_delta * Scheduler._PREFILL_TRANSIENT_SAFETY
-    )
+    assert predicted == pytest.approx(full_delta * Scheduler._PREFILL_TRANSIENT_SAFETY)
 
 
 def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
@@ -1042,9 +1044,13 @@ def test_guard_shrink_math_unchanged_by_observed_max():
 
 
 class TestMaybeRecordFixedStateBytes:
-    def _ns(self, armed=True):
+    def _ns(self, armed: bool = True) -> SimpleNamespace:
+        monitor = MagicMock()
+        monitor.estimate_paged_writer_block_memory.return_value = 654_321
         ns = SimpleNamespace(
-            memory_monitor=MagicMock(),
+            memory_monitor=monitor,
+            paged_ssd_cache_manager=MagicMock(),
+            config=SimpleNamespace(paged_cache_block_size=256),
             _fixed_state_measure_armed=armed,
             _fixed_state_recorded=False,
         )
@@ -1066,6 +1072,12 @@ class TestMaybeRecordFixedStateBytes:
         caches = [self._arrays_cache([100, 200]), self._arrays_cache([300])]
         ns._maybe_record_fixed_state_bytes(caches)
         ns.memory_monitor.set_fixed_state_bytes.assert_called_once_with(600)
+        ns.memory_monitor.estimate_paged_writer_block_memory.assert_called_once_with(
+            256
+        )
+        ns.paged_ssd_cache_manager.set_expected_block_payload_bytes.assert_called_once_with(
+            654_321
+        )
         assert ns._fixed_state_recorded is True
         # Second call is a no-op flag check.
         ns._maybe_record_fixed_state_bytes(caches)
@@ -1085,12 +1097,9 @@ class TestMaybeRecordFixedStateBytes:
 
     def test_zero_total_marks_recorded_without_setting(self):
         ns = self._ns()
-        ns._maybe_record_fixed_state_bytes(
-            [type("KVCache", (), {"state": []})()]
-        )
+        ns._maybe_record_fixed_state_bytes([type("KVCache", (), {"state": []})()])
         ns.memory_monitor.set_fixed_state_bytes.assert_not_called()
         assert ns._fixed_state_recorded is True
-
 
 
 # --------------------------------------------------------------------------

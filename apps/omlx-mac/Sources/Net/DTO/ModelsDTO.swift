@@ -102,6 +102,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvBits: Double?
+    let turboquantMidPrefill: Bool?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -166,6 +167,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
     var turboquantKvBits: Double? = nil
+    var turboquantMidPrefill: Bool? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

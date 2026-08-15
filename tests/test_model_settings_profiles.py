@@ -295,6 +295,24 @@ class TestApplyProfile:
         mgr.apply_profile("m", "p")
         assert mgr.get_settings("m").turboquant_kv_enabled is True
 
+    def test_apply_retains_turboquant_mid_prefill(
+        self, mgr: ModelSettingsManager
+    ) -> None:
+        mgr.save_profile(
+            "m",
+            "p",
+            "P",
+            None,
+            {
+                "turboquant_kv_enabled": True,
+                "turboquant_mid_prefill": True,
+            },
+        )
+        mgr.apply_profile("m", "p")
+        settings = mgr.get_settings("m")
+        assert settings.turboquant_kv_enabled is True
+        assert settings.turboquant_mid_prefill is True
+
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"
         profiles_file.write_text(
@@ -523,6 +541,20 @@ class TestExposedProfilePersistence:
 
         assert flags == {"thinking": False, "accelerated": True}
 
+    def test_mid_prefill_is_classified_as_an_engine_field(
+        self, mgr: ModelSettingsManager
+    ) -> None:
+        _save_exposed_profile(
+            mgr,
+            name="mid-prefill",
+            settings={"turboquant_mid_prefill": True},
+        )
+
+        profile = next(
+            p for p in mgr.list_profiles("qwen-base") if p["name"] == "mid-prefill"
+        )
+        assert profile["has_engine_fields"] is True
+
     def test_alias_drives_advertised_model_id(self, mgr):
         """A base-model alias renames the advertised exposed ID, mirroring
         how /v1/models lists the base model under its alias."""
@@ -680,6 +712,30 @@ class TestExposedProfileRequestSettings:
         assert settings.mtp_enabled is True
         assert mgr.get_settings("qwen-base").temperature == 0.2
         assert mgr.get_settings("qwen-base").mtp_enabled is False
+
+    def test_runtime_settings_overlay_turboquant_mid_prefill(
+        self, mgr: ModelSettingsManager
+    ) -> None:
+        mgr.set_settings(
+            "qwen-base",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_mid_prefill=False,
+            ),
+        )
+        _save_exposed_profile(
+            mgr,
+            settings={"turboquant_mid_prefill": True},
+        )
+
+        runtime = mgr.get_exposed_profile_runtime_settings_for_request(
+            "qwen-base:thinking"
+        )
+
+        assert runtime is not None
+        _, settings = runtime
+        assert settings.turboquant_mid_prefill is True
+        assert mgr.get_settings("qwen-base").turboquant_mid_prefill is False
 
     def test_request_settings_fall_back_to_resolved_physical_model(self, mgr):
         mgr.set_settings(

@@ -12,21 +12,38 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 try:
     import mlx.core as mx
 
-    HAS_MLX = True
+    HAS_MLX = mx is not None
 except ImportError:
     HAS_MLX = False
 
 from ..model_discovery import _decode_hf_cache_model_id, _has_vision_subconfig
+from ..utils.metal_sync import _conversion_coordinator, _sync_and_clear_cache
 
 logger = logging.getLogger(__name__)
 
+def _run_process_guarded_metal(
+    fn: Callable[..., object],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Run independent oQ Metal work only when no mid-prefill owner exists."""
+    with _conversion_coordinator.background_metal_operation():
+        if HAS_MLX:
+            _sync_and_clear_cache()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if HAS_MLX:
+                _sync_and_clear_cache()
 
 class _QuantCancelled(Exception):
     """Raised by progress callback when task is cancelled."""
@@ -517,15 +534,6 @@ class OQManager:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # GPU cleanup after thread is done
-        if HAS_MLX:
-            for _attempt in range(3):
-                try:
-                    mx.synchronize()
-                    mx.clear_cache()
-                    break
-                except Exception:
-                    await asyncio.sleep(1.0)
 
         logger.info(f"oQ quantization cancelled: {task.model_name} (task_id={task_id})")
         return True
@@ -563,16 +571,6 @@ class OQManager:
                 if task_id in self._cancelled:
                     return
 
-                # Ensure GPU is clean before starting (previous task may have been cancelled)
-                # Metal command buffers need full sync + cache clear after cancellation
-                if HAS_MLX:
-                    for _ in range(3):
-                        try:
-                            mx.synchronize()
-                            mx.clear_cache()
-                            break
-                        except Exception:
-                            await asyncio.sleep(1.0)
 
                 # Phase 1: Loading
                 task.status = QuantStatus.LOADING
@@ -609,6 +607,7 @@ class OQManager:
                 from ..oq import quantize_oq_streaming
 
                 await asyncio.to_thread(
+                    _run_process_guarded_metal,
                     quantize_oq_streaming,
                     task.model_path,
                     task.output_path,
@@ -638,6 +637,7 @@ class OQManager:
 
                     _progress_cb("saving", 97.0, "Merging MTP head...")
                     await asyncio.to_thread(
+                        _run_process_guarded_metal,
                         combine_mtp_into_output,
                         task.output_path,
                         task.mtp_assistant_model_path,

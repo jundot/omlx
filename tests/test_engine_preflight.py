@@ -13,11 +13,13 @@ the exception into HTTP 400. We exercise the contract by:
 - Confirming the exception type propagates.
 """
 
+import asyncio
 import concurrent.futures
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
@@ -28,6 +30,9 @@ _TINY_PNG_DATA_URI = (
     "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
 
+_CACHE_PROBE_MISSING = object()
+_CACHE_PROBE_FAILURE = object()
+
 # ---------------------------------------------------------------------------
 # Scheduler.preflight_or_raise / _preflight_memory_check_tokens
 # ---------------------------------------------------------------------------
@@ -36,24 +41,29 @@ _TINY_PNG_DATA_URI = (
 class _ModelConfig:
     def __init__(
         self,
-        num_hidden_layers=32,
-        num_key_value_heads=8,
-        num_attention_heads=32,
-        head_dim=192,
-    ):
+        num_hidden_layers: int = 32,
+        num_key_value_heads: int = 8,
+        num_attention_heads: int = 32,
+        head_dim: int = 192,
+    ) -> None:
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
 
 
-def _make_scheduler():
+def _make_scheduler(cache_probe: object = _CACHE_PROBE_MISSING) -> Scheduler:
     from omlx.scheduler import SchedulerConfig
 
     model = MagicMock()
     model.layers = []
     model.config = _ModelConfig()
-    del model.make_cache
+    if cache_probe is _CACHE_PROBE_MISSING:
+        del model.make_cache
+    elif cache_probe is _CACHE_PROBE_FAILURE:
+        model.make_cache.side_effect = RuntimeError("cache probe failed")
+    else:
+        model.make_cache.return_value = cache_probe
 
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
@@ -116,6 +126,151 @@ class TestPreflightOrRaise:
         scheduler.preflight_or_raise(num_prompt_tokens=10_000, cached_tokens=10_000)
 
 
+@pytest.mark.parametrize(
+    ("cache_probe", "expected"),
+    [
+        pytest.param([KVCache(), KVCache()], True, id="dense-targets"),
+        pytest.param(
+            [KVCache(), RotatingKVCache(max_size=128)],
+            True,
+            id="dense-target-with-pass-through",
+        ),
+        pytest.param(
+            [RotatingKVCache(max_size=128)],
+            False,
+            id="no-turboquant-targets",
+        ),
+        pytest.param(
+            [KVCache(), object()],
+            False,
+            id="unsupported-list-member",
+        ),
+        pytest.param([], False, id="empty-list"),
+        pytest.param(object(), None, id="invalid-output"),
+        pytest.param(_CACHE_PROBE_MISSING, None, id="missing-factory"),
+        pytest.param(_CACHE_PROBE_FAILURE, None, id="failing-factory"),
+    ],
+)
+def test_scheduler_records_confirmed_preflight_conversion_eligibility(
+    cache_probe: object,
+    expected: bool | None,
+) -> None:
+    scheduler = _make_scheduler(cache_probe)
+
+    assert scheduler._turboquant_preflight_conversion_eligible is expected
+
+
+@pytest.mark.parametrize(
+    ("conversion_eligible", "should_defer"),
+    [
+        pytest.param(True, True, id="confirmed"),
+        pytest.param(False, False, id="unsupported"),
+        pytest.param(None, False, id="unknown"),
+    ],
+)
+def test_forced_overshoot_defers_only_confirmed_conversion_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    conversion_eligible: bool | None,
+    should_defer: bool,
+) -> None:
+    import omlx.scheduler as scheduler_mod
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    scheduler._turboquant_mid_prefill = True
+    scheduler._turboquant_kv_bits = 4.0
+    scheduler._prefill_tq_kv_dtype_size = 1.0
+    scheduler._turboquant_preflight_conversion_eligible = conversion_eligible
+
+    def _zero_memory() -> int:
+        return 0
+
+    def _exclusive(_owner: object) -> bool:
+        return True
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", _zero_memory)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", _zero_memory)
+    monkeypatch.setattr(
+        scheduler_mod._conversion_coordinator,
+        "process_exclusive",
+        _exclusive,
+    )
+
+    if should_defer:
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=65536,
+            request_id="confirmed-layout",
+        )
+    else:
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(
+                num_prompt_tokens=65536,
+                request_id="unconfirmed-layout",
+            )
+
+
+@pytest.mark.parametrize(
+    ("recorded_eligibility", "prompt_cache", "should_defer"),
+    [
+        pytest.param(
+            False,
+            [KVCache(), KVCache()],
+            True,
+            id="actual-dense-overrides-recorded-unsupported",
+        ),
+        pytest.param(
+            True,
+            [RotatingKVCache(max_size=128)],
+            False,
+            id="actual-unsupported-overrides-recorded-dense",
+        ),
+    ],
+)
+def test_request_cache_layout_overrides_recorded_preflight_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_eligibility: bool,
+    prompt_cache: list[object],
+    should_defer: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    import omlx.scheduler as scheduler_mod
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    scheduler._prefill_eviction_callback_configured = False
+    scheduler._turboquant_mid_prefill = True
+    scheduler._turboquant_kv_bits = 4.0
+    scheduler._prefill_tq_kv_dtype_size = 1.0
+    scheduler._turboquant_preflight_conversion_eligible = recorded_eligibility
+    request = SimpleNamespace(
+        request_id="actual-layout",
+        num_prompt_tokens=65536,
+        cached_tokens=0,
+        prompt_cache=prompt_cache,
+        turboquant_mid_prefill_attempted=False,
+    )
+
+    def _zero_memory() -> int:
+        return 0
+
+    def _exclusive(_owner: object) -> bool:
+        return True
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", _zero_memory)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", _zero_memory)
+    monkeypatch.setattr(
+        scheduler_mod._conversion_coordinator,
+        "process_exclusive",
+        _exclusive,
+    )
+
+    rejection = scheduler._preflight_memory_check(request)
+    assert (rejection is None) is should_defer
+
+
 # ---------------------------------------------------------------------------
 # Engine wrapper preflight methods
 # ---------------------------------------------------------------------------
@@ -152,7 +307,7 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
 
 
 @pytest.mark.asyncio
-async def test_batched_engine_preflight_runs_eviction_before_final_check():
+async def test_batched_engine_preflight_runs_eviction_before_final_check() -> None:
     from omlx.engine.batched import BatchedEngine
 
     scheduler = MagicMock()
@@ -163,7 +318,7 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
         ("final", "checked")
     )
 
-    async def _evict(request):
+    async def _evict(request: SimpleNamespace) -> bool:
         order.append(("evict", request.request_id))
         return True
 
@@ -172,11 +327,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
         prefill_eviction_callback=_evict,
     )
 
-    await engine._preflight_or_raise_with_eviction(
+    attempted = await engine._preflight_or_raise_with_eviction(
         scheduler,
         num_prompt_tokens=123,
         request_id="req-evict",
     )
+    assert attempted is True
 
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
@@ -190,7 +346,9 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
 
 
 @pytest.mark.asyncio
-async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypatch):
+async def test_batched_engine_retries_transient_rejection_after_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A rejection caused by finished-request residue must be re-measured.
 
     The second estimate represents the scheduler state after its normal async
@@ -208,7 +366,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     ]
     scheduler.has_pending_route_preflight_cleanup.side_effect = [True, False]
 
-    async def _no_sleep(_delay):
+    async def _no_sleep(_delay: float) -> None:
         return None
 
     monkeypatch.setattr("omlx.engine.base.asyncio.sleep", _no_sleep)
@@ -218,12 +376,13 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
         prefill_eviction_callback=evict,
     )
 
-    await engine._preflight_or_raise_with_eviction(
+    attempted = await engine._preflight_or_raise_with_eviction(
         scheduler,
         num_prompt_tokens=60_000,
         request_id="req-next",
     )
 
+    assert attempted is False
     assert scheduler.preflight_eviction_request.call_count == 3
     assert scheduler.has_pending_route_preflight_cleanup.call_count == 2
     scheduler.preflight_or_raise.assert_called_once_with(
@@ -233,7 +392,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     evict.assert_not_awaited()
 
 
-def test_scheduler_route_preflight_cleanup_signal():
+def test_scheduler_route_preflight_cleanup_signal() -> None:
     scheduler = _make_scheduler()
     assert scheduler.has_pending_route_preflight_cleanup() is False
 
@@ -249,7 +408,9 @@ def test_scheduler_route_preflight_cleanup_signal():
     assert scheduler.has_pending_route_preflight_cleanup() is False
 
 
-def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch):
+def test_async_remove_schedules_clear_after_extracted_cache_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scheduler = _make_scheduler()
     future = concurrent.futures.Future()
     future.set_result(None)
@@ -269,6 +430,341 @@ def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch)
     assert scheduler._deferred_clear_at == (
         scheduler._step_counter + scheduler._DEFERRED_CLEAR_DELAY
     )
+
+
+@pytest.mark.asyncio
+async def test_batched_preflight_without_callback_does_not_consume_retry() -> None:
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.return_value = SimpleNamespace(
+        request_id="batched-no-callback"
+    )
+    engine = BatchedEngine(model_name="test-model")
+
+    attempted = await engine._preflight_or_raise_with_eviction(
+        scheduler,
+        num_prompt_tokens=123,
+        request_id="batched-no-callback",
+    )
+
+    assert attempted is False
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=123,
+        request_id="batched-no-callback",
+    )
+
+
+@pytest.mark.asyncio
+async def test_batched_completion_preflight_reports_callback_attempt() -> None:
+    from types import SimpleNamespace
+
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = MagicMock()
+    eviction_request = SimpleNamespace(request_id="batched-completion-callback")
+    scheduler.preflight_eviction_request.return_value = eviction_request
+    engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+    callback = AsyncMock(return_value=True)
+    engine._prefill_eviction_callback = callback
+
+    attempted = await engine.preflight_completion(
+        "hello",
+        request_id="batched-completion-callback",
+    )
+
+    assert attempted is True
+    callback.assert_awaited_once_with(eviction_request)
+
+
+@pytest.mark.asyncio
+async def test_vlm_preflight_reports_actual_callback_attempt() -> None:
+    from types import SimpleNamespace
+
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = MagicMock()
+    eviction_request = SimpleNamespace(request_id="vlm-callback")
+    scheduler.preflight_eviction_request.return_value = eviction_request
+    callback = AsyncMock(return_value=True)
+    engine = VLMBatchedEngine(
+        model_name="test-model",
+        prefill_eviction_callback=callback,
+    )
+
+    attempted = await engine._preflight_or_raise_with_eviction(
+        scheduler,
+        num_prompt_tokens=123,
+        request_id="vlm-callback",
+    )
+
+    assert attempted is True
+    callback.assert_awaited_once_with(eviction_request)
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=123,
+        request_id="vlm-callback",
+    )
+
+
+@pytest.mark.asyncio
+async def test_vlm_preflight_without_callback_does_not_consume_retry() -> None:
+    from types import SimpleNamespace
+
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.return_value = SimpleNamespace(
+        request_id="vlm-no-callback"
+    )
+    engine = VLMBatchedEngine(model_name="test-model")
+
+    attempted = await engine._preflight_or_raise_with_eviction(
+        scheduler,
+        num_prompt_tokens=123,
+        request_id="vlm-no-callback",
+    )
+
+    assert attempted is False
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=123,
+        request_id="vlm-no-callback",
+    )
+
+
+@pytest.mark.asyncio
+async def test_vlm_completion_preflight_reports_callback_attempt() -> None:
+    from types import SimpleNamespace
+
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = MagicMock()
+    eviction_request = SimpleNamespace(request_id="vlm-completion-callback")
+    scheduler.preflight_eviction_request.return_value = eviction_request
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+    callback = AsyncMock(return_value=True)
+    engine._prefill_eviction_callback = callback
+
+    attempted = await engine.preflight_completion(
+        "hello",
+        request_id="vlm-completion-callback",
+    )
+
+    assert attempted is True
+    callback.assert_awaited_once_with(eviction_request)
+
+
+@pytest.mark.asyncio
+async def test_vlm_completion_preflight_without_callback_reports_false() -> None:
+    from types import SimpleNamespace
+
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.return_value = SimpleNamespace(
+        request_id="vlm-completion-no-callback"
+    )
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+
+    attempted = await engine.preflight_completion(
+        "hello",
+        request_id="vlm-completion-no-callback",
+    )
+
+    assert attempted is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_completion_preflight_leaves_retry_marker_absent() -> None:
+    from omlx.server import _preflight_completion_with_eviction_budget
+
+    engine = MagicMock()
+    engine.preflight_completion = AsyncMock(return_value=None)
+    generation_kwargs: dict[str, bool] = {}
+
+    await _preflight_completion_with_eviction_budget(
+        engine,
+        "hello",
+        generation_kwargs,
+        request_id="legacy-completion",
+    )
+
+    assert generation_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_completion_preflight_leaves_retry_marker_absent() -> None:
+    from omlx.server import _preflight_completion_with_eviction_budget
+
+    engine = MagicMock()
+    engine.preflight_completion = AsyncMock(
+        side_effect=PrefillMemoryExceededError(
+            message="rejected after callback",
+            request_id="failed-completion",
+        )
+    )
+    generation_kwargs: dict[str, bool] = {}
+
+    with pytest.raises(PrefillMemoryExceededError):
+        await _preflight_completion_with_eviction_budget(
+            engine,
+            "hello",
+            generation_kwargs,
+            request_id="failed-completion",
+        )
+
+    assert generation_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_completion_preflight_leaves_retry_marker_absent() -> None:
+    from omlx.server import _preflight_completion_with_eviction_budget
+
+    callback_started = asyncio.Event()
+
+    async def _cancelled_preflight(
+        prompt: str,
+        request_id: str | None = None,
+    ) -> bool:
+        callback_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    engine = MagicMock()
+    engine.preflight_completion = AsyncMock(side_effect=_cancelled_preflight)
+    generation_kwargs: dict[str, bool] = {}
+    task = asyncio.create_task(
+        _preflight_completion_with_eviction_budget(
+            engine,
+            "hello",
+            generation_kwargs,
+            request_id="cancelled-completion",
+        )
+    )
+
+    await callback_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert generation_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_route_preflight_leaves_no_retry_marker() -> None:
+    from omlx.server import _preflight_chat_with_eviction_budget
+
+    attempted_ids: list[str | None] = []
+
+    async def _raise_after_callback(
+        messages: list,
+        request_id: str | None = None,
+        **kwargs: object,
+    ) -> bool:
+        attempted_ids.append(request_id)
+        raise PrefillMemoryExceededError(
+            message="rejected after callback",
+            request_id=request_id,
+        )
+
+    engine = MagicMock()
+    engine.preflight_chat = AsyncMock(side_effect=_raise_after_callback)
+    chat_kwargs: dict = {}
+
+    with pytest.raises(PrefillMemoryExceededError):
+        await _preflight_chat_with_eviction_budget(
+            engine,
+            [{"role": "user", "content": "x"}],
+            chat_kwargs,
+            request_id="failed-preflight",
+        )
+
+    assert attempted_ids == ["failed-preflight"]
+    assert "prefill_eviction_callback_attempted" not in chat_kwargs
+
+
+@pytest.mark.asyncio
+async def test_cancelled_route_preflight_leaves_no_retry_marker() -> None:
+    from omlx.server import _preflight_chat_with_eviction_budget
+
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def _cancelled_preflight(
+        messages: list,
+        request_id: str | None = None,
+        **kwargs: object,
+    ) -> bool:
+        callback_started.set()
+        await callback_release.wait()
+        return True
+
+    engine = MagicMock()
+    engine.preflight_chat = AsyncMock(side_effect=_cancelled_preflight)
+    chat_kwargs: dict = {}
+    task = asyncio.create_task(
+        _preflight_chat_with_eviction_budget(
+            engine,
+            [{"role": "user", "content": "x"}],
+            chat_kwargs,
+            request_id="cancelled-preflight",
+        )
+    )
+
+    await callback_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "prefill_eviction_callback_attempted" not in chat_kwargs
+
+
+@pytest.mark.asyncio
+async def test_concurrent_route_preflights_keep_retry_markers_request_local() -> None:
+    from omlx.server import _preflight_chat_with_eviction_budget
+
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+    entered = 0
+
+    async def _preflight(
+        messages: list,
+        request_id: str | None = None,
+        **kwargs: object,
+    ) -> bool:
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        await release.wait()
+        return request_id == "callback-ran"
+
+    engine = MagicMock()
+    engine.preflight_chat = AsyncMock(side_effect=_preflight)
+    callback_kwargs: dict = {}
+    absent_kwargs: dict = {}
+    callback_task = asyncio.create_task(
+        _preflight_chat_with_eviction_budget(
+            engine,
+            [{"role": "user", "content": "first"}],
+            callback_kwargs,
+            request_id="callback-ran",
+        )
+    )
+    absent_task = asyncio.create_task(
+        _preflight_chat_with_eviction_budget(
+            engine,
+            [{"role": "user", "content": "second"}],
+            absent_kwargs,
+            request_id="callback-absent",
+        )
+    )
+
+    await both_entered.wait()
+    release.set()
+    await asyncio.gather(callback_task, absent_task)
+
+    assert callback_kwargs == {"prefill_eviction_callback_attempted": True}
+    assert absent_kwargs == {}
 
 
 @pytest.mark.asyncio

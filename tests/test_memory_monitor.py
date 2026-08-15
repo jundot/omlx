@@ -349,13 +349,19 @@ class TestEstimatePrefillPeakBytes:
         n_q, chunk, kv, hd = 8, 2048, 32768, 256
         m_bf16 = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
         m_bf16.set_model_info(
-            num_layers=48, num_kv_heads=4, head_dim=hd,
-            num_attention_heads=n_q, compute_dtype_size=2,
+            num_layers=48,
+            num_kv_heads=4,
+            head_dim=hd,
+            num_attention_heads=n_q,
+            compute_dtype_size=2,
         )
         m_fp32 = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
         m_fp32.set_model_info(
-            num_layers=48, num_kv_heads=4, head_dim=hd,
-            num_attention_heads=n_q, compute_dtype_size=4,
+            num_layers=48,
+            num_kv_heads=4,
+            head_dim=hd,
+            num_attention_heads=n_q,
+            compute_dtype_size=4,
         )
         assert _scores(m_bf16, n_q, chunk, kv, hd) == n_q * chunk * kv * 2
         assert _scores(m_fp32, n_q, chunk, kv, hd) == n_q * chunk * kv * 4
@@ -366,8 +372,12 @@ class TestEstimatePrefillPeakBytes:
         n_q, chunk, kv, hd = 8, 2048, 32768, 256
         m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
         m.set_model_info(
-            num_layers=48, num_kv_heads=4, head_dim=hd, dtype_size=0.5,
-            num_attention_heads=n_q, compute_dtype_size=2,
+            num_layers=48,
+            num_kv_heads=4,
+            head_dim=hd,
+            dtype_size=0.5,
+            num_attention_heads=n_q,
+            compute_dtype_size=2,
         )
         out = n_q * chunk * hd * 4
         scores = m._estimate_sdpa_activation_bytes(chunk, kv) - out
@@ -387,9 +397,9 @@ class TestEstimatePrefillPeakBytes:
         expected_heavy_sdpa = self._expected_fallback_sdpa(8, 1024, 100 * 1024, 256)
         expected_heavy = expected_heavy_sdpa + m.estimate_prompt_kv_bytes(1024)
         assert heavy_cache == expected_heavy
-        assert (
-            heavy_cache > 900 * 1024**2
-        ), f"heavy-cache peak under-counted: {heavy_cache / 1024**2:.0f} MB"
+        assert heavy_cache > 900 * 1024**2, (
+            f"heavy-cache peak under-counted: {heavy_cache / 1024**2:.0f} MB"
+        )
         # And the all-new case (larger eff_chunk = 2048 but same kv_len)
         # should be larger overall because both KV growth and scores
         # widen with new_tokens.
@@ -427,8 +437,7 @@ class TestEstimatePrefillPeakBytes:
         peak = m.estimate_prefill_peak_bytes(100, 2048)
         # KV: 48*4*256*2*2*100 ≈ 19 MB. SDPA is small here. Total < 25 MB.
         assert peak < 25 * 1024**2, (
-            f"short-prompt peak suggests chunk wasn't clamped: "
-            f"{peak / 1024**2:.0f} MB"
+            f"short-prompt peak suggests chunk wasn't clamped: {peak / 1024**2:.0f} MB"
         )
 
     def test_no_python_overhead_constant(self):
@@ -616,8 +625,7 @@ class TestEstimateResidentKvBytes:
         per_layer_token = 8 * 128 * 2 * 2
         for chunk in (1, 32, 256):
             expected = (
-                n * 5 * per_layer_token
-                + 25 * (1024 + chunk - 1) * per_layer_token
+                n * 5 * per_layer_token + 25 * (1024 + chunk - 1) * per_layer_token
             )
             assert m.estimate_resident_kv_bytes(n, chunk_tokens=chunk) == expected
 
@@ -641,8 +649,7 @@ class TestEstimateResidentKvBytes:
         n = 10_000
         rotating_term = 2 * (64 + 31) * 8 * 128 * 2 * 2
         assert (
-            m.estimate_resident_kv_bytes(n, chunk_tokens=32)
-            == n * 1000 + rotating_term
+            m.estimate_resident_kv_bytes(n, chunk_tokens=32) == n * 1000 + rotating_term
         )
 
     def test_fixed_state_added_and_reset_by_set_model_info(self):
@@ -669,15 +676,49 @@ class TestEstimateResidentKvBytes:
         m.set_fixed_state_bytes(999)
         assert m.estimate_resident_kv_bytes(0) == 0
 
-    def test_prompt_kv_and_block_memory_bytes_unchanged(self):
-        """Regression pin: the throttle static term and the paged-SSD
-        writer-cap input must not move with the resident-KV extension."""
+    def test_prompt_kv_and_block_memory_use_full_attention_layers(self) -> None:
+        """Per-block estimates must not charge recurrent layers as KV."""
         m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
         per_layer_token = 8 * 128 * 2 * 2
-        # estimate_prompt_kv_bytes: full (num_kv_cache_layers) only.
         assert m.estimate_prompt_kv_bytes(1000) == 1000 * 5 * per_layer_token
-        # estimate_block_memory: all num_layers, ignores layer classes.
-        assert m.estimate_block_memory(1) == 30 * 8 * 128 * 2 * 2
+        assert m.estimate_block_memory(1) == 5 * per_layer_token
+
+    def test_paged_writer_block_includes_hybrid_boundary_state(self) -> None:
+        """Queued SSD blocks price rotating windows and fixed snapshots once."""
+        block_size = 256
+        m = self._make(
+            num_kv_cache_layers=5,
+            rotating_layer_specs=[(25, 1024)],
+        )
+        m.set_fixed_state_bytes(123_456)
+        per_layer_token = 8 * 128 * 2 * 2
+        expected = (
+            block_size * 5 * per_layer_token
+            + 25 * (1024 + block_size - 1) * per_layer_token
+            + 123_456
+        )
+
+        assert m.estimate_paged_writer_block_memory(block_size) == expected
+        assert expected > m.estimate_block_memory(block_size)
+
+    def test_zero_full_attention_layers_do_not_fall_back_to_all_layers(self) -> None:
+        m = self._make(num_kv_cache_layers=0, rotating_layer_specs=[(30, 1024)])
+        assert m.estimate_prompt_kv_bytes(1000) == 0
+        assert m.estimate_block_memory(64) == 0
+
+    def test_qwen_hybrid_turboquant_block_uses_sixteen_kv_layers(self) -> None:
+        tq_width = (2 + 64 * 4) / 256
+        weighted_width = (15 * tq_width + 2) / 16
+        m = self._make(
+            num_layers=64,
+            num_kv_cache_layers=16,
+            num_kv_heads=4,
+            head_dim=256,
+            dtype_size=weighted_width,
+            rotating_layer_specs=(),
+        )
+        expected = 64 * 16 * 4 * 256 * weighted_width * 2
+        assert m.estimate_block_memory(64) == expected
 
 
 class TestSetModelInfoFromModelRotating:

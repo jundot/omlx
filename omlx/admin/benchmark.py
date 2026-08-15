@@ -301,6 +301,7 @@ _UPLOADED_SETTING_FIELDS = (
     "model_type_override",
     "index_cache_freq",
     "turboquant_kv_enabled",
+    "turboquant_mid_prefill",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "specprefill_enabled",
@@ -361,13 +362,15 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
     if len(json.dumps(filtered, separators=(",", ":"))) > _MAX_UPLOADED_SETTINGS_BYTES:
         logger.warning(
             "Benchmark: model settings snapshot exceeded "
-            f"{_MAX_UPLOADED_SETTINGS_BYTES} bytes, uploading accelerator flags only"
+            f"{_MAX_UPLOADED_SETTINGS_BYTES} bytes, uploading accelerator provenance only"
         )
         filtered = {
             spec.attr: filtered[spec.attr]
             for spec in _FEATURE_FLAG_SPECS
             if spec.attr in filtered
         }
+        if "turboquant_mid_prefill" in raw:
+            filtered["turboquant_mid_prefill"] = bool(raw["turboquant_mid_prefill"])
     return filtered
 
 

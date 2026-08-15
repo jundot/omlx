@@ -201,10 +201,13 @@ def test_shared_helper_uses_caller_supplied_usage_without_mlx_probe():
     monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
     set_model_info_from_model(monitor, _make_target_model())
 
-    with patch(
-        "omlx.memory_monitor.mx.get_active_memory",
-        side_effect=AssertionError("preflight must not read MLX directly"),
-    ), pytest.raises(PrefillMemoryExceededError):
+    with (
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+        pytest.raises(PrefillMemoryExceededError),
+    ):
         raise_if_prefill_exceeds(
             monitor,
             prefill_memory_guard=True,
@@ -391,10 +394,15 @@ async def test_engine_preflight_chat_delegates_to_fallback_in_fallback_mode():
     eng = _bare_engine()
     eng._in_fallback_mode = True
     eng._fallback_engine = AsyncMock()
+    eng._fallback_engine.preflight_chat.return_value = True
     eng._prefill_guard = MagicMock()  # must NOT be consulted in fallback mode
 
-    await eng.preflight_chat([{"role": "user", "content": "hi"}], request_id="r1")
+    eviction_attempted = await eng.preflight_chat(
+        [{"role": "user", "content": "hi"}],
+        request_id="r1",
+    )
 
+    assert eviction_attempted is True
     eng._fallback_engine.preflight_chat.assert_awaited_once()
     eng._prefill_guard.preflight_or_raise.assert_not_called()
 
@@ -417,3 +425,20 @@ async def test_engine_preflight_completion_delegates_to_guard():
     eng._prefill_guard.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=777, request_id="rc"
     )
+
+
+async def test_engine_preflight_completion_returns_fallback_eviction_attempt() -> None:
+    eng = _bare_engine()
+    eng._in_fallback_mode = True
+    eng._fallback_engine = AsyncMock()
+    eng._fallback_engine.preflight_completion.return_value = True
+    eng._prefill_guard = MagicMock()
+
+    eviction_attempted = await eng.preflight_completion("hello", request_id="rc")
+
+    assert eviction_attempted is True
+    eng._fallback_engine.preflight_completion.assert_awaited_once_with(
+        "hello",
+        request_id="rc",
+    )
+    eng._prefill_guard.preflight_or_raise.assert_not_called()

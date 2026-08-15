@@ -49,6 +49,7 @@
                 "reasoning_parser": null,
                 "turboquant_kv_enabled": false,
                 "turboquant_kv_bits": 4.0,
+                "turboquant_mid_prefill": false,
                 "turboquant_skip_last": true,
                 "specprefill_enabled": false,
                 "specprefill_draft_model": null,

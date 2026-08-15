@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import logging
 import shutil
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,8 +19,10 @@ from omlx.exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    TurboQuantProcessExclusiveError,
 )
 from omlx.scheduler import PrefillEvictionRequest
+from omlx.utils.metal_sync import _ConversionCoordinator
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -337,6 +340,272 @@ class TestOrphanedLoadSafetyNet:
         # The replaced entry must be loadable again afterwards
         assert pool.get_entry("model-a").is_loading is False
         assert pool.get_entry("model-a").load_failure_message is None
+
+
+class _TestTurboQuantProcessOwner:
+    """Typed coordinator owner used by pool retry regressions."""
+
+    def __init__(self, coordinator: _ConversionCoordinator) -> None:
+        self._coordinator = coordinator
+        self.closed = False
+        self.close_count = 0
+        coordinator.register_engine(self)
+
+    async def claim_turboquant_mid_prefill_process(self) -> None:
+        self._coordinator.claim_process_exclusive(self)
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.closed:
+            return
+        self._coordinator.unregister_engine(self)
+        self.closed = True
+
+
+class TestTurboQuantProcessClaim:
+    """Tests for fail-closed process ownership during engine loading."""
+
+    @pytest.mark.asyncio
+    async def test_claim_failure_closes_owner_when_wrapper_stop_fails(
+        self, small_mock_model_dir: Path
+    ) -> None:
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+
+        process_owner = MagicMock()
+        process_owner.claim_turboquant_mid_prefill_process = AsyncMock(
+            side_effect=TurboQuantProcessExclusiveError("exclusive unavailable")
+        )
+        scheduler = MagicMock(
+            _turboquant_mid_prefill=True,
+            _metal_process_owner=process_owner,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock(side_effect=RuntimeError("stop failed"))
+
+        pool._resolve_scheduler_from_engine = MagicMock(return_value=scheduler)
+        pool._schedule_failed_load_reclaim = MagicMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(ModelLoadingError, match="exclusive unavailable") as exc_info,
+        ):
+            await pool._load_engine("model-a")
+
+        mock_engine.stop.assert_awaited_once()
+        process_owner.close.assert_called_once_with()
+        assert entry.engine is None
+        assert pool._current_model_memory == 0
+        pool._schedule_failed_load_reclaim.assert_called_once()
+        assert isinstance(
+            exc_info.value.__cause__,
+            TurboQuantProcessExclusiveError,
+        )
+        assert entry.is_loading is False
+        assert entry.load_failed is False
+        assert entry.load_failure_message is None
+        assert entry.load_failure_at is None
+
+    @pytest.mark.asyncio
+    async def test_claim_cancellation_stops_and_unpublishes_engine(
+        self, small_mock_model_dir: Path
+    ) -> None:
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+
+        process_owner = MagicMock()
+        process_owner.close = MagicMock()
+        scheduler = MagicMock(
+            _turboquant_mid_prefill=True,
+            _metal_process_owner=process_owner,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        pool._resolve_scheduler_from_engine = MagicMock(return_value=scheduler)
+        pool._claim_turboquant_mid_prefill_process = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await pool._load_engine("model-a")
+
+        mock_engine.stop.assert_awaited_once()
+        process_owner.close.assert_called_once_with()
+        assert entry.engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_claim_rejects_loaded_embedding_engine(
+        self,
+        small_mock_model_dir: Path,
+    ) -> None:
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        embedding_entry = pool.get_entry("model-a")
+        mid_prefill_entry = pool.get_entry("model-b")
+        assert embedding_entry is not None
+        assert mid_prefill_entry is not None
+
+        embedding_entry.engine_type = "embedding"
+        embedding_entry.engine = MagicMock()
+        mid_prefill_entry.engine = MagicMock()
+        process_owner = MagicMock()
+        process_owner.claim_turboquant_mid_prefill_process = AsyncMock()
+        scheduler = MagicMock(
+            _turboquant_mid_prefill=True,
+            _metal_process_owner=process_owner,
+        )
+
+        with pytest.raises(
+            TurboQuantProcessExclusiveError,
+            match="model-a",
+        ):
+            await pool._claim_turboquant_mid_prefill_process(
+                "model-b",
+                scheduler,
+            )
+
+        process_owner.claim_turboquant_mid_prefill_process.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exclusive_owner_blocks_existing_non_core_engine_access(
+        self,
+        small_mock_model_dir: Path,
+    ) -> None:
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        owner_entry = pool.get_entry("model-a")
+        embedding_entry = pool.get_entry("model-b")
+        assert owner_entry is not None
+        assert embedding_entry is not None
+
+        owner_entry.engine = MagicMock(
+            scheduler=MagicMock(_turboquant_mid_prefill=True)
+        )
+        embedding_entry.engine_type = "embedding"
+        embedding_entry.engine = MagicMock()
+
+        with pytest.raises(ModelLoadingError) as exc_info:
+            await pool.get_engine("model-b")
+
+        assert isinstance(
+            exc_info.value.__cause__,
+            TurboQuantProcessExclusiveError,
+        )
+        assert "unload 'model-a'" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_registered_engine_conflict_retries_without_discovery(
+        self, small_mock_model_dir: Path
+    ) -> None:
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry_a = pool.get_entry("model-a")
+        entry_b = pool.get_entry("model-b")
+        assert entry_a is not None
+        assert entry_b is not None
+
+        coordinator = _ConversionCoordinator()
+        owner_a = _TestTurboQuantProcessOwner(coordinator)
+        scheduler_a = MagicMock(
+            _turboquant_mid_prefill=False,
+            _metal_process_owner=owner_a,
+        )
+        engine_a = MagicMock(scheduler=scheduler_a)
+        engine_a.start = AsyncMock()
+        engine_a.stop = AsyncMock()
+        b_owners: list[_TestTurboQuantProcessOwner] = []
+        b_engines: list[MagicMock] = []
+
+        def engine_factory(**kwargs: object) -> MagicMock:
+            if str(kwargs["model_name"]).endswith("model-a"):
+                return engine_a
+            owner = _TestTurboQuantProcessOwner(coordinator)
+            scheduler = MagicMock(
+                _turboquant_mid_prefill=True,
+                _metal_process_owner=owner,
+            )
+            engine = MagicMock(scheduler=scheduler)
+            engine.start = AsyncMock()
+            engine.stop = AsyncMock()
+            b_owners.append(owner)
+            b_engines.append(engine)
+            return engine
+
+        def scheduler_from_engine(engine: object) -> object | None:
+            return getattr(engine, "scheduler", None)
+
+        pool._resolve_scheduler_from_engine = MagicMock(
+            side_effect=scheduler_from_engine
+        )
+        pool._schedule_failed_load_reclaim = MagicMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=engine_factory,
+        ) as engine_constructor:
+            assert await pool.get_engine("model-a") is engine_a
+            assert pool.current_model_memory == entry_a.estimated_size
+
+            with pytest.raises(
+                ModelLoadingError,
+                match="unload all other engines",
+            ) as conflict:
+                await pool.get_engine("model-b")
+
+            assert len(b_engines) == 1
+            b_engines[0].stop.assert_awaited_once()
+            assert b_owners[0].closed is True
+            assert b_owners[0].close_count == 1
+            assert entry_b.engine is None
+            assert entry_b.is_loading is False
+            assert entry_b.load_failed is False
+            assert entry_b.load_failure_message is None
+            assert entry_b.load_failure_at is None
+            assert pool.current_model_memory == entry_a.estimated_size
+            pool._schedule_failed_load_reclaim.assert_called_once()
+            assert isinstance(
+                conflict.value.__cause__,
+                TurboQuantProcessExclusiveError,
+            )
+
+            await pool._unload_engine("model-a")
+
+            engine_a.stop.assert_awaited_once()
+            assert owner_a.closed is True
+            assert owner_a.close_count == 1
+            assert entry_a.engine is None
+            assert pool.current_model_memory == 0
+            assert pool.get_entry("model-b") is entry_b
+
+            loaded_b = await pool.get_engine("model-b")
+
+            assert len(b_engines) == 2
+            assert loaded_b is b_engines[1]
+            b_engines[1].start.assert_awaited_once()
+            assert engine_constructor.call_count == 3
+            assert entry_b.engine is loaded_b
+            assert coordinator.process_exclusive(b_owners[1]) is True
+            assert pool.current_model_memory == entry_b.estimated_size
+
+            await pool._unload_engine("model-b")
+
+        b_engines[1].stop.assert_awaited_once()
+        assert b_owners[1].closed is True
+        assert b_owners[1].close_count == 1
+        assert coordinator.process_exclusive(b_owners[1]) is False
+        assert pool.current_model_memory == 0
+        assert coordinator.snapshot() == (0, 0, False, 0)
 
 
 class TestEnginePoolErrors:
@@ -1061,7 +1330,7 @@ class TestEnginePoolAsync:
             patch(
                 "omlx.engine.dflash.DFlashEngine",
                 return_value=dflash_engine,
-            ),
+            ) as dflash_constructor,
             patch("omlx.engine_pool.BatchedEngine", return_value=fallback_engine),
         ):
             first = await pool.get_engine(
@@ -1086,6 +1355,9 @@ class TestEnginePoolAsync:
         dflash_engine.stop.assert_awaited_once()
         fallback_engine.start.assert_awaited_once()
         fallback_engine.stop.assert_not_awaited()
+        dflash_kwargs = dflash_constructor.call_args.kwargs
+        assert callable(dflash_kwargs["prefill_eviction_callback"])
+        assert callable(dflash_kwargs["mid_prefill_process_claim_callback"])
 
     @pytest.mark.asyncio
     async def test_vlm_mtp_fallback_reuses_requested_variant_while_leased(
@@ -1203,6 +1475,36 @@ class TestEnginePoolAsync:
         assert pure_signature == pure_think_signature
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
+
+    def test_turboquant_mid_prefill_only_affects_active_signature(
+        self, pool_with_mock_engines: EnginePool
+    ) -> None:
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        off_false = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=False,
+        )
+        off_true = ModelSettings(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        )
+        on_false = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=False,
+        )
+        on_true = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+        )
+
+        assert pool._engine_runtime_signature(
+            "model-a", off_false
+        ) == pool._engine_runtime_signature("model-a", off_true)
+        assert pool._engine_runtime_signature(
+            "model-a", on_false
+        ) != pool._engine_runtime_signature("model-a", on_true)
 
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
@@ -1536,9 +1838,7 @@ class TestEnginePoolEviction:
             hwm["v"] = max(hwm["v"], pool._current_model_memory)
             return hwm["v"]
 
-        monkeypatch.setattr(
-            "omlx.engine_pool.get_phys_footprint", lagging_footprint
-        )
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lagging_footprint)
         monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
         return pool
 
@@ -1660,9 +1960,7 @@ class TestAdmissionSoftTargetEviction:
         return pool
 
     @pytest.mark.asyncio
-    async def test_soft_band_swap_evicts_idle_model_before_load(
-        self, soft_band_pool
-    ):
+    async def test_soft_band_swap_evicts_idle_model_before_load(self, soft_band_pool):
         """Projected total in the soft..ceiling band must evict the idle
         LRU model before the new one loads, not admit both."""
         pool = soft_band_pool
@@ -1789,9 +2087,7 @@ class TestGuardOffBestEffortAdmission:
         assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
-    async def test_nothing_evictable_admits_over_ceiling(
-        self, guard_off_pool, caplog
-    ):
+    async def test_nothing_evictable_admits_over_ceiling(self, guard_off_pool, caplog):
         """Guard off + nothing to evict: warn and load anyway, never raise."""
         pool = guard_off_pool
         pool._entries["model-a"].is_pinned = True
@@ -3380,9 +3676,7 @@ class TestFailedLoadReclaim:
                     side_effect=_drop_on_clear,
                 ),
                 patch("omlx.engine_pool.get_phys_footprint", return_value=0),
-                patch(
-                    "omlx.engine_pool.get_mlx_executor", return_value=executor
-                ),
+                patch("omlx.engine_pool.get_mlx_executor", return_value=executor),
                 patch(
                     "omlx.engine_pool.asyncio.sleep",
                     new=AsyncMock(return_value=None),
@@ -3391,13 +3685,48 @@ class TestFailedLoadReclaim:
                 pool._schedule_failed_load_reclaim(
                     "model-x", pre_load_memory=1 * 1024**3
                 )
-                await asyncio.wait_for(
-                    pool._failed_load_reclaim_task, timeout=10
-                )
+                await asyncio.wait_for(pool._failed_load_reclaim_task, timeout=10)
         finally:
             executor.shutdown(wait=False)
 
         assert gauge["active"] == 1 * 1024**3
+
+    async def test_reclaim_retries_process_exclusive_conflict(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pool = _make_pool()
+        get_executor = MagicMock(
+            side_effect=TurboQuantProcessExclusiveError("exclusive owner active")
+        )
+        sleep = AsyncMock(return_value=None)
+        pool._wake_process_memory_enforcer = MagicMock()
+
+        with (
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+            patch("omlx.engine_pool.gc.collect"),
+            patch(
+                "omlx.engine_pool.get_mlx_executor",
+                new=get_executor,
+            ),
+            patch("omlx.engine_pool.mx.get_active_memory") as active_memory,
+            patch("omlx.engine_pool.get_phys_footprint") as physical_memory,
+            patch(
+                "omlx.engine_pool.asyncio.sleep",
+                new=sleep,
+            ),
+        ):
+            pool._schedule_failed_load_reclaim(
+                "model-x",
+                pre_load_memory=1 * 1024**3,
+            )
+            await asyncio.wait_for(pool._failed_load_reclaim_task, timeout=10)
+
+        assert get_executor.call_count == 6
+        assert sleep.await_count == 6
+        active_memory.assert_not_called()
+        physical_memory.assert_not_called()
+        pool._wake_process_memory_enforcer.assert_called_once_with()
+        assert "remained blocked for all 6 rounds" in caplog.text
 
     async def test_reclaim_gives_up_after_max_rounds(self):
         """A permanently-inflated gauge must not hang the reclaim task."""
@@ -3415,9 +3744,7 @@ class TestFailedLoadReclaim:
                 patch("omlx.engine_pool.mx.synchronize"),
                 patch("omlx.engine_pool.mx.clear_cache"),
                 patch("omlx.engine_pool.get_phys_footprint", return_value=0),
-                patch(
-                    "omlx.engine_pool.get_mlx_executor", return_value=executor
-                ),
+                patch("omlx.engine_pool.get_mlx_executor", return_value=executor),
                 patch(
                     "omlx.engine_pool.asyncio.sleep",
                     new=AsyncMock(return_value=None),
@@ -3426,9 +3753,7 @@ class TestFailedLoadReclaim:
                 pool._schedule_failed_load_reclaim(
                     "model-x", pre_load_memory=1 * 1024**3
                 )
-                await asyncio.wait_for(
-                    pool._failed_load_reclaim_task, timeout=10
-                )
+                await asyncio.wait_for(pool._failed_load_reclaim_task, timeout=10)
         finally:
             executor.shutdown(wait=False)
 
@@ -3473,7 +3798,9 @@ class TestSchedulerConfigModelId:
             await pool.get_engine("model-a")
 
         assert pool._scheduler_config.model_name == "model-a"
-        assert pool._scheduler_config.model_path == str(small_mock_model_dir / "model-a")
+        assert pool._scheduler_config.model_path == str(
+            small_mock_model_dir / "model-a"
+        )
 
 
 class _StubEnforcer:

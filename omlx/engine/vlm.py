@@ -62,6 +62,25 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _configure_turboquant_scheduler(scheduler: Any, model_settings: Any | None) -> None:
+    """Propagate effective TurboQuant settings to a newly-created scheduler."""
+    turboquant_active = bool(getattr(model_settings, "turboquant_kv_enabled", False))
+    scheduler._turboquant_mid_prefill = turboquant_active and bool(
+        getattr(model_settings, "turboquant_mid_prefill", False)
+    )
+    if not turboquant_active:
+        return
+
+    scheduler._turboquant_kv_bits = float(
+        getattr(model_settings, "turboquant_kv_bits", 4)
+    )
+    scheduler._turboquant_skip_last = getattr(
+        model_settings, "turboquant_skip_last", True
+    )
+    scheduler._set_model_info_for_monitor()
+
+
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
@@ -1314,8 +1333,8 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
-    ) -> None:
-        await _run_scheduler_preflight_with_cleanup_retry(
+    ) -> bool:
+        callback_attempted = await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
@@ -1326,6 +1345,7 @@ class VLMBatchedEngine(BaseEngine):
                 None,
             ),
         )
+        return callback_attempted
 
     @property
     def model_name(self) -> str:
@@ -1700,21 +1720,19 @@ class VLMBatchedEngine(BaseEngine):
 
         # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
-        if self._model_settings is not None:
-            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
-            if tq_enabled:
-                from ..patches.turboquant_attention import (
-                    apply_turboquant_attention_patch,
-                )
+        scheduler._prefill_eviction_callback_configured = (
+            self._prefill_eviction_callback is not None
+        )
+        tq_enabled = bool(getattr(self._model_settings, "turboquant_kv_enabled", False))
+        if tq_enabled:
+            from ..patches.turboquant_attention import (
+                apply_turboquant_attention_patch,
+            )
 
-                apply_turboquant_attention_patch()
-                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                scheduler._turboquant_kv_bits = tq_bits
-                scheduler._turboquant_skip_last = getattr(
-                    self._model_settings, "turboquant_skip_last", True
-                )
-                scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+            apply_turboquant_attention_patch()
+            tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
+            logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+        _configure_turboquant_scheduler(scheduler, self._model_settings)
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -3134,6 +3152,9 @@ class VLMBatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        prefill_eviction_callback_attempted = bool(
+            kwargs.pop("prefill_eviction_callback_attempted", False)
+        )
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -3144,6 +3165,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            prefill_eviction_callback_attempted=prefill_eviction_callback_attempted,
             **specprefill_kwargs,
         )
 
@@ -3245,6 +3267,9 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        prefill_eviction_callback_attempted = bool(
+            kwargs.pop("prefill_eviction_callback_attempted", False)
+        )
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -3257,6 +3282,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             tools=tools,
+            prefill_eviction_callback_attempted=prefill_eviction_callback_attempted,
             **specprefill_kwargs,
         )
 
@@ -3374,7 +3400,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> bool:
         """Early prefill memory check for chat completions (VLM path).
 
         The actual VLM prompt is built by ``_process_chat_messages`` →
@@ -3406,6 +3432,10 @@ class VLMBatchedEngine(BaseEngine):
         ``BatchedEngine.preflight_chat`` for the upstream rationale
         (avoiding the ``StreamingResponse`` 200 commit so HTTP 400
         actually reaches the client).
+
+        Returns ``True`` only when this preflight actually invoked the async
+        eviction callback, allowing the route to consume the request's one
+        scheduler retry without storing cross-request state.
         """
         if not self._loaded:
             await self.start()
@@ -3417,7 +3447,7 @@ class VLMBatchedEngine(BaseEngine):
                 stop=kwargs.get("stop"),
                 kwargs=kwargs,
             )
-            return
+            return False
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
@@ -3454,7 +3484,7 @@ class VLMBatchedEngine(BaseEngine):
                 "surface the error",
                 type(e).__name__,
             )
-            return
+            return False
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
         num_tokens += _count_image_tokens_real(
@@ -3467,8 +3497,8 @@ class VLMBatchedEngine(BaseEngine):
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
-            return
-        await self._preflight_or_raise_with_eviction(
+            return False
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
@@ -3477,8 +3507,13 @@ class VLMBatchedEngine(BaseEngine):
         prompt: str,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
-        """Early prefill memory check for plain /v1/completions calls (VLM)."""
+    ) -> bool:
+        """Early prefill memory check for plain /v1/completions calls (VLM).
+
+        Returns ``True`` only when this preflight completed after invoking the
+        async eviction callback. The route carries that request-local result to
+        admission so the scheduler cannot invoke the same callback twice.
+        """
         if not self._loaded:
             await self.start()
         if self.is_diffusion_model:
@@ -3486,7 +3521,7 @@ class VLMBatchedEngine(BaseEngine):
                 stop=kwargs.get("stop"),
                 kwargs=kwargs,
             )
-            return
+            return False
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
@@ -3496,12 +3531,12 @@ class VLMBatchedEngine(BaseEngine):
                 "path will surface the error",
                 type(e).__name__,
             )
-            return
+            return False
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
-            return
-        await self._preflight_or_raise_with_eviction(
+            return False
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 

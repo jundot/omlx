@@ -1595,6 +1595,43 @@ async def _ensure_tokenizer_for_system_probe(
     await engine.start()
 
 
+async def _preflight_chat_with_eviction_budget(
+    engine: BaseEngine,
+    messages: list,
+    chat_kwargs: dict,
+    *,
+    request_id: str | None,
+) -> None:
+    """Run route preflight and carry a real callback attempt to admission.
+
+    The marker lives only in this HTTP request's kwargs, so concurrent routes
+    cannot consume each other's retry and cancellation leaves no keyed state.
+    """
+    callback_attempted = await engine.preflight_chat(
+        messages,
+        request_id=request_id,
+        **chat_kwargs,
+    )
+    if callback_attempted is True:
+        chat_kwargs["prefill_eviction_callback_attempted"] = True
+
+
+async def _preflight_completion_with_eviction_budget(
+    engine: BaseEngine,
+    prompt: str,
+    generation_kwargs: dict[str, bool],
+    *,
+    request_id: str | None,
+) -> None:
+    """Carry a completed route eviction attempt to this prompt's admission."""
+    callback_attempted = await engine.preflight_completion(
+        prompt,
+        request_id=request_id,
+    )
+    if callback_attempted is True:
+        generation_kwargs["prefill_eviction_callback_attempted"] = True
+
+
 def _unsupported_mid_system_policy() -> str:
     settings = _server_state.global_settings
     preserve_cache = True
@@ -3126,7 +3163,7 @@ async def create_completion(
     request: CompletionRequest,
     http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-):
+) -> StreamingResponse:
     """Create a text completion."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -3158,9 +3195,17 @@ async def create_completion(
         # log line and the FastAPI handler trace correlate with whatever
         # the client is using on its side.
         upstream_request_id = http_request.headers.get("x-request-id")
+        completion_preflight_kwargs_by_prompt: list[dict[str, bool]] = [
+            {} for _ in prompts
+        ]
         await _raise_if_llm_lease_abort_requested(lease)
-        for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+        for i, prompt in enumerate(prompts):
+            await _preflight_completion_with_eviction_budget(
+                engine,
+                prompt,
+                completion_preflight_kwargs_by_prompt[i],
+                request_id=upstream_request_id,
+            )
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -3179,6 +3224,12 @@ async def create_completion(
                             prompt_token_ids=prompt_token_ids_by_prompt[0],
                             resolved_model=resolved_model,
                             response_id=response_id,
+                            prefill_eviction_callback_attempted=(
+                                completion_preflight_kwargs_by_prompt[0].get(
+                                    "prefill_eviction_callback_attempted",
+                                    False,
+                                )
+                            ),
                         ),
                         http_request=http_request,
                         keepalive_chunk=keepalive,
@@ -3190,7 +3241,7 @@ async def create_completion(
             )
 
         # Non-streaming response with keepalive during prefill
-        async def _build_completion():
+        async def _build_completion() -> str:
             await _raise_if_llm_lease_abort_requested(lease)
             start_time = time.perf_counter()
             choices = []
@@ -3247,6 +3298,7 @@ async def create_completion(
                     xtc_threshold=xtc_threshold,
                     stop=request.stop,
                     seed=request.seed,
+                    **completion_preflight_kwargs_by_prompt[i],
                     **gen_kwargs,
                 )
                 if i == 0:
@@ -3675,10 +3727,11 @@ async def create_chat_completion(
         # an incomplete chunked read. Running the check here lets
         # prefill_memory_exceeded_handler return a clean HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
-        await engine.preflight_chat(
+        await _preflight_chat_with_eviction_budget(
+            engine,
             messages,
+            chat_kwargs,
             request_id=http_request.headers.get("x-request-id"),
-            **chat_kwargs,
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
@@ -4266,6 +4319,7 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
+    prefill_eviction_callback_attempted: bool = False,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4307,6 +4361,8 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    if prefill_eviction_callback_attempted:
+        gen_kwargs["prefill_eviction_callback_attempted"] = True
     try:
         async for output in engine.stream_generate(
             prompt=prompt,
@@ -5588,10 +5644,11 @@ async def create_anthropic_message(
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
-        await engine.preflight_chat(
+        await _preflight_chat_with_eviction_budget(
+            engine,
             messages,
+            chat_kwargs,
             request_id=http_request.headers.get("x-request-id"),
-            **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
 
@@ -6077,10 +6134,11 @@ async def create_response(
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
-        await engine.preflight_chat(
+        await _preflight_chat_with_eviction_budget(
+            engine,
             messages,
+            chat_kwargs,
             request_id=http_request.headers.get("x-request-id"),
-            **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
 

@@ -32,6 +32,7 @@ from typing import Any
 
 from .paged_ssd_cache import (
     HAS_MLX,
+    DarwinNoCacheError,
     _encode_shape,
     _extract_tensor_bytes,
     _has_zero_dim,
@@ -185,6 +186,7 @@ class BoundarySnapshotSSDStore:
         self._pending_bytes = 0
         self._pending_peak_bytes = 0
         self._backpressure_ms = 0.0
+        self._fatal_write_error: str | None = None
 
         # Cancelled requests with remaining queue item counts. Writer
         # thread decrements on each skip; entry is deleted when count
@@ -214,6 +216,23 @@ class BoundarySnapshotSSDStore:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _raise_if_write_failed_locked(self) -> None:
+        if self._fatal_write_error is not None:
+            raise DarwinNoCacheError(self._fatal_write_error)
+
+    def raise_if_write_failed(self) -> None:
+        """Surface a failed Darwin cache-bypass policy on the caller thread."""
+        with self._pending_lock:
+            self._raise_if_write_failed_locked()
+
+    def _record_write_policy_failure(self, exc: DarwinNoCacheError) -> None:
+        message = str(exc)
+        with self._pending_cond:
+            if self._fatal_write_error is None:
+                self._fatal_write_error = message
+                logger.error("Boundary snapshot SSD policy failed: %s", message)
+            self._pending_cond.notify_all()
 
     def save(
         self,
@@ -248,6 +267,7 @@ class BoundarySnapshotSSDStore:
         bool
             True if successfully enqueued for writing.
         """
+        self.raise_if_write_failed()
         if not HAS_MLX:
             return False
 
@@ -291,6 +311,7 @@ class BoundarySnapshotSSDStore:
             wait_started = time.monotonic()
             deadline = wait_started + _PENDING_RESERVATION_TIMEOUT_S
             with self._pending_cond:
+                self._raise_if_write_failed_locked()
                 # The same request/token boundary is deterministic. Coalesce a
                 # duplicate capture with the generation already queued instead
                 # of retaining two raw buffers or letting stale writer cleanup
@@ -306,6 +327,7 @@ class BoundarySnapshotSSDStore:
                         inline_write = True
                         break
                     self._pending_cond.wait(timeout=remaining)
+                    self._raise_if_write_failed_locked()
 
                 self._backpressure_ms += max(
                     0.0, (time.monotonic() - wait_started) * 1000.0
@@ -364,9 +386,12 @@ class BoundarySnapshotSSDStore:
                     token_count,
                 )
                 return self._write_inline(pw_key, pending, file_path)
+            self.raise_if_write_failed()
 
             return True
 
+        except DarwinNoCacheError:
+            raise
         except Exception as e:
             logger.debug("Failed to save boundary snapshot: %s", e)
             return False
@@ -387,6 +412,7 @@ class BoundarySnapshotSSDStore:
             List of per-layer dicts matching ``_extract_cache_states`` output
             format, or None on failure.
         """
+        self.raise_if_write_failed()
         pw_key = (request_id, token_count)
         try:
             file_path = self._file_path(request_id, token_count)
@@ -398,6 +424,7 @@ class BoundarySnapshotSSDStore:
 
         # Fast path: still in pending writes buffer.
         with self._pending_lock:
+            self._raise_if_write_failed_locked()
             pending = self._pending_writes.get(pw_key)
             if pending is not None:
                 tensors_raw = pending.get("tensors_raw")
@@ -413,6 +440,7 @@ class BoundarySnapshotSSDStore:
                             e,
                         )
                         return None
+        self.raise_if_write_failed()
 
         # Slow path: read from disk.
         if not file_path.is_file():
@@ -473,6 +501,7 @@ class BoundarySnapshotSSDStore:
         this store's request registry so later request cleanup cannot race an
         atomic rename into the durable cache namespace.
         """
+        self.raise_if_write_failed()
         pw_key = (request_id, token_count)
         deadline = time.monotonic() + max(0.0, timeout_s)
         try:
@@ -484,10 +513,12 @@ class BoundarySnapshotSSDStore:
             # Wait for the latest generation, even if an older generation has
             # already materialized the shared final path.
             while pw_key in self._pending_writes:
+                self._raise_if_write_failed_locked()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._pending_cond.wait(timeout=remaining)
+            self._raise_if_write_failed_locked()
 
         if (
             not self._is_safe_snapshot_path(file_path)
@@ -576,6 +607,7 @@ class BoundarySnapshotSSDStore:
 
     def has(self, request_id: str, token_count: int) -> bool:
         """Check if a snapshot exists (in memory or on disk)."""
+        self.raise_if_write_failed()
         pw_key = (request_id, token_count)
         try:
             file_path = self._file_path(request_id, token_count)
@@ -584,13 +616,14 @@ class BoundarySnapshotSSDStore:
         if not self._is_safe_snapshot_path(file_path):
             return False
         with self._pending_lock:
+            self._raise_if_write_failed_locked()
             if pw_key in self._pending_writes:
                 return True
         with self._registry_lock:
             req_files = self._file_registry.get(request_id)
-            if req_files and token_count in req_files:
-                return True
-        return False
+            registered = bool(req_files and token_count in req_files)
+        self.raise_if_write_failed()
+        return registered
 
     def cleanup_request(self, request_id: str) -> None:
         """Delete all snapshot files and pending writes for a request.
@@ -989,19 +1022,25 @@ class BoundarySnapshotSSDStore:
                     if current is pending:
                         self._remove_pending_locked(pw_key)
                 return True
-        except Exception as e:
-            logger.warning(
-                "Inline boundary snapshot write failed for %s/%d: %s",
-                pw_key[0],
-                pw_key[1],
-                e,
-            )
+        except Exception as exc:
+            policy_failure = exc if isinstance(exc, DarwinNoCacheError) else None
+            if policy_failure is not None:
+                self._record_write_policy_failure(policy_failure)
+            else:
+                logger.warning(
+                    "Inline boundary snapshot write failed for %s/%d: %s",
+                    pw_key[0],
+                    pw_key[1],
+                    exc,
+                )
             for path in (temp_path, file_path):
                 try:
                     if path.is_symlink() or path.is_file():
                         path.unlink()
                 except Exception:
                     pass
+            if policy_failure is not None:
+                raise
             return False
         finally:
             removed = False
@@ -1043,7 +1082,10 @@ class BoundarySnapshotSSDStore:
                 # cleaned up.
                 item = None
 
-    def _process_write_item(self, item) -> None:
+    def _process_write_item(
+        self,
+        item: tuple[tuple[str, int], dict[str, Any], Path],
+    ) -> None:
         """Process one (pw_key, pending, file_path) queue item.
 
         Extracted from ``_writer_loop`` so the busy-lock can wrap it
@@ -1089,6 +1131,7 @@ class BoundarySnapshotSSDStore:
 
         temp_path = None
         try:
+            self.raise_if_write_failed()
             if not self._is_safe_snapshot_path(file_path):
                 logger.warning(
                     "Refusing to stage boundary snapshot through symlink: %s",
@@ -1146,12 +1189,15 @@ class BoundarySnapshotSSDStore:
                 except Exception:
                     pass
                 self._dec_cancelled(pw_key[0])
-        except Exception as e:
-            logger.debug("Background snapshot write failed: %s", e)
-            for p in (temp_path, file_path):
+        except Exception as exc:
+            if isinstance(exc, DarwinNoCacheError):
+                self._record_write_policy_failure(exc)
+            else:
+                logger.debug("Background snapshot write failed: %s", exc)
+            for path in (temp_path, file_path):
                 try:
-                    if p is not None and (p.is_symlink() or p.is_file()):
-                        p.unlink()
+                    if path is not None and (path.is_symlink() or path.is_file()):
+                        path.unlink()
                 except Exception:
                     pass
             # Same bookkeeping invariant as the early-return path: if

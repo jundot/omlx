@@ -46,6 +46,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    TurboQuantProcessExclusiveError,
     describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
@@ -369,6 +370,10 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add(
+                "turboquant_mid_prefill",
+                bool(data.get("turboquant_mid_prefill", False)),
+            )
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -1047,6 +1052,14 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            try:
+                self._raise_if_other_mid_prefill_model_owns_process(model_id)
+            except TurboQuantProcessExclusiveError as exc:
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' cannot load while process-exclusive "
+                    f"Metal access is unavailable: {exc}",
+                ) from exc
             expected_signature = self._engine_runtime_signature(
                 model_id,
                 runtime_settings,
@@ -1430,6 +1443,53 @@ class EnginePool:
         except AttributeError:
             return None
 
+    def _raise_if_other_mid_prefill_model_owns_process(
+        self,
+        model_id: str,
+    ) -> None:
+        for other_id, entry in self._entries.items():
+            if other_id == model_id or entry.engine is None:
+                continue
+            scheduler = self._resolve_scheduler_from_engine(entry.engine)
+            if (
+                scheduler is not None
+                and getattr(scheduler, "_turboquant_mid_prefill", False) is True
+            ):
+                raise TurboQuantProcessExclusiveError(
+                    "TurboQuant mid-prefill requires process-exclusive Metal "
+                    f"access; unload '{other_id}' before loading '{model_id}'"
+                )
+
+    async def _claim_turboquant_mid_prefill_process(
+        self,
+        model_id: str,
+        scheduler: object,
+    ) -> None:
+        other_ids = [
+            other_id
+            for other_id, entry in self._entries.items()
+            if other_id != model_id and entry.engine is not None
+        ]
+        if other_ids:
+            raise TurboQuantProcessExclusiveError(
+                "TurboQuant mid-prefill requires process-exclusive Metal "
+                "access; unload all other engines before enabling it "
+                f"(loaded: {', '.join(sorted(other_ids))})"
+            )
+
+        process_owner = getattr(scheduler, "_metal_process_owner", None)
+        claim_process = getattr(
+            process_owner,
+            "claim_turboquant_mid_prefill_process",
+            None,
+        )
+        if not callable(claim_process):
+            raise RuntimeError(
+                "TurboQuant mid-prefill requires an EngineCore-owned "
+                "process-exclusive Metal lane"
+            )
+        await claim_process()
+
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
         if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
@@ -1447,16 +1507,16 @@ class EnginePool:
         return True
 
     def _find_lru_prefill_eviction_victim(self, *, exclude_model_id: str) -> str | None:
-        candidates = []
-        for mid, entry in self._entries.items():
-            if mid == exclude_model_id:
-                continue
-            if self._is_idle_for_prefill_eviction(entry):
-                candidates.append((entry.last_access, mid))
-        if not candidates:
-            return None
-        candidates.sort()
-        return candidates[0][1]
+        candidate = min(
+            (
+                (entry.last_access, model_id)
+                for model_id, entry in self._entries.items()
+                if model_id != exclude_model_id
+                and self._is_idle_for_prefill_eviction(entry)
+            ),
+            default=None,
+        )
+        return candidate[1] if candidate is not None else None
 
     async def _evict_idle_lru_for_prefill(
         self,
@@ -1661,6 +1721,12 @@ class EnginePool:
         distributed = self._distributed_deployment_for_entry(entry) is not None
         resident_size = self._entry_resident_size(entry)
         pre_unload_active = 0 if distributed else mx.get_active_memory()
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        process_owner = (
+            getattr(scheduler, "_metal_process_owner", None)
+            if scheduler is not None
+            else None
+        )
 
         try:
             await entry.engine.stop()
@@ -1676,6 +1742,17 @@ class EnginePool:
                 self._wake_process_memory_enforcer()
                 raise
             logger.warning(f"Error stopping engine for {model_id}: {e}")
+        finally:
+            close_process_owner = getattr(process_owner, "close", None)
+            if callable(close_process_owner):
+                try:
+                    close_process_owner()
+                except Exception:
+                    logger.warning(
+                        "Error closing engine owner for %s",
+                        model_id,
+                        exc_info=True,
+                    )
 
         # #1595: the immediate-abort stop() above tears the engine down without the normal
         # per-request completion callbacks, so a non-streaming engine's active_requests
@@ -1867,13 +1944,18 @@ class EnginePool:
             # barrier's small-model tolerance floor.
             target = pre_load_memory + 2 * 1024**3
             current = 0
+            blocked_rounds = 0
             for _round in range(6):
                 await asyncio.sleep(0.5 if _round == 0 else 1.0)
                 gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                try:
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+                except TurboQuantProcessExclusiveError:
+                    blocked_rounds += 1
+                    continue
                 current = max(mx.get_active_memory(), get_phys_footprint())
                 if current <= target:
                     logger.info(
@@ -1883,6 +1965,15 @@ class EnginePool:
                     )
                     self._wake_process_memory_enforcer()
                     return
+            if blocked_rounds == 6:
+                logger.warning(
+                    "Post-failed-load reclaim for '%s' remained blocked for "
+                    "all 6 rounds by process-exclusive TurboQuant Metal "
+                    "ownership; deferred buffers remain until exclusivity ends.",
+                    model_id,
+                )
+                self._wake_process_memory_enforcer()
+                return
             logger.warning(
                 f"Post-failed-load reclaim for '{model_id}' did not settle: "
                 f"current={format_size(current)} "
@@ -1956,6 +2047,35 @@ class EnginePool:
             # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
             pass
 
+            async def prefill_eviction_callback(
+                eviction_request: object,
+                *,
+                _model_id: str = model_id,
+            ) -> bool:
+                return await self._evict_idle_lru_for_prefill(
+                    exclude_model_id=_model_id,
+                    eviction_request=eviction_request,
+                )
+
+            async def mid_prefill_process_claim_callback(
+                scheduler: object,
+                *,
+                _model_id: str = model_id,
+            ) -> None:
+                async with self._lock:
+                    try:
+                        await self._claim_turboquant_mid_prefill_process(
+                            _model_id,
+                            scheduler,
+                        )
+                    except TurboQuantProcessExclusiveError as exc:
+                        raise ModelLoadingError(
+                            _model_id,
+                            f"Model '{_model_id}' cannot switch to its "
+                            "mid-prefill fallback while process-exclusive "
+                            f"Metal access is unavailable: {exc}",
+                        ) from exc
+
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
@@ -2002,10 +2122,16 @@ class EnginePool:
                             omlx_ssd_cache_dir=getattr(
                                 self._scheduler_config, "paged_ssd_cache_dir", None
                             ),
+                            prefill_eviction_callback=prefill_eviction_callback,
+                            mid_prefill_process_claim_callback=(
+                                mid_prefill_process_claim_callback
+                            ),
                         )
                         logger.info(
                             f"DFlash enabled for {model_id}, draft={dflash_draft}"
                         )
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except ImportError:
                         logger.warning(
                             f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
@@ -2026,16 +2152,6 @@ class EnginePool:
                 if model_settings
                 else False
             )
-
-            async def prefill_eviction_callback(
-                eviction_request: object,
-                *,
-                _model_id: str = model_id,
-            ) -> bool:
-                return await self._evict_idle_lru_for_prefill(
-                    exclude_model_id=_model_id,
-                    eviction_request=eviction_request,
-                )
 
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
@@ -2106,6 +2222,8 @@ class EnginePool:
 
             try:
                 await engine.start()
+            except TurboQuantProcessExclusiveError:
+                raise
             except Exception as start_error:
                 if _is_dflash_engine:
                     # DFlash engine failed to start -- fall back to the
@@ -2143,6 +2261,8 @@ class EnginePool:
                         )
                     try:
                         await engine.start()
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"DFlash load failed: {start_error}; "
@@ -2181,6 +2301,8 @@ class EnginePool:
                     )
                     try:
                         await engine.start()
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -2217,6 +2339,8 @@ class EnginePool:
                     )
                     try:
                         await engine.start()
+                    except TurboQuantProcessExclusiveError:
+                        raise
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
@@ -2250,6 +2374,7 @@ class EnginePool:
                 )
 
             self._validate_llm_engine_ready(model_id, engine)
+            assert engine is not None
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += resident_size
@@ -2357,6 +2482,49 @@ class EnginePool:
                     "the request.",
                 )
 
+            scheduler = self._resolve_scheduler_from_engine(engine)
+            if (
+                scheduler is not None
+                and getattr(scheduler, "_turboquant_mid_prefill", False) is True
+            ):
+                process_owner = getattr(
+                    scheduler,
+                    "_metal_process_owner",
+                    None,
+                )
+                try:
+                    await self._claim_turboquant_mid_prefill_process(
+                        model_id,
+                        scheduler,
+                    )
+                except BaseException:
+                    entry.engine = None
+                    self._current_model_memory = max(
+                        0,
+                        self._current_model_memory - entry.estimated_size,
+                    )
+                    load_completed = False
+                    try:
+                        await engine.stop()
+                    except BaseException:
+                        logger.warning(
+                            "Failed to stop non-exclusive mid-prefill engine %s",
+                            model_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        close_process_owner = getattr(process_owner, "close", None)
+                        if callable(close_process_owner):
+                            try:
+                                close_process_owner()
+                            except Exception:
+                                logger.warning(
+                                    "Failed to close non-exclusive mid-prefill "
+                                    "owner for %s",
+                                    model_id,
+                                    exc_info=True,
+                                )
+                    raise
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(actual: {format_size(entry.actual_size)}, "
@@ -2375,6 +2543,12 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if isinstance(exc, TurboQuantProcessExclusiveError):
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' cannot load while process-exclusive "
+                    f"Metal access is unavailable: {exc}",
+                ) from exc
             if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(

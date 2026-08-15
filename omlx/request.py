@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
+    from .cache.hybrid_cache import ModelCacheConfig
 
 
 class RequestStatus(enum.IntEnum):
@@ -132,6 +133,12 @@ class Request:
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
+    _extracted_cache: list[Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _model_cache_config: "ModelCacheConfig | None" = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
@@ -209,6 +216,15 @@ class Request:
     prefill_oom_retries: int = 0  # Per-request prefill-OOM requeue counter
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
+    )
+    prefill_started_at: float | None = (
+        None  # First external/chunked prefill attempt; survives LRU retries
+    )
+    turboquant_mid_prefill_attempted: bool = (
+        False  # Durable across prefill-OOM requeues; one attempt per request
+    )
+    _prefill_saved_rope_deltas: Any = field(
+        default=None, init=False, repr=False, compare=False
     )
 
     # Request-scoped tool schemas used by protocol output parsers.

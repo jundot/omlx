@@ -6,7 +6,67 @@ from pathlib import Path
 
 import pytest
 
+import omlx.admin.oq_manager as oq_manager
 from omlx.admin.oq_manager import OQManager, QuantStatus, QuantTask
+from omlx.utils.metal_sync import _ConversionCoordinator
+
+
+class _MetalOwner:
+    pass
+
+
+class TestProcessGuardedMetal:
+    def test_exclusive_owner_rejects_before_cleanup_or_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        coordinator = _ConversionCoordinator()
+        owner = _MetalOwner()
+        coordinator.register_engine(owner)
+        coordinator.claim_process_exclusive(owner)
+        events: list[str] = []
+
+        def _cleanup() -> None:
+            events.append("cleanup")
+
+        def _work() -> object:
+            events.append("work")
+            return object()
+
+        monkeypatch.setattr(oq_manager, "_conversion_coordinator", coordinator)
+        monkeypatch.setattr(oq_manager, "_sync_and_clear_cache", _cleanup)
+        monkeypatch.setattr(oq_manager, "HAS_MLX", True)
+        try:
+            with pytest.raises(RuntimeError, match="Independent Metal work"):
+                oq_manager._run_process_guarded_metal(_work)
+        finally:
+            coordinator.unregister_engine(owner)
+
+        assert events == []
+
+    def test_cleanup_brackets_work_inside_background_gate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        coordinator = _ConversionCoordinator()
+        events: list[str] = []
+
+        def _cleanup() -> None:
+            events.append("cleanup")
+
+        def _work(value: str) -> str:
+            events.append(value)
+            return "done"
+
+        monkeypatch.setattr(oq_manager, "_conversion_coordinator", coordinator)
+        monkeypatch.setattr(oq_manager, "_sync_and_clear_cache", _cleanup)
+        monkeypatch.setattr(oq_manager, "HAS_MLX", True)
+
+        result = oq_manager._run_process_guarded_metal(_work, "work")
+
+        assert result == "done"
+        assert events == ["cleanup", "work", "cleanup"]
+        assert coordinator.snapshot() == (0, 0, False, 0)
 
 
 @pytest.fixture

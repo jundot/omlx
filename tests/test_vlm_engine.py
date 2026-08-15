@@ -12,6 +12,7 @@ Tests cover:
 
 import base64
 import io
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -120,6 +121,47 @@ class FakeStreamingCore:
 # ---------------------------------------------------------------------------
 # Test stream cleanup
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+def test_vlm_scheduler_mid_prefill_requires_active_turboquant() -> None:
+    from omlx.engine.vlm import _configure_turboquant_scheduler
+
+    inactive_scheduler = MagicMock()
+    _configure_turboquant_scheduler(
+        inactive_scheduler,
+        SimpleNamespace(
+            turboquant_kv_enabled=False,
+            turboquant_mid_prefill=True,
+        ),
+    )
+    assert inactive_scheduler._turboquant_mid_prefill is False
+    inactive_scheduler._set_model_info_for_monitor.assert_not_called()
+
+    child_disabled_scheduler = MagicMock()
+    _configure_turboquant_scheduler(
+        child_disabled_scheduler,
+        SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=False,
+        ),
+    )
+    assert child_disabled_scheduler._turboquant_mid_prefill is False
+
+    active_scheduler = MagicMock()
+    _configure_turboquant_scheduler(
+        active_scheduler,
+        SimpleNamespace(
+            turboquant_kv_enabled=True,
+            turboquant_mid_prefill=True,
+            turboquant_kv_bits=3,
+            turboquant_skip_last=False,
+        ),
+    )
+    assert active_scheduler._turboquant_mid_prefill is True
+    assert active_scheduler._turboquant_kv_bits == 3
+    assert active_scheduler._turboquant_skip_last is False
+    active_scheduler._set_model_info_for_monitor.assert_called_once_with()
 
 
 class TestVLMStreamingCleanup:
@@ -2500,6 +2542,78 @@ class TestVLMEngineFrequencyPenalty:
 
         call_kwargs = engine._engine.add_request.call_args.kwargs
         assert call_kwargs["sampling_params"].frequency_penalty == 0.9
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_forwards_route_preflight_eviction_attempt(self) -> None:
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate(
+            "a prompt",
+            prefill_eviction_callback_attempted=True,
+        )
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["prefill_eviction_callback_attempted"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_defaults_route_preflight_eviction_attempt_to_false(
+        self,
+    ) -> None:
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt")
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["prefill_eviction_callback_attempted"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_generate_forwards_route_preflight_eviction_attempt(
+        self,
+    ) -> None:
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = MagicMock()
+        engine._engine.add_request = AsyncMock(return_value="req-1")
+        engine._engine.abort_request = AsyncMock(return_value=True)
+
+        async def _one_output_stream(
+            request_id: str,
+        ) -> AsyncIterator[SimpleNamespace]:
+            yield SimpleNamespace(
+                output_text="ok",
+                new_text="ok",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+                cached_tokens=0,
+            )
+
+        engine._engine.stream_outputs = _one_output_stream
+
+        async for _ in engine.stream_generate(
+            "hello",
+            prefill_eviction_callback_attempted=True,
+        ):
+            pass
+
+        call_kwargs = engine._engine.add_request.call_args.kwargs
+        assert call_kwargs["prefill_eviction_callback_attempted"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(

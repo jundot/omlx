@@ -409,6 +409,7 @@ def test_scheduler_headroom_provider_math():
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
         _prefill_abort_cap = Scheduler._prefill_abort_cap
+        _prefill_sizing_target = Scheduler._prefill_sizing_target
 
         def _current_usage_bytes(self):
             return 10 * gib

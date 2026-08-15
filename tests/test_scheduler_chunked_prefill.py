@@ -1149,6 +1149,55 @@ class TestFirstChunkEvictionPreservesPrefix:
         assert req.shared_prefix_blocks == 3
         sched.block_aware_cache.release_cache.assert_not_called()
 
+    def test_partial_external_pause_discards_mutated_prefix(self) -> None:
+        """A retry rebuilds a restored prefix extended by completed chunks."""
+        sched = _make_scheduler(chunked_prefill=False, step_size=4)
+        sched.block_aware_cache = MagicMock()
+        req = _make_request("evict-after-progress", n_tokens=100)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        prompt_cache = [MagicMock()]
+        block_table = MagicMock()
+        sched._prefix_cache_prepared.add(req.request_id)
+        req.prompt_cache = prompt_cache
+        req.cached_tokens = 90
+        req.remaining_tokens = req.prompt_token_ids[90:]
+        req.block_table = block_table
+        req.shared_prefix_blocks = 3
+        eviction = PrefillEvictionRequest(
+            request_id=req.request_id,
+            model_id="test",
+            current_bytes=1,
+            target_cap_bytes=1,
+            predicted_transient_bytes=1,
+            requested_tokens=4,
+            reason="turboquant_mid_prefill",
+            processed_tokens=4,
+        )
+
+        with (
+            patch.object(sched, "_validate_cache", return_value=True),
+            patch.object(
+                sched,
+                "_do_external_prefill",
+                side_effect=_PrefillEvictionNeeded(eviction),
+            ),
+        ):
+            scheduled, rejected = sched._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert req in sched.waiting
+        assert sched._pending_prefill_eviction_request is eviction
+        assert req.prompt_cache is None
+        assert req.cached_tokens == 0
+        assert req.remaining_tokens == req.prompt_token_ids
+        assert req.block_table is None
+        assert req.shared_prefix_blocks == 0
+        assert req.request_id not in sched._prefix_cache_prepared
+        sched.block_aware_cache.release_cache.assert_called_once_with(req.request_id)
+
 
 # ---------------------------------------------------------------------------
 # _schedule_waiting(): specprefill guard defers everything while one is active

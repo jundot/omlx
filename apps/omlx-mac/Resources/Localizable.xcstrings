@@ -11512,6 +11512,24 @@
         }
       }
     },
+    "profile.detail.acceleration.turboquant.mid_prefill" : {
+      "comment" : "TurboQuant profile-chip suffix indicating opt-in conversion when a full prefill chunk cannot fit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "prefill pressure"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "prefill pressure"
+          }
+        }
+      }
+    },
     "profile.detail.acceleration.turboquant.skip" : {
       "comment" : "TurboQuant skip-last-N suffix; placeholder is the layer count",
       "extractionState" : "extracted_with_value",
@@ -22007,20 +22025,56 @@
         }
       }
     },
-    "settings.experimental.turboquant.sub" : {
-      "comment" : "Sublabel describing TurboQuant KV cache",
+    "settings.experimental.turboquant.mid_prefill.label" : {
+      "comment" : "Subordinate TurboQuant row label for converting the KV cache when a full prefill chunk cannot fit",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Quantize the KV cache during prefill. Saves memory at a small quality cost."
+            "value" : "Convert under prefill pressure"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Квантовать KV-кэш во время префилла. Экономит память с небольшой потерей качества."
+            "value" : "Convert under prefill pressure"
+          }
+        }
+      }
+    },
+    "settings.experimental.turboquant.mid_prefill.sub" : {
+      "comment" : "Help text for converting the TurboQuant KV cache once under prefill memory pressure",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "When a full prefill chunk cannot fit, convert the growing KV cache once and continue with TurboQuant. Requires this to be the only loaded model. Adds a one-time pause and may slow the rest of prefill."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "When a full prefill chunk cannot fit, convert the growing KV cache once and continue with TurboQuant. Requires this to be the only loaded model. Adds a one-time pause and may slow the rest of prefill."
+          }
+        }
+      }
+    },
+    "settings.experimental.turboquant.sub" : {
+      "comment" : "Sublabel describing the normal TurboQuant KV cache conversion path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Convert the KV cache after prefill for generation. Saves memory at a small quality cost."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Квантовать KV-кэш после префилла для генерации. Экономит память с небольшой потерей качества."
           }
         },
         "zh-Hans" : {

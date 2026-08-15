@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -26,13 +27,14 @@ import queue
 import shutil
 import stat
 import struct
+import sys
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 
@@ -837,6 +839,41 @@ def _restore_tensor_from_bytes(
     return arr.reshape(shape)
 
 
+class DarwinNoCacheError(OSError):
+    """Darwin refused the required cache-bypass policy for an SSD write."""
+
+
+def _enable_darwin_nocache(fd: int) -> None:
+    """Require ``F_NOCACHE`` on Darwin before any bytes reach the file."""
+    if sys.platform != "darwin":
+        return
+    try:
+        command = fcntl.F_NOCACHE
+    except AttributeError as exc:
+        raise DarwinNoCacheError("fcntl.F_NOCACHE is unavailable on Darwin") from exc
+    try:
+        result = fcntl.fcntl(fd, command, 1)
+    except OSError as exc:
+        raise DarwinNoCacheError(
+            exc.errno,
+            f"failed to enable F_NOCACHE: {exc}",
+        ) from exc
+    if result != 0:
+        raise DarwinNoCacheError(f"F_NOCACHE returned nonzero status {result}")
+
+
+def _write_all(file_obj: BinaryIO, data: bytes) -> None:
+    """Write every byte or raise if an unbuffered descriptor stops progressing."""
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        written = file_obj.write(view[offset:])
+        remaining = len(view) - offset
+        if written is None or written <= 0 or written > remaining:
+            raise OSError(errno.EIO, "unbuffered SSD write made invalid progress")
+        offset += written
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -846,6 +883,9 @@ def _write_safetensors_no_mx(
 
     Safe to call from background threads. Produces files fully compatible
     with mx.load(path, return_metadata=True).
+
+    Darwin requires ``F_NOCACHE`` on the data descriptor before the first byte.
+    Policy setup failure aborts the write without a cached retry.
 
     The safetensors binary format:
       [8 bytes: header_size as little-endian uint64]
@@ -882,11 +922,17 @@ def _write_safetensors_no_mx(
     pad = (8 - len(header_json) % 8) % 8
     header_json += b" " * pad
 
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(header_json)))
-        f.write(header_json)
-        for d in all_data:
-            f.write(d)
+    try:
+        with open(path, "wb", buffering=0) as file_obj:
+            _enable_darwin_nocache(file_obj.fileno())
+            _write_all(file_obj, struct.pack("<Q", len(header_json)))
+            _write_all(file_obj, header_json)
+            for data in all_data:
+                _write_all(file_obj, data)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
 
     return 8 + len(header_json) + offset
 
@@ -1748,6 +1794,22 @@ class PagedSSDCacheManager(CacheManager):
             f"max_size={format_bytes(max_size_bytes)}{hot_info}, "
             f"existing_files={self._index.count}{disk_info}"
         )
+
+    def set_expected_block_payload_bytes(self, payload_bytes: int) -> None:
+        """Resize the writer queue from one conservative serialized block size."""
+        if payload_bytes <= 0:
+            raise ValueError("expected block payload must be positive")
+        block_tokens = max(1, int(self._expected_block_size_tokens))
+        per_token = max(1, (int(payload_bytes) + block_tokens - 1) // block_tokens)
+        cap = _compute_max_pending_writes(
+            block_size_tokens=block_tokens,
+            kv_bytes_per_token=per_token,
+        )
+        with self._write_queue.mutex:
+            self._expected_kv_bytes_per_token = per_token
+            self._max_pending_writes = cap
+            self._write_queue.maxsize = cap
+            self._write_queue.not_full.notify_all()
 
     # --- Hot cache helpers ---
 
@@ -3140,7 +3202,6 @@ class PagedSSDCacheManager(CacheManager):
         file_path = self._get_file_path(block_hash)
 
         try:
-
             # Prepare arrays for safetensors. Three layer_data shapes are
             # accepted:
             # - ``('__nstate__', class_name, [elem0, elem1, ...])`` — V3
@@ -3156,9 +3217,7 @@ class PagedSSDCacheManager(CacheManager):
             #   etc.) has been migrated to emit ``__nstate__`` markers yet.
             arrays = {}
             has_pooling_cache_delta = False
-            cache_list_meta = (
-                {}
-            )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
+            cache_list_meta: dict[str, Any] = {}
 
             # Shim; module-level to avoid a recursive-closure refcount
             # cycle pinning `arrays` — see _store_nstate_elements_flat.
@@ -3856,8 +3915,7 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
             logger.debug(
-                f"Loaded block with metadata from hot cache: "
-                f"{block_hash.hex()[:16]}..."
+                f"Loaded block with metadata from hot cache: {block_hash.hex()[:16]}..."
             )
             return cache_data, metadata_dict
 
@@ -4197,17 +4255,13 @@ class PagedSSDCacheManager(CacheManager):
 
         new_signature = list(layer_cache_types)
         new_canonical = _canonicalize_layer_cache_types(new_signature)
-        new_bits = (
-            float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
-        )
+        new_bits = float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
 
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
             bits_changed = new_bits != self._expected_turboquant_kv_bits
-            subtypes_changed = (
-                cachelist_subtypes != self._expected_cachelist_subtypes
-            )
+            subtypes_changed = cachelist_subtypes != self._expected_cachelist_subtypes
             if (
                 old_canonical == new_canonical
                 and not bits_changed

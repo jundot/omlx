@@ -10,6 +10,13 @@
 
 import SwiftUI
 
+/// Profile-chip detail state for TurboQuant's opt-in mid-prefill conversion.
+/// The child flag is meaningful only while its parent feature is enabled.
+func turboquantMidPrefillDetailIsActive(_ settings: [String: AnyCodable]) -> Bool {
+    boolOf(settings[ProfileSettingsKey.turboquantKvEnabled]) == true
+        && boolOf(settings[ProfileSettingsKey.turboquantMidPrefill]) == true
+}
+
 // MARK: - Scope colors / labels
 
 /// Per-scope visual treatment. Lifted from omlx-screens.jsx:878-884
@@ -980,7 +987,12 @@ struct ProfileDetailCard: View {
                      defaultValue: "skip \(skip)",
                      comment: "TurboQuant skip-last-N suffix; placeholder is the layer count")
             : nil
-        let parts = [bitsText, skipText].compactMap { $0 }
+        let midPrefillText = turboquantMidPrefillDetailIsActive(s)
+            ? String(localized: "profile.detail.acceleration.turboquant.mid_prefill",
+                     defaultValue: "prefill pressure",
+                     comment: "TurboQuant profile-chip suffix indicating opt-in conversion when a full prefill chunk cannot fit")
+            : nil
+        let parts = [bitsText, skipText, midPrefillText].compactMap { $0 }
         return parts.isEmpty
             ? baseName
             : String(localized: "profile.detail.acceleration.turboquant.with_parts",

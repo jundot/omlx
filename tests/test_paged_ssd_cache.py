@@ -10,6 +10,7 @@ import errno
 import gc
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -22,6 +23,7 @@ from unittest.mock import patch
 import pytest
 
 from omlx.cache.paged_ssd_cache import (
+    DarwinNoCacheError,
     PagedSSDBlockMetadata,
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
@@ -1789,9 +1791,9 @@ class TestAsyncWriteAndTimeoutLoad:
         # The old implementation used ThreadPoolExecutor(max_workers=1) which
         # caused deadlocks when mx.load() in a worker thread contested Metal
         # GPU resources with the main inference thread. Verify it's gone.
-        assert not hasattr(
-            ssd_cache, "_load_executor"
-        ), "_load_executor should not exist — it causes Metal GPU deadlocks"
+        assert not hasattr(ssd_cache, "_load_executor"), (
+            "_load_executor should not exist — it causes Metal GPU deadlocks"
+        )
 
     def test_sequential_loads_no_queue_blocking(self, ssd_cache, mx):
         """Regression test: consecutive loads must not block each other."""
@@ -1822,9 +1824,9 @@ class TestAsyncWriteAndTimeoutLoad:
 
         # 5 loads from SSD should complete in well under 5s
         # (each ~2ms read + reconstruction)
-        assert (
-            elapsed < 5.0
-        ), f"Sequential loads took {elapsed:.1f}s — possible queue blocking"
+        assert elapsed < 5.0, (
+            f"Sequential loads took {elapsed:.1f}s — possible queue blocking"
+        )
 
     def test_writer_error_handling(self, ssd_cache, mx):
         """Verify that background writer errors clean up the index."""
@@ -2101,6 +2103,160 @@ class TestAsyncBackgroundWrite:
         assert loaded_meta["block_hash"] == "abc123"
         assert mx.allclose(t1, loaded_arrays["tensor_a"]).item()
         assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
+
+    def test_write_safetensors_enables_darwin_nocache_before_first_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import omlx.cache.paged_ssd_cache as paged_ssd_cache
+
+        events: list[tuple] = []
+
+        class _RecordingFile:
+            def __enter__(self) -> "_RecordingFile":
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                del exc_type, exc, traceback
+
+            def fileno(self) -> int:
+                return 91
+
+            def write(self, data: bytes | bytearray | memoryview) -> int:
+                events.append(("write", bytes(data)))
+                return len(data)
+
+        def _record_fcntl(fd: int, command: int, value: int) -> int:
+            events.append(("fcntl", fd, command, value))
+            return 0
+
+        monkeypatch.setattr(paged_ssd_cache.sys, "platform", "darwin")
+        monkeypatch.setattr(paged_ssd_cache.fcntl, "F_NOCACHE", 48, raising=False)
+        monkeypatch.setattr(paged_ssd_cache.fcntl, "fcntl", _record_fcntl)
+        with patch("builtins.open", return_value=_RecordingFile()) as mocked_open:
+            _write_safetensors_no_mx(
+                "/tmp/nocache-order.safetensors",
+                {"tensor": (b"payload", "U8", [7])},
+            )
+
+        mocked_open.assert_called_once_with(
+            "/tmp/nocache-order.safetensors",
+            "wb",
+            buffering=0,
+        )
+        assert events[0] == ("fcntl", 91, 48, 1)
+        assert all(event[0] == "write" for event in events[1:])
+
+    def test_write_safetensors_retries_unbuffered_short_writes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import omlx.cache.paged_ssd_cache as paged_ssd_cache
+
+        written = bytearray()
+
+        class _ShortWritingFile:
+            def __enter__(self) -> "_ShortWritingFile":
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                del exc_type, exc, traceback
+
+            def fileno(self) -> int:
+                return 93
+
+            def write(self, data: bytes | bytearray | memoryview) -> int:
+                chunk = bytes(data[:3])
+                written.extend(chunk)
+                return len(chunk)
+
+        monkeypatch.setattr(paged_ssd_cache.sys, "platform", "linux")
+        with patch("builtins.open", return_value=_ShortWritingFile()) as mocked_open:
+            expected_size = _write_safetensors_no_mx(
+                "/tmp/short-write.safetensors",
+                {"tensor": (b"payload", "U8", [7])},
+            )
+
+        assert mocked_open.call_count == 1
+        assert len(written) == expected_size
+        assert written.endswith(b"payload")
+
+    @pytest.mark.parametrize("failure", ["missing", "nonzero", "oserror"])
+    def test_write_safetensors_darwin_nocache_failure_has_no_cached_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: str,
+    ) -> None:
+        import omlx.cache.paged_ssd_cache as paged_ssd_cache
+
+        writes: list[bytes] = []
+
+        class _RecordingFile:
+            def __enter__(self) -> "_RecordingFile":
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                del exc_type, exc, traceback
+
+            def fileno(self) -> int:
+                return 92
+
+            def write(self, data: bytes | bytearray | memoryview) -> int:
+                writes.append(bytes(data))
+                return len(data)
+
+        monkeypatch.setattr(paged_ssd_cache.sys, "platform", "darwin")
+        if failure == "missing":
+            monkeypatch.delattr(paged_ssd_cache.fcntl, "F_NOCACHE", raising=False)
+        else:
+            monkeypatch.setattr(
+                paged_ssd_cache.fcntl,
+                "F_NOCACHE",
+                48,
+                raising=False,
+            )
+            if failure == "nonzero":
+                monkeypatch.setattr(
+                    paged_ssd_cache.fcntl,
+                    "fcntl",
+                    lambda *_args: 1,
+                )
+            else:
+                def _raise_oserror(*_args: object) -> None:
+                    raise OSError(errno.EPERM, "not permitted")
+
+                monkeypatch.setattr(
+                    paged_ssd_cache.fcntl,
+                    "fcntl",
+                    _raise_oserror,
+                )
+
+        with (
+            patch("builtins.open", return_value=_RecordingFile()) as mocked_open,
+            pytest.raises(DarwinNoCacheError),
+        ):
+            _write_safetensors_no_mx(
+                "/tmp/nocache-failure.safetensors",
+                {"tensor": (b"payload", "U8", [7])},
+            )
+
+        assert mocked_open.call_count == 1
+        assert writes == []
 
     def test_write_safetensors_bfloat16_roundtrip(self, mx, tmp_path):
         """Verify bfloat16 safetensors file is loadable by mx.load."""
@@ -3033,6 +3189,35 @@ class TestComputeMaxPendingWrites:
         mgr_small.close()
         mgr_large.close()
 
+    def test_manager_resizes_queue_from_whole_block_payload(
+        self, tmp_path: Path
+    ) -> None:
+        """A measured recurrent snapshot can shrink the live writer queue."""
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDCacheManager,
+            _compute_max_pending_writes,
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "resize",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=256,
+            expected_kv_bytes_per_token=50_000,
+        )
+        payload_bytes = 256 * 400_000 + 1
+
+        manager.set_expected_block_payload_bytes(payload_bytes)
+
+        expected_per_token = 400_001
+        expected_cap = _compute_max_pending_writes(
+            block_size_tokens=256,
+            kv_bytes_per_token=expected_per_token,
+        )
+        assert manager._expected_kv_bytes_per_token == expected_per_token
+        assert manager._max_pending_writes == expected_cap
+        assert manager._write_queue.maxsize == expected_cap
+        manager.close()
+
 
 class TestSchedulerPlumbsBlockSizeToSSDCache:
     """The Scheduler construction path must plumb its final
@@ -3120,10 +3305,9 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
             "miscalibrated on every workload"
         )
         assert sched.memory_monitor.has_model_info(), (
-            "_set_model_info_for_monitor must populate dims from "
-            "model.config BEFORE _init_tiered_cache constructs the "
-            "PagedSSDCacheManager; otherwise estimate_block_memory(1) "
-            "returns its 7B-class default fiction"
+            "_set_model_info_for_monitor must populate dims from model.config "
+            "before _init_tiered_cache constructs the manager; otherwise the "
+            "estimator returns its 7B-class default fiction"
         )
 
         # The model-derived per-token KV is what should reach the
@@ -3147,17 +3331,14 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
             f"a value of 200000 indicates a silent fallback to the "
             f"manager default"
         )
-        # And the value the manager received must match
-        # ``memory_monitor.estimate_block_memory(1)`` — the documented
-        # source. Keep both checks: the inline calc above catches
-        # tautological pass-throughs, this one catches drift between
-        # the monitor's calc and the scheduler's wiring.
-        assert mgr._expected_kv_bytes_per_token == (
-            sched.memory_monitor.estimate_block_memory(1)
-        ), (
-            "Scheduler must plumb memory_monitor.estimate_block_memory"
-            "(1) as expected_kv_bytes_per_token"
+        # Dense-only models have no boundary-only state, so the whole-block
+        # writer estimate reduces to the linear KV estimate above.
+        expected_payload = sched.memory_monitor.estimate_paged_writer_block_memory(
+            mgr._expected_block_size_tokens
         )
+        assert mgr._expected_kv_bytes_per_token == math.ceil(
+            expected_payload / mgr._expected_block_size_tokens
+        ), "Scheduler must plumb the whole serialized block payload"
 
         # And the cap computed from those plumbed inputs must drive the
         # write queue's maxsize — the cap is only useful if the queue
@@ -3803,9 +3984,9 @@ class TestLayerSignatureSweep:
         dropped = mgr.invalidate_stale_layer_signature()
 
         assert dropped == 1
-        assert (
-            mgr._index.get(b"bb" * 10) is not None
-        ), "model-B block must not be touched by model-A's sweep"
+        assert mgr._index.get(b"bb" * 10) is not None, (
+            "model-B block must not be touched by model-A's sweep"
+        )
         assert mgr._index.get(b"cc" * 10) is None
 
     def test_sweep_skips_legacy_unnamed_blocks(self, tmp_path: Path):

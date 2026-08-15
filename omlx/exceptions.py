@@ -542,6 +542,10 @@ class InsufficientMemoryError(EnginePoolError):
         super().__init__(message)
 
 
+class TurboQuantProcessExclusiveError(RuntimeError):
+    """Raised when temporary process-wide Metal activity blocks exclusivity."""
+
+
 class ModelLoadingError(EnginePoolError):
     """Raised when a model load is unavailable, blocked, or invalid."""
 

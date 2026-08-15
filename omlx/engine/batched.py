@@ -25,6 +25,24 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+def _configure_turboquant_scheduler(scheduler: Any, model_settings: Any | None) -> None:
+    """Propagate effective TurboQuant settings to a newly-created scheduler."""
+    turboquant_active = bool(getattr(model_settings, "turboquant_kv_enabled", False))
+    scheduler._turboquant_mid_prefill = turboquant_active and bool(
+        getattr(model_settings, "turboquant_mid_prefill", False)
+    )
+    if not turboquant_active:
+        return
+
+    scheduler._turboquant_kv_bits = float(
+        getattr(model_settings, "turboquant_kv_bits", 4)
+    )
+    scheduler._turboquant_skip_last = getattr(
+        model_settings, "turboquant_skip_last", True
+    )
+    scheduler._set_model_info_for_monitor()
+
+
 # Optional Harmony adapter import
 try:
     from ..adapter.harmony import preprocess_harmony_messages
@@ -85,8 +103,8 @@ class BatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
-    ) -> None:
-        await _run_scheduler_preflight_with_cleanup_retry(
+    ) -> bool:
+        callback_attempted = await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
@@ -97,6 +115,7 @@ class BatchedEngine(BaseEngine):
                 None,
             ),
         )
+        return callback_attempted
 
     @property
     def model_name(self) -> str:
@@ -433,17 +452,12 @@ class BatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant KV cache: propagate bits to scheduler
+        # TurboQuant KV cache: propagate effective settings to scheduler
         scheduler = self._engine.engine.scheduler
-        if self._model_settings is not None:
-            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
-            if tq_enabled:
-                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                scheduler._turboquant_kv_bits = tq_bits
-                scheduler._turboquant_skip_last = getattr(
-                    self._model_settings, "turboquant_skip_last", True
-                )
-                scheduler._set_model_info_for_monitor()
+        scheduler._prefill_eviction_callback_configured = (
+            self._prefill_eviction_callback is not None
+        )
+        _configure_turboquant_scheduler(scheduler, self._model_settings)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -737,11 +751,15 @@ class BatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        prefill_eviction_callback_attempted = bool(
+            kwargs.pop("prefill_eviction_callback_attempted", False)
+        )
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            prefill_eviction_callback_attempted=prefill_eviction_callback_attempted,
             **specprefill_kwargs,
         )
 
@@ -813,6 +831,9 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        prefill_eviction_callback_attempted = bool(
+            kwargs.pop("prefill_eviction_callback_attempted", False)
+        )
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -820,6 +841,7 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            prefill_eviction_callback_attempted=prefill_eviction_callback_attempted,
             **specprefill_kwargs,
         )
 
@@ -938,7 +960,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Early prefill memory check for chat completions.
 
         Tokenizes the templated prompt and asks the scheduler whether the
@@ -987,7 +1009,7 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
-        await self._preflight_or_raise_with_eviction(
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
@@ -996,7 +1018,7 @@ class BatchedEngine(BaseEngine):
         prompt: str,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Early prefill memory check for plain /v1/completions calls.
 
         See ``preflight_chat`` for the rationale.
@@ -1017,7 +1039,7 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
-        await self._preflight_or_raise_with_eviction(
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
