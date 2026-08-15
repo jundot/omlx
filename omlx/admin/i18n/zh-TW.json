@@ -828,7 +828,7 @@
   "modal.model_settings.vlm_mtp": "VLM MTP",
   "modal.model_settings.vlm_mtp_hint": "透過外部 MTP drafter 模型進行推測解碼（Gemma 4 assistant 或 Qwen MTP）。單一請求約 1.3–1.6× 加速；並發符合條件的請求退回至標準批次處理。",
   "modal.model_settings.vlm_mtp_conflict": "請先停用 DFlash / SpecPrefill / MTP / TurboQuant KV — VLM MTP 獨佔推測解碼路徑。",
-  "modal.model_settings.vlm_mtp_processor_conflict": "請先取消設定重複懲罰 / 存在懲罰、思考預算和引導語法 — VLM MTP 無法套用逐請求的 logits 處理器。",
+  "modal.model_settings.vlm_mtp_processor_conflict": "請先取消設定重複懲罰 / 存在懲罰和引導語法 — VLM MTP 無法套用這些逐請求的 logits 處理器。支援思考預算。",
   "modal.model_settings.vlm_mtp_processor_locked": "VLM MTP 啟用時鎖定 — 此設定需要逐請求的 logits 處理器，而 VLM MTP 無法套用。",
   "modal.model_settings.vlm_mtp_draft_model": "Drafter 模型",
   "modal.model_settings.vlm_mtp_draft_model_placeholder": "選擇 assistant 或 MTP drafter…",
