@@ -376,8 +376,48 @@ class TestApplyAndForward:
         full = 10**9
         est = estimate_offload_admission_bytes(tmp_path, full, 0.25)
         assert est == full - int(expert_bytes * 0.75)
+        # minimum-eight capacity floor: at fraction 0.05 the runtime still
+        # keeps 8 of 32 experts resident, so savings cap at 75%, not 95%
+        est_tiny = estimate_offload_admission_bytes(tmp_path, full, 0.05)
+        assert est_tiny == full - int(expert_bytes * (1 - 8 / E))
         # unknown path -> conservative fallback
         assert estimate_offload_admission_bytes("/nonexistent", full, 0.25) == full
+
+    def test_admission_estimate_unsupported_layouts(self, tmp_path):
+        """Layouts the wrapper rejects must discount nothing: the estimate
+        may never promise savings that wrap zero layers (reported on the
+        carry PR: a w1/w2/w3 checkpoint estimated at 44% of full size)."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        # Mixtral-style renamed projections, per-expert layout
+        tensors = {}
+        for e in range(4):
+            for proj in ("w1", "w2", "w3"):
+                tensors[f"layers.0.mlp.experts.{e}.{proj}.weight"] = mx.zeros(
+                    (INTER, D), dtype=mx.float16
+                )
+        tensors["lm_head.weight"] = mx.zeros((256, D), dtype=mx.float32)
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**6
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+
+    def test_admission_estimate_unquantized_discounts_nothing(self, tmp_path):
+        """No scales -> the wrapper skips the layer -> no discount."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        tensors = {
+            f"layers.0.mlp.switch_mlp.{proj}.weight": mx.zeros(
+                (E, INTER, D), dtype=mx.float16
+            )
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        }
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**6
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
 
     def test_kill_switch(self, tmp_path, monkeypatch):
         model, _ = self._wrapped_model(tmp_path)

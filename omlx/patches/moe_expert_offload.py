@@ -52,7 +52,10 @@ logger = logging.getLogger(__name__)
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 
-_PER_EXPERT_RE = re.compile(r"\.experts\.\d+\.")
+_PER_EXPERT_PROJ_RE = re.compile(
+    r"^(?P<parent>.+)\.experts\.(?P<idx>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<field>weight|scales|biases)$"
+)
 
 # safetensors dtype tag -> (numpy transport dtype, mlx dtype to view as).
 # bf16 has no numpy equivalent, so it travels as raw uint16 and is
@@ -543,18 +546,29 @@ def estimate_offload_admission_bytes(
 ) -> int:
     """Admission-time size estimate with offload active.
 
-    Scans safetensors headers (no load) for expert tensors in either
-    supported layout — stacked 3-D ``{gate,up,down}_proj`` tensors under any
-    container name (``switch_glu``, ``switch_mlp``, ...) or per-expert
-    ``.experts.<n>.`` names — and subtracts the non-resident share. Falls
-    back to ``full_size`` on any failure — admission must never get more
-    permissive by accident than the plain estimate would be conservative.
+    Derived from the same structural rules ``apply_moe_expert_offload``
+    enforces, so the estimate cannot promise savings the wrapper will not
+    deliver: a container counts only when all three ``{gate,up,down}_proj``
+    projections are present *with quantization scales* (unquantized
+    checkpoints wrap nothing) in a supported layout — stacked 3-D tensors
+    or per-expert ``.experts.<n>.<proj>.<field>`` names. Renamed layouts
+    (Mixtral-style ``w1/w2/w3``) match neither and discount nothing. Each
+    layer's savings honor the runtime's minimum-eight capacity floor:
+    ``capacity = max(8, min(E, round(E * fraction)))``, so tiny fractions
+    do not under-report the resident share. Falls back to ``full_size`` on
+    any failure — admission must never get more permissive by accident.
     """
     try:
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:
             return full_size
-        expert_bytes = 0
+        # container path -> {"bytes", "fields": {(proj, field)}, "e": set}
+        stacked: dict[str, dict] = {}
+        per_expert: dict[str, dict] = {}
+
+        def _bucket(d, key):
+            return d.setdefault(key, {"bytes": 0, "fields": set(), "e": set()})
+
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
             with open(shard, "rb") as f:
                 header_len = struct.unpack("<Q", f.read(8))[0]
@@ -562,16 +576,44 @@ def estimate_offload_admission_bytes(
             for name, spec in header.items():
                 if name == "__metadata__":
                     continue
-                stacked = len(spec.get("shape", ())) == 3 and any(
-                    f".{p}." in name for p in _PROJS
-                )
-                if stacked or _PER_EXPERT_RE.search(name):
-                    b0, b1 = spec["data_offsets"]
-                    expert_bytes += b1 - b0
-        if expert_bytes <= 0:
+                b0, b1 = spec["data_offsets"]
+                m = _PER_EXPERT_PROJ_RE.match(name)
+                if m:
+                    b = _bucket(per_expert, m.group("parent"))
+                    b["bytes"] += b1 - b0
+                    b["fields"].add((m.group("proj"), m.group("field")))
+                    b["e"].add(int(m.group("idx")))
+                    continue
+                shape = spec.get("shape", ())
+                if len(shape) == 3:
+                    parts = name.rsplit(".", 2)
+                    if len(parts) == 3 and parts[1] in _PROJS and parts[2] in (
+                        "weight", "scales", "biases"
+                    ):
+                        b = _bucket(stacked, parts[0])
+                        b["bytes"] += b1 - b0
+                        b["fields"].add((parts[1], parts[2]))
+                        b["e"].add(int(shape[0]))
+
+        required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
+        saved = 0.0
+        for kind, containers in (("stacked", stacked), ("per_expert", per_expert)):
+            for b in containers.values():
+                if not required <= b["fields"]:
+                    continue  # unquantized or partial: wraps nothing
+                if kind == "stacked":
+                    if len(b["e"]) != 1:  # projections disagree on E
+                        continue
+                    n = next(iter(b["e"]))
+                else:
+                    n = len(b["e"])
+                if n <= 0:
+                    continue
+                capacity = max(8, min(n, round(n * resident_fraction)))
+                saved += b["bytes"] * (1.0 - capacity / n)
+        if saved <= 0:
             return full_size
-        saved = int(expert_bytes * (1.0 - resident_fraction))
-        return max(full_size - saved, full_size - expert_bytes)
+        return full_size - int(saved)
     except Exception:
         logger.debug("offload admission estimate failed", exc_info=True)
         return full_size
