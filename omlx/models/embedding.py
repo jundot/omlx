@@ -39,6 +39,10 @@ _CONTEXT_LENGTH_ATTRS = (
 )
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
+# Pooling modes whose result depends on the attention mask. CLS reads a fixed
+# position, so it is mask-independent.
+_MASK_AWARE_POOLING_MODES = ("mean", "lasttoken")
+
 
 @dataclass
 class EmbeddingOutput:
@@ -585,6 +589,58 @@ class MLXEmbeddingModel:
             None,
         )
 
+    def _eager_forward_with_mask(
+        self,
+        processor,
+        normalized_inputs,
+        input_texts,
+        max_length: int,
+        padding: bool,
+        truncation: bool,
+    ):
+        """Eager forward for tokenizer-style processors, keeping the mask.
+
+        ``mlx_embeddings.generate`` is ``prepare_inputs`` + ``model(**inputs)``
+        and returns only the outputs, dropping the mask it just built. When the
+        checkpoint declares a mask-aware pooling mode, run those same two steps
+        here so the mask survives into pooling; the compiled path already has
+        it. Without this, a right-padded batch pools a pad token whenever
+        compile is off or has fallen back. Any preparation failure returns to
+        ``generate()`` unchanged, so this can only add a mask, never remove a
+        working path.
+        """
+        if self._pooling_mode in _MASK_AWARE_POOLING_MODES:
+            inputs = None
+            try:
+                prepared = self._prepare_embedding_inputs(
+                    processor, normalized_inputs, max_length, padding, truncation
+                )
+                inputs = dict(prepared)
+            except Exception as e:
+                # Only input preparation is guarded: a forward error must
+                # surface as it does on every other path, not silently rerun.
+                logger.warning(
+                    "masked eager forward unavailable for %s (%s); falling back "
+                    "to generate() without a mask",
+                    self.model_name,
+                    e,
+                )
+            if inputs is not None:
+                outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
+                return outputs, inputs.get("attention_mask")
+
+        from mlx_embeddings import generate
+
+        outputs = generate(
+            self.model,
+            processor,
+            input_texts,
+            max_length=max_length,
+            padding=padding,
+            truncation=truncation,
+        )
+        return outputs, None
+
     def _detect_input_key_remapping(self) -> None:
         """Check if the model accepts `inputs` instead of `input_ids` and cache the result."""
         try:
@@ -796,6 +852,9 @@ class MLXEmbeddingModel:
                     total_tokens = None
 
             if embeddings_array is None:
+                # Both eager paths must carry the prepared mask the compiled
+                # path passes: pooling is only correct with it.
+                eager_mask = None
                 if uses_custom_embedding_inputs:
                     inputs = self._prepare_embedding_inputs(
                         processor,
@@ -808,18 +867,17 @@ class MLXEmbeddingModel:
                         inputs = dict(inputs)
                     outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
                     total_tokens = self._count_prepared_tokens(inputs)
+                    eager_mask = inputs.get("attention_mask")
                 else:
-                    from mlx_embeddings import generate
-
-                    outputs = generate(
-                        self.model,
+                    outputs, eager_mask = self._eager_forward_with_mask(
                         processor,
+                        normalized_inputs,
                         input_texts,
-                        max_length=max_length,
-                        padding=padding,
-                        truncation=truncation,
+                        max_length,
+                        padding,
+                        truncation,
                     )
-                embeddings_array = self._extract_embeddings_array(outputs)
+                embeddings_array = self._extract_embeddings_array(outputs, eager_mask)
 
         mx.eval(embeddings_array)
         embeddings = embeddings_array.tolist()

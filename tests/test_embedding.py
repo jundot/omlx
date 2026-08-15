@@ -1856,6 +1856,8 @@ class TestDeclaredPoolingMode:
     def _outputs(hidden):
         from types import SimpleNamespace
 
+        import mlx.core as mx
+
         return SimpleNamespace(
             last_hidden_state=hidden,
             # Sentinel: if pooling is honoured, this pre-pooled tensor is unused.
@@ -1913,6 +1915,8 @@ class TestDeclaredPoolingMode:
 
     # ── pooling itself ────────────────────────────────────────────────────
     def test_cls_is_normalized(self, tmp_path):
+        import mlx.core as mx
+
         m = self._model(tmp_path, {"pooling_mode_cls_token": True})
         m._pooling_mode, m._pooling_source = m._resolve_pooling_mode()
         hidden = mx.array([[[3.0, 4.0], [0.0, 1.0]]])
@@ -1929,6 +1933,8 @@ class TestDeclaredPoolingMode:
         bare ``[:, -1]`` reads a pad token. Both must equal the single-input
         result.
         """
+        import mlx.core as mx
+
         for declared, mode in (({"pooling_mode_mean_tokens": True}, "mean"),
                                ({"pooling_mode": "lasttoken"}, "lasttoken")):
             m = self._model(tmp_path / mode, declared)
@@ -1950,3 +1956,97 @@ class TestDeclaredPoolingMode:
                     self._outputs(single),
                     mx.ones((1, keep), dtype=mx.int32)))[0])
             assert np.allclose(batched, np.stack(alone), atol=1e-5), mode
+
+    # ── end-to-end, compile off ───────────────────────────────────────────
+    @staticmethod
+    def _eager_model(tmp_path, processor):
+        """A loaded model on the eager path, declaring last-token pooling."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        m = TestDeclaredPoolingMode._model(tmp_path, {"pooling_mode": "lasttoken"})
+        m._pooling_mode, m._pooling_source = m._resolve_pooling_mode()
+        assert m._pooling_mode == "lasttoken"
+        m._loaded = True
+        m._is_compiled = False
+        m._compiled_embed = None
+        m.processor = processor
+        assert isinstance(m, MLXEmbeddingModel)
+        return m
+
+    # Sequence A holds 2 real tokens then a pad; B holds 3. Right padding is
+    # what Qwen3 / Qwen3-VL tokenizers emit.
+    _E2E_HIDDEN = [
+        [[1.0, 0.0], [0.0, 1.0], [9.0, 9.0]],
+        [[1.0, 1.0], [2.0, 0.0], [0.0, 3.0]],
+    ]
+    _E2E_MASK = [[1, 1, 0], [1, 1, 1]]
+    # Last *real* token of each row, L2-normalized. Without the mask the first
+    # row pools the pad and returns (0.707, 0.707) instead.
+    _E2E_EXPECTED = [[0.0, 1.0], [0.0, 1.0]]
+
+    @classmethod
+    def _batch_model_fn(cls):
+        import mlx.core as mx
+
+        def _call(**kwargs):
+            del kwargs
+            hidden = mx.array(cls._E2E_HIDDEN)
+            return SimpleNamespace(
+                last_hidden_state=hidden,
+                # What a correct checkpoint would have pooled itself; the eager
+                # path must not silently disagree with it.
+                text_embeds=mx.array(cls._E2E_EXPECTED),
+                pooler_output=None,
+            )
+
+        return _call
+
+    def test_eager_batch_is_masked_standard_processor(self, tmp_path):
+        """compile off + right-padded batch: the tokenizer path must pool real tokens.
+
+        ``mlx_embeddings.generate`` drops the mask it builds, so this path
+        pooled a pad token for every mixed-length batch whenever
+        ``OMLX_EMBEDDING_COMPILE=0`` or a compile failure sent it here.
+        """
+        import mlx.core as mx
+
+        class Tokenizer:
+            def __call__(self, texts, **kwargs):
+                del kwargs
+                assert len(texts) == 2
+                return {
+                    "input_ids": mx.array([[1, 2, 0], [1, 2, 3]]),
+                    "attention_mask": mx.array(
+                        TestDeclaredPoolingMode._E2E_MASK, dtype=mx.int32
+                    ),
+                }
+
+        m = self._eager_model(tmp_path / "std", Tokenizer())
+        m.model = self._batch_model_fn()
+
+        out = np.array(m.embed(["ab", "abc"]).embeddings)
+        assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+    def test_eager_batch_is_masked_custom_processor(self, tmp_path):
+        """Same batch through the custom-processor branch (Qwen3-VL style).
+
+        The mask was already in scope here and simply was not passed on.
+        """
+        import mlx.core as mx
+
+        class CustomProcessor:
+            def prepare_embedding_inputs(self, items, return_tensors="mlx"):
+                del return_tensors
+                assert len(items) == 2
+                return {
+                    "input_ids": mx.array([[1, 2, 0], [1, 2, 3]]),
+                    "attention_mask": mx.array(
+                        TestDeclaredPoolingMode._E2E_MASK, dtype=mx.int32
+                    ),
+                }
+
+        m = self._eager_model(tmp_path / "custom", CustomProcessor())
+        m.model = self._batch_model_fn()
+
+        out = np.array(m.embed(["ab", "abc"]).embeddings)
+        assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
