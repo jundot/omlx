@@ -3074,7 +3074,7 @@
                 if (this.clusterPlanError || this.clusterAutoconfigureError) {
                     return window.t('cluster.no_fit_at').replace('{tokens}', this.clusterTokens(
                         this.clusterTargetContextTokens
-                    )} — choose a smaller context or allow more memory.`;
+                    ));
                 }
                 const summary = this.clusterContextMemorySummary();
                 if (!summary) return window.t('cluster.checking_weights');
