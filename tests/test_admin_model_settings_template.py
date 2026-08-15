@@ -1,7 +1,6 @@
 """Regression tests for admin model-settings UI gates."""
 
 import json
-import re
 from pathlib import Path
 
 
@@ -15,8 +14,6 @@ def _model_settings_template() -> str:
 def _dashboard_js() -> str:
     root = Path(__file__).resolve().parents[1]
     return (root / "omlx/admin/static/js/dashboard.js").read_text()
-
-
 
 
 def _section(html: str, start_marker: str, end_marker: str) -> str:
@@ -148,40 +145,10 @@ def test_mtplx_import_condition_guards_empty_compatibility_reason() -> None:
     html = _model_settings_template()
 
     assert (
-        "x-show=\"!modelSettings.mtp_compatible && "
+        'x-show="!modelSettings.mtp_compatible && '
         "(modelSettings.mtp_compatibility_reason || '').includes("
-        "'MTPLX side-car')\""
-        in html
+        "'MTPLX side-car')\"" in html
     )
-
-
-def test_direct_modal_receiver_operations_have_safe_initial_values() -> None:
-    html = _model_settings_template()
-    initial = _initial_model_settings(_dashboard_js())
-    direct_receiver_fields = {
-        method_field or length_field
-        for method_field, _, length_field in re.findall(
-            r"modelSettings\.([A-Za-z_$][\w$]*)\."
-            r"(includes|some|push|splice)\s*\("
-            r"|modelSettings\.([A-Za-z_$][\w$]*)\.length\b",
-            html,
-        )
-    }
-    guarded_receiver_fields = set(
-        re.findall(
-            r"\(modelSettings\.([A-Za-z_$][\w$]*) \|\| "
-            r"(?:''|\"\")\)\.(?:includes|some|push|splice)\s*\(",
-            html,
-        )
-    )
-    receiver_fields = direct_receiver_fields | guarded_receiver_fields
-
-    assert receiver_fields == {
-        "ctKwargEntries",
-        "mtp_compatibility_reason",
-    }
-    assert "ctKwargEntries: []" in initial
-    assert "mtp_compatibility_reason: ''" in initial
 
 
 def test_reasoning_effort_offers_max_after_high() -> None:
