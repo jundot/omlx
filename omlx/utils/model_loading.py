@@ -1127,6 +1127,17 @@ def maybe_load_custom_quantization(
     if not quant_method:
         return None
 
+    if quant_method.lower() == "compressed-tensors":
+        from ..patches import qwen38_modelopt_mixed
+
+        if qwen38_modelopt_mixed.is_supported_config(config):
+            if not is_vlm:
+                raise ValueError(
+                    "The supported Qwen3.8 ModelOpt mixed checkpoint is a VLM; "
+                    "refusing the text-only fallback loader"
+                )
+            return qwen38_modelopt_mixed.load(model_name)
+
     if quant_method.lower() == "paroquant":
         try:
             from paroquant.inference.backends.mlx.load import load as paro_load
