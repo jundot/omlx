@@ -2166,6 +2166,44 @@ class TestAsyncBackgroundWrite:
 
         manager.close()
 
+    def test_arrays_hybrid_write_back_retains_hot_cache_entry(self, tmp_path, mx):
+        """ArraysCache hybrid blocks must enter the RAM tier on write-back."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "arrays_hot_write_back",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+            gdn_ssd_split_enabled=True,
+        )
+        block_hash = b"arrays_hybrid_hot"
+        kv_keys = mx.zeros((1, 2, 16, 8))
+        kv_values = mx.ones((1, 2, 16, 8))
+        recurrent_conv = mx.zeros((2, 8))
+        recurrent_ssm = mx.ones((2, 8))
+
+        try:
+            assert manager.save_block(
+                block_hash=block_hash,
+                cache_data=[
+                    (kv_keys, kv_values),
+                    (
+                        "__nstate__",
+                        "ArraysCache",
+                        [recurrent_conv, recurrent_ssm],
+                    ),
+                ],
+                token_count=16,
+                layer_cache_types=["KVCache", "ArraysCache"],
+                hot_cache_write_back=True,
+            )
+
+            entry = manager._hot_cache_get(block_hash)
+            assert entry is not None
+            assert entry["dirty"] is True
+            assert manager.get_stats().hot_cache_entries == 1
+            assert manager.get_stats().hot_cache_size_bytes > 0
+        finally:
+            manager.close()
+
     def test_pending_writes_bytes_readback(self, tmp_path, mx):
         """Verify load_block can restore mx.arrays from bytes-based pending_writes."""
         manager = PagedSSDCacheManager(
