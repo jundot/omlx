@@ -13,6 +13,31 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_JS = ROOT / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+EN_I18N = ROOT / "omlx" / "admin" / "i18n" / "en.json"
+
+
+def _english_i18n_map() -> str:
+    """Flatten en.json cluster.* keys into a JSON object of dotted keys -> English.
+
+    Dashboard cluster methods translate via ``window.t('cluster.xxx')``; the
+    Node test seam returns real English source so label assertions stay
+    meaningful. Emitted as JSON and parsed with ``JSON.parse`` so quotes and
+    unicode escapes in the values can't break the injected script.
+    """
+
+    def flatten(obj, prefix=""):
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                yield from flatten(value, path)
+            else:
+                yield path, value
+
+    data = json.loads(EN_I18N.read_text(encoding="utf-8"))
+    translations = {
+        key: value for key, value in flatten(data) if key.startswith("cluster.")
+    }
+    return json.dumps(translations)
 
 
 def _method_source(name: str) -> str:
@@ -72,6 +97,7 @@ let deploymentLoads = 0;
 global.window = {{
   location: {{ href: '' }},
   localStorage: {{ setItem: () => {{}} }},
+  t: (key) => {{ const __EN = JSON.parse({json.dumps(_english_i18n_map())}); return __EN[key] ?? key; }},
 }};
 global.setTimeout = () => 0;
 global.clearTimeout = () => {{}};
@@ -215,6 +241,11 @@ const component = {{
   clusterDeployments: [],
   clusterPeerSsh: '',
 }};
+global.window = global.window || {{}};
+if (!global.window.t) {{
+    const __EN = JSON.parse({json.dumps(_english_i18n_map())});
+    global.window.t = (key) => __EN[key] ?? key;
+}}
 {body}
 """
     result = subprocess.run(
