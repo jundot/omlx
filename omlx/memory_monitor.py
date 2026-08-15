@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
+from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -908,12 +909,6 @@ class _DeepSeekV4PrefillMemoryProfile:
     index_topk: int
     dtype_size: float
 
-    # Mirrors the fallback bounds in deepseek_v4_model.py. The indexer
-    # materializes fp32 scores when the optional native extension is absent,
-    # and tiles before an MLX tensor reaches the int32 indexing limit.
-    _INDEXER_POOL_TILE = 16_384
-    _INDEXER_MAX_ELEMS = 2**30
-
     def _pool_cache_elements(
         self,
         num_tokens: int,
@@ -974,23 +969,15 @@ class _DeepSeekV4PrefillMemoryProfile:
         if query_tokens <= 0 or pooled_tokens <= 0:
             return 0
 
-        per_pool = self.index_n_heads * query_tokens
-        score_elements = per_pool * pooled_tokens
-        if score_elements < self._INDEXER_MAX_ELEMS:
-            tile = pooled_tokens
-        else:
-            tile = max(
-                1024,
-                min(
-                    self._INDEXER_POOL_TILE,
-                    self._INDEXER_MAX_ELEMS // max(per_pool, 1),
-                ),
-            )
-
+        score_elements = self.index_n_heads * query_tokens * pooled_tokens
         query = self.index_n_heads * query_tokens * self.index_head_dim * 4
         keys = pooled_tokens * self.index_head_dim * 4
         weights = self.index_n_heads * query_tokens * 4
-        tiled_scores = per_pool * min(tile, pooled_tokens) * 4
+        # The model splits score matmuls to keep each tensor below MLX's int32
+        # indexing limit, then concatenates the reduced shards lazily. MLX can
+        # keep every per-head shard live while evaluating that graph, so the
+        # aggregate peak still approaches the full [H, L, P] fp32 volume.
+        materialized_scores = score_elements * 4
         reduced_scores = query_tokens * pooled_tokens * 4
 
         # _stable_topk_indices keeps the reduced fp32 scores while building
@@ -998,7 +985,24 @@ class _DeepSeekV4PrefillMemoryProfile:
         # conservative bound for the unfused MLX path.
         topk_workspace = 6 * reduced_scores
         selected = query_tokens * min(self.index_topk, pooled_tokens) * 4
-        return query + keys + weights + tiled_scores + topk_workspace + selected
+        return (
+            query
+            + keys
+            + weights
+            + materialized_scores
+            + topk_workspace
+            + selected
+        )
+
+    def _indexer_native_bytes(self, query_tokens: int, pooled_tokens: int) -> int:
+        """Bound the fused native indexer score and deterministic top-k path."""
+        query = (
+            self.index_n_heads * query_tokens * self.index_head_dim * self.dtype_size
+        )
+        weights = self.index_n_heads * query_tokens * self.dtype_size
+        scores = query_tokens * pooled_tokens * self.dtype_size
+        selected = query_tokens * self.index_topk * 4
+        return int(query + weights + scores + selected)
 
     def _sparse_attention_bytes(
         self, query_tokens: int, local_tokens: int, pooled_tokens: int
@@ -1064,7 +1068,17 @@ class _DeepSeekV4PrefillMemoryProfile:
                 * (self.head_dim + self.index_head_dim)
                 * self.dtype_size
             )
-            indexer = self._indexer_fallback_bytes(query_tokens, pooled_tokens)
+            if native_indexer_eligible(
+                query_tokens=query_tokens,
+                pooled_tokens=pooled_tokens,
+                n_heads=self.index_n_heads,
+                head_dim=self.index_head_dim,
+                index_topk=self.index_topk,
+                dtype_supported=self.dtype_size == 2,
+            ):
+                indexer = self._indexer_native_bytes(query_tokens, pooled_tokens)
+            else:
+                indexer = self._indexer_fallback_bytes(query_tokens, pooled_tokens)
             if pooled_tokens <= self.index_topk:
                 attended = local_tokens + pooled_tokens
                 attention = estimate_unfused_sdpa_call_bytes(

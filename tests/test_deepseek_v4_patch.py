@@ -2070,8 +2070,6 @@ class TestIndexerFallbackTiling:
 
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-
         dm = sys.modules["mlx_lm.models.deepseek_v4"]
         config = dm.ModelArgs(
             hidden_size=16,
@@ -2081,22 +2079,22 @@ class TestIndexerFallbackTiling:
             compress_ratios=[4],
             index_n_heads=32,
             index_head_dim=128,
-            index_topk=8,
+            index_topk=512,
         )
         indexer = dm.Indexer(config, compress_ratio=4)
-        pooled = mx.zeros((1, 64, 128), dtype=mx.float16)
+        pooled = mx.zeros((1, 577, 128), dtype=mx.float16)
         monkeypatch.setattr(
             dm.Compressor,
             "__call__",
             lambda self, x, pool_cache, offset: pooled,
         )
-        monkeypatch.setattr(glm_fast, "has_symbol", lambda name: False)
-        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_NATIVE_DISABLED", False)
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: False)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
         monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_FALLBACK_WARNED", False)
 
-        x = mx.zeros((1, 64, 16), dtype=mx.float16)
-        projected_q = mx.zeros((1, 32, 64, 128), dtype=mx.float16)
-        projected_weights = mx.zeros((1, 64, 32), dtype=mx.float16)
+        x = mx.zeros((1, 65, 16), dtype=mx.float16)
+        projected_q = mx.zeros((1, 32, 65, 128), dtype=mx.float16)
+        projected_weights = mx.zeros((1, 65, 32), dtype=mx.float16)
         with caplog.at_level(logging.WARNING, logger=dm.__name__):
             for _ in range(2):
                 result = indexer(

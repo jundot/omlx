@@ -789,6 +789,69 @@ class TestDeepSeekV4PrefillMemoryProfile:
         assert 0 < profiled < 20 * 1024**3
         assert profiled < dense / 4
 
+    def test_prefill_transient_uses_native_indexer_for_unaligned_tail(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+
+        monitor = self._monitor()
+        profile = monitor._prefill_memory_profile
+        assert profile is not None
+        query_tokens = 1817
+        kv_len = 347_929
+        pooled_tokens = kv_len // 4
+
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_eligible",
+            lambda **kwargs: True,
+        )
+        native = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_eligible",
+            lambda **kwargs: False,
+        )
+        fallback = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        native_indexer = profile._indexer_native_bytes(query_tokens, pooled_tokens)
+        fallback_indexer = profile._indexer_fallback_bytes(
+            query_tokens, pooled_tokens
+        )
+        assert native < fallback
+        assert native < 3 * 1024**3
+        assert fallback > 40 * 1024**3
+        assert native_indexer < 1024**3
+        assert fallback_indexer > 30 * 1024**3
+
+    def test_prefill_transient_falls_back_when_native_indexer_is_disabled(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+
+        monitor = self._monitor()
+        calls = []
+
+        def unavailable(**kwargs):
+            calls.append(kwargs)
+            return False
+
+        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", unavailable)
+        estimate = monitor.estimate_chunk_transient_bytes(1817, 347_929)
+
+        assert estimate > 0
+        assert calls == [
+            {
+                "query_tokens": 1817,
+                "pooled_tokens": 347_929 // 4,
+                "n_heads": 64,
+                "head_dim": 128,
+                "index_topk": 512,
+                "dtype_supported": True,
+            }
+        ]
+
     def test_non_v4_config_keeps_generic_estimator(self):
         from omlx.memory_monitor import make_prefill_memory_profile
 
