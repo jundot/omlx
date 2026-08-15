@@ -134,7 +134,7 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
     assert "Coordinator · rank 0" in cluster
-    assert "Worker · rank " in cluster
+    assert "window.t('cluster.worker_rank')" in cluster
     assert "clusterPeerDisplayName()" in cluster
     assert "clusterTopologySummary()" in cluster
     assert "Physical peer detected" not in cluster
@@ -172,7 +172,7 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
     assert "if (this.clusterIpsOverridden) return 'ring'" in javascript
     assert "this.clusterFabric?.backend === 'jaccl'" in javascript
     assert "hosts.length > 0 && !this.clusterIpsOverridden" in javascript
-    assert "TCP ring · manual addresses" in javascript
+    assert "window.t('cluster.tcp_ring_manual')" in javascript
     assert 'clusterFabric && !clusterIpsOverridden' in cluster
     assert "clusterCatalogueInputsReady()" in javascript
     assert "requestKey !== this.clusterCatalogueRequestKey()" in javascript
@@ -190,7 +190,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     assert "data-cluster-neural-fabric" in cluster
     assert "Your compute pool" in cluster
     assert "clusterPairTitle()" in cluster
-    assert "Change model" in cluster
+    assert "window.t('cluster.change_model')" in cluster
     assert "data-cluster-model-picker" in cluster
     assert "data-cluster-primary-action" in cluster
     assert "data-cluster-live-summary" in cluster
@@ -199,7 +199,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     assert "clusterPublicEndpoint()" in cluster
     assert "data-cluster-advanced-toggle" in cluster
     assert "Diagnostics" in cluster
-    assert "Download diagnostic report" in cluster
+    assert "window.t('cluster.download_diagnostic_report')" in cluster
     assert "runClusterPrimaryAction()" in cluster
     assert cluster.count('@click="startCluster()"') >= 1
     assert "clusterShowModelPicker: false" in javascript
@@ -210,8 +210,8 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     # The default path is generated from every detected Mac.
     assert "clusterDeviceCountLabel()" in quick_start
     assert "clusterNodeRankLabel(node)" in quick_start
-    assert "Coordinator · ${rankLabel}" in javascript
-    assert "Worker · ${rankLabel}" in javascript
+    assert "window.t('cluster.coordinator')" in javascript
+    assert "window.t('cluster.worker_node')" in javascript
     assert "Multi-node preview" not in quick_start
     assert "Refresh node" not in quick_start
 
@@ -255,13 +255,13 @@ def test_cluster_model_picker_uses_omlx_models_not_repository_directories():
     assert "Choose a downloaded model" in cluster
     assert 'x-for="model in clusterModelOptions()"' in cluster
     assert "clusterCatalogueFit(model.model_path)" in cluster
-    assert "Recommended for this pool" in javascript
-    assert "Best for this pool" in javascript
-    assert "Uses ${fit.nodes_required} devices" in javascript
+    assert "window.t('cluster.recommended_pool')" in javascript
+    assert "window.t('cluster.best_for_pool')" in javascript
+    assert "window.t('cluster.uses_devices')" in javascript
     assert "Mac Studio only" not in javascript
     assert "clusterModelFailureLabel(fit)" in javascript
     assert "single_node_only" in javascript
-    assert "Does not fit" in javascript
+    assert "window.t('cluster.does_not_fit')" in javascript
     assert "Too large" not in javascript
     assert "clusterModelDisplayName(model)" in cluster
     assert "clusterModelOwner(model)" in cluster
@@ -314,7 +314,7 @@ def test_cluster_model_setup_shows_context_and_per_node_kv_cost():
     assert "Weights" in cluster
     assert "KV cache" in cluster
     assert "clusterSetAutomaticContext()" in cluster
-    assert "'Auto · ' + clusterTokens(" in cluster
+    assert "window.t('cluster.auto_prefix') + clusterTokens(" in cluster
     assert "async clusterSetTargetContext(tokens)" in javascript
     assert "async clusterSetAutomaticContext()" in javascript
     assert javascript.count("target_context_tokens: Number(") >= 4
@@ -373,7 +373,7 @@ def test_cluster_dashboard_groups_cuda_workers_and_shows_pooled_memory():
     stylesheet = _read("omlx/admin/static/css/dashboard.css")
 
     assert "Pooled accelerator memory" in cluster
-    assert "model-usable of" in javascript
+    assert "window.t('cluster.model_usable_of')" in javascript
     assert "clusterLogicalNodes()" in javascript
     assert "connectx-7-auto-pair" in javascript
     assert "Verified CUDA pair" in javascript
@@ -394,7 +394,7 @@ def test_cluster_neural_fabric_uses_real_runtime_measurements():
     stylesheet = _read("omlx/admin/static/css/dashboard.css")
 
     assert "Neural fabric" in cluster
-    assert "Ring latency" in javascript
+    assert "window.t('cluster.metric_ring_latency')" in javascript
     assert "collective_latency_seconds" in javascript
     assert "collective_bandwidth_bytes_per_second" in javascript
     assert "requestActive && aggregateDecode > 0" not in javascript
@@ -406,17 +406,17 @@ def test_cluster_neural_fabric_uses_real_runtime_measurements():
     assert "now`" in javascript
     assert "prefillProgress?.eta" in javascript
     assert "request?.prefill_progress?.active" in javascript
-    assert "Starts after prefill" in javascript
+    assert "window.t('cluster.starts_after_prefill')" in javascript
     assert "completionTokens > 1" in javascript
     assert "lastRequest?.decode_tps" in javascript
     assert "lastRequest?.prefill_tps" in javascript
     assert "cluster-fabric-metric__progress" in cluster
     assert ".cluster-fabric-metric__progress" in stylesheet
-    assert "Collective throughput" in javascript
-    assert "1 MiB all-reduce · startup probe · slowest rank" in javascript
-    assert "Negotiated speed · not measured throughput" in javascript
-    assert "Measured when the cluster starts" in javascript
-    assert "Latest startup probe · slowest hop" in javascript
+    assert "window.t('cluster.metric_collective')" in javascript
+    assert "window.t('cluster.metric_probe_slowest_rank')" in javascript
+    assert "window.t('cluster.metric_negotiated')" in javascript
+    assert "window.t('cluster.metric_when_start')" in javascript
+    assert "window.t('cluster.metric_probe_slowest')" in javascript
     assert "clusterNeuralFabricLinkCapacityGbps()" in javascript
     fabric_job = javascript.split("clusterNeuralFabricJob()", 1)[1].split(
         "clusterNeuralFabricMode()", 1
