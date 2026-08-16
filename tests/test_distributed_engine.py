@@ -126,6 +126,20 @@ async def test_request_read_timeout_env_var_rejects_non_numeric(monkeypatch):
         DistributedBatchedEngine(_deployment())
 
 
+@pytest.mark.asyncio
+async def test_request_read_timeout_rejects_non_finite_and_non_positive(monkeypatch):
+    for bad in ("nan", "inf", "0", "-5"):
+        monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", bad)
+        with pytest.raises(ValueError, match="finite positive"):
+            DistributedBatchedEngine(_deployment())
+
+    monkeypatch.delenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT")
+    with pytest.raises(ValueError, match="finite positive"):
+        DistributedBatchedEngine(_deployment(), request_read_timeout=float("nan"))
+    with pytest.raises(ValueError, match="finite positive"):
+        DistributedBatchedEngine(_deployment(), request_read_timeout=0.0)
+
+
 def _stalled_engine():
     def handler(request):
         raise httpx.ReadTimeout("collective stalled", request=request)
