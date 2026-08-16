@@ -1110,3 +1110,94 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     _run_rank(monkeypatch, tmp_path, rank=0)
 
     assert list(tmp_path.glob("*.json")) == []
+
+
+class _ThinkTokenizer:
+    think_end_id = 55
+    think_start_id = 54
+    unk_token_id = 0
+
+
+def test_think_token_ids_resolves_from_tokenizer_attributes():
+    end_ids, start_id = inference_worker._think_token_ids(_ThinkTokenizer())
+    assert end_ids == [55]
+    assert start_id == 54
+
+
+def test_think_token_ids_falls_back_to_encoding_when_attributes_missing():
+    class Tokenizer:
+        unk_token_id = 0
+
+        def encode(self, text, add_special_tokens=False):
+            return {"</think>": [7, 8]}[text]
+
+    end_ids, start_id = inference_worker._think_token_ids(Tokenizer())
+    assert end_ids == [7, 8]
+    assert start_id is None
+
+
+def test_think_token_ids_returns_empty_when_unsupported():
+    class Tokenizer:
+        @property
+        def think_end_id(self):
+            raise ValueError("no thinking support")
+
+        @property
+        def think_start_id(self):
+            raise ValueError("no thinking support")
+
+        def encode(self, text, add_special_tokens=False):
+            raise ValueError("no thinking support")
+
+    end_ids, start_id = inference_worker._think_token_ids(Tokenizer())
+    assert end_ids == []
+    assert start_id is None
+
+
+def test_install_thinking_budget_support_appends_processor_per_request():
+    from omlx.api.thinking import ThinkingBudgetProcessor
+
+    calls = []
+
+    class FakeServer:
+        @staticmethod
+        def _make_logits_processors(args):
+            calls.append(args)
+            return ["base-processor"]
+
+    server = FakeServer()
+    with inference_worker._install_thinking_budget_support(server, _ThinkTokenizer()):
+        args = SimpleNamespace(chat_template_kwargs={"thinking_budget": 2048})
+        processors = server._make_logits_processors(args)
+        assert len(processors) == 2
+        assert isinstance(processors[1], ThinkingBudgetProcessor)
+        assert processors[1]._budget == 2048
+        assert processors[1]._think_end_ids == [55]
+
+    # No budget: only the base processors.
+    assert server._make_logits_processors(
+        SimpleNamespace(chat_template_kwargs={})
+    ) == ["base-processor"]
+
+    # The original factory is restored after the context exits.
+    assert calls and server._make_logits_processors is FakeServer._make_logits_processors
+
+
+def test_install_thinking_budget_support_is_noop_without_think_tokens():
+    class Tokenizer:
+        @property
+        def think_end_id(self):
+            raise ValueError("no thinking support")
+
+        def encode(self, text, add_special_tokens=False):
+            raise ValueError("no thinking support")
+
+    class FakeServer:
+        @staticmethod
+        def _make_logits_processors(args):
+            return ["base-processor"]
+
+    server = FakeServer()
+    with inference_worker._install_thinking_budget_support(server, Tokenizer()):
+        assert server._make_logits_processors(None) == ["base-processor"]
+    assert server._make_logits_processors is FakeServer._make_logits_processors

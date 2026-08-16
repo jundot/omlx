@@ -285,10 +285,6 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         if kwargs.get("logit_bias"):
             raise ValueError("logit_bias is not yet supported by distributed inference")
-        if kwargs.get("thinking_budget") is not None:
-            raise ValueError(
-                "thinking budgets are not yet supported by distributed inference"
-            )
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
 
@@ -335,6 +331,14 @@ class DistributedBatchedEngine(BatchedEngine):
             payload["stop"] = stop
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
+        chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        # MLX-LM's private server reads thinking budgets from chat_template_kwargs
+        # on the request body, not from a top-level field. Fold it in so the rank
+        # sees it and can build its budget processor per request.
+        if kwargs.get("thinking_budget") is not None:
+            chat_template_kwargs["thinking_budget"] = kwargs["thinking_budget"]
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
         if stream:
             payload["stream_options"] = {"include_usage": True}
         return payload
@@ -395,7 +399,12 @@ class DistributedBatchedEngine(BatchedEngine):
             payload["stop"] = stop
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
-        chat_template_kwargs = kwargs.get("chat_template_kwargs")
+        chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        # MLX-LM's private server reads thinking budgets from chat_template_kwargs
+        # on the request body, not from a top-level field. Fold it in so the rank
+        # sees it and can build its budget processor per request.
+        if kwargs.get("thinking_budget") is not None:
+            chat_template_kwargs["thinking_budget"] = kwargs["thinking_budget"]
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
         if stream:
