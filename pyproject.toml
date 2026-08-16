@@ -140,7 +140,7 @@ grammar = [
     # on macOS arm64, so an open-ended resolver can break Homebrew installs
     # without any oMLX source change (#2428).
     "xgrammar==0.2.3",
-    "apache-tvm-ffi==0.1.11",
+    "apache-tvm-ffi==0.1.13.post3",
 ]
 mcp = [
     "mcp>=1.5.0",
@@ -216,7 +216,7 @@ dev = [
     # pip/uv dev installs unresolvable (#2289). Bump again once
     # upstream lifts the cap.
     "xgrammar==0.2.3",
-    "apache-tvm-ffi==0.1.11",
+    "apache-tvm-ffi==0.1.13.post3",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
 # Keep in sync with [project.optional-dependencies] dev above
@@ -231,7 +231,7 @@ dev = [
     "mcp>=1.5.0",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.3",
-    "apache-tvm-ffi==0.1.11",
+    "apache-tvm-ffi==0.1.13.post3",
 ]
 
 [project.urls]
