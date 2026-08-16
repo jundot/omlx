@@ -12649,6 +12649,29 @@ class Scheduler:
                 ),
             }
 
+        if self.paged_ssd_cache_manager is not None:
+            # The same codec, reported from the other storage layout. Kept
+            # separate from gdn_staging because only one of the two is doing
+            # the encoding for a given configuration.
+            stats["gdn_embedded_state"] = {
+                "state_dtype": self.config.gdn_snapshot_state_dtype,
+                "state_encodes": (
+                    self.paged_ssd_cache_manager.gdn_state_encodes
+                ),
+                "state_dequantizations": (
+                    self.paged_ssd_cache_manager.gdn_state_dequantizations
+                ),
+                "encode_failures": (
+                    self.paged_ssd_cache_manager.gdn_state_encode_failures
+                ),
+                "decode_failures": (
+                    self.paged_ssd_cache_manager.gdn_state_decode_failures
+                ),
+                "capability_fallbacks": (
+                    self.paged_ssd_cache_manager.gdn_capability_fallbacks
+                ),
+            }
+
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()
             stats["prefix_cache"] = prefix_stats
