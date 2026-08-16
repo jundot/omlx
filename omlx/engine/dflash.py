@@ -18,7 +18,6 @@ import math
 import re
 import threading
 import time
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -843,8 +842,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._last_fallback_activity_ts = time.monotonic()
 
     def _should_auto_revert(self) -> bool:
-        """True when fallback mode has been idle long enough to reload dflash."""
+        """True when fallback mode has been idle long enough to reload dflash.
+
+        Only meaningful for VLM fallback (image requests put the engine
+        there). Context-length fallback (BatchedEngine) is a full-speed
+        engine serving an oversized context — reloading dflash would just
+        re-evict on the next long request (churn), so it never auto-reverts.
+        """
         if not self._in_fallback_mode:
+            return False
+        if self._fallback_engine_type != "vlm":
             return False
         cooldown = self._fallback_cooldown_secs
         if not cooldown or cooldown <= 0:
@@ -854,22 +861,48 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return False
         return (time.monotonic() - last) >= cooldown
 
-    async def _reload_dflash_from_fallback(self) -> None:
+    async def _reload_dflash_from_fallback(self) -> bool:
         """Stop the VLM fallback engine and reload the dflash engine.
 
         dflash start() reloads the target + drafter (~1.5s measured) and
         reinstalls the prefix cache (L2 SSD survives; L1 starts empty and
         repopulates on the first request).
+
+        Returns True when the reload succeeded (caller may proceed on the
+        dflash path). Returns False on failure — the engine is left in
+        fallback mode and the caller should serve the request on the
+        fallback engine instead of erroring.
         """
         async with self._fallback_lock:
             if not self._in_fallback_mode:
-                return
+                return True
             logger.info(
                 "DFlash auto-revert: fallback idle >= "
                 f"{self._fallback_cooldown_secs}s, reloading dflash engine"
             )
-            await self.stop()
-            await self.start()
+            try:
+                await self.stop()
+                await self.start()
+            except Exception as exc:
+                # stop() tears down the fallback engine too; if start()
+                # fails afterwards, re-enter fallback so the request still
+                # gets served (slow path) instead of a 500, and reset the
+                # cooldown so we don't retry the reload every request.
+                logger.warning(
+                    f"DFlash auto-revert failed ({exc}); staying in fallback mode"
+                )
+                self._in_fallback_mode = True
+                self._mark_fallback_activity()
+                if self._fallback_engine is None:
+                    try:
+                        await self._evict_dflash_and_start_fallback()
+                    except Exception as exc2:
+                        logger.error(
+                            f"DFlash auto-revert: fallback re-entry failed: {exc2}"
+                        )
+                        return False
+                return False
+            return True
 
     async def stop(self) -> None:
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
@@ -1447,8 +1480,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # requests keep arriving; once idle past the cooldown, reload dflash
         # so text-only traffic runs at full speculative speed again.
         if self._in_fallback_mode:
-            if self._should_auto_revert():
-                await self._reload_dflash_from_fallback()
+            if self._should_auto_revert() and await self._reload_dflash_from_fallback():
+                pass
             else:
                 self._mark_fallback_activity()
                 return await self._fallback_engine.generate(
@@ -1663,8 +1696,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Already in fallback mode — reload dflash once idle past the
         # cooldown, otherwise keep serving and stamp activity.
         if self._in_fallback_mode:
-            if self._should_auto_revert():
-                await self._reload_dflash_from_fallback()
+            if self._should_auto_revert() and await self._reload_dflash_from_fallback():
+                pass
             else:
                 self._mark_fallback_activity()
                 async for output in self._fallback_engine.stream_generate(
@@ -1821,10 +1854,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     tools=tools,
                     **kwargs,
                 )
-            if self._should_auto_revert():
+            if self._should_auto_revert() and await self._reload_dflash_from_fallback():
                 # Text-only chat while in fallback and idle past cooldown:
-                # reload dflash and fall through to the dflash path below.
-                await self._reload_dflash_from_fallback()
+                # dflash reloaded — fall through to the dflash path below.
+                pass
             else:
                 self._mark_fallback_activity()
                 return await self._fallback_engine.chat(
@@ -1925,10 +1958,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 ):
                     yield output
                 return
-            if self._should_auto_revert():
+            if self._should_auto_revert() and await self._reload_dflash_from_fallback():
                 # Text-only chat while in fallback and idle past cooldown:
-                # reload dflash and fall through to the dflash path below.
-                await self._reload_dflash_from_fallback()
+                # dflash reloaded — fall through to the dflash path below.
+                pass
             else:
                 self._mark_fallback_activity()
                 async for output in self._fallback_engine.stream_chat(
