@@ -686,6 +686,20 @@ def maybe_apply_pre_load_patches(
         # paths so mlx-vlm classes are not touched when the load goes
         # through mlx-lm only.
         if for_vlm:
+            has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+            if not has_mtp_weights and mtp_enabled:
+                # The "Speculative backend selected ... (active)" INFO above
+                # reports the requested setting, but without head tensors the
+                # outcome is standard decode — say so at WARNING or the two
+                # lines together read as Lightning MTP running. Emitted
+                # before the patch import so neither an import failure nor a
+                # patch-application failure can suppress it.
+                logger.warning(
+                    "Lightning MTP requested for %s but the checkpoint "
+                    "ships no mtp.* weights; MTPModule attachment "
+                    "skipped, standard decode remains active",
+                    model_name,
+                )
             try:
                 from ..patches.mlx_vlm_mtp import (
                     apply_mlx_vlm_mtp_patch,
@@ -705,7 +719,6 @@ def maybe_apply_pre_load_patches(
                 # and silently downgrade the engine to LLM, dropping
                 # vision. Scan the index for actual mtp.* keys and skip
                 # attachment when they're absent.
-                has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
                 set_mtp_attach_enabled(has_mtp_weights)
 
                 # Sanitize-preservation patch runs unconditionally: the
