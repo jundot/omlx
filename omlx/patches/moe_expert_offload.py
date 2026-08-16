@@ -562,12 +562,15 @@ def estimate_offload_admission_bytes(
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:
             return full_size
-        # container path -> {"bytes", "fields": {(proj, field)}, "e": set}
+        # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
+        # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
+        # Field completeness is tracked PER EXPERT, not container-wide: the
+        # wrapper verifies every expert's tensors, so one complete expert
+        # must not vouch for 31 incomplete ones (reported: 1 complete + 31
+        # gate-only experts estimated 972,736 from 1,000,000 while zero
+        # modules wrapped).
         stacked: dict[str, dict] = {}
         per_expert: dict[str, dict] = {}
-
-        def _bucket(d, key):
-            return d.setdefault(key, {"bytes": 0, "fields": set(), "e": set()})
 
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -579,10 +582,13 @@ def estimate_offload_admission_bytes(
                 b0, b1 = spec["data_offsets"]
                 m = _PER_EXPERT_PROJ_RE.match(name)
                 if m:
-                    b = _bucket(per_expert, m.group("parent"))
+                    b = per_expert.setdefault(
+                        m.group("parent"), {"bytes": 0, "per_e": {}}
+                    )
                     b["bytes"] += b1 - b0
-                    b["fields"].add((m.group("proj"), m.group("field")))
-                    b["e"].add(int(m.group("idx")))
+                    b["per_e"].setdefault(int(m.group("idx")), set()).add(
+                        (m.group("proj"), m.group("field"))
+                    )
                     continue
                 shape = spec.get("shape", ())
                 if len(shape) == 3:
@@ -590,27 +596,32 @@ def estimate_offload_admission_bytes(
                     if len(parts) == 3 and parts[1] in _PROJS and parts[2] in (
                         "weight", "scales", "biases"
                     ):
-                        b = _bucket(stacked, parts[0])
+                        b = stacked.setdefault(
+                            parts[0], {"bytes": 0, "fields": set(), "e": set()}
+                        )
                         b["bytes"] += b1 - b0
                         b["fields"].add((parts[1], parts[2]))
                         b["e"].add(int(shape[0]))
 
         required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
         saved = 0.0
-        for kind, containers in (("stacked", stacked), ("per_expert", per_expert)):
-            for b in containers.values():
-                if not required <= b["fields"]:
-                    continue  # unquantized or partial: wraps nothing
-                if kind == "stacked":
-                    if len(b["e"]) != 1:  # projections disagree on E
-                        continue
-                    n = next(iter(b["e"]))
-                else:
-                    n = len(b["e"])
-                if n <= 0:
-                    continue
-                capacity = max(8, min(n, round(n * resident_fraction)))
-                saved += b["bytes"] * (1.0 - capacity / n)
+        for b in stacked.values():
+            if not required <= b["fields"]:
+                continue  # unquantized or partial: wraps nothing
+            if len(b["e"]) != 1:  # projections disagree on E
+                continue
+            n = next(iter(b["e"]))
+            if n <= 0:
+                continue
+            capacity = max(8, min(n, round(n * resident_fraction)))
+            saved += b["bytes"] * (1.0 - capacity / n)
+        for b in per_expert.values():
+            per_e = b["per_e"]
+            if not per_e or any(not required <= s for s in per_e.values()):
+                continue  # any incomplete expert: the wrapper rejects the layer
+            n = len(per_e)
+            capacity = max(8, min(n, round(n * resident_fraction)))
+            saved += b["bytes"] * (1.0 - capacity / n)
         if saved <= 0:
             return full_size
         return full_size - int(saved)

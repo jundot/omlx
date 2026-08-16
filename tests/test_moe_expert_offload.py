@@ -438,6 +438,55 @@ class TestApplyAndForward:
         full = 10**6
         assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
 
+    def test_admission_estimate_per_expert_requires_every_expert(self, tmp_path):
+        """One complete expert must not vouch for the rest: the wrapper
+        verifies every expert's tensors, so a container with any incomplete
+        expert wraps zero layers and must discount nothing (reported: 1
+        complete + 31 gate-only experts estimated at 97% of full size)."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        tensors = {}
+        prefix = "layers.0.mlp"
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"{prefix}.experts.0.{proj}.weight"] = mx.zeros(
+                (INTER, D // 8), dtype=mx.uint32
+            )
+            tensors[f"{prefix}.experts.0.{proj}.scales"] = mx.zeros(
+                (INTER, D // GROUP), dtype=mx.float16
+            )
+        for e in range(1, 32):
+            tensors[f"{prefix}.experts.{e}.gate_proj.weight"] = mx.zeros(
+                (INTER, D // 8), dtype=mx.uint32
+            )
+        _save_checkpoint(tmp_path, tensors)
+        full = 10**6
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+
+    def test_admission_estimate_per_expert_complete_discounts(self, tmp_path):
+        """Control: a fully-complete per-expert container discounts with the
+        capacity floor (16 experts at 0.25 -> capacity 8 -> 50% resident)."""
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        tensors = {}
+        prefix = "layers.0.mlp"
+        for e in range(16):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                tensors[f"{prefix}.experts.{e}.{proj}.weight"] = mx.zeros(
+                    (INTER, D // 8), dtype=mx.uint32
+                )
+                tensors[f"{prefix}.experts.{e}.{proj}.scales"] = mx.zeros(
+                    (INTER, D // GROUP), dtype=mx.float16
+                )
+        _save_checkpoint(tmp_path, tensors)
+        expert_bytes = sum(v.size * v.dtype.size for v in tensors.values())
+        full = 10**6
+        est = estimate_offload_admission_bytes(tmp_path, full, 0.25)
+        assert est == full - int(expert_bytes * (1 - 8 / 16))
+
     def test_admission_estimate_unquantized_discounts_nothing(self, tmp_path):
         """No scales -> the wrapper skips the layer -> no discount."""
         from omlx.patches.moe_expert_offload import (
