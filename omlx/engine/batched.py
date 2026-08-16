@@ -302,7 +302,10 @@ class BatchedEngine(BaseEngine):
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
-            from ..patches.moe_expert_offload import apply_moe_expert_offload
+            from ..patches.moe_expert_offload import (
+                apply_moe_expert_offload,
+                materialize_offload_state,
+            )
 
             fraction = float(
                 getattr(
@@ -318,6 +321,15 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 fraction,
             )
+            if moe_offload_wrapped:
+                # The caches' slot maps and resident slots live on plain
+                # attributes outside the module tree, so materialize_lazy_state
+                # below never reaches them; left lazy they stay bound to this
+                # loader stream and the first request from an inference thread
+                # dies with "There is no Stream(gpu, N) in current thread".
+                await loop.run_in_executor(
+                    get_mlx_executor(), materialize_offload_state, self._model
+                )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).

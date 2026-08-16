@@ -151,6 +151,41 @@ class TestApplyAndForward:
             assert isinstance(layer.experts.switch_glu, OffloadSwitchGLU)
             assert layer.experts.switch_glu.cache.capacity == 8  # 25% of 32
 
+    def test_materialize_reaches_every_cache_the_module_walk_cannot(self):
+        """The caches' slot maps and resident slots live on plain attributes,
+        invisible to materialize_lazy_state's module walk; left lazy they stay
+        bound to the loader thread's stream and the first request from an
+        inference thread dies with "There is no Stream(gpu, N) in current
+        thread" (reproduced live on the VLM path). The helper must find every
+        wrapped layer and leave its arrays evaluated."""
+        import threading
+
+        from omlx.patches.moe_expert_offload import materialize_offload_state
+
+        holder = {}
+
+        def _build(tmp):
+            model, _ = self._wrapped_model(tmp)
+            apply_moe_expert_offload(model, tmp, resident_fraction=0.25)
+            assert materialize_offload_state(model) == 2
+            holder["model"] = model
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            loader = threading.Thread(target=_build, args=(Path(tmp),))
+            loader.start()
+            loader.join()
+            # a DIFFERENT thread reads the materialized state — exactly the
+            # loader-thread/inference-thread split that crashed the VLM path
+            glu = holder["model"].layers[0].experts.switch_glu
+            x = mx.random.normal((1, 1, D))
+            idx = _ri(1, 1, K, e=E)
+            out = glu(x, idx)
+            mx.eval(out)
+
     def test_decode_bit_exact_at_partial_residency(self, tmp_path):
         model, _ = self._wrapped_model(tmp_path)
         cases = [
