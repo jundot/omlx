@@ -1643,20 +1643,19 @@ class EnginePool:
                 load_settings,
                 base_size=admission_size,
             )
-            admission_kind = "local shard" if deployment is not None else "model"
-
             # Expert offload shrinks the resident footprint before any
             # weights allocate, so admit by the offload-adjusted estimate —
             # otherwise the over-ceiling MoE checkpoints the feature exists
-            # for are rejected before it can run. Estimate falls back to
+            # for are rejected before it can run. Local loads only: a
+            # distributed shard's planned size must not be discounted by
+            # whole-checkpoint expert bytes. Applied AFTER the CPU-share
+            # adjustment above so both corrections compose (the estimate is a
+            # relative discount on the size passed in). Falls back to
             # admission_size on any failure (never more permissive by
             # accident).
-            _adm_settings = runtime_settings
-            if _adm_settings is None and self._settings_manager is not None:
-                _get = getattr(self._settings_manager, "get_settings", None)
-                if callable(_get):
-                    _adm_settings = _get(model_id)
-            if getattr(_adm_settings, "moe_expert_offload_enabled", False):
+            if deployment is None and getattr(
+                admission_settings, "moe_expert_offload_enabled", False
+            ):
                 from .patches.moe_expert_offload import (
                     estimate_offload_admission_bytes,
                 )
@@ -1666,12 +1665,14 @@ class EnginePool:
                     admission_size,
                     float(
                         getattr(
-                            _adm_settings,
+                            admission_settings,
                             "moe_expert_offload_resident_fraction",
                             0.25,
                         )
                     ),
                 )
+
+            admission_kind = "local shard" if deployment is not None else "model"
 
             ceiling = self._current_ceiling()
             best_effort = False
