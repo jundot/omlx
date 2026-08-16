@@ -1035,6 +1035,105 @@ def _remap_nested_visual_on_load(model_dir: Path):
         _vu.load_model = original_load_model
 
 
+@contextlib.contextmanager
+def _force_deepseek_v4_sanitize_on_load(model_dir: Path):
+    """Force mlx-vlm's sanitize path for MLX-format DeepSeek-V4 checkpoints.
+
+    mlx-vlm skips ``Model.sanitize`` when the safetensors metadata declares
+    ``format=mlx``. For deepseek_v4 that skip breaks the load two ways:
+
+    - the ``model.* -> language_model.*`` key remap never runs, so strict
+      ``load_weights`` reports "Received N parameters not in model";
+    - the ``wo_a`` MultiLinear reshape never runs ("Expected shape
+      (8, 1024, 1024) but received (8192, 1024)").
+
+    The VLM load then fails and oMLX silently falls back to the text engine,
+    which drops any VLM-only feature -- in particular the ``vlm_mtp`` external
+    drafter, which only attaches to ``VLMBatchedEngine``. So MLX-format
+    DeepSeek-V4-Flash builds (the mlx-community mxfp8 build and abliterated
+    derivatives) could never use VLM MTP speculative decoding.
+
+    This mirrors ``_force_minimax_m3_moe_sanitize_on_load``: hide the ``format``
+    metadata during load so the upstream sanitize path runs. It additionally
+    expands the per-tensor quantization config with ``language_model.``-prefixed
+    key variants (via ``expand_per_layer_quant_keys``, the same fix already used
+    on the mlx-lm path) so mlx-vlm's quantize class_predicate still matches the
+    mixed mxfp8/mxfp4 per-expert overrides after the prefix remap; without it the
+    routed mxfp4 experts get the default mxfp8 params and ``load_weights`` hits a
+    shape mismatch.
+
+    Scoped to deepseek_v4* MLX-format checkpoints; no-op otherwise.
+    """
+    model_type = _read_config_model_type(model_dir)
+    if not (isinstance(model_type, str) and model_type.startswith("deepseek_v4")):
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+
+    import safetensors
+    import mlx_vlm.utils as _vu
+
+    from ..utils.model_loading import expand_per_layer_quant_keys
+
+    original_safe_open = safetensors.safe_open
+    original_load_config = _vu.load_config
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    def _patched_load_config(model_path, *args, **kwargs):
+        cfg = original_load_config(model_path, *args, **kwargs)
+        try:
+            if Path(model_path).resolve() == target_dir:
+                expand_per_layer_quant_keys(cfg)
+        except Exception:
+            pass
+        return cfg
+
+    safetensors.safe_open = _patched_safe_open
+    _vu.load_config = _patched_load_config
+    try:
+        logger.info(
+            "DeepSeek-V4 MLX-format sanitize patch active for %s",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+        _vu.load_config = original_load_config
+
+
 # Models that only support a single image per request
 SINGLE_IMAGE_ONLY_MODELS = {
     "llava_next",
@@ -1518,6 +1617,7 @@ class VLMBatchedEngine(BaseEngine):
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
+                _force_deepseek_v4_sanitize_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
@@ -1974,6 +2074,16 @@ class VLMBatchedEngine(BaseEngine):
         and loads the correct per-model parser.  Falls back to mlx_lm if the
         mlx_vlm.tool_parsers package is not present.
         """
+        # DeepSeek V4 publishes a minimal chat_template with no DSML tool
+        # grammar, so the generic _infer_tool_parser below returns None: the
+        # model is never shown the tool schema (input side) and any DSML it
+        # emits goes unparsed (output side). Wire the DSML template + parser
+        # explicitly, mirroring the mlx-lm text path
+        # (patches/deepseek_v4/tokenizer_patch.py::apply_load_patch).
+        if (self.model_type or "").startswith("deepseek_v4"):
+            self._inject_deepseek_v4_tool_calling(tokenizer)
+            return
+
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
@@ -2048,6 +2158,60 @@ class VLMBatchedEngine(BaseEngine):
         tokenizer.tool_parser = tool_module.parse_tool_call
 
         logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
+
+    def _inject_deepseek_v4_tool_calling(self, tokenizer) -> None:
+        """Wire DeepSeek V4's DSML chat_template + tool parser into the VLM path.
+
+        DeepSeek V4's published chat_template carries no DSML tool grammar, so
+        the generic ``_inject_tool_calling`` path can neither render tool
+        definitions into the prompt (input side) nor recognise the DSML the
+        model emits (output side). The mlx-lm text path solves this in
+        ``patches/deepseek_v4/tokenizer_patch.py::apply_load_patch`` by
+        overwriting the mlx-lm TokenizerWrapper's callable ``_chat_template``
+        and ``_tool_parser``.
+
+        **Input side.** The VLM chat prompt is built in
+        ``_prepare_vision_inputs`` via ``self._processor.apply_chat_template``
+        (the processor, not ``self._tokenizer``), and the text-only
+        ``_apply_chat_template`` path uses ``self._tokenizer``. Neither
+        respects a callable ``_chat_template`` hook — both delegate to the HF
+        jinja through ``__getattr__``. Since ``__getattr__`` only fires when
+        normal lookup fails, an *instance* ``apply_chat_template`` attribute
+        wins, so we override it on both objects to route through the DSML
+        template. ``_format_messages_for_vlm_template`` flattens content to
+        strings and preserves tool fields, and ``tools`` arrive as a template
+        kwarg, so ``chat_template_v4`` receives exactly what it expects.
+
+        **Output side.** ``omlx.api.tool_calling.parse_tool_calls`` reads
+        ``has_tool_calling`` / ``tool_call_start`` / ``tool_call_end`` /
+        ``tool_parser`` off the tokenizer passed at generation time
+        (``self._tokenizer``) — the same attributes every other model uses.
+        """
+        from ..patches.deepseek_v4 import chat_template_v4, tool_parser_v4
+
+        def _dsml_apply_chat_template(messages, **kwargs):
+            # chat_template_v4.apply_chat_template consumes the kwargs it
+            # knows (tools, add_generation_prompt, enable_thinking ->
+            # thinking_mode) and drops the rest (e.g. tokenize=), so the
+            # engine's template_kwargs can be forwarded verbatim.
+            return chat_template_v4.apply_chat_template(messages, **kwargs)
+
+        # Input side: override on both the prompt-building objects.
+        tokenizer.apply_chat_template = _dsml_apply_chat_template
+        processor = getattr(self, "_processor", None)
+        if processor is not None and processor is not tokenizer:
+            processor.apply_chat_template = _dsml_apply_chat_template
+
+        # Output side: attributes omlx.api.tool_calling reads off the tokenizer.
+        tokenizer.has_tool_calling = True
+        tokenizer.tool_call_start = tool_parser_v4.tool_call_start
+        tokenizer.tool_call_end = tool_parser_v4.tool_call_end
+        tokenizer.tool_parser = tool_parser_v4.parse_tool_call
+
+        logger.info(
+            "VLM tool calling enabled: parser=deepseek_v4 "
+            "(DSML chat_template + tool_parser injected)"
+        )
 
     @staticmethod
     def _count_content_parts(content: Any, part_types: set[str]) -> int:
