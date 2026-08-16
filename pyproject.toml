@@ -60,7 +60,7 @@ dependencies = [
     # fix_mistral_regex backend gate (used by get_tokenizer_config for
     # mistral-common models) first shipped in 5.12.1 — on older 5.x the kwarg
     # is silently swallowed and Tekken prompts stay corrupted.
-    "transformers>=5.12.1,<5.13",
+    "transformers>=5.12.1,<5.16",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
