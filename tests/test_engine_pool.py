@@ -418,19 +418,28 @@ class TestEnginePoolErrors:
     def test_moe_offload_admits_oversized_moe(self, small_mock_model_dir):
         """An MoE checkpoint over the ceiling must admit by the offload-
         adjusted estimate when expert offload is enabled for the model, and
-        still refuse when it is not (#2595 review). The estimator header-scans
-        a real safetensors here: 1600 expert bytes at 25% residency saves
-        1200, so the 2000-byte model admits under the 1500 ceiling."""
+        still refuse when it is not (#2595 review). The estimator only counts
+        containers where all three projections carry weight AND scales — an
+        unquantized or partial container wraps nothing — and floors capacity
+        at 8 experts, so the fixture is a 32-expert quantized container:
+        2400 expert bytes at 25% residency keeps 8 of 32 and saves 1800,
+        so the 2000-byte model admits under the 1500 ceiling."""
         from types import SimpleNamespace
 
         import mlx.core as mx
 
+        experts = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            experts[f"model.layers.0.mlp.switch_glu.{proj}.weight"] = mx.zeros(
+                (32, 5, 4), dtype=mx.uint8
+            )
+            experts[f"model.layers.0.mlp.switch_glu.{proj}.scales"] = mx.zeros(
+                (32, 5, 1), dtype=mx.uint8
+            )
         mx.save_safetensors(
             str(small_mock_model_dir / "model-a" / "model.safetensors"),
             {
-                "model.layers.0.mlp.switch_glu.gate_proj.weight": mx.zeros(
-                    (4, 20, 20), dtype=mx.uint8
-                ),
+                **experts,
                 "model.layers.0.attn.q_proj.weight": mx.zeros((20, 20), dtype=mx.uint8),
             },
         )
