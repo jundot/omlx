@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import json
 import logging
 import time
@@ -103,6 +104,8 @@ class EngineEntry:
     ) = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
+    is_unloading: bool = False  # Reentrancy guard: one _unload_engine() at a time
+    unload_done: asyncio.Event | None = None  # Set when the in-flight unload finishes
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
@@ -1363,7 +1366,7 @@ class EnginePool:
         """
         candidates = []
         for mid, e in self._entries.items():
-            if e.engine is None or e.is_pinned:
+            if e.engine is None or e.is_pinned or e.is_unloading:
                 continue
             if e.in_use > 0:
                 continue
@@ -1386,7 +1389,7 @@ class EnginePool:
         victims: list[str] = []
         blocked: list[str] = []
         for mid, e in self._entries.items():
-            if mid == model_id or e.engine is None:
+            if mid == model_id or e.engine is None or e.is_unloading:
                 continue
             if type(e.engine).__name__ != "DFlashEngine":
                 continue
@@ -1432,7 +1435,13 @@ class EnginePool:
 
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
-        if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
+        if (
+            engine is None
+            or entry.is_pinned
+            or entry.is_loading
+            or entry.in_use > 0
+            or entry.is_unloading
+        ):
             return False
         if self._entry_has_active_requests(entry):
             return False
@@ -1657,196 +1666,259 @@ class EnginePool:
         if not entry or entry.engine is None:
             return
 
-        logger.info(f"Unloading model: {model_id} (immediate abort)")
-        distributed = self._distributed_deployment_for_entry(entry) is not None
-        resident_size = self._entry_resident_size(entry)
-        pre_unload_active = 0 if distributed else mx.get_active_memory()
+        if entry.is_unloading:
+            # Someone else's teardown is already in flight for this
+            # model_id. Capture the Event into a local before awaiting:
+            # the in-flight call's `finally` clears entry.unload_done once
+            # it wakes waiters, but this local reference stays valid.
+            # Waiting (instead of returning immediately) matters because
+            # some callers hold self._lock across this call (the settings-
+            # variant and force-LM reload paths in get_engine) and proceed
+            # to reload immediately after -- a silent no-op return would
+            # let them reload while the in-flight teardown is still
+            # tearing the old engine down.
+            ev = entry.unload_done
+            if ev is not None:
+                await ev.wait()
+            return
+        entry.is_unloading = True
+        entry.unload_done = asyncio.Event()
 
         try:
-            await entry.engine.stop()
-        except Exception as e:
-            if distributed:
-                # Keep the supervisor reachable and the planned memory
-                # accounted so a later unload can retry process teardown.
-                logger.error(
-                    f"Distributed teardown failed for {model_id}; "
-                    "keeping the engine registered for retry",
-                    exc_info=True,
+            logger.info(f"Unloading model: {model_id} (immediate abort)")
+            distributed = (
+                self._distributed_deployment_for_entry(entry) is not None
+            )
+            resident_size = self._entry_resident_size(entry)
+            pre_unload_active = 0 if distributed else mx.get_active_memory()
+
+            abort = getattr(entry.engine, "abort_all_requests", None)
+            if inspect.iscoroutinefunction(abort):
+                try:
+                    aborted = await abort(
+                        error_message=(
+                            f"Request aborted: model '{model_id}' was unloaded"
+                        ),
+                        error_code="model_unloaded",
+                        reason=f"to unload model '{model_id}'",
+                    )
+                    if aborted:
+                        logger.warning(
+                            f"Aborted {aborted} tracked request(s) "
+                            f"before unloading {model_id}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Error aborting in-flight requests for {model_id}: {e}"
+                    )
+            else:
+                logger.debug(
+                    f"Engine for {model_id} has no async abort_all_requests; "
+                    f"in-flight requests (if any) are not aborted before unload"
                 )
-                self._wake_process_memory_enforcer()
-                raise
-            logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        # #1595: the immediate-abort stop() above tears the engine down without the normal
-        # per-request completion callbacks, so a non-streaming engine's active_requests
-        # counter can leak a phantom count (a stale engine then looks permanently busy).
-        # Reset it on teardown so has_active_requests() and the status API stay consistent.
-        reset = getattr(entry.engine, "_reset_activity_tracking", None)
-        if callable(reset):
-            try:
-                reset()
-            except Exception as e:
-                logger.warning(f"Error resetting activity counter for {model_id}: {e}")
-
-        # Yield to the event loop before dropping the engine reference.
-        #
-        # When abort_all_requests() fires before _unload_engine(), it sets
-        # asyncio Events for each active request.  Server-side streaming
-        # generators are then scheduled in the asyncio ready queue, but they
-        # cannot run until the event loop gets control.  EngineCore.close()
-        # (called inside stop()) blocks the event loop with synchronous
-        # .result() calls on the MLX executor -- scheduler.shutdown() and
-        # scheduler.deep_reset() -- so those generators are still suspended
-        # when stop() returns.
-        #
-        # If we set entry.engine = None and call gc.collect() immediately,
-        # the generators are still alive with a local 'engine' variable
-        # referencing the BatchedEngine, keeping its refcount above zero.
-        # The model's ~20 GB of MLX weight tensors therefore remain "active"
-        # in Metal memory, the settle barrier times out, and subsequent load
-        # attempts fail with 507 because the ceiling is still exceeded.
-        #
-        # A few asyncio.sleep(0) calls drain the ready queue -- generator
-        # tear-down is at most a few frames deep -- so that by the time we
-        # clear entry.engine and run gc.collect(), no coroutine frame holds
-        # a stale engine reference.
-        for _ in range(5):
+            # The abort above has no internal awaits (see
+            # EngineCore.abort_all_requests), so it runs to completion without
+            # yielding to the event loop. Two bare asyncio.sleep(0) calls give
+            # woken consumer generators a turn each to drain their terminal
+            # output before stop()/close() below clears the collectors out from
+            # under them (same trick used again further down, after stop()).
+            await asyncio.sleep(0)
             await asyncio.sleep(0)
 
-        # Clear engine reference before settle barrier
-        entry.engine = None
-        entry.last_access = 0.0
-        entry.actual_size = None
-        entry.abort_requested = False
-        entry.pending_unload_reason = None
-        entry.runtime_settings_signature = None
+            try:
+                await entry.engine.stop()
+            except Exception as e:
+                if distributed:
+                    # Keep the supervisor reachable and the planned memory
+                    # accounted so a later unload can retry process teardown.
+                    logger.error(
+                        f"Distributed teardown failed for {model_id}; "
+                        "keeping the engine registered for retry",
+                        exc_info=True,
+                    )
+                    self._wake_process_memory_enforcer()
+                    raise
+                logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        if distributed:
-            # Cluster weights live in supervised rank processes, not this
-            # process's Metal allocator. Successful supervisor teardown is
-            # the memory barrier; polling mx.get_active_memory() here would
-            # wait against an unrelated gauge and then run emergency reclaim.
-            gc.collect()
-            self._current_model_memory = max(
-                0,
-                self._current_model_memory - resident_size,
-            )
-            logger.info(
-                f"Unloaded distributed model: {model_id}, "
-                f"released local shard process "
-                f"({format_size(resident_size)} planned)"
-            )
-            self._wake_process_memory_enforcer()
-            return
+            # #1595: the immediate-abort stop() above tears the engine down without the normal
+            # per-request completion callbacks, so a non-streaming engine's active_requests
+            # counter can leak a phantom count (a stale engine then looks permanently busy).
+            # Reset it on teardown so has_active_requests() and the status API stay consistent.
+            reset = getattr(entry.engine, "_reset_activity_tracking", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception as e:
+                    logger.warning(f"Error resetting activity counter for {model_id}: {e}")
 
-        # Force garbage collection to release memory.
-        # Run mx.clear_cache on the global MLX executor to avoid concurrent
-        # Metal operations with running engines. See issue #85.
-        # Synchronize before clearing to prevent releasing Metal buffers
-        # still referenced by in-flight command buffers. See issue #300.
-        gc.collect()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+            # Yield to the event loop before dropping the engine reference.
+            #
+            # When abort_all_requests() fires before _unload_engine(), it sets
+            # asyncio Events for each active request.  Server-side streaming
+            # generators are then scheduled in the asyncio ready queue, but they
+            # cannot run until the event loop gets control.  EngineCore.close()
+            # (called inside stop()) blocks the event loop with synchronous
+            # .result() calls on the MLX executor -- scheduler.shutdown() and
+            # scheduler.deep_reset() -- so those generators are still suspended
+            # when stop() returns.
+            #
+            # If we set entry.engine = None and call gc.collect() immediately,
+            # the generators are still alive with a local 'engine' variable
+            # referencing the BatchedEngine, keeping its refcount above zero.
+            # The model's ~20 GB of MLX weight tensors therefore remain "active"
+            # in Metal memory, the settle barrier times out, and subsequent load
+            # attempts fail with 507 because the ceiling is still exceeded.
+            #
+            # A few asyncio.sleep(0) calls drain the ready queue -- generator
+            # tear-down is at most a few frames deep -- so that by the time we
+            # clear entry.engine and run gc.collect(), no coroutine frame holds
+            # a stale engine reference.
+            for _ in range(5):
+                await asyncio.sleep(0)
 
-        # Memory settle barrier: poll actual freed memory instead of
-        # trusting the cumulative _current_model_memory estimate.
-        # Scale tolerance with model size: estimated_size includes a 5%
-        # overhead factor (model_discovery.py) that may not be reflected in
-        # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
-        min_expected_freed = max(0, resident_size - settle_tolerance)
-        settled = False
-        settle_indeterminate = False
-        for _settle_round in range(10):
-            active_now = mx.get_active_memory()
-            actual_freed = pre_unload_active - active_now
-            if actual_freed >= min_expected_freed:
-                settled = True
-                logger.debug(
-                    f"Settle round {_settle_round + 1} for '{model_id}': "
-                    f"freed={format_size(actual_freed)} "
-                    f"(need>={format_size(min_expected_freed)}) - settled"
+            # Clear engine reference before settle barrier
+            entry.engine = None
+            entry.last_access = 0.0
+            entry.actual_size = None
+            entry.abort_requested = False
+            entry.pending_unload_reason = None
+            entry.runtime_settings_signature = None
+
+            if distributed:
+                # Cluster weights live in supervised rank processes, not this
+                # process's Metal allocator. Successful supervisor teardown is
+                # the memory barrier; polling mx.get_active_memory() here would
+                # wait against an unrelated gauge and then run emergency reclaim.
+                gc.collect()
+                self._current_model_memory = max(
+                    0,
+                    self._current_model_memory - resident_size,
                 )
-                break
-            if self._other_entries_serving(model_id):
-                # actual_freed is a delta of the process-global MLX gauge,
-                # so while another engine allocates (prefill/KV growth) the
-                # amount freed by THIS unload is unmeasurable — the delta can
-                # even read negative. Burning settle rounds here serializes
-                # gc/synchronize/clear_cache against live decode for seconds,
-                # under memory pressure, with the enforcer holding the pool
-                # lock. Bail out instead: pre-load admission re-reads the
-                # live gauge, so nothing downstream trusts this sample.
-                settle_indeterminate = True
                 logger.info(
-                    f"Settle for '{model_id}' indeterminate under concurrent "
-                    f"activity (freed={format_size(actual_freed)}, "
-                    f"need>={format_size(min_expected_freed)}); skipping "
-                    f"settle wait"
+                    f"Unloaded distributed model: {model_id}, "
+                    f"released local shard process "
+                    f"({format_size(resident_size)} planned)"
                 )
-                break
-            logger.debug(
-                f"Settle round {_settle_round + 1} for '{model_id}': "
-                f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)}) - retry"
-            )
-            await asyncio.sleep(0.5)
+                self._wake_process_memory_enforcer()
+                return
+
+            # Force garbage collection to release memory.
+            # Run mx.clear_cache on the global MLX executor to avoid concurrent
+            # Metal operations with running engines. See issue #85.
+            # Synchronize before clearing to prevent releasing Metal buffers
+            # still referenced by in-flight command buffers. See issue #300.
             gc.collect()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
             )
 
-        # Release memory tracking AFTER barrier
-        self._current_model_memory = max(0, self._current_model_memory - resident_size)
-
-        if settled:
-            logger.info(
-                f"Unloaded model: {model_id}, "
-                f"freed={format_size(actual_freed)} "
-                f"(expected>={format_size(min_expected_freed)}), "
-                f"active_memory: {format_size(active_now)} (settled)"
-            )
-        elif settle_indeterminate:
-            # Settle wait skipped (logged above). Emergency reclaim is
-            # deliberately skipped too: its gc + synchronize + clear_cache
-            # rounds would stall the live engines that made the measurement
-            # indeterminate in the first place. Recovery is not lost:
-            # _wake_process_memory_enforcer() below triggers an immediate
-            # enforcer re-poll, and pre-load admission re-reads the live gauge
-            # alongside the tracked accumulator (the #1623 max() in
-            # get_engine), so any unreleased memory stays visible to both.
-            pass
-        else:
-            # Barrier timed out - try emergency reclaim
-            logger.warning(
-                f"Settle barrier timed out for '{model_id}': "
-                f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)})"
-            )
-            for _ in range(3):
+            # Memory settle barrier: poll actual freed memory instead of
+            # trusting the cumulative _current_model_memory estimate.
+            # Scale tolerance with model size: estimated_size includes a 5%
+            # overhead factor (model_discovery.py) that may not be reflected in
+            # actual freed memory. Use 2 GB floor for small models. See #768.
+            settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
+            min_expected_freed = max(0, resident_size - settle_tolerance)
+            settled = False
+            settle_indeterminate = False
+            for _settle_round in range(10):
+                active_now = mx.get_active_memory()
+                actual_freed = pre_unload_active - active_now
+                if actual_freed >= min_expected_freed:
+                    settled = True
+                    logger.debug(
+                        f"Settle round {_settle_round + 1} for '{model_id}': "
+                        f"freed={format_size(actual_freed)} "
+                        f"(need>={format_size(min_expected_freed)}) - settled"
+                    )
+                    break
+                if self._other_entries_serving(model_id):
+                    # actual_freed is a delta of the process-global MLX gauge,
+                    # so while another engine allocates (prefill/KV growth) the
+                    # amount freed by THIS unload is unmeasurable — the delta can
+                    # even read negative. Burning settle rounds here serializes
+                    # gc/synchronize/clear_cache against live decode for seconds,
+                    # under memory pressure, with the enforcer holding the pool
+                    # lock. Bail out instead: pre-load admission re-reads the
+                    # live gauge, so nothing downstream trusts this sample.
+                    settle_indeterminate = True
+                    logger.info(
+                        f"Settle for '{model_id}' indeterminate under concurrent "
+                        f"activity (freed={format_size(actual_freed)}, "
+                        f"need>={format_size(min_expected_freed)}); skipping "
+                        f"settle wait"
+                    )
+                    break
+                logger.debug(
+                    f"Settle round {_settle_round + 1} for '{model_id}': "
+                    f"freed={format_size(actual_freed)} "
+                    f"(need>={format_size(min_expected_freed)}) - retry"
+                )
+                await asyncio.sleep(0.5)
                 gc.collect()
                 await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
-                await asyncio.sleep(1.0)
-            active_after = mx.get_active_memory()
-            if active_after > self._current_model_memory + 5 * 1024**3:
-                logger.error(
-                    f"Emergency reclaim failed for '{model_id}': "
-                    f"active_memory={format_size(active_after)} "
-                    f"exceeds safe threshold "
-                    f"({format_size(self._current_model_memory + 5 * 1024**3)})"
-                )
-            else:
-                logger.info(
-                    f"Emergency reclaim succeeded: "
-                    f"active_memory={format_size(active_after)}"
+                    get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
                 )
 
-        self._wake_process_memory_enforcer()
+            # Release memory tracking AFTER barrier
+            self._current_model_memory = max(
+                0, self._current_model_memory - resident_size
+            )
+
+            if settled:
+                logger.info(
+                    f"Unloaded model: {model_id}, "
+                    f"freed={format_size(actual_freed)} "
+                    f"(expected>={format_size(min_expected_freed)}), "
+                    f"active_memory: {format_size(active_now)} (settled)"
+                )
+            elif settle_indeterminate:
+                # Settle wait skipped (logged above). Emergency reclaim is
+                # deliberately skipped too: its gc + synchronize + clear_cache
+                # rounds would stall the live engines that made the measurement
+                # indeterminate in the first place. Recovery is not lost:
+                # _wake_process_memory_enforcer() below triggers an immediate
+                # enforcer re-poll, and pre-load admission re-reads the live gauge
+                # alongside the tracked accumulator (the #1623 max() in
+                # get_engine), so any unreleased memory stays visible to both.
+                pass
+            else:
+                # Barrier timed out - try emergency reclaim
+                logger.warning(
+                    f"Settle barrier timed out for '{model_id}': "
+                    f"freed={format_size(actual_freed)} "
+                    f"(need>={format_size(min_expected_freed)})"
+                )
+                for _ in range(3):
+                    gc.collect()
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+                    await asyncio.sleep(1.0)
+                active_after = mx.get_active_memory()
+                if active_after > self._current_model_memory + 5 * 1024**3:
+                    logger.error(
+                        f"Emergency reclaim failed for '{model_id}': "
+                        f"active_memory={format_size(active_after)} "
+                        f"exceeds safe threshold "
+                        f"({format_size(self._current_model_memory + 5 * 1024**3)})"
+                    )
+                else:
+                    logger.info(
+                        f"Emergency reclaim succeeded: "
+                        f"active_memory={format_size(active_after)}"
+                    )
+
+            self._wake_process_memory_enforcer()
+        finally:
+            entry.is_unloading = False
+            done_event = entry.unload_done
+            if done_event is not None:
+                done_event.set()
+            entry.unload_done = None
 
     def _schedule_failed_load_reclaim(
         self, model_id: str, pre_load_memory: int

@@ -36,6 +36,7 @@ from typing import (
 import mlx.core as mx
 
 from .exceptions import (
+    ModelUnloadedError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -50,6 +51,7 @@ from .utils.compile_cache import (
 )
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.hardware import format_bytes
+from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,13 @@ def _raise_request_output_error(output: RequestOutput) -> None:
                 int(estimated_bytes) if estimated_bytes is not None else None
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
+        )
+    if output.error_code == "model_unloaded":
+        metadata = output.error_metadata or {}
+        request_id = metadata.get("request_id")
+        raise ModelUnloadedError(
+            message=output.error or "Request aborted: model was unloaded",
+            request_id=str(request_id) if request_id is not None else output.request_id,
         )
     raise RuntimeError(output.error)
 
@@ -688,98 +697,121 @@ class EngineCore:
 
         return result
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        error_message: Optional[str] = None,
+        error_code: str = "prefill_memory_aborted",
+        reason: str = "due to memory pressure",
+    ) -> int:
         """Abort all active requests without stopping the engine.
 
         Sends error output to all active collectors and marks requests
         for deferred abort in the scheduler. Cleanup is handled by
         the consumer (stream_outputs/generate).
-        """
-        from .utils.proc_memory import get_phys_footprint
 
+        Args:
+            error_message: Message put on each aborted request's output and
+                new_text. None (the default, used by the memory enforcer)
+                builds the usage/ceiling/watermark diagnosis below. Callers
+                with an unrelated reason (e.g. a manual model unload) should
+                pass their own message so clients are not told a fabricated
+                memory diagnosis.
+            error_code: Error code put on each aborted request's output.
+                Defaults to "prefill_memory_aborted" so existing callers keep
+                today's HTTP 400 / JSON-keepalive classification unchanged.
+            reason: Human-readable clause for the summary log line below.
+        """
         request_ids = list(self._output_collectors.keys())
-        ceiling = 0
-        watermark = 0
-        sched = self.scheduler
-        if sched is not None:
-            ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
-            watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
-        usage = get_phys_footprint()
-        usage_gb = usage / (1024**3)
-        ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
-        watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
-        # Name the component ceiling that actually produced this abort. A
-        # generic "loosen memory_guard_tier" leaves users who are already on
-        # `aggressive` with nothing to try (#2362); the ladder points at the
-        # constraint that is really binding, or falls back to the same
-        # generic advice when the enforcer has not propagated a breakdown.
-        binding, advice = describe_ceiling_binding(
-            static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
-            dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
-            metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
-            tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
-            current=usage,
-            fmt=format_bytes,
-            tail="reduce context length",
-        )
-        advice = f"{advice}."
-        ceiling_label = f"{binding} ceiling" if binding != "effective" else "ceiling"
+
+        if error_message is None:
+            ceiling = 0
+            watermark = 0
+            sched = self.scheduler
+            if sched is not None:
+                ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
+                watermark = int(
+                    getattr(sched, "_memory_hard_watermark_bytes", 0) or 0
+                )
+            usage = get_phys_footprint()
+            usage_gb = usage / (1024**3)
+            ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
+            watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
+            # Name the component ceiling that actually produced this abort. A
+            # generic "loosen memory_guard_tier" leaves users who are already on
+            # `aggressive` with nothing to try (#2362); the ladder points at the
+            # constraint that is really binding, or falls back to the same
+            # generic advice when the enforcer has not propagated a breakdown.
+            binding, advice = describe_ceiling_binding(
+                static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
+                dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
+                metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
+                tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
+                current=usage,
+                fmt=format_bytes,
+                tail="reduce context length",
+            )
+            advice = f"{advice}."
+            ceiling_label = (
+                f"{binding} ceiling" if binding != "effective" else "ceiling"
+            )
+            # Name the watermark that actually tripped; printing only the
+            # ceiling reads as "usage below limit yet aborted" (#2321).
+            if watermark > 0 and ceiling > 0:
+                error_message = (
+                    f"Request aborted: process memory limit exceeded "
+                    f"(usage {usage_gb:.1f} GB, abort threshold "
+                    f"(hard watermark) {watermark_gb:.1f} GB, "
+                    f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                    f"{advice}"
+                )
+            elif ceiling > 0:
+                error_message = (
+                    f"Request aborted: process memory limit exceeded "
+                    f"(usage {usage_gb:.1f} GB, "
+                    f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                    f"{advice}"
+                )
+            else:
+                error_message = (
+                    f"Request aborted: process memory limit exceeded "
+                    f"(usage {usage_gb:.1f} GB). "
+                    f"{advice}"
+                )
+            limit_bytes = watermark or ceiling or None
+        else:
+            limit_bytes = None
+
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                # Name the watermark that actually tripped; printing only the
-                # ceiling reads as "usage below limit yet aborted" (#2321).
-                if watermark > 0 and ceiling > 0:
-                    error_msg = (
-                        f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, abort threshold "
-                        f"(hard watermark) {watermark_gb:.1f} GB, "
-                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
-                        f"{advice}"
-                    )
-                elif ceiling > 0:
-                    error_msg = (
-                        f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, "
-                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
-                        f"{advice}"
-                    )
-                else:
-                    error_msg = (
-                        f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB). "
-                        f"{advice}"
-                    )
                 collector.put(
                     RequestOutput(
                         request_id=rid,
                         finished=True,
                         finish_reason="error",
-                        new_text=f"\n\n[Error: {error_msg}]",
-                        error=error_msg,
+                        new_text=f"\n\n[Error: {error_message}]",
+                        error=error_message,
                         # Without a code this surfaced as a bare RuntimeError:
                         # the JSON keepalive wrapper never saw a memory error,
                         # so the response generator died mid-body and the
                         # client got a truncated read plus a 500 traceback
                         # instead of the same actionable 400 the pre-flight
                         # guard returns.
-                        error_code="prefill_memory_aborted",
+                        error_code=error_code,
                         error_metadata={
                             "request_id": rid,
                             # Only the limit is reported: the exception's
                             # estimated_bytes means "predicted peak", and this
                             # abort fires on measured usage, which the message
                             # already states.
-                            "limit_bytes": watermark or ceiling or None,
+                            "limit_bytes": limit_bytes,
                         },
                     )
                 )
             self._mark_request_finished(rid)
         if request_ids:
-            logger.warning(
-                f"Aborted {len(request_ids)} requests due to memory pressure"
-            )
+            logger.warning(f"Aborted {len(request_ids)} requests {reason}")
             self._wake_engine_loop()
         return len(request_ids)
 
@@ -1311,12 +1343,19 @@ class AsyncEngineCore:
             return False
         return await engine.abort_request(request_id)
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        error_message: Optional[str] = None,
+        error_code: str = "prefill_memory_aborted",
+        reason: str = "due to memory pressure",
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         engine = getattr(self, "engine", None)
         if engine is None:
             return 0
-        return await engine.abort_all_requests()
+        return await engine.abort_all_requests(
+            error_message=error_message, error_code=error_code, reason=reason
+        )
 
     async def stream_outputs(
         self,

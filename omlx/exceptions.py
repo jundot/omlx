@@ -570,6 +570,26 @@ class ModelBusyError(EnginePoolError):
         )
 
 
+class ModelUnloadedError(EnginePoolError):
+    """
+    An in-flight request was aborted because its model was manually
+    unloaded mid-request.
+
+    Raised by _raise_request_output_error() when a collector output carries
+    error_code="model_unloaded" (set by EnginePool._unload_engine() via
+    EngineCore.abort_all_requests()). A distinct type from the memory-guard
+    exceptions so clients are never told a fabricated memory diagnosis for
+    what is actually an operator-initiated unload.
+
+    Attributes:
+        request_id: The request that was aborted.
+    """
+
+    def __init__(self, message: str, request_id: str | None = None):
+        self.request_id = request_id
+        super().__init__(message)
+
+
 # =============================================================================
 # MCP Errors
 # =============================================================================

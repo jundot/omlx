@@ -188,6 +188,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    ModelUnloadedError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
@@ -829,6 +830,54 @@ def _prefill_memory_openai_error_body(
     if exc.limit_bytes is not None:
         content["error"]["limit_bytes"] = exc.limit_bytes
     return content
+
+
+def _model_unloaded_openai_error_body(
+    exc: ModelUnloadedError,
+    *,
+    status_code: int = 503,
+) -> dict:
+    """Same body SHAPE as _prefill_memory_openai_error_body(), distinct code.
+
+    No estimated_bytes/limit_bytes: this abort has no memory diagnosis to
+    report, unlike its PrefillMemoryExceededError sibling above. Defaults to
+    503, not 400: an operator-initiated unload is a transient server
+    condition the client can retry, not a malformed/oversized request —
+    OpenAI-SDK clients treat invalid_request_error (what 400 maps to) as
+    do-not-retry.
+    """
+    content = _openai_error_body(str(exc), status_code, code="model_unloaded")
+    content["type"] = "error"
+    content["error"]["omlx_code"] = "model_unloaded"
+    return content
+
+
+@app.exception_handler(ModelUnloadedError)
+async def model_unloaded_handler(request: FastAPIRequest, exc: ModelUnloadedError):
+    """Map a manual-unload abort to HTTP 503 with a clear JSON body.
+
+    Mirrors prefill_memory_exceeded_handler below. Covers a pre-response-
+    start raise (the response has not begun streaming yet, so a normal
+    exception-handler mapping applies) -- without this, ModelUnloadedError
+    would fall through to the generic 500 handler and lose the message.
+    """
+    status_code = 503
+    detail = str(exc)
+    logger.warning(
+        "%s %s → %d: %s",
+        request.method,
+        request.url.path,
+        status_code,
+        detail,
+    )
+    if _is_api_route(request):
+        content = _model_unloaded_openai_error_body(exc, status_code=status_code)
+    else:
+        content = {
+            "detail": detail,
+            "omlx_code": "model_unloaded",
+        }
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(PrefillMemoryExceededError)
@@ -2188,6 +2237,9 @@ async def _with_sse_keepalive(
                     if isinstance(e, PrefillMemoryExceededError):
                         logger.warning(f"SSE generator prefill rejected: {e}")
                         error_data = _prefill_memory_openai_error_body(e)
+                    elif isinstance(e, ModelUnloadedError):
+                        logger.warning(f"SSE generator request aborted: {e}")
+                        error_data = _model_unloaded_openai_error_body(e)
                     else:
                         logger.error(f"SSE generator error: {e}")
                         error_data = {
@@ -2287,6 +2339,15 @@ async def _with_json_keepalive(
         except PrefillMemoryExceededError as e:
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
+            return
+        except ModelUnloadedError as e:
+            # Same JSON-keepalive body shape as the memory-guard path above,
+            # so clients get a parseable error instead of the truncated read
+            # + dropped connection an unclassified exception would leave
+            # here (the response already started: headers + leading
+            # keepalive space are already on the wire).
+            logger.warning(f"JSON keepalive request aborted: {e}")
+            yield json.dumps(_model_unloaded_openai_error_body(e))
             return
         if result is not None:
             yield result

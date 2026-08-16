@@ -1118,8 +1118,15 @@ class BatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        error_message: str | None = None,
+        error_code: str = "prefill_memory_aborted",
+        reason: str = "due to memory pressure",
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         if self._engine and self._engine.engine:
-            return await self._engine.engine.abort_all_requests()
+            return await self._engine.engine.abort_all_requests(
+                error_message=error_message, error_code=error_code, reason=reason
+            )
         return 0

@@ -11,7 +11,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.exceptions import (
+    ModelUnloadedError,
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+)
 
 
 def _build_test_app():
@@ -22,6 +26,7 @@ def _build_test_app():
     app.add_exception_handler(
         PrefillMemoryExceededError, srv.prefill_memory_exceeded_handler
     )
+    app.add_exception_handler(ModelUnloadedError, srv.model_unloaded_handler)
 
     @app.get("/v1/raise")
     def raise_prefill_too_large():
@@ -55,6 +60,13 @@ def _build_test_app():
         raise PrefillMemoryExceededError(
             message="Prefill would require ~50 GB peak but limit is 40 GB.",
             request_id="req-xyz",
+        )
+
+    @app.get("/v1/raise-unload")
+    def raise_model_unloaded():
+        raise ModelUnloadedError(
+            message="Request aborted: model 'demo' was unloaded",
+            request_id="req-unload",
         )
 
     return app
@@ -132,6 +144,33 @@ class TestPrefillMemoryHandler:
         assert body["omlx_code"] == "prefill_memory_exceeded"
 
 
+class TestModelUnloadedHandler:
+    """A ModelUnloadedError that escapes before the response starts must
+    reach the client as a clean, typed 503 -- not fall through to the
+    generic 500 handler and lose the message. No current production path
+    raises it that early (generation errors surface inside the keepalive
+    wrappers), so this pins the handler's contract as the backstop for
+    any future pre-response raise site."""
+
+    def test_returns_503(self):
+        with TestClient(_build_test_app()) as client:
+            resp = client.get("/v1/raise-unload")
+        assert resp.status_code == 503
+
+    def test_api_route_uses_openai_error_body(self):
+        with TestClient(_build_test_app()) as client:
+            resp = client.get("/v1/raise-unload")
+        body = resp.json()
+        assert body["type"] == "error"
+        assert body["error"]["message"] == "Request aborted: model 'demo' was unloaded"
+        assert body["error"]["code"] == "model_unloaded"
+        assert body["error"]["omlx_code"] == "model_unloaded"
+        # 503 (server_error), not 400 (invalid_request_error) -- retryable,
+        # operator-initiated, not a malformed/oversized client request.
+        assert body["error"]["type"] == "server_error"
+        assert "memory" not in body["error"]["message"].lower()
+
+
 class TestPostCommitPrefillMemorySurface:
     @pytest.mark.asyncio
     async def test_json_keepalive_emits_openai_error_body(self):
@@ -187,6 +226,85 @@ class TestPostCommitPrefillMemorySurface:
         body = json.loads(data)
         assert body["error"]["code"] == "prefill_memory_exceeded"
         assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
+
+
+class TestPostCommitModelUnloadedSurface:
+    """A manual model unload mid-request must surface the same way the
+    memory-guard abort does above: a clean, parseable JSON error body, not
+    a truncated read.
+
+    Before this wrapper case existed, error_code="model_unloaded" fell
+    through _raise_request_output_error() to a bare RuntimeError, which
+    _with_json_keepalive() did not catch. Since the response had already
+    started (headers + leading keepalive space already on the wire), the
+    uncaught exception left the client with a dropped connection instead
+    of an error body.
+    """
+
+    @pytest.mark.asyncio
+    async def test_json_keepalive_emits_model_unloaded_body(self):
+        import json
+
+        import omlx.server as srv
+
+        class _Request:
+            async def is_disconnected(self):
+                return False
+
+        async def _raise_late():
+            raise ModelUnloadedError(
+                message="Request aborted: model 'demo' was unloaded",
+                request_id="req-unload",
+            )
+
+        chunks = [
+            chunk
+            async for chunk in srv._with_json_keepalive(
+                _Request(), _raise_late(), disconnect_poll=0.001
+            )
+        ]
+        # A truncated/uncaught path would raise out of the loop above
+        # instead of yielding a complete body to parse here.
+        body = json.loads("".join(chunks))
+        assert body["type"] == "error"
+        assert body["error"]["code"] == "model_unloaded"
+        assert body["error"]["omlx_code"] == "model_unloaded"
+        assert body["error"]["message"] == "Request aborted: model 'demo' was unloaded"
+        assert "memory" not in body["error"]["message"].lower()
+        # 503 (transient, retryable), not 400 (invalid_request_error, which
+        # OpenAI-SDK clients treat as do-not-retry) -- an operator unload is
+        # a server condition, not a malformed/oversized request.
+        assert body["error"]["type"] == "server_error"
+
+    @pytest.mark.asyncio
+    async def test_sse_keepalive_emits_model_unloaded_chunk(self):
+        """Drives ``_with_sse_keepalive`` directly: an escaping
+        ModelUnloadedError yields the same code/omlx_code fields as the
+        JSON-keepalive path above. On today's streaming routes the route
+        generator's own except block terminates the stream first, so
+        this branch is the wrapper-level backstop, mirroring the prefill
+        branch beside it."""
+        import json
+
+        import omlx.server as srv
+
+        async def _gen():
+            raise ModelUnloadedError(
+                message="Request aborted: model 'demo' was unloaded",
+                request_id="req-sse-unload",
+            )
+            yield ""
+
+        chunks = [
+            chunk
+            async for chunk in srv._with_sse_keepalive(_gen(), keepalive_chunk=None)
+        ]
+        assert chunks[-1] == "data: [DONE]\n\n"
+        data = chunks[0].removeprefix("data: ").strip()
+        body = json.loads(data)
+        assert body["error"]["code"] == "model_unloaded"
+        assert body["error"]["omlx_code"] == "model_unloaded"
+        assert body["error"]["type"] == "server_error"
 
 
 class TestResponsesEndpointReaches400:

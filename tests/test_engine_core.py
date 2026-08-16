@@ -24,7 +24,11 @@ from omlx.engine_core import (
     EngineCore,
     _raise_request_output_error,
 )
-from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.exceptions import (
+    ModelUnloadedError,
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+)
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
@@ -1292,6 +1296,66 @@ class TestEngineCoreAbortAllRequests:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_abort_all_requests_default_reason_preserved(
+        self, mock_model, mock_tokenizer
+    ):
+        """Calling with no args keeps the enforcer's memory-guard contract:
+        the "prefill_memory_aborted" code and the built usage/ceiling text."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                rid = await engine.add_request(prompt="Hello")
+                count = await engine.abort_all_requests()
+                assert count == 1
+
+                collector = engine._output_collectors.get(rid)
+                assert collector is not None
+                output = collector.get_nowait()
+                assert output.error_code == "prefill_memory_aborted"
+                assert "memory limit" in output.error
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_custom_reason(self, mock_model, mock_tokenizer):
+        """A caller-supplied error_message/error_code (e.g. a manual model
+        unload) reaches the collector output verbatim, with no fabricated
+        memory-guard diagnosis and a distinct, non-memory error_code."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                rid = await engine.add_request(prompt="Hello")
+                count = await engine.abort_all_requests(
+                    error_message="Request aborted: model 'demo' was unloaded",
+                    error_code="model_unloaded",
+                )
+                assert count == 1
+
+                collector = engine._output_collectors.get(rid)
+                assert collector is not None
+                output = collector.get_nowait()
+                assert output.error_code == "model_unloaded"
+                assert output.error == "Request aborted: model 'demo' was unloaded"
+                assert "memory limit" not in output.error
+                assert "memory limit" not in output.new_text
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_abort_all_requests_engine_keeps_running(
         self, mock_model, mock_tokenizer
     ):
@@ -1888,3 +1952,34 @@ class TestMemoryAbortErrorSurface:
                 self._abort_output(error_code=None, error_metadata=None)
             )
         assert not isinstance(exc.value, PrefillMemoryExceededError)
+
+    def test_model_unloaded_code_raises_typed_error(self):
+        """A manual-unload abort must not be classified as a memory error —
+        clients would be told a fabricated memory diagnosis otherwise."""
+        with pytest.raises(ModelUnloadedError) as exc:
+            _raise_request_output_error(
+                self._abort_output(
+                    error="Request aborted: model 'demo' was unloaded",
+                    error_code="model_unloaded",
+                    error_metadata={"request_id": "req-abort", "limit_bytes": None},
+                )
+            )
+        assert exc.value.request_id == "req-abort"
+        assert not isinstance(exc.value, PrefillMemoryExceededError)
+
+    def test_error_code_contract_across_all_three_types(self):
+        """Each error_code must keep raising its own type — the memory
+        codes must not regress when a third, unrelated code is added."""
+        with pytest.raises(PrefillMemoryAbortedError):
+            _raise_request_output_error(self._abort_output())
+        with pytest.raises(PrefillMemoryExceededError):
+            _raise_request_output_error(
+                self._abort_output(error_code="prefill_memory_exceeded")
+            )
+        with pytest.raises(ModelUnloadedError):
+            _raise_request_output_error(
+                self._abort_output(
+                    error="Request aborted: model 'demo' was unloaded",
+                    error_code="model_unloaded",
+                )
+            )

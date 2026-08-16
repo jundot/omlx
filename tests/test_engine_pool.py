@@ -828,6 +828,33 @@ class TestEnginePoolLRU:
         # model-a skipped (active requests), model-b selected
         assert victim == "model-b"
 
+    def test_find_lru_victim_skips_mid_unload(self, pool_with_entries):
+        """A model whose _unload_engine() is already in flight must not be
+        picked as a fresh victim.
+
+        Regression guard (F1): the admission eviction loop calls
+        `await self._unload_engine(victim); continue` in a tight while
+        loop held under self._lock. If the finder kept returning a
+        mid-unload entry, _unload_engine's wait-for-completion path would
+        make every iteration block on the SAME in-flight teardown instead
+        of ever converging -- filtering it out here is the belt to the
+        wait-semantics braces in _unload_engine itself.
+        """
+        mock_a = MagicMock()
+        mock_a.has_active_requests.return_value = False
+        pool_with_entries._entries["model-a"].engine = mock_a
+        pool_with_entries._entries["model-a"].last_access = 50  # Older
+        pool_with_entries._entries["model-a"].is_unloading = True
+
+        mock_b = MagicMock()
+        mock_b.has_active_requests.return_value = False
+        pool_with_entries._entries["model-b"].engine = mock_b
+        pool_with_entries._entries["model-b"].last_access = 200  # Newer
+
+        victim = pool_with_entries._find_lru_victim()
+        # model-a skipped (mid-unload), model-b selected
+        assert victim == "model-b"
+
     def test_find_lru_victim_all_active(self, pool_with_entries):
         """Test that None is returned when all models have active requests."""
         for mid in ("model-a", "model-b"):
@@ -1367,6 +1394,231 @@ class TestEnginePoolAsync:
         mock_engine.stop.assert_called_once()
         assert pool.current_model_memory < initial_memory
         assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_aborts_inflight_requests_before_stop(
+        self, pool_with_mock_engines
+    ):
+        """_unload_engine must abort in-flight requests before stopping the engine.
+
+        Manual unload used to stop the engine without aborting active requests,
+        leaving their streaming generators awaiting output forever. Ordering
+        matters: abort_all_requests() must fire while the engine is still
+        alive, before stop() tears it down.
+        """
+        pool = pool_with_mock_engines
+        call_order: list[str] = []
+        abort_kwargs: dict = {}
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        async def fake_abort_all_requests(**kwargs):
+            abort_kwargs.update(kwargs)
+            call_order.append("abort")
+            return 2
+
+        async def fake_stop():
+            call_order.append("stop")
+
+        mock_engine.abort_all_requests = AsyncMock(side_effect=fake_abort_all_requests)
+        mock_engine.stop = AsyncMock(side_effect=fake_stop)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool._unload_engine("model-a")
+
+        mock_engine.abort_all_requests.assert_called_once()
+        mock_engine.stop.assert_called_once()
+        assert call_order == ["abort", "stop"]
+        # The reason must be model-unload-specific, never the fabricated
+        # memory-guard diagnosis (#2321-style client-facing regression).
+        assert abort_kwargs["error_code"] == "model_unloaded"
+        assert "model-a" in abort_kwargs["error_message"]
+        assert "memory" not in abort_kwargs["error_message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_skips_non_coroutine_abort_attr(
+        self, pool_with_mock_engines
+    ):
+        """A present-but-non-async abort_all_requests attribute must be
+        skipped outright, not entered and caught as an error.
+
+        A bare MagicMock() auto-generates a plain (non-coroutine) attribute
+        for any name accessed, including abort_all_requests. Awaiting it
+        would raise TypeError; the guard must recognize it is not an
+        async method and never call it at all.
+        """
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        # mock_engine.abort_all_requests is left as the auto-generated,
+        # non-coroutine MagicMock attribute (the case under test).
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool._unload_engine("model-a")
+
+        mock_engine.abort_all_requests.assert_not_called()
+        mock_engine.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_without_abort_all_requests_still_unloads(
+        self, pool_with_mock_engines
+    ):
+        """Engines without abort_all_requests (e.g. embedding engines) still unload."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock(spec=["start", "stop"])
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool._unload_engine("model-a")
+
+        mock_engine.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_survives_abort_all_requests_error(
+        self, pool_with_mock_engines
+    ):
+        """A raising abort_all_requests() must not block teardown (fail-open)."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.abort_all_requests = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool._unload_engine("model-a")
+
+        mock_engine.abort_all_requests.assert_called_once()
+        mock_engine.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_reentrancy_waits_for_completion(
+        self, pool_with_mock_engines
+    ):
+        """A concurrent unload of the same model waits for the in-flight
+        teardown instead of double-running it.
+
+        Manual unload has no caller-side lock (both HTTP routes call
+        _unload_engine directly). A silent early-return on the second
+        caller (the old reentrancy guard) is a correctness bug of its own:
+        the admission eviction loop holds self._lock across this call in a
+        tight `await self._unload_engine(victim); continue` loop, so a
+        no-op return spins that loop against a victim that never actually
+        goes away. The second caller must block until teardown is
+        genuinely complete, and only then return.
+        """
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        stop_gate = asyncio.Event()
+
+        async def controlled_stop():
+            await stop_gate.wait()
+
+        mock_engine.stop = AsyncMock(side_effect=controlled_stop)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            entry = pool._entries["model-a"]
+            initial_memory = pool.current_model_memory
+            estimated_size = entry.estimated_size
+
+            task1 = asyncio.create_task(pool._unload_engine("model-a"))
+            # Let task1 run up to its block inside stop().
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert entry.is_unloading is True
+
+            task2 = asyncio.create_task(pool._unload_engine("model-a"))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            # Teardown has not finished -- neither caller has returned, and
+            # the engine reference is still live.
+            assert not task1.done()
+            assert not task2.done()
+            assert entry.engine is not None
+
+            stop_gate.set()
+            await asyncio.gather(task1, task2)
+
+        mock_engine.stop.assert_called_once()
+        assert entry.engine is None
+        assert pool.current_model_memory == initial_memory - estimated_size
+        assert entry.is_unloading is False
+        assert entry.unload_done is None
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_second_caller_yields_to_event_loop(
+        self, pool_with_mock_engines
+    ):
+        """The second caller's wait suspends the event loop, it does not
+        spin it.
+
+        F1 regression shape: proves the second _unload_engine() call is a
+        genuine suspension point by scheduling an independent marker task
+        alongside it and observing the marker runs (and completes) while
+        the second call is still pending -- a synchronous no-op return
+        would instead let the second call finish in the same turn it
+        started, before the marker task gets to run at all.
+        """
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        stop_gate = asyncio.Event()
+
+        async def controlled_stop():
+            await stop_gate.wait()
+
+        mock_engine.stop = AsyncMock(side_effect=controlled_stop)
+
+        marker_ran: list[bool] = []
+
+        async def marker_task():
+            await asyncio.sleep(0)
+            marker_ran.append(True)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            entry = pool._entries["model-a"]
+
+            task1 = asyncio.create_task(pool._unload_engine("model-a"))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert entry.is_unloading is True
+
+            marker = asyncio.create_task(marker_task())
+            task2 = asyncio.create_task(pool._unload_engine("model-a"))
+
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            # The marker got a full turn (proof task2 yielded instead of
+            # running to completion synchronously), and task2 is still
+            # waiting on the in-flight teardown.
+            assert marker_ran == [True]
+            assert not task2.done()
+
+            stop_gate.set()
+            await asyncio.gather(task1, task2, marker)
+
+        assert entry.engine is None
 
     @pytest.mark.asyncio
     async def test_shutdown_unloads_all(self, pool_with_mock_engines):
