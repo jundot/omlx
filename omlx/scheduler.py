@@ -12311,7 +12311,12 @@ class Scheduler:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir),
                         pending_max_bytes=self.config.gdn_ssd_pending_max_bytes,
-                        gdn_sidecar_state_dtype=(
+                        # Under the embedded layout these boundary snapshots
+                        # are an ephemeral staging step whose state is handed
+                        # to the block payload, which encodes it there.
+                        # Encoding here too would quantize the same state
+                        # twice for storage that does not outlive the request.
+                        gdn_snapshot_state_dtype=(
                             self.config.gdn_snapshot_state_dtype
                             if self.config.gdn_ssd_split_enabled
                             else "fp32"

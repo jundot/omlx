@@ -599,11 +599,67 @@ def _decode_shape(shape_str: str) -> tuple:
     return tuple(int(d) for d in shape_str.split(","))
 
 
+# Suffix for an encoded recurrent-state payload. The flat ``{elem_key}``
+# tensor is deliberately not written alongside it: an older reader, which
+# knows nothing about ``_storage_codec`` metadata, then hits its existing
+# ``Missing {elem_key} in arrays`` path and skips the block instead of
+# reading an int16 payload as fp32. New blocks are therefore safe to mix
+# with fp32 ones in the same cache directory, with no signature bump and
+# no invalidation of what is already there.
+_GDN_ENCODED_SUFFIX = "__q"
+_GDN_SCALE_SUFFIX = "__scale"
+
+
+class _EmbeddedGDNStateCodec:
+    """Applies the GDN state codec to state embedded in a cache block.
+
+    One instance per ``save_block`` call. It owns the deferred finiteness
+    checks for the whole block so the encode costs a single GPU->CPU sync
+    rather than one per layer, and reports back to the manager's counters.
+
+    Only the caller knows which layers are Arrays-family, so eligibility is
+    split: the caller decides *whether* to hand a layer to this codec, and
+    this class decides whether the individual element qualifies.
+    """
+
+    def __init__(self, state_dtype: str) -> None:
+        self.state_dtype = state_dtype
+        self.checks: list[tuple[str, tuple[int, ...], Any]] = []
+        self.encoded = 0
+        self.capability_fallbacks = 0
+
+    def try_encode(
+        self,
+        arrays: dict[str, Any],
+        cache_list_meta: dict[str, str],
+        elem_key: str,
+        state_index: int,
+        elem: Any,
+    ) -> bool:
+        """Encode one element in place. Returns False to store it raw."""
+        if not gdn_codec.is_recurrent_state_payload(state_index, elem, min_rank=2):
+            return False
+        if not gdn_codec.codec_supports_tensor(self.state_dtype, elem):
+            self.capability_fallbacks += 1
+            return False
+        stored, scale, encoding = gdn_codec.encode_state(
+            elem, self.state_dtype, self.checks
+        )
+        arrays[f"{elem_key}{_GDN_ENCODED_SUFFIX}"] = stored
+        if scale is not None:
+            arrays[f"{elem_key}{_GDN_SCALE_SUFFIX}"] = scale
+        for suffix, value in encoding.metadata_suffixes().items():
+            cache_list_meta[f"{elem_key}_{suffix}"] = value
+        self.encoded += 1
+        return True
+
+
 def _store_nstate_elements_flat(
     arrays: dict[str, Any],
     cache_list_meta: dict[str, str],
     prefix: str,
     elements,
+    codec: _EmbeddedGDNStateCodec | None = None,
 ) -> None:
     """Write N elements as ``{prefix}_state_{k}`` keys with a
     ``{prefix}_state_count`` count marker. Zero-dim shapes are
@@ -642,19 +698,67 @@ def _store_nstate_elements_flat(
             sub_elements = elem[2] if len(elem) >= 3 else []
             if sub_class:
                 cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
-            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, sub_elements)
+            _store_nstate_elements_flat(
+                arrays,
+                cache_list_meta,
+                elem_key,
+                sub_elements,
+                codec if gdn_codec.is_arrays_cache_family(sub_class) else None,
+            )
         elif isinstance(elem, (tuple, list)):
             # Bare tuple/list of sub-elements — recurse, no flat
             # tensor written.
             cache_list_meta[f"{elem_key}_nested"] = "tuple"
-            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, list(elem))
+            _store_nstate_elements_flat(
+                arrays, cache_list_meta, elem_key, list(elem), codec
+            )
         else:
             if not isinstance(elem, mx.array):
                 raise TypeError(
                     f"unsupported non-array nstate element "
                     f"{elem_key}: {type(elem).__name__}"
                 )
-            arrays[elem_key] = elem
+            if codec is None or not codec.try_encode(
+                arrays, cache_list_meta, elem_key, k, elem
+            ):
+                arrays[elem_key] = elem
+
+
+def _decode_embedded_gdn_state(
+    arrays: dict[str, Any],
+    file_metadata: dict[str, str],
+    elem_key: str,
+    codec: str,
+    checks: list[tuple[str, tuple[int, ...], Any]],
+) -> Any:
+    """Rebuild one encoded recurrent-state element, or raise.
+
+    Two properties keep a restore chain's cost independent of its length,
+    which the sidecar layout gets for free by only ever decoding one
+    checkpoint:
+
+    * The result is an unevaluated MLX graph. Every matched block is
+      reconstructed, but only one block's recurrent state is adopted, so the
+      rest are dropped before MLX computes them.
+    * The scale validity check is deferred into ``checks`` rather than tested
+      here. Testing it reads the tensor, and a GPU->CPU sync per layer per
+      block dominated everything else in a chain restore (measured at 20 ms
+      per 48-layer block, against 1.2 ms for the same block in fp32). The
+      caller evaluates the whole block's checks in one batch instead.
+    """
+    payload = arrays.get(f"{elem_key}{_GDN_ENCODED_SUFFIX}")
+    if payload is None:
+        raise ValueError(f"missing encoded GDN payload: {elem_key}")
+    encoding = gdn_codec.parse_encoding(
+        codec,
+        file_metadata.get(f"{elem_key}_{gdn_codec.METADATA_ORIGINAL_DTYPE}"),
+        file_metadata.get(f"{elem_key}_{gdn_codec.METADATA_RHT_SEED}"),
+        file_metadata.get(f"{elem_key}_{gdn_codec.METADATA_RHT_DIM}"),
+        payload,
+    )
+    scale_key = f"{elem_key}{_GDN_SCALE_SUFFIX}"
+    scale = arrays.get(scale_key) if encoding.needs_scale else None
+    return gdn_codec.decode_state(payload, scale, encoding, scale_key, checks)
 
 
 def _load_nstate_flat(
@@ -662,6 +766,8 @@ def _load_nstate_flat(
     file_metadata: dict[str, str],
     prefix: str,
     fallback_class: str | None,
+    on_decode: Any = None,
+    checks: list[tuple[str, tuple[int, ...], Any]] | None = None,
 ) -> tuple | None:
     """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
     polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
@@ -696,7 +802,9 @@ def _load_nstate_flat(
             if file_metadata and nested_marker in file_metadata:
                 # Composite element — recurse, then restore the same
                 # shape it had on save (bare tuple vs __nstate__).
-                sub = _load_nstate_flat(arrays, file_metadata, elem_key, None)
+                sub = _load_nstate_flat(
+                    arrays, file_metadata, elem_key, None, on_decode, checks
+                )
                 if sub is None:
                     return None
                 if file_metadata[nested_marker] == "tuple":
@@ -709,6 +817,41 @@ def _load_nstate_flat(
                 else:
                     # Corrupt/unknown nested marker — fail closed.
                     return None
+                continue
+            codec = (
+                file_metadata.get(f"{elem_key}_{gdn_codec.METADATA_CODEC}")
+                if file_metadata
+                else None
+            )
+            if codec:
+                # Encoded elements live under a suffixed key, never under
+                # ``elem_key`` itself — see _GDN_ENCODED_SUFFIX.
+                try:
+                    elements.append(
+                        _decode_embedded_gdn_state(
+                            arrays,
+                            file_metadata,
+                            elem_key,
+                            codec,
+                            checks if checks is not None else [],
+                        )
+                    )
+                except Exception as exc:
+                    # Fail closed: the caller turns None into a cache miss and
+                    # the request re-prefills, which is always safe. Decoding
+                    # anyway could feed a wrong-basis or wrong-scale recurrent
+                    # state into generation.
+                    logger.warning(
+                        "Rejected embedded GDN state %s (codec=%s): %s",
+                        elem_key,
+                        codec,
+                        exc,
+                    )
+                    if on_decode is not None:
+                        on_decode(False)
+                    return None
+                if on_decode is not None:
+                    on_decode(True)
                 continue
             if elem_key not in arrays:
                 logger.error(f"Missing {elem_key} in arrays")
@@ -1616,6 +1759,13 @@ class PagedSSDCacheManager(CacheManager):
                 "fp32, bf16, int8, rht_int8, rht_int16"
             )
         self._gdn_legacy_fp32_fallbacks = 0
+        # Embedded-layout codec counters (the sidecar store keeps its own).
+        self._gdn_state_encodes = 0
+        self._gdn_state_dequantizations = 0
+        self._gdn_state_encode_failures = 0
+        self._gdn_state_decode_failures = 0
+        self._gdn_capability_fallbacks = 0
+        self._gdn_capability_reported = False
         self._payload_layout = (
             "split_recurrent_v1" if self._gdn_ssd_split_enabled else "embedded"
         )
@@ -3185,12 +3335,38 @@ class PagedSSDCacheManager(CacheManager):
                 {}
             )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
 
+            # The codec only runs where recurrent state is actually embedded
+            # in the block. Under the SSD sidecar layout that state has
+            # already been externalized and every layer here is a placeholder,
+            # so there is nothing to encode and the sidecar keeps owning it.
+            gdn_state_codec = (
+                _EmbeddedGDNStateCodec(self._gdn_snapshot_state_dtype)
+                if self._gdn_snapshot_state_dtype != "fp32"
+                and not self._gdn_ssd_split_enabled
+                else None
+            )
+
             # Shim; module-level to avoid a recursive-closure refcount
             # cycle pinning `arrays` — see _store_nstate_elements_flat.
-            def _store_nstate_elements(prefix: str, elements):
-                _store_nstate_elements_flat(arrays, cache_list_meta, prefix, elements)
+            def _store_nstate_elements(prefix: str, elements, layer_class=None):
+                _store_nstate_elements_flat(
+                    arrays,
+                    cache_list_meta,
+                    prefix,
+                    elements,
+                    (
+                        gdn_state_codec
+                        if gdn_codec.is_arrays_cache_family(layer_class)
+                        else None
+                    ),
+                )
 
             for i, layer_data in enumerate(cache_data):
+                layer_type = (
+                    layer_cache_types[i]
+                    if layer_cache_types and i < len(layer_cache_types)
+                    else None
+                )
                 if (
                     isinstance(layer_data, tuple)
                     and len(layer_data) >= 2
@@ -3204,7 +3380,7 @@ class PagedSSDCacheManager(CacheManager):
                         cache_list_meta[f"layer_{i}_state_class_name"] = class_name
                     if class_name == POOLING_CACHE_DELTA_CLASS:
                         has_pooling_cache_delta = True
-                    _store_nstate_elements(f"layer_{i}", elements)
+                    _store_nstate_elements(f"layer_{i}", elements, class_name)
                 elif (
                     isinstance(layer_data, tuple)
                     and len(layer_data) == 2
@@ -3239,7 +3415,9 @@ class PagedSSDCacheManager(CacheManager):
                                 )
                             if sub_class_name == POOLING_CACHE_DELTA_CLASS:
                                 has_pooling_cache_delta = True
-                            _store_nstate_elements(sub_prefix, sub_elements)
+                            _store_nstate_elements(
+                                sub_prefix, sub_elements, sub_class_name
+                            )
                         elif (
                             isinstance(sub_tensor, (list, tuple))
                             and len(sub_tensor) >= 2
@@ -3284,7 +3462,26 @@ class PagedSSDCacheManager(CacheManager):
                             f"{type(layer_data).__name__}"
                         )
                         return False
-                    _store_nstate_elements(f"layer_{i}", list(layer_data))
+                    # A plain 2-tuple carries no class name of its own; the
+                    # layer type is the only thing that says whether this is
+                    # Arrays-family recurrent state. This is the shape a GDN
+                    # layer actually takes in an embedded block.
+                    _store_nstate_elements(f"layer_{i}", list(layer_data), layer_type)
+
+            if gdn_state_codec is not None:
+                # Reject a non-finite recurrent state before its payload is
+                # materialized. Batched so the whole block costs one
+                # GPU->CPU sync instead of one per layer.
+                try:
+                    gdn_codec.verify_encode_checks(
+                        gdn_state_codec.checks, gdn_state_codec.state_dtype
+                    )
+                except ValueError as exc:
+                    with self._lock:
+                        self._gdn_state_encode_failures += 1
+                    logger.warning("Skipping cache block: %s", exc)
+                    return False
+                self._record_gdn_encode(gdn_state_codec)
 
             block_size = self._expected_block_size or token_count
             # Stamp the depth the block's own TurboQuant layers were packed
@@ -3541,10 +3738,26 @@ class PagedSSDCacheManager(CacheManager):
                 return (elements[0], elements[1])
             return marker
 
+        decode_checks: list[tuple[str, tuple[int, ...], Any]] = []
+
+        def _note_decode(ok: bool) -> None:
+            with self._lock:
+                if ok:
+                    self._gdn_state_dequantizations += 1
+                else:
+                    self._gdn_state_decode_failures += 1
+
         # Shim; module-level to avoid a recursive-closure refcount
         # cycle pinning `arrays` — see _load_nstate_flat.
         def _load_nstate(prefix: str, fallback_class: str | None) -> tuple | None:
-            return _load_nstate_flat(arrays, file_metadata, prefix, fallback_class)
+            return _load_nstate_flat(
+                arrays,
+                file_metadata,
+                prefix,
+                fallback_class,
+                _note_decode,
+                decode_checks,
+            )
 
         for i in range(num_layers):
             cache_type = (
@@ -3643,6 +3856,17 @@ class PagedSSDCacheManager(CacheManager):
                     logger.error(f"Missing N-tuple state for layer {i}")
                     return None
                 cache_data.append(_maybe_unwrap_legacy(layer_marker))
+
+        if decode_checks:
+            # One sync for the whole block, however many layers carried
+            # encoded recurrent state.
+            try:
+                gdn_codec.verify_decode_checks(decode_checks)
+            except ValueError as exc:
+                with self._lock:
+                    self._gdn_state_decode_failures += 1
+                logger.warning("Rejected embedded GDN state: %s", exc)
+                return None
 
         return cache_data
 
@@ -4781,6 +5005,62 @@ class PagedSSDCacheManager(CacheManager):
         """Number of reduced-namespace lookups resolved by legacy FP32."""
         with self._lock:
             return self._gdn_legacy_fp32_fallbacks
+
+    def _record_gdn_encode(self, codec: _EmbeddedGDNStateCodec) -> None:
+        """Fold one block's codec outcome into the manager counters."""
+        with self._lock:
+            self._gdn_state_encodes += codec.encoded
+            self._gdn_capability_fallbacks += codec.capability_fallbacks
+            first_fallback = (
+                codec.capability_fallbacks > 0 and not self._gdn_capability_reported
+            )
+            if first_fallback:
+                self._gdn_capability_reported = True
+        if first_fallback:
+            # Once per manager: a 48-layer model would otherwise log this on
+            # every layer of every block.
+            logger.warning(
+                "GDN state codec %s cannot encode this model's recurrent width "
+                "(needs a positive power-of-two last dimension); storing it as "
+                "fp32 instead. Set gdn_snapshot_state_dtype=int8 for a codec "
+                "with no width constraint.",
+                codec.state_dtype,
+            )
+
+    @property
+    def gdn_state_encodes(self) -> int:
+        """Recurrent-state elements encoded into embedded block payloads."""
+        with self._lock:
+            return self._gdn_state_encodes
+
+    @property
+    def gdn_state_dequantizations(self) -> int:
+        """Encoded recurrent-state elements rebuilt from embedded payloads.
+
+        Counts elements handed back to the caller, not elements MLX has
+        actually computed: the decode is a lazy graph, and a restore chain
+        drops most of them unevaluated.
+        """
+        with self._lock:
+            return self._gdn_state_dequantizations
+
+    @property
+    def gdn_state_encode_failures(self) -> int:
+        """Blocks refused because their recurrent state failed encode checks."""
+        with self._lock:
+            return self._gdn_state_encode_failures
+
+    @property
+    def gdn_state_decode_failures(self) -> int:
+        """Embedded payloads rejected on read (corrupt or foreign codec)."""
+        with self._lock:
+            return self._gdn_state_decode_failures
+
+    @property
+    def gdn_capability_fallbacks(self) -> int:
+        """Elements stored raw because the codec cannot encode their width."""
+        with self._lock:
+            return self._gdn_capability_fallbacks
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
         """Get model-scoped SSD cache statistics.

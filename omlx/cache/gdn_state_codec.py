@@ -117,24 +117,32 @@ def rht_sign_values(dim: int, seed: int) -> tuple[float, ...]:
     )
 
 
+# Materializing the diagonal is O(dim) host work, and a restore chain builds
+# one decode graph per block per layer — thousands of them on a long prompt,
+# none of which MLX will necessarily evaluate. Hand every graph the same
+# immutable array instead. Bounded like ``rht_sign_values``, and a few hundred
+# bytes per distinct width.
+@lru_cache(maxsize=32)
+def rht_sign_array(dim: int, seed: int) -> Any:
+    return mx.array(rht_sign_values(dim, seed), dtype=mx.float32)
+
+
 def rht_forward(tensor: Any, seed: int) -> Any:
     dim = int(tensor.shape[-1])
-    signs = mx.array(rht_sign_values(dim, seed), dtype=mx.float32)
     return mx.hadamard_transform(
-        tensor.astype(mx.float32) * signs,
+        tensor.astype(mx.float32) * rht_sign_array(dim, seed),
         scale=1.0 / math.sqrt(dim),
     )
 
 
 def rht_inverse(tensor: Any, seed: int) -> Any:
     dim = int(tensor.shape[-1])
-    signs = mx.array(rht_sign_values(dim, seed), dtype=mx.float32)
     return (
         mx.hadamard_transform(
             tensor.astype(mx.float32),
             scale=1.0 / math.sqrt(dim),
         )
-        * signs
+        * rht_sign_array(dim, seed)
     )
 
 
@@ -145,6 +153,31 @@ def is_arrays_cache_family(class_name: Any, cache_type: Any = None) -> bool:
     ).endswith(_ARRAYS_CACHE_SUFFIX)
 
 
+def is_recurrent_state_payload(
+    state_index: int,
+    tensor: Any,
+    *,
+    min_rank: int = 1,
+) -> bool:
+    """Select the fp32 recurrent member from an Arrays-family state tuple.
+
+    The caller is responsible for having established that the state belongs to
+    an Arrays-family cache; this only judges the element.
+
+    ``min_rank`` exists for the embedded layout, where the same state tuple is
+    also written as the ``(mx.zeros((1,)), mx.zeros((1,)))`` placeholder that
+    non-sliceable layers put in every block but the last. That placeholder is
+    a rank-1 fp32 array in exactly the eligible slot; encoding it would cost a
+    second tensor and four metadata entries to save four bytes. Real GDN state
+    is at least rank 2, so callers that can see placeholders ask for ``2``.
+    """
+    if state_index != _RECURRENT_STATE_INDEX:
+        return False
+    if getattr(tensor, "dtype", None) != mx.float32:
+        return False
+    return len(getattr(tensor, "shape", ())) >= min_rank
+
+
 def is_recurrent_state_element(
     class_name: Any,
     cache_type: Any,
@@ -153,22 +186,10 @@ def is_recurrent_state_element(
     *,
     min_rank: int = 1,
 ) -> bool:
-    """Select the fp32 recurrent member of an Arrays-family cache.
-
-    ``min_rank`` exists for the embedded layout, where the same helper also
-    sees the ``(mx.zeros((1,)), mx.zeros((1,)))`` placeholder that non-sliceable
-    layers write into every block but the last. That placeholder is a rank-1
-    fp32 tensor in exactly the eligible slot; encoding it would cost a second
-    tensor and a metadata round trip to save nothing. Real GDN state is at
-    least rank 2, so the callers that can see placeholders ask for ``2``.
-    """
-    if state_index != _RECURRENT_STATE_INDEX:
-        return False
-    if not is_arrays_cache_family(class_name, cache_type):
-        return False
-    if getattr(tensor, "dtype", None) != mx.float32:
-        return False
-    return len(getattr(tensor, "shape", ())) >= min_rank
+    """Select the fp32 recurrent member of an Arrays-family cache."""
+    return is_arrays_cache_family(class_name, cache_type) and (
+        is_recurrent_state_payload(state_index, tensor, min_rank=min_rank)
+    )
 
 
 def codec_supports_tensor(codec_or_dtype: str, tensor: Any) -> bool:
@@ -390,7 +411,15 @@ def validate_scale(
     scale_key: str,
     *,
     payload_dtype: Any = None,
+    checks: list[tuple[str, tuple[int, ...], Any]] | None = None,
 ) -> None:
+    """Reject a scale tensor that cannot describe this payload.
+
+    Shape and dtype are metadata and cost nothing. The value check is not: it
+    reads the tensor, which forces a GPU->CPU sync. Pass ``checks`` to defer it
+    into a batch — a caller that decodes many payloads in a row (one per layer,
+    per block, across a restore chain) would otherwise pay one sync each.
+    """
     if payload_dtype is None:
         payload_dtype = mx.int8
     kind = "int16" if payload_dtype == mx.int16 else "int8"
@@ -410,8 +439,38 @@ def validate_scale(
             f"invalid GDN {kind} scale dtype for {scale_key}: "
             f"expected float32, got {getattr(scale, 'dtype', None)}"
         )
-    if not bool(mx.all(mx.isfinite(scale) & (scale > 0))):
+    valid = mx.all(mx.isfinite(scale) & (scale > 0))
+    if checks is not None:
+        checks.append(
+            (
+                f"invalid GDN {kind} scale values for {scale_key}",
+                tuple(getattr(scale, "shape", ())),
+                valid,
+            )
+        )
+        return
+    if not bool(valid):
         raise ValueError(f"invalid GDN {kind} scale values for {scale_key}")
+
+
+def verify_decode_checks(
+    checks: list[tuple[str, tuple[int, ...], Any]],
+) -> None:
+    """Evaluate every deferred decode check with a single sync.
+
+    Raises ``ValueError`` naming the first failing check, which callers turn
+    into a cache miss.
+    """
+    if not checks:
+        return
+    flags = mx.stack([flag for _reason, _shape, flag in checks])
+    mx.eval(flags)
+    if bool(mx.all(flags)):
+        return
+    reason, _shape, _flag = next(
+        check for check, ok in zip(checks, flags.tolist()) if not ok
+    )
+    raise ValueError(reason)
 
 
 def decode_state(
@@ -419,6 +478,7 @@ def decode_state(
     scale: Any | None,
     encoding: GDNEncoding,
     scale_key: str,
+    checks: list[tuple[str, tuple[int, ...], Any]] | None = None,
 ) -> Any:
     """Restore an fp32 recurrent tensor from an encoded payload.
 
@@ -434,7 +494,11 @@ def decode_state(
             kind = "int16" if encoding.codec in INT16_CODECS else "int8"
             raise ValueError(f"missing GDN {kind} scale tensor: {scale_key}")
         validate_scale(
-            payload, scale, scale_key, payload_dtype=encoding.payload_dtype
+            payload,
+            scale,
+            scale_key,
+            payload_dtype=encoding.payload_dtype,
+            checks=checks,
         )
         restored = payload.astype(mx.float32) * scale
         if encoding.codec in RHT_CODECS:
