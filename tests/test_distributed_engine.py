@@ -143,6 +143,8 @@ async def test_distributed_stream_bounds_rank_zero_read_stalls():
     finally:
         await engine._client.aclose()
 
+    assert len(status_calls) == 2, "availability must be rechecked after timeout"
+
 
 def test_chat_payload_folds_thinking_budget_into_chat_template_kwargs():
     engine = DistributedBatchedEngine(_deployment())

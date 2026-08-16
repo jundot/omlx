@@ -93,9 +93,24 @@ def _think_token_ids(tokenizer: Any) -> tuple[list[int], int | None]:
     The single-machine scheduler reads these off the tokenizer and feeds them
     into ``ThinkingBudgetProcessor``. The rank has the same tokenizer, so it
     can resolve them the same way (scheduler.py ``_get_think_token_id`` /
-    ``_resolve_think_end_token_ids`` Tier 1).
+    ``_resolve_think_end_token_ids`` / ``_encode_thinking_marker``).
     """
     think_end_ids: list[int] | None = None
+
+    def _encode(text: str) -> list[int] | None:
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = tokenizer.encode(text)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if ids:
+            return [i for i in ids if isinstance(i, int)]
+        return None
+
     try:
         end_id = getattr(tokenizer, "think_end_id", None)
         if end_id is not None:
@@ -103,16 +118,12 @@ def _think_token_ids(tokenizer: Any) -> tuple[list[int], int | None]:
     except (ValueError, TypeError):
         pass
     if think_end_ids is None:
-        try:
-            ids = tokenizer.encode("</think>", add_special_tokens=False)
-            if ids:
-                think_end_ids = list(ids)
-        except Exception:
-            pass
+        think_end_str = getattr(tokenizer, "think_end", None) or "</think>"
+        think_end_ids = _encode(think_end_str)
     if think_end_ids is None:
         try:
             tid = tokenizer.convert_tokens_to_ids("</think>")
-            if tid != getattr(tokenizer, "unk_token_id", None):
+            if isinstance(tid, int) and tid != getattr(tokenizer, "unk_token_id", None):
                 think_end_ids = [tid]
         except (AttributeError, KeyError, TypeError):
             pass

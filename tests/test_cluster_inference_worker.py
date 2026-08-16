@@ -1136,6 +1136,50 @@ def test_think_token_ids_falls_back_to_encoding_when_attributes_missing():
     assert start_id is None
 
 
+def test_think_token_ids_uses_think_end_string_when_id_missing():
+    class Tokenizer:
+        think_end = "<|/think|>"
+        unk_token_id = 0
+
+        @property
+        def think_end_id(self):
+            raise ValueError("multi-token sequence")
+
+        def encode(self, text, add_special_tokens=False):
+            return {"<|/think|>": [42]}[text]
+
+    end_ids, _ = inference_worker._think_token_ids(Tokenizer())
+    assert end_ids == [42]
+
+
+def test_think_token_ids_retries_encode_without_add_special_tokens_kwarg():
+    class Tokenizer:
+        unk_token_id = 0
+
+        @property
+        def think_end_id(self):
+            raise ValueError("multi-token sequence")
+
+        def encode(self, text, add_special_tokens=False):
+            if add_special_tokens is not False:
+                raise TypeError("unexpected kwarg")
+            return [9]
+
+    end_ids, _ = inference_worker._think_token_ids(Tokenizer())
+    assert end_ids == [9]
+
+
+def test_think_token_ids_filters_non_integer_ids():
+    class Tokenizer:
+        unk_token_id = 0
+
+        def encode(self, text, add_special_tokens=False):
+            return [9, None, "x"]
+
+    end_ids, _ = inference_worker._think_token_ids(Tokenizer())
+    assert end_ids == [9]
+
+
 def test_think_token_ids_returns_empty_when_unsupported():
     class Tokenizer:
         @property
