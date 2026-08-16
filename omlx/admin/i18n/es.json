@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "Error al eliminar el modelo",
   "js.error.delete_model_connection": "Error al eliminar el modelo. Verifica la conexión con el servidor.",
   "js.success.download_started": "Descarga iniciada: {repo_id}",
-  "js.success.settings_saved": "Configuración guardada correctamente"
+  "js.success.settings_saved": "Configuración guardada correctamente",
+  "settings.mcp.expose_tools": "Exponer herramientas MCP del backend a los clientes",
+  "settings.mcp.expose_tools_hint": "Combina las herramientas MCP del backend en las respuestas. Desactívalo si tu cliente tiene sus propios servidores MCP."
 }

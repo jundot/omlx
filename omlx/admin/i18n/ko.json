@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "모델 삭제에 실패했습니다",
   "js.error.delete_model_connection": "모델 삭제에 실패했습니다. 서버 연결을 확인하세요.",
   "js.success.download_started": "다운로드 시작: {repo_id}",
-  "js.success.settings_saved": "설정이 저장되었습니다"
+  "js.success.settings_saved": "설정이 저장되었습니다",
+  "settings.mcp.expose_tools": "백엔드 MCP 도구를 클라이언트에 노출",
+  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요."
 }

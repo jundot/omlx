@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "Impossible de supprimer le modèle",
   "js.error.delete_model_connection": "Impossible de supprimer le modèle. Vérifiez la connexion au serveur.",
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
-  "js.success.settings_saved": "Paramètres enregistrés avec succès"
+  "js.success.settings_saved": "Paramètres enregistrés avec succès",
+  "settings.mcp.expose_tools": "Exposer les outils MCP du backend aux clients",
+  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP."
 }

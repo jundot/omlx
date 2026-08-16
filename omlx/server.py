@@ -294,6 +294,20 @@ def get_mcp_manager():
     return _server_state.mcp_manager
 
 
+def mcp_tools_exposed() -> bool:
+    """Whether backend MCP tools are exposed to clients.
+
+    Controlled by the dashboard toggle (Settings > Global Settings > MCP).
+    Defaults to True (backward compatible) when global settings are
+    unavailable, e.g. when MCP was started via env var/CLI without a
+    settings file.
+    """
+    gs = _server_state.global_settings
+    if gs is None:
+        return True
+    return bool(getattr(gs.mcp, "expose_tools", True))
+
+
 async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -3514,7 +3528,11 @@ async def create_chat_completion(
                 )
             tools_disabled = True
         effective_tools = None if tools_disabled else request.tools
-        if _server_state.mcp_manager and not tools_disabled:
+        if (
+            _server_state.mcp_manager
+            and not tools_disabled
+            and mcp_tools_exposed()
+        ):
             # Convert Pydantic ToolDefinition models to dicts for merge_tools
             user_tools_dicts = (
                 [t.model_dump() for t in request.tools] if request.tools else None
@@ -5523,7 +5541,7 @@ async def create_anthropic_message(
                     field="tools",
                 )
             internal_tools = None
-        elif _server_state.mcp_manager:
+        elif _server_state.mcp_manager and mcp_tools_exposed():
             mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
             combined = (mcp_openai_tools or []) + (user_internal or [])
             # Deduplicate by function name (user tools take precedence)
@@ -5961,7 +5979,11 @@ async def create_response(
             )
             else openai_tools
         )
-        if _server_state.mcp_manager and effective_tools:
+        if (
+            _server_state.mcp_manager
+            and effective_tools
+            and mcp_tools_exposed()
+        ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
 
         # Convert tools for chat template

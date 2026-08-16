@@ -1933,6 +1933,226 @@ class TestMCPEndpoints:
         assert response.status_code == 422
 
 
+class _RecordingMCPManager:
+    """MCP manager stand-in that records merge requests."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_merged_tools(self, user_tools=None):
+        self.calls.append(user_tools)
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_search",
+                    "description": "Search via MCP",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+    def get_all_tools_openai(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_search",
+                    "description": "Search via MCP",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+
+class TestMCPExposeToolsToggle:
+    """Settings > Global Settings > MCP: "Expose backend MCP tools to clients".
+
+    When the toggle is OFF, backend MCP tools must not be merged into client
+    requests, while tools the client itself sends still pass through.
+    """
+
+    USER_SEARCH_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "user_search",
+                "description": "Search from request tools",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                    },
+                },
+            },
+        }
+    ]
+
+    def _install(self, expose_tools, manager):
+        """Install manager + toggle into server state; returns restore fn."""
+        from omlx.server import _server_state
+        from omlx.settings import GlobalSettings, MCPSettings
+
+        original_manager = _server_state.mcp_manager
+        original_settings = _server_state.global_settings
+        _server_state.mcp_manager = manager
+        _server_state.global_settings = GlobalSettings(
+            mcp=MCPSettings(
+                config_path="/mcp.json",
+                expose_tools=expose_tools,
+            )
+        )
+        return lambda: (
+            setattr(_server_state, "mcp_manager", original_manager),
+            setattr(_server_state, "global_settings", original_settings),
+        )
+
+    def _tool_names(self, recorded_chat_kwargs):
+        tools = recorded_chat_kwargs[0].get("tools") or []
+        return [t.get("function", {}).get("name") for t in tools]
+
+    @pytest.mark.parametrize(
+        ("expose_tools", "request_tools", "expect_mcp_merge"),
+        [
+            (True, None, True),
+            (False, None, False),
+            (False, "user_tools", False),
+        ],
+    )
+    def test_chat_completion_expose_tools_controls_mcp_merge(
+        self,
+        client,
+        mock_llm_engine,
+        expose_tools,
+        request_tools,
+        expect_mcp_merge,
+    ):
+        """OpenAI-compatible /v1/chat/completions honours the toggle."""
+        from omlx.server import _server_state
+
+        recorded_count_tools = []
+        recorded_chat_kwargs = []
+
+        def count_chat_tokens(messages, tools=None, **kwargs):
+            recorded_count_tools.append(tools)
+            return 1
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        manager = _RecordingMCPManager()
+        restore = self._install(expose_tools, manager)
+        mock_llm_engine.count_chat_tokens = count_chat_tokens
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if request_tools == "user_tools":
+            payload["tools"] = self.USER_SEARCH_TOOLS
+
+        try:
+            response = client.post("/v1/chat/completions", json=payload)
+        finally:
+            restore()
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        names = self._tool_names(recorded_chat_kwargs)
+
+        if expect_mcp_merge:
+            assert manager.calls == [payload.get("tools")]
+            assert "mcp_search" in names
+        else:
+            assert manager.calls == []
+            assert "mcp_search" not in names
+            if request_tools == "user_tools":
+                assert "user_search" in names
+            else:
+                assert "tools" not in recorded_chat_kwargs[0]
+
+    @pytest.mark.parametrize(
+        ("expose_tools", "expect_mcp_merge"),
+        [
+            (True, True),
+            (False, False),
+        ],
+    )
+    def test_anthropic_messages_expose_tools_controls_mcp_merge(
+        self,
+        client,
+        mock_llm_engine,
+        expose_tools,
+        expect_mcp_merge,
+    ):
+        """Anthropic-compatible /v1/messages honours the toggle."""
+        from omlx.server import _server_state
+
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        manager = _RecordingMCPManager()
+        restore = self._install(expose_tools, manager)
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            ],
+        }
+
+        try:
+            response = client.post("/v1/messages", json=payload)
+        finally:
+            restore()
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        names = self._tool_names(recorded_chat_kwargs)
+
+        if expect_mcp_merge:
+            assert "mcp_search" in names
+            assert "get_weather" in names
+        else:
+            assert "mcp_search" not in names
+            assert "get_weather" in names
+
+
 class TestErrorHandling:
     """Tests for error handling in endpoints."""
 

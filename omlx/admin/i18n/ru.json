@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "Не удалось удалить модель",
   "js.error.delete_model_connection": "Не удалось удалить модель. Проверьте соединение с сервером.",
   "js.success.download_started": "Загрузка начата: {repo_id}",
-  "js.success.settings_saved": "Настройки успешно сохранены"
+  "js.success.settings_saved": "Настройки успешно сохранены",
+  "settings.mcp.expose_tools": "Показывать инструменты MCP бэкенда клиентам",
+  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
 }

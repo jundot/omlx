@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "Failed to delete model",
   "js.error.delete_model_connection": "Failed to delete model. Check server connection.",
   "js.success.download_started": "Download started: {repo_id}",
-  "js.success.settings_saved": "Settings saved successfully"
+  "js.success.settings_saved": "Settings saved successfully",
+  "settings.mcp.expose_tools": "Expose backend MCP tools to clients",
+  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers."
 }

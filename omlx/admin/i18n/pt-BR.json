@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "Falha ao apagar o modelo",
   "js.error.delete_model_connection": "Falha ao apagar o modelo. Verifique a conexão com o servidor.",
   "js.success.download_started": "Download iniciado: {repo_id}",
-  "js.success.settings_saved": "Configurações salvas com sucesso"
+  "js.success.settings_saved": "Configurações salvas com sucesso",
+  "settings.mcp.expose_tools": "Expor ferramentas MCP do backend para clientes",
+  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP."
 }

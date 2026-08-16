@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "刪除模型失敗",
   "js.error.delete_model_connection": "刪除模型失敗，請檢查伺服器連線。",
   "js.success.download_started": "已開始下載：{repo_id}",
-  "js.success.settings_saved": "設定儲存成功"
+  "js.success.settings_saved": "設定儲存成功",
+  "settings.mcp.expose_tools": "向客戶端公開後端 MCP 工具",
+  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。"
 }

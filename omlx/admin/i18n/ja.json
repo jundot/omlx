@@ -1044,5 +1044,7 @@
   "js.error.delete_model_failed": "モデルの削除に失敗しました",
   "js.error.delete_model_connection": "モデルの削除に失敗しました。サーバー接続を確認してください。",
   "js.success.download_started": "ダウンロード開始: {repo_id}",
-  "js.success.settings_saved": "設定が保存されました"
+  "js.success.settings_saved": "設定が保存されました",
+  "settings.mcp.expose_tools": "バックエンドMCPツールをクライアントに公開",
+  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。"
 }
