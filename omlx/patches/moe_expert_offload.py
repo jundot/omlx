@@ -619,6 +619,42 @@ def estimate_offload_admission_bytes(
         return full_size
 
 
+def materialize_offload_state(model) -> int:
+    """Evaluate every offload cache's arrays on the loading thread's stream.
+
+    ``ExpertCache`` keeps its slot map and resident slots on plain object
+    attributes, so the engine's ``materialize_lazy_state`` walk never reaches
+    them. Left lazy, they stay bound to the loader thread's stream and the
+    first request from another thread dies with ``RuntimeError: There is no
+    Stream(gpu, N) in current thread``. Reproduced live on a 24GB M5 Pro the
+    moment the VLM path ran with offload enabled. Call this right after
+    ``apply_moe_expert_offload``; returns the number of layers materialized.
+    """
+    arrays = []
+    layers = 0
+    stack = [model]
+    seen = set()
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, OffloadSwitchGLU):
+            layers += 1
+            cache = obj.cache
+            arrays.append(cache.map)
+            for triple in cache.resident.values():
+                arrays.extend(a for a in triple if a is not None)
+            continue
+        if isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+    if arrays:
+        mx.eval(*arrays)
+    return layers
+
+
 def moe_offload_stats(model) -> dict:
     """Aggregate hit/miss counters over all offloaded layers."""
     hits = misses = layers = 0
@@ -651,5 +687,6 @@ __all__ = [
     "CheckpointExpertStore",
     "OffloadSwitchGLU",
     "apply_moe_expert_offload",
+    "materialize_offload_state",
     "moe_offload_stats",
 ]

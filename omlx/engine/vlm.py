@@ -1640,7 +1640,10 @@ class VLMBatchedEngine(BaseEngine):
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
-            from ..patches.moe_expert_offload import apply_moe_expert_offload
+            from ..patches.moe_expert_offload import (
+                apply_moe_expert_offload,
+                materialize_offload_state,
+            )
 
             fraction = float(
                 getattr(
@@ -1656,6 +1659,19 @@ class VLMBatchedEngine(BaseEngine):
                 self._model_name,
                 fraction,
             )
+            if moe_offload_wrapped:
+                # The caches' slot maps and resident slots live on plain
+                # attributes outside the module tree, so the lazy-state
+                # materialization below never reaches them; left lazy they
+                # stay bound to the loader stream and the first request from
+                # an inference thread dies with "There is no Stream(gpu, N)
+                # in current thread". Same executor as the apply, so the
+                # arrays realize on the stream that created them.
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    materialize_offload_state,
+                    self._vlm_model,
+                )
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
