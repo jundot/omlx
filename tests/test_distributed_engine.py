@@ -119,6 +119,13 @@ async def test_request_read_timeout_env_var_takes_backseat_to_explicit_arg(monke
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_request_read_timeout_env_var_rejects_non_numeric(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "not-a-number")
+    with pytest.raises(ValueError, match="must be a number"):
+        DistributedBatchedEngine(_deployment())
+
+
 def _stalled_engine():
     def handler(request):
         raise httpx.ReadTimeout("collective stalled", request=request)

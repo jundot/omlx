@@ -49,9 +49,14 @@ class DistributedBatchedEngine(BatchedEngine):
         request_read_timeout: float | None = None,
     ) -> None:
         if request_read_timeout is None:
-            request_read_timeout = float(
-                os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", 300.0)
-            )
+            raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
+            try:
+                request_read_timeout = float(raw)
+            except ValueError:
+                raise ValueError(
+                    "OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT must be a number, "
+                    f"got {raw!r}"
+                ) from None
         if request_read_timeout <= 0:
             raise ValueError("distributed request read timeout must be positive")
         super().__init__(
