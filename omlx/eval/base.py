@@ -57,6 +57,9 @@ class BaseBenchmark(ABC):
 
     name: str = ""
     quick_size: int = 100
+    # Full dataset size, recorded by load_dataset before sampling. Uploaded to
+    # omlx.ai so "300 of 14,042" reads correctly on the community leaderboard.
+    dataset_total: Optional[int] = None
 
     @abstractmethod
     async def load_dataset(self, sample_size: int = 0) -> list[dict]:

@@ -67,6 +67,7 @@ class CMMLUBenchmark(BaseBenchmark):
 
         logger.info(f"CMMLU: loaded {len(all_items)} questions")
 
+        self.dataset_total = len(all_items)
         if sample_size == 0:
             return all_items
         return stratified_sample(all_items, sample_size, key="subject")

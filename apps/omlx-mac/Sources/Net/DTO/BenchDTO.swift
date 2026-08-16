@@ -272,6 +272,27 @@ struct AccuracyProgressDTO: Codable, Equatable, Sendable {
     let benchmark: String?
 }
 
+/// Community upload outcome for one accuracy suite, attached to its result
+/// by the server after the suite completes (local runs only). Same JSON `id`
+/// → `submissionId` rename rationale as BenchUploadResultDTO above.
+struct AccuracyUploadDTO: Codable, Equatable, Sendable {
+    let submissionId: String?
+    let url: String?
+    let duplicate: Bool?
+    let error: String?
+    /// Non-nil when the server chose not to upload, e.g. "min_questions"
+    /// for runs under the 100-question leaderboard minimum.
+    let skipped: String?
+
+    enum CodingKeys: String, CodingKey {
+        case submissionId = "id"
+        case url
+        case duplicate
+        case error
+        case skipped
+    }
+}
+
 struct AccuracyResultDTO: Codable, Equatable, Sendable, Identifiable {
     let benchmark: String
     let modelId: String
@@ -281,6 +302,9 @@ struct AccuracyResultDTO: Codable, Equatable, Sendable, Identifiable {
     let timeS: Double
     let thinkingUsed: Bool
     let categoryScores: [String: Double]?
+    /// Optional so results from servers predating the community upload
+    /// (and external-endpoint runs, which never upload) still decode.
+    let upload: AccuracyUploadDTO?
 
     /// Synthetic ID — the server doesn't emit one and `(benchmark,
     /// model)` is unique within an accAllResults array.

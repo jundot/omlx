@@ -94,6 +94,7 @@ class GSM8KBenchmark(BaseBenchmark):
 
         logger.info(f"GSM8K: loaded {len(normalized)} questions")
 
+        self.dataset_total = len(normalized)
         if sample_size == 0:
             return normalized
 

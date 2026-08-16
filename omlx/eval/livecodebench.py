@@ -161,6 +161,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
 
         logger.info(f"LiveCodeBench: loaded {len(normalized)} problems")
 
+        self.dataset_total = len(normalized)
         if sample_size == 0:
             return normalized
 

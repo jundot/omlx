@@ -132,6 +132,7 @@ class MBPPBenchmark(BaseBenchmark):
 
         logger.info(f"MBPP: loaded {len(normalized)} problems")
 
+        self.dataset_total = len(normalized)
         if sample_size == 0:
             return normalized
 

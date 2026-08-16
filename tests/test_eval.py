@@ -433,9 +433,13 @@ def _registered_benchmark_names():
 async def test_load_sample_per_benchmark(name):
     """Each registered benchmark loads a 10-row sample without crashing."""
     from omlx.eval import BENCHMARKS
-    items = await BENCHMARKS[name]().load_dataset(sample_size=10)
+    bench = BENCHMARKS[name]()
+    items = await bench.load_dataset(sample_size=10)
     assert items, f"{name} returned empty list"
     assert len(items) <= 10, f"{name} returned {len(items)} items"
+    # Recorded before sampling; the omlx.ai upload renders "n of total".
+    assert bench.dataset_total is not None, f"{name} did not set dataset_total"
+    assert bench.dataset_total >= len(items)
 
 
 class TestEvalSingleSampling:
