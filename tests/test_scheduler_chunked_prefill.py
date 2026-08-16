@@ -1149,6 +1149,62 @@ class TestFirstChunkEvictionPreservesPrefix:
         assert req.shared_prefix_blocks == 3
         sched.block_aware_cache.release_cache.assert_not_called()
 
+    def test_external_prefill_eviction_pause_keeps_reconstructed_prefix(self):
+        """Same contract on the external-prefill path, which is the only path
+        a VLM request can take: the chunked branch is gated on
+        ``vlm_embeds is None``, so a request carrying image embeddings always
+        lands in ``_do_external_prefill``. That catch released the request's
+        paged-cache block refs before pausing, dropping the reconstructed
+        prefix the retry is meant to reuse (#2180)."""
+        sched = _make_scheduler(chunked_prefill=False)
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.fetch_cache.return_value = (None, list(range(100)))
+        req = _make_request("evict-external-prefill", n_tokens=100)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        prompt_cache = [MagicMock()]
+        block_table = MagicMock()
+        sched._prefix_cache_prepared.add(req.request_id)
+        req.prompt_cache = prompt_cache
+        req.cached_tokens = 90
+        req.remaining_tokens = req.prompt_token_ids[90:]
+        req.block_table = block_table
+        req.shared_prefix_blocks = 3
+        # Image embeddings force the external-prefill branch.
+        req.vlm_inputs_embeds = mx.zeros((1, 4, 8))
+
+        eviction = PrefillEvictionRequest(
+            request_id=req.request_id,
+            model_id="test",
+            current_bytes=1,
+            target_cap_bytes=1,
+            predicted_transient_bytes=1,
+            requested_tokens=4,
+            reason="adaptive_prefill_throttle",
+        )
+        with patch.object(
+            sched,
+            "_do_external_prefill",
+            side_effect=_PrefillEvictionNeeded(eviction),
+        ):
+            scheduled, rejected = sched._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert req in sched.waiting
+        assert sched._pending_prefill_eviction_request is eviction
+        # The reconstructed prefix must survive the pause untouched.
+        assert req.prompt_cache is prompt_cache
+        assert req.cached_tokens == 90
+        assert req.remaining_tokens == req.prompt_token_ids[90:]
+        assert req.block_table is block_table
+        assert req.shared_prefix_blocks == 3
+        sched.block_aware_cache.release_cache.assert_not_called()
+        # The temporary uid mapping is still cleaned up: the retry allocates a
+        # fresh one, so leaving it behind would orphan the reverse lookup.
+        assert req.request_id not in sched.request_id_to_uid
+
 
 # ---------------------------------------------------------------------------
 # _schedule_waiting(): specprefill guard defers everything while one is active

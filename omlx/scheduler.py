@@ -10019,9 +10019,14 @@ class Scheduler:
                     self._cleanup_prefill_abort_request(request, temp_uid=temp_uid)
                     continue
                 except _PrefillEvictionNeeded as e:
+                    # Pause, not reject: the request is requeued, so its
+                    # prefix-cache state must survive untouched, same as the
+                    # pre-chunk pause above (#2180). This is the only path a
+                    # VLM request can take, and _do_external_prefill never
+                    # mutates the paged cache, so these refs are the pristine
+                    # prefix the retry reuses. The temp uid is still cleared.
                     self.uid_to_request_id.pop(temp_uid, None)
                     self.request_id_to_uid.pop(request.request_id, None)
-                    self._release_paged_cache_for_request(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
                     self._pause_for_prefill_eviction(request, e.request)
                     break
