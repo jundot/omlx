@@ -437,6 +437,7 @@ class TestCacheSettings:
             "gdn_ssd_split_enabled": False,
             "gdn_snapshot_storage": "auto",
             "gdn_ssd_pending_max_size": "512MB",
+            "gdn_snapshot_state_dtype": "rht_int16",
             "gdn_sidecar_state_dtype": "rht_int16",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
@@ -544,6 +545,34 @@ class TestCacheSettings:
             "rht_int8",
             "rht_int16",
         }
+
+    def test_canonical_state_dtype_key_wins_over_the_legacy_alias(self):
+        """A file written by both names is read by the canonical one."""
+        settings = CacheSettings.from_dict(
+            {
+                "gdn_ssd_split_enabled": True,
+                "gdn_snapshot_state_dtype": "rht_int16",
+                "gdn_sidecar_state_dtype": "int8",
+            }
+        )
+        assert settings.gdn_snapshot_state_dtype == "rht_int16"
+        assert settings.gdn_sidecar_state_dtype == "rht_int16"
+
+    def test_legacy_alias_key_still_loads_and_is_written_back_both_ways(self):
+        """A settings file predating the rename keeps working."""
+        settings = CacheSettings.from_dict(
+            {"gdn_ssd_split_enabled": True, "gdn_sidecar_state_dtype": "rht_int8"}
+        )
+        assert settings.gdn_snapshot_state_dtype == "rht_int8"
+        stored = settings.to_dict()
+        # Both keys are written so a downgrade keeps reading the value.
+        assert stored["gdn_snapshot_state_dtype"] == "rht_int8"
+        assert stored["gdn_sidecar_state_dtype"] == "rht_int8"
+
+    def test_legacy_alias_setter_writes_through_to_the_canonical_field(self):
+        settings = CacheSettings()
+        settings.gdn_sidecar_state_dtype = "bf16"
+        assert settings.gdn_snapshot_state_dtype == "bf16"
 
     def test_gdn_state_dtype_survives_a_dict_roundtrip(self):
         original = CacheSettings.from_dict(
@@ -1388,14 +1417,14 @@ class TestGlobalSettings:
         settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "int8"
         errors = settings.validate()
-        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
+        assert not any("gdn_snapshot_state_dtype" in e for e in errors)
 
     def test_rht_int8_is_dormant_when_embedded(self):
         settings = GlobalSettings()
         settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "rht_int8"
         errors = settings.validate()
-        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
+        assert not any("gdn_snapshot_state_dtype" in e for e in errors)
 
     @pytest.mark.parametrize(
         "dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
@@ -1406,7 +1435,7 @@ class TestGlobalSettings:
         settings.cache.hot_cache_only = False
         settings.cache.gdn_sidecar_state_dtype = dtype
         errors = settings.validate()
-        assert not any("gdn_sidecar_state_dtype" in e for e in errors)
+        assert not any("gdn_snapshot_state_dtype" in e for e in errors)
 
     @pytest.mark.parametrize("dtype", ["fp8", "int4", "", "none", "8"])
     def test_validate_rejects_unknown_dtype(self, dtype):
@@ -1422,7 +1451,7 @@ class TestGlobalSettings:
         settings.cache.gdn_ssd_split_enabled = False
         settings.cache.gdn_sidecar_state_dtype = "fp8"
         errors = settings.validate()
-        gdn_errors = [e for e in errors if "gdn_sidecar_state_dtype" in e]
+        gdn_errors = [e for e in errors if "gdn_snapshot_state_dtype" in e]
         assert len(gdn_errors) == 1
         assert "must be one of" in gdn_errors[0]
 

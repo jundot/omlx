@@ -87,12 +87,12 @@ def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
         expected_block_size=BLOCK_SIZE,
         expected_layer_cache_types=LAYER_TYPES,
         gdn_ssd_split_enabled=True,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     boundary = BoundarySnapshotSSDStore(
         cache_dir,
         pending_max_bytes=1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     prefix = BlockAwarePrefixCache(
         model=_HybridModel(),
@@ -209,7 +209,7 @@ def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
         legacy_boundary = BoundarySnapshotSSDStore(
             tmp_path / "legacy-boundary",
             pending_max_bytes=1024**2,
-            gdn_sidecar_state_dtype="fp32",
+            gdn_snapshot_state_dtype="fp32",
         )
         try:
             assert legacy_boundary.save(
@@ -685,17 +685,17 @@ def test_split_restore_retries_legacy_candidate_at_the_same_endpoint(tmp_path):
         expected_block_size=BLOCK_SIZE,
         expected_layer_cache_types=LAYER_TYPES,
         gdn_ssd_split_enabled=True,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     boundary = BoundarySnapshotSSDStore(
         cache_dir,
         pending_max_bytes=1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     legacy_boundary = BoundarySnapshotSSDStore(
         tmp_path / "legacy-boundary",
         pending_max_bytes=1024**2,
-        gdn_sidecar_state_dtype="fp32",
+        gdn_snapshot_state_dtype="fp32",
     )
     prefix = BlockAwarePrefixCache(
         model=_HybridModel(),
@@ -831,12 +831,12 @@ def test_split_restore_retry_budget_is_one_per_block(tmp_path):
         expected_block_size=BLOCK_SIZE,
         expected_layer_cache_types=LAYER_TYPES,
         gdn_ssd_split_enabled=True,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     boundary = BoundarySnapshotSSDStore(
         cache_dir,
         pending_max_bytes=1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     prefix = BlockAwarePrefixCache(
         model=_HybridModel(),

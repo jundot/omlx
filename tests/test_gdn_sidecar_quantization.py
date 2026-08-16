@@ -77,7 +77,7 @@ def test_storage_precision_roundtrip_and_scope(
 ):
     store = BoundarySnapshotSSDStore(
         tmp_path,
-        gdn_sidecar_state_dtype=mode,
+        gdn_snapshot_state_dtype=mode,
     )
     extracted = _extracted()
     source = np.array(extracted[0]["state"][1], copy=True)
@@ -117,7 +117,7 @@ def test_storage_precision_roundtrip_and_scope(
 
 
 def test_zero_rows_have_finite_positive_scale(tmp_path):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         extracted = _extracted()
         extracted[0]["state"] = (
@@ -137,7 +137,7 @@ def test_int8_async_staging_file_roundtrip(tmp_path):
     store = BoundarySnapshotSSDStore(
         tmp_path,
         pending_max_bytes=1024**2,
-        gdn_sidecar_state_dtype="int8",
+        gdn_snapshot_state_dtype="int8",
     )
     extracted = _extracted()
 
@@ -165,7 +165,7 @@ def test_rht_int8_roundtrip_rotates_last_axis_and_restores_fp32(tmp_path):
     """RHT-int8 stores row scales and reconstructs the original axis shape."""
     store = BoundarySnapshotSSDStore(
         tmp_path,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     extracted = _rht_extracted()
     source = extracted[0]["state"][1]
@@ -204,7 +204,7 @@ def test_rht_int16_roundtrip_rotates_last_axis_and_restores_fp32(tmp_path):
     """RHT-int16 keeps the storage-only inverse path in fp32."""
     store = BoundarySnapshotSSDStore(
         tmp_path,
-        gdn_sidecar_state_dtype="rht_int16",
+        gdn_snapshot_state_dtype="rht_int16",
     )
     extracted = _rht_extracted()
     source = extracted[0]["state"][1]
@@ -242,9 +242,9 @@ def test_rht_int16_roundtrip_rotates_last_axis_and_restores_fp32(tmp_path):
 def test_rht_int8_encoding_is_deterministic_and_codec_is_distinct(tmp_path):
     """Fixed RHT signs make repeated snapshots byte-identical."""
     extracted = _rht_extracted()
-    first = BoundarySnapshotSSDStore(tmp_path / "first", gdn_sidecar_state_dtype="rht_int8")
+    first = BoundarySnapshotSSDStore(tmp_path / "first", gdn_snapshot_state_dtype="rht_int8")
     second = BoundarySnapshotSSDStore(
-        tmp_path / "second", gdn_sidecar_state_dtype="rht_int8"
+        tmp_path / "second", gdn_snapshot_state_dtype="rht_int8"
     )
     try:
         tensors_1, metadata_1 = first._serialize_extracted(extracted, "rht", 2048)
@@ -252,7 +252,7 @@ def test_rht_int8_encoding_is_deterministic_and_codec_is_distinct(tmp_path):
         assert tensors_1 == tensors_2
         assert metadata_1 == metadata_2
 
-        plain = BoundarySnapshotSSDStore(tmp_path / "plain", gdn_sidecar_state_dtype="int8")
+        plain = BoundarySnapshotSSDStore(tmp_path / "plain", gdn_snapshot_state_dtype="int8")
         try:
             plain_tensors, plain_metadata = plain._serialize_extracted(
                 extracted, "rht", 2048
@@ -275,7 +275,7 @@ def test_rht_int8_async_staging_file_roundtrip(tmp_path):
     store = BoundarySnapshotSSDStore(
         tmp_path,
         pending_max_bytes=1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     extracted = _rht_extracted()
 
@@ -304,7 +304,7 @@ def test_rht_int8_async_staging_file_roundtrip(tmp_path):
 
 
 def test_rht_int8_corrupt_metadata_fails_closed(tmp_path):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         tensors, metadata = store._serialize_extracted(_rht_extracted(), "bad-rht", 2048)
         info = json.loads(metadata["layer_info"])
@@ -343,7 +343,7 @@ def test_rht_int8_corrupt_metadata_fails_closed(tmp_path):
 
 
 def test_missing_scale_and_future_format_fail_closed(tmp_path):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         tensors, metadata = store._serialize_extracted(_extracted(), "bad", 2048)
         missing_scale = dict(tensors)
@@ -359,7 +359,7 @@ def test_missing_scale_and_future_format_fail_closed(tmp_path):
 
 
 def test_legacy_fp32_metadata_remains_readable(tmp_path):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         tensors, metadata = store._serialize_extracted(_extracted(), "old", 2048)
         info = json.loads(metadata["layer_info"])
@@ -395,10 +395,10 @@ def test_reduced_precision_uses_distinct_sidecar_signature(tmp_path):
         expected_layer_cache_types=["KVCache", "ArraysCache"],
         gdn_ssd_split_enabled=True,
     )
-    fp32 = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="fp32")
-    int8 = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="int8")
+    fp32 = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="fp32")
+    int8 = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="int8")
     rht_int8 = PagedSSDCacheManager(
-        **common, gdn_sidecar_state_dtype="rht_int8"
+        **common, gdn_snapshot_state_dtype="rht_int8"
     )
     try:
         kwargs = dict(
@@ -509,8 +509,8 @@ def test_reduced_precision_uses_distinct_sidecar_signature(tmp_path):
 
 
 def test_invalid_precision_rejected(tmp_path):
-    with pytest.raises(ValueError, match="gdn_sidecar_state_dtype"):
-        BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="fp8")
+    with pytest.raises(ValueError, match="gdn_snapshot_state_dtype"):
+        BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="fp8")
 
 
 def test_rht_int16_uses_distinct_sidecar_signature_namespace(tmp_path):
@@ -523,8 +523,8 @@ def test_rht_int16_uses_distinct_sidecar_signature_namespace(tmp_path):
         expected_layer_cache_types=["ArraysCache"],
         gdn_ssd_split_enabled=True,
     )
-    rht8 = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int8")
-    rht16 = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int16")
+    rht8 = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="rht_int8")
+    rht16 = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="rht_int16")
     try:
         kwargs = dict(
             model_name="model",
@@ -571,7 +571,7 @@ def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, bad):
     NaN survives round/clip into an undefined int8 value while its row scale
     can still look finite, so restore-side validation alone would not catch it.
     """
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype=mode)
     try:
         values = mx.arange(1, 1 + 2 * 8, dtype=mx.float32).reshape(1, 1, 2, 8)
         poisoned = mx.concatenate(
@@ -604,7 +604,7 @@ def test_non_finite_source_is_refused_before_encoding(tmp_path, mode, bad):
 @pytest.mark.parametrize("mode", ["int8", "rht_int8", "rht_int16"])
 def test_non_finite_check_does_not_reject_extreme_finite_states(tmp_path, mode):
     """All-zero, subnormal and wide-dynamic-range rows stay encodable."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype=mode)
     try:
         rows = mx.array(
             [
@@ -637,7 +637,7 @@ def test_rht_overflow_on_near_max_fp32_row_is_refused_at_encode(tmp_path):
     though every source element is finite, so the encoder validates the row
     scale as well as the source.
     """
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         rows = mx.full((1, 1, 2, 8), 3.4e38, dtype=mx.float32)
         assert bool(mx.all(mx.isfinite(rows)))
@@ -652,7 +652,7 @@ def test_rht_overflow_on_near_max_fp32_row_is_refused_at_encode(tmp_path):
 
 def test_plain_int8_tolerates_near_max_fp32_row(tmp_path):
     """Without the rotation the same row quantizes without overflow."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         rows = mx.full((1, 1, 2, 8), 3.4e38, dtype=mx.float32)
         tensors, metadata = store._serialize_extracted(
@@ -674,7 +674,7 @@ def test_plain_int8_tolerates_near_max_fp32_row(tmp_path):
 )
 def test_scale_dtype_must_be_exactly_fp32(tmp_path, np_dtype, dtype_str):
     """The codec contract stores fp32 scales; a narrower dtype changes rows."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         tensors, metadata = store._serialize_extracted(_extracted(), "scale", 2048)
         key = "layer_0_state_1__scale"
@@ -701,7 +701,7 @@ def test_reduced_codec_requires_float32_source_dtype(tmp_path, mode, original):
         if mode in {"rht_int8", "rht_int16"}
         else _extracted()
     )
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype=mode)
     try:
         tensors, metadata = store._serialize_extracted(extracted, "dtype", 2048)
         info = json.loads(metadata["layer_info"])
@@ -719,7 +719,7 @@ def test_reduced_codec_requires_float32_source_dtype(tmp_path, mode, original):
 
 def test_rht_metadata_rejected_under_plain_int8_codec(tmp_path):
     """Plain int8 carrying RHT keys would restore in the wrong basis."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         tensors, metadata = store._serialize_extracted(_rht_extracted(), "mix", 2048)
         info = json.loads(metadata["layer_info"])
@@ -752,7 +752,7 @@ def test_rht_metadata_rejected_under_plain_int8_codec(tmp_path):
 def test_rht_metadata_literals_and_dimension_fail_closed(
     tmp_path, seed, dim, match
 ):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         tensors, metadata = store._serialize_extracted(_rht_extracted(), "meta", 2048)
         info = json.loads(metadata["layer_info"])
@@ -767,7 +767,7 @@ def test_rht_metadata_literals_and_dimension_fail_closed(
 
 
 def test_non_int8_payload_under_int8_codec_fails_closed(tmp_path):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         tensors, metadata = store._serialize_extracted(_rht_extracted(), "payload", 2048)
         key = "layer_0_state_1"
@@ -783,7 +783,7 @@ def test_non_int8_payload_under_int8_codec_fails_closed(tmp_path):
 
 def test_disk_restore_path_applies_the_same_validation(tmp_path):
     """_reconstruct_from_safetensors must fail closed like the pending path."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         tensors, metadata = store._serialize_extracted(_rht_extracted(), "disk", 2048)
         arrays = {
@@ -809,7 +809,7 @@ def test_disk_restore_path_applies_the_same_validation(tmp_path):
 
 def test_unrepresentable_scale_dtype_is_still_counted_as_a_decode_failure(tmp_path):
     """F64 has no safetensors mapping, so it fails before the dtype check."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="int8")
     try:
         tensors, metadata = store._serialize_extracted(_extracted(), "f64", 2048)
         key = "layer_0_state_1__scale"
@@ -834,7 +834,7 @@ def test_rejected_sidecar_degrades_to_a_cache_miss(tmp_path):
     writer can drain a pending entry at any point, after which load() would
     read the intact file on disk and the corruption would not be exercised.
     """
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         def extract(_snapshot):
             return _rht_extracted(), None
@@ -862,7 +862,7 @@ def test_rejected_sidecar_degrades_to_a_cache_miss(tmp_path):
 
 @pytest.mark.parametrize("dim", [1, 2, 16, 128, 1024])
 def test_rht_encodes_supported_power_of_two_widths(tmp_path, dim):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         rows = mx.arange(1, 1 + 2 * dim, dtype=mx.float32).reshape(1, 1, 2, dim)
         tensors, metadata = store._serialize_extracted(
@@ -883,7 +883,7 @@ def test_rht_encodes_supported_power_of_two_widths(tmp_path, dim):
 @pytest.mark.parametrize("dim", [3, 12, 20, 96])
 def test_rht_unsupported_width_stores_plain_fp32(tmp_path, dim):
     """An unsupported width must degrade visibly, not disable the sidecar."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         rows = mx.arange(1, 1 + 2 * dim, dtype=mx.float32).reshape(1, 1, 2, dim)
         tensors, metadata = store._serialize_extracted(
@@ -909,7 +909,7 @@ def test_rht_unsupported_width_stores_plain_fp32(tmp_path, dim):
 
 
 def test_rht_capability_error_is_logged_once_per_store(tmp_path, caplog):
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         rows = mx.ones((1, 1, 2, 12), dtype=mx.float32)
         layers = _recurrent_extracted(rows) * 4
@@ -930,7 +930,7 @@ def test_rht_capability_error_is_logged_once_per_store(tmp_path, caplog):
 @pytest.mark.parametrize("dim", [3, 12])
 def test_width_constraint_applies_only_to_rht(tmp_path, mode, dim):
     """Only the rotation needs a power-of-two width; the others do not."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype=mode)
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype=mode)
     try:
         rows = mx.arange(1, 1 + 2 * dim, dtype=mx.float32).reshape(1, 1, 2, dim)
         tensors, metadata = store._serialize_extracted(
@@ -946,7 +946,7 @@ def test_width_constraint_applies_only_to_rht(tmp_path, mode, dim):
 
 def test_zero_dim_recurrent_state_never_reaches_the_codec(tmp_path):
     """Zero-sized states are handled by the shape marker path, not the codec."""
-    store = BoundarySnapshotSSDStore(tmp_path, gdn_sidecar_state_dtype="rht_int8")
+    store = BoundarySnapshotSSDStore(tmp_path, gdn_snapshot_state_dtype="rht_int8")
     try:
         rows = mx.zeros((1, 1, 2, 0), dtype=mx.float32)
         tensors, metadata = store._serialize_extracted(
@@ -998,7 +998,7 @@ def test_pending_raw_and_durable_file_restore_identically(tmp_path, mode):
     store = BoundarySnapshotSSDStore(
         tmp_path,
         pending_max_bytes=64 * 1024**2,
-        gdn_sidecar_state_dtype=mode,
+        gdn_snapshot_state_dtype=mode,
     )
     extracted = _codec_extracted(mode)
     try:
@@ -1032,7 +1032,7 @@ def test_pending_decode_counts_dequantizations_once_per_state(tmp_path):
     store = BoundarySnapshotSSDStore(
         tmp_path,
         pending_max_bytes=64 * 1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     try:
         with store._writer_busy:
@@ -1053,7 +1053,7 @@ def test_cancelled_pending_write_leaves_no_sidecar_or_dequantization(tmp_path):
     store = BoundarySnapshotSSDStore(
         tmp_path,
         pending_max_bytes=64 * 1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
     try:
         assert store.save(
@@ -1113,11 +1113,11 @@ def test_restart_index_scan_selects_the_requested_codec_namespace(tmp_path):
         "rht_int8": b"rht-int8-payload",
     }
 
-    writer = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int8")
+    writer = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="rht_int8")
     signatures = {}
     try:
         for mode in ("fp32", "int8", "rht_int8"):
-            manager = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype=mode)
+            manager = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype=mode)
             try:
                 signatures[mode] = manager.gdn_cache_signature_for(**sig_kwargs)
             finally:
@@ -1131,7 +1131,7 @@ def test_restart_index_scan_selects_the_requested_codec_namespace(tmp_path):
 
     # Fresh managers: the index comes from the startup scan, not from memory.
     for mode in ("fp32", "int8", "rht_int8"):
-        restarted = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype=mode)
+        restarted = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype=mode)
         try:
             lookup = restarted.get_gdn_checkpoint_file_with_diagnostic(
                 block_hash, signatures[mode]
@@ -1166,7 +1166,7 @@ def test_restart_falls_back_to_legacy_only_when_current_namespace_is_absent(
     )
     block_hash = b"legacy-only-block"
 
-    writer = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="fp32")
+    writer = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="fp32")
     try:
         fp32_signature = writer.gdn_cache_signature_for(**sig_kwargs)
         _commit_sidecar(
@@ -1175,7 +1175,7 @@ def test_restart_falls_back_to_legacy_only_when_current_namespace_is_absent(
     finally:
         writer.close()
 
-    restarted = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int8")
+    restarted = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="rht_int8")
     try:
         rht_signature = restarted.gdn_cache_signature_for(**sig_kwargs)
         lookup = restarted.get_gdn_checkpoint_file_with_diagnostic(
@@ -1192,7 +1192,7 @@ def test_restart_falls_back_to_legacy_only_when_current_namespace_is_absent(
 
     # A plain int8 request must never be served the RHT namespace, restart or
     # not: the payload would be restored without the inverse rotation.
-    writer = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int8")
+    writer = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="rht_int8")
     try:
         rht_signature = writer.gdn_cache_signature_for(**sig_kwargs)
         _commit_sidecar(
@@ -1201,7 +1201,7 @@ def test_restart_falls_back_to_legacy_only_when_current_namespace_is_absent(
     finally:
         writer.close()
 
-    restarted = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="int8")
+    restarted = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="int8")
     try:
         int8_signature = restarted.gdn_cache_signature_for(**sig_kwargs)
         assert (
@@ -1238,9 +1238,9 @@ def test_restart_restores_real_rht_payload_end_to_end(tmp_path):
 
     store = BoundarySnapshotSSDStore(
         cache_dir, pending_max_bytes=64 * 1024**2,
-        gdn_sidecar_state_dtype="rht_int8",
+        gdn_snapshot_state_dtype="rht_int8",
     )
-    manager = PagedSSDCacheManager(**common, gdn_sidecar_state_dtype="rht_int8")
+    manager = PagedSSDCacheManager(**common, gdn_snapshot_state_dtype="rht_int8")
     try:
         assert store.save(
             "real", 2048, [object()], lambda _s: (extracted, None)
@@ -1264,10 +1264,10 @@ def test_restart_restores_real_rht_payload_end_to_end(tmp_path):
         store.shutdown()
 
     restarted_manager = PagedSSDCacheManager(
-        **common, gdn_sidecar_state_dtype="rht_int8"
+        **common, gdn_snapshot_state_dtype="rht_int8"
     )
     restarted_store = BoundarySnapshotSSDStore(
-        cache_dir, gdn_sidecar_state_dtype="rht_int8"
+        cache_dir, gdn_snapshot_state_dtype="rht_int8"
     )
     try:
         signature = restarted_manager.gdn_cache_signature_for(**sig_kwargs)
@@ -1372,7 +1372,7 @@ def test_encoded_sidecar_bytes_are_identical_across_processes(tmp_path):
         "    'cache_type': 'ArraysCache',\n"
         "}]\n"
         "with tempfile.TemporaryDirectory() as d:\n"
-        "    store = BoundarySnapshotSSDStore(Path(d), gdn_sidecar_state_dtype='rht_int8')\n"
+        "    store = BoundarySnapshotSSDStore(Path(d), gdn_snapshot_state_dtype='rht_int8')\n"
         "    try:\n"
         "        tensors, metadata = store._serialize_extracted(extracted, 'x', 2048)\n"
         "    finally:\n"
@@ -1418,7 +1418,7 @@ def test_production_shape_error_and_payload_layout(tmp_path):
     errors = {}
     for mode in ("int8", "rht_int8"):
         store = BoundarySnapshotSSDStore(
-            tmp_path / mode, gdn_sidecar_state_dtype=mode
+            tmp_path / mode, gdn_snapshot_state_dtype=mode
         )
         try:
             tensors, metadata = store._serialize_extracted(
@@ -1455,7 +1455,7 @@ def test_rht_int16_production_shape_payload_layout(tmp_path):
     recurrent = mx.random.normal(shape, dtype=mx.float32)
     mx.eval(recurrent)
     store = BoundarySnapshotSSDStore(
-        tmp_path / "rht_int16", gdn_sidecar_state_dtype="rht_int16"
+        tmp_path / "rht_int16", gdn_snapshot_state_dtype="rht_int16"
     )
     try:
         tensors, metadata = store._serialize_extracted(
@@ -1500,7 +1500,7 @@ def test_manager_constructor_does_not_enforce_the_split_invariant(tmp_path, mode
         cache_dir=tmp_path / mode,
         max_size_bytes=1024**2,
         gdn_ssd_split_enabled=False,
-        gdn_sidecar_state_dtype=mode,
+        gdn_snapshot_state_dtype=mode,
     )
     try:
         assert manager._payload_layout == "embedded"
@@ -1513,7 +1513,7 @@ def test_manager_constructor_does_not_enforce_the_split_invariant(tmp_path, mode
 )
 def test_constructors_normalize_dtype_case(tmp_path, mode):
     store = BoundarySnapshotSSDStore(
-        tmp_path / f"store-{mode}", gdn_sidecar_state_dtype=mode.upper()
+        tmp_path / f"store-{mode}", gdn_snapshot_state_dtype=mode.upper()
     )
     try:
         assert store.gdn_sidecar_state_dtype == mode
@@ -1524,22 +1524,22 @@ def test_constructors_normalize_dtype_case(tmp_path, mode):
         cache_dir=tmp_path / f"mgr-{mode}",
         max_size_bytes=1024**2,
         gdn_ssd_split_enabled=True,
-        gdn_sidecar_state_dtype=mode.upper(),
+        gdn_snapshot_state_dtype=mode.upper(),
     )
     try:
-        assert manager._gdn_sidecar_state_dtype == mode
+        assert manager._gdn_snapshot_state_dtype == mode
     finally:
         manager.close()
 
 
 @pytest.mark.parametrize("bad", ["fp8", "int4", "", "rht", None, 8])
 def test_constructors_reject_unknown_dtype(tmp_path, bad):
-    with pytest.raises(ValueError, match="gdn_sidecar_state_dtype"):
-        BoundarySnapshotSSDStore(tmp_path / "s", gdn_sidecar_state_dtype=bad)
-    with pytest.raises(ValueError, match="gdn_sidecar_state_dtype"):
+    with pytest.raises(ValueError, match="gdn_snapshot_state_dtype"):
+        BoundarySnapshotSSDStore(tmp_path / "s", gdn_snapshot_state_dtype=bad)
+    with pytest.raises(ValueError, match="gdn_snapshot_state_dtype"):
         PagedSSDCacheManager(
             cache_dir=tmp_path / "m",
             max_size_bytes=1024**2,
             gdn_ssd_split_enabled=True,
-            gdn_sidecar_state_dtype=bad,
+            gdn_snapshot_state_dtype=bad,
         )

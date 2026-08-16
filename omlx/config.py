@@ -116,7 +116,22 @@ class PagedSSDCacheConfig:
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
-    gdn_sidecar_state_dtype: str = "rht_int16"
+    gdn_snapshot_state_dtype: str = "rht_int16"
+
+    @property
+    def gdn_sidecar_state_dtype(self) -> str:
+        """Compatibility alias for ``gdn_snapshot_state_dtype``.
+
+        The codec started out as an SSD-sidecar-only feature and the setting
+        was named after that layout. It now applies to the embedded block
+        payload too, so the canonical name is layout-independent; the old name
+        keeps existing configs and callers working.
+        """
+        return self.gdn_snapshot_state_dtype
+
+    @gdn_sidecar_state_dtype.setter
+    def gdn_sidecar_state_dtype(self, value: str) -> None:
+        self.gdn_snapshot_state_dtype = value
 
     @property
     def gdn_snapshot_storage(self) -> str:
@@ -228,9 +243,12 @@ class OMLXConfig:
             "OMLX_GDN_SSD_PENDING_MAX_SIZE",
             config.paged_ssd_cache.gdn_ssd_pending_max_size,
         )
-        config.paged_ssd_cache.gdn_sidecar_state_dtype = os.getenv(
-            "OMLX_GDN_SIDECAR_STATE_DTYPE",
-            config.paged_ssd_cache.gdn_sidecar_state_dtype,
+        config.paged_ssd_cache.gdn_snapshot_state_dtype = os.getenv(
+            "OMLX_GDN_SNAPSHOT_STATE_DTYPE",
+            os.getenv(
+                "OMLX_GDN_SIDECAR_STATE_DTYPE",
+                config.paged_ssd_cache.gdn_snapshot_state_dtype,
+            ),
         ).lower()
         paged_ssd_dir = os.getenv("OMLX_PAGED_SSD_CACHE_DIR")
         if paged_ssd_dir:
@@ -362,7 +380,7 @@ class OMLXConfig:
                 errors.append("gdn_ssd_pending_max_size must be positive")
         except (AttributeError, TypeError, ValueError) as exc:
             errors.append(f"Invalid gdn_ssd_pending_max_size: {exc}")
-        if self.paged_ssd_cache.gdn_sidecar_state_dtype not in {
+        if self.paged_ssd_cache.gdn_snapshot_state_dtype not in {
             "fp32",
             "bf16",
             "int8",
@@ -370,7 +388,7 @@ class OMLXConfig:
             "rht_int16",
         }:
             errors.append(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_snapshot_state_dtype must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             )
         return errors

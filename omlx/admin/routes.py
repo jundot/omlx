@@ -255,6 +255,8 @@ class GlobalSettingsRequest(BaseModel):
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
+    gdn_snapshot_state_dtype: str | None = None
+    # Retained so clients written against the sidecar-only name keep working.
     gdn_sidecar_state_dtype: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
@@ -943,8 +945,8 @@ async def _apply_cache_settings_runtime(
     pool._scheduler_config.gdn_ssd_pending_max_bytes = parse_size(
         global_settings.cache.gdn_ssd_pending_max_size
     )
-    pool._scheduler_config.gdn_sidecar_state_dtype = (
-        global_settings.cache.gdn_sidecar_state_dtype
+    pool._scheduler_config.gdn_snapshot_state_dtype = (
+        global_settings.cache.gdn_snapshot_state_dtype
     )
     pool._scheduler_config.initial_cache_blocks = (
         global_settings.cache.initial_cache_blocks
@@ -3324,7 +3326,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
-            "gdn_sidecar_state_dtype": global_settings.cache.gdn_sidecar_state_dtype,
+            "gdn_snapshot_state_dtype": (
+                global_settings.cache.gdn_snapshot_state_dtype
+            ),
+            "gdn_sidecar_state_dtype": global_settings.cache.gdn_snapshot_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
@@ -3825,15 +3830,20 @@ async def update_global_settings(
                 status_code=400,
                 detail="gdn_ssd_pending_max_size must be positive",
             )
+    requested_state_dtype = (
+        request.gdn_snapshot_state_dtype
+        if request.gdn_snapshot_state_dtype is not None
+        else request.gdn_sidecar_state_dtype
+    )
     if (
-        request.gdn_sidecar_state_dtype is not None
-        and request.gdn_sidecar_state_dtype.lower()
+        requested_state_dtype is not None
+        and requested_state_dtype.lower()
         not in {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
     ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_snapshot_state_dtype must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             ),
         )
@@ -3862,10 +3872,8 @@ async def update_global_settings(
             request.gdn_ssd_pending_max_size
         )
         cache_changed = True
-    if request.gdn_sidecar_state_dtype is not None:
-        global_settings.cache.gdn_sidecar_state_dtype = (
-            request.gdn_sidecar_state_dtype.lower()
-        )
+    if requested_state_dtype is not None:
+        global_settings.cache.gdn_snapshot_state_dtype = requested_state_dtype.lower()
         cache_changed = True
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size

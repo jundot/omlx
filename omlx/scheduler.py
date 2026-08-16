@@ -1511,7 +1511,8 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
-    gdn_sidecar_state_dtype: str = "rht_int16"
+    # Storage precision for GDN recurrent state, in either payload layout.
+    gdn_snapshot_state_dtype: str = "rht_int16"
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -1520,6 +1521,15 @@ class SchedulerConfig:
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+
+    @property
+    def gdn_sidecar_state_dtype(self) -> str:
+        """Compatibility alias for ``gdn_snapshot_state_dtype``."""
+        return self.gdn_snapshot_state_dtype
+
+    @gdn_sidecar_state_dtype.setter
+    def gdn_sidecar_state_dtype(self, value: str) -> None:
+        self.gdn_snapshot_state_dtype = value
 
 
 @dataclass
@@ -12278,7 +12288,7 @@ class Scheduler:
                 expected_block_size=self.config.paged_cache_block_size,
                 expected_block_size_tokens=self.config.paged_cache_block_size,
                 expected_kv_bytes_per_token=expected_kv_bytes_per_token,
-                gdn_sidecar_state_dtype=self.config.gdn_sidecar_state_dtype,
+                gdn_snapshot_state_dtype=self.config.gdn_snapshot_state_dtype,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -12302,7 +12312,7 @@ class Scheduler:
                         base_dir=Path(self.config.paged_ssd_cache_dir),
                         pending_max_bytes=self.config.gdn_ssd_pending_max_bytes,
                         gdn_sidecar_state_dtype=(
-                            self.config.gdn_sidecar_state_dtype
+                            self.config.gdn_snapshot_state_dtype
                             if self.config.gdn_ssd_split_enabled
                             else "fp32"
                         ),

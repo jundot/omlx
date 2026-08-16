@@ -13,13 +13,13 @@ GDN_I18N_KEYS = {
     "settings.advanced.gdn_snapshot_storage_embedded",
     "settings.advanced.gdn_pending_write_limit",
     "settings.advanced.gdn_pending_write_limit_hint",
-    "settings.advanced.gdn_sidecar_state_precision",
-    "settings.advanced.gdn_sidecar_state_precision_hint",
-    "settings.advanced.gdn_sidecar_state_precision_rht_int16",
-    "settings.advanced.gdn_sidecar_state_precision_fp32",
-    "settings.advanced.gdn_sidecar_state_precision_bf16",
-    "settings.advanced.gdn_sidecar_state_precision_int8",
-    "settings.advanced.gdn_sidecar_state_precision_rht_int8",
+    "settings.advanced.gdn_snapshot_state_precision",
+    "settings.advanced.gdn_snapshot_state_precision_hint",
+    "settings.advanced.gdn_snapshot_state_precision_rht_int16",
+    "settings.advanced.gdn_snapshot_state_precision_fp32",
+    "settings.advanced.gdn_snapshot_state_precision_bf16",
+    "settings.advanced.gdn_snapshot_state_precision_int8",
+    "settings.advanced.gdn_snapshot_state_precision_rht_int8",
 }
 
 
@@ -56,6 +56,6 @@ def test_dashboard_posts_canonical_gdn_fields_only():
     payload = script[payload_start:payload_end]
 
     assert "gdn_snapshot_storage:" in payload
-    assert "gdn_sidecar_state_dtype:" in payload
+    assert "gdn_snapshot_state_dtype:" in payload
     assert "gdn_ssd_pending_max_size:" in payload
     assert "gdn_ssd_split_enabled:" not in payload

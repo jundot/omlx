@@ -116,15 +116,15 @@ class BoundarySnapshotSSDStore:
         base_dir: Path,
         *,
         pending_max_bytes: int = _DEFAULT_PENDING_MAX_BYTES,
-        gdn_sidecar_state_dtype: str = "fp32",
+        gdn_snapshot_state_dtype: str = "fp32",
     ) -> None:
-        state_dtype = str(gdn_sidecar_state_dtype).lower()
+        state_dtype = str(gdn_snapshot_state_dtype).lower()
         if state_dtype not in _GDN_STATE_DTYPES:
             raise ValueError(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_snapshot_state_dtype must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             )
-        self._gdn_sidecar_state_dtype = state_dtype
+        self._gdn_snapshot_state_dtype = state_dtype
         self._gdn_state_dequantizations = 0
         self._gdn_encode_failures = 0
         self._gdn_decode_failures = 0
@@ -519,8 +519,13 @@ class BoundarySnapshotSSDStore:
             return self._backpressure_ms
 
     @property
+    def gdn_snapshot_state_dtype(self) -> str:
+        return self._gdn_snapshot_state_dtype
+
+    @property
     def gdn_sidecar_state_dtype(self) -> str:
-        return self._gdn_sidecar_state_dtype
+        """Compatibility alias for ``gdn_snapshot_state_dtype``."""
+        return self._gdn_snapshot_state_dtype
 
     @property
     def gdn_state_dequantizations(self) -> int:
@@ -1292,12 +1297,12 @@ class BoundarySnapshotSSDStore:
     ) -> bool:
         """Select only the fp32 recurrent member of Arrays-family caches."""
         eligible = bool(
-            self._gdn_sidecar_state_dtype != "fp32"
+            self._gdn_snapshot_state_dtype != "fp32"
             and gdn_codec.is_recurrent_state_element(
                 class_name, cache_type, state_index, tensor
             )
         )
-        if not eligible or self._gdn_sidecar_state_dtype not in {
+        if not eligible or self._gdn_snapshot_state_dtype not in {
             "rht_int8",
             "rht_int16",
         }:
@@ -1317,7 +1322,7 @@ class BoundarySnapshotSSDStore:
         """
         shape = getattr(tensor, "shape", ())
         dim = int(shape[-1]) if shape else 0
-        if gdn_codec.codec_supports_tensor(self._gdn_sidecar_state_dtype, tensor):
+        if gdn_codec.codec_supports_tensor(self._gdn_snapshot_state_dtype, tensor):
             return True
         with self._gdn_dequant_lock:
             self._gdn_capability_fallbacks += 1
@@ -1329,7 +1334,7 @@ class BoundarySnapshotSSDStore:
             logger.error(
                 "GDN RHT sidecars unsupported for last dimension %s "
                 "(needs a positive power of two); storing recurrent state as "
-                "fp32 instead. Set gdn_sidecar_state_dtype=int8 for a codec "
+                "fp32 instead. Set gdn_snapshot_state_dtype=int8 for a codec "
                 "with no width constraint, or use fp32 for this shape.",
                 dim,
             )
@@ -1345,7 +1350,7 @@ class BoundarySnapshotSSDStore:
         layer has been encoded (see ``_verify_gdn_encode_checks``).
         """
         return gdn_codec.encode_state(
-            tensor, self._gdn_sidecar_state_dtype, checks
+            tensor, self._gdn_snapshot_state_dtype, checks
         )
 
     def _verify_gdn_encode_checks(
@@ -1353,7 +1358,7 @@ class BoundarySnapshotSSDStore:
     ) -> None:
         """Evaluate every deferred encode check with a single sync."""
         try:
-            gdn_codec.verify_encode_checks(checks, self._gdn_sidecar_state_dtype)
+            gdn_codec.verify_encode_checks(checks, self._gdn_snapshot_state_dtype)
         except ValueError:
             with self._gdn_dequant_lock:
                 self._gdn_encode_failures += 1
@@ -1361,7 +1366,7 @@ class BoundarySnapshotSSDStore:
             # warn here: refusing a recurrent state is a model-level event,
             # not a routine checkpoint miss.
             logger.warning(
-                "Skipping GDN sidecar: codec=%s", self._gdn_sidecar_state_dtype
+                "Skipping GDN sidecar: codec=%s", self._gdn_snapshot_state_dtype
             )
             raise
 

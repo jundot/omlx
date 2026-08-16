@@ -38,6 +38,7 @@ import numpy as np
 
 from omlx.utils.formatting import format_bytes
 
+from . import gdn_state_codec as gdn_codec
 from .interface import CacheManager
 from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
@@ -167,13 +168,7 @@ _READABLE_CACHE_FORMAT_VERSIONS = frozenset(
     {"2", "3", "5", POOLING_CACHE_DELTA_FORMAT_VERSION}
 )
 
-_GDN_STATE_CODEC_BY_DTYPE = {
-    "fp32": "fp32",
-    "bf16": "bf16_v1",
-    "int8": "int8_rowwise_last_axis_v1",
-    "rht_int8": "rht_int8_rowwise_last_axis_v1",
-    "rht_int16": "rht_int16_rowwise_last_axis_v1",
-}
+_GDN_STATE_CODEC_BY_DTYPE = gdn_codec.CODEC_BY_DTYPE
 
 
 # Layer cache type names whose meta_state should be clamped on save so the
@@ -1553,7 +1548,7 @@ class PagedSSDCacheManager(CacheManager):
         expected_kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
         expected_layer_cache_types: list[str] | None = None,
         gdn_ssd_split_enabled: bool = False,
-        gdn_sidecar_state_dtype: str = "fp32",
+        gdn_snapshot_state_dtype: str = "fp32",
     ):
         """
         Initialize the SSD cache manager.
@@ -1614,16 +1609,10 @@ class PagedSSDCacheManager(CacheManager):
         self._expected_block_size = expected_block_size
         self._expected_layer_cache_types = expected_layer_cache_types
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
-        self._gdn_sidecar_state_dtype = str(gdn_sidecar_state_dtype).lower()
-        if self._gdn_sidecar_state_dtype not in {
-            "fp32",
-            "bf16",
-            "int8",
-            "rht_int8",
-            "rht_int16",
-        }:
+        self._gdn_snapshot_state_dtype = str(gdn_snapshot_state_dtype).lower()
+        if self._gdn_snapshot_state_dtype not in gdn_codec.STATE_DTYPES:
             raise ValueError(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_snapshot_state_dtype must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             )
         self._gdn_legacy_fp32_fallbacks = 0
@@ -2766,10 +2755,13 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
         )
-        if self._gdn_sidecar_state_dtype == "fp32":
+        if self._gdn_snapshot_state_dtype == "fp32":
             return base
         payload = json.loads(base)
-        payload["gdn_sidecar_state_dtype"] = self._gdn_sidecar_state_dtype
+        # On-disk namespace key: it names the sidecar directory an existing
+        # checkpoint lives in, so it keeps its original spelling even though
+        # the setting it mirrors is now layout-independent.
+        payload["gdn_sidecar_state_dtype"] = self._gdn_snapshot_state_dtype
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @staticmethod

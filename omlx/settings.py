@@ -328,7 +328,21 @@ class CacheSettings:
     # True/False preserve the legacy explicit split/embedded choices.
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
-    gdn_sidecar_state_dtype: str = "rht_int16"
+    gdn_snapshot_state_dtype: str = "rht_int16"
+
+    @property
+    def gdn_sidecar_state_dtype(self) -> str:
+        """Compatibility alias for ``gdn_snapshot_state_dtype``.
+
+        The codec was SSD-sidecar-only when the setting was named, and the
+        name followed the layout. It now also applies to state embedded in
+        cache blocks, so the canonical name is layout-independent.
+        """
+        return self.gdn_snapshot_state_dtype
+
+    @gdn_sidecar_state_dtype.setter
+    def gdn_sidecar_state_dtype(self, value: str) -> None:
+        self.gdn_snapshot_state_dtype = value
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -408,7 +422,9 @@ class CacheSettings:
             "gdn_ssd_split_enabled": self.get_gdn_ssd_split_enabled(),
             "gdn_snapshot_storage": self.get_gdn_snapshot_storage(),
             "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
-            "gdn_sidecar_state_dtype": self.gdn_sidecar_state_dtype,
+            "gdn_snapshot_state_dtype": self.gdn_snapshot_state_dtype,
+            # Written for readers that predate the layout-independent name.
+            "gdn_sidecar_state_dtype": self.gdn_snapshot_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -453,10 +469,13 @@ class CacheSettings:
             gdn_ssd_pending_max_size=data.get(
                 "gdn_ssd_pending_max_size", "512MB"
             ),
-            gdn_sidecar_state_dtype=str(
+            gdn_snapshot_state_dtype=str(
                 data.get(
-                    "gdn_sidecar_state_dtype",
-                    "fp32" if legacy_settings else "rht_int16",
+                    "gdn_snapshot_state_dtype",
+                    data.get(
+                        "gdn_sidecar_state_dtype",
+                        "fp32" if legacy_settings else "rht_int16",
+                    ),
                 )
             ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
@@ -1097,8 +1116,11 @@ class GlobalSettings:
             )
         if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
             self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
-        if gdn_sidecar_dtype := os.getenv("OMLX_GDN_SIDECAR_STATE_DTYPE"):
-            self.cache.gdn_sidecar_state_dtype = gdn_sidecar_dtype.lower()
+        if gdn_state_dtype := (
+            os.getenv("OMLX_GDN_SNAPSHOT_STATE_DTYPE")
+            or os.getenv("OMLX_GDN_SIDECAR_STATE_DTYPE")
+        ):
+            self.cache.gdn_snapshot_state_dtype = gdn_state_dtype.lower()
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -1484,7 +1506,7 @@ class GlobalSettings:
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid gdn_ssd_pending_max_size: {e}")
 
-        if self.cache.gdn_sidecar_state_dtype not in {
+        if self.cache.gdn_snapshot_state_dtype not in {
             "fp32",
             "bf16",
             "int8",
@@ -1492,7 +1514,7 @@ class GlobalSettings:
             "rht_int16",
         }:
             errors.append(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_snapshot_state_dtype must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             )
         if not (
@@ -1645,7 +1667,7 @@ class GlobalSettings:
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
             ),
-            gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            gdn_snapshot_state_dtype=self.cache.gdn_snapshot_state_dtype,
         )
 
     def to_dict(self) -> dict[str, Any]:
