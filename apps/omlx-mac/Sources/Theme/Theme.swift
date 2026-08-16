@@ -7,11 +7,40 @@
 
 import SwiftUI
 
+extension Color {
+    /// Initialize from a 0xRRGGBB hex value.
+    init(hex: UInt32) {
+        let r = Double((hex >> 16) & 0xFF) / 255.0
+        let g = Double((hex >> 8) & 0xFF) / 255.0
+        let b = Double(hex & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b)
+    }
+}
+
+// MARK: - Enhanced Readability (global)
+
+/// Mirrors the web admin's Enhanced Readability preference. When on, the app
+/// lifts secondary/tertiary text to the primary color, enforces a 12pt body
+/// text floor, and raises placeholder contrast — same behavior as the web.
+enum EnhancedReadability {
+    static let enabledKey = "OMLXEnhancedReadability"
+    nonisolated(unsafe) static var isEnabled: Bool = false
+
+    static func syncFromDefaults() {
+        isEnabled = UserDefaults.standard.bool(forKey: enabledKey)
+        OMLXFont.minBodySize = isEnabled ? 12 : 0
+    }
+}
+
+/// App-wide typography knobs. `minBodySize` floors body text (Enhanced Readability).
+enum OMLXFont {
+    nonisolated(unsafe) static var minBodySize: CGFloat = 0
+}
+
 // MARK: - Token table
 
 struct OMLXTheme: Sendable {
     let isDark: Bool
-
     // Surfaces
     let windowBg: Color
     let sidebarBg: Color
@@ -26,8 +55,8 @@ struct OMLXTheme: Sendable {
 
     // Text
     let text: Color
-    let textSecondary: Color
-    let textTertiary: Color
+    var textSecondary: Color
+    var textTertiary: Color
 
     // Accent + selection
     let accent: Color
@@ -71,7 +100,7 @@ struct OMLXTheme: Sendable {
 }
 
 extension OMLXTheme {
-    static let light = OMLXTheme(
+    static var light: OMLXTheme { OMLXTheme(
         isDark: false,
         windowBg: systemWindowBgLight,
         sidebarBg: systemWindowBgLight,
@@ -100,7 +129,7 @@ extension OMLXTheme {
         inputBorderFocus: systemAccent,
         greenDot: systemGreen,
         amberDot: systemOrange,
-        redDot: systemRed,
+        redDot: redFor(isDark: false),
         blueDot: systemAccent,
         codeBg: systemCodeBgLight,
         warningBg: systemOrange.opacity(0.16),
@@ -112,9 +141,9 @@ extension OMLXTheme {
         desktopWashBase: systemWindowBgLight,
         groupHighlightTopOpacity: 0.35,
         groupShadowOpacity: 0.06
-    )
+    ) }
 
-    static let dark = OMLXTheme(
+    static var dark: OMLXTheme { OMLXTheme(
         isDark: true,
         windowBg: systemWindowBg,
         sidebarBg: systemWindowBg,
@@ -143,7 +172,7 @@ extension OMLXTheme {
         inputBorderFocus: systemAccent,
         greenDot: systemGreen,
         amberDot: systemOrange,
-        redDot: systemRed,
+        redDot: redFor(isDark: true),
         blueDot: systemAccent,
         codeBg: systemCodeBgDark,
         warningBg: systemOrange.opacity(0.18),
@@ -155,7 +184,7 @@ extension OMLXTheme {
         desktopWashBase: systemWindowBg,
         groupHighlightTopOpacity: 0.08,
         groupShadowOpacity: 0.08
-    )
+    ) }
 
     private static var systemWindowBg: Color {
         Color(nsColor: .underPageBackgroundColor)
@@ -198,11 +227,13 @@ extension OMLXTheme {
     }
 
     private static var systemTextSecondary: Color {
-        Color(nsColor: .secondaryLabelColor)
+        // Enhanced Readability lifts secondary text to primary for higher contrast.
+        EnhancedReadability.isEnabled ? Color(nsColor: .labelColor) : Color(nsColor: .secondaryLabelColor)
     }
 
     private static var systemTextTertiary: Color {
-        Color(nsColor: .tertiaryLabelColor)
+        // Enhanced Readability lifts tertiary text to primary for higher contrast.
+        EnhancedReadability.isEnabled ? Color(nsColor: .labelColor) : Color(nsColor: .tertiaryLabelColor)
     }
 
     private static var systemAccent: Color {
@@ -231,6 +262,14 @@ extension OMLXTheme {
 
     private static var systemRed: Color {
         Color(nsColor: .systemRed)
+    }
+
+    /// Web Enhanced Readability red: #d92d20 (light) / #ef5b54 (dark).
+    private static func redFor(isDark: Bool) -> Color {
+        if EnhancedReadability.isEnabled {
+            return Color(hex: isDark ? 0xef5b54 : 0xd92d20)
+        }
+        return Color(nsColor: .systemRed)
     }
 }
 
@@ -286,9 +325,12 @@ extension Color {
 // MARK: - Typography conveniences
 
 extension Font {
-    /// SF Pro Text-y body. macOS picks the right SF variant automatically by size.
+    /// Body text. macOS resolves this to PingFang SC/TC for Chinese (simplified
+    /// vs traditional automatically) and SF Pro Text for Latin, mirroring the
+    /// web admin's "PingFang first, SF Pro fallback" stack. The 12pt floor
+    /// applies under Enhanced Readability.
     static func omlxText(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        .system(size: size, weight: weight)
+        .system(size: max(size, OMLXFont.minBodySize), weight: weight)
     }
     /// Display weight for headlines (size auto-promotes on macOS at ≥ 20pt).
     static func omlxDisplay(_ size: CGFloat, weight: Font.Weight = .semibold) -> Font {

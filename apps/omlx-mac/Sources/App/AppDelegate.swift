@@ -152,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installWindowObservers()
+        EnhancedReadability.syncFromDefaults()
         // Seed without applying: launch flow (accessory flip / welcome)
         // owns the initial policy; only later real flips act.
         lastAppliedDockIconPref = dockIconAlwaysVisible
@@ -272,6 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the activation policy.
     @objc nonisolated private func defaultsDidChange(_ note: Notification) {
         Task { @MainActor in
+            EnhancedReadability.syncFromDefaults()
             self.applyDockIconPreference()
         }
     }

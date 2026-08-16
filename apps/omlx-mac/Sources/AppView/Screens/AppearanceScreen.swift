@@ -25,6 +25,8 @@ struct AppearanceScreen: View {
     private var showMemoryItem = false
     @AppStorage(MenubarMetricPrefs.modelLibraryScopeKey)
     private var modelLibraryScope = MenuBarModelScope.all.rawValue
+    @AppStorage(EnhancedReadability.enabledKey)
+    private var enhancedReadability = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -252,6 +254,31 @@ struct AppearanceScreen: View {
                     isLast: true
                 ) {
                     Toggle("", isOn: $showMemoryItem)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+            }
+
+            SectionHeader(String(
+                localized: "appearance.section.readability",
+                defaultValue: "Enhanced Readability",
+                comment: "Appearance section header for the Enhanced Readability preference"
+            ))
+            ListGroup {
+                Row(
+                    label: String(
+                        localized: "appearance.row.enhanced_readability",
+                        defaultValue: "Enhanced Readability",
+                        comment: "Appearance row label for the Enhanced Readability toggle"
+                    ),
+                    sublabel: String(
+                        localized: "appearance.row.enhanced_readability.sub",
+                        defaultValue: "Raise low-contrast text to the primary color and enforce a 12pt minimum body font.",
+                        comment: "Appearance row sublabel describing Enhanced Readability"
+                    ),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: $enhancedReadability)
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
