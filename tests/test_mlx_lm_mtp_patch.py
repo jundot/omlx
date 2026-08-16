@@ -1744,12 +1744,14 @@ class TestBatchGeneratorDispatch:
         class _FakeCache:
             def __init__(self):
                 self.offset = 0
+                self._mtp_undo = None
 
         def fake_rebuild(model):
             return [_FakeCache()]
 
         def fake_backbone(model, inputs, cache, n_confirmed=0):
             cache[0].offset = int(inputs.shape[1])
+            cache[0]._mtp_undo = object()
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
             return mx.array(arr), None, None
@@ -1801,6 +1803,7 @@ class TestBatchGeneratorDispatch:
         assert 42 not in batch.tokens[0]
         # cache rebuilt to contain exactly the streamed tokens
         assert batch.prompt_cache[0].offset == 4
+        assert batch.prompt_cache[0]._mtp_undo is None
 
     def test_reconcile_empty_queue_samples_from_logits(self, monkeypatch):
         bg, batch, state = self._make_reconcile_batch(
@@ -2337,9 +2340,9 @@ class TestRestoreOrTrimAtomicity:
 
 class TestRotatingCacheMtpUndo:
     """A rotated RotatingKVCache cannot trim, so MTP draft rejection needs
-    the armed one-update undo log: restore the pre-verify references and
-    replay the confirmed token. Equivalence is checked against a reference
-    cache that never saw the rejected draft."""
+    the armed verify-block undo log: restore the pre-verify state and replay
+    the confirmed/accepted prefix. Equivalence is checked against a reference
+    cache that never saw the rejected positions."""
 
     @staticmethod
     def _fill(cache, n, dim=4, start=0):
@@ -2349,7 +2352,7 @@ class TestRotatingCacheMtpUndo:
             k = mx.full((1, 1, 1, dim), float(i))
             cache.update_and_fetch(k, k)
 
-    def _run_equivalence(self, make_cache):
+    def _run_equivalence(self, make_cache, num_drafts=1):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import cache_rollback
@@ -2361,18 +2364,22 @@ class TestRotatingCacheMtpUndo:
         self._fill(cache, 12)
         self._fill(ref, 12)
 
-        confirmed = mx.full((1, 1, 1, 4), 100.0)
-        draft = mx.full((1, 1, 1, 4), 200.0)
-        both = mx.concatenate([confirmed, draft], axis=2)
+        verify_steps = num_drafts + 1
+        verify = mx.broadcast_to(
+            mx.arange(100, 100 + verify_steps, dtype=mx.float32).reshape(
+                1, 1, verify_steps, 1
+            ),
+            (1, 1, verify_steps, 4),
+        )
         cache_rollback.set_undo_armed(True)
         try:
-            cache.update_and_fetch(both, both)
+            cache.update_and_fetch(verify, verify)
         finally:
             cache_rollback.set_undo_armed(False)
         assert cache.is_trimmable()
-        assert cache.trim(1) == 1
+        assert cache.trim(num_drafts) == num_drafts
 
-        ref.update_and_fetch(confirmed, confirmed)
+        ref.update_and_fetch(verify[..., :1, :], verify[..., :1, :])
 
         nxt = mx.full((1, 1, 1, 4), 300.0)
         ck, cv = cache.update_and_fetch(nxt, nxt)
@@ -2380,6 +2387,7 @@ class TestRotatingCacheMtpUndo:
         mx.eval(ck, cv, rk, rv)
         assert mx.array_equal(ck, rk).item()
         assert mx.array_equal(cv, rv).item()
+        assert cache.meta_state == ref.meta_state
         c_off = cache.offset
         r_off = ref.offset
         if hasattr(c_off, "tolist"):
@@ -2396,6 +2404,18 @@ class TestRotatingCacheMtpUndo:
         from mlx_lm.models.cache import BatchRotatingKVCache
 
         self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]))
+
+    def test_rotating_kv_cache_depth_eight_verify_undo(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        # Depth-8 contains one confirmed token plus eight drafts. The old gate
+        # admitted at most eight positions, excluding this nine-position update.
+        self._run_equivalence(lambda: RotatingKVCache(max_size=8), num_drafts=8)
+
+    def test_batch_rotating_kv_cache_depth_eight_verify_undo(self):
+        from mlx_lm.models.cache import BatchRotatingKVCache
+
+        self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]), num_drafts=8)
 
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx

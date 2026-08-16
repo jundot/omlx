@@ -7,18 +7,18 @@ Two pieces:
    snapshots ``(conv_state, ssm_state)`` after the confirmed prefix of an
    MTP draft+verify forward, then restores it when the draft is rejected.
 
-2. A one-update undo log on ``RotatingKVCache`` / ``BatchRotatingKVCache``:
+2. A verify-block undo log on ``RotatingKVCache`` / ``BatchRotatingKVCache``:
    a rotated rotating cache is not trimmable (the slot of the evicted token
-   has been overwritten), so an MTP draft rejection could not roll back the
-   2-token verify write and the rejected token stayed in the cache as a
-   phantom, progressively corrupting output (hit on DeepSeek-V4-Flash,
-   sliding_window=128). The S==2 verify update always takes the
+   has been overwritten), so an MTP draft rejection could not discard the
+   rejected positions exactly and phantom tokens progressively corrupted
+   output (hit on DeepSeek-V4-Flash, sliding_window=128). A multi-token verify
+   update takes the
    ``_update_concat`` path, which only rebinds ``keys``/``values`` (no
    in-place setitem), so stashing the pre-update attribute references plus
-   the update's inputs gives an exact undo; ``trim(1)`` then replays the
-   confirmed token. Stashing is armed only around the MTP backbone forward
-   (``batch_generator._call_backbone``) so non-MTP flows keep stock
-   trim semantics.
+   the update's inputs gives an exact undo. ``trim(rejected)`` then restores
+   the snapshot and replays the confirmed/accepted prefix. Stashing is armed
+   only around MTP-managed backbone forwards (``batch_generator._call_backbone``)
+   so non-MTP flows keep stock trim semantics.
 """
 
 from __future__ import annotations
@@ -94,8 +94,12 @@ def _wrap_rotating(cls, fields) -> None:
 
     def update_and_fetch(self, keys, values):
         # DSpark's decode-consistent verify advances the cache with several
-        # M=1 updates; other MTP backends use one M=2..8 update. Preserve one
-        # pre-block snapshot for both forms so rejection can restore exactly.
+        # M=1 updates; a depth-k Lightning verify uses one update containing the
+        # confirmed token plus every draft token (currently up to M=9 for
+        # depth-8 drafting). Preserve one pre-block snapshot for both forms
+        # so rejection can restore exactly. Undo is scoped by _call_backbone;
+        # record every non-empty armed update instead of duplicating the
+        # supported draft-depth limit here.
         steps = keys.shape[2]
         armed = _is_undo_armed()
         existing = getattr(self, "_mtp_undo", None)
@@ -109,7 +113,7 @@ def _wrap_rotating(cls, fields) -> None:
                 mx.concatenate([old_values, values], axis=2),
                 True,
             )
-        elif armed and 1 <= steps <= 8:
+        elif armed and steps >= 1:
             snap = {}
             for f in fields:
                 v = getattr(self, f)
