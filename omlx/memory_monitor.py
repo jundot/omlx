@@ -908,6 +908,46 @@ class _DeepSeekV4PrefillMemoryProfile:
     index_head_dim: int
     index_topk: int
     dtype_size: float
+    wsdpa_dtype_supported: bool = False
+
+    def _wsdpa_route_active(self, *, topk: bool = False) -> bool:
+        """Match the live WSDPA route without a process-wide head-dim flag."""
+        if (
+            not self.wsdpa_dtype_supported
+            or self.num_attention_heads != 64
+            or self.head_dim != 512
+        ):
+            return False
+        try:
+            from omlx.patches.deepseek_v4.wsdpa_attention import (
+                wsdpa_prefill_route_active,
+            )
+
+            return wsdpa_prefill_route_active(topk=topk)
+        except Exception:
+            return False
+
+    def _wsdpa_attention_bytes(
+        self,
+        query_tokens: int,
+        local_tokens: int,
+        pooled_tokens: int = 0,
+        *,
+        selected_tokens: int = 0,
+    ) -> int:
+        """Bound the custom kernel's contiguous inputs and output.
+
+        The kernel performs online softmax in registers and never materializes
+        a score matrix. Count potentially copied query/KV/top-k inputs and keep
+        the generic estimator's fp32-width output bound for conservatism.
+        """
+        query = (
+            self.num_attention_heads * query_tokens * self.head_dim * self.dtype_size
+        )
+        keys = (local_tokens + pooled_tokens) * self.head_dim * self.dtype_size
+        output = self.num_attention_heads * query_tokens * self.head_dim * 4
+        topk = query_tokens * selected_tokens * 4
+        return int(query + keys + output + topk)
 
     def _pool_cache_elements(
         self,
@@ -1032,31 +1072,43 @@ class _DeepSeekV4PrefillMemoryProfile:
         candidates: list[int] = []
 
         if self.local_layers:
-            candidates.append(
-                estimate_unfused_sdpa_call_bytes(
+            if query_tokens > 1 and self._wsdpa_route_active():
+                local_attention = self._wsdpa_attention_bytes(
+                    query_tokens, local_tokens
+                )
+            else:
+                local_attention = estimate_unfused_sdpa_call_bytes(
                     self.num_attention_heads,
                     query_tokens,
                     local_tokens,
                     self.head_dim,
                     self.dtype_size,
                 )
-            )
+            candidates.append(local_attention)
 
         if self.ratio128_layers:
             pooled_tokens = kv_len // 128
             attended = local_tokens + pooled_tokens
             projection = 2 * query_tokens * self.head_dim * self.dtype_size
-            concat = attended * self.head_dim * self.dtype_size
-            candidates.append(
-                int(projection + concat)
-                + estimate_unfused_sdpa_call_bytes(
-                    self.num_attention_heads,
+            if query_tokens > 1 and self._wsdpa_route_active():
+                attention = self._wsdpa_attention_bytes(
                     query_tokens,
-                    attended,
-                    self.head_dim,
-                    self.dtype_size,
+                    local_tokens,
+                    pooled_tokens,
                 )
-            )
+                candidates.append(int(projection) + attention)
+            else:
+                concat = attended * self.head_dim * self.dtype_size
+                candidates.append(
+                    int(projection + concat)
+                    + estimate_unfused_sdpa_call_bytes(
+                        self.num_attention_heads,
+                        query_tokens,
+                        attended,
+                        self.head_dim,
+                        self.dtype_size,
+                    )
+                )
 
         if self.ratio4_layers:
             pooled_tokens = kv_len // 4
@@ -1081,19 +1133,34 @@ class _DeepSeekV4PrefillMemoryProfile:
                 indexer = self._indexer_fallback_bytes(query_tokens, pooled_tokens)
             if pooled_tokens <= self.index_topk:
                 attended = local_tokens + pooled_tokens
-                attention = estimate_unfused_sdpa_call_bytes(
-                    self.num_attention_heads,
-                    query_tokens,
-                    attended,
-                    self.head_dim,
-                    self.dtype_size,
-                )
+                if query_tokens > 1 and self._wsdpa_route_active():
+                    attention = self._wsdpa_attention_bytes(
+                        query_tokens,
+                        local_tokens,
+                        pooled_tokens,
+                    )
+                else:
+                    attention = estimate_unfused_sdpa_call_bytes(
+                        self.num_attention_heads,
+                        query_tokens,
+                        attended,
+                        self.head_dim,
+                        self.dtype_size,
+                    )
             else:
-                attention = self._sparse_attention_bytes(
-                    query_tokens,
-                    local_tokens,
-                    pooled_tokens,
-                )
+                if query_tokens > 4 and self._wsdpa_route_active(topk=True):
+                    attention = self._wsdpa_attention_bytes(
+                        query_tokens,
+                        local_tokens,
+                        pooled_tokens,
+                        selected_tokens=self.index_topk,
+                    )
+                else:
+                    attention = self._sparse_attention_bytes(
+                        query_tokens,
+                        local_tokens,
+                        pooled_tokens,
+                    )
             # Both are evaluated within the same layer graph. Summing them is
             # deliberately conservative for lazy MLX execution and remains far
             # below the impossible dense full-context SDPA charge.
@@ -1103,7 +1170,10 @@ class _DeepSeekV4PrefillMemoryProfile:
 
 
 def make_prefill_memory_profile(
-    config: Any, *, compute_dtype_size: float
+    config: Any,
+    *,
+    compute_dtype_size: float,
+    wsdpa_dtype_supported: bool = False,
 ) -> PrefillMemoryProfile | None:
     """Build the one model-specific prefill strategy currently required."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
@@ -1153,6 +1223,7 @@ def make_prefill_memory_profile(
         index_head_dim=index_head_dim,
         index_topk=index_topk,
         dtype_size=float(compute_dtype_size),
+        wsdpa_dtype_supported=bool(wsdpa_dtype_supported),
     )
 
 

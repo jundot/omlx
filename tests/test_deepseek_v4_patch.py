@@ -1440,6 +1440,43 @@ class TestDeepseekV4CompressedNativeAttention:
 
         assert result is None
 
+    def test_topk_wsdpa_dispatch_ignores_native_sparse_disable(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        expected = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+        calls = []
+
+        def wsdpa_spy(*args):
+            calls.append(args)
+            return expected
+
+        monkeypatch.setattr(dsv4, "wsdpa_topk_prefill", wsdpa_spy)
+        monkeypatch.setattr(
+            dsv4,
+            "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED",
+            True,
+        )
+        actual = dsv4._sparse_pooled_attention(
+            mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 133, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 513, 512), dtype=mx.bfloat16),
+            mx.zeros((1, 5, 512), dtype=mx.uint32),
+            None,
+            None,
+            512**-0.5,
+            mx.zeros((64,), dtype=mx.bfloat16),
+            q_offset=128,
+            compress_ratio=4,
+            local_window=128,
+            _standard_mask=True,
+        )
+
+        assert actual is expected
+        assert len(calls) == 1
+
     @pytest.mark.parametrize(
         ("dtype_name", "max_tolerance"),
         (("float16", 0.004), ("bfloat16", 0.032)),

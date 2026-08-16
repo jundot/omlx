@@ -24,6 +24,27 @@ logger = logging.getLogger(__name__)
 _ENABLED = os.environ.get("OMLX_DSV4_WSDPA", "1") == "1"
 _kernel = None
 _broken = False
+_ready = False
+_topk_ready = False
+
+
+def _wsdpa_route_enabled(*, topk: bool = False) -> bool:
+    if _broken or not _ENABLED:
+        return False
+    return not topk or _TOPK_ENABLED
+
+
+def wsdpa_prefill_route_active(*, topk: bool = False) -> bool:
+    """Whether the matching WSDPA route is proven active in this process.
+
+    Stay conservative until the matching kernel output has evaluated once.
+    Setup/dispatch failures set ``_broken`` before returning to stock attention,
+    and this live predicate then makes the memory profile price that fallback.
+    """
+    if not _wsdpa_route_enabled(topk=topk):
+        return False
+    return _topk_ready if topk else _ready
+
 
 _HEADER = """
 #include <metal_stdlib>
@@ -113,7 +134,7 @@ _SOURCE = """
 
 def _get_kernel():
     global _kernel, _broken
-    if _broken or not _ENABLED:
+    if not _wsdpa_route_enabled():
         return None
     if _kernel is None:
         try:
@@ -227,7 +248,7 @@ _SOURCE_TOPK = """
 
 def _get_topk_kernel():
     global _KERNEL_TOPK, _broken
-    if _broken or not _ENABLED or not _TOPK_ENABLED:
+    if not _wsdpa_route_enabled(topk=True):
         return None
     if _KERNEL_TOPK is None:
         try:
@@ -263,7 +284,7 @@ def wsdpa_prefill(
     q: [B, H, L, D] (B == 1), kv: [B, 1, S, D], pooled: [B, P, D] or None.
     Only valid for prefill shapes (L > 1); callers keep decode paths.
     """
-    global _broken
+    global _broken, _ready
     if isinstance(offset, mx.array):
         return None  # should not happen in prefill; stay safe
     if (
@@ -298,6 +319,11 @@ def wsdpa_prefill(
             output_shapes=[(heads, q_len, head_dim)],
             output_dtypes=[mx.bfloat16],
         )[0]
+        if not _ready:
+            # MLX is lazy: construction alone cannot prove the route works.
+            # Evaluate the first dispatch inside this fallback boundary.
+            mx.eval(out)
+            _ready = True
         return out[None]
     except Exception:
         _broken = True
@@ -321,8 +347,8 @@ def wsdpa_topk_prefill(
     Requires the Indexer's temporally sorted topk rows. Returns None to keep the
     native/stock path whenever shapes or dtypes are not the exact prefill case.
     """
-    global _broken
-    if isinstance(offset, mx.array) or not _TOPK_ENABLED:
+    global _broken, _topk_ready
+    if isinstance(offset, mx.array) or not _wsdpa_route_enabled(topk=True):
         return None
     if (
         q.dtype != mx.bfloat16
@@ -370,6 +396,11 @@ def wsdpa_topk_prefill(
             output_shapes=[(heads, q_len, head_dim)],
             output_dtypes=[mx.bfloat16],
         )[0]
+        if not _topk_ready:
+            # Keep the low-memory profile disabled until lazy execution proves
+            # that this independent top-k route is usable.
+            mx.eval(out)
+            _topk_ready = True
         return out[None]
     except Exception:
         _broken = True

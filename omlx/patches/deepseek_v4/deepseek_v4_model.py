@@ -656,8 +656,7 @@ def _sparse_pooled_attention(
 
     B, H, L, D = q.shape
     if (
-        not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
-        and q_offset is not None
+        q_offset is not None
         and compress_ratio is not None
         and local_window is not None
         and sinks is not None
@@ -689,29 +688,30 @@ def _sparse_pooled_attention(
             )
             if out is not None:
                 return out
-        try:
-            from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        if not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+            try:
+                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
-            if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
-                return glm_fast.deepseek_v4_sparse_attention(
-                    q,
-                    local_kv,
-                    pooled,
-                    topk[:, None],
-                    sinks,
-                    scale,
-                    int(q_offset),
-                    int(compress_ratio),
-                    int(local_window),
+                if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
+                    return glm_fast.deepseek_v4_sparse_attention(
+                        q,
+                        local_kv,
+                        pooled,
+                        topk[:, None],
+                        sinks,
+                        scale,
+                        int(q_offset),
+                        int(compress_ratio),
+                        int(local_window),
+                    )
+            except Exception as exc:
+                _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native sparse attention kernel failed; MLX fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
                 )
-        except Exception as exc:
-            _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
-            logging.getLogger(__name__).warning(
-                "DSV4 native sparse attention kernel failed; MLX fallback "
-                "for the rest of this process: %s",
-                exc,
-                exc_info=True,
-            )
 
     if native_only:
         return None

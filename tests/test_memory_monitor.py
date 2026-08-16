@@ -743,25 +743,167 @@ class TestDeepSeekV4PrefillMemoryProfile:
             compress_ratios=[0, 0] + [4, 128] * 20 + [4],
         )
 
-    def _monitor(self):
+    def _monitor(
+        self,
+        *,
+        ratios=None,
+        wsdpa_dtype_supported: bool = False,
+    ):
         from omlx.memory_monitor import make_prefill_memory_profile
 
         config = self._config()
-        profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+        if ratios is not None:
+            config.compress_ratios = list(ratios)
+            config.num_hidden_layers = len(config.compress_ratios)
+        profile = make_prefill_memory_profile(
+            config,
+            compute_dtype_size=2,
+            wsdpa_dtype_supported=wsdpa_dtype_supported,
+        )
         assert profile is not None
         monitor = MemoryMonitor(max_kv_cache_memory=256 * 1024**3)
         monitor.set_model_info(
-            num_layers=43,
+            num_layers=config.num_hidden_layers,
             num_kv_heads=1,
             head_dim=512,
             dtype_size=2,
             num_attention_heads=64,
             num_kv_cache_layers=0,
             compute_dtype_size=2,
-            rotating_layer_specs=[(43, 128)],
+            rotating_layer_specs=[(config.num_hidden_layers, 128)],
             prefill_memory_profile=profile,
         )
         return monitor
+
+    @staticmethod
+    def _set_wsdpa_route(
+        monkeypatch,
+        *,
+        enabled: bool = True,
+        broken: bool = False,
+        dense: bool = True,
+        topk: bool = True,
+    ):
+        from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
+
+        monkeypatch.setattr(wsdpa, "_ENABLED", enabled)
+        monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
+        monkeypatch.setattr(wsdpa, "_broken", broken)
+        monkeypatch.setattr(wsdpa, "_ready", dense)
+        monkeypatch.setattr(wsdpa, "_topk_ready", topk)
+
+    @staticmethod
+    def _wsdpa_bytes(query_tokens, local_tokens, pooled_tokens=0, selected=0):
+        return (
+            64 * query_tokens * 512 * (2 + 4)
+            + (local_tokens + pooled_tokens) * 512 * 2
+            + query_tokens * selected * 4
+        )
+
+    @staticmethod
+    def _native_indexer_bytes(query_tokens, pooled_tokens):
+        return (
+            64 * query_tokens * 128 * 2
+            + 64 * query_tokens * 2
+            + query_tokens * pooled_tokens * 2
+            + query_tokens * 512 * 4
+        )
+
+    def test_wsdpa_route_uses_bounded_local_transient_and_safe_fallbacks(
+        self, monkeypatch
+    ):
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        query_tokens, kv_len = 2048, 66_000
+        local_tokens = 128 + query_tokens - 1
+        fallback = estimate_unfused_sdpa_call_bytes(
+            64, query_tokens, local_tokens, 512, 2
+        )
+        supported = self._monitor(ratios=[0], wsdpa_dtype_supported=True)
+
+        self._set_wsdpa_route(monkeypatch)
+        active = supported.estimate_chunk_transient_bytes(query_tokens, kv_len)
+        assert active == self._wsdpa_bytes(query_tokens, local_tokens)
+        assert active < fallback
+
+        for enabled, broken in ((False, False), (True, True)):
+            self._set_wsdpa_route(monkeypatch, enabled=enabled, broken=broken)
+            assert (
+                supported.estimate_chunk_transient_bytes(query_tokens, kv_len)
+                == fallback
+            )
+
+        self._set_wsdpa_route(monkeypatch)
+        unsupported = self._monitor(ratios=[0], wsdpa_dtype_supported=False)
+        assert (
+            unsupported.estimate_chunk_transient_bytes(query_tokens, kv_len) == fallback
+        )
+
+    def test_active_wsdpa_route_prices_ratio128_without_scores(self, monkeypatch):
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        self._set_wsdpa_route(monkeypatch)
+        monitor = self._monitor(ratios=[128], wsdpa_dtype_supported=True)
+        query_tokens, kv_len = 2048, 66_000
+        local_tokens = 128 + query_tokens - 1
+        pooled_tokens = kv_len // 128
+        projection = 2 * query_tokens * 512 * 2
+        active = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        assert active == projection + self._wsdpa_bytes(
+            query_tokens, local_tokens, pooled_tokens
+        )
+        concat = (local_tokens + pooled_tokens) * 512 * 2
+        fallback = estimate_unfused_sdpa_call_bytes(
+            64, query_tokens, local_tokens + pooled_tokens, 512, 2
+        )
+        assert active < projection + concat + fallback
+
+    def test_active_wsdpa_route_prices_ratio4_dense_without_scores(self, monkeypatch):
+        import omlx.memory_monitor as memory_monitor
+
+        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", lambda **_: True)
+        self._set_wsdpa_route(monkeypatch)
+        monitor = self._monitor(ratios=[4], wsdpa_dtype_supported=True)
+        query_tokens = kv_len = 2048
+        pooled_tokens = kv_len // 4
+        active = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+
+        assert active == (
+            4 * query_tokens * (512 + 128) * 2
+            + self._native_indexer_bytes(query_tokens, pooled_tokens)
+            + self._wsdpa_bytes(query_tokens, kv_len, pooled_tokens)
+        )
+
+    def test_ratio4_topk_route_switches_between_wsdpa_and_sparse_fallback(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+
+        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", lambda **_: True)
+        monitor = self._monitor(ratios=[4], wsdpa_dtype_supported=True)
+        query_tokens, kv_len = 2048, 66_000
+        local_tokens = 128 + query_tokens - 1
+        pooled_tokens = kv_len // 4
+        selected = 512
+        common = 4 * query_tokens * (512 + 128) * 2 + self._native_indexer_bytes(
+            query_tokens, pooled_tokens
+        )
+
+        self._set_wsdpa_route(monkeypatch)
+        active = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+        assert active == common + self._wsdpa_bytes(
+            query_tokens, local_tokens, pooled_tokens, selected
+        )
+
+        self._set_wsdpa_route(monkeypatch, topk=False)
+        fallback = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
+        sparse_attention = (
+            query_tokens * selected * 512 * 2
+            + 2 * 64 * query_tokens * (local_tokens + selected) * 2
+            + 64 * query_tokens * 512 * (2 + 4)
+        )
+        assert fallback == common + sparse_attention
 
     def test_resident_bytes_follow_local_and_pooled_cache_shapes(self):
         monitor = self._monitor()

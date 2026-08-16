@@ -84,7 +84,140 @@ def _reset_wsdpa(monkeypatch):
     monkeypatch.setattr(wsdpa, "_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
+    monkeypatch.setattr(wsdpa, "_ready", False, raising=False)
+    monkeypatch.setattr(wsdpa, "_topk_ready", False, raising=False)
     return wsdpa
+
+
+def test_wsdpa_prefill_route_activates_only_after_output_evaluates(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, 64, 2, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 2, 512), dtype=mx.bfloat16)
+    sinks = mx.zeros((64,), dtype=mx.bfloat16)
+
+    assert not wsdpa.wsdpa_prefill_route_active()
+
+    monkeypatch.setattr(
+        wsdpa,
+        "_get_kernel",
+        lambda: lambda **kwargs: [mx.zeros((64, 2, 512), dtype=mx.bfloat16)],
+    )
+    out = wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1)
+
+    assert out is not None
+    assert wsdpa.wsdpa_prefill_route_active()
+
+
+def test_wsdpa_dispatch_failure_keeps_route_inactive(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, 64, 2, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 2, 512), dtype=mx.bfloat16)
+    sinks = mx.zeros((64,), dtype=mx.bfloat16)
+
+    def fail(**kwargs):
+        raise RuntimeError("synthetic dispatch failure")
+
+    monkeypatch.setattr(wsdpa, "_get_kernel", lambda: fail)
+
+    assert wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1) is None
+    assert wsdpa._broken
+    assert not wsdpa.wsdpa_prefill_route_active()
+
+
+def test_wsdpa_first_evaluation_failure_keeps_route_inactive(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, 64, 2, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 2, 512), dtype=mx.bfloat16)
+    sinks = mx.zeros((64,), dtype=mx.bfloat16)
+    monkeypatch.setattr(
+        wsdpa,
+        "_get_kernel",
+        lambda: lambda **kwargs: [mx.zeros((64, 2, 512), dtype=mx.bfloat16)],
+    )
+
+    def fail_eval(*args):
+        raise RuntimeError("synthetic evaluation failure")
+
+    monkeypatch.setattr(wsdpa.mx, "eval", fail_eval)
+
+    assert wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1) is None
+    assert wsdpa._broken
+    assert not wsdpa.wsdpa_prefill_route_active()
+
+
+def test_wsdpa_topk_route_activates_only_after_output_evaluates(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 5, 512), dtype=mx.bfloat16)
+    pooled = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
+    topk = mx.zeros((1, 5, 2), dtype=mx.uint32)
+    sinks = mx.zeros((64,), dtype=mx.bfloat16)
+
+    assert not wsdpa.wsdpa_prefill_route_active(topk=True)
+
+    monkeypatch.setattr(
+        wsdpa,
+        "_get_topk_kernel",
+        lambda: lambda **kwargs: [mx.zeros((64, 5, 512), dtype=mx.bfloat16)],
+    )
+    out = wsdpa.wsdpa_topk_prefill(q, kv, pooled, topk, sinks, 1.0, 0, 128, 4)
+
+    assert out is not None
+    assert wsdpa.wsdpa_prefill_route_active(topk=True)
+
+
+def test_wsdpa_topk_first_evaluation_failure_keeps_route_inactive(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 9, 512), dtype=mx.bfloat16)
+    pooled = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
+    topk = mx.zeros((1, 5, 2), dtype=mx.uint32)
+    sinks = mx.zeros((64,), dtype=mx.float32)
+    monkeypatch.setattr(
+        wsdpa,
+        "_get_topk_kernel",
+        lambda: lambda **kwargs: [mx.zeros((64, 5, 512), dtype=mx.bfloat16)],
+    )
+    monkeypatch.setattr(
+        wsdpa.mx,
+        "eval",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("top-k eval failed")),
+    )
+
+    out = wsdpa.wsdpa_topk_prefill(q, kv, pooled, topk, sinks, 1.0, 0, 4, 4)
+
+    assert out is None
+    assert wsdpa._broken
+    assert not wsdpa.wsdpa_prefill_route_active()
+    assert not wsdpa.wsdpa_prefill_route_active(topk=True)
+
+
+def test_wsdpa_route_state_respects_disable_and_failure(monkeypatch):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    monkeypatch.setattr(wsdpa, "_ready", True)
+    monkeypatch.setattr(wsdpa, "_topk_ready", True)
+
+    assert wsdpa.wsdpa_prefill_route_active()
+    assert wsdpa.wsdpa_prefill_route_active(topk=True)
+
+    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", False)
+    assert wsdpa.wsdpa_prefill_route_active()
+    assert not wsdpa.wsdpa_prefill_route_active(topk=True)
+
+    monkeypatch.setattr(wsdpa, "_ENABLED", False)
+    assert not wsdpa.wsdpa_prefill_route_active()
+
+    monkeypatch.setattr(wsdpa, "_ENABLED", True)
+    monkeypatch.setattr(wsdpa, "_broken", True)
+    assert not wsdpa.wsdpa_prefill_route_active()
+    assert not wsdpa.wsdpa_prefill_route_active(topk=True)
+
+
+def test_wsdpa_import_does_not_register_head_dim_512_globally():
+    from omlx import memory_monitor
+    from omlx.patches.deepseek_v4 import wsdpa_attention  # noqa: F401
+
+    assert 512 not in memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS
 
 
 @requires_metal

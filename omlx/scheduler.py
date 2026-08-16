@@ -11923,13 +11923,29 @@ class Scheduler:
                 num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
                 head_dim = hidden_size // num_heads
 
+            # Determine the activation dtype from an explicit model property or,
+            # for mlx-lm text models (including DeepSeek V4), the embedding
+            # weight that produces the hidden-state stream. ``mx.Dtype`` cannot
+            # be compared with ``None`` safely, so keep matching guarded.
+            model_dtype = getattr(self.model, "dtype", None)
+            if model_dtype is None:
+                model_body = getattr(self.model, "model", None)
+                embed_tokens = getattr(model_body, "embed_tokens", None)
+                embed_weight = getattr(embed_tokens, "weight", None)
+                model_dtype = getattr(embed_weight, "dtype", None)
+
+            def _dtype_matches(dtype: Any, expected: Any) -> bool:
+                if dtype is None:
+                    return False
+                try:
+                    return bool(dtype == expected)
+                except (TypeError, ValueError):
+                    return False
+
             # Determine base dtype size for uncompressed KV cache elements.
             base_dtype_size: float = 2  # Default float16/bfloat16
-            if hasattr(self.model, "dtype"):
-                if self.model.dtype == mx.float32:
-                    base_dtype_size = 4
-                elif self.model.dtype == mx.bfloat16:
-                    base_dtype_size = 2
+            if _dtype_matches(model_dtype, mx.float32):
+                base_dtype_size = 4
             dtype_size = base_dtype_size
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
@@ -12010,6 +12026,7 @@ class Scheduler:
                 make_prefill_memory_profile(
                     config,
                     compute_dtype_size=base_dtype_size,
+                    wsdpa_dtype_supported=_dtype_matches(model_dtype, mx.bfloat16),
                 )
                 if make_prefill_memory_profile is not None
                 else None
