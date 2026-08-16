@@ -97,6 +97,28 @@ async def test_private_rank_zero_client_has_finite_inactivity_timeouts():
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_request_read_timeout_defaults_from_env_var(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")
+    engine = DistributedBatchedEngine(_deployment())
+    client = engine._new_client("http://127.0.0.1:1")
+    try:
+        assert client.timeout.read == 600.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_env_var_takes_backseat_to_explicit_arg(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")
+    engine = DistributedBatchedEngine(_deployment(), request_read_timeout=12.5)
+    client = engine._new_client("http://127.0.0.1:1")
+    try:
+        assert client.timeout.read == 12.5
+    finally:
+        await client.aclose()
+
+
 def _stalled_engine():
     def handler(request):
         raise httpx.ReadTimeout("collective stalled", request=request)
