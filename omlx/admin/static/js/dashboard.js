@@ -1781,7 +1781,7 @@
                         ? localCapacityBytes
                         : Number(local.capacity_bytes || 0),
                     reserve_gib: Number(local.reserve_gib || 0),
-                    role: 'workstation',
+                    role: local.role || 'workstation',
                     accelerator: this.clusterStatus?.node?.accelerator || 'metal',
                     accelerator_vendor:
                         this.clusterStatus?.node?.accelerator_vendor || 'apple',
