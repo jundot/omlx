@@ -634,7 +634,7 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
-            elif model_type == "gemma4":
+            elif model_type in ("gemma4", "gemma4_unified"):
                 # The fused multi-row verify kernel keeps gemma4 global-layer
                 # attention near-flat in L, so depths 4..8 are genuinely
                 # competitive on predictable text (26B code hit 1.89x at d4+
@@ -964,9 +964,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
     fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4, VLM path only). The model
-    also has to declare MTP heads in the config; otherwise the patch is a
-    no-op.
+    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
+    only). The model also has to declare MTP heads in the config; otherwise
+    the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -978,7 +978,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
-        or model_type == "gemma4"
+        or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
     )

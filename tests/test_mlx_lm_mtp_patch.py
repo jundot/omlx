@@ -1927,6 +1927,15 @@ class TestMtpCompatibilityHelpers:
             _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
         )
 
+    def test_is_mtp_compatible_gemma4_unified(self):
+        config = {
+            "text_config": {
+                "mtp_num_hidden_layers": 4,
+                "mtp_assistant_config": {"model_type": "gemma4_unified_assistant"},
+            }
+        }
+        assert _is_mtp_compatible(config, "gemma4_unified") is True
+
     def test_is_mtp_compatible_llama_rejected(self):
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "llama") is False
 
