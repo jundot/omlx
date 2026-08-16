@@ -18,6 +18,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 import concurrent.futures
 import json
 import threading
+import time
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -2005,16 +2006,188 @@ class TestSchedulerReset:
         scheduler._store_cache_gate = MagicMock()
         future = MagicMock()
         scheduler._inflight_store_futures["req-stuck"] = future
+        manager = MagicMock()
+        scheduler.paged_ssd_cache_manager = manager
+        snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store = snapshot_store
+        block_cache = MagicMock()
+        scheduler.block_aware_cache = block_cache
 
         with (
             patch("concurrent.futures.wait", return_value=(set(), {future})),
+            patch("omlx.scheduler.time.monotonic", return_value=10.0),
             patch("omlx.scheduler.fatal_exit", side_effect=SystemExit) as fatal,
             pytest.raises(SystemExit),
         ):
+            scheduler.shutdown(persistence_deadline=10.1)
+
+        assert "Scheduler shutdown timed out after 0.1s" in fatal.call_args.args[0]
+        manager.begin_shutdown.assert_called_once()
+        manager.close.assert_not_called()
+        fake_executor.shutdown.assert_not_called()
+        assert scheduler._store_cache_executor is fake_executor
+        assert scheduler._inflight_store_futures == {"req-stuck": future}
+        snapshot_store.cleanup_all.assert_not_called()
+        snapshot_store.shutdown.assert_not_called()
+        block_cache.clear.assert_not_called()
+
+    def test_shutdown_signals_ssd_before_wait_and_reuses_absolute_deadline(
+        self, mock_model, mock_tokenizer
+    ):
+        """One deadline must cover store quiescing and SSD close in order."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+        future = MagicMock()
+        scheduler._inflight_store_futures["req-active"] = future
+        manager = MagicMock()
+        scheduler.paged_ssd_cache_manager = manager
+        order: list[str] = []
+        deadlines: dict[str, float] = {}
+
+        def record_begin(*, deadline):
+            order.append("begin")
+            deadlines["begin"] = deadline
+
+        def record_wait(futures, timeout):
+            assert order == ["begin"]
+            order.append("wait")
+            assert 0 < timeout <= 0.2
+            return ({future}, set())
+
+        def record_close(*, deadline):
+            order.append("close")
+            deadlines["close"] = deadline
+
+        manager.begin_shutdown.side_effect = record_begin
+        manager.close.side_effect = record_close
+
+        with patch("concurrent.futures.wait", side_effect=record_wait):
+            scheduler.shutdown(persistence_deadline=time.monotonic() + 0.2)
+
+        assert order == ["begin", "wait", "close"]
+        assert deadlines["begin"] == deadlines["close"]
+        fake_executor.shutdown.assert_called_once_with(wait=False)
+
+    def test_shutdown_budgets_worker_stream_cleanup_from_same_deadline(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        clear_future = MagicMock()
+        fake_executor = MagicMock()
+        fake_executor.submit.return_value = clear_future
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+        scheduler.paged_ssd_cache_manager = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", side_effect=[10.0, 10.04]):
+            scheduler.shutdown(persistence_deadline=10.1)
+
+        clear_future.result.assert_called_once_with(timeout=pytest.approx(0.06))
+
+    def test_shutdown_bounds_draft_ssd_manager_with_same_deadline(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+        future = MagicMock()
+        scheduler._inflight_store_futures["req-active"] = future
+        primary = MagicMock()
+        draft = MagicMock()
+        draft._writer_thread = None
+        scheduler.paged_ssd_cache_manager = primary
+        scheduler._draft_paged_ssd_cache_manager = draft
+
+        def wait_after_both_signals(futures, timeout):
+            assert primary.begin_shutdown.called
+            assert draft.begin_shutdown.called
+            return ({future}, set())
+
+        deadline = time.monotonic() + 1.0
+        with patch("concurrent.futures.wait", side_effect=wait_after_both_signals):
+            scheduler.shutdown(persistence_deadline=deadline)
+
+        draft.begin_shutdown.assert_called_once_with(deadline=deadline)
+        draft.close.assert_called_once_with(deadline=deadline)
+        primary.close.assert_called_once_with(deadline=deadline)
+        assert scheduler._draft_paged_ssd_cache_manager is None
+
+    def test_deadline_draft_close_drops_manager_with_deferred_writer_cleanup(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        draft = MagicMock()
+        draft._writer_thread.is_alive.return_value = True
+        scheduler._draft_paged_ssd_cache_manager = draft
+        deadline = time.monotonic() + 0.1
+
+        closed = scheduler._close_specprefill_draft_cache_manager(
+            deadline=deadline
+        )
+
+        assert closed is True
+        draft.begin_shutdown.assert_called_once_with(deadline=deadline)
+        draft.close.assert_called_once_with(deadline=deadline)
+        assert scheduler._draft_paged_ssd_cache_manager is None
+
+    def test_shutdown_signal_allows_active_store_worker_to_finish(
+        self, mock_model, mock_tokenizer
+    ):
+        """Admission closes before the bounded wait so a worker can quiesce."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        release_worker = threading.Event()
+        worker_started = threading.Event()
+
+        def worker():
+            worker_started.set()
+            assert release_worker.wait(timeout=2.0)
+
+        future = executor.submit(worker)
+        assert worker_started.wait(timeout=2.0)
+        scheduler._store_cache_executor = executor
+        scheduler._store_cache_gate = MagicMock()
+        scheduler._inflight_store_futures["req-active"] = future
+        manager = MagicMock()
+        manager.begin_shutdown.side_effect = lambda **_: release_worker.set()
+        scheduler.paged_ssd_cache_manager = manager
+
+        scheduler.shutdown(persistence_deadline=time.monotonic() + 1.0)
+
+        assert future.done()
+        manager.begin_shutdown.assert_called_once()
+        manager.close.assert_called_once()
+        assert scheduler._inflight_store_futures == {}
+
+    def test_shutdown_without_deadline_signals_before_full_flush(
+        self, mock_model, mock_tokenizer
+    ):
+        """A full-flush caller still closes admission before waiting."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+        future = MagicMock()
+        scheduler._inflight_store_futures["req-active"] = future
+        manager = MagicMock()
+        scheduler.paged_ssd_cache_manager = manager
+
+        signal_seen_before_wait: list[bool] = []
+
+        def wait_after_signal(futures, timeout):
+            signal_seen_before_wait.append(manager.begin_shutdown.called)
+            assert timeout == 60.0
+            return ({future}, set())
+
+        with patch("concurrent.futures.wait", side_effect=wait_after_signal):
             scheduler.shutdown()
 
-        assert "Scheduler shutdown timed out after 60s" in fatal.call_args.args[0]
-        fake_executor.shutdown.assert_not_called()
+        assert signal_seen_before_wait == [True]
+        manager.begin_shutdown.assert_called_once_with(deadline=None)
+        manager.close.assert_called_once_with()
 
 
 class TestSchedulerStopTokens:

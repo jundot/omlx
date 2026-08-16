@@ -19,6 +19,8 @@ import threading
 import weakref
 from typing import Any, Dict, Optional, Tuple
 
+from omlx.utils.fatal import FATAL_TEARDOWN_TIMEOUT_S
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,7 +89,17 @@ class ModelRegistry:
                         logger.warning(
                             f"Model ownership transfer: {owner_id} -> {engine_id}"
                         )
-                        self._reset_owner(owner)
+                        # Run the previous owner's deep_reset on ITS OWN MLX
+                        # executor thread (deep_reset is stream-bound). Failure
+                        # to dispatch or finish in time aborts the transfer
+                        # rather than registering a new owner over an
+                        # unfinished teardown.
+                        if not self._reset_owner(owner):
+                            raise ModelOwnershipError(
+                                f"Previous owner engine {owner_id} teardown "
+                                f"failed via its MLX executor; model ownership "
+                                f"transfer aborted"
+                            )
                     else:
                         raise ModelOwnershipError(
                             f"Model is already owned by engine {owner_id}. "
@@ -141,13 +153,37 @@ class ModelRegistry:
                     del self._owners[model_id]
         return (False, None)
 
-    def _reset_owner(self, owner: Any) -> None:
-        """Reset the scheduler of a previous owner."""
+    def _reset_owner(self, owner: Any) -> bool:
+        """Reset the scheduler of a previous owner via its own MLX executor.
+
+        ``deep_reset()`` is bound to the previous engine's MLX executor stream,
+        so it must run on that executor thread. Dispatch with a bounded wait; if
+        submission is rejected or the reset times out, report failure so the
+        caller can abort the transfer instead of registering a new owner while
+        the old one may still be tearing down.
+
+        Returns:
+            True on successful teardown, False on any dispatch/timeout failure.
+        """
+        scheduler = getattr(owner, "scheduler", None)
+        if scheduler is None or not hasattr(scheduler, "deep_reset"):
+            logger.warning("Previous owner has no scheduler to reset")
+            return False
+        executor = getattr(owner, "_mlx_executor", None)
+        if executor is None:
+            logger.warning(
+                "Previous owner %s has no MLX executor; aborting ownership "
+                "transfer",
+                getattr(owner, "_engine_id", "?"),
+            )
+            return False
         try:
-            if hasattr(owner, 'scheduler'):
-                owner.scheduler.deep_reset()
+            future = executor.submit(scheduler.deep_reset)
+            future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
         except Exception as e:
-            logger.warning(f"Failed to reset previous owner: {e}")
+            logger.warning(f"Failed to reset previous owner via its MLX executor: {e}")
+            return False
+        return True
 
     def cleanup(self) -> int:
         """

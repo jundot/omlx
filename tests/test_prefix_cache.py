@@ -6,8 +6,11 @@ This module tests the block-aware prefix caching system that uses
 PagedCacheManager for block-based storage with SSD persistence.
 """
 
+import concurrent.futures
 import logging
+import queue
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -529,6 +532,99 @@ class TestBlockAwarePrefixCache:
         assert result is not None
         assert result.request_id == "req-001"
         assert "req-001" in prefix_cache._request_tables
+
+    def test_store_cache_stops_before_next_block_after_ssd_shutdown(self, tmp_path):
+        """An active worker must stop before slicing another block at teardown."""
+        import mlx.core as mx
+
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "stop-active-store"
+        )
+        tokens = list(range(8))
+        keys = mx.ones((1, 1, 8, 1))
+        extracted_cache = [
+            {
+                "state": (keys, keys),
+                "meta_state": (8,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        real_save_block = ssd_manager.save_block
+        saved_hashes: list[bytes] = []
+
+        def save_first_then_signal(**kwargs):
+            saved_hashes.append(kwargs["block_hash"])
+            saved = real_save_block(**kwargs)
+            if len(saved_hashes) == 1:
+                ssd_manager.begin_shutdown(deadline=time.monotonic() + 1.0)
+            return saved
+
+        ssd_manager.save_block = save_first_then_signal  # type: ignore[method-assign]
+        try:
+            table = prefix_cache.store_cache(
+                "req-stop-active-store", tokens, extracted_cache
+            )
+
+            assert table is not None
+            assert len(saved_hashes) == 1
+            assert table.num_tokens == 4
+            assert len(table.block_ids) == 1
+        finally:
+            ssd_manager.close()
+
+    def test_shutdown_interrupts_active_store_worker_on_saturated_writer(
+        self, tmp_path
+    ):
+        """A real store_cache worker must quiesce when its SSD queue is saturated."""
+        import mlx.core as mx
+
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "saturated-active-store"
+        )
+        tokens = list(range(4))
+        keys = mx.ones((1, 1, 4, 1))
+        mx.eval(keys)
+        extracted_cache = [
+            {
+                "state": (keys, keys),
+                "meta_state": (4,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        put_started = threading.Event()
+        original_put = ssd_manager._write_queue.put
+        original_write = ssd_manager._write_block_file
+        write_inline = MagicMock()
+
+        def saturated_put(item, timeout=None, *args, **kwargs):
+            put_started.set()
+            time.sleep(min(timeout or 0, 0.05))
+            raise queue.Full
+
+        ssd_manager._write_queue.put = saturated_put  # type: ignore[method-assign]
+        ssd_manager._write_block_file = write_inline  # type: ignore[method-assign]
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    prefix_cache.store_cache,
+                    "req-saturated-active-store",
+                    tokens,
+                    extracted_cache,
+                )
+                assert put_started.wait(timeout=1.0)
+                ssd_manager.begin_shutdown(deadline=time.monotonic() + 0.2)
+                table = future.result(timeout=0.4)
+
+            assert table is not None
+            assert table.num_tokens == 0
+            assert table.block_ids == []
+            write_inline.assert_not_called()
+        finally:
+            ssd_manager._write_queue.put = original_put  # type: ignore[method-assign]
+            ssd_manager._write_block_file = original_write  # type: ignore[method-assign]
+            ssd_manager.close(deadline=time.monotonic() + 1.0)
 
     def test_release_cache(self, prefix_cache, paged_cache):
         """Test releasing cache for a request."""
