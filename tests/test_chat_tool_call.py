@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat MCP tool call loop (chat.html streamResponse changes)."""
+
 import json
+from pathlib import Path
+
+CHAT_TEMPLATE = Path(__file__).parents[1] / "omlx" / "admin" / "templates" / "chat.html"
 
 
 class TestChatToolCallMessageFiltering:
@@ -129,15 +133,32 @@ class TestChatToolCallAccumulation:
 
 
 class TestChatToolCallSafety:
-    """Test safety guards for the MCP tool call loop (depth limit, abort, errors)."""
+    """Test safety guards for the chat tool loop (round limit, abort, errors)."""
 
-    MAX_TOOL_DEPTH = 10
+    MAX_TOOL_ROUNDS = 10
     TOOL_TIMEOUT_MS = 30000
 
     @staticmethod
-    def build_depth_error_message(max_depth):
-        """Replicate the depth-exceeded error message from streamResponse."""
-        return f"Error: Maximum tool call depth ({max_depth}) exceeded. The model may be stuck in a loop."
+    def build_round_error_message(max_rounds):
+        """Replicate the round-limit error message from streamResponse."""
+        return (
+            f"Error: Maximum tool call rounds ({max_rounds}) reached. "
+            "Increase the limit in Chat settings for longer tool workflows."
+        )
+
+    @staticmethod
+    def normalize_max_tool_rounds(value):
+        """Replicate normalizeMaxToolRounds from chat.html."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 10
+        return min(100, max(1, parsed))
+
+    @staticmethod
+    def should_execute_tool_round(completed_rounds, max_rounds):
+        """A newly requested tool round is blocked once the limit is reached."""
+        return completed_rounds < max_rounds
 
     @staticmethod
     def build_tool_result(content, error=False, tool_name=None):
@@ -158,24 +179,29 @@ class TestChatToolCallSafety:
         names = [r["toolName"] for r in failed_results if r.get("error")]
         return f"Failed: {', '.join(names)}" if names else ""
 
-    # --- Depth limit tests ---
+    # --- Tool round limit tests ---
 
-    def test_depth_limit_error_message_format(self):
-        """Depth-exceeded message includes the limit value and loop warning."""
-        msg = self.build_depth_error_message(self.MAX_TOOL_DEPTH)
+    def test_round_limit_error_message_format(self):
+        """The error identifies the configured limit and where to change it."""
+        msg = self.build_round_error_message(self.MAX_TOOL_ROUNDS)
         assert "10" in msg
-        assert "stuck in a loop" in msg
+        assert "Chat settings" in msg
 
-    def test_depth_limit_boundary_at_max(self):
-        """Depth exactly equal to MAX_TOOL_DEPTH should still be allowed."""
-        depth = self.MAX_TOOL_DEPTH
-        # In the JS: if (depth > MAX_TOOL_DEPTH) — so depth == 10 is allowed
-        assert not (depth > self.MAX_TOOL_DEPTH)
+    def test_tool_round_below_limit_is_executed(self):
+        assert self.should_execute_tool_round(9, self.MAX_TOOL_ROUNDS)
 
-    def test_depth_limit_boundary_over_max(self):
-        """Depth one over MAX_TOOL_DEPTH should be rejected."""
-        depth = self.MAX_TOOL_DEPTH + 1
-        assert depth > self.MAX_TOOL_DEPTH
+    def test_new_tool_round_at_limit_is_blocked(self):
+        assert not self.should_execute_tool_round(10, self.MAX_TOOL_ROUNDS)
+
+    def test_custom_tool_round_limit_is_honored(self):
+        assert self.should_execute_tool_round(24, 25)
+        assert not self.should_execute_tool_round(25, 25)
+
+    def test_tool_round_limit_is_normalized_to_safe_range(self):
+        assert self.normalize_max_tool_rounds(None) == 10
+        assert self.normalize_max_tool_rounds("bad") == 10
+        assert self.normalize_max_tool_rounds(0) == 1
+        assert self.normalize_max_tool_rounds(150) == 100
 
     # --- Tool result format tests ---
 
@@ -258,6 +284,52 @@ class TestChatToolCallSafety:
         aborted = getattr(getattr(controller, "signal", None), "aborted", None)
         # None is falsy, so recursion should proceed
         assert not aborted
+
+
+class TestChatToolRoundSourceContract:
+    """Pin the browser implementation's tool-round and timing lifecycle."""
+
+    @staticmethod
+    def stream_response_source():
+        source = CHAT_TEMPLATE.read_text(encoding="utf-8")
+        start = source.index("async streamResponse(streamContext = null, depth = 0)")
+        end = source.index("    stopStreaming()", start)
+        return source[start:end]
+
+    def test_limit_is_checked_before_executing_an_extra_tool_round(self):
+        stream = self.stream_response_source()
+        tool_branch = stream[stream.index("if (toolCalls.length > 0) {") :]
+
+        assert tool_branch.index("if (depth >= maxToolRounds)") < tool_branch.index(
+            "const results = await Promise.all"
+        )
+        assert "MAX_TOOL_DEPTH" not in stream
+
+    def test_final_answer_is_still_allowed_after_the_last_tool_round(self):
+        stream = self.stream_response_source()
+
+        assert stream.index("if (toolCalls.length > 0) {") < stream.index(
+            "if (depth >= maxToolRounds)"
+        )
+
+    def test_root_request_owns_timing_and_stream_cleanup(self):
+        stream = self.stream_response_source()
+
+        assert "context._requestStartedAt = Date.now();" in stream
+        assert "Date.now() - context._requestStartedAt" in stream
+        assert stream.count("this.resetStreamSession(stream") == 2
+        finally_body = stream[stream.rindex("} finally {") :]
+        assert finally_body.index("if (depth === 0) {") < finally_body.index(
+            "this.resetStreamSession(stream, { preserveFinalContent: true });"
+        )
+
+    def test_chat_setting_exposes_a_bounded_tool_round_limit(self):
+        source = CHAT_TEMPLATE.read_text(encoding="utf-8")
+
+        assert "maxToolRounds: 10" in source
+        assert 'id="max-tool-rounds"' in source
+        assert 'min="1" max="100"' in source
+        assert "normalizeMaxToolRounds(value)" in source
 
 
 class TestBuiltinWebToolDispatch:

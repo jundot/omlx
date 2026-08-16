@@ -60,6 +60,9 @@ def test_chat_sidebar_model_settings_use_i18n_keys():
         "chat.status.prefilling_percent",
         "chat.web_search_on",
         "chat.web_search_off",
+        "chat.max_tool_rounds",
+        "chat.max_tool_rounds_hint",
+        "chat.error.max_tool_rounds",
         "chat.status.searching_web",
         "chat.status.fetching_page",
     ]

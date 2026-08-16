@@ -129,6 +129,16 @@ class Message(BaseModel):
 # =============================================================================
 
 
+# Deeply nested values break json.loads/json.dumps in a version-dependent way
+# (RecursionError on 3.11-3.13, JSONDecodeError or SyntaxError on 3.14), and
+# neither RecursionError nor SyntaxError is a ValueError, so both escape
+# excepts written for decode errors. This validator re-parses a value the
+# tool-call parser already decoded, from a deeper stack frame, so a value that
+# was fine there can breach the limit here (#2545). Kept in this module rather
+# than in tool_calling to avoid an import cycle; tool_calling imports it.
+_DEEP_NEST_ERRORS = (RecursionError, SyntaxError)
+
+
 def _coerce_tool_call_arguments(v: Any) -> str:
     """Normalize a tool_call.arguments value to a JSON-object string.
 
@@ -141,7 +151,12 @@ def _coerce_tool_call_arguments(v: Any) -> str:
     that can't round-trip into a JSON object raises ValueError.
     """
     if isinstance(v, dict):
-        return json.dumps(v, ensure_ascii=False)
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except _DEEP_NEST_ERRORS as e:
+            raise ValueError(
+                f"arguments are nested too deeply to serialize: {e}."
+            ) from e
     if not isinstance(v, str):
         raise ValueError(
             f"arguments must be a JSON-encoded string, got {type(v).__name__}. "
@@ -153,7 +168,7 @@ def _coerce_tool_call_arguments(v: Any) -> str:
         return "{}"
     try:
         parsed = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS) as e:
         snippet = stripped if len(stripped) <= 120 else stripped[:117] + "..."
         raise ValueError(
             f"arguments must be valid JSON, got parse error: {e}. "
@@ -299,7 +314,10 @@ class ChatCompletionRequest(BaseModel):
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # OpenAI-compatible reasoning depth; forwarded to the chat template.
-    reasoning_effort: Optional[str] = None
+    # Numbers stay numbers: models like Inkling take a numeric effort
+    # (0.1-0.99) while Qwen3.8 uses strings ("low".."xhigh") — each chat
+    # template validates its own vocabulary.
+    reasoning_effort: Optional[Union[str, int, float]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)

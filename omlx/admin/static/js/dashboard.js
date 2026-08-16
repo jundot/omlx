@@ -56,6 +56,9 @@
         'reasoning_effort',
         'preserve_thinking',
     ]);
+    const REASONING_EFFORT_PRESETS = new Set([
+        'low', 'medium', 'high', 'xhigh', 'max',
+    ]);
     const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
         'gemma4_assistant',
         'gemma4_unified_assistant',
@@ -71,6 +74,8 @@
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const THEME_STORAGE_KEY = 'omlx-chat-theme';
+    const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
@@ -80,9 +85,10 @@
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
+            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -103,7 +109,7 @@
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_state_dtype: 'rht_int16' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
-                mcp: { config_path: '' },
+                mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
@@ -1022,8 +1028,9 @@
                 this.clusterShowPeerAdvanced = true;
                 if (!this.clusterSshKey) await this.loadClusterSshKey();
                 await this.$nextTick();
+                const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
                 document.querySelector('[data-cluster-ssh-setup]')?.scrollIntoView({
-                    behavior: 'smooth',
+                    behavior: reduced ? 'auto' : 'smooth',
                     block: 'center',
                 });
             },
@@ -1596,14 +1603,34 @@
                     const status = result.status || {};
                     const node = status.node || {};
                     if (result.bootstrap_required) {
+                        // Repeat what the probe measured. This used to assert
+                        // "not installed" for every bootstrap_required result,
+                        // including peers whose runtime it merely could not
+                        // check — which is what surfaced the wrong guidance in
+                        // #2680.
+                        const measured = (result.runtime_mismatches || [])
+                            .find((entry) => Boolean(entry));
                         this.clusterConnectionError =
-                            `${node.hostname || ssh} is online, but its oMLX `
-                            + 'worker runtime is not installed yet.';
+                            `${node.hostname || ssh} is online, but `
+                            + (measured || 'its oMLX worker runtime is not installed yet.');
                         this.explainClusterError(this.clusterConnectionError);
                     }
                     if (this.clusterPlanNodes[1]) {
-                        this.clusterPlanNodes[1].ssh = ssh;
-                        this.clusterPlanNodes[1].node_id = node.hostname || this.clusterPlanNodes[1].node_id;
+                        const planned = this.clusterPlanNodes[1];
+                        const previousId = String(planned.ssh || '').trim() === ssh
+                            ? planned.node_id
+                            : '';
+                        const deployedId = (this.clusterDeployments?.[0]?.hosts || [])
+                            .find(host => host.ssh === ssh)?.node_id;
+                        const sshHostname = ssh.split('@').pop();
+                        planned.ssh = ssh;
+                        planned.node_id = this.clusterNodeId(
+                            deployedId,
+                            previousId,
+                            node.hostname,
+                            sshHostname,
+                            'worker-1',
+                        );
                         const exactCapacity = Number(
                             node.admission_ceiling_bytes
                             || node.recommended_working_set_bytes
@@ -1727,7 +1754,17 @@
                         .filter(node => String(node.ssh || '').trim())
                         .map(node => [String(node.ssh).trim(), node])
                 );
-                const localName = this.clusterStatus?.node?.hostname || 'this-mac';
+                const deployedBySsh = new Map(
+                    (this.clusterDeployments?.[0]?.hosts || [])
+                        .filter(host => String(host.ssh || '').trim())
+                        .map(host => [String(host.ssh).trim(), host])
+                );
+                const localName = this.clusterNodeId(
+                    deployedBySsh.get('127.0.0.1')?.node_id,
+                    existingBySsh.get('127.0.0.1')?.node_id,
+                    this.clusterStatus?.node?.hostname,
+                    'this-mac',
+                );
                 const local = existingBySsh.get('127.0.0.1')
                     || existing.get(localName)
                     || this.clusterPlanNodes?.[0]
@@ -1759,18 +1796,25 @@
                         this.clusterStatus?.runtime?.python_executable || '',
                 }];
                 this.clusterWorkerPeers().forEach((peer, index) => {
-                    const nodeId = this.clusterFriendlyMacName(
-                        peer.name || peer.ssh,
+                    const previousBySsh = existingBySsh.get(peer.ssh);
+                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
+                    const sshHostname = String(peer.ssh || '').trim().split('@').pop();
+                    const nodeId = this.clusterNodeId(
+                        deployedBySsh.get(peer.ssh)?.node_id,
+                        peer.node_id,
+                        previousBySsh?.node_id,
+                        peer.name,
+                        hardware.hostname,
+                        sshHostname,
                         `worker-${index + 1}`,
                     );
                     const namedPrevious = existing.get(nodeId);
-                    const previous = existingBySsh.get(peer.ssh)
+                    const previous = previousBySsh
                         || (
                             namedPrevious && !String(namedPrevious.ssh || '').trim()
                                 ? namedPrevious
                                 : {}
                         );
-                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
                     const peerRuntime = this.clusterPeerProbes?.[peer.ssh]?.status?.runtime || {};
                     const exactCapacityBytes = Number(
                         hardware.admission_ceiling_bytes
@@ -3360,13 +3404,26 @@
                 if (this.clusterPeerProbeLoading
                     || this.clusterFabricLoading
                     || this.clusterLinkStatusLoading
-                    || !this.clusterPeerProbe?.runtime_compatible) {
+                    || !this.clusterPeerProbe) {
                     return {
                         key: 'checking',
                         label: 'Checking the connection…',
                         detail: 'oMLX is confirming every worker and the fastest shared links.',
                         tone: 'blue',
                         busy: true,
+                    };
+                }
+                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                    const mismatches = Array.isArray(
+                        this.clusterPeerProbe.runtime_mismatches
+                    ) ? this.clusterPeerProbe.runtime_mismatches.filter(Boolean) : [];
+                    return {
+                        key: 'runtime-mismatch',
+                        label: 'Worker runtime mismatch',
+                        detail: mismatches.join(' · ')
+                            || 'The worker runtime differs from this Mac.',
+                        tone: 'red',
+                        busy: false,
                     };
                 }
                 if (this.clusterCatalogueLoading && !selected) {
@@ -3530,6 +3587,15 @@
                     return;
                 }
                 await this.startCluster();
+            },
+
+            clusterNodeId(...candidates) {
+                const pattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+                for (const candidate of candidates) {
+                    const value = String(candidate || '').trim();
+                    if (pattern.test(value)) return value;
+                }
+                return '';
             },
 
             clusterFriendlyMacName(name, fallback = 'Mac') {
@@ -5164,7 +5230,10 @@
                     || this.clusterStatus.node.recommended_working_set_bytes
                     || 0
                 );
-                this.clusterPlanNodes[index].node_id = this.clusterStatus.node.hostname;
+                this.clusterPlanNodes[index].node_id = this.clusterNodeId(
+                    this.clusterStatus.node.hostname,
+                    'this-mac',
+                );
                 this.clusterPlanNodes[index].capacity_gib = Number(
                     (exactCapacity / gib).toFixed(2)
                 );
@@ -6330,6 +6399,7 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            mcp_expose_tools: this.globalSettings.mcp.expose_tools,
                             hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
@@ -6529,8 +6599,9 @@
                         method: 'POST',
                     });
                     if (response.ok) {
+                        const data = await response.json();
                         const model = this.models.find(m => m.id === modelId);
-                        if (model) model.loaded = false;
+                        if (model && data.status === 'ok') model.loaded = false;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -6602,17 +6673,17 @@
                         if (e.force) forced.push('enable_thinking');
                     } else if (e.type === 'reasoning_effort') {
                         if (isDiffusion) continue;
-                        ctk.reasoning_effort = e.value;
-                        if (e.force) forced.push('reasoning_effort');
+                        const rawEffort = e.custom ? e.customValue : e.value;
+                        const effort = this.coerceKwargValue(rawEffort);
+                        if (String(effort).trim() !== '') {
+                            ctk.reasoning_effort = effort;
+                            if (e.force) forced.push('reasoning_effort');
+                        }
                     } else if (e.type === 'custom' && e.key && e.key.trim()) {
                         if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(e.key.trim())) {
                             continue;
                         }
-                        let v = e.value;
-                        if (v === 'true') v = true;
-                        else if (v === 'false') v = false;
-                        else if (!isNaN(Number(v)) && String(v).trim() !== '') v = Number(v);
-                        ctk[e.key.trim()] = v;
+                        ctk[e.key.trim()] = this.coerceKwargValue(e.value);
                         if (e.force) forced.push(e.key.trim());
                     }
                 }
@@ -6872,6 +6943,18 @@
                     || !!ms.guided_grammar_enabled;
             },
 
+            // Coerce a raw kwarg string from the panel into its JSON type:
+            // 'true'/'false' -> boolean, finite numeric strings -> number.
+            coerceKwargValue(v) {
+                if (v === 'true') return true;
+                if (v === 'false') return false;
+                if (String(v).trim() !== '') {
+                    const numeric = Number(v);
+                    if (Number.isFinite(numeric)) return numeric;
+                }
+                return v;
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -6887,9 +6970,13 @@
                             force: forced.has('enable_thinking'),
                         });
                     } else if (key === 'reasoning_effort') {
+                        const isPreset = typeof value === 'string'
+                            && REASONING_EFFORT_PRESETS.has(value);
                         entries.push({
                             type: 'reasoning_effort',
-                            value: String(value),
+                            value: isPreset ? value : 'low',
+                            custom: !isPreset,
+                            customValue: isPreset ? '' : String(value),
                             force: forced.has('reasoning_effort'),
                         });
                     } else {
@@ -7430,13 +7517,16 @@
                                     if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
                                     if (isDiffusion) continue;
-                                    chatTemplateKwargs.reasoning_effort = entry.value;
-                                    if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    const rawEffort = entry.custom
+                                        ? entry.customValue
+                                        : entry.value;
+                                    const effort = this.coerceKwargValue(rawEffort);
+                                    if (String(effort).trim() !== '') {
+                                        chatTemplateKwargs.reasoning_effort = effort;
+                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    }
                                 } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    let val = entry.value;
-                                    if (val === 'true') val = true;
-                                    else if (val === 'false') val = false;
-                                    else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
+                                    const val = this.coerceKwargValue(entry.value);
                                     const key = entry.key.trim();
                                     if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
                                         continue;
@@ -8021,6 +8111,7 @@
                             brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
                             searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
                             ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                            max_results: this.globalSettings.integrations.web_search_max_results,
                         }),
                     });
                     const payload = await response.json();
@@ -9267,6 +9358,22 @@
                                     }
                                 }
                                 break;
+                            case 'upload':
+                                // Community upload outcome for one suite. Idempotent
+                                // on replay: keyed to the same (model_id, benchmark)
+                                // as its result card. Array reassign for reactivity.
+                                {
+                                    const idx = this.accAllResults.findIndex(
+                                        r => r.model_id === data.data.model_id
+                                          && r.benchmark === data.data.benchmark
+                                    );
+                                    if (idx >= 0) {
+                                        const updated = { ...this.accAllResults[idx], upload: data.data };
+                                        this.accAllResults.splice(idx, 1, updated);
+                                        this.accAllResults = [...this.accAllResults];
+                                    }
+                                }
+                                break;
                             case 'done':
                                 this.accProgress = null;
                                 es.close();
@@ -10145,8 +10252,18 @@
             // Theme select
             setTheme(theme) {
                 this.theme = theme;
-                localStorage.setItem('omlx-chat-theme', this.theme);
+                localStorage.setItem(THEME_STORAGE_KEY, this.theme);
                 this.applyTheme();
+            },
+
+            setEnhancedReadability(enabled) {
+                this.enhancedReadability = enabled;
+                localStorage.setItem(ENHANCED_READABILITY_KEY, enabled ? 'on' : 'off');
+                if (enabled) {
+                    document.documentElement.setAttribute('data-enhanced-readability', '');
+                } else {
+                    document.documentElement.removeAttribute('data-enhanced-readability');
+                }
             },
 
             applyTheme() {

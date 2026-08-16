@@ -866,6 +866,25 @@ def apply_chat_template(
     if not add_generation_prompt:
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_start_token)
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_end_token)
+    elif not (
+        prepared_messages and prepared_messages[-1].get("task") is not None
+    ) and not out.endswith(
+        (
+            ASSISTANT_SP_TOKEN + thinking_start_token,
+            ASSISTANT_SP_TOKEN + thinking_end_token,
+        )
+    ):
+        # encode_messages only emits the generation anchor after a
+        # user/developer-final message. A system-final conversation (e.g. a
+        # bare title-generation instruction, or a trailing workspace/system
+        # note after the last user turn) otherwise ends without
+        # <|Assistant|><think>, and the model free-runs as document
+        # continuation until max_tokens.
+        out += ASSISTANT_SP_TOKEN + (
+            thinking_start_token
+            if encode_kwargs.get("thinking_mode", "thinking") == "thinking"
+            else thinking_end_token
+        )
     if continue_final_message and messages and messages[-1].get("role") == "assistant":
         out = out.removesuffix(eos_token)
     return out

@@ -989,18 +989,36 @@ private struct EntryEditor: View {
                 forceCheckbox
             }
         case .reasoningEffort:
-            HStack(spacing: 8) {
-                Popup(
-                    selection: vm.bindProfile(binding.value),
-                    width: 130,
-                    options: [
-                        ("low", "low"),
-                        ("medium", "medium"),
-                        ("high", "high"),
-                        ("max", "max"),
-                    ]
-                )
-                forceCheckbox
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    if entry.usesCustomReasoningEffort {
+                        TextInput(
+                            text: vm.bindProfile(binding.reasoningEffortCustomValue),
+                            placeholder: "0.9",
+                            mono: true,
+                            width: 130
+                        )
+                    } else {
+                        Popup(
+                            selection: vm.bindProfile(binding.value),
+                            width: 130,
+                            options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
+                                ($0, $0)
+                            }
+                        )
+                    }
+                    forceCheckbox
+                }
+                Toggle(isOn: vm.bindProfile(binding.usesCustomReasoningEffort)) {
+                    Text(String(
+                        localized: "settings.advanced.chat_template.reasoning_effort.custom",
+                        defaultValue: "Custom",
+                        comment: "Checkbox label that enables a custom reasoning_effort value"
+                    ))
+                    .font(.omlxText(11))
+                    .foregroundStyle(theme.textSecondary)
+                }
+                .toggleStyle(.checkbox)
             }
         case .custom:
             VStack(alignment: .leading, spacing: 6) {

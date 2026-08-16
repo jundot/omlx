@@ -7838,12 +7838,33 @@ def _measure_sensitivity(
 
 
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
+_AFFINE_GROUP_SIZES = (32, 64, 128)
 
 
 def _perturb_bits_for(bits: int):
     """Closest valid re-quantization width below ``bits``, or None."""
     lower = [b for b in _REQUANT_VALID_BITS if b < bits]
     return max(lower) if lower else None
+
+
+def _affine_perturb_group_size(group_size: int, in_dim: int):
+    """Group size for an affine perturbation re-quant of a row of ``in_dim``.
+
+    The sensitivity perturbation always re-quantizes with ``mode="affine"``,
+    and affine kernels only implement group sizes 32/64/128. The source
+    module's own group size is therefore not always reusable: nvfp4 modules
+    carry ``group_size=16``, which mx.quantize rejects. Keep the module's size
+    whenever affine supports it, so affine/mxfp4/mxfp8 sources perturb exactly
+    as before; otherwise take the supported size closest to it (smallest on a
+    tie) that still divides the row. Returns None when none divides it, in
+    which case the module cannot be perturbed and is skipped.
+    """
+    usable = [g for g in _AFFINE_GROUP_SIZES if in_dim % g == 0]
+    if not usable:
+        return None
+    if group_size in usable:
+        return group_size
+    return min(usable, key=lambda g: (abs(g - group_size), g))
 
 
 def _build_proxy_for_sensitivity(
@@ -8278,15 +8299,28 @@ def _measure_sensitivity_from_quantized_model(
                 bits=bits,
                 mode=mode,
             )
-            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode)
+            # Affine kernels only ship group sizes 32/64/128, so the module's
+            # own size cannot always be reused for the perturbation re-quant.
+            perturb_gs = _affine_perturb_group_size(gs, w_float.shape[-1])
+            if perturb_gs is None:
+                logger.debug(
+                    f"Sensitivity perturbation skipped for {p}: no affine group "
+                    f"size divides an input dim of {w_float.shape[-1]}"
+                )
+                continue
+            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode, gs)
             qw, sc, *rest = mx.quantize(
-                w_float, group_size=gs, bits=perturb_bits, mode="affine"
+                w_float, group_size=perturb_gs, bits=perturb_bits, mode="affine"
             )
             m.weight = qw
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
             m.mode = "affine"
+            # The perturbed forward reads group_size off the module, so it has
+            # to track the re-quantized layout; the restore below puts the
+            # source module's own size back.
+            m.group_size = perturb_gs
             # Force re-quant materialization so the next forward sees the
             # perturbed weights instead of the lazy reference to the originals.
             if m.biases is not None:
@@ -8307,7 +8341,7 @@ def _measure_sensitivity_from_quantized_model(
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
         )
-        for p, (w, s, b, orig_bits, orig_mode) in saved.items():
+        for p, (w, s, b, orig_bits, orig_mode, orig_gs) in saved.items():
             if p in modules_by_path:
                 mod = modules_by_path[p]
                 mod.weight = w
@@ -8318,6 +8352,7 @@ def _measure_sensitivity_from_quantized_model(
                     del mod.biases
                 mod.bits = orig_bits
                 mod.mode = orig_mode
+                mod.group_size = orig_gs
 
         if out_perturbed is not None:
             # Cast to float32 first: float16 squared differences overflow

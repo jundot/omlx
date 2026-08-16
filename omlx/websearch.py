@@ -500,17 +500,25 @@ async def run_web_search_test(
     brave_api_key: str = "",
     searxng_url: str = "",
     ddgs_backends: str = "",
+    max_results: int = DEFAULT_MAX_RESULTS,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     """Validate pending settings-form values with one real search.
 
-    Always runs in snippet mode with the default result count — the test
-    checks connectivity/credentials, not the content options.
+    Always runs in snippet mode, but honors the pending result count. The test
+    checks connectivity and credentials without fetching full page content.
     """
     return await _search_with_provider(
-        provider, "omlx web search connectivity check", brave_api_key,
-        searxng_url, ddgs_backends, DEFAULT_MAX_RESULTS, "snippet",
-        DEFAULT_FETCH_CONTENT_CHARS, True, transport,
+        provider,
+        "omlx web search connectivity check",
+        brave_api_key,
+        searxng_url,
+        ddgs_backends,
+        clamp_max_results(max_results),
+        "snippet",
+        DEFAULT_FETCH_CONTENT_CHARS,
+        True,
+        transport,
     )
 
 

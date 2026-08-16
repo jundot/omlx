@@ -656,23 +656,71 @@ class TestMCPSettings:
         """Test default values."""
         settings = MCPSettings()
         assert settings.config_path is None
+        assert settings.expose_tools is True
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = MCPSettings(config_path="/path/to/mcp.json")
+        settings = MCPSettings(config_path="/path/to/mcp.json", expose_tools=False)
         assert settings.config_path == "/path/to/mcp.json"
+        assert settings.expose_tools is False
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
         settings = MCPSettings(config_path="/mcp/config.json")
         result = settings.to_dict()
-        assert result == {"config_path": "/mcp/config.json"}
+        assert result == {"config_path": "/mcp/config.json", "expose_tools": True}
+
+    def test_to_dict_expose_tools_false(self):
+        """expose_tools=False survives the to_dict round trip."""
+        settings = MCPSettings(config_path="/mcp/config.json", expose_tools=False)
+        result = settings.to_dict()
+        assert result == {"config_path": "/mcp/config.json", "expose_tools": False}
 
     def test_from_dict(self):
         """Test creation from dictionary."""
         data = {"config_path": "/some/path.json"}
         settings = MCPSettings.from_dict(data)
         assert settings.config_path == "/some/path.json"
+        assert settings.expose_tools is True
+
+    def test_from_dict_expose_tools_false(self):
+        """Test explicit expose_tools=False from dictionary."""
+        data = {"config_path": "/some/path.json", "expose_tools": False}
+        settings = MCPSettings.from_dict(data)
+        assert settings.config_path == "/some/path.json"
+        assert settings.expose_tools is False
+
+    def test_from_dict_missing_expose_tools_defaults_true(self):
+        """Legacy configs without expose_tools keep exposing tools."""
+        data = {"config_path": "/legacy/path.json"}
+        settings = MCPSettings.from_dict(data)
+        assert settings.expose_tools is True
+
+    def test_global_settings_save_load_round_trip_preserves_expose_tools(
+        self, tmp_path
+    ):
+        """save()/load() keep the MCP expose toggle across restarts."""
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.mcp.config_path = "/mcp.json"
+        gs.mcp.expose_tools = False
+        gs.save()
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.mcp.config_path == "/mcp.json"
+        assert restored.mcp.expose_tools is False
+
+    def test_global_settings_save_load_defaults_expose_tools_true(self, tmp_path):
+        """Legacy settings files without expose_tools default to True."""
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.save()
+
+        settings_file = tmp_path / "settings.json"
+        data = json.loads(settings_file.read_text())
+        del data["mcp"]["expose_tools"]
+        settings_file.write_text(json.dumps(data))
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.mcp.expose_tools is True
 
 
 class TestHuggingFaceSettings:

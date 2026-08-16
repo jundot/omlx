@@ -1652,6 +1652,7 @@ class PagedSSDCacheManager(CacheManager):
         self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
         self._disk_usage_cache_time: float = 0.0
         self._last_disk_pressure_warn: float = 0.0
+        self._last_promotion_failure_warn: float = 0.0
 
         # Statistics
         self._stats = {
@@ -1666,6 +1667,7 @@ class PagedSSDCacheManager(CacheManager):
             "hot_cache_hits": 0,
             "hot_cache_evictions": 0,
             "hot_cache_promotions": 0,
+            "hot_cache_promotion_failures": 0,
             "preload_calls": 0,
             "preload_blocks_loaded": 0,
             "preload_time_ms": 0.0,
@@ -1938,8 +1940,11 @@ class PagedSSDCacheManager(CacheManager):
         arrays: dict[str, Any],
         file_metadata: Any,
         metadata: PagedSSDBlockMetadata,
-    ) -> None:
-        """Promote a block loaded from SSD into the hot cache."""
+    ) -> bool:
+        """Promote a block loaded from SSD into the hot cache.
+
+        Returns True when the entry was retained, False on failure.
+        """
         try:
             promoted_raw = {}
             for name, arr in arrays.items():
@@ -1956,14 +1961,16 @@ class PagedSSDCacheManager(CacheManager):
             }
             self._hot_cache_put(block_hash, entry)
             self._stats["hot_cache_promotions"] += 1
-        except Exception:
-            pass  # Promotion failure is non-critical
+            return True
+        except Exception as e:
+            self._record_promotion_failure(block_hash, e)
+            return False
 
     def _promote_pending_write_to_hot_cache(
         self,
         block_hash: bytes,
         entry: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """Retain a pending-write read in the hot tier when requested.
 
         A write-through block can be read while its background SSD write is
@@ -1971,9 +1978,12 @@ class PagedSSDCacheManager(CacheManager):
         whether it is promoted depends on a race with the writer thread.
         Keep the promoted copy dirty until its atomic SSD file is visible so
         an early eviction still preserves the block.
+
+        Returns True when the entry was retained, False on failure or when
+        the hot cache is disabled.
         """
         if not self._hot_cache_enabled:
-            return
+            return False
         try:
             promoted_entry = dict(entry)
             block_metadata = promoted_entry.get("block_metadata")
@@ -1983,8 +1993,31 @@ class PagedSSDCacheManager(CacheManager):
             )
             self._hot_cache_put(block_hash, promoted_entry)
             self._stats["hot_cache_promotions"] += 1
-        except Exception:
-            pass  # Promotion failure is non-critical
+            return True
+        except Exception as e:
+            self._record_promotion_failure(block_hash, e)
+            return False
+
+    def _record_promotion_failure(self, block_hash: bytes, exc: Exception) -> None:
+        """Count a failed hot cache promotion and warn with throttling.
+
+        Promotion failures are non-critical for the request being served
+        (the reconstructed cache is already in hand), but a systematic
+        failure would leave the hot tier permanently empty with no signal,
+        so surface it in stats and a throttled warning (#2662).
+        """
+        self._stats["hot_cache_promotion_failures"] += 1
+        now = time.monotonic()
+        if now - self._last_promotion_failure_warn < 60.0:
+            return
+        self._last_promotion_failure_warn = now
+        logger.warning(
+            "Hot cache promotion failed for block %s: %s "
+            "(%d promotion failures total)",
+            block_hash.hex()[:16],
+            exc,
+            self._stats["hot_cache_promotion_failures"],
+        )
 
     def _init_directories(self) -> None:
         """Create cache directory structure."""
@@ -4112,8 +4145,9 @@ class PagedSSDCacheManager(CacheManager):
                     not in _READABLE_CACHE_FORMAT_VERSIONS
                 ):
                     return False
-                self._promote_to_hot_cache(block_hash, arrays, file_metadata, metadata)
-                return True
+                return self._promote_to_hot_cache(
+                    block_hash, arrays, file_metadata, metadata
+                )
             except Exception as e:
                 logger.warning(f"Preload failed for block {block_hash.hex()[:16]}: {e}")
                 return False
@@ -4733,6 +4767,9 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                hot_cache_promotion_failures=self._stats[
+                    "hot_cache_promotion_failures"
+                ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
             )
@@ -4811,6 +4848,9 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                hot_cache_promotion_failures=self._stats[
+                    "hot_cache_promotion_failures"
+                ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
             )

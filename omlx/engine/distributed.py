@@ -1131,7 +1131,12 @@ class DistributedBatchedEngine(BatchedEngine):
     def get_cache_stats(self) -> dict[str, Any] | None:
         return None
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         # Closing the private client disconnects all rank-zero handlers. The
         # MLX-LM handler cancels their generation contexts in ``finally``.
         active = self._active_requests

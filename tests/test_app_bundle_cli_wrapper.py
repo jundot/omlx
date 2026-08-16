@@ -6,15 +6,19 @@ import subprocess
 from pathlib import Path
 
 
-def _extract_cli_wrapper_script() -> str:
+def _extract_wrapper_script(variable: str) -> str:
     build_script = Path("apps/omlx-mac/Scripts/build.sh").read_text()
     match = re.search(
-        r"cat > \"\$CLI_WRAPPER\" <<'EOF'\n(?P<script>.*?)\nEOF",
+        rf"cat > \"\${variable}\" <<'EOF'\n(?P<script>.*?)\nEOF",
         build_script,
         re.DOTALL,
     )
-    assert match is not None
+    assert match is not None, f"build.sh does not write ${variable}"
     return match.group("script")
+
+
+def _extract_cli_wrapper_script() -> str:
+    return _extract_wrapper_script("CLI_WRAPPER")
 
 
 def _write_fake_python(path: Path) -> None:
@@ -78,4 +82,41 @@ def test_app_bundle_cli_wrapper_resolves_symlinked_invocation(tmp_path):
         expected_home,
         expected_path,
         expected_args,
+    ]
+
+
+def test_app_bundle_ships_a_cluster_interpreter_next_to_the_cli(tmp_path):
+    """#2680: omlx-cli forces ``-m omlx.cli``, so it cannot answer a probe.
+
+    A peer coordinator needs a real interpreter surface — it runs both
+    ``-m omlx.cli cluster status`` and ``-c <script>`` under the discovered
+    executable. Ship one that carries the bundle's PYTHONHOME/PYTHONPATH and
+    forwards argv untouched.
+    """
+
+    script = _extract_wrapper_script("CLUSTER_PYTHON_WRAPPER")
+    wrapper = tmp_path / "Applications/oMLX.app/Contents/MacOS/omlx-cluster-python"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(script)
+    wrapper.chmod(0o755)
+
+    app_root = tmp_path / "Applications/oMLX.app/Contents"
+    _write_fake_python(app_root / "Resources/Python/cpython-3.11/bin/python3")
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [str(wrapper), "-c", "import omlx"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert completed.stdout.splitlines() == [
+        f"PYTHONHOME={app_root}/Resources/Python/cpython-3.11",
+        f"PYTHONPATH={app_root}/Resources:"
+        f"{app_root}/Resources/Python/framework-mlx-base/lib/python3.11/site-packages",
+        # No injected "-m omlx.cli": argv reaches the interpreter verbatim.
+        "ARGS=-c import omlx",
     ]

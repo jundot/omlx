@@ -56,22 +56,26 @@ enum ShellEnvWriter {
             throw WriterError.cliWrapperNotExecutable(bundleCLI.path)
         }
         let shimURL = shimDir.appendingPathComponent("omlx")
-        let script = """
-        #!/bin/sh
-        BOOTSTRAP="$HOME/Library/Application Support/oMLX/base-path"
-        if [ -r "$BOOTSTRAP" ]; then
-            IFS= read -r \(variableName) < "$BOOTSTRAP" || \(variableName)=""
-            if [ -n "$\(variableName)" ]; then
-                export \(variableName)
-            fi
-        fi
-        exec \(shellQuote(bundleCLI.path)) "$@"
-        """
-        try script.write(to: shimURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: shimURL.path
-        )
+        try writeLauncherShim(at: shimURL, forwardingTo: bundleCLI)
+
+        // Another Mac's coordinator discovers this node by running
+        // `~/.omlx/bin/omlx-cluster-python -c 'import omlx'` over SSH. The CLI
+        // wrapper above cannot answer that — it hardcodes `-m omlx.cli` — so a
+        // peer with the app installed failed every discovery candidate and was
+        // reported as "worker runtime is not installed" (#2680). Publish the
+        // bundle's plain interpreter under the name discovery looks for.
+        let clusterPython = appBundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("omlx-cluster-python")
+        if FileManager.default.isExecutableFile(atPath: clusterPython.path) {
+            // Best effort: an older bundle predates this wrapper, and failing
+            // to publish it must not stop the CLI shim from installing.
+            try? writeLauncherShim(
+                at: shimDir.appendingPathComponent("omlx-cluster-python"),
+                forwardingTo: clusterPython
+            )
+        }
 
         if let path = firstCLIPathInCurrentPath() {
             if isManagedCLI(path: path, shimURL: shimURL) {
@@ -114,6 +118,27 @@ enum ShellEnvWriter {
 
     static func ensureShellPathExport() throws {
         try ensureCLIPathExport()
+    }
+
+    /// Write an executable `/bin/sh` shim that restores `OMLX_BASE_PATH` from
+    /// the app's bootstrap file and then hands argv to a bundle executable.
+    private static func writeLauncherShim(at shimURL: URL, forwardingTo target: URL) throws {
+        let script = """
+        #!/bin/sh
+        BOOTSTRAP="$HOME/Library/Application Support/oMLX/base-path"
+        if [ -r "$BOOTSTRAP" ]; then
+            IFS= read -r \(variableName) < "$BOOTSTRAP" || \(variableName)=""
+            if [ -n "$\(variableName)" ]; then
+                export \(variableName)
+            fi
+        fi
+        exec \(shellQuote(target.path)) "$@"
+        """
+        try script.write(to: shimURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: shimURL.path
+        )
     }
 
     // MARK: - File targets

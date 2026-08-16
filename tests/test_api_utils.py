@@ -75,6 +75,12 @@ class TestReasoningEffortChatTemplateKwargs:
     def test_empty_inputs_return_none(self):
         assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
 
+    def test_numeric_effort_forwarded_unchanged(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(None, 0.9)
+
+        assert merged == {"reasoning_effort": 0.9}
+        assert isinstance(merged["reasoning_effort"], float)
+
 
 class TestCleanOutputText:
     """Tests for clean_output_text function."""

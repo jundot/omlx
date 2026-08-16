@@ -609,6 +609,42 @@ EOF
 chmod 755 "$CLI_WRAPPER"
 ok "  + omlx-cli"
 
+# --- Embed cluster interpreter wrapper ------------------------------------
+#
+# omlx-cli above hardcodes `-m omlx.cli`, so it can never answer the
+# `-c 'import omlx'` probe a peer coordinator runs, nor host the `-c` scripts
+# the memory-ceiling and preflight probes execute. Ship a second wrapper that
+# assembles the same environment and then forwards argv to the interpreter
+# untouched — this is what ~/.omlx/bin/omlx-cluster-python points at, and what
+# discover_remote_python_executable has always looked for (#2680).
+
+log "Writing app-bundle cluster interpreter wrapper..."
+CLUSTER_PYTHON_WRAPPER="$STAGED_APP/Contents/MacOS/omlx-cluster-python"
+cat > "$CLUSTER_PYTHON_WRAPPER" <<'EOF'
+#!/bin/sh
+set -eu
+
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
+RESOURCES="$APP_ROOT/Resources"
+PYROOT="$RESOURCES/Python"
+CPYTHON="$PYROOT/cpython-3.11"
+PYTHON="$CPYTHON/bin/python3"
+MLX_SITE="$PYROOT/framework-mlx-base/lib/python3.11/site-packages"
+
+export PYTHONHOME="$CPYTHON"
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$RESOURCES:$MLX_SITE:$PYTHONPATH"
+else
+    export PYTHONPATH="$RESOURCES:$MLX_SITE"
+fi
+
+exec "$PYTHON" "$@"
+EOF
+chmod 755 "$CLUSTER_PYTHON_WRAPPER"
+ok "  + omlx-cluster-python"
+
 # --- Compile AppIcon.icon (Tahoe Liquid Glass) ----------------------------
 #
 # Xcode 26.5's project build system does NOT route a standalone
@@ -677,6 +713,8 @@ else
     _sign_embedded_mach_o_files "$PYTHON_DIR"
     codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
     ok "  + signed omlx-cli wrapper"
+    codesign --force --sign - "$CLUSTER_PYTHON_WRAPPER" >/dev/null 2>&1
+    ok "  + signed omlx-cluster-python wrapper"
 fi
 
 log "Ad-hoc resigning app bundle…"

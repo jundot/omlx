@@ -10,6 +10,8 @@ guard, and the /v1/web HTTP layer.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -424,6 +426,13 @@ class TestRunWebSearch:
         assert payload["ok"] is False
         assert payload["error"]["code"] == "missing_api_key"
 
+    async def test_run_web_search_test_uses_pending_max_results(self, monkeypatch):
+        monkeypatch.setattr(
+            websearch, "_ddgs_text", lambda query, max_results, backend: fake_rows(10)
+        )
+        payload = await run_web_search_test("duckduckgo", max_results=7)
+        assert len(payload["results"]) == 7
+
 
 class TestSsrfGuard:
     @pytest.mark.parametrize(
@@ -740,16 +749,33 @@ class TestAdminWebSearchTest:
         def fake_text(query, max_results, backend):
             seen["query"] = query
             seen["backend"] = backend
+            seen["max_results"] = max_results
             return [{"title": "T", "href": "https://example.com/", "body": "B"}]
 
         monkeypatch.setattr(websearch, "_ddgs_text", fake_text)
         response = self._client().post(
             "/admin/api/web-search/test",
-            json={"provider": "ddgs_custom", "ddgs_backends": "yahoo,mojeek"},
+            json={
+                "provider": "ddgs_custom",
+                "ddgs_backends": "yahoo,mojeek",
+                "max_results": 7,
+            },
         )
         assert response.status_code == 200
         assert response.json()["ok"] is True
         assert seen["backend"] == "yahoo,mojeek"
+        assert seen["max_results"] == 7
+
+    def test_dashboard_posts_pending_max_results(self):
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "omlx/admin/static/js/dashboard.js").read_text()
+        test_method = javascript.split("async testWebSearch()", 1)[1].split(
+            "async saveLanguage", 1
+        )[0]
+        assert (
+            "max_results: this.globalSettings.integrations.web_search_max_results"
+            in test_method
+        )
 
     def test_failure_payload_passes_through(self):
         response = self._client().post(

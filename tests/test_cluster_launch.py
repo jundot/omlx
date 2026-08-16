@@ -2,9 +2,11 @@
 
 import io
 import json
+import platform
 import signal
 import stat
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -368,6 +370,7 @@ def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
                 versions
                 | {
                     "cluster-protocol": CLUSTER_PROTOCOL_VERSION,
+                    "python": platform.python_version(),
                     "model-exists": True,
                     "admission-ceiling-bytes": 1024**4,
                 }
@@ -405,19 +408,22 @@ def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
     assert kwargs["check"] is False
 
 
-def test_local_runtime_version_falls_back_to_source_package(monkeypatch):
+def test_local_runtime_version_ignores_stale_installed_metadata(monkeypatch):
     real_version = launch.importlib.metadata.version
+    metadata_lookups = []
 
-    def source_only(name):
+    def stale_metadata(name):
+        metadata_lookups.append(name)
         if name == "omlx":
-            raise launch.importlib.metadata.PackageNotFoundError(name)
+            return "0.0.0-stale"
         return real_version(name)
 
-    monkeypatch.setattr(launch.importlib.metadata, "version", source_only)
+    monkeypatch.setattr(launch.importlib.metadata, "version", stale_metadata)
 
     from omlx._version import __version__
 
     assert launch._local_runtime_versions()["omlx"] == __version__
+    assert "omlx" not in metadata_lookups
 
 
 def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
@@ -511,6 +517,7 @@ def test_remote_preflight_rejects_runtime_drift():
 def test_remote_preflight_requires_same_model_path():
     versions = _local_runtime_versions() | {
         "cluster-protocol": CLUSTER_PROTOCOL_VERSION,
+        "python": platform.python_version(),
         "model-exists": False,
     }
 
@@ -546,6 +553,7 @@ def test_remote_preflight_requires_matching_model_identity(
     )
     versions = _local_runtime_versions() | {
         "cluster-protocol": CLUSTER_PROTOCOL_VERSION,
+        "python": platform.python_version(),
         "model-exists": True,
         "model_identity": "remote",
         "stage_ready": True,
@@ -583,6 +591,7 @@ def test_remote_preflight_rejects_an_incomplete_rank_stage(
     )
     versions = _local_runtime_versions() | {
         "cluster-protocol": CLUSTER_PROTOCOL_VERSION,
+        "python": platform.python_version(),
         "model-exists": True,
         "model_identity": "same",
         "stage_ready": False,
@@ -615,6 +624,7 @@ def test_peer_probe_is_prompt_free_and_reports_runtime_compatibility():
             "omlx_version": versions["omlx"],
             "mlx_version": versions["mlx"],
             "mlx_lm_version": versions["mlx-lm"],
+            "python_version": platform.python_version(),
         },
         "transport": {
             "rdma": {"enabled": True, "devices": ["rdma_en5"]},
@@ -656,6 +666,7 @@ def test_peer_probe_rejects_protocol_drift():
             "omlx_version": versions["omlx"],
             "mlx_version": versions["mlx"],
             "mlx_lm_version": versions["mlx-lm"],
+            "python_version": platform.python_version(),
         },
         "transport": {},
     }
@@ -685,6 +696,7 @@ def test_peer_probe_discovers_a_different_linux_python_path():
             "omlx_version": versions["omlx"],
             "mlx_version": versions["mlx"],
             "mlx_lm_version": versions["mlx-lm"],
+            "python_version": platform.python_version(),
             "python_executable": "/opt/omlx/bin/python",
         },
         "transport": {},
@@ -722,6 +734,7 @@ def test_peer_probe_preserves_packaged_cluster_wrapper_path():
             "omlx_version": versions["omlx"],
             "mlx_version": versions["mlx"],
             "mlx_lm_version": versions["mlx-lm"],
+            "python_version": platform.python_version(),
             "python_executable": "/Applications/oMLX.app/Contents/Python/python3",
         },
         "transport": {},
@@ -961,6 +974,238 @@ def test_peer_probe_keeps_legacy_packaged_worker_visible(monkeypatch):
     assert result["status"]["warnings"] == [
         "Update the installed oMLX worker to enable cluster execution."
     ]
+
+
+# --- A packaged-app peer must need no hand-made shim (#2680) ----------------
+#
+# The coordinator runs inside the .app, so sys.executable is the bundled
+# interpreter.  That exact path exists on the peer too and is therefore tried
+# first, but without the launcher's PYTHONHOME/PYTHONPATH it cannot import
+# omlx.  The peer was then declared "worker runtime is not installed" while the
+# app sat in /Applications.  These reproduce the reported host exactly.
+
+_BUNDLED_PYTHON = (
+    "/Applications/oMLX.app/Contents/Resources/Python/cpython-3.11/bin/python3.11"
+)
+_PEER_SHIM = "/Users/test/.omlx/bin/omlx-cluster-python"
+
+
+def _packaged_app_peer_runner(status: dict) -> tuple[list[str], object]:
+    """A peer where only the shipped cluster shim can import oMLX."""
+
+    commands: list[str] = []
+
+    def runner(argv, **_kwargs):
+        command = argv[-1]
+        commands.append(command)
+        if command.startswith(_BUNDLED_PYTHON):
+            return subprocess.CompletedProcess(
+                argv, 1, "", "ModuleNotFoundError: No module named 'omlx'"
+            )
+        if command.startswith("~/.omlx/bin/omlx-cluster-python"):
+            return subprocess.CompletedProcess(argv, 0, f"{_PEER_SHIM}\n", "")
+        if command.startswith(_PEER_SHIM):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(status), "")
+        return subprocess.CompletedProcess(argv, 127, "", "not found")
+
+    return commands, runner
+
+
+def test_packaged_app_peer_is_runtime_ready_without_a_hand_made_shim():
+    versions = _local_runtime_versions()
+    status = {
+        "protocol_version": CLUSTER_PROTOCOL_VERSION,
+        "node": {"hostname": "studio", "distributed_backends": ["ring", "jaccl"]},
+        "runtime": {
+            "omlx_version": versions["omlx"],
+            "mlx_version": versions["mlx"],
+            "mlx_lm_version": versions["mlx-lm"],
+            "python_version": platform.python_version(),
+            "python_executable": _BUNDLED_PYTHON,
+        },
+        "transport": {},
+    }
+    commands, runner = _packaged_app_peer_runner(status)
+
+    result = probe_remote_host(
+        "studio",
+        python_executable=_BUNDLED_PYTHON,
+        runner=runner,
+    )
+
+    assert result["ok"] is True
+    assert result["runtime_compatible"] is True
+    assert result["runtime_mismatches"] == []
+    assert "bootstrap_required" not in result
+    # The shim, not the bundled interpreter, must be carried forward: reusing
+    # the raw binary loses the environment and fails the very next probe.
+    assert result["status"]["runtime"]["python_executable"] == _PEER_SHIM
+    assert commands[-1].startswith(_PEER_SHIM)
+
+
+def test_admission_ceiling_probe_discovers_the_peer_interpreter_when_unknown():
+    """#2680: falling back to sys.executable 503'd node-budgets every poll."""
+
+    commands, runner = _packaged_app_peer_runner({})
+
+    def ceiling_runner(argv, **kwargs):
+        command = argv[-1]
+        if command.startswith(_PEER_SHIM) and "admission_ceiling_bytes" in command:
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"admission_ceiling_bytes": 213 * 1024**3}), ""
+            )
+        return runner(argv, **kwargs)
+
+    ceiling = launch.probe_remote_admission_ceiling(
+        "studio",
+        python_executable=None,
+        runner=ceiling_runner,
+    )
+
+    assert ceiling == 213 * 1024**3
+    assert commands[-1].startswith(_PEER_SHIM)
+
+
+def test_admission_ceiling_probe_rediscovers_when_the_known_interpreter_broke():
+    """A stored bundled-interpreter path must not keep failing forever."""
+
+    commands, runner = _packaged_app_peer_runner({})
+
+    def ceiling_runner(argv, **kwargs):
+        command = argv[-1]
+        if command.startswith(_PEER_SHIM) and "admission_ceiling_bytes" in command:
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"admission_ceiling_bytes": 7}), ""
+            )
+        return runner(argv, **kwargs)
+
+    ceiling = launch.probe_remote_admission_ceiling(
+        "studio",
+        python_executable=_BUNDLED_PYTHON,
+        runner=ceiling_runner,
+    )
+
+    assert ceiling == 7
+    assert commands[0].startswith(_BUNDLED_PYTHON)
+    assert commands[-1].startswith(_PEER_SHIM)
+
+
+def test_admission_ceiling_probe_reports_the_original_failure_when_no_peer_python():
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, "", "ModuleNotFoundError: No module named 'omlx'"
+        )
+
+    with pytest.raises(DistributedLaunchError, match="memory ceiling probe failed"):
+        launch.probe_remote_admission_ceiling(
+            "studio",
+            python_executable=_BUNDLED_PYTHON,
+            runner=runner,
+        )
+
+
+# --- "Not installed" must be measured, not asserted (#2680) ----------------
+
+
+def _system_probe_runner(payload: dict, *, evidence: list[str]):
+    def runner(argv, **_kwargs):
+        command = argv[-1]
+        if "import sys; print(sys.executable)" in command:
+            return subprocess.CompletedProcess(argv, 0, "/usr/bin/python3\n", "")
+        if "worker_runtime_ready" in command:
+            body = json.loads(json.dumps(payload))
+            body["node"]["worker_runtime_evidence"] = evidence
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        return subprocess.CompletedProcess(argv, 1, "", "No module named 'omlx'")
+
+    return runner
+
+
+_SYSTEM_PROBE_PAYLOAD = {
+    "protocol_version": None,
+    "node": {"hostname": "studio", "accelerator": "metal"},
+    "runtime": {"python_executable": "/usr/bin/python3"},
+    "transport": {},
+    "warnings": [],
+}
+
+
+def test_preinstall_inventory_confirms_a_genuinely_absent_runtime():
+    result = probe_remote_system_host(
+        "studio",
+        preferred_python=_BUNDLED_PYTHON,
+        runner=_system_probe_runner(_SYSTEM_PROBE_PAYLOAD, evidence=[]),
+    )
+
+    assert result["bootstrap_required"] is True
+    assert result["runtime_compatible"] is False
+    assert result["runtime_mismatches"] == ["oMLX worker runtime is not installed"]
+    assert result["worker_runtime_evidence"] == []
+
+
+def test_preinstall_inventory_will_not_claim_missing_when_omlx_is_installed():
+    result = probe_remote_system_host(
+        "studio",
+        preferred_python=_BUNDLED_PYTHON,
+        runner=_system_probe_runner(
+            _SYSTEM_PROBE_PAYLOAD, evidence=["/Applications/oMLX.app"]
+        ),
+    )
+
+    assert result["bootstrap_required"] is True
+    assert result["runtime_compatible"] is False
+    assert result["runtime_mismatches"] == [
+        "oMLX worker runtime could not be verified"
+    ]
+    assert result["worker_runtime_evidence"] == ["/Applications/oMLX.app"]
+    assert result["status"]["warnings"] == [
+        "oMLX is installed on this node but its worker runtime could not be run."
+    ]
+
+
+def test_preinstall_probe_measures_installation_instead_of_hardcoding_it():
+    """The script itself must look; the verdict is not a constant."""
+
+    assert "worker_runtime_evidence" in launch._REMOTE_SYSTEM_PROBE
+    assert "/Applications/oMLX.app" in launch._REMOTE_SYSTEM_PROBE
+    assert ".omlx/bin/omlx" in launch._REMOTE_SYSTEM_PROBE
+    assert "find_spec" in launch._REMOTE_SYSTEM_PROBE
+
+
+def test_preinstall_probe_reports_its_own_failures_on_stderr():
+    """A swallowed error here reads as 'oMLX is absent'. Say what broke.
+
+    stdout carries the JSON the caller parses, so diagnostics must go to
+    stderr or they corrupt the payload.
+    """
+
+    script = launch._REMOTE_SYSTEM_PROBE
+    body = script.split("def worker_runtime_evidence")[1].split("\ngpu_code")[0]
+    # Neither blanket nor silent: every handler names its types and says what
+    # it could not do.
+    assert "except Exception" not in body
+    assert body.count("except ") == body.count("note(")
+    assert "except (OSError, ValueError) as exc" in body
+    assert "cannot test %s" in body
+    assert "cannot look up the omlx package" in body
+    assert "sys.stderr.write" in script
+
+
+def test_preinstall_probe_keeps_stdout_clean_when_every_lookup_fails():
+    """Run the real script under an interpreter that cannot import omlx."""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", launch._REMOTE_SYSTEM_PROBE],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent-omlx-home"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert isinstance(payload["node"]["worker_runtime_evidence"], list)
 
 
 # --- The node role has to survive the argv the launcher actually runs -------

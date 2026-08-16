@@ -7,8 +7,10 @@ import hashlib
 import importlib.metadata
 import ipaddress
 import json
+import logging
 import math
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -32,6 +34,8 @@ from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
 from .ssh_policy import cluster_ssh_options
 from .staging import validate_staged_model
+
+logger = logging.getLogger(__name__)
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 _LOG_LINE_LIMIT = 8192
@@ -163,13 +167,13 @@ def _available_launch_ports(
 
 
 def _package_version(name: str) -> str:
+    if name == "omlx":
+        from omlx._version import __version__
+
+        return __version__
     try:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
-        if name == "omlx":
-            from omlx._version import __version__
-
-            return __version__
         return "unknown"
 
 
@@ -179,6 +183,45 @@ def _local_runtime_versions() -> dict[str, str]:
         "mlx": _package_version("mlx"),
         "mlx-lm": _package_version("mlx-lm"),
     }
+
+
+def _python_minor(version: str) -> tuple[str, str] | None:
+    """``"3.12.13"`` -> ``("3", "12")``; ``None`` when it is not a version."""
+
+    parts = version.split(".")
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    return (parts[0], parts[1])
+
+
+def _interpreter_parity(
+    local: str, remote: Any
+) -> tuple[str | None, str | None]:
+    """Compare the interpreter two ranks will actually run under (#2695).
+
+    Returns ``(blocking, warning)``, at most one of which is set.
+
+    Python ABI tags govern which wheel each rank can load locally; Python
+    objects do not cross the MLX transport boundary.  A minor-version split is
+    therefore reported but does not block ranks whose package and protocol
+    versions otherwise match.  Missing, malformed, or different-major reports
+    remain blocking because they do not establish a compatible runtime.
+    """
+
+    remote_text = remote.strip() if isinstance(remote, str) else ""
+    if not remote_text:
+        return (f"python local={local} remote=missing", None)
+    local_minor = _python_minor(local)
+    remote_minor = _python_minor(remote_text)
+    if remote_minor is None or local_minor is None:
+        return (f"python local={local} remote={remote_text}", None)
+    if local_minor[0] != remote_minor[0]:
+        return (f"python local={local} remote={remote_text}", None)
+    if local_minor != remote_minor:
+        return (None, f"python minor differs: local={local} remote={remote_text}")
+    if local != remote_text:
+        return (None, f"python patch differs: local={local} remote={remote_text}")
+    return (None, None)
 
 
 def _validate_python_executable(value: str) -> str:
@@ -847,6 +890,41 @@ def memory_bytes():
     except Exception:
         return 0
 
+# Look for an oMLX install rather than asserting there isn't one. This runs
+# under a plain system interpreter, so importing omlx is not expected to work
+# even when the app is present; anything found here means the runtime exists
+# and merely could not be started, which is a different diagnosis from
+# "not installed".
+def note(message):
+    # stderr only: stdout carries the JSON payload this probe is read for.
+    sys.stderr.write("omlx-probe: " + message + "\n")
+
+def worker_runtime_evidence():
+    found = []
+    for path in (
+        os.path.expanduser("~/.omlx/bin/omlx"),
+        os.path.expanduser("~/.omlx/bin/omlx-cluster-python"),
+        "/Applications/oMLX.app",
+        os.path.expanduser("~/Applications/oMLX.app"),
+        "/opt/omlx-cluster-worker/venv/bin/python",
+    ):
+        try:
+            if os.path.exists(path):
+                found.append(path)
+        except (OSError, ValueError) as exc:
+            # An unreadable parent or a bad path is not evidence either way;
+            # say so, because silence here reads as "absent".
+            note("cannot test %s: %r" % (path, exc))
+    try:
+        import importlib.util
+        if importlib.util.find_spec("omlx") is not None:
+            found.append("import omlx")
+    except (ImportError, AttributeError, TypeError, ValueError, OSError) as exc:
+        # A broken or partially removed install raises here rather than
+        # returning None, and that is worth seeing in the SSH stderr.
+        note("cannot look up the omlx package: %r" % (exc,))
+    return found
+
 gpu_code, gpu_output = run([
     "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"
 ])
@@ -904,6 +982,7 @@ payload = {
         "fabric_group_id": None,
         "fabric_verified": False,
         "worker_runtime_ready": False,
+        "worker_runtime_evidence": worker_runtime_evidence(),
     },
     "runtime": {
         "omlx_version": "",
@@ -927,10 +1006,15 @@ payload = {
         "thunderbolt": {"ports": [], "peer_connected": False},
         "route": None,
     },
-    "warnings": ["oMLX worker runtime is not installed on this node."],
+    # Filled in by probe_remote_system_host from the evidence above, so the
+    # verdict has exactly one author.
+    "warnings": [],
 }
 print(json.dumps(payload, sort_keys=True))
 """
+
+_RUNTIME_MISSING = "oMLX worker runtime is not installed"
+_RUNTIME_UNVERIFIED = "oMLX worker runtime could not be verified"
 
 
 def probe_remote_system_host(
@@ -972,13 +1056,32 @@ def probe_remote_system_host(
         raise DistributedLaunchError(
             f"{ssh_target} returned incomplete hardware discovery"
         )
+    # "Not installed" is a claim about the peer, so it has to be earned. The
+    # inventory looks for an oMLX install with a plain interpreter; when it
+    # finds one, all we actually know is that no interpreter here could load
+    # the worker — say that instead (#2680).
+    raw_evidence = payload["node"].get("worker_runtime_evidence")
+    evidence = (
+        [str(item) for item in raw_evidence] if isinstance(raw_evidence, list) else []
+    )
+    payload["warnings"] = [
+        "oMLX is installed on this node but its worker runtime could not be run."
+        if evidence
+        else "oMLX worker runtime is not installed on this node."
+    ]
     return {
         "ok": False,
         "ssh": validate_ssh_target(ssh_target),
         "ssh_reachable": True,
         "status": payload,
         "runtime_compatible": False,
-        "runtime_mismatches": ["oMLX worker runtime is not installed"],
+        "runtime_mismatches": [
+            _RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING
+        ],
+        # Same keys as the healthy path, so a caller never has to know which
+        # branch produced the result before reading it.
+        "runtime_warnings": [],
+        "worker_runtime_evidence": evidence,
         "bootstrap_required": True,
     }
 
@@ -986,7 +1089,7 @@ def probe_remote_system_host(
 def probe_remote_admission_ceiling(
     ssh_target: str,
     *,
-    python_executable: str = sys.executable,
+    python_executable: str | None = None,
     timeout: float = 8.0,
     runner: SSHRunner = subprocess.run,
 ) -> int:
@@ -996,9 +1099,16 @@ def probe_remote_admission_ceiling(
     doing that merely to refresh a slider made every cluster-page load slow.
     This fixed, bounded command uses the peer's own oMLX memory guard and
     normally completes in one SSH round trip.
+
+    ``python_executable`` is the interpreter a previous capability probe found
+    on the peer.  It used to default to the coordinator's ``sys.executable``,
+    which inside the packaged app is a bundled binary that exists on the peer
+    but cannot import oMLX — so every dashboard poll raised, and the cluster
+    page oscillated between ready and Needs Attention (#2680).  With no known
+    interpreter, or when the known one has stopped working, discover the peer's
+    own instead.
     """
 
-    python_executable = _validate_python_executable(python_executable)
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
@@ -1014,18 +1124,64 @@ def probe_remote_admission_ceiling(
         "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
         "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
     )
-    completed = _run_cluster_ssh(
-        ssh_target,
-        shlex.join([python_executable, "-c", script]),
-        timeout=timeout,
-        runner=runner,
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise DistributedLaunchError(
-            f"memory ceiling probe failed for {ssh_target}"
-            + (f": {detail[:500]}" if detail else "")
+
+    def _read(executable: str) -> subprocess.CompletedProcess[str]:
+        return _run_cluster_ssh(
+            ssh_target,
+            shlex.join([executable, "-c", script]),
+            timeout=timeout,
+            runner=runner,
         )
+
+    attempted: str | None = None
+    completed: subprocess.CompletedProcess[str] | None = None
+    if python_executable is not None:
+        attempted = _validate_python_executable(python_executable)
+        completed = _read(attempted)
+    if completed is None or completed.returncode != 0:
+        detail = (
+            (completed.stderr.strip() or completed.stdout.strip())
+            if completed is not None
+            else ""
+        )
+        failure = f"memory ceiling probe failed for {ssh_target}" + (
+            f": {detail[:500]}" if detail else ""
+        )
+        try:
+            discovered = discover_remote_python_executable(
+                ssh_target,
+                preferred=attempted or sys.executable,
+                timeout=min(timeout, 8.0),
+                runner=runner,
+            )
+        except DistributedLaunchError as exc:
+            # Carry the discovery reason into the message. Dropping it left
+            # the operator with a bare ModuleNotFoundError repeating every
+            # poll and no indication that a search had even been attempted.
+            raise DistributedLaunchError(
+                f"{failure}; no interpreter that can import oMLX was found "
+                f"on {ssh_target}: {exc}"
+            ) from exc
+        if discovered == attempted:
+            raise DistributedLaunchError(
+                f"{failure}; {discovered} is the only interpreter "
+                f"{ssh_target} offers and it did not answer"
+            )
+        # A silent recovery is how the same stale interpreter got retried
+        # hundreds of times before anyone noticed (#2680).
+        logger.info(
+            "Memory ceiling probe for %s fell back from %s to the discovered %s",
+            ssh_target,
+            attempted or "no known interpreter",
+            discovered,
+        )
+        completed = _read(discovered)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise DistributedLaunchError(
+                f"memory ceiling probe failed for {ssh_target}"
+                + (f": {detail[:500]}" if detail else "")
+            )
     try:
         payload = json.loads(completed.stdout)
         ceiling = int(payload.get("admission_ceiling_bytes") or 0)
@@ -1157,13 +1313,59 @@ def probe_remote_host(
         for name in expected
         if expected[name] != remote_versions[name]
     ]
+    # The packages can match while the interpreter under them does not (#2695).
+    blocking, warning = _interpreter_parity(
+        platform.python_version(), runtime.get("python_version")
+    )
+    if blocking is not None:
+        mismatches.append(blocking)
+    warnings = [warning] if warning is not None else []
+    if warnings:
+        existing = payload.get("warnings")
+        payload["warnings"] = (
+            [*existing, *warnings] if isinstance(existing, list) else list(warnings)
+        )
     return {
         "ok": not mismatches,
         "ssh": validate_ssh_target(ssh_target),
         "status": payload,
         "runtime_compatible": not mismatches,
         "runtime_mismatches": mismatches,
+        "runtime_warnings": warnings,
     }
+
+
+_PREFLIGHT_SCRIPT = (
+    "import importlib.metadata as m,json,pathlib,platform,sys\n"
+    "from omlx.cluster.memory_guard import ceiling_breakdown\n"
+    "from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION as p\n"
+    "from omlx.cluster.staging import validate_staged_model as validate\n"
+    "from omlx._torch_stub import install as install_torch_stub\n"
+    "install_torch_stub()\n"
+    "import mlx_lm.server\n"
+    "import omlx.adapter.output_parser\n"
+    "def package_version(name):\n"
+    "    if name == 'omlx':\n"
+    "        from omlx._version import __version__\n"
+    "        return __version__\n"
+    "    try:\n"
+    "        return m.version(name)\n"
+    "    except m.PackageNotFoundError:\n"
+    "        return 'unknown'\n"
+    "x=pathlib.Path(sys.argv[1]).expanduser()\n"
+    "v={n:package_version(n) for n in ('omlx','mlx','mlx-lm')}\n"
+    "v['cluster-protocol']=p\n"
+    # Report the interpreter this rank will actually run under. Package and
+    # protocol parity decide compatibility; Python minor differences are
+    # surfaced as diagnostics because each rank loads its own matching wheel.
+    "v['python']=platform.python_version()\n"
+    "v['admission-ceiling-bytes']=int("
+    "ceiling_breakdown(sys.argv[4]).get('hard_limit',0))\n"
+    "v['model-exists']=x.is_dir()\n"
+    "if v['model-exists']:\n"
+    "    v.update(validate(x,int(sys.argv[2]),int(sys.argv[3])))\n"
+    "print(json.dumps(v,sort_keys=True))"
+)
 
 
 def preflight_remote_hosts(
@@ -1179,33 +1381,8 @@ def preflight_remote_hosts(
     if timeout <= 0:
         raise ValueError("SSH preflight timeout must be positive")
     expected = _local_runtime_versions()
-    script = (
-        "import importlib.metadata as m,json,pathlib,sys\n"
-        "from omlx.cluster.memory_guard import ceiling_breakdown\n"
-        "from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION as p\n"
-        "from omlx.cluster.staging import validate_staged_model as validate\n"
-        "from omlx._torch_stub import install as install_torch_stub\n"
-        "install_torch_stub()\n"
-        "import mlx_lm.server\n"
-        "import omlx.adapter.output_parser\n"
-        "def package_version(name):\n"
-        "    try:\n"
-        "        return m.version(name)\n"
-        "    except m.PackageNotFoundError:\n"
-        "        if name == 'omlx':\n"
-        "            from omlx._version import __version__\n"
-        "            return __version__\n"
-        "        return 'unknown'\n"
-        "x=pathlib.Path(sys.argv[1]).expanduser()\n"
-        "v={n:package_version(n) for n in ('omlx','mlx','mlx-lm')}\n"
-        "v['cluster-protocol']=p\n"
-        "v['admission-ceiling-bytes']=int("
-        "ceiling_breakdown(sys.argv[4]).get('hard_limit',0))\n"
-        "v['model-exists']=x.is_dir()\n"
-        "if v['model-exists']:\n"
-        "    v.update(validate(x,int(sys.argv[2]),int(sys.argv[3])))\n"
-        "print(json.dumps(v,sort_keys=True))"
-    )
+    script = _PREFLIGHT_SCRIPT
+    local_python_version = platform.python_version()
     results: list[dict[str, Any]] = []
     local_model_exists = Path(deployment.model).is_dir()
     assignments = sorted(deployment.assignments, key=lambda item: item.rank)
@@ -1256,6 +1433,7 @@ def preflight_remote_hosts(
                     "model_identity": local_identity,
                     "stage_ready": local_validation.get("stage_ready"),
                     "admission_ceiling_bytes": local_admission_ceiling,
+                    "runtime_warnings": [],
                     "local": True,
                 }
             )
@@ -1310,6 +1488,12 @@ def preflight_remote_hosts(
                 f"local={CLUSTER_PROTOCOL_VERSION} "
                 f"remote={versions.get('cluster-protocol', 'missing')}"
             )
+        blocking, warning = _interpreter_parity(
+            local_python_version, versions.get("python")
+        )
+        if blocking is not None:
+            mismatches.append(blocking)
+        runtime_warnings = [warning] if warning is not None else []
         if versions.get("model-exists") is not True:
             mismatches.append(
                 f"model directory is missing on remote host: {deployment.model}"
@@ -1340,6 +1524,7 @@ def preflight_remote_hosts(
                 "admission_ceiling_bytes": int(
                     versions.get("admission-ceiling-bytes") or 0
                 ),
+                "runtime_warnings": runtime_warnings,
                 "local": False,
             }
         )

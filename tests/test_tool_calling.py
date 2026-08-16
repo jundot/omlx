@@ -5,6 +5,7 @@ Tests for tool calling parsing and conversion utilities.
 Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
+import ast
 import json
 import logging
 import re
@@ -44,6 +45,7 @@ from omlx.api.tool_calling import (
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
     restore_gemma4_param_names,
+    sanitize_tool_call_markup,
     validate_json_schema,
 )
 
@@ -1080,6 +1082,147 @@ class TestToolCallStreamFilter:
         assert r1 == "Next: "
         assert r2 == ""
         assert f.finish() == ""
+
+
+_DSML_START = "<｜DSML｜tool_calls>"
+_DSML_END = "</｜DSML｜tool_calls>"
+
+
+def _make_dsml_filter():
+    return ToolCallStreamFilter(_make_tokenizer_with_end(_DSML_START, _DSML_END))
+
+
+class TestToolCallStreamFilterDsmlSeparator:
+    """DeepSeek V4's "\\n\\n" separator belongs to the DSML envelope.
+
+    The reference decoder's stop token is the literal string
+    "\\n\\n<｜DSML｜tool_calls", so the separator before a tool-call block
+    is control markup, not content. The filter consumes it with the
+    envelope; content deltas never carry it.
+    """
+
+    def test_separator_consumed_before_tool_call(self):
+        f = _make_dsml_filter()
+        r = f.feed("I'll run it.\n\n" + _DSML_START + '{"name":"x"}')
+        assert r == "I'll run it."
+        assert f.feed(_DSML_END) == ""
+        assert f.finish() == ""
+
+    def test_separator_split_across_feeds(self):
+        f = _make_dsml_filter()
+        out = f.feed("answer.")
+        out += f.feed("\n")
+        out += f.feed("\n")
+        out += f.feed("<｜DSML｜tool_")
+        out += f.feed('calls>{"name":"x"}')
+        out += f.feed(_DSML_END)
+        out += f.finish()
+        assert out == "answer."
+
+    def test_marker_without_separator_still_suppressed(self):
+        f = _make_dsml_filter()
+        r = f.feed("answer." + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "answer."
+
+    def test_only_final_two_newlines_belong_to_envelope(self):
+        # The reference decoder's str.find match consumes exactly the last
+        # two newlines of a longer run; the rest is content.
+        f = _make_dsml_filter()
+        r = f.feed("a.\n\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "a.\n"
+
+    def test_trailing_newlines_without_tool_call_survive_finish(self):
+        # Newlines held back as a potential envelope prefix are literal
+        # content when the stream ends without a tool call.
+        f = _make_dsml_filter()
+        r1 = f.feed("done.\n\n")
+        r2 = f.finish()
+        assert r1 == "done."
+        assert r1 + r2 == "done.\n\n"
+
+    def test_newlines_before_prose_pass_through(self):
+        f = _make_dsml_filter()
+        r1 = f.feed("a\n\n")
+        r2 = f.feed("b")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "a\n\nb"
+
+    def test_separator_hold_disabled_for_thinking_channel(self):
+        # Filters watching the reasoning channel opt out: trailing newlines
+        # flush in place, never as a late delta after the channel closed.
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(_DSML_START, _DSML_END),
+            consume_dsml_separator=False,
+        )
+        assert f.feed("thinking...\n\n") == "thinking...\n\n"
+        assert f.finish() == ""
+
+    def test_opted_out_filter_keeps_separator_but_still_suppresses(self):
+        # With the opt-out, a separator-preceded envelope is suppressed via
+        # the bare pair and the separator stays visible -- byte-identical
+        # to pre-change behavior for the thinking channel.
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(_DSML_START, _DSML_END),
+            consume_dsml_separator=False,
+        )
+        r = f.feed("think\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "think\n\n"
+
+    def test_multiple_envelopes_with_prose_between(self):
+        f = _make_dsml_filter()
+        r = f.feed(
+            "a\n\n"
+            + _DSML_START
+            + "x"
+            + _DSML_END
+            + "b\n\n"
+            + _DSML_START
+            + "y"
+            + _DSML_END
+            + "c"
+        )
+        r += f.finish()
+        assert r == "abc"
+
+    def test_single_newline_held_then_released(self):
+        f = _make_dsml_filter()
+        r1 = f.feed("a\n")
+        r2 = f.feed("b")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "a\nb"
+
+    def test_truncated_open_marker_drops_held_separator_at_finish(self):
+        # A stream cut mid-marker is malformed; strict mode drops the
+        # partial-marker tail, and the held separator goes with it --
+        # intended: the separator belongs to the (broken) envelope.
+        f = _make_dsml_filter()
+        r = f.feed("a\n\n<")
+        r += f.finish()
+        assert r == "a"
+
+    def test_unclosed_envelope_recovery_includes_separator(self):
+        # The recovery candidate carries the exact withheld bytes,
+        # separator included -- nothing streamed is duplicated, nothing
+        # withheld is lost.
+        f = _make_dsml_filter()
+        assert f.feed("a\n\n" + _DSML_START + "payload") == "a"
+        assert f.finish() == ""
+        assert (
+            f.take_recovery_candidate() == "\n\n" + _DSML_START + "payload"
+        )
+
+    def test_sanitize_markup_preserves_thinking_separator(self):
+        # sanitize_tool_call_markup cleans thinking-channel text at every
+        # call site; it must match the streamed reasoning deltas, which
+        # keep the separator (the opt-out above).
+        tok = _make_tokenizer_with_end(_DSML_START, _DSML_END)
+        cleaned = sanitize_tool_call_markup(
+            "a\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END + "b", tok
+        )
+        assert cleaned == "a\n\nb"
 
 
 class TestToolCallStreamFilterBracketPartialPrefix:
@@ -3814,3 +3957,481 @@ class TestQwen3CoderMarkerInArguments:
         # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
         # loaded CI box while still catching quadratic growth.
         assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+
+class TestDeepNestingNeverEscapesParseChain:
+    """Deep nesting must degrade to a parse failure, not raise (#2545).
+
+    The interpreter decides *which* error deep input produces, and it varies
+    by version: on 3.14 ``json.loads`` already returns a JSONDecodeError that
+    the old excepts caught, while ``ast`` raises SyntaxError. On earlier
+    versions RecursionError is the mode. Testing with genuinely deep input
+    therefore proves nothing portable, so these tests inject the error at the
+    decoder instead and assert the chain still degrades cleanly on every
+    version.
+    """
+
+    ERRORS = [RecursionError, SyntaxError]
+
+    @staticmethod
+    def _tokenizer(parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parser
+        return tok
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_native_parser_raising_does_not_escape(self, error):
+        """A real parser hitting the limit internally must not escape.
+
+        This is the path #2545 is really about: glm47, kimi_k2 and
+        qwen3_coder call ``json.loads`` inside the parser, so the error
+        surfaces at the parser call rather than at a decode site in this
+        module. Recovering via the XML fallback is a fine outcome; raising
+        is not.
+        """
+        def boom(text, tools):
+            raise error("nested too deeply")
+
+        # Recoverable payload: the fallback picks it up, nothing escapes.
+        _, calls = parse_tool_calls(
+            '<tool_call>{"name": "f"}</tool_call>', self._tokenizer(boom)
+        )
+        assert calls is not None and calls[0].function.name == "f"
+
+        # Unrecoverable payload: drops to no tool calls, still no raise.
+        _, calls = parse_tool_calls(
+            "<tool_call>" + "[" * 500 + "</tool_call>", self._tokenizer(boom)
+        )
+        assert calls is None
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_json_loads_raising_does_not_escape(self, monkeypatch, error):
+        """Every json.loads site in the chain sits behind a guard."""
+        import omlx.api.tool_calling as mod
+
+        real = json.loads
+
+        def boom(s, *a, **k):
+            raise error("nested too deeply")
+
+        monkeypatch.setattr(mod.json, "loads", boom)
+        try:
+            # Each of these reaches a different decode site. The third runs a
+            # real parser so a decoder is actually exercised: an earlier
+            # version of this test passed plain text with tool_parser=None,
+            # which reached no decoder at all (caught by DiscoStew6082).
+            mod._parse_xml_tool_calls("<tool_call>{}</tool_call>")
+            mod.extract_json_from_text('{"a": 1}')
+            parse_tool_calls(
+                '<tool_call>{"name": "f", "arguments": {}}</tool_call>',
+                self._tokenizer(lambda text, tools: real(text)),
+            )
+        finally:
+            monkeypatch.setattr(mod.json, "loads", real)
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_gemma4_args_reject_hard_instead_of_retrying_legacy(
+        self, monkeypatch, error
+    ):
+        """Deep nesting must not fall through to the unbounded legacy parser.
+
+        The legacy path ignores the length/depth bounds on purpose, so routing
+        a payload that broke a decoder into it would hand the exact input the
+        bounds exist to stop to the parser that does not apply them.
+        """
+        import omlx.api.tool_calling as mod
+
+        def boom(_args):
+            raise error("nested too deeply")
+
+        called = []
+        monkeypatch.setattr(mod, "_gemma4_transcode_to_json", boom)
+        monkeypatch.setattr(
+            mod,
+            "_gemma4_args_to_json_legacy",
+            lambda a: called.append(a) or {},
+        )
+
+        with pytest.raises(mod._Gemma4ArgsTooComplexError):
+            mod._gemma4_args_to_json_robust('{"a": 1}')
+        assert called == [], "legacy parser must not see deep-nested args"
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_gemma4_legacy_raising_is_converted(self, monkeypatch, error):
+        """The legacy parser is unbounded, so guard its decoders too."""
+        import omlx.api.tool_calling as mod
+
+        def transcode_fails(_args):
+            raise ValueError("ambiguous, retry with legacy")
+
+        def legacy_boom(_args):
+            raise error("nested too deeply")
+
+        monkeypatch.setattr(mod, "_gemma4_transcode_to_json", transcode_fails)
+        monkeypatch.setattr(mod, "_gemma4_args_to_json_legacy", legacy_boom)
+
+        with pytest.raises(mod._Gemma4ArgsTooComplexError):
+            mod._gemma4_args_to_json_robust('{"a": 1}')
+
+    def test_reported_repro_does_not_raise(self):
+        """The issue's original repro, kept as a smoke test.
+
+        It no longer raises on 3.14 because json.loads returns a decode error
+        there, so it is a regression guard rather than the proof.
+        """
+        tok = self._tokenizer(lambda text, tools: json.loads(text))
+        cleaned, calls = parse_tool_calls(
+            "<tool_call>" + "[" * 100000 + "</tool_call>", tok
+        )
+        assert calls is None
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_deep_nesting_does_not_take_down_a_neighboring_tool_call(error):
+    """One unparseable call must not lose the valid call beside it (#2545).
+
+    The parse loop runs per match, so a payload that breaks the decoder has
+    to fail that match alone and leave the rest of the batch intact.
+    """
+    def parser(text, tools):
+        if "[" in text:
+            raise error("nested too deeply")
+        return json.loads(text)
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = parser
+
+    cleaned, calls = parse_tool_calls(
+        "<tool_call>" + "[" * 500 + "</tool_call>"
+        '<tool_call>{"name": "good", "arguments": {"a": 1}}</tool_call>',
+        tok,
+    )
+
+    assert [c.function.name for c in calls] == ["good"]
+    # The broken envelope's markup must not leak into content either.
+    assert cleaned == ""
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
+        # Real namespaced grammar. An earlier version of this fixture used
+        # <function=..><parameter=..>, which _parse_namespaced_tool_calls does
+        # not accept, so it parsed zero calls and exercised nothing
+        # (caught by DiscoStew6082).
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+    ],
+    ids=["xml-fallback", "qwen-xml", "glm-xml", "namespaced-xml"],
+)
+def test_serialization_after_a_successful_decode_does_not_escape(
+    monkeypatch, error, text
+):
+    """The re-serialize step is a second decode from a deeper frame (#2545).
+
+    ``json.dumps`` recurses per nesting level just as the decoders do, and it
+    runs *after* a value has already parsed, further down the stack. A value
+    nested just under the limit when it decoded can therefore breach it here.
+    DiscoStew6082 hit this at depth ~987 on 3.11, past the first guard.
+
+    Injecting at ``json.dumps`` rather than nesting for real keeps this
+    meaningful on 3.14, where the interpreter does not raise at these depths.
+    """
+    import omlx.api.tool_calling as mod
+
+    nested = "[" * 400 + "0" + "]" * 400
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    payload = text.replace("{}", nested)
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        # Must not raise. Dropping the call is fine; escaping is not.
+        if "ns:tool_call" in payload:
+            mod._parse_namespaced_tool_calls(payload, "ns")
+        else:
+            mod._parse_xml_tool_calls(payload)
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_serialize_arguments_raises_so_the_caller_can_drop(monkeypatch, error):
+    """``_serialize_tool_call_arguments`` propagates rather than emptying.
+
+    An earlier version of this test asserted it returned "{}" here. That was
+    wrong: it produced a runnable tool call with its arguments silently
+    removed. The failure has to reach ``_build_tool_call`` so the call is
+    dropped (jundot's review on #2593).
+    """
+    import omlx.api.tool_calling as mod
+
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        with pytest.raises(error):
+            mod._serialize_tool_call_arguments({"x": 1})
+        with pytest.raises(error):
+            mod._serialize_tool_call_arguments('{"x": 1}')
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+    ],
+    ids=["compact-xml", "qwen-xml", "namespaced-xml"],
+)
+def test_balanced_depth_sweep_through_public_entry(template):
+    """Real nesting swept across the recursion boundary (#2545).
+
+    Unlike the injected tests, this uses genuinely deep input and so only
+    bites on Python 3.11 through 3.13, where ``json.loads`` still raises
+    RecursionError. CI covers exactly those versions. It sweeps rather than
+    picking a depth because the boundary moves with how much stack the caller
+    has already used, which is why a single hand-picked depth reproduced for
+    DiscoStew6082 and not for me.
+
+    Any outcome except an escaping exception is acceptable: parsing the call,
+    or dropping it with a warning.
+    """
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    for depth in range(940, 1041):
+        nested = "[" * depth + "0" + "]" * depth
+        try:
+            parse_tool_calls(template.replace("{}", nested), tok)
+        except (RecursionError, SyntaxError) as exc:
+            pytest.fail(f"escaped at depth {depth}: {type(exc).__name__}: {exc}")
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError, ValueError])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+        '<|tool_call_start|>{"name": "f", "arguments": {"x": 1}}<|tool_call_end|>',
+    ],
+    ids=["compact-xml", "qwen-xml", "glm-xml", "namespaced-xml", "hermes"],
+)
+def test_functioncall_validation_failure_drops_one_call(
+    monkeypatch, error, template
+):
+    """The third decode lives in openai_models, not this module (#2545).
+
+    ``FunctionCall`` re-parses the arguments string while validating it, from
+    a deeper frame than either the parse or the serialize that preceded it, so
+    a value fine at both can still breach the limit there. DiscoStew6082 hit
+    this on 3.11 at depth ~989 after the serialize guard was already in place.
+
+    Injected here because the real-depth version only bites on 3.11 to 3.13.
+    ValueError is included because that is what the validator raises for
+    ordinary malformed arguments, and it escaped the parse chain too.
+    """
+    import omlx.api.openai_models as om
+
+    def boom(_v):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(om, "_coerce_tool_call_arguments", boom)
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    # Must not raise. Dropping the call with a warning is the contract.
+    _, calls = parse_tool_calls(template.replace("{}", "1"), tok)
+    assert not calls
+
+
+@pytest.mark.parametrize("chain", [200, 400, 800])
+def test_hermes_chained_expression_does_not_escape(chain):
+    """`ast.unparse` recurses too, and runs after `ast.parse` succeeded (#2545).
+
+    A long chained expression parses fine, fails `ast.literal_eval` because it
+    is not a literal, then breaches the limit in the `ast.unparse` fallback
+    that renders it back to source. jundot found this on the Hermes path after
+    the decoder, serializer and validator layers were all guarded.
+
+    Real nesting rather than injection, so it only bites on 3.11 to 3.13,
+    which is what CI runs.
+    """
+    expr = "+".join(["1"] * chain)
+    text = f"<|tool_call_start|>f(x={expr})<|tool_call_end|>"
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    # Must not raise through the public entry point.
+    parse_tool_calls(text, tok)
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_unrepresentable_argument_drops_the_call(monkeypatch, error):
+    """An argument we cannot render drops the call, not just the argument."""
+    import omlx.api.tool_calling as mod
+
+    real_unparse = ast.unparse
+
+    def boom(node):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.ast, "unparse", boom)
+    # `1+1` is not a literal, so literal_eval fails and unparse is the fallback.
+    cleaned, calls = mod._parse_hermes_tool_calls(
+        "<|tool_call_start|>f(x=1+1)<|tool_call_end|>"
+    )
+    monkeypatch.setattr(mod.ast, "unparse", real_unparse)
+
+    assert not calls, "a call missing an argument must not be emitted"
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_serialization_failure_drops_the_call_rather_than_emptying_it(
+    monkeypatch, error
+):
+    """A serialize failure must not yield a runnable call with no arguments.
+
+    Coercing to "{}" here would hand back a tool call that still executes with
+    its arguments silently removed, so a `write_file` would fire with nothing
+    to write. That is worse than dropping it. Distinct from the non-object
+    coercion below, which is a benign parser quirk (jundot's review on #2593).
+    """
+    import omlx.api.tool_calling as mod
+
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        built = mod._build_tool_call("write_file", {"path": "a", "content": "b"})
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+    assert built is None, "must drop, not emit a call with emptied arguments"
+
+
+def test_non_object_arguments_still_coerce_to_empty_object():
+    """The benign coercion is unchanged: a parser quirk, not lost data."""
+    import omlx.api.tool_calling as mod
+
+    assert mod._serialize_tool_call_arguments([1, 2]) == "{}"
+    assert mod._serialize_tool_call_arguments("not json") == "{}"
+    assert mod._serialize_tool_call_arguments({"a": 1}) == '{"a": 1}'
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_string_parser_output_that_cannot_decode_drops_the_call(
+    monkeypatch, error
+):
+    """The string branch loses arguments the same way the dict branch did.
+
+    Parsers that follow the OpenAI spec hand back a JSON-object *string*
+    (mlx-vlm and mlx-lm's gemma4 do). If decoding that string breaches the
+    limit, catching the error here would fall through to the "{}" coercion and
+    emit a runnable call without its arguments. Caught by DiscoStew6082 on
+    #2593 after the dict branch was already fixed.
+
+    The decode is made to fail only for this exact payload, so the downstream
+    validator still works and the drop is attributable to this branch.
+    """
+    import omlx.api.tool_calling as mod
+
+    payload = '{"path": "notes.xml", "content": "IMPORTANT"}'
+    real_loads = json.loads
+
+    def selective(s, *args, **kwargs):
+        if s == payload:
+            raise error("nested too deeply")
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(mod.json, "loads", selective)
+    try:
+        built = mod._build_tool_call("write_file", payload)
+    finally:
+        monkeypatch.setattr(mod.json, "loads", real_loads)
+
+    assert built is None, "must drop, not emit a call with emptied arguments"
+
+
+def test_malformed_string_arguments_still_coerce():
+    """Undecodable-but-shallow input stays a benign coercion, not a drop."""
+    import omlx.api.tool_calling as mod
+
+    assert mod._serialize_tool_call_arguments("not json at all") == "{}"
+    assert mod._serialize_tool_call_arguments('{"a": 1}') == '{"a": 1}'
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["{1, 2}", "b'abc'", "1+2j"],
+    ids=["set", "bytes", "complex"],
+)
+def test_hermes_non_json_literal_drops_only_bad_call(literal):
+    """Python literals that JSON cannot represent must not escape the parser."""
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = False
+    text = "<|tool_call_start|>[bad(x=" + literal + "), good(x=1)]<|tool_call_end|>"
+
+    cleaned, calls = parse_tool_calls(text, tok)
+
+    assert cleaned == ""
+    assert [call.function.name for call in calls] == ["good"]
+
+
+def test_bracket_deep_decode_never_runs_raw_arguments():
+    """A recursion-bound breach must drop the call, not run its raw payload."""
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = False
+
+    for depth in range(900, 1051):
+        nested = "[" * depth + "0" + "]" * depth
+        text = '[Tool call: bad({"x":' + nested + '})][Tool call: good({"x":1})]'
+
+        cleaned, calls = parse_tool_calls(text, tok)
+        names = [call.function.name for call in calls or []]
+
+        assert cleaned == ""
+        assert names.count("good") == 1
+        for call in calls or []:
+            if call.function.name == "bad":
+                assert not call.function.arguments.startswith('{"raw":')

@@ -12,6 +12,7 @@ These tests pin the wiring so a future refactor cannot silently revert it.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from omlx.exceptions import PrefillMemoryExceededError
@@ -827,12 +828,27 @@ def test_admission_charges_full_step_under_speed_priority():
     assert est_small.floor_chunk == 1023
 
 
-def test_deepseek_v4_200k_admission_uses_profile_instead_of_81_gib_dense_charge():
+def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
+    monkeypatch,
+):
     """Issue #2521: V4's local + pooled sparse cache must not be priced as
     43 full-context K/V layers followed by a dense 200K SDPA."""
     from mlx_lm.models.cache import RotatingKVCache
 
+    import omlx.memory_monitor as memory_monitor
     from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+    from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
+
+    monkeypatch.setattr(
+        memory_monitor,
+        "native_indexer_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(wsdpa, "_ENABLED", True)
+    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
+    monkeypatch.setattr(wsdpa, "_broken", False)
+    monkeypatch.setattr(wsdpa, "_ready", False)
+    monkeypatch.setattr(wsdpa, "_topk_ready", False)
 
     config = _ModelConfig(
         num_hidden_layers=43,
@@ -850,6 +866,12 @@ def test_deepseek_v4_200k_admission_uses_profile_instead_of_81_gib_dense_charge(
     model = MagicMock()
     model.layers = []
     model.config = config
+    del model.dtype
+    model.model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(
+            weight=mx.zeros((1,), dtype=mx.bfloat16),
+        )
+    )
     model.make_cache = lambda: [RotatingKVCache(max_size=128) for _ in range(43)]
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
@@ -864,9 +886,29 @@ def test_deepseek_v4_200k_admission_uses_profile_instead_of_81_gib_dense_charge(
     )
     scheduler._prefill_speed_priority = True
 
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
     gib = 1024**3
     current = int(156.05 * gib)
     limit = int(235.96 * gib)
+    cold_admission = scheduler._admission_estimate(
+        num_prompt_tokens=200_000,
+        cached_tokens=0,
+        current=current,
+    )
+    assert cold_admission is not None
+    assert cold_admission.estimated < limit
+
+    cold_fallback = monitor.estimate_chunk_transient_bytes(2048, 66_000)
+    monkeypatch.setattr(wsdpa, "_ready", True)
+    monkeypatch.setattr(wsdpa, "_topk_ready", True)
+    active = monitor.estimate_chunk_transient_bytes(2048, 66_000)
+    monkeypatch.setattr(wsdpa, "_broken", True)
+    failed_fallback = monitor.estimate_chunk_transient_bytes(2048, 66_000)
+    assert active < cold_fallback
+    assert failed_fallback == cold_fallback
+    monkeypatch.setattr(wsdpa, "_broken", False)
+
     est = scheduler._admission_estimate(
         num_prompt_tokens=200_000,
         cached_tokens=0,

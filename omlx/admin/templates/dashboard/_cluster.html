@@ -1809,9 +1809,16 @@
                                                 ' usable · MLX ' + clusterPeerProbe.status.runtime.mlx_version +
                                                 ' · ' + (clusterPeerProbe.status.transport.rdma.devices.length || 0) + ' RDMA interface(s)'"></div>
                                     </div>
+                                    <!-- A non-blocking runtime warning (e.g. a Python patch-level
+                                         split, #2695) must not read as an unqualified match. -->
                                     <span class="text-xs font-medium"
-                                          :class="clusterPeerProbe.runtime_compatible ? 'text-green-700' : 'text-red-700'"
-                                          x-text="clusterPeerProbe.runtime_compatible ? 'Runtime match' : clusterPeerProbe.runtime_mismatches.join(' · ')"></span>
+                                          :class="!clusterPeerProbe.runtime_compatible ? 'text-red-700'
+                                                  : ((clusterPeerProbe.runtime_warnings || []).length ? 'text-amber-700' : 'text-green-700')"
+                                          x-text="!clusterPeerProbe.runtime_compatible
+                                                  ? clusterPeerProbe.runtime_mismatches.join(' · ')
+                                                  : ((clusterPeerProbe.runtime_warnings || []).length
+                                                     ? clusterPeerProbe.runtime_warnings.join(' · ')
+                                                     : 'Runtime match')"></span>
                                 </div>
                             </div>
                         </template>

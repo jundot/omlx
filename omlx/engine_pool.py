@@ -109,6 +109,7 @@ class EngineEntry:
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
+    pending_unload_allow_pinned: bool = False  # Explicit unload may override pinning
     # Requested load-time variant. This deliberately tracks the settings that
     # produced the engine, even when an optional accelerator fails soft and the
     # engine falls back, so identical requests keep reusing that fallback.
@@ -164,6 +165,8 @@ class EnginePool:
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
+        self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._shutting_down = False
         self.configure_hot_cache_budget()
 
     def _distributed_deployment_for_entry(
@@ -903,6 +906,31 @@ class EnginePool:
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
 
+    def _entry_has_scheduler_work(self, entry: EngineEntry) -> bool:
+        """Return True until deferred aborts have actually left the scheduler."""
+        scheduler = self._resolve_scheduler_from_engine(entry.engine)
+        if scheduler is None:
+            return False
+        has_requests = getattr(scheduler, "has_requests", None)
+        if callable(has_requests):
+            try:
+                if has_requests():
+                    return True
+            except Exception:
+                return True
+        for attr in ("running", "waiting", "prefilling", "requests"):
+            if getattr(scheduler, attr, None):
+                return True
+        return False
+
+    def _entry_is_quiescent(self, entry: EngineEntry) -> bool:
+        """Return True only after leases, collectors, and scheduler work drain."""
+        return not (
+            entry.in_use > 0
+            or self._entry_has_active_requests(entry)
+            or self._entry_has_scheduler_work(entry)
+        )
+
     def _raise_if_reload_busy(self, entry: EngineEntry, operation: str) -> None:
         if self._entry_is_busy(entry):
             raise ModelBusyError(entry.model_id, operation)
@@ -935,17 +963,25 @@ class EnginePool:
         reason: str,
         *,
         abort_requested: bool = False,
+        allow_pinned: bool = False,
     ) -> bool:
-        """Mark a loaded non-pinned model for unload once it is no longer busy.
+        """Mark a loaded model for unload once it is no longer busy.
 
         Caller must hold ``self._lock``. Returns True when a pending marker was
         installed. The method deliberately does not unload by itself; call
         ``_unload_pending_if_idle_locked`` after abort/release state changes.
+        Pinning is respected unless an explicit caller opts out.
         """
         entry = self._entries.get(model_id)
-        if entry is None or entry.engine is None or entry.is_loading or entry.is_pinned:
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or (entry.is_pinned and not allow_pinned)
+        ):
             return False
         entry.pending_unload_reason = reason
+        entry.pending_unload_allow_pinned = allow_pinned
         if abort_requested:
             entry.abort_requested = True
         return True
@@ -958,8 +994,8 @@ class EnginePool:
             if (
                 entry.engine is None
                 or entry.is_loading
-                or entry.is_pinned
-                or self._entry_is_busy(entry)
+                or (entry.is_pinned and not entry.pending_unload_allow_pinned)
+                or not self._entry_is_quiescent(entry)
             ):
                 continue
             candidates.append((entry.last_access, mid))
@@ -979,13 +1015,14 @@ class EnginePool:
             or entry.engine is None
             or not entry.pending_unload_reason
             or entry.is_loading
-            or entry.is_pinned
-            or self._entry_is_busy(entry)
+            or (entry.is_pinned and not entry.pending_unload_allow_pinned)
+            or not self._entry_is_quiescent(entry)
         ):
             return False
 
         reason = entry.pending_unload_reason
         entry.pending_unload_reason = None
+        entry.pending_unload_allow_pinned = False
         entry.abort_requested = False
         logger.warning(
             "Unloading pending model '%s' after activity drained (%s)",
@@ -995,11 +1032,122 @@ class EnginePool:
         await self._unload_engine(model_id)
         return True
 
+    def _finish_pending_unload_task(
+        self,
+        model_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._pending_unload_tasks.get(model_id) is task:
+            self._pending_unload_tasks.pop(model_id, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Pending unload task failed for '%s'", model_id)
+
+    def _schedule_pending_unload_locked(self, model_id: str) -> None:
+        current = self._pending_unload_tasks.get(model_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._wait_for_pending_unload(model_id),
+            name=f"engine-pending-unload:{model_id}",
+        )
+        self._pending_unload_tasks[model_id] = task
+        task.add_done_callback(
+            lambda completed, mid=model_id: self._finish_pending_unload_task(
+                mid, completed
+            )
+        )
+
+    async def _wait_for_pending_unload(self, model_id: str) -> None:
+        """Poll scheduler state without ever tearing down an in-flight MLX step."""
+        while not self._shutting_down:
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if (
+                    entry is None
+                    or entry.engine is None
+                    or not entry.pending_unload_reason
+                ):
+                    return
+                if await self._unload_pending_if_idle_locked(model_id):
+                    return
+            await asyncio.sleep(0.1)
+
+    async def request_unload(
+        self,
+        model_id: str,
+        *,
+        reason: str = "manual unload",
+    ) -> bool:
+        """Unload now when idle, otherwise abort and unload after quiescence.
+
+        Returns True when the engine was unloaded before this call returned and
+        False when teardown was queued. New acquisitions are rejected while the
+        pending marker is installed, so the engine can drain deterministically.
+        """
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None or entry.engine is None:
+                return True
+            if entry.is_loading:
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' is still loading and cannot be unloaded yet",
+                )
+            if self._entry_is_quiescent(entry):
+                await self._unload_engine(model_id)
+                return True
+
+            self._mark_pending_unload_locked(
+                model_id,
+                reason,
+                abort_requested=True,
+                allow_pinned=True,
+            )
+            abort_all = getattr(entry.engine, "abort_all_requests", None)
+            if callable(abort_all):
+                try:
+                    await abort_all(
+                        reason=(
+                            f"Request aborted because model '{model_id}' is being unloaded"
+                        ),
+                        error_code="model_unloading",
+                    )
+                except TypeError:
+                    # Non-batched engines may expose the older no-argument hook.
+                    await abort_all()
+                except Exception:
+                    logger.warning(
+                        "Failed to request abort before unloading '%s'",
+                        model_id,
+                        exc_info=True,
+                    )
+
+            if await self._unload_pending_if_idle_locked(model_id):
+                return True
+            self._schedule_pending_unload_locked(model_id)
+            logger.warning(
+                "Queued unload for model '%s' until active scheduler work drains",
+                model_id,
+            )
+            return False
+
     def is_abort_requested(self, model_id: str | None) -> bool:
         if model_id is None:
             return False
         entry = self._entries.get(model_id)
         return bool(entry and entry.abort_requested)
+
+    def get_abort_requested_reason(self, model_id: str | None) -> str | None:
+        if model_id is None:
+            return None
+        entry = self._entries.get(model_id)
+        if entry is None or not entry.abort_requested:
+            return None
+        return entry.pending_unload_reason or "request abort"
 
     async def get_engine(
         self,
@@ -1047,6 +1195,8 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.pending_unload_reason:
+                raise ModelBusyError(model_id, "start work while unload is pending")
             expected_signature = self._engine_runtime_signature(
                 model_id,
                 runtime_settings,
@@ -1719,6 +1869,7 @@ class EnginePool:
         entry.actual_size = None
         entry.abort_requested = False
         entry.pending_unload_reason = None
+        entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
 
         if distributed:
@@ -2430,6 +2581,10 @@ class EnginePool:
 
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
+        self._shutting_down = True
+        pending_tasks = tuple(self._pending_unload_tasks.values())
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         await self._drain_lease_release_tasks()
         async with self._lock:
             for model_id in list(self._entries.keys()):

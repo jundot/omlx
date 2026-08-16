@@ -178,8 +178,8 @@ class TestAdaptiveChunkCap:
     def test_cap_stays_on_64_grid(self):
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
-        # The DSv4 native indexer requires chunk length % 64 == 0; an
-        # arbitrary tps must never produce an unaligned cap (e.g. 297).
+        # Keep scheduler chunk sizing stable even though model-specific native
+        # kernels now handle partial tiles internally.
         for tps in (594.0, 733.0, 999.0, 1601.0, 5000.0):
             s._prefill_tps_best = tps
             assert s._contended_prefill_cap() % 64 == 0

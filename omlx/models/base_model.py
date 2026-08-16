@@ -82,16 +82,11 @@ def last_token_pool(
     if attention_mask is None:
         return hidden_states[:, -1]
 
-    # Left padding: every sequence ends on a real token, so the last position
-    # is always valid and we can index it directly.
-    left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
-    if left_padding:
-        return hidden_states[:, -1]
-
-    # Right (or mixed) padding: the last valid token is at sum(mask) - 1.
-    sequence_lengths = attention_mask.sum(axis=1) - 1
-    batch_size = hidden_states.shape[0]
-    return hidden_states[mx.arange(batch_size), sequence_lengths]
+    # Locate the final unmasked position per row without evaluating an array
+    # in Python, which keeps this helper safe to trace with ``mx.compile``.
+    reverse_indices = mx.argmax(attention_mask[:, ::-1], axis=1)
+    sequence_lengths = attention_mask.shape[1] - reverse_indices - 1
+    return hidden_states[mx.arange(hidden_states.shape[0]), sequence_lengths]
 
 
 def normalize_embeddings(embeddings: mx.array) -> mx.array:

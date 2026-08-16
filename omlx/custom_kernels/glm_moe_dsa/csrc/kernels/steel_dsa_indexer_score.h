@@ -408,6 +408,8 @@ dsa_indexer_score(
   const int M = params->M;
   const int N = params->N;
   const int D = params->K;
+  const short tgp_bm = short(metal::min(BM, M - c_row));
+  const short tgp_bn = short(metal::min(BN, N - c_col));
   const int q_offset = causal_q_offset >= 0 ? causal_q_offset : N - M;
   constexpr int THREADS = WM * WN * 32;
   const int thread_idx = int(simd_group_id) * 32 + int(simd_lane_id);
@@ -465,8 +467,16 @@ dsa_indexer_score(
 
     for (int d = 0; d < params->gemm_k_iterations_aligned; ++d) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.load_unsafe();
-      loader_b.load_unsafe();
+      if (tgp_bm == BM) {
+        loader_a.load_unsafe();
+      } else {
+        loader_a.load_safe(short2(BK, tgp_bm));
+      }
+      if (tgp_bn == BN) {
+        loader_b.load_unsafe();
+      } else {
+        loader_b.load_safe(short2(BK, tgp_bn));
+      }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       mma_op.mma(As, Bs);
@@ -481,9 +491,10 @@ dsa_indexer_score(
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < decltype(mma_op.Ctile)::kTileRows; ++i) {
       const int row = c_row + mma_op.sm + i * mma_t::TM_stride;
-      const float weight = weights_lh
-          ? static_cast<float>(W[size_t(row) * H + h])
-          : static_cast<float>(W[size_t(h) * M + row]);
+      const float weight = row < M
+          ? (weights_lh ? static_cast<float>(W[size_t(row) * H + h])
+                        : static_cast<float>(W[size_t(h) * M + row]))
+          : 0.0f;
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < decltype(mma_op.Ctile)::kTileCols; ++j) {
         thread const auto& frag = mma_op.Ctile.frag_at(i, j);
@@ -526,7 +537,9 @@ dsa_indexer_score(
         const T value = future ? static_cast<T>(-INFINITY)
             : pooled_masked  ? pooled_sentinel
                              : static_cast<T>(accum[ai]);
-        Dst[out_base + e] = value;
+        if (row < M && col < N) {
+          Dst[out_base + e] = value;
+        }
         ai++;
       }
     }

@@ -493,6 +493,35 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     assert studio["capacity_bytes"] < 223 * gib
 
 
+def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monkeypatch):
+    """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
+
+    gib = 1024**3
+    asked = {}
+    monkeypatch.setattr(
+        "omlx.cluster.node_role._enforcer_ceiling_bytes",
+        lambda: 100 * gib,
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh, *, python_executable: (
+            asked.update(ssh=ssh, python=python_executable) or 64 * gib
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "headless"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert asked == {"ssh": "studio.local", "python": None}
+
+
 def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     called = []
     monkeypatch.setattr(

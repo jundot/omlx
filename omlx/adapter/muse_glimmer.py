@@ -266,7 +266,11 @@ def _extract_tool_calls(
     scanned, so ATEM examples the model may quote inside reasoning are never
     parsed as calls. The first generated message has no leading
     ``<|start|>assistant`` (the generation prompt supplied it), so one is
-    prepended before matching.
+    prepended before matching. The header regex allows ``\\s*`` rather than
+    ``\\s+`` because the streaming detokenizer strips the leading space off
+    the first segment: a turn that opens directly with a tool call (common
+    right after a tool-error result) arrives as ``to=bash...``, and the
+    prepend then yields ``assistantto=bash...``.
     """
     schemas = _tool_param_schemas(tools)
     tool_calls: list[dict[str, str]] = []
@@ -274,7 +278,7 @@ def _extract_tool_calls(
     search_text = _MUSE_START + "assistant" + raw_text
     message_re = re.compile(
         re.escape(_MUSE_START)
-        + r"assistant\s+to=([^\s<]+)\s*"
+        + r"assistant\s*to=([^\s<]+)\s*"
         + re.escape(_MUSE_MESSAGE)
         + r"(.*?)(?:"
         + re.escape(_MUSE_EOM)

@@ -81,6 +81,29 @@ def _first_seen_host_guidance(message: str) -> Guidance | None:
 # Ordered: the first pattern that matches wins, so put specific before general.
 _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
     (
+        # Must precede the "not installed" rule below: a runtime we could not
+        # reach is not a runtime we know to be absent (#2680).
+        re.compile(
+            r"worker runtime could not be (?:verified|run|checked)",
+            re.I,
+        ),
+        Guidance(
+            "The device is online but its worker runtime could not be checked",
+            "SSH and hardware discovery succeeded and oMLX was found on the "
+            "device, but nothing there could load the worker, so its runtime "
+            "state is unknown rather than confirmed missing.",
+            (
+                "Open oMLX once on the named device — starting it publishes the "
+                "helper (~/.omlx/bin/omlx-cluster-python) this Mac looks for.",
+                "If the device runs oMLX from a pip or source install, start its "
+                "oMLX server once so the same helper is written.",
+                "Then return here and press Start again; oMLX re-checks the "
+                "runtime, memory, and links automatically.",
+            ),
+            "worker-runtime",
+        ),
+    ),
+    (
         re.compile(r"oMLX worker runtime is not installed", re.I),
         Guidance(
             "The device is online but its worker runtime is missing",
@@ -91,6 +114,25 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "the coordinator.",
                 "Return here and press Start again; oMLX will re-check the "
                 "runtime, memory, and links automatically.",
+            ),
+            "worker-runtime",
+        ),
+    ),
+    (
+        # Before the generic version rule below, which would otherwise claim
+        # the oMLX release differs when it is the interpreter that does (#2695).
+        re.compile(r"python local=\S+ remote=", re.I),
+        Guidance(
+            "The two Macs are running different Python versions",
+            "MLX ships a separate build for each Python version, so ranks on "
+            "different ones load different binaries and can disagree in ways "
+            "that produce wrong output rather than a clean error.",
+            (
+                "Run both Macs from the same oMLX install shape — either the "
+                "packaged app on both, or the same Python version on both.",
+                "If one Mac runs oMLX from source, recreate its environment on "
+                "the Python version the other Mac reports, then reinstall.",
+                "Re-run Set up cluster afterwards to confirm.",
             ),
             "worker-runtime",
         ),

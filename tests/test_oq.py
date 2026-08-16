@@ -28,6 +28,7 @@ from omlx.oq import (
     OQ_LEVELS,
     OQImatrixCollector,
     OQImatrixEntry,
+    _affine_perturb_group_size,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
@@ -3690,6 +3691,40 @@ class TestPerturbBitsFor:
         assert _perturb_bits_for(2) is None
 
 
+class TestAffinePerturbGroupSize:
+    """The perturbation re-quant is always affine, which ships only 32/64/128."""
+
+    @pytest.mark.parametrize("gs", [32, 64, 128])
+    def test_supported_group_sizes_are_kept(self, gs):
+        # A module quantized at gs always has in_dim % gs == 0, so the
+        # perturbation of every affine/mxfp4/mxfp8 source is byte-identical
+        # to what it was before the nvfp4 clamp existed.
+        assert _affine_perturb_group_size(gs, 4096) == gs
+
+    def test_nvfp4_group_16_clamps_to_nearest_supported(self):
+        # nvfp4 is the only MLX mode with group_size=16; 32 is both the
+        # nearest supported size and the finest, so it adds the least
+        # grouping error on top of the bit-width reduction being measured.
+        assert _affine_perturb_group_size(16, 4096) == 32
+
+    def test_unsupported_sizes_pick_the_nearest_divisor(self):
+        assert _affine_perturb_group_size(8, 1024) == 32
+        assert _affine_perturb_group_size(256, 1024) == 128
+        # 96 is equidistant from 64 and 128; the smaller (finer) size wins.
+        assert _affine_perturb_group_size(96, 1024) == 64
+
+    def test_own_size_wins_over_a_closer_but_indivisible_one(self):
+        # 192 is not a multiple of 128, so a gs=64 module keeps 64 rather
+        # than being pushed to a size that cannot quantize its rows.
+        assert _affine_perturb_group_size(64, 192) == 64
+
+    def test_none_when_no_supported_size_divides_the_row(self):
+        # in_dim % 16 == 0 but in_dim % 32 != 0: reachable for an nvfp4
+        # module, and re-quantizing it at any affine size would raise.
+        assert _affine_perturb_group_size(16, 48) is None
+        assert _affine_perturb_group_size(16, 112) is None
+
+
 class TestShouldQuantizeTensorWeightGuard:
     def test_non_weight_2d_params_not_quantized(self):
         assert not _should_quantize_tensor("model.layers.0.attn_hc.fn", (24, 16384))
@@ -4933,6 +4968,136 @@ class TestMeasureSensitivityQuantizedVlm:
         assert vlm_load.call_args.kwargs["trust_remote_code"] is True
         tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
         lm_load.assert_not_called()
+
+
+def _toy_quantized_model(hidden, group_size, bits, mode, seed=11):
+    """One-block model whose single Linear is quantized in ``mode``.
+
+    Returns (model, proj) so the test can inspect the module the perturbation
+    loop mutates. Defined inside the function so the file still imports
+    without MLX.
+    """
+
+    class _Block(nn.Module):
+        def __init__(self, proj):
+            super().__init__()
+            self.proj = proj
+
+        def __call__(self, x, mask=None, cache=None, position_ids=None):
+            return x + self.proj(x)
+
+    class _Inner(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(64, hidden)
+            self.layers = layers
+
+    class _Toy(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.model = _Inner(layers)
+
+    # Explicit key rather than mx.random.seed: no global RNG state to leak
+    # into whichever test runs next.
+    weight = mx.random.normal((hidden, hidden), key=mx.random.key(seed)).astype(
+        mx.bfloat16
+    )
+    proj = nn.QuantizedLinear(
+        hidden, hidden, bias=False, group_size=group_size, bits=bits, mode=mode
+    )
+    packed = mx.quantize(weight, group_size=group_size, bits=bits, mode=mode)
+    proj.weight, proj.scales = packed[0], packed[1]
+    proj.biases = packed[2] if len(packed) > 2 else None
+    mx.eval(proj.weight, proj.scales)
+    return _Toy([_Block(proj)]), proj
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestMeasureSensitivityQuantizedGroupSize:
+    """The perturbation loop re-quantizes with mode="affine", whose kernels
+    only implement group sizes 32/64/128. nvfp4 source modules carry
+    group_size=16, so reusing the module's own size raised ValueError out of
+    mx.quantize and killed the whole quantization job (issue 2354).
+    """
+
+    def _measure(self, monkeypatch, model):
+        from omlx import oq as oq_mod
+
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.utils.model_loading",
+            MagicMock(
+                maybe_apply_pre_load_patches=MagicMock(),
+                _has_mtp_heads=MagicMock(return_value=False),
+                _checkpoint_has_mtp_weights=MagicMock(return_value=False),
+                lm_load_compat=MagicMock(return_value=(model, MagicMock())),
+            ),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(apply_mlx_lm_mtp_patch=MagicMock(return_value=False)),
+        )
+        monkeypatch.setattr(
+            oq_mod,
+            "_load_calibration_data",
+            MagicMock(return_value=mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])),
+        )
+        return oq_mod._measure_sensitivity_from_quantized_model("/fake/proxy", {}, 4)
+
+    def test_nvfp4_source_is_measured_and_restored(self, monkeypatch):
+        model, proj = _toy_quantized_model(64, 16, 4, "nvfp4")
+        weight_before, scales_before = proj.weight, proj.scales
+
+        result = self._measure(monkeypatch, model)
+
+        # A score at all means mx.quantize accepted the perturbation *and*
+        # the perturbed forward ran: _forward_layer_result swallows ValueError,
+        # so a module left claiming group_size=16 with affine weights would
+        # drop the layer from the map instead of raising.
+        assert set(result) == {0}
+        assert result[0] > 0
+        # Every quantization attribute is back on the source module, or the
+        # next layer's baseline forward would run on a perturbed one.
+        assert (proj.group_size, proj.bits, proj.mode) == (16, 4, "nvfp4")
+        assert mx.array_equal(proj.weight, weight_before)
+        assert mx.array_equal(proj.scales, scales_before)
+        # nvfp4 has no zero point; the affine perturbation's biases must not
+        # survive the restore.
+        assert proj.get("biases") is None
+
+    @pytest.mark.parametrize("group_size", [32, 64])
+    def test_affine_source_behaviour_is_unchanged(self, monkeypatch, group_size):
+        model, proj = _toy_quantized_model(128, group_size, 8, "affine")
+        weight_before, scales_before, biases_before = (
+            proj.weight,
+            proj.scales,
+            proj.biases,
+        )
+
+        result = self._measure(monkeypatch, model)
+
+        assert set(result) == {0}
+        assert result[0] > 0
+        assert (proj.group_size, proj.bits, proj.mode) == (group_size, 8, "affine")
+        assert mx.array_equal(proj.weight, weight_before)
+        assert mx.array_equal(proj.scales, scales_before)
+        assert mx.array_equal(proj.biases, biases_before)
+
+    def test_row_no_affine_group_size_divides_is_skipped(self, monkeypatch):
+        # 48 is a legal nvfp4 row (48 % 16 == 0) but no affine group size
+        # divides it, so clamping alone would trade one mx.quantize ValueError
+        # for another ("last dimension ... divisible by 32"). The module is
+        # left alone instead, which shows up as a zero score for the layer.
+        model, proj = _toy_quantized_model(48, 16, 4, "nvfp4")
+        weight_before = proj.weight
+
+        result = self._measure(monkeypatch, model)
+
+        assert set(result) == {0}
+        assert result[0] == 0.0
+        assert (proj.group_size, proj.bits, proj.mode) == (16, 4, "nvfp4")
+        assert mx.array_equal(proj.weight, weight_before)
 
 
 # =============================================================================

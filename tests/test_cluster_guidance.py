@@ -15,6 +15,18 @@ def test_missing_worker_runtime_is_explained_as_online_setup():
     assert "SSH and hardware discovery succeeded" in guidance.explanation
 
 
+def test_unverifiable_runtime_is_not_reported_as_a_missing_one():
+    """#2680: a probe that could not run is not proof the runtime is absent."""
+
+    unverified = explain("studio is online, but oMLX worker runtime could not be verified.")
+    missing = explain("studio is online, but oMLX worker runtime is not installed.")
+
+    assert unverified.title != missing.title
+    assert "could not be checked" in unverified.title
+    assert "install" not in unverified.title.lower()
+    assert any("open omlx once" in step.lower() for step in unverified.steps)
+
+
 @pytest.mark.parametrize(
     ("message", "expected_in_title"),
     [

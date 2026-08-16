@@ -57,6 +57,9 @@ class BaseBenchmark(ABC):
 
     name: str = ""
     quick_size: int = 100
+    # Full dataset size, recorded by load_dataset before sampling. Uploaded to
+    # omlx.ai so "300 of 14,042" reads correctly on the community leaderboard.
+    dataset_total: Optional[int] = None
 
     @abstractmethod
     async def load_dataset(self, sample_size: int = 0) -> list[dict]:
@@ -174,7 +177,13 @@ class BaseBenchmark(ABC):
 
     @staticmethod
     def _strip_think_tags(text: str) -> str:
-        """Remove <think>...</think> blocks from model output."""
+        """Remove completed thinking spans from model output."""
+        # Some chat templates open <think> in the prompt, so non-streaming
+        # generation contains only ``reasoning</think>answer``.  Handle that
+        # shape before the complete-block regex so reasoning drafts cannot
+        # leak into answer extraction.
+        if "<think>" not in text and "</think>" in text:
+            return text.split("</think>", 1)[1].strip()
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     def _classify_response(

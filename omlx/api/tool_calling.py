@@ -100,6 +100,19 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     coerced to "{}" here so we never hand the client a non-JSON value that
     the next turn's template would crash on.
     """
+    # `json.dumps` recurses per nesting level just as the decoders do, and it
+    # runs after a value has already decoded successfully, from a deeper stack
+    # frame. A value nested just under the limit at decode time can therefore
+    # breach it here (#2545, found by DiscoStew6082 at depth ~987 on 3.11).
+    #
+    # A breach is deliberately NOT coerced to "{}" like a non-object value is.
+    # The two are different failures: a non-object is a parser quirk we can
+    # safely normalize, whereas failing to serialize means we HAVE the
+    # arguments and cannot render them. Returning "{}" there would hand back a
+    # runnable tool call with its arguments silently removed, so `write_file`
+    # would still fire with nothing to write. Let it raise instead, so
+    # `_build_tool_call` drops that one call with a warning, which is what the
+    # issue asks for (jundot's review on #2593).
     if isinstance(arguments, dict):
         return json.dumps(arguments, ensure_ascii=False)
     # mlx-vlm / mlx-lm gemma4 parser returns a JSON-object string per the
@@ -108,6 +121,14 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
         try:
             parsed = json.loads(arguments)
         except (json.JSONDecodeError, ValueError):
+            # Deep-nest errors are deliberately NOT caught here. Catching them
+            # sends a value we failed to decode into the "{}" coercion below,
+            # which is the same silent argument loss as the dict branch above:
+            # the parser handed us real arguments and we would return a
+            # runnable call without them. Letting it propagate reaches
+            # `_build_tool_call`, which drops that one call. Malformed JSON
+            # still coerces, since that is a parser quirk rather than lost
+            # data. (DiscoStew6082 caught this branch on #2593.)
             parsed = None
         if isinstance(parsed, dict):
             return json.dumps(parsed, ensure_ascii=False)
@@ -118,6 +139,38 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
         arguments,
     )
     return "{}"
+
+
+def _build_tool_call(name: str, arguments: Any) -> Optional[ToolCall]:
+    """Build a ToolCall, dropping this one call if validation cannot finish.
+
+    ``FunctionCall`` re-parses the arguments string while validating it, which
+    is a *third* decode of a value the parser already decoded and serialized,
+    and it runs from a deeper stack frame than either (#2545).  Recursion
+    limits are about remaining stack rather than input depth, so a value that
+    was fine at both earlier steps can still breach the limit here.
+
+    Validation failure has to drop this one call and leave the rest of the
+    batch alone, the same way an unparseable match does, rather than escape
+    the parse chain.
+    """
+    try:
+        return ToolCall(
+            id=f"call_{uuid.uuid4().hex[:8]}",
+            type="function",
+            function=FunctionCall(
+                name=name,
+                arguments=_serialize_tool_call_arguments(arguments),
+            ),
+        )
+    except (TypeError, ValueError, *_DEEP_NEST_ERRORS) as exc:
+        logger.warning(
+            "Dropping tool call %.80r: arguments failed validation (%s: %s)",
+            name,
+            type(exc).__name__,
+            exc,
+        )
+        return None
 
 
 @dataclass(frozen=True)
@@ -198,7 +251,7 @@ def _repair_json_value(val: str) -> Optional[Any]:
         out.append(stack.pop())
     try:
         return json.loads("".join(out), strict=False)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
         return None
 
 
@@ -216,7 +269,7 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
         # Undeclared param, union type list, or anyOf: legacy behavior.
         try:
             return json.loads(val)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
     if val.strip().lower() == "null":
         return None
@@ -231,7 +284,7 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
         if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
             try:
                 decoded = json.loads(stripped)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
                 decoded = None
             if isinstance(decoded, str):
                 return decoded
@@ -253,13 +306,13 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             pass
     try:
         return json.loads(val, strict=False)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
         pass
     try:
         literal = ast.literal_eval(val)
         if isinstance(literal, (dict, list, tuple)):
             return list(literal) if isinstance(literal, tuple) else literal
-    except (ValueError, SyntaxError, TypeError, MemoryError):
+    except (ValueError, SyntaxError, TypeError, MemoryError, *_DEEP_NEST_ERRORS):
         pass
     if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
         repaired = _repair_json_value(val)
@@ -286,6 +339,18 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
 # tolerance already used when parsing tool-call JSON elsewhere in this module,
 # so boundary detection never rejects a payload the parser would have accepted.
 _TOOL_CALL_JSON_DECODER = json.JSONDecoder(strict=False)
+
+# Deeply nested model output breaks the decoders in a version-dependent way:
+# `json.loads` raises RecursionError on some Python versions and a plain
+# JSONDecodeError on others, while `ast.literal_eval`/`ast.parse` raise
+# SyntaxError or RecursionError depending on where the compiler gives up.
+# Neither RecursionError nor SyntaxError is a ValueError, so both slip past
+# excepts written for decode errors and escape the parse chain (#2545).
+# Model output is untrusted and attacker-influenceable, so a breach has to be
+# a clean parse failure on the existing drop path, never a raised exception.
+# Added to every decode-site except in this module rather than relying on the
+# bounds, because only some of these paths are bounded.
+_DEEP_NEST_ERRORS = (RecursionError, SyntaxError)
 
 # Boundary detection is a hint, not the real parse, so it is cheap to bound.
 # Same rationale as _GEMMA4_MAX_ARGS_LEN below: model output is untrusted and
@@ -318,7 +383,7 @@ def _json_value_end(text: str, start: int) -> Optional[int]:
         return None
     try:
         _, end = _TOOL_CALL_JSON_DECODER.raw_decode(text, idx)
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, *_DEEP_NEST_ERRORS):
         return None
     return end
 
@@ -539,18 +604,11 @@ def _parse_xml_tool_calls(
             parsed = json.loads(content, strict=False)
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=name,
-                        arguments=_serialize_tool_call_arguments(arguments),
-                    ),
-                )
-            )
+            _built = _build_tool_call(name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
             continue
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
             pass
 
         # Qwen/Llama format: <function=name><parameter=key>value</parameter></function>
@@ -566,16 +624,9 @@ def _parse_xml_tool_calls(
             arguments = {}
             for key, val in _iter_xml_parameters(params_text):
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
             continue
 
         # GLM XML format: func_name<arg_key>k</arg_key><arg_value>v</arg_value>...
@@ -593,16 +644,9 @@ def _parse_xml_tool_calls(
             arguments = {}
             for k, v in zip(arg_keys, arg_values):
                 arguments[k] = _coerce_param_value(v, k, props, func_name)
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
 
     if not tool_calls:
         return text, None
@@ -649,16 +693,9 @@ def _parse_namespaced_tool_calls(
                 key = pm.group(1)
                 val = pm.group(2).strip()
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
-                    ),
-                )
-            )
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
 
     if not tool_calls:
         return text, None
@@ -695,18 +732,11 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
             if name:
-                tool_calls.append(
-                    ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
-                        type="function",
-                        function=FunctionCall(
-                            name=name,
-                            arguments=_serialize_tool_call_arguments(arguments),
-                        ),
-                    )
-                )
+                _built = _build_tool_call(name, arguments)
+                if _built is not None:
+                    tool_calls.append(_built)
                 continue
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
             pass
 
         # Hermes bracket format: [func_name(arg1=val1), other_tool(arg2=val2)]
@@ -714,7 +744,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         # strings or nested lists/dicts do not split calls incorrectly.
         try:
             parsed_expr = ast.parse(content, mode="eval").body
-        except SyntaxError:
+        except (SyntaxError, *_DEEP_NEST_ERRORS):
             parsed_expr = None
 
         calls = parsed_expr.elts if isinstance(parsed_expr, ast.List) else [parsed_expr]
@@ -725,29 +755,45 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             if isinstance(call.func, ast.Name):
                 func_name = call.func.id
             elif isinstance(call.func, ast.Attribute):
-                func_name = ast.unparse(call.func)
+                try:
+                    func_name = ast.unparse(call.func)
+                except _DEEP_NEST_ERRORS:
+                    continue
             else:
                 continue
 
             arguments = {}
+            unrepresentable = False
             for kw in call.keywords:
                 if kw.arg is None:
                     continue
                 try:
                     arguments[kw.arg] = ast.literal_eval(kw.value)
-                except (ValueError, SyntaxError):
-                    arguments[kw.arg] = ast.unparse(kw.value)
+                except (ValueError, SyntaxError, *_DEEP_NEST_ERRORS):
+                    # Fall back to the source text. `ast.unparse` walks the
+                    # tree recursively, so an expression `ast.parse` built
+                    # successfully can still breach the limit being rendered
+                    # back out, from a deeper frame (#2545). An argument we
+                    # cannot represent drops the whole call rather than
+                    # yielding one that is missing it.
+                    try:
+                        arguments[kw.arg] = ast.unparse(kw.value)
+                    except _DEEP_NEST_ERRORS:
+                        unrepresentable = True
+                        break
 
-            tool_calls.append(
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=func_name,
-                        arguments=json.dumps(arguments, ensure_ascii=False),
-                    ),
+            if unrepresentable:
+                logger.warning(
+                    "Dropping tool call %.80r: argument %.40r could not be "
+                    "represented (nested too deeply)",
+                    func_name,
+                    kw.arg,
                 )
-            )
+                continue
+
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
 
     if not tool_calls:
         return text, None
@@ -780,18 +826,21 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         args_str = match.group(2)
         try:
             arguments = json.loads(args_str)
+        except _DEEP_NEST_ERRORS as exc:
+            logger.warning(
+                "Dropping bracket tool call %.80r: arguments nested too deeply "
+                "to decode (%s: %s)",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            matched_spans.append(match.span())
+            continue
         except (json.JSONDecodeError, ValueError):
             arguments = {"raw": args_str}
-        tool_calls.append(
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name,
-                    arguments=json.dumps(arguments, ensure_ascii=False),
-                ),
-            )
-        )
+        _built = _build_tool_call(name, arguments)
+        if _built is not None:
+            tool_calls.append(_built)
         matched_spans.append(match.span())
 
     # Match without args (model-generated simplified form)
@@ -1019,12 +1068,27 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
         # these bounds and would parse the input anyway, defeating the DoS
         # guard, so it must NOT see oversized/deeply-nested args.
         raise
+    except _DEEP_NEST_ERRORS as exc:
+        # Nesting deep enough to break a decoder is a bound breach in all but
+        # name, so it takes the reject-hard path above rather than the legacy
+        # retry below (#2545).  Falling through would hand the very input the
+        # bounds exist to stop to the parser that ignores them.
+        raise _Gemma4ArgsTooComplexError(
+            "Gemma 4 args nested too deeply to decode"
+        ) from exc
     except (ValueError, json.JSONDecodeError):
         # The legacy path's NUL-placeholder forge vector is reintroduced
         # ONLY for ambiguous input the strict transcoder could not parse
         # (e.g. bare multi-comma markdown values, #1837); the common path
         # keeps the transcoder's no-placeholder, injection-safe guarantee.
-        return _gemma4_args_to_json_legacy(args_str)
+        try:
+            return _gemma4_args_to_json_legacy(args_str)
+        except _DEEP_NEST_ERRORS as exc:
+            # The legacy parser is deliberately unbounded, so it is the one
+            # place a deep payload can still reach a raw decoder.
+            raise _Gemma4ArgsTooComplexError(
+                "Gemma 4 args nested too deeply to decode"
+            ) from exc
 
 
 def _gemma4_transcode_to_json(args_str: str) -> dict:
@@ -1216,7 +1280,7 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 try:
                     json.loads(value)  # already a valid scalar (number, ...)
                     out.append(value)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
                     out.append(json.dumps(value))
             expect = "delim"
         else:  # expect == "delim"
@@ -1285,7 +1349,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     # 4. Try json.loads — works when all values are already valid JSON primitives
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
     # 5. Quote bare string values that are not numbers, booleans, or null
@@ -1297,7 +1361,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
         try:
             json.loads(value)
             return f": {value}{suffix}"
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return f": {json.dumps(value)}{suffix}"
 
     # Keep the pre-step-5 text: if step 5 fails, its partial quoting has
@@ -1308,7 +1372,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     )
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
     # 6. Last resort: key-anchored value capture. Bare values that
@@ -1337,7 +1401,7 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
             raw_value = raw_value.rstrip().rstrip(",").rstrip()
         try:
             result[km.group(1)] = json.loads(raw_value)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             result[km.group(1)] = raw_value
     return result
 
@@ -1533,16 +1597,9 @@ def _parse_tool_calls_impl(
                     for p in items:
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
-                        tool_calls.append(
-                            ToolCall(
-                                id=f"call_{uuid.uuid4().hex[:8]}",
-                                type="function",
-                                function=FunctionCall(
-                                    name=name,
-                                    arguments=_serialize_tool_call_arguments(arguments),
-                                ),
-                            )
-                        )
+                        _built = _build_tool_call(name, arguments)
+                        if _built is not None:
+                            tool_calls.append(_built)
                 except (
                     ValueError,
                     json.JSONDecodeError,
@@ -1550,6 +1607,11 @@ def _parse_tool_calls_impl(
                     KeyError,
                     SyntaxError,
                     TypeError,
+                    # The parser is third-party code that decodes internally
+                    # (glm47, kimi_k2 and qwen3_coder all call json.loads), so
+                    # deep nesting surfaces here rather than at a decode site
+                    # in this module (#2545).
+                    *_DEEP_NEST_ERRORS,
                 ) as primary_err:
                     # Gemma 4 only: try robust fallback that handles bare
                     # string values and colons in function names.
@@ -1565,18 +1627,9 @@ def _parse_tool_calls_impl(
                             for p in items:
                                 name = p.get("name", "")
                                 arguments = p.get("arguments", {})
-                                tool_calls.append(
-                                    ToolCall(
-                                        id=f"call_{uuid.uuid4().hex[:8]}",
-                                        type="function",
-                                        function=FunctionCall(
-                                            name=name,
-                                            arguments=_serialize_tool_call_arguments(
-                                                arguments
-                                            ),
-                                        ),
-                                    )
-                                )
+                                _built = _build_tool_call(name, arguments)
+                                if _built is not None:
+                                    tool_calls.append(_built)
                             gemma4_handled = True
                         except (
                             ValueError,
@@ -1688,7 +1741,10 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     if not text:
         return ""
 
-    stream_filter = ToolCallStreamFilter(tokenizer)
+    # Every caller sanitizes thinking-channel text; keep it byte-identical
+    # with the streamed reasoning deltas, which do not consume DeepSeek
+    # V4's separator either.
+    stream_filter = ToolCallStreamFilter(tokenizer, consume_dsml_separator=False)
     cleaned = stream_filter.feed(text)
     cleaned += stream_filter.finish()
     return cleaned.strip()
@@ -1816,9 +1872,15 @@ class ToolCallStreamFilter:
     Args:
         tokenizer: The model's tokenizer. Uses tokenizer-defined
             ``tool_call_start`` when available.
+        consume_dsml_separator: Treat DeepSeek V4's ``"\n\n"`` separator as
+            part of the DSML tool-call envelope, matching the reference
+            decoder's stop token. Disable for filters watching a channel
+            that never contains a separator-prefixed tool-call block (the
+            thinking channel), where holding trailing newlines would flush
+            them only after the channel closed.
     """
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, *, consume_dsml_separator: bool = True):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
         # Normalize None-like values but preserve empty strings.
@@ -1839,6 +1901,16 @@ class ToolCallStreamFilter:
                 # One-sided markers (e.g. Mistral "[TOOL_CALLS]" with no
                 # end marker): suppress everything after the start marker.
                 self._suppress_after_markers.append(marker)
+        # DeepSeek V4's reference decoder consumes "\n\n<｜DSML｜tool_calls"
+        # as one literal stop token, so the separator belongs to the envelope,
+        # not to content. Register the separator-inclusive variant so the
+        # earliest-match rule consumes it when present; the bare pair stays as
+        # fallback for emissions that omit the separator.
+        is_dsml_tool_marker = (
+            marker == "<｜DSML｜tool_calls>" and marker_end == "</｜DSML｜tool_calls>"
+        )
+        if is_dsml_tool_marker and consume_dsml_separator:
+            self._marker_pairs.insert(0, ("\n\n" + marker, marker_end))
         # Gemma 4 can emit a bare close token outside a matched tool-call
         # envelope. Do not apply this to XML-style closers like </tool_call>,
         # which may appear as literal prose.
@@ -2269,6 +2341,11 @@ class ToolCallStreamFilter:
                 # bracket at end-of-stream is much more likely to be literal
                 # prose than an incomplete MiniMax control marker.
                 if tail == "]":
+                    continue
+                # Newline-only tails are held back only because of the
+                # separator-inclusive DeepSeek V4 marker; at end-of-stream
+                # with no envelope following they are literal content.
+                if not tail.strip("\n"):
                     continue
                 return True
 
@@ -2744,7 +2821,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     # Strategy 1: Try to parse entire text as JSON
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
     # Strategy 2: Extract from markdown code blocks
@@ -2754,7 +2831,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     for match in matches:
         try:
             return json.loads(match.strip())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
             continue
 
     # Strategy 3: Find JSON object or array in text
@@ -2768,7 +2845,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         if match:
             try:
                 return json.loads(match.group(1))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
                 continue
 
     return None

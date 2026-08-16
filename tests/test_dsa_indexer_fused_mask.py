@@ -36,12 +36,57 @@ def _bit_equal(a, b):
 
 
 @pytest.mark.parametrize(
+    "L,P,dtype",
+    [
+        (1, 513, mx.bfloat16),
+        (63, 575, mx.bfloat16),
+        (65, 577, mx.bfloat16),
+        (127, 639, mx.bfloat16),
+        (65, 577, mx.float16),
+    ],
+)
+def test_unaligned_tail_matches_zero_padded_reference(L, P, dtype):
+    """Partial M/N tiles must match the old aligned kernel domain exactly."""
+    mx.random.seed(19)
+    H, D = 64, 128
+    q = mx.random.normal((1, H, L, D)).astype(dtype)
+    pooled = mx.random.normal((1, 1, P, D)).astype(dtype)
+    weights = mx.random.normal((1, L, H)).astype(dtype)
+
+    actual = glm_fast.dsa_indexer_scores(q, pooled, weights, causal=False)
+
+    padded_l = ((L + 63) // 64) * 64
+    padded_p = ((P + 63) // 64) * 64
+    padded_q = mx.pad(q, ((0, 0), (0, 0), (0, padded_l - L), (0, 0)))
+    padded_pool = mx.pad(
+        pooled,
+        ((0, 0), (0, 0), (0, padded_p - P), (0, 0)),
+    )
+    padded_weights = mx.pad(weights, ((0, 0), (0, padded_l - L), (0, 0)))
+    reference = glm_fast.dsa_indexer_scores(
+        padded_q,
+        padded_pool,
+        padded_weights,
+        causal=False,
+    )[:, :, :L, :P]
+
+    assert actual.shape == (1, 1, L, P)
+    assert _bit_equal(actual, reference)
+
+    indices = glm_fast.dsa_topk_indices(actual, 512, bucketed=False)
+    mx.eval(indices)
+    assert indices.shape == (1, 1, L, 512)
+    assert bool(mx.all(indices < P).item())
+
+
+@pytest.mark.parametrize(
     "L,P,ratio,q_offset,dtype",
     [
         (128, 1088, 4, 256, mx.bfloat16),   # offset > 0
         (64, 2048, 4, 0, mx.bfloat16),      # offset 0
         (128, 2560, 128, 1024, mx.bfloat16),  # ratio-128 style
         (128, 1088, 4, 256, mx.float16),    # fp16
+        (65, 577, 4, 256, mx.bfloat16),     # partial M/N tiles
     ],
 )
 def test_fused_mask_bit_identical(L, P, ratio, q_offset, dtype):

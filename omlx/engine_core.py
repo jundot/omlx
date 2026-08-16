@@ -688,23 +688,47 @@ class EngineCore:
 
         return result
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine.
 
         Sends error output to all active collectors and marks requests
         for deferred abort in the scheduler. Cleanup is handled by
-        the consumer (stream_outputs/generate).
+        the consumer (stream_outputs/generate). Without an explicit reason,
+        preserve the memory-pressure error used by the process enforcer.
         """
         from .utils.proc_memory import get_phys_footprint
 
-        request_ids = list(self._output_collectors.keys())
+        # Only abort requests not already finished or pending abort. The
+        # enforcer calls this once per poll (1s) while pressure persists; a
+        # deferred abort can take many seconds to drain (it executes at the
+        # next step()/chunk boundary), so without this filter the same
+        # request is re-aborted every poll: duplicate [Error: ...] frames
+        # reach streaming clients and the returned count reports stale
+        # aborts as fresh progress, hiding a stuck scheduler from the
+        # enforcer's escalation logic.
+        pending_aborts: set[str] = set()
+        sched_for_filter = self.scheduler
+        if sched_for_filter is not None:
+            pending_aborts = set(
+                getattr(sched_for_filter, "_pending_abort_ids", None) or ()
+            )
+        request_ids = [
+            rid
+            for rid in self._output_collectors
+            if rid not in self._finished_at and rid not in pending_aborts
+        ]
         ceiling = 0
         watermark = 0
         sched = self.scheduler
-        if sched is not None:
+        if reason is None and sched is not None:
             ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
             watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
-        usage = get_phys_footprint()
+        usage = get_phys_footprint() if reason is None else 0
         usage_gb = usage / (1024**3)
         ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
         watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
@@ -713,16 +737,19 @@ class EngineCore:
         # `aggressive` with nothing to try (#2362); the ladder points at the
         # constraint that is really binding, or falls back to the same
         # generic advice when the enforcer has not propagated a breakdown.
-        binding, advice = describe_ceiling_binding(
-            static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
-            dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
-            metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
-            tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
-            current=usage,
-            fmt=format_bytes,
-            tail="reduce context length",
-        )
-        advice = f"{advice}."
+        binding = "effective"
+        advice = ""
+        if reason is None:
+            binding, advice = describe_ceiling_binding(
+                static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
+                dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
+                metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
+                tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
+                current=usage,
+                fmt=format_bytes,
+                tail="reduce context length",
+            )
+            advice = f"{advice}."
         ceiling_label = f"{binding} ceiling" if binding != "effective" else "ceiling"
         for rid in request_ids:
             self.scheduler.abort_request(rid)
@@ -730,7 +757,9 @@ class EngineCore:
             if collector is not None:
                 # Name the watermark that actually tripped; printing only the
                 # ceiling reads as "usage below limit yet aborted" (#2321).
-                if watermark > 0 and ceiling > 0:
+                if reason is not None:
+                    error_msg = reason
+                elif watermark > 0 and ceiling > 0:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB, abort threshold "
@@ -764,22 +793,29 @@ class EngineCore:
                         # client got a truncated read plus a 500 traceback
                         # instead of the same actionable 400 the pre-flight
                         # guard returns.
-                        error_code="prefill_memory_aborted",
+                        error_code=error_code or "prefill_memory_aborted",
                         error_metadata={
                             "request_id": rid,
                             # Only the limit is reported: the exception's
                             # estimated_bytes means "predicted peak", and this
                             # abort fires on measured usage, which the message
                             # already states.
-                            "limit_bytes": watermark or ceiling or None,
+                            "limit_bytes": (
+                                watermark or ceiling or None
+                                if reason is None
+                                else None
+                            ),
                         },
                     )
                 )
             self._mark_request_finished(rid)
         if request_ids:
-            logger.warning(
-                f"Aborted {len(request_ids)} requests due to memory pressure"
-            )
+            if reason is None:
+                logger.warning(
+                    f"Aborted {len(request_ids)} requests due to memory pressure"
+                )
+            else:
+                logger.warning("Aborted %d requests: %s", len(request_ids), reason)
             self._wake_engine_loop()
         return len(request_ids)
 
@@ -1311,12 +1347,17 @@ class AsyncEngineCore:
             return False
         return await engine.abort_request(request_id)
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         engine = getattr(self, "engine", None)
         if engine is None:
             return 0
-        return await engine.abort_all_requests()
+        return await engine.abort_all_requests(reason=reason, error_code=error_code)
 
     async def stream_outputs(
         self,

@@ -60,7 +60,7 @@ Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), dr
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install jundot/omlx/omlx
 
 # Upgrade to the latest version
 brew update && brew upgrade omlx
@@ -75,7 +75,7 @@ omlx start
 Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
 
 ```bash
-brew install omlx --HEAD --with-custom-kernel
+brew install jundot/omlx/omlx --HEAD --with-custom-kernel
 ```
 
 ### From Source
@@ -100,7 +100,7 @@ Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/
 > uses more memory (#2137). Building them requires the Metal toolchain, which
 > Command Line Tools alone do not provide (`xcrun: error: unable to find utility
 > "metal"`): install full Xcode, or use the official DMG which ships the kernels
-> precompiled. Homebrew can build them with `brew install omlx --HEAD
+> precompiled. Homebrew can build them with `brew install jundot/omlx/omlx --HEAD
 > --with-custom-kernel`, but that build also needs full Xcode. To verify your
 > install:
 >

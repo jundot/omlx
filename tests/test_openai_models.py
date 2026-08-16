@@ -539,6 +539,23 @@ class TestChatCompletionRequest:
 
         assert req.reasoning_effort == "xhigh"
 
+    def test_reasoning_effort_accepts_numbers(self):
+        """Numeric effort (Inkling 0.1-0.99) must survive validation as-is."""
+        req_float = ChatCompletionRequest(
+            model="Inkling-Small",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort=0.9,
+        )
+        assert req_float.reasoning_effort == 0.9
+        assert isinstance(req_float.reasoning_effort, float)
+
+        req_int = ChatCompletionRequest(
+            model="Inkling-Small",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort=1,
+        )
+        assert req_int.reasoning_effort == 1
+
 
 class TestChatCompletionResponse:
     """Tests for ChatCompletionResponse model."""

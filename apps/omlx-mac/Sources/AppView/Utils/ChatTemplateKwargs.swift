@@ -11,7 +11,7 @@
 // as a flat list of entries, each one of three kinds:
 //
 //   • enable_thinking   — bool, dropdown true/false
-//   • reasoning_effort  — string, dropdown low/medium/high/max
+//   • reasoning_effort  — common string presets or a custom typed value
 //   • custom            — free-form key + value with light auto-coercion
 //                         ("true"/"false" → Bool, numeric strings → Number,
 //                         otherwise string)
@@ -37,6 +37,9 @@ struct ChatTemplateKwargEntry: Equatable, Identifiable, Sendable {
     /// String form (the editor renders all values as strings; the codec
     /// coerces on encode).
     var value: String
+    /// Alternate value used when the reasoning-effort editor is in Custom mode.
+    var reasoningEffortCustomValue: String
+    var usesCustomReasoningEffort: Bool
     /// When true, the key gets added to `forced_ct_kwargs` so this
     /// chat-template kwarg overrides whatever the request body sent.
     var force: Bool
@@ -46,12 +49,16 @@ struct ChatTemplateKwargEntry: Equatable, Identifiable, Sendable {
         kind: ChatTemplateKwargEntryKind,
         customKey: String = "",
         value: String,
+        reasoningEffortCustomValue: String = "",
+        usesCustomReasoningEffort: Bool = false,
         force: Bool = false
     ) {
         self.id = id
         self.kind = kind
         self.customKey = customKey
         self.value = value
+        self.reasoningEffortCustomValue = reasoningEffortCustomValue
+        self.usesCustomReasoningEffort = usesCustomReasoningEffort
         self.force = force
     }
 
@@ -72,6 +79,7 @@ struct ChatTemplateKwargEntry: Equatable, Identifiable, Sendable {
 /// Encode + decode bridge between the editor's flat entry list and the
 /// server's `(chat_template_kwargs, forced_ct_kwargs)` pair.
 enum ChatTemplateKwargsCodec {
+    static let reasoningEffortPresets = ["low", "medium", "high", "xhigh", "max"]
 
     /// Build the server-facing pair. Returns `(nil, nil)` when the entry
     /// list is empty after dropping invalid custom entries — the patch
@@ -84,7 +92,19 @@ enum ChatTemplateKwargsCodec {
 
         for entry in entries {
             guard let key = entry.resolvedKey else { continue }
-            let coerced = coerceValue(entry.value, for: entry.kind)
+            let rawValue = entry.kind == .reasoningEffort
+                && entry.usesCustomReasoningEffort
+                ? entry.reasoningEffortCustomValue
+                : entry.value
+            if entry.kind == .reasoningEffort,
+               rawValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                continue
+            }
+            let coerced = coerceValue(
+                rawValue,
+                for: entry.kind,
+                usesCustomReasoningEffort: entry.usesCustomReasoningEffort
+            )
             dict[key] = coerced
             if entry.force { forced.append(key) }
         }
@@ -116,9 +136,15 @@ enum ChatTemplateKwargsCodec {
             ))
         }
         if let v = kwargs["reasoning_effort"] {
+            let rendered = stringify(v)
+            let preset = (v.value as? String).flatMap { value in
+                reasoningEffortPresets.contains(value) ? value : nil
+            }
             out.append(ChatTemplateKwargEntry(
                 kind: .reasoningEffort,
-                value: stringify(v),
+                value: preset ?? "low",
+                reasoningEffortCustomValue: preset == nil ? rendered : "",
+                usesCustomReasoningEffort: preset == nil,
                 force: forcedSet.contains("reasoning_effort")
             ))
         }
@@ -159,32 +185,41 @@ enum ChatTemplateKwargsCodec {
 
     /// Mirror of dashboard.js's encode-time coercion:
     /// • enable_thinking: "true"/"false" → Bool
-    /// • reasoning_effort: always a string
+    /// • reasoning_effort preset: string
+    /// • reasoning_effort Custom: numeric literals become numbers
     /// • custom: bool literals first, then numeric, otherwise string
     private static func coerceValue(
         _ raw: String,
-        for kind: ChatTemplateKwargEntryKind
+        for kind: ChatTemplateKwargEntryKind,
+        usesCustomReasoningEffort: Bool = false
     ) -> AnyCodable {
         switch kind {
         case .enableThinking:
             return AnyCodable(raw == "true")
         case .reasoningEffort:
-            return AnyCodable(raw)
+            if !usesCustomReasoningEffort { return AnyCodable(raw) }
+            return coerceLiteral(raw)
         case .custom:
-            let t = raw.trimmingCharacters(in: .whitespaces)
-            if t == "true"  { return AnyCodable(true) }
-            if t == "false" { return AnyCodable(false) }
-            if !t.isEmpty,
-               let n = Double(t),
-               !n.isNaN {
-                // Prefer Int when the user's literal has no decimal/exponent.
-                if !t.contains(".") && !t.contains("e") && !t.contains("E"),
-                   let i = Int(t) {
-                    return AnyCodable(i)
-                }
-                return AnyCodable(n)
-            }
-            return AnyCodable(raw)
+            return coerceLiteral(raw)
         }
+    }
+
+    private static func coerceLiteral(_ raw: String) -> AnyCodable {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed == "true"  { return AnyCodable(true) }
+        if trimmed == "false" { return AnyCodable(false) }
+        if !trimmed.isEmpty,
+           let number = Double(trimmed),
+           number.isFinite {
+            // Prefer Int when the user's literal has no decimal/exponent.
+            if !trimmed.contains(".")
+                && !trimmed.contains("e")
+                && !trimmed.contains("E"),
+               let integer = Int(trimmed) {
+                return AnyCodable(integer)
+            }
+            return AnyCodable(number)
+        }
+        return AnyCodable(raw)
     }
 }

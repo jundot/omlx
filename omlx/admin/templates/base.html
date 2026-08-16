@@ -66,19 +66,24 @@
             display: inline-block;
         }
 
-        /* Language-specific font stack */
+        /* Global UI tokens */
         :root {
+            --focus-ring-color: #171717;
             {% if current_lang == 'ko' %}
             --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh' %}
-            --font-sans: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+            --font-sans: 'PingFang SC', 'SF Pro Text', 'Noto Sans SC', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh-TW' %}
-            --font-sans: 'Noto Sans TC', 'Inter', system-ui, sans-serif;
+            --font-sans: 'PingFang TC', 'SF Pro Text', 'Noto Sans TC', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'ja' %}
             --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
             {% else %}
             --font-sans: 'Inter', system-ui, sans-serif;
             {% endif %}
+        }
+
+        [data-theme="dark"] {
+            --focus-ring-color: #efefef;
         }
 
         body {
@@ -107,6 +112,25 @@
         input:focus, select:focus, textarea:focus {
             outline: none;
             box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
+        }
+
+        /* Clear keyboard focus indicator (complements the enhanced-readability
+           contrast boost). Visible on :focus-visible only, so mouse users see
+           no extra chrome while keyboard users always see where focus is. */
+        :focus-visible {
+            outline: 2px solid var(--focus-ring-color) !important;
+            outline-offset: 2px;
+        }
+
+        /* Respect "Reduce Motion" (accessibility): collapse CSS transitions
+           and animations so the UI does not animate for users who ask for it. */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
         }
 
         /* Benchmark tooltip (fixed position, outside overflow containers) */
@@ -159,8 +183,6 @@
             color: var(--text-primary) !important;
         }
         [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
-        [data-enhanced-readability] :disabled,
-        [data-enhanced-readability] [disabled] { color: var(--text-primary) !important; }
         /* Font-size floor: lift all <12px text to 12px. KaTeX is intentionally
            excluded (its font-size stays untouched, preserving 1.21em scaling).
            Tailwind arbitrary-value classes MUST use the escaped form

@@ -16,6 +16,7 @@ import mlx.core as mx
 import pytest
 
 pytest.importorskip("mlx_vlm.models.gemma4")
+pytest.importorskip("mlx_vlm.models.gemma4_unified")
 
 from omlx.patches import mlx_lm_mtp as lm_mtp
 from omlx.patches.mlx_vlm_mtp import gemma4_vlm_runtime, set_mtp_attach_enabled
@@ -91,6 +92,15 @@ def _language_model(config):
     return LanguageModel(config)
 
 
+def _unified_text_config(extra: dict | None = None):
+    from mlx_vlm.models.gemma4_unified.config import TextConfig
+
+    params = dict(TINY_BACKBONE_CONFIG, model_type="gemma4_unified_text")
+    if extra:
+        params.update(extra)
+    return TextConfig.from_dict(params)
+
+
 def test_apply_is_idempotent():
     assert gemma4_vlm_runtime.apply()
     assert gemma4_vlm_runtime.apply()
@@ -100,6 +110,13 @@ def test_text_config_retains_assistant_config():
     cfg = _text_config({"mtp_assistant_config": TINY_ASSISTANT_CONFIG})
     assert cfg.mtp_assistant_config == TINY_ASSISTANT_CONFIG
     assert _text_config().mtp_assistant_config is None
+
+
+def test_unified_text_config_retains_assistant_config():
+    assistant = dict(TINY_ASSISTANT_CONFIG, model_type="gemma4_unified_assistant")
+    cfg = _unified_text_config({"mtp_assistant_config": assistant})
+    assert cfg.mtp_assistant_config == assistant
+    assert _unified_text_config().mtp_assistant_config is None
 
 
 def test_no_attach_without_assistant_config():

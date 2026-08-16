@@ -294,6 +294,20 @@ def get_mcp_manager():
     return _server_state.mcp_manager
 
 
+def mcp_tools_exposed() -> bool:
+    """Whether backend MCP tools are exposed to clients.
+
+    Controlled by the dashboard toggle (Settings > Global Settings > MCP).
+    Defaults to True (backward compatible) when global settings are
+    unavailable, e.g. when MCP was started via env var/CLI without a
+    settings file.
+    """
+    gs = _server_state.global_settings
+    if gs is None:
+        return True
+    return bool(getattr(gs.mcp, "expose_tools", True))
+
+
 async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -406,6 +420,24 @@ async def lifespan(app: FastAPI):
             logger.warning("Server alias auto-detection failed: %s", exc)
 
     _reset_boundary_snapshots_for_server()
+
+    # Publish the interpreter another Mac's coordinator discovers over SSH.
+    # Without it a packaged-app peer fails every discovery candidate and gets
+    # reported as "worker runtime is not installed" (#2680). Best effort: a
+    # read-only home must never keep this node from serving inference.
+    try:
+        from .cluster.worker_shim import ensure_cluster_python_shim
+
+        ensure_cluster_python_shim()
+    except (ImportError, OSError, RuntimeError) as exc:
+        # RuntimeError: Path.home() cannot resolve a home directory.
+        # Anything outside this set is a real bug and should surface loudly
+        # rather than be swallowed by a start-up convenience path.
+        logger.warning(
+            "Could not publish the cluster interpreter shim; a peer "
+            "coordinator may not discover this node over SSH: %r",
+            exc,
+        )
 
     # Advertise this oMLX instance so another Mac can identify it by hostname
     # and API port without asking the user to type an SSH target. Publication
@@ -1209,19 +1241,31 @@ class _LLMEngineLease:
             await get_engine_pool().release_engine(self.model_id)
 
     def abort_requested(self) -> bool:
+        return self.abort_reason() is not None
+
+    def abort_reason(self) -> str | None:
         if self.model_id is None or self.released:
-            return False
+            return None
         pool = _server_state.engine_pool
         if pool is None:
-            return False
+            return None
+        get_reason = getattr(pool, "get_abort_requested_reason", None)
+        if callable(get_reason):
+            return get_reason(self.model_id)
         is_abort_requested = getattr(pool, "is_abort_requested", None)
         if not callable(is_abort_requested):
-            return False
-        return bool(is_abort_requested(self.model_id))
+            return None
+        return "hard memory pressure" if is_abort_requested(self.model_id) else None
 
 
 async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
-    if lease.abort_requested():
+    reason = lease.abort_reason()
+    if reason == "manual admin unload":
+        raise HTTPException(
+            status_code=409,
+            detail="Request aborted because this model is being unloaded.",
+        )
+    if reason is not None:
         raise HTTPException(
             status_code=507,
             detail=(
@@ -3514,7 +3558,11 @@ async def create_chat_completion(
                 )
             tools_disabled = True
         effective_tools = None if tools_disabled else request.tools
-        if _server_state.mcp_manager and not tools_disabled:
+        if (
+            _server_state.mcp_manager
+            and not tools_disabled
+            and mcp_tools_exposed()
+        ):
             # Convert Pydantic ToolDefinition models to dicts for merge_tools
             user_tools_dicts = (
                 [t.model_dump() for t in request.tools] if request.tools else None
@@ -4566,7 +4614,12 @@ async def stream_chat_completion(
     stream_content = True
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        # The thinking channel never contains a separator-prefixed DSML
+        # block; holding trailing newlines would flush them as a late
+        # reasoning delta after the channel closed.
+        _thinking_filter = ToolCallStreamFilter(
+            engine.tokenizer, consume_dsml_separator=False
+        )
         if _content_filter.active:
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
@@ -4993,7 +5046,12 @@ async def stream_anthropic_messages(
     thinking_filter = None
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        # The thinking channel never contains a separator-prefixed DSML
+        # block; holding trailing newlines would flush them as a late
+        # reasoning delta after the channel closed.
+        _thinking_filter = ToolCallStreamFilter(
+            engine.tokenizer, consume_dsml_separator=False
+        )
         if _content_filter.active:
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
@@ -5072,14 +5130,15 @@ async def stream_anthropic_messages(
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
                         # When tools are requested AND we haven't yet opened
-                        # a text block, drop pure-whitespace deltas. Models
-                        # often emit a leading newline around <tool_call>
-                        # envelopes that tool_filter passes through
-                        # (whitespace isn't part of the envelope markers).
-                        # Without this guard, the `\n` opens a text block
-                        # that then holds only whitespace — surfacing as
-                        # a phantom empty-ish text block before the
-                        # tool_use blocks.
+                        # a text block, drop pure-whitespace deltas. Most
+                        # models emit a leading newline around <tool_call>
+                        # envelopes that tool_filter passes through (their
+                        # whitespace isn't part of the envelope markers;
+                        # DeepSeek V4's separator is, and the filter
+                        # consumes it itself). Without this guard, the `\n`
+                        # opens a text block that then holds only
+                        # whitespace — surfacing as a phantom empty-ish
+                        # text block before the tool_use blocks.
                         if (
                             not text_block_started
                             and kwargs.get("tools")
@@ -5160,7 +5219,14 @@ async def stream_anthropic_messages(
     # Flush any remaining buffered content from the tool-call filter
     if tool_filter:
         remaining = tool_filter.finish()
-        if remaining:
+        # Same guard as the delta path above: the filter can now flush
+        # held newlines here, and pure whitespace must not open a
+        # phantom text block.
+        if remaining and not (
+            not text_block_started
+            and kwargs.get("tools")
+            and not remaining.strip()
+        ):
             if not text_block_started:
                 if thinking_block_started:
                     yield create_content_block_stop_event(index=block_index)
@@ -5523,7 +5589,7 @@ async def create_anthropic_message(
                     field="tools",
                 )
             internal_tools = None
-        elif _server_state.mcp_manager:
+        elif _server_state.mcp_manager and mcp_tools_exposed():
             mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
             combined = (mcp_openai_tools or []) + (user_internal or [])
             # Deduplicate by function name (user tools take precedence)
@@ -5917,6 +5983,7 @@ async def create_response(
         # Handle text.format (structured output)
         response_format = None
         compiled_grammar = None
+        response_format_warning = None
         if request.text and request.text.format:
             fmt = request.text.format
             if fmt.type == "json_object":
@@ -5946,6 +6013,11 @@ async def create_response(
                     reasoning_parser=reasoning_parser,
                 )
                 if compiled_grammar is None:
+                    # Non-strict formats still degrade to prompt injection, so
+                    # surface it to the caller with the same Warning response
+                    # header /v1/chat/completions uses; the log line alone only
+                    # ever reaches the operator (#1241).
+                    response_format_warning = _response_format_warning_header(rf)
                     json_instruction = build_json_system_prompt(rf)
                     if json_instruction:
                         messages = _inject_json_instruction(messages, json_instruction)
@@ -5961,7 +6033,11 @@ async def create_response(
             )
             else openai_tools
         )
-        if _server_state.mcp_manager and effective_tools:
+        if (
+            _server_state.mcp_manager
+            and effective_tools
+            and mcp_tools_exposed()
+        ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
 
         # Convert tools for chat template
@@ -6085,6 +6161,9 @@ async def create_response(
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
+            sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+            if response_format_warning:
+                sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
                     _with_sse_keepalive(
@@ -6106,7 +6185,7 @@ async def create_response(
                     lease,
                 ),
                 media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                headers=sse_headers,
             )
 
         # Non-streaming with keepalive during prefill
@@ -6246,12 +6325,16 @@ async def create_response(
 
             return response_obj.model_dump_json()
 
+        json_headers = (
+            {"Warning": response_format_warning} if response_format_warning else None
+        )
         return StreamingResponse(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_responses_api()),
                 lease,
             ),
             media_type="application/json",
+            headers=json_headers,
         )
 
     except BaseException:
@@ -6280,7 +6363,22 @@ async def stream_responses_api(
     accumulated_text = ""
     accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser(start_in_thinking=native_reasoning)
+    # Some templates open the thinking block in the prompt itself, so the
+    # generated text starts with reasoning body and only later emits </think>.
+    start_in_thinking = native_reasoning
+    if not start_in_thinking:
+        try:
+            tokenizer = getattr(engine, "tokenizer", None)
+            if tokenizer is not None:
+                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                    engine, messages, kwargs
+                )
+                start_in_thinking, _ = prompt_opens_thinking(
+                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
+                )
+        except Exception as exc:
+            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
@@ -6504,7 +6602,12 @@ async def stream_responses_api(
     stream_content = True
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        # The thinking channel never contains a separator-prefixed DSML
+        # block; holding trailing newlines would flush them as a late
+        # reasoning delta after the channel closed.
+        _thinking_filter = ToolCallStreamFilter(
+            engine.tokenizer, consume_dsml_separator=False
+        )
         if _content_filter.active:
             tool_filter = _content_filter
             thinking_filter = _thinking_filter

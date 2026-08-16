@@ -105,8 +105,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
     if (q.shape(3) != 128 || k.shape(3) != 128) {
       return true;
     }
-    if (q.shape(2) % 64 != 0 || k.shape(2) % 64 != 0 ||
-        q.shape(3) % 16 != 0) {
+    if (q.shape(3) % 16 != 0) {
       return true;
     }
     return k.shape(2) < 64;

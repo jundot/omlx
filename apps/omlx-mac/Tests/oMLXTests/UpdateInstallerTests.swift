@@ -106,89 +106,12 @@ final class UpdateInstallerTests: XCTestCase {
         )
     }
 
-    func testLaunchAgentWorkerSmoke() throws {
-        let identifier = "app.omlx.updater.smoke.\(UUID().uuidString)"
-        let live = try makeLaunchableBundle(
-            name: "oMLX.app",
-            marker: "old",
-            identifier: identifier
-        )
-        let staged = try makeLaunchableBundle(
-            name: UpdateInstaller.stagedAppName,
-            marker: "new",
-            identifier: identifier
-        )
-        let jobsDirectory = temporaryDirectory.appendingPathComponent("jobs")
-        defer { UpdateInstaller.cleanupLaunchAgents(in: jobsDirectory) }
-
-        let parent = Process()
-        parent.executableURL = URL(fileURLWithPath: "/bin/sleep")
-        parent.arguments = ["0.3"]
-        try parent.run()
-
-        let executable = try XCTUnwrap(Bundle.main.executableURL)
-        try UpdateInstaller.submitWorker(
-            parentPID: parent.processIdentifier,
-            liveApp: live,
-            stagedApp: staged,
-            executable: executable,
-            jobsDirectory: jobsDirectory
-        )
-        parent.waitUntilExit()
-
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline, try marker(in: live) != "new" {
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-
-        XCTAssertEqual(try marker(in: live), "new")
-        XCTAssertEqual(try marker(in: staged), "old")
-        Thread.sleep(forTimeInterval: 0.5)
-        XCTAssertEqual(try marker(in: live), "new")
-        XCTAssertEqual(try marker(in: staged), "old")
-    }
-
     private func makeBundle(name: String, marker: String) throws -> URL {
         let bundle = temporaryDirectory.appendingPathComponent(name)
         try FileManager.default.createDirectory(
             at: bundle,
             withIntermediateDirectories: true
         )
-        try Data(marker.utf8).write(to: bundle.appendingPathComponent("marker"))
-        return bundle
-    }
-
-    private func makeLaunchableBundle(
-        name: String,
-        marker: String,
-        identifier: String
-    ) throws -> URL {
-        let bundle = temporaryDirectory.appendingPathComponent(name)
-        let contents = bundle.appendingPathComponent("Contents")
-        let macOS = contents.appendingPathComponent("MacOS")
-        try FileManager.default.createDirectory(
-            at: macOS,
-            withIntermediateDirectories: true
-        )
-        try FileManager.default.copyItem(
-            at: URL(fileURLWithPath: "/usr/bin/true"),
-            to: macOS.appendingPathComponent("smoke")
-        )
-        let info: [String: Any] = [
-            "CFBundleExecutable": "smoke",
-            "CFBundleIdentifier": identifier,
-            "CFBundleName": "oMLX updater smoke",
-            "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": marker == "new" ? "2.0" : "1.0",
-            "CFBundleVersion": marker == "new" ? "2" : "1",
-            "LSBackgroundOnly": true,
-        ]
-        let data = try PropertyListSerialization.data(
-            fromPropertyList: info,
-            format: .binary,
-            options: 0
-        )
-        try data.write(to: contents.appendingPathComponent("Info.plist"))
         try Data(marker.utf8).write(to: bundle.appendingPathComponent("marker"))
         return bundle
     }

@@ -294,11 +294,21 @@
                     <!-- Results Header with Clear Button -->
                     <div x-show="accAllResults.length > 0" x-cloak class="flex items-center justify-between mb-4">
                         <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('acc_bench.results.section_label') }}</span>
-                        <button @click="resetAccResults()"
-                                class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
-                            <i data-lucide="trash-2" class="w-3 h-3"></i>
-                            {{ t('acc_bench.results.clear') }}
-                        </button>
+                        <div class="flex items-center gap-2">
+                            <a x-show="benchDeviceInfo?.owner_hash"
+                               x-cloak
+                               :href="'https://omlx.ai/my/' + benchDeviceInfo?.owner_hash"
+                               target="_blank"
+                               class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
+                                <i data-lucide="external-link" class="w-3 h-3"></i>
+                                My Submissions
+                            </a>
+                            <button @click="resetAccResults()"
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
+                                <i data-lucide="trash-2" class="w-3 h-3"></i>
+                                {{ t('acc_bench.results.clear') }}
+                            </button>
+                        </div>
                     </div>
 
                     <!-- Results Section -->
@@ -331,6 +341,32 @@
                                               :class="r.accuracy >= 0.7 ? 'text-green-600' : r.accuracy >= 0.4 ? 'text-amber-600' : 'text-red-600'"
                                               x-text="(r.accuracy * 100).toFixed(1) + '%'"></span>
                                     </div>
+                                </div>
+
+                                <!-- Community upload status (local runs only; mirrors the throughput bench card) -->
+                                <div x-show="r.upload" x-cloak class="mt-3 flex items-center gap-1.5 text-xs flex-wrap">
+                                    <template x-if="r.upload && r.upload.url && !r.upload.error">
+                                        <span class="inline-flex items-center gap-1.5 flex-wrap">
+                                            <i data-lucide="check-circle" class="w-3.5 h-3.5" :class="r.upload.duplicate ? 'text-amber-500' : 'text-green-600'"></i>
+                                            <span x-show="!r.upload.duplicate" class="font-medium text-green-700">{{ t('acc_bench.upload.success') }}</span>
+                                            <span x-show="r.upload.duplicate" class="font-medium text-amber-600">{{ t('acc_bench.upload.duplicate') }}</span>
+                                            <a :href="r.upload.url" target="_blank" rel="noopener"
+                                               class="text-neutral-400 hover:text-neutral-700 underline break-all" x-text="r.upload.url"></a>
+                                        </span>
+                                    </template>
+                                    <template x-if="r.upload && r.upload.error">
+                                        <span class="inline-flex items-center gap-1.5 text-red-600 flex-wrap">
+                                            <i data-lucide="x-circle" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                            <span class="font-medium">{{ t('acc_bench.upload.failed') }}</span>
+                                            <span class="text-red-400 break-all" x-text="r.upload.error"></span>
+                                        </span>
+                                    </template>
+                                    <template x-if="r.upload && r.upload.skipped">
+                                        <span class="inline-flex items-center gap-1.5 text-neutral-400">
+                                            <i data-lucide="info" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                            <span>{{ t('acc_bench.upload.skipped_min') }}</span>
+                                        </span>
+                                    </template>
                                 </div>
 
                                 <div x-show="r.external && r.reliability_warning" x-cloak

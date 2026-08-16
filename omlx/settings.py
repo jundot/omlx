@@ -603,15 +603,19 @@ class MCPSettings:
     """MCP (Model Context Protocol) configuration settings."""
 
     config_path: str | None = None
+    expose_tools: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"config_path": self.config_path}
+        return {"config_path": self.config_path, "expose_tools": self.expose_tools}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MCPSettings:
         """Create from dictionary."""
-        return cls(config_path=data.get("config_path"))
+        return cls(
+            config_path=data.get("config_path"),
+            expose_tools=data.get("expose_tools", True),
+        )
 
 
 @dataclass

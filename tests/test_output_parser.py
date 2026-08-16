@@ -1315,6 +1315,35 @@ class TestMuseGlimmerOutputParserSession:
         }
         assert final.finish_reason == "tool_calls"
 
+    def test_tool_call_first_turn_without_leading_space(self):
+        # The streaming detokenizer strips the leading space off the first
+        # segment of a generation, so a turn that opens directly with a tool
+        # call (no to=self message first — typical right after a tool-error
+        # result) reaches the parser as "to=bash..." with nothing between it
+        # and the synthetic "<|start|>assistant" prepend at finalize.
+        token_map = {
+            1: "to=bash",
+            2: "<|message|>",
+            3: (
+                '<atem:function_calls>\n<atem:invoke name="bash">\n'
+                "<atem:parameter name=\"command\">ls -la /tmp/reports"
+                "</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
+            ),
+            4: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2, 3, 4])
+
+        assert visible == ""
+        assert stopped
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "bash"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {
+            "command": "ls -la /tmp/reports"
+        }
+        assert final.finish_reason == "tool_calls"
+
     def test_multiple_tool_calls_across_messages(self):
         token_map = {
             1: " to=alpha",

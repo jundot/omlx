@@ -317,7 +317,7 @@
                                     </select>
                                 </div>
                                 <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
-                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Reasoning Parser</label>
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.reasoning_parser') }}</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">None</option>
@@ -573,8 +573,8 @@
                                                     @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
-                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false"
+                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort' || (e.type === 'custom' && e.key && e.key.trim() === 'reasoning_effort'))"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', custom: false, customValue: '', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false"
@@ -612,15 +612,33 @@
                                                 </select>
                                             </template>
                                             <template x-if="entry.type === 'reasoning_effort'">
-                                                <select x-model="entry.value"
-                                                        class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                    <option value="low">{{ t('modal.model_settings.kwarg_effort_low') }}</option>
-                                                    <option value="medium">{{ t('modal.model_settings.kwarg_effort_medium') }}</option>
-                                                    <option value="high">{{ t('modal.model_settings.kwarg_effort_high') }}</option>
-                                                    <option value="max">max</option>
-                                                </select>
+                                                <div class="flex-1 space-y-2">
+                                                    <select x-show="!entry.custom" x-model="entry.value"
+                                                           class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        <option value="low">low</option>
+                                                        <option value="medium">medium</option>
+                                                        <option value="high">high</option>
+                                                        <option value="xhigh">xhigh</option>
+                                                        <option value="max">max</option>
+                                                    </select>
+                                                    <input x-show="entry.custom" type="text" x-model="entry.customValue"
+                                                           placeholder="0.9"
+                                                           class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    <div class="flex items-center gap-3">
+                                                        <label class="inline-flex items-center gap-1">
+                                                            <input type="checkbox" x-model="entry.custom"
+                                                                   class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                                            <span class="text-xs text-neutral-400">{{ t('modal.model_settings.kwarg_custom') }}</span>
+                                                        </label>
+                                                        <label class="inline-flex items-center gap-1" title="{{ t('modal.model_settings.kwarg_force_tooltip') }}">
+                                                            <input type="checkbox" x-model="entry.force"
+                                                                   class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                                            <span class="text-xs text-neutral-400">{{ t('modal.model_settings.kwarg_force') }}</span>
+                                                        </label>
+                                                    </div>
+                                                </div>
                                             </template>
-                                            <template x-if="entry.type !== 'custom'">
+                                            <template x-if="entry.type === 'enable_thinking'">
                                                 <label class="flex items-center gap-1 flex-shrink-0" title="{{ t('modal.model_settings.kwarg_force_tooltip') }}">
                                                     <input type="checkbox" x-model="entry.force"
                                                            class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
@@ -766,7 +784,7 @@
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
-                                            <span class="text-sm font-medium text-neutral-700">SpecPrefill</span>
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill') }}</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
                                         </div>
                                         <button type="button"
@@ -819,7 +837,7 @@
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
-                                            <span class="text-sm font-medium text-neutral-700">DFlash</span>
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding for faster generation. Supports Qwen (3, 3.5, 3.6), Gemma4, and Laguna model families. Requires a DFlash draft model checkpoint.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
                                             <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
                                                class="text-xs text-amber-600 mt-1"

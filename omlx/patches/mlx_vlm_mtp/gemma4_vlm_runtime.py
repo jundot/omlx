@@ -60,6 +60,7 @@ def apply() -> bool:
     try:
         from mlx_vlm.models.gemma4 import config as g4_config
         from mlx_vlm.models.gemma4 import language as g4_lang
+        from mlx_vlm.models.gemma4_unified import config as g4_unified_config
         from mlx_vlm.speculative.drafters.gemma4_assistant import (  # noqa: F401
             Gemma4AssistantDraftModel,
         )
@@ -68,6 +69,10 @@ def apply() -> bool:
         return False
 
     _patch_text_config(g4_config)
+    # Gemma4 unified reuses Gemma4's LanguageModel but declares its own
+    # TextConfig subclass. Retain the embedded assistant config there too so
+    # the shared language model can attach the head during loading.
+    _patch_text_config(g4_unified_config)
     _patch_vlm_language_model(g4_lang)
     # VLMModelAdapter pass-throughs (mtp / mtp_forward / make_mtp_cache /
     # rollback_speculative_cache) are shared with the Qwen3.5 runtimes;

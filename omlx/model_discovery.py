@@ -1083,6 +1083,132 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
+_SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")
+
+
+def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None:
+    """Detect weight shards missing from an incompletely downloaded checkpoint.
+
+    An interrupted download leaves config.json (fetched first) plus a subset of
+    the weight shards, so the directory would otherwise register as a normal,
+    load-ready model. Verify against the checkpoint's own manifest:
+    model.safetensors.index.json when it is readable, else the
+    ``-NNNNN-of-NNNNN`` shard filename numbering (the index file itself may not
+    have been downloaded yet).
+
+    Returns (missing count, up to 3 example names, manifest description), or
+    None when the directory is complete or makes no shard promises.
+    """
+    idx_path = model_dir / "model.safetensors.index.json"
+    index_missing: tuple[int, list[str]] | None = None
+    if idx_path.is_file():
+        try:
+            index = json.loads(idx_path.read_text())
+        except (OSError, ValueError):
+            # Unreadable/corrupt index (a non-UTF-8 file raises
+            # UnicodeDecodeError, a ValueError): fall back to the filename
+            # numbering below — loaders surface the index defect itself.
+            index = None
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if isinstance(weight_map, dict) and weight_map:
+            # Resolve values against the model dir (the HF index convention),
+            # so ./-prefixed or subpath entries are not misreported: only
+            # files the manifest references that are provably absent count.
+            missing = sorted(
+                {
+                    v
+                    for v in weight_map.values()
+                    if isinstance(v, str) and not (model_dir / v).is_file()
+                }
+            )
+            if not missing:
+                return None
+            referenced_count = len(
+                {v for v in weight_map.values() if isinstance(v, str)}
+            )
+            if len(missing) < referenced_count:
+                return len(missing), missing[:3], "model.safetensors.index.json"
+            # Every shard the index references is absent. An interrupted
+            # download keeps the shards it already fetched, so
+            # zero-of-referenced is not that shape — it is a stale index
+            # describing a different sharding of the same checkpoint (seen
+            # in the wild: a 4-shard weight_map shipped over 2 actual
+            # shards). Loaders glob model*.safetensors and never consult
+            # the index, so fall through and judge by the shard files
+            # actually present.
+            index_missing = (len(missing), missing[:3])
+
+    try:
+        shard_names = [
+            f.name
+            for f in model_dir.iterdir()
+            if f.is_file() and f.suffix == ".safetensors"
+        ]
+    except OSError:
+        return None
+    groups: dict[tuple[str, str], set[int]] = {}
+    for name in shard_names:
+        m = _SHARD_FILE_RE.search(name)
+        if m:
+            key = (name[: m.start()], m.group(2))
+            groups.setdefault(key, set()).add(int(m.group(1)))
+    missing_count = 0
+    examples: list[str] = []
+    for (prefix, total), present in sorted(groups.items()):
+        expected_total = int(total)
+        # Count distinct in-range indices so stray or duplicate-padding names
+        # can't mask a gap; tolerate 0-based numbering alongside the 1-based
+        # HF convention.
+        base = 1
+        present_n = len({i for i in present if 1 <= i <= expected_total})
+        zero_based_n = len({i for i in present if 0 <= i < expected_total})
+        if zero_based_n > present_n:
+            base, present_n = 0, zero_based_n
+        if present_n >= expected_total:
+            continue
+        missing_count += expected_total - present_n
+        width = len(total)
+        for i in range(base, base + expected_total):
+            if len(examples) >= 3:
+                break
+            if i not in present:
+                examples.append(
+                    f"{prefix}-{str(i).zfill(width)}-of-{total}.safetensors"
+                )
+    if missing_count:
+        return (
+            missing_count,
+            examples,
+            (
+                "shard filename numbering (no shard referenced by the stale "
+                "index exists; judging by the shards present)"
+                if index_missing is not None
+                else "shard filename numbering (no index file)"
+            ),
+        )
+    if index_missing is not None:
+        if groups or (model_dir / "model.safetensors").is_file():
+            # A self-consistent complete shard set (or a consolidated
+            # single-file checkpoint) is present: the index is stale, the
+            # weights are whole. Register the model; loaders read the shard
+            # files directly and never consult the index.
+            n_missing, examples = index_missing
+            logger.warning(
+                f"Model at {model_dir} ships a stale "
+                f"model.safetensors.index.json: none of the {n_missing} "
+                f"shard(s) it references exist (e.g. {', '.join(examples)}), "
+                f"but the weight files present form a complete set — "
+                f"registering the model anyway."
+            )
+            return None
+        # No weight files at all: config + index landed first, shards did not
+        # (interrupted download before the first shard finished) — skip, and
+        # report against the only manifest available.
+        n_missing, examples = index_missing
+        return n_missing, examples, "model.safetensors.index.json"
+    return None
+
+
 def model_directory_access_error(path: Path) -> str | None:
     """Return a user-facing error if a model directory cannot be scanned."""
     try:
@@ -1314,6 +1440,18 @@ def _register_model(
     try:
         if _is_unsupported_model(model_dir):
             logger.info(f"Skipping unsupported model: {model_id}")
+            return
+
+        incomplete = _missing_weight_shards(model_dir)
+        if incomplete:
+            n_missing, examples, manifest = incomplete
+            logger.warning(
+                f"Skipping incomplete model '{model_id}': {n_missing} weight "
+                f"shard(s) referenced by {manifest} are missing from "
+                f"{model_dir} (e.g. {', '.join(examples)}) — likely an "
+                f"interrupted or still-running download; re-run the download "
+                f"to resume it (finished shards are kept and reused)."
+            )
             return
 
         model_type = detect_model_type(model_dir)

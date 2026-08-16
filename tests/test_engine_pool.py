@@ -3225,6 +3225,70 @@ class TestEnginePoolInUseLease:
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_manual_unload_waits_for_scheduler_quiescence(self):
+        """Admin unload must not queue teardown behind a running MLX step."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.is_pinned = True
+        entry.in_use = 1
+        entry.engine.has_active_requests.return_value = True
+        scheduler = MagicMock()
+        scheduler.has_requests.return_value = True
+        scheduler.running = {"request-1": object()}
+        scheduler.waiting = []
+        scheduler.prefilling = []
+        scheduler.requests = {"request-1": object()}
+        entry.engine.scheduler = scheduler
+        entry.engine.abort_all_requests = AsyncMock(return_value=1)
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+
+        unloaded = await pool.request_unload("leased")
+
+        assert unloaded is False
+        assert entry.pending_unload_reason == "manual unload"
+        assert entry.pending_unload_allow_pinned is True
+        assert entry.abort_requested is True
+        entry.engine.abort_all_requests.assert_awaited_once_with(
+            reason="Request aborted because model 'leased' is being unloaded",
+            error_code="model_unloading",
+        )
+        pool._unload_engine.assert_not_awaited()
+        with pytest.raises(ModelBusyError, match="unload is pending"):
+            await pool.get_engine("leased")
+
+        # The response collector can disappear before the executor applies the
+        # deferred scheduler abort. Neither that nor the lease drain is enough.
+        entry.engine.has_active_requests.return_value = False
+        await pool.release_engine("leased")
+        pool._unload_engine.assert_not_awaited()
+
+        scheduler.has_requests.return_value = False
+        scheduler.running = {}
+        scheduler.requests = {}
+        task = pool._pending_unload_tasks["leased"]
+        await asyncio.wait_for(task, timeout=1)
+
+        pool._unload_engine.assert_awaited_once_with("leased")
+        assert entry.pending_unload_reason is None
+        assert entry.pending_unload_allow_pinned is False
+        assert entry.abort_requested is False
+
+    @pytest.mark.asyncio
+    async def test_manual_unload_stops_idle_engine_immediately(self):
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("idle")
+        entry.engine.abort_all_requests = AsyncMock(return_value=0)
+        pool._entries = {"idle": entry}
+        pool._unload_engine = AsyncMock()
+
+        unloaded = await pool.request_unload("idle")
+
+        assert unloaded is True
+        pool._unload_engine.assert_awaited_once_with("idle")
+        assert entry.engine.abort_all_requests.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_acquire_leases_then_releases_on_success(self):
         """acquire() leases on enter and releases in finally on normal exit."""
         pool = _make_pool(ceiling=0)

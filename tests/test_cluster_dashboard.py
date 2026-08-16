@@ -48,7 +48,12 @@ def test_distributed_inference_is_an_advanced_restart_scoped_opt_in():
     settings = _read("omlx/admin/templates/dashboard/_settings.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
+    distributed_section = settings.index("<!-- Distributed inference subsection -->")
+    performance_section = settings.index("<!-- Performance subsection -->")
+
+    assert distributed_section < performance_section
     assert "settings.advanced.distributed_inference" in settings
+    assert "settings.advanced.distributed_inference_enabled" in settings
     assert "settings.advanced.distributed_inference_hint" in settings
     assert "distributed_inference_enabled: false" in javascript
     assert "distributed_inference_active: false" in javascript
@@ -355,7 +360,10 @@ def test_cluster_nodes_show_dynamic_hardware_identity_for_every_peer():
     assert "async loadClusterPeerHardware()" in javascript
     assert "await this.loadClusterPeerHardware()" in javascript
     assert "result.bootstrap_required" in javascript
-    assert "worker runtime is not installed yet" in javascript
+    # #2680: the banner must repeat what the probe measured, not assert
+    # "not installed" over a runtime it was merely unable to check.
+    assert "result.runtime_mismatches" in javascript
+    assert "its oMLX worker runtime is not installed yet" in javascript
     assert "probe?.ssh_reachable" in javascript
     assert "this.clusterPeerProbes?.[ssh]" in javascript
     assert "hardware.chip_name" in javascript
@@ -461,6 +469,7 @@ def test_every_dashboard_locale_names_cluster_tab():
     required = {
         "navbar.tab.cluster",
         "settings.advanced.distributed_inference",
+        "settings.advanced.distributed_inference_enabled",
         "settings.advanced.distributed_inference_hint",
         "cluster.pairing.shared_secret",
         "cluster.pairing.shared_secret_hint",

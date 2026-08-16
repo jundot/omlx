@@ -14,13 +14,14 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import validate_image_data_uri
+from .base_model import last_token_pool, mean_pooling, normalize_embeddings
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
@@ -37,6 +38,10 @@ _CONTEXT_LENGTH_ATTRS = (
     "n_positions",
 )
 _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+
+# Pooling modes whose result depends on the attention mask. CLS reads a fixed
+# position, so it is mask-independent.
+_MASK_AWARE_POOLING_MODES = ("mean", "lasttoken")
 
 
 @dataclass
@@ -93,6 +98,107 @@ class MLXEmbeddingModel:
         self._is_compiled = False
         self._compiled_embed = None
         self._remap_input_ids_to_inputs = False
+        self._pooling_mode: Optional[str] = None
+        self._pooling_source: str = "not resolved"
+
+    # Fallbacks for MLX conversions that dropped the sentence-transformers
+    # metadata. Reviewed against the concrete checkpoints on the Hub: none of
+    # the MLX BGE-M3 / Qwen3-Embedding / Qwen3-VL-Embedding repos ship
+    # ``1_Pooling/config.json``, so detection alone never fires for exactly the
+    # models this fix is meant to serve.
+    _FAMILY_POOLING = (
+        ("qwen3-vl-embedding", "lasttoken"),
+        ("qwen3-embedding", "lasttoken"),
+        ("bge-m3", "cls"),
+    )
+
+    def _pooling_config_path(self, model_path: Path) -> Optional[Path]:
+        """Locate the Pooling module through ``modules.json``.
+
+        sentence-transformers describes its pipeline there; the Pooling module
+        carries its own directory in ``path`` (usually ``1_Pooling``, but not
+        always). Hardcoding ``1_Pooling`` misses non-standard exports, and some
+        MLX repos keep the ``modules.json`` entry while dropping the directory
+        itself -- so the path is also checked for existence.
+        """
+        modules_path = model_path / "modules.json"
+        if modules_path.is_file():
+            try:
+                with open(modules_path) as fh:
+                    modules = json.load(fh)
+                for module in modules if isinstance(modules, list) else []:
+                    if "Pooling" in str(module.get("type", "")):
+                        candidate = model_path / str(module.get("path", ""))
+                        cfg = candidate / "config.json"
+                        if cfg.is_file():
+                            return cfg
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not read modules.json for {self.model_name}: {e}")
+        # Fall back to the conventional location for exports without modules.json.
+        conventional = model_path / "1_Pooling" / "config.json"
+        return conventional if conventional.is_file() else None
+
+    @staticmethod
+    def _pooling_mode_from_config(cfg: Dict[str, Any]) -> Optional[str]:
+        """Read either config dialect.
+
+        Recent sentence-transformers releases write a single
+        ``{"pooling_mode": "lasttoken"}`` string; older ones set one boolean per
+        mode. Qwen3-VL-Embedding uses the newer form, so a boolean-only parser
+        silently ignores a pooling config that is actually present.
+        """
+        declared = cfg.get("pooling_mode")
+        if isinstance(declared, str):
+            alias = {
+                "cls": "cls",
+                "mean": "mean",
+                "lasttoken": "lasttoken",
+                "last_token": "lasttoken",
+            }
+            mode = alias.get(declared.strip().lower())
+            if mode:
+                return mode
+        for key, mode in (
+            ("pooling_mode_cls_token", "cls"),
+            ("pooling_mode_lasttoken", "lasttoken"),
+            ("pooling_mode_mean_tokens", "mean"),
+        ):
+            if cfg.get(key):
+                return mode
+        return None
+
+    def _resolve_pooling_mode(self) -> Tuple[Optional[str], str]:
+        """Resolve the pooling mode and report where it came from.
+
+        Returns ``(mode, source)``. ``source`` is logged at load time so an
+        operator can tell a declared mode from an inferred one without reading
+        the code -- silent pooling changes are exactly what makes retrieval
+        quality drift unnoticed.
+        """
+        model_path = Path(self.model_name)
+        cfg_path = self._pooling_config_path(model_path)
+        if cfg_path is not None:
+            try:
+                with open(cfg_path) as fh:
+                    cfg = json.load(fh)
+                mode = self._pooling_mode_from_config(cfg)
+                if mode:
+                    return mode, str(cfg_path.relative_to(model_path))
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not read pooling config for {self.model_name}: {e}")
+
+        haystack = str(self.model_name).lower()
+        config_path = model_path / "config.json"
+        if config_path.is_file():
+            try:
+                with open(config_path) as fh:
+                    haystack += " " + str(json.load(fh).get("_name_or_path", "")).lower()
+            except (OSError, ValueError):
+                pass
+        for needle, mode in self._FAMILY_POOLING:
+            if needle in haystack:
+                return mode, f"known family ({needle})"
+        return None, "not declared"
 
     def _load_native(self) -> bool:
         """
@@ -201,6 +307,13 @@ class MLXEmbeddingModel:
         if self._loaded:
             return
 
+        self._pooling_mode, self._pooling_source = self._resolve_pooling_mode()
+        if self._pooling_mode:
+            logger.info(
+                f"Embedding pooling for {self.model_name}: "
+                f"{self._pooling_mode} (source: {self._pooling_source})"
+            )
+
         # 1. Try native loading first (xlm_roberta, bert)
         if self._load_native():
             return
@@ -248,8 +361,31 @@ class MLXEmbeddingModel:
             logger.error(f"Failed to load embedding model: {e}")
             raise
 
-    def _extract_embeddings_array(self, outputs):
+    def _extract_embeddings_array(self, outputs, attention_mask=None):
         """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
+        # Honour the checkpoint's own declaration first. Some MLX conversions of
+        # sentence-transformers models expose a mean-pooled ``text_embeds`` while
+        # the checkpoint was trained for CLS pooling (e.g. BGE-M3), which silently
+        # degrades retrieval instead of failing. Mode is resolved once at load().
+        #
+        # Pooling goes through the existing mask-aware helpers: a bare
+        # ``[:, -1]`` is only correct under left padding and an unmasked
+        # ``mean(axis=1)`` averages pad tokens in, both of which corrupt vectors
+        # in mixed-length batches while single inputs still look fine. The
+        # result is L2-normalized like every other path out of this method.
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if self._pooling_mode and last_hidden is not None and last_hidden.ndim == 3:
+            if self._pooling_mode == "cls":
+                return normalize_embeddings(last_hidden[:, 0, :])
+            if self._pooling_mode == "lasttoken":
+                return normalize_embeddings(
+                    last_token_pool(last_hidden, attention_mask)
+                )
+            if self._pooling_mode == "mean" and attention_mask is not None:
+                return normalize_embeddings(
+                    mean_pooling(last_hidden, attention_mask)
+                )
+
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
             embeddings = outputs.text_embeds
         elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
@@ -453,6 +589,58 @@ class MLXEmbeddingModel:
             None,
         )
 
+    def _eager_forward_with_mask(
+        self,
+        processor,
+        normalized_inputs,
+        input_texts,
+        max_length: int,
+        padding: bool,
+        truncation: bool,
+    ):
+        """Eager forward for tokenizer-style processors, keeping the mask.
+
+        ``mlx_embeddings.generate`` is ``prepare_inputs`` + ``model(**inputs)``
+        and returns only the outputs, dropping the mask it just built. When the
+        checkpoint declares a mask-aware pooling mode, run those same two steps
+        here so the mask survives into pooling; the compiled path already has
+        it. Without this, a right-padded batch pools a pad token whenever
+        compile is off or has fallen back. Any preparation failure returns to
+        ``generate()`` unchanged, so this can only add a mask, never remove a
+        working path.
+        """
+        if self._pooling_mode in _MASK_AWARE_POOLING_MODES:
+            inputs = None
+            try:
+                prepared = self._prepare_embedding_inputs(
+                    processor, normalized_inputs, max_length, padding, truncation
+                )
+                inputs = dict(prepared)
+            except Exception as e:
+                # Only input preparation is guarded: a forward error must
+                # surface as it does on every other path, not silently rerun.
+                logger.warning(
+                    "masked eager forward unavailable for %s (%s); falling back "
+                    "to generate() without a mask",
+                    self.model_name,
+                    e,
+                )
+            if inputs is not None:
+                outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
+                return outputs, inputs.get("attention_mask")
+
+        from mlx_embeddings import generate
+
+        outputs = generate(
+            self.model,
+            processor,
+            input_texts,
+            max_length=max_length,
+            padding=padding,
+            truncation=truncation,
+        )
+        return outputs, None
+
     def _detect_input_key_remapping(self) -> None:
         """Check if the model accepts `inputs` instead of `input_ids` and cache the result."""
         try:
@@ -495,7 +683,10 @@ class MLXEmbeddingModel:
         try:
             def _compiled_embed(inputs):
                 outputs = base_model(**self._adapt_model_inputs_for_call(inputs))
-                return self._extract_embeddings_array(outputs)
+                # The mask travels with the request; mask-aware pooling needs it.
+                return self._extract_embeddings_array(
+                    outputs, inputs.get("attention_mask")
+                )
 
             self._compiled_embed = mx.compile(_compiled_embed)
 
@@ -631,7 +822,9 @@ class MLXEmbeddingModel:
                 attention_mask = mx.array(masks)
 
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings_array = self._extract_embeddings_array(outputs)
+            embeddings_array = self._extract_embeddings_array(
+                outputs, attention_mask
+            )
             total_tokens = self._count_prepared_tokens(
                 {"attention_mask": attention_mask, "input_ids": input_ids}
             )
@@ -659,6 +852,9 @@ class MLXEmbeddingModel:
                     total_tokens = None
 
             if embeddings_array is None:
+                # Both eager paths must carry the prepared mask the compiled
+                # path passes: pooling is only correct with it.
+                eager_mask = None
                 if uses_custom_embedding_inputs:
                     inputs = self._prepare_embedding_inputs(
                         processor,
@@ -671,18 +867,17 @@ class MLXEmbeddingModel:
                         inputs = dict(inputs)
                     outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
                     total_tokens = self._count_prepared_tokens(inputs)
+                    eager_mask = inputs.get("attention_mask")
                 else:
-                    from mlx_embeddings import generate
-
-                    outputs = generate(
-                        self.model,
+                    outputs, eager_mask = self._eager_forward_with_mask(
                         processor,
+                        normalized_inputs,
                         input_texts,
-                        max_length=max_length,
-                        padding=padding,
-                        truncation=truncation,
+                        max_length,
+                        padding,
+                        truncation,
                     )
-                embeddings_array = self._extract_embeddings_array(outputs)
+                embeddings_array = self._extract_embeddings_array(outputs, eager_mask)
 
         mx.eval(embeddings_array)
         embeddings = embeddings_array.tolist()

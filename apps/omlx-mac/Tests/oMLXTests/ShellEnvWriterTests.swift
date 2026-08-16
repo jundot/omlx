@@ -56,6 +56,86 @@ final class ShellEnvWriterTests: XCTestCase {
         }
     }
 
+    /// #2680 — the coordinator probes ~/.omlx/bin/omlx-cluster-python before
+    /// anything else. Nothing shipped it, so a peer with the app installed
+    /// failed every discovery candidate and was reported as "worker runtime is
+    /// not installed".
+    func testEnsureCLIShimAlsoPublishesTheClusterInterpreter() throws {
+        let appURL = try makeFakeAppURL()
+
+        try ShellEnvWriter.ensureCLIShim(appBundleURL: appURL)
+
+        let shim = tempHome
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("omlx-cluster-python")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: shim.path))
+        let shimText = try String(contentsOf: shim, encoding: .utf8)
+        XCTAssertTrue(shimText.contains("Contents/MacOS/omlx-cluster-python"))
+        XCTAssertTrue(shimText.contains("\"$@\""))
+        // It must not be the CLI launcher: that one forces -m omlx.cli and can
+        // never answer `-c 'import omlx'`.
+        XCTAssertFalse(shimText.contains("MacOS/omlx-cli"))
+    }
+
+    func testClusterInterpreterShimForwardsArgumentsVerbatim() throws {
+        let appURL = try makeFakeAppURL()
+        let output = tempHome.appendingPathComponent("cluster-python-args.txt")
+        let wrapper = appURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("omlx-cluster-python")
+        try """
+        #!/bin/sh
+        printf "%s" "$*" > \(shellQuote(output.path))
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: wrapper.path
+        )
+
+        try ShellEnvWriter.ensureCLIShim(appBundleURL: appURL)
+
+        let shim = tempHome
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("omlx-cluster-python")
+        let process = Process()
+        process.executableURL = shim
+        process.arguments = ["-c", "import omlx"]
+        process.environment = ["HOME": tempHome.path, "PATH": "/usr/bin:/bin"]
+        try process.run()
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertEqual(
+            try String(contentsOf: output, encoding: .utf8),
+            "-c import omlx"
+        )
+    }
+
+    /// An older bundle has no cluster wrapper; installing the CLI shim must
+    /// still succeed rather than throwing the whole app launch.
+    func testMissingClusterInterpreterDoesNotBlockCLIShimInstall() throws {
+        let appURL = try makeFakeAppURL(includeClusterPython: false)
+
+        try ShellEnvWriter.ensureCLIShim(appBundleURL: appURL)
+
+        let bin = tempHome
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(
+                atPath: bin.appendingPathComponent("omlx").path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: bin.appendingPathComponent("omlx-cluster-python").path
+            )
+        )
+    }
+
     func testEnsureCLIShimCreatesPublicSymlinkWhenWritable() throws {
         let publicBin = tempHome.appendingPathComponent("public-bin", isDirectory: true)
         try FileManager.default.createDirectory(at: publicBin, withIntermediateDirectories: true)
@@ -168,23 +248,29 @@ final class ShellEnvWriterTests: XCTestCase {
         XCTAssertTrue(ShellEnvWriter.shouldSuppressCLIPathPrompt())
     }
 
-    private func makeFakeAppURL() throws -> URL {
+    private func makeFakeAppURL(includeClusterPython: Bool = true) throws -> URL {
         let appURL = tempHome
             .appendingPathComponent("Apps", isDirectory: true)
             .appendingPathComponent("oMLX.app", isDirectory: true)
-        let cli = appURL
+        let macOS = appURL
             .appendingPathComponent("Contents", isDirectory: true)
             .appendingPathComponent("MacOS", isDirectory: true)
-            .appendingPathComponent("omlx-cli")
         try FileManager.default.createDirectory(
-            at: cli.deletingLastPathComponent(),
+            at: macOS,
             withIntermediateDirectories: true
         )
-        try "#!/bin/sh\n".write(to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: cli.path
-        )
+        var names = ["omlx-cli"]
+        if includeClusterPython {
+            names.append("omlx-cluster-python")
+        }
+        for name in names {
+            let executable = macOS.appendingPathComponent(name)
+            try "#!/bin/sh\n".write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
         return appURL
     }
 

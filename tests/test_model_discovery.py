@@ -853,6 +853,243 @@ class TestDiscoverModels:
         assert "/first/dup" in caplog.text
         assert str(second) in caplog.text
 
+    def test_discover_skips_incomplete_download_with_index(self, tmp_path, caplog):
+        """A partially downloaded sharded model (index present, shard missing)
+        is excluded from discovery, with a warning naming the missing shard."""
+        model_dir = tmp_path / "big-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'big-model'" in caplog.text
+        assert "model-00002-of-00002.safetensors" in caplog.text
+
+    def test_discover_skips_incomplete_download_without_index(self, tmp_path, caplog):
+        """Interrupted before the index file itself landed (upstream issue 459's
+        actual on-disk shape): only the shard filename numbering promises 14
+        shards; one is on disk."""
+        model_dir = tmp_path / "big-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model-00004-of-00014.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'big-model'" in caplog.text
+        assert "13 weight shard(s)" in caplog.text
+
+    def test_discover_complete_sharded_model_with_index(self, tmp_path, caplog):
+        """All shards referenced by the index are on disk — registers normally,
+        and an extra safetensors file the index does not reference (e.g. an oQ
+        model-mtp.safetensors) does not confuse the check."""
+        model_dir = tmp_path / "sharded"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-mtp.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert "sharded" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_stale_index_complete_other_shards_registers(
+        self, tmp_path, caplog
+    ):
+        """A repo shipping an index left over from a DIFFERENT sharding (none
+        of its referenced files exist) over a complete on-disk shard set is
+        stale-index, not incomplete-download: register, warn (real case:
+        mlx-community/Qwen3-Embedding-8B-mxfp8, 4-shard index over 2 shards)."""
+        model_dir = tmp_path / "stale-index"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                f"layer.{i}": f"model-0000{i}-of-00004.safetensors"
+                for i in range(1, 5)
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert "stale-index" in models
+        assert "stale" in caplog.text
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_stale_index_no_weights_skips(self, tmp_path, caplog):
+        """config.json + index landed first, zero shards on disk (interrupted
+        before the first shard finished): still skipped as incomplete."""
+        model_dir = tmp_path / "no-weights"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'no-weights'" in caplog.text
+
+    def test_discover_stale_index_partial_other_shards_skips(
+        self, tmp_path, caplog
+    ):
+        """Stale index AND the differently-numbered on-disk set has its own
+        gap: skip, reporting against the shards actually present."""
+        model_dir = tmp_path / "stale-partial"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                f"layer.{i}": f"model-0000{i}-of-00004.safetensors"
+                for i in range(1, 5)
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'stale-partial'" in caplog.text
+        assert "model-00002-of-00002.safetensors" in caplog.text
+
+    def test_discover_complete_sharded_model_without_index(self, tmp_path, caplog):
+        """A full 1..N shard set with no index file registers normally."""
+        model_dir = tmp_path / "sharded"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        for i in (1, 2, 3):
+            (model_dir / f"model-0000{i}-of-00003.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert "sharded" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_index_with_subpath_weight_map_values(self, tmp_path):
+        """weight_map values are resolved against the model directory (the HF
+        index convention), so ./-prefixed or subfolder entries are not
+        misreported as missing."""
+        model_dir = tmp_path / "subpath"
+        model_dir.mkdir()
+        (model_dir / "weights").mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "./model-00001-of-00002.safetensors",
+                "layer.b": "weights/model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "weights" / "model-00002-of-00002.safetensors").write_bytes(
+            b"0" * 1000
+        )
+
+        models = discover_models(tmp_path)
+        assert "subpath" in models
+
+    def test_discover_corrupt_index_falls_back_to_shard_numbering(
+        self, tmp_path, caplog
+    ):
+        """An unreadable index (here non-UTF-8 bytes, the UnicodeDecodeError
+        trap) must not crash discovery into the generic 'Failed to discover'
+        path: the filename-numbering fallback still separates a complete set
+        from a gapped one."""
+        ok = tmp_path / "ok-model"
+        ok.mkdir()
+        (ok / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (ok / "model.safetensors.index.json").write_bytes(b"\x80\x81 not json")
+        (ok / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (ok / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        gapped = tmp_path / "gapped-model"
+        gapped.mkdir()
+        (gapped / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (gapped / "model.safetensors.index.json").write_bytes(b"\x80\x81 not json")
+        (gapped / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert "ok-model" in models
+        assert "gapped-model" not in models
+        assert "incomplete model 'gapped-model'" in caplog.text
+        assert "Failed to discover" not in caplog.text
+
+    def test_discover_zero_based_shard_numbering_registers(self, tmp_path, caplog):
+        """A complete 0-based shard set (non-HF numbering variant) is not a
+        false positive."""
+        model_dir = tmp_path / "zero-based"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        for i in (0, 1, 2):
+            (model_dir / f"model-0000{i}-of-00003.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert "zero-based" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_duplicate_padding_cannot_mask_a_gap(self, tmp_path, caplog):
+        """Two spellings of the same shard index don't add up to a complete
+        set: distinct indices are counted, not filenames."""
+        model_dir = tmp_path / "padded"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-0001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert models == {}
+        assert "incomplete model 'padded'" in caplog.text
+
+    def test_discover_subdirectory_weights_not_flagged(self, tmp_path):
+        """Weights living only in a subdirectory (estimate_model_size's
+        **/*.safetensors fallback layout) make no top-level shard promises and
+        register normally."""
+        model_dir = tmp_path / "nested"
+        model_dir.mkdir()
+        (model_dir / "weights").mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "weights" / "part.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert "nested" in models
+
     def test_discover_model_dir_is_itself_a_model(self, tmp_path):
         """Test that pointing directly at a model directory works."""
         model_dir = tmp_path / "Qwen3-5-9B-MLX-4bit"

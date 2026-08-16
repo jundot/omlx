@@ -2733,7 +2733,11 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
             capacity_bytes = await asyncio.to_thread(
                 probe_remote_admission_ceiling,
                 host.ssh,
-                python_executable=host.python_executable or sys.executable,
+                # No fallback to sys.executable: inside the packaged app that
+                # is a bundled interpreter which exists on the peer but cannot
+                # import oMLX, so every poll 503'd (#2680). Unknown means the
+                # probe discovers the peer's own interpreter.
+                python_executable=host.python_executable,
             )
             capacity_source = "admission_ceiling"
         budget = await asyncio.to_thread(

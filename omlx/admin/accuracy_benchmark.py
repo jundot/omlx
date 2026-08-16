@@ -18,6 +18,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, field_validator, model_validator
 
+from .accuracy_upload import build_upload_context, upload_intelligence_result
 from .external_api import (
     ExternalAPIClient,
     ExternalChatAdapter,
@@ -132,10 +133,15 @@ class AccuracyBenchmarkRun:
     #   pending → loading → evaluating → unloading → completed
     # (cancelled / error replace the terminal phase on those branches.)
     phase: str = "pending"
+    # Snapshot for the omlx.ai upload, captured at run start (local runs
+    # only). None disables upload for the run — external endpoints, or a
+    # capture failure that must not fail the benchmark itself.
+    upload_ctx: Optional[dict] = None
 
 
 # Accuracy stream closes on `done` (run finished) or `error`. Unlike the
-# throughput bench there's no separate upload phase to ride out.
+# throughput bench there's no post-done upload phase to ride out: each
+# suite's `upload` event is emitted right after its `result`, before `done`.
 _ACCURACY_TERMINAL_TYPES = frozenset({"done", "error"})
 
 
@@ -458,6 +464,14 @@ async def run_accuracy_benchmark(
                     if ms.presence_penalty is not None:
                         sampling_kwargs["presence_penalty"] = ms.presence_penalty
 
+            # Snapshot the upload context (hardware, quantization, feature
+            # flags, submission group). A failure here only disables the
+            # community upload, never the benchmark itself.
+            try:
+                run.upload_ctx = build_upload_context(request, engine_pool)
+            except Exception as e:
+                logger.warning(f"Accuracy upload context unavailable: {e}")
+
         # Phase 3: Run each benchmark
         run.phase = "evaluating"
         completed = 0
@@ -582,6 +596,8 @@ async def run_accuracy_benchmark(
                 "total": result.total_questions,
                 "correct": result.correct_count,
                 "time_s": round(result.time_seconds, 1),
+                "dataset_total": evaluator.dataset_total,
+                "sampling_profile": request.sampling_profile,
                 "question_results": question_results,
             }
             if request.external is not None:
@@ -638,6 +654,25 @@ async def run_accuracy_benchmark(
                 "type": "result",
                 "data": result_data,
             })
+
+            # Upload to omlx.ai community benchmarks, per suite, before the
+            # done event so the SSE terminal contract stays unchanged.
+            # result_data is the same object stored in _accumulated_results,
+            # so the outcome is visible to polling clients and SSE replay
+            # without any extra state. Never fails the benchmark.
+            if run.upload_ctx is not None and run.status != "cancelled":
+                outcome = await upload_intelligence_result(
+                    run, run.upload_ctx, result_data
+                )
+                result_data["upload"] = outcome
+                await _send_event(run, {
+                    "type": "upload",
+                    "data": {
+                        "model_id": request.model_id,
+                        "benchmark": result_data["benchmark"],
+                        **outcome,
+                    },
+                })
 
         # Phase 4: Unload model. The result(s) are already emitted by now,
         # so flip phase so polling clients hide the running indicator

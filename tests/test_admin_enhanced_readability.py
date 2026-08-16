@@ -12,9 +12,9 @@ the three behaviors the upstream reviewer asked for:
                     form (``.text-\[10px\]``) so they actually match the compiled
                     CSS, lifting sub-12px text to 12px.
 
-Plus invariants: gray helper text -> primary, red kept, model-card markdown
-keeps its original gray, and the i18n key exists in every locale (English
-fallback, not translated here).
+Plus invariants: gray helper text -> primary, red kept, model-card gray text is
+also lifted to primary, no blanket disabled-text override, and the i18n key
+exists in every locale (English fallback, not translated here).
 """
 
 import json
@@ -29,6 +29,8 @@ I18N = ROOT / "omlx/admin/i18n"
 
 BASE = (TEMPLATES / "base.html").read_text(encoding="utf-8")
 CHAT = (TEMPLATES / "chat.html").read_text(encoding="utf-8")
+DASHBOARD_NAV = (TEMPLATES / "dashboard/_navbar.html").read_text(encoding="utf-8")
+DASHBOARD_JS = (ROOT / "omlx/admin/static/js/dashboard.js").read_text(encoding="utf-8")
 
 
 def _env():
@@ -39,6 +41,7 @@ def test_templates_compile():
     env = _env()
     env.get_template("base.html")
     env.get_template("chat.html")
+    env.get_template("dashboard.html")
 
 
 def test_cascade_after_block_head():
@@ -74,7 +77,12 @@ def test_red_kept_as_functional_red():
     assert "#ef5b54 !important" in BASE
 
 
-def test_model_card_gray_text_also_darkens():
+def test_no_blanket_disabled_text_color_override():
+    assert "[data-enhanced-readability] :disabled" not in BASE
+    assert "[data-enhanced-readability] [disabled]" not in BASE
+
+
+def test_model_card_gray_text_maps_to_primary():
     # The model-card markup container is no longer exempt; its gray (incl.
     # #475569, a common model-card gray) is lifted to primary via the gray-hex
     # mapping. Explicitly-colored markdown (links/code) is untouched because
@@ -100,6 +108,27 @@ def test_switch_below_theme_and_wired():
     assert "setEnhancedReadability(!enhancedReadability)" in CHAT
 
 
+def test_dashboard_theme_menu_controls_same_readability_setting():
+    assert DASHBOARD_NAV.count("setEnhancedReadability(!enhancedReadability)") == 2
+    assert "chat.enhanced_readability" in DASHBOARD_NAV
+    assert '@focusin="themeDropdown = true"' in DASHBOARD_NAV
+    assert ":aria-expanded=\"themeDropdown ? 'true' : 'false'\"" in DASHBOARD_NAV
+    assert "enhancedReadability:" in DASHBOARD_JS
+    assert "localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on'" in DASHBOARD_JS
+    assert (
+        "localStorage.setItem(ENHANCED_READABILITY_KEY, enabled ? 'on' : 'off')"
+        in DASHBOARD_JS
+    )
+    assert (
+        "document.documentElement.setAttribute('data-enhanced-readability', '')"
+        in DASHBOARD_JS
+    )
+    assert (
+        "document.documentElement.removeAttribute('data-enhanced-readability')"
+        in DASHBOARD_JS
+    )
+
+
 def test_shortcuts_at_top_of_chat_settings():
     # Keyboard-shortcuts button is the first item in the chat-settings panel.
     assert CHAT.index("chat.shortcuts") < CHAT.index("chat.attachments")
@@ -110,5 +139,7 @@ def test_i18n_key_present_in_all_locales():
     for loc in locales:
         data = json.loads((I18N / f"{loc}.json").read_text(encoding="utf-8"))
         assert "chat.enhanced_readability" in data, f"{loc} missing key"
-        assert data["chat.enhanced_readability"] == "Enhanced Readability", f"{loc} not English fallback"
+        assert (
+            data["chat.enhanced_readability"] == "Enhanced Readability"
+        ), f"{loc} not English fallback"
         assert "chat.enhanced_readability_desc" in data

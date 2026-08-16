@@ -86,7 +86,8 @@ def apply_mlx_vlm_mtp_runtime_patch() -> bool:
     the MTP head at inference time.
 
     Covers Qwen3.5-MoE (qwen3_5_moe), dense Qwen3.5/3.6 (qwen3_5) and
-    Gemma 4 merged-assistant (gemma4) VLM families. Each sub-patch tracks
+    Gemma 4 merged-assistant (gemma4 and gemma4_unified) VLM families. Each
+    sub-patch tracks
     its own ``_APPLIED`` flag, so calling repeatedly is cheap once all
     have settled. Returns True if at least one sub-patch applied
     successfully — a given model only needs whichever matches its

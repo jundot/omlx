@@ -16,6 +16,9 @@ NEW_I18N_KEYS = {
     "chat.regenerate_creative",
     "chat.regenerate_with",
     "chat.chat_tab",
+    "chat.max_tool_rounds",
+    "chat.max_tool_rounds_hint",
+    "chat.error.max_tool_rounds",
 }
 
 

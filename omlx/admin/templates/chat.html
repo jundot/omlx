@@ -2292,7 +2292,7 @@
                 <div class="space-y-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.behavior') }}</label>
-                    <div class="p-3 bg-surface-muted rounded-xl border border-line">
+                    <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-3">
                         <div class="svg-allow-row">
                             <div class="svg-allow-label">
                                 <i data-lucide="arrow-down-to-line" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
@@ -2307,6 +2307,19 @@
                             </button>
                         </div>
                         <p class="svg-allow-warning" x-text="window.t('chat.scroll_behavior_hint')"></p>
+                        <div class="pt-3 border-t border-line space-y-1.5">
+                            <div class="flex items-center justify-between gap-3">
+                                <label class="text-xs font-medium" style="color: var(--text-primary);"
+                                    for="max-tool-rounds" x-text="window.t('chat.max_tool_rounds')"></label>
+                                <input id="max-tool-rounds" type="number" min="1" max="100" step="1"
+                                    x-model.number="chatSettings.maxToolRounds"
+                                    @change="chatSettings.maxToolRounds = normalizeMaxToolRounds(chatSettings.maxToolRounds); saveChatSettings()"
+                                    class="w-20 px-2 py-1.5 text-xs text-right border border-line rounded-lg focus:outline-none focus:border-line-strong bg-surface"
+                                    style="color: var(--text-primary);">
+                            </div>
+                            <p class="text-[10px]" style="color: var(--text-tertiary);"
+                                x-text="window.t('chat.max_tool_rounds_hint')"></p>
+                        </div>
                     </div>
                 </div>
 
@@ -2539,13 +2552,30 @@
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
             showChatSettingsModal: false,
-            enhancedReadability: localStorage.getItem('omlx-enhanced-readability') === 'on',
+            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
             chatSettings: (() => {
-                const d = { maxImages: 10, maxImageSizeMb: 10, showScrollButton: true, webSearchEnabled: false };
-                try { return { ...d, ...JSON.parse(localStorage.getItem('omlx-chat-settings') || '{}') }; }
-                catch { return d; }
+                const d = {
+                    maxImages: 10,
+                    maxImageSizeMb: 10,
+                    maxToolRounds: 10,
+                    showScrollButton: true,
+                    webSearchEnabled: false,
+                };
+                try {
+                    const saved = JSON.parse(localStorage.getItem('omlx-chat-settings') || '{}');
+                    const parsedMaxToolRounds = Number.parseInt(saved.maxToolRounds, 10);
+                    return {
+                        ...d,
+                        ...saved,
+                        maxToolRounds: Number.isFinite(parsedMaxToolRounds)
+                            ? Math.min(100, Math.max(1, parsedMaxToolRounds))
+                            : d.maxToolRounds,
+                    };
+                } catch {
+                    return d;
+                }
             })(),
             chatSearchQuery: '',
             showShortcutsHelp: false,
@@ -2635,8 +2665,6 @@
             profileDeleteConfirm: null,
 
             // MODEL SETTINGS Section State (shared prompt profiles from PROFILE tab)
-            // MCP Tool Call Limits
-            MAX_TOOL_DEPTH: 10,          // Max recursive streamResponse calls for tool loops
             TOOL_TIMEOUT_MS: 30000,      // Per-tool execution timeout (ms)
 
             // MCP tools & prefill polling
@@ -6048,6 +6076,7 @@
             _apiVariantChainId: streamContext?._apiVariantChainId ?? null,
             _modelOverride: streamContext?._modelOverride ?? null,
             _generationOverride: streamContext?._generationOverride ?? null,
+            _requestStartedAt: streamContext?._requestStartedAt ?? null,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
@@ -6065,23 +6094,11 @@
         }
         chatSession.systemPrompt = context.systemPrompt;
 
-        if (depth > this.MAX_TOOL_DEPTH) {
-            chatSession.messages.push({
-                id: this.newMessageId(),
-                role: 'assistant',
-                content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
-                model: requestModel,
-                _profile: context._profile,
-                _perfVisible: false,
-            });
-            this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
-            this.resetStreamSession(stream);
-            return;
-        }
         // Initialise timing and status log once, at the top of a new prompt
         if (depth === 0) {
             this.resetStreamSession(stream);
-            stream._statusStart = Date.now();
+            context._requestStartedAt = Date.now();
+            stream._statusStart = context._requestStartedAt;
             stream.targetMessageId = this.newMessageId();
             stream.sourceModel = requestModel;
             stream.sourceSystemPrompt = context.systemPrompt;
@@ -6291,6 +6308,42 @@
 
             const toolCalls = Object.values(toolCallsMap);
             if (toolCalls.length > 0) {
+                const maxToolRounds = this.normalizeMaxToolRounds(this.chatSettings.maxToolRounds);
+                if (depth >= maxToolRounds) {
+                    const assistantId = stream.targetMessageId || this.newMessageId();
+                    const errorMsg = {
+                        id: assistantId,
+                        role: 'assistant',
+                        content: window.t('chat.error.max_tool_rounds')
+                            .replace('{max}', maxToolRounds),
+                        reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
+                            ? stream.streamingThinking : null,
+                        model: requestModel,
+                        meta: this.captureGenerationContext(
+                            requestModel,
+                            context.systemPrompt,
+                            context._profile,
+                            context._generationOverride
+                        ),
+                        _perfVisible: false,
+                        _thinkingOpen: false,
+                    };
+                    this.attachThinkingToAssistantMessage(errorMsg, stream.streamingThinking);
+                    this.attachProfileToAssistantMessage(errorMsg, context._profile);
+                    chatSession.messages.push(errorMsg);
+                    this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
+                    this.saveCurrentChat(
+                        context.chatId,
+                        chatSession.messages,
+                        chatSession.model,
+                        context.systemPrompt
+                    );
+                    if (this.currentChatId === context.chatId) {
+                        this.scheduleEnhanceMessages();
+                    }
+                    return;
+                }
+
                 // Log the resolved tool set once — summarise when count is large
                 const names = toolCalls.map(t => t.function.name).filter(Boolean);
                 const uniqueNames = [...new Set(names)];
@@ -6520,7 +6573,7 @@
                     }
                 }
                 if (msg) {
-                        const totalTime = ((Date.now() - stream._statusStart) / 1000).toFixed(2);
+                        const totalTime = ((Date.now() - context._requestStartedAt) / 1000).toFixed(2);
                         const perfEntries = [];
                         const meta = msg.meta || {};
                         const gen = meta.generation || {};
@@ -6581,10 +6634,9 @@
                 }
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
                 this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
-            }
-            this.resetStreamSession(stream, { preserveFinalContent: true });
-            this.thinkingAutoScroll = true;
-            if (depth === 0) {
+                // Recursive tool rounds share one stream; only its root owns cleanup.
+                this.resetStreamSession(stream, { preserveFinalContent: true });
+                this.thinkingAutoScroll = true;
                 this.stopStatsPollingIfIdle();
                 this.ensureStatsPollingForCurrentChat();
             }
@@ -6897,7 +6949,8 @@
         if (!container) return;
         const target = container.querySelector(`.message-fade-in[data-msg-index="${index}"]`);
         if (target && target.offsetParent !== null) {
-            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+            target.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
         }
     },
 
@@ -7285,7 +7338,15 @@
         this.refreshCodeBlockButtons();
     },
 
+    normalizeMaxToolRounds(value) {
+        const parsed = Number.parseInt(value, 10);
+        return Number.isFinite(parsed) ? Math.min(100, Math.max(1, parsed)) : 10;
+    },
+
     saveChatSettings() {
+        this.chatSettings.maxToolRounds = this.normalizeMaxToolRounds(
+            this.chatSettings.maxToolRounds
+        );
         localStorage.setItem('omlx-chat-settings', JSON.stringify(this.chatSettings));
     },
 
@@ -7677,8 +7738,8 @@
                 // scrolls don't animate and fight a user scrolling away; the scroll
                 // listener distinguishes this downward auto-follow from a user
                 // scrolling up by direction. Smooth only for explicit "jump to
-                // latest" (force=true).
-                behavior: force ? 'smooth' : 'auto'
+                // latest" (force=true). Honor reduce-motion by never animating.
+                behavior: (force && !matchMedia('(prefers-reduced-motion: reduce)').matches) ? 'smooth' : 'auto'
             });
         });
     },
