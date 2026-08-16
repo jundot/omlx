@@ -641,6 +641,68 @@ async def _send_event(run: BenchmarkRun, event: dict) -> None:
         run.cond.notify_all()
 
 
+
+def _drain_mtp_snapshots() -> list[dict]:
+    """Pull finished-sequence Lightning MTP stats from the shared decode loop.
+
+    Fail-soft on purpose: telemetry must never break a benchmark, and the
+    MTP patch module may legitimately be absent for non-MTP models.
+    """
+    try:
+        from ..patches.mlx_lm_mtp.batch_generator import drain_mtp_stats_snapshots
+
+        return drain_mtp_stats_snapshots()
+    except Exception:
+        return []
+
+
+def _summarize_mtp(entries: list[dict], expected_sequences: int) -> dict | None:
+    """Aggregate drained snapshots into the acceptance summary for one point.
+
+    The registry is process-global and drained wholesale, so attribution
+    rests on the benchmark being the only traffic on the server. That
+    assumption is validated rather than trusted: the benchmark knows how
+    many sequences it ran for the point, and when the drained unique-uid
+    count disagrees the summary is withheld with a warning — visibly absent
+    beats silently contaminated. The guard is cardinality, not ownership:
+    concurrent traffic that happens to finish exactly the expected number
+    of MTP sequences while the benchmark's own produce none would still be
+    misattributed. Exact per-request attribution needs scheduler-uid
+    plumbing beyond this change's scope. A sequence can legitimately produce more
+    than one snapshot (late-join handoff logs a segment, then the rejoined
+    run logs another), so ``segments`` may exceed ``sequences``.
+
+    Rates are recomputed from summed counters rather than averaged
+    per-sequence so short sequences don't dominate.
+    """
+    if not entries:
+        return None
+    uids = {e.get("uid") for e in entries}
+    if len(uids) != expected_sequences:
+        logger.warning(
+            "MTP telemetry withheld for this point: drained %d sequence(s), "
+            "expected %d — was other traffic hitting the server during the "
+            "benchmark?",
+            len(uids),
+            expected_sequences,
+        )
+        return None
+    cycles = sum(e.get("cycles", 0) for e in entries)
+    accepts = sum(e.get("accepts", 0) for e in entries)
+    drafted = sum(e.get("drafted", 0) for e in entries)
+    tokens = sum(e.get("tokens", 0) for e in entries)
+    return {
+        "sequences": len(uids),
+        "segments": len(entries),
+        "tokens": tokens,
+        "cycles": cycles,
+        "accepts": accepts,
+        "drafted": drafted,
+        "accept_pct": round(accepts / drafted * 100, 1) if drafted else None,
+        "tok_per_cycle": round(tokens / cycles, 2) if cycles else None,
+    }
+
+
 async def _run_single_test(
     engine: Any,
     prompt: list[int],
@@ -659,6 +721,10 @@ async def _run_single_test(
         mx.reset_peak_memory()
     except Exception:
         pass
+
+    # Discard stats left over from priming or pre-benchmark traffic so the
+    # post-test drain attributes cleanly to this request.
+    _drain_mtp_snapshots()
 
     start_time = time.perf_counter()
     first_token_time = None
@@ -750,7 +816,7 @@ async def _run_single_test(
 
     generation_measured = generation_duration_s is not None
 
-    return _compute_single_metrics(
+    metrics = _compute_single_metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=metric_completion_tokens,
         start_time=start_time,
@@ -762,6 +828,10 @@ async def _run_single_test(
         generation_duration_s=generation_duration_s,
         generation_measured=generation_measured,
     )
+    mtp = _summarize_mtp(_drain_mtp_snapshots(), expected_sequences=1)
+    if mtp is not None:
+        metrics["mtp"] = mtp
+    return metrics
 
 
 async def _run_batch_test(
@@ -852,6 +922,7 @@ async def _run_batch_test(
             mx.reset_peak_memory()
         except Exception:
             pass
+    _drain_mtp_snapshots()  # discard pre-test stats for clean attribution
     wall_start = time.perf_counter()
     results = await asyncio.gather(
         *[_single_request(prompts[i]) for i in range(batch_size)]
@@ -880,7 +951,7 @@ async def _run_batch_test(
     gen_wall_time = wall_end - max_first_token
     tg_tps = total_gen_tokens / max(gen_wall_time, 1e-9)
 
-    return {
+    batch_metrics = {
         "pp_tps": round(pp_tps, 1),
         "tg_tps": round(tg_tps, 1),
         "avg_ttft_ms": round(avg_ttft_ms, 1),
@@ -889,6 +960,10 @@ async def _run_batch_test(
         "total_gen_tokens": total_gen_tokens,
         "batch_size": batch_size,
     }
+    mtp = _summarize_mtp(_drain_mtp_snapshots(), expected_sequences=batch_size)
+    if mtp is not None:
+        batch_metrics["mtp"] = mtp
+    return batch_metrics
 
 
 async def _run_external_single_test(
