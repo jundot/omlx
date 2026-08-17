@@ -1745,6 +1745,30 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
 
+        # Qwen3.5/3.6 verify-width GDN prework -> one fused Metal launch
+        # (conv+SiLU+split+RMS+scale+conv-state), bit-exact to the chain.
+        try:
+            from ..patches.qwen35_gdn_prework import (
+                apply_qwen35_gdn_prework_patch,
+            )
+
+            apply_qwen35_gdn_prework_patch()
+        except Exception:
+            logger.debug("Qwen GDN prework patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 verify-width (MTP target-verify) attention -> chunked
+        # causal vector-kernel calls instead of the per-row SDPA loop.
+        try:
+            from ..patches.qwen35_verify_sdpa_split import (
+                apply_qwen35_verify_sdpa_split_patch,
+            )
+
+            apply_qwen35_verify_sdpa_split_patch()
+        except Exception:
+            logger.debug(
+                "Qwen verify-split attention patch not applied", exc_info=True
+            )
+
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
         # Decode and masked paths keep the original mlx-vlm kernel.
         gdn_prefill_enabled = getattr(

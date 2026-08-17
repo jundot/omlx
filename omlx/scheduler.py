@@ -1742,6 +1742,27 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        # Qwen3.5/3.6 hybrid (GatedDeltaNet + hd-256 full attention): the
+        # fused prefill routes favor wider chunks. Measured on the 27B
+        # (M3 Ultra, 2026-08-17): chunk 4096 beats the 2048 default +3.2%
+        # at 4k prompts / +1.0% at 16k, 8192 flat vs 4096. Floor the chunk
+        # at 4096 when the machine has headroom; the prefill memory guard
+        # still shrinks chunks under pressure, so small Macs are unchanged.
+        self._qwen35_prefill_floor = 0
+        try:
+            _mt = str(getattr(model, "model_type", "") or "")
+            if not _mt:
+                _mt = str(
+                    getattr(getattr(model, "config", None), "model_type", "") or ""
+                )
+            if _mt.startswith("qwen3_5"):
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3:
+                    self._qwen35_prefill_floor = 4096
+        except Exception:
+            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -4800,7 +4821,11 @@ class Scheduler:
 
         adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
-            return self.config.prefill_step_size
+            size = self.config.prefill_step_size
+            floor = getattr(self, "_qwen35_prefill_floor", 0)
+            if floor and size < floor:
+                size = floor
+            return size
         from .patches.minimax_m3.generate_patch import (
             _prefill_step_size_for_progress as _minimax_prefill_step_size,
         )
