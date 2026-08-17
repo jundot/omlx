@@ -5343,14 +5343,22 @@ async def delete_hf_model(
     model_name: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Delete a downloaded model from disk and refresh the model pool."""
+    """Delete a downloaded model or HF cache entry and refresh the model pool."""
     global_settings = _get_global_settings()
     engine_pool = _get_engine_pool()
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+    # The Models screen includes compatible entries discovered directly from
+    # the Hugging Face Hub cache, which is an effective model directory rather
+    # than a user-configured model directory. Search the same roots used by
+    # discovery so every listed model can also be deleted.
+    model_dirs = list(global_settings.get_effective_model_dirs())
+    if not model_dirs:  # Defensive fallback for partial settings/test doubles.
+        model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+
+    from ..model_discovery import _resolve_hf_cache_entry
 
     # Search for model across all directories in both flat and org-folder layouts
     model_path = None
@@ -5363,10 +5371,25 @@ async def delete_hf_model(
             model_path = candidate
             parent_model_dir = model_dir
             break
-        # Try two-level: search inside organization folders
+        # Try HF cache entries and two-level organization folders.
         for subdir in model_dir.iterdir():
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
+
+            hf_resolved = _resolve_hf_cache_entry(subdir)
+            if hf_resolved is not None:
+                if (
+                    hf_resolved.model_id == model_name
+                    and (hf_resolved.snapshot_path / "config.json").exists()
+                ):
+                    # Delete the complete repository cache entry, including
+                    # refs, snapshots, and blobs. Removing only the active
+                    # snapshot would leave most of the downloaded data behind.
+                    model_path = subdir
+                    parent_model_dir = model_dir
+                    break
+                continue
+
             candidate = subdir / model_name
             if candidate.is_dir() and (candidate / "config.json").exists():
                 model_path = candidate

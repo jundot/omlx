@@ -880,6 +880,72 @@ class TestHFDownloaderRoutes:
             routes_module._get_settings_manager = orig_mgr
 
     @pytest.mark.asyncio
+    async def test_delete_hf_cache_model_removes_repo_entry(self, tmp_path):
+        """Deleting a discovered HF cache model removes its complete cache entry."""
+        import omlx.admin.routes as routes_module
+        from omlx.admin.routes import delete_hf_model
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        hf_cache_dir = tmp_path / "hub"
+        hf_cache_dir.mkdir()
+
+        entry = hf_cache_dir / "models--mlx-community--Tiny-MLX"
+        snapshot = entry / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        (entry / "refs").mkdir()
+        (entry / "refs" / "main").write_text("abc123\n")
+        (entry / "blobs").mkdir()
+        (entry / "blobs" / "weight").write_bytes(b"weights")
+        (snapshot / "config.json").write_text('{"architectures": ["LlamaForCausalLM"]}')
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+
+        sibling = hf_cache_dir / "models--mlx-community--Keep-MLX"
+        sibling.mkdir()
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [
+            model_dir,
+            hf_cache_dir,
+        ]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+        mock_pool._entries = {}
+        mock_pool.discover_models = MagicMock()
+
+        mock_settings_mgr = MagicMock()
+        mock_settings_mgr.get_pinned_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: mock_settings_mgr
+
+        try:
+            result = await delete_hf_model(
+                model_name="mlx-community--Tiny-MLX", is_admin=True
+            )
+
+            assert result["success"] is True
+            assert not entry.exists()
+            assert sibling.exists()
+            mock_settings_mgr.delete_settings.assert_called_once_with(
+                "mlx-community--Tiny-MLX"
+            )
+            mock_pool.discover_models.assert_called_once_with(
+                [str(model_dir), str(hf_cache_dir)], []
+            )
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+
+    @pytest.mark.asyncio
     async def test_delete_model_organized_drops_empty_org_folder(self, tmp_path):
         """Deleting the last model in an org folder should drop the empty org dir."""
         from omlx.admin.routes import delete_hf_model
