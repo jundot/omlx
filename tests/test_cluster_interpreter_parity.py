@@ -21,6 +21,7 @@ from test_cluster_launch import _deployment
 from omlx.cluster import launch
 from omlx.cluster.launch import (
     DistributedLaunchError,
+    _local_probe_versions,
     _local_runtime_versions,
     preflight_remote_hosts,
     probe_remote_host,
@@ -31,7 +32,9 @@ PEER_PYTHON = "/opt/omlx/bin/python"
 
 
 def _status(python_version: str | None) -> dict:
-    versions = _local_runtime_versions()
+    # probe.py reports mlx/mlx-lm as module constants, so a fake probe payload
+    # must mirror that source and not dist-info (#2726).
+    versions = _local_probe_versions()
     runtime = {
         "omlx_version": versions["omlx"],
         "mlx_version": versions["mlx"],
@@ -166,7 +169,7 @@ def test_probe_still_rejects_a_genuine_omlx_source_version_difference():
 
     assert result["runtime_compatible"] is False
     assert result["runtime_mismatches"] == [
-        f"omlx local={_local_runtime_versions()['omlx']} remote=0.0.0-other"
+        f"omlx local={_local_probe_versions()['omlx']} remote=0.0.0-other"
     ]
 
 
