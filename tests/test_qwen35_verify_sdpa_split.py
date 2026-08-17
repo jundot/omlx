@@ -77,3 +77,23 @@ def test_eligibility_gates():
         bits = 4
 
     assert _eligible(q, k, _QuantCache()) == 0
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_eligibility_gates_turboquant_proxy():
+    """A turboquant-quantized KV cache hands back a proxy with .shape but no
+    .ndim (mlx_vlm.turboquant._QuantizedStateProxy, kept dequantized-free on
+    purpose). _eligible() must treat that as "not ours" rather than raising —
+    it used to crash every verify forward once turboquant KV compression was
+    active, since the .ndim check ran before the cache-type guard could rule
+    the call out.
+    """
+
+    class _TurboQuantProxy:
+        def __init__(self, shape):
+            self.shape = shape
+
+    q = mx.random.normal((1, HQ, 4, HD)).astype(mx.bfloat16)
+    k = mx.random.normal((1, HKV, 256, HD)).astype(mx.bfloat16)
+    assert _eligible(_TurboQuantProxy((1, HQ, 4, HD)), k, None) == 0
+    assert _eligible(q, _TurboQuantProxy((1, HKV, 256, HD)), None) == 0

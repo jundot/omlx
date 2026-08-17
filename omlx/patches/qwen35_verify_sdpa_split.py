@@ -75,7 +75,13 @@ def _chunked_causal_sdpa(queries, keys, values, scale, limit: int):
 
 def _eligible(queries, keys, cache) -> int:
     """Return the vector-kernel row limit (>0) when this call is ours."""
-    if queries.ndim != 4 or keys.ndim != 4:
+    # A turboquant-quantized cache hands back `_QuantizedStateProxy` objects
+    # (exposes .shape, deliberately not .ndim, to avoid dequantizing — see
+    # mlx_vlm.turboquant). That's exactly the "quantized caches" case this
+    # patch already means to delegate to the original path below, but the
+    # attribute access below used to run before the `hasattr(cache, "bits")`
+    # guard could rule it out, so it crashed instead of falling through.
+    if getattr(queries, "ndim", None) != 4 or getattr(keys, "ndim", None) != 4:
         return 0
     if queries.shape[0] != 1:
         return 0
