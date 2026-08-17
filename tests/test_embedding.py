@@ -805,6 +805,37 @@ class TestEmbeddingCompileFallback:
         result = model.embed([{"image": IMAGE_DATA_URI}])
 
         assert result.total_tokens == 4
+        assert result.token_counts == [4]
+
+    def test_custom_processor_reports_per_input_token_counts(self):
+        """Prepared masks should retain token usage for each batched input."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.1, 0.2], [0.3, 0.4]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+        model.model = MagicMock(return_value=mock_outputs)
+
+        processor = MagicMock(spec=[])
+        processor.prepare_embedding_inputs = MagicMock(
+            return_value={
+                "input_ids": mx.array([[11, 12, 0], [21, 22, 23]]),
+                "attention_mask": mx.array([[1, 1, 0], [1, 1, 1]]),
+            }
+        )
+        model.processor = processor
+
+        result = model.embed(["short", "longer"])
+
+        assert result.total_tokens == 5
+        assert result.token_counts == [2, 3]
 
     def test_standard_processor_rejects_image_inputs(self):
         """Standard text embedding processors should reject image items."""
@@ -985,12 +1016,14 @@ class TestEmbeddingEngine:
         engine = EmbeddingEngine(
             "test-model",
             scheduler_config=SchedulerConfig(
+                max_num_seqs=7,
                 completion_batch_size=6,
                 embedding_batch_size=4,
             ),
         )
 
         assert engine.get_stats()["batch_size"] == 4
+        assert engine.get_stats()["max_pending_requests"] == 7
 
     def test_engine_ignores_scheduler_completion_batch_size(self):
         """Completion batching should not affect embedding forward chunks."""
@@ -1075,36 +1108,319 @@ class TestEmbeddingEngine:
             mock_mx.synchronize.assert_called_once()
             mock_mx.clear_cache.assert_called_once()
 
-    def test_engine_clears_metal_cache_per_concurrent_request(self):
-        """Cache clear must fire per request even under concurrency (#684 regression).
-
-        The earlier fix gated the clear on `_active_count == 0`, which never
-        triggered under steady concurrent RAG indexing loads. This asserts
-        every request clears, not just the last one.
-        """
-        engine = EmbeddingEngine("test-model")
+    def test_engine_microbatches_concurrent_small_requests(self):
+        """Concurrent small requests should share one bounded forward pass."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=4, microbatch_wait_ms=10
+        )
         concurrency = 4
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
              patch("omlx.engine.embedding.mx") as mock_mx:
             mock_model = MagicMock()
-            mock_model.embed.return_value = EmbeddingOutput(
-                embeddings=[[0.1, 0.2]],
-                total_tokens=5,
-                dimensions=2,
-            )
+
+            def embed_side_effect(inputs, **kwargs):
+                return EmbeddingOutput(
+                    embeddings=[[float(text.rsplit("-", 1)[-1])] for text in inputs],
+                    total_tokens=len(inputs),
+                    dimensions=1,
+                    token_counts=[1] * len(inputs),
+                )
+
+            mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
 
             async def run_concurrent():
                 await engine.start()
-                await asyncio.gather(
+                return await asyncio.gather(
                     *(engine.embed([f"text-{i}"]) for i in range(concurrency))
+                )
+
+            results = asyncio.run(run_concurrent())
+
+            assert [result.embeddings for result in results] == [
+                [[float(index)]] for index in range(concurrency)
+            ]
+            assert [result.total_tokens for result in results] == [1] * concurrency
+            assert mock_model.embed.call_count == 1
+            assert mock_mx.synchronize.call_count == 1
+            assert mock_mx.clear_cache.call_count == 1
+
+    def test_engine_dispatches_as_soon_as_microbatch_fills(self):
+        """A full batch should wake the dispatcher before the wait deadline."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=2, microbatch_wait_ms=10_000
+        )
+
+        def embed_side_effect(inputs, **kwargs):
+            return EmbeddingOutput(
+                embeddings=[[float(len(text))] for text in inputs],
+                total_tokens=sum(len(text) for text in inputs),
+                dimensions=1,
+                token_counts=[len(text) for text in inputs],
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_requests():
+                await engine.start()
+                first = asyncio.create_task(engine.embed(["a"]))
+                await asyncio.sleep(0.01)
+                second = asyncio.create_task(engine.embed(["bb"]))
+                return await asyncio.wait_for(
+                    asyncio.gather(first, second), timeout=1.0
+                )
+
+            results = asyncio.run(run_requests())
+
+        assert mock_model.embed.call_count == 1
+        assert [result.total_tokens for result in results] == [1, 2]
+
+    def test_engine_microbatch_restores_each_request_order_and_usage(self):
+        """Length sorting must preserve request boundaries, order, and token usage."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=8, microbatch_wait_ms=10
+        )
+        seen_batches = []
+
+        def embed_side_effect(inputs, **kwargs):
+            seen_batches.append(list(inputs))
+            return EmbeddingOutput(
+                embeddings=[[float(len(text))] for text in inputs],
+                total_tokens=sum(len(text) for text in inputs),
+                dimensions=1,
+                token_counts=[len(text) for text in inputs],
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_concurrent():
+                await engine.start()
+                return await asyncio.gather(
+                    engine.embed(["longgg", "a"]),
+                    engine.embed(["bbb", "cc"]),
+                )
+
+            first, second = asyncio.run(run_concurrent())
+
+        assert seen_batches == [["a", "cc", "bbb", "longgg"]]
+        assert first.embeddings == [[6.0], [1.0]]
+        assert first.total_tokens == 7
+        assert first.token_counts == [6, 1]
+        assert second.embeddings == [[3.0], [2.0]]
+        assert second.total_tokens == 5
+        assert second.token_counts == [3, 2]
+
+    def test_engine_does_not_mix_incompatible_microbatch_parameters(self):
+        """Requests with different model-call parameters need separate forwards."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=8, microbatch_wait_ms=0
+        )
+
+        def embed_side_effect(inputs, **kwargs):
+            return EmbeddingOutput(
+                embeddings=[[1.0] for _ in inputs],
+                total_tokens=len(inputs),
+                dimensions=1,
+                token_counts=[1] * len(inputs),
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_concurrent():
+                await engine.start()
+                return await asyncio.gather(
+                    engine.embed(["a"], max_length=64),
+                    engine.embed(["b"], max_length=128),
                 )
 
             asyncio.run(run_concurrent())
 
-            assert mock_mx.synchronize.call_count == concurrency
-            assert mock_mx.clear_cache.call_count == concurrency
+        assert mock_model.embed.call_count == 2
+        assert [
+            call.kwargs["max_length"] for call in mock_model.embed.call_args_list
+        ] == [64, 128]
+
+    def test_engine_does_not_mix_text_and_structured_inputs(self):
+        """The model parser selects one input representation for the whole batch."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=8, microbatch_wait_ms=0
+        )
+
+        def embed_side_effect(inputs, **kwargs):
+            return EmbeddingOutput(
+                embeddings=[[1.0] for _ in inputs],
+                total_tokens=len(inputs),
+                dimensions=1,
+                token_counts=[1] * len(inputs),
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_concurrent():
+                await engine.start()
+                return await asyncio.gather(
+                    engine.embed(["plain text"]),
+                    engine.embed([{"text": "structured text"}]),
+                )
+
+            asyncio.run(run_concurrent())
+
+        assert mock_model.embed.call_count == 2
+        assert isinstance(
+            mock_model.embed.call_args_list[0].kwargs["inputs"][0], str
+        )
+        assert isinstance(
+            mock_model.embed.call_args_list[1].kwargs["inputs"][0], dict
+        )
+
+    def test_engine_microbatch_error_isolated_and_dispatcher_recovers(self):
+        """A failed batch should fail its jobs without poisoning later requests."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=8, microbatch_wait_ms=10
+        )
+        call_count = 0
+
+        def embed_side_effect(inputs, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ValueError("bad embedding batch")
+            return EmbeddingOutput(
+                embeddings=[[1.0] for _ in inputs],
+                total_tokens=len(inputs),
+                dimensions=1,
+                token_counts=[1] * len(inputs),
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_requests():
+                await engine.start()
+                failed = await asyncio.gather(
+                    engine.embed(["a"]),
+                    engine.embed(["b"]),
+                    return_exceptions=True,
+                )
+                recovered = await engine.embed(["c"])
+                return failed, recovered
+
+            failed, recovered = asyncio.run(run_requests())
+
+        assert all(isinstance(result, ValueError) for result in failed)
+        assert recovered.embeddings == [[1.0]]
+        assert engine.get_stats()["queued_requests"] == 0
+
+    def test_engine_cancelled_microbatch_job_does_not_cancel_peer(self):
+        """Cancelling one caller must not discard another caller's result."""
+        engine = EmbeddingEngine(
+            "test-model", batch_size=8, microbatch_wait_ms=10
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def embed_side_effect(inputs, **kwargs):
+            started.set()
+            assert release.wait(timeout=2)
+            return EmbeddingOutput(
+                embeddings=[[float(len(text))] for text in inputs],
+                total_tokens=sum(len(text) for text in inputs),
+                dimensions=1,
+                token_counts=[len(text) for text in inputs],
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_requests():
+                await engine.start()
+                cancelled = asyncio.create_task(engine.embed(["cancel-me"]))
+                peer = asyncio.create_task(engine.embed(["peer"]))
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                cancelled.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancelled
+                release.set()
+                return await peer
+
+            result = asyncio.run(run_requests())
+
+        assert result.embeddings == [[4.0]]
+        assert result.total_tokens == 4
+        assert engine.get_stats()["queued_requests"] == 0
+
+    def test_engine_microbatch_queue_applies_backpressure(self):
+        """The dispatcher should bound retained jobs instead of growing forever."""
+        engine = EmbeddingEngine(
+            "test-model",
+            batch_size=8,
+            microbatch_wait_ms=0,
+            max_pending_requests=1,
+        )
+        started = threading.Event()
+        release = threading.Event()
+        seen_batches = []
+
+        def embed_side_effect(inputs, **kwargs):
+            seen_batches.append(list(inputs))
+            if len(seen_batches) == 1:
+                started.set()
+                assert release.wait(timeout=2)
+            return EmbeddingOutput(
+                embeddings=[[float(len(text))] for text in inputs],
+                total_tokens=sum(len(text) for text in inputs),
+                dimensions=1,
+                token_counts=[len(text) for text in inputs],
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_requests():
+                await engine.start()
+                first = asyncio.create_task(engine.embed(["first"]))
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                second = asyncio.create_task(engine.embed(["second"]))
+                await asyncio.sleep(0)
+                stats_while_blocked = engine.get_stats()
+                release.set()
+                results = await asyncio.gather(first, second)
+                return stats_while_blocked, results
+
+            stats, results = asyncio.run(run_requests())
+
+        assert stats["max_pending_requests"] == 1
+        assert stats["active_requests"] == 1
+        assert seen_batches == [["first"], ["second"]]
+        assert [result.total_tokens for result in results] == [5, 6]
 
     def test_engine_chunks_large_embedding_requests_and_clears_each_chunk(self):
         """Large embedding requests should not hold the whole batch in MLX memory."""
