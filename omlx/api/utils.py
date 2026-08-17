@@ -500,7 +500,7 @@ def _mid_system_placement_kinds(messages: list[dict]) -> set[str] | None:
 
         prev_role = messages[start - 1].get("role") if start > 0 else None
         next_role = messages[i].get("role") if i < len(messages) else None
-        if prev_role != "user":
+        if prev_role not in ("user", "tool"):
             return None
         if next_role is None:
             placements.add("tail")
