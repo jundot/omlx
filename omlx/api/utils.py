@@ -252,8 +252,10 @@ _PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
 _TOOL_ROLE_CHECK_RE = re.compile(r"==\s*['\"]tool['\"]")
 
 _MID_SYSTEM_USER_MARKER = "__OMLX_MID_SYSTEM_PROBE_USER__"
+_MID_SYSTEM_TOOL_MARKER = "__OMLX_MID_SYSTEM_PROBE_TOOL__"
 _MID_SYSTEM_MARKER = "__OMLX_MID_SYSTEM_PROBE_SYSTEM__"
 _MID_SYSTEM_ASSISTANT_MARKER = "__OMLX_MID_SYSTEM_PROBE_ASSISTANT__"
+_MID_SYSTEM_PROBE_TOOL_CALL_ID = "omlx_mid_system_probe_call"
 _MID_SYSTEM_PROBE_TOOL = [
     {
         "type": "function",
@@ -315,6 +317,7 @@ def _mid_system_probe_cache_key(
     *,
     has_tools: bool,
     chat_template_kwargs: dict[str, Any] | None,
+    preceding_role: str,
     placement: str,
     is_partial: bool,
 ) -> tuple[Any, ...]:
@@ -328,6 +331,7 @@ def _mid_system_probe_cache_key(
         template_fingerprint,
         has_tools,
         _freeze_template_value(chat_template_kwargs or {}),
+        preceding_role,
         placement,
         is_partial,
     )
@@ -374,18 +378,21 @@ def chat_template_preserves_mid_system(
     *,
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
+    preceding_role: str = "user",
     placement: str = "tail",
     is_partial: bool = False,
 ) -> bool:
     """Return whether the chat template renders a mid-system message in-place.
 
     This does not prove model-level semantics. It only verifies that the
-    current tokenizer template keeps the system content after the preceding
-    user turn instead of raising, dropping it, or moving it to the front.
+    current tokenizer template keeps the system content after the requested
+    preceding role instead of raising, dropping it, or moving it to the front.
     """
     if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
         return False
     if placement not in {"tail", "between"}:
+        return False
+    if preceding_role not in {"user", "tool"}:
         return False
 
     explicit_capability = getattr(tokenizer, "_omlx_supports_mid_system_messages", None)
@@ -400,6 +407,7 @@ def chat_template_preserves_mid_system(
         tokenizer,
         has_tools=has_tools,
         chat_template_kwargs=chat_template_kwargs,
+        preceding_role=preceding_role,
         placement=placement,
         is_partial=is_partial,
     )
@@ -407,10 +415,34 @@ def chat_template_preserves_mid_system(
     if cached is not None:
         return cached
 
-    probe_messages = [
-        {"role": "user", "content": _MID_SYSTEM_USER_MARKER},
-        {"role": "system", "content": _MID_SYSTEM_MARKER},
-    ]
+    probe_messages = [{"role": "user", "content": _MID_SYSTEM_USER_MARKER}]
+    preceding_marker = _MID_SYSTEM_USER_MARKER
+    if preceding_role == "tool":
+        probe_messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": _MID_SYSTEM_PROBE_TOOL_CALL_ID,
+                            "type": "function",
+                            "function": {
+                                "name": "omlx_probe_tool",
+                                "arguments": {},
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": _MID_SYSTEM_PROBE_TOOL_CALL_ID,
+                    "content": _MID_SYSTEM_TOOL_MARKER,
+                },
+            ]
+        )
+        preceding_marker = _MID_SYSTEM_TOOL_MARKER
+    probe_messages.append({"role": "system", "content": _MID_SYSTEM_MARKER})
     if placement == "between":
         probe_messages.append(
             {"role": "assistant", "content": _MID_SYSTEM_ASSISTANT_MARKER}
@@ -428,11 +460,11 @@ def chat_template_preserves_mid_system(
         _MID_SYSTEM_PROBE_CACHE[cache_key] = False
         return False
 
-    user_idx = rendered.find(_MID_SYSTEM_USER_MARKER)
+    preceding_idx = rendered.find(preceding_marker)
     system_idx = rendered.find(_MID_SYSTEM_MARKER)
     assistant_idx = rendered.find(_MID_SYSTEM_ASSISTANT_MARKER)
 
-    supported = user_idx >= 0 and system_idx > user_idx
+    supported = preceding_idx >= 0 and system_idx > preceding_idx
     if placement == "between":
         supported = supported and assistant_idx > system_idx
 
@@ -476,12 +508,14 @@ def _merge_consecutive_system_messages(messages: list[dict]) -> list[dict]:
     return merged
 
 
-def _mid_system_placement_kinds(messages: list[dict]) -> set[str] | None:
+def _mid_system_placement_kinds(
+    messages: list[dict],
+) -> set[tuple[str, str]] | None:
     """Classify supported cache-preserving mid-system placements.
 
     Returns None when any non-leading system run has an unsupported position.
     """
-    placements: set[str] = set()
+    placements: set[tuple[str, str]] = set()
     seen_non_system = False
     i = 0
     while i < len(messages):
@@ -500,12 +534,12 @@ def _mid_system_placement_kinds(messages: list[dict]) -> set[str] | None:
 
         prev_role = messages[start - 1].get("role") if start > 0 else None
         next_role = messages[i].get("role") if i < len(messages) else None
-        if prev_role != "user":
+        if prev_role not in ("user", "tool"):
             return None
         if next_role is None:
-            placements.add("tail")
+            placements.add((prev_role, "tail"))
         elif next_role == "assistant":
-            placements.add("between")
+            placements.add((prev_role, "between"))
         else:
             return None
 
@@ -731,10 +765,11 @@ def prepare_system_messages_for_template(
             tokenizer,
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
+            preceding_role=preceding_role,
             placement=placement,
             is_partial=is_partial,
         )
-        for placement in placements
+        for preceding_role, placement in placements
     )
     if can_preserve:
         return _merge_consecutive_system_messages(messages)

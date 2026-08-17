@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.27)
 
-project(omlx_qwen35_prefill_kernels LANGUAGES CXX)
+project(omlx_qwen35_prefill_kernels LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,7 +32,8 @@ add_library(omlx_qwen35_prefill_kernel_ops)
 target_sources(
   omlx_qwen35_prefill_kernel_ops
   PRIVATE
-  ${CMAKE_CURRENT_LIST_DIR}/qwen35_prefill.cpp)
+  ${CMAKE_CURRENT_LIST_DIR}/qwen35_prefill.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/qwen35_ane.mm)
 target_include_directories(
   omlx_qwen35_prefill_kernel_ops
   PUBLIC ${CMAKE_CURRENT_LIST_DIR} ${OMLX_CUSTOM_KERNEL_COMMON_DIR})
@@ -40,12 +41,16 @@ target_compile_definitions(
   omlx_qwen35_prefill_kernel_ops
   PUBLIC OMLX_QWEN35_PREFILL_KERNEL_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}"
          OMLX_QWEN35_PREFILL_MLX_INCLUDE_DIR="${OMLX_QWEN35_PREFILL_MLX_INCLUDE_DIR}")
-target_link_libraries(omlx_qwen35_prefill_kernel_ops PUBLIC mlx)
+target_link_libraries(
+  omlx_qwen35_prefill_kernel_ops
+  PUBLIC mlx
+  PRIVATE "-framework Foundation" "-framework IOSurface" "-framework Metal")
 
 if(MLX_BUILD_METAL)
   set(OMLX_QWEN35_PREFILL_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/qwen35_attention.metal
-      ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm.metal)
+      ${CMAKE_CURRENT_LIST_DIR}/qwen35_qmm.metal
+      ${CMAKE_CURRENT_LIST_DIR}/qwen35_ane.metal)
   file(GLOB_RECURSE OMLX_QWEN35_PREFILL_METAL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/*.h
        ${OMLX_CUSTOM_KERNEL_COMMON_DIR}/kernels/*.h

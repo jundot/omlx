@@ -54,6 +54,25 @@ class BenchmarkContextProfile(StrEnum):
     NOVEL_JA = "novel_ja"
 
 
+class BenchmarkWarmupMode(StrEnum):
+    """How much of the local inference path to compile before measurement."""
+
+    QUICK = "quick"
+    ANE_2048 = "ane_2048"
+
+
+def _warmup_prompt_tokens(mode: BenchmarkWarmupMode | str) -> int:
+    """Return prompt length needed to execute the selected prefill warm-up.
+
+    Generation reserves the final prompt token for the first decode step, so a
+    2,048-token prefill requires a 2,049-token prompt.  Keeping that detail in
+    one helper prevents the UI's "2,048-token block" option from accidentally
+    warming only the 2,047-token GPU fallback shape.
+    """
+    normalized = BenchmarkWarmupMode(mode)
+    return 2049 if normalized is BenchmarkWarmupMode.ANE_2048 else 32
+
+
 @dataclass(frozen=True)
 class BenchmarkCorpusSpec:
     """Metadata needed to build local and tokenizer-less prompts."""
@@ -91,6 +110,7 @@ class BenchmarkRequest(BaseModel):
     generation_length: int = 128
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
+    warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
     force_lm_engine: bool = False
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
@@ -216,6 +236,12 @@ _FEATURE_FLAG_SPECS = (
     ),
     _FeatureFlagSpec("mtp_enabled", "mtp", "lightning_mtp", "Lightning MTP"),
     _FeatureFlagSpec("vlm_mtp_enabled", "vlm_mtp", "vlm_mtp", "VLM MTP"),
+    _FeatureFlagSpec(
+        "qwen35_ane_prefill_enabled",
+        "qwen35_ane_prefill",
+        "qwen35_ane_prefill",
+        "Qwen ANE Prefill",
+    ),
 )
 
 
@@ -326,6 +352,14 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
+    "qwen35_ane_prefill_enabled",
+    "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_max_layers",
+    "qwen35_ane_prefill_dual_ane",
+    "qwen35_ane_prefill_gdn",
+    "qwen35_ane_prefill_gdn_fraction",
+    "qwen35_ane_prefill_gdn_max_layers",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(
@@ -647,6 +681,7 @@ async def _run_single_test(
     prompt: list[int],
     max_tokens: int,
     pp_len: int,
+    ane_trace_config: dict[str, Any] | None = None,
 ) -> dict:
     """Run a single request benchmark test and return metrics."""
     if len(prompt) != pp_len:
@@ -666,32 +701,56 @@ async def _run_single_test(
     last_generated_token_time = None
     last_output = None
     prev_completion_tokens = 0
+    ane_profile_enabled = False
+    ane_profile: dict[str, dict[str, float]] = {}
 
-    async for output in engine.stream_generate(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=0.0,
-        top_p=1.0,
-        skip_cache_store=True,
-    ):
-        # Detect first generated token via completion_tokens count,
-        # not new_text. Some models (e.g. Harmony/gpt-oss) produce
-        # protocol tokens that don't yield visible new_text.
-        completion_delta = output.completion_tokens - prev_completion_tokens
-        if completion_delta > 0:
-            generated_at = getattr(output, "generated_at", None)
-            generated_until = getattr(output, "generated_until", None)
-            output_first_token_time = (
-                float(generated_at) if generated_at is not None else time.perf_counter()
-            )
-            if first_token_time is None:
-                first_token_time = output_first_token_time
-            if generated_until is not None:
-                last_generated_token_time = float(generated_until)
-            elif completion_delta == 1:
-                last_generated_token_time = output_first_token_time
-        prev_completion_tokens = output.completion_tokens
-        last_output = output
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        ane_profile_enabled = fast.qwen35_ane_profile_set_enabled(True)
+        if ane_profile_enabled:
+            fast.qwen35_ane_profile_reset()
+    except Exception:
+        logger.debug("Benchmark ANE profiler unavailable", exc_info=True)
+
+    try:
+        async for output in engine.stream_generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            skip_cache_store=True,
+            benchmark_trace=True,
+            benchmark_ane_sequence_length=int(
+                (ane_trace_config or {}).get("sequence_length", 0) or 0
+            ),
+        ):
+            # Detect first generated token via completion_tokens count,
+            # not new_text. Some models (e.g. Harmony/gpt-oss) produce
+            # protocol tokens that don't yield visible new_text.
+            completion_delta = output.completion_tokens - prev_completion_tokens
+            if completion_delta > 0:
+                generated_at = getattr(output, "generated_at", None)
+                generated_until = getattr(output, "generated_until", None)
+                output_first_token_time = (
+                    float(generated_at)
+                    if generated_at is not None
+                    else time.perf_counter()
+                )
+                if first_token_time is None:
+                    first_token_time = output_first_token_time
+                if generated_until is not None:
+                    last_generated_token_time = float(generated_until)
+                elif completion_delta == 1:
+                    last_generated_token_time = output_first_token_time
+            prev_completion_tokens = output.completion_tokens
+            last_output = output
+    finally:
+        if ane_profile_enabled:
+            try:
+                ane_profile = fast.qwen35_ane_profile_snapshot()
+            finally:
+                fast.qwen35_ane_profile_set_enabled(False)
 
     end_time = time.perf_counter()
 
@@ -750,6 +809,16 @@ async def _run_single_test(
         generation_duration_s = producer_generation_duration_s
 
     generation_measured = generation_duration_s is not None
+    trace_prefill_duration_s = prefill_duration_s
+    if trace_prefill_duration_s is None and first_token_time is not None:
+        trace_prefill_duration_s = max(0.0, first_token_time - start_time)
+
+    _log_ane_benchmark_trace(
+        pp_len=pp_len,
+        prefill_duration_s=trace_prefill_duration_s,
+        config=ane_trace_config,
+        profile=ane_profile,
+    )
 
     return _compute_single_metrics(
         prompt_tokens=prompt_tokens,
@@ -763,6 +832,79 @@ async def _run_single_test(
         generation_duration_s=generation_duration_s,
         generation_measured=generation_measured,
     )
+
+
+def _log_ane_benchmark_trace(
+    *,
+    pp_len: int,
+    prefill_duration_s: float | None,
+    config: dict[str, Any] | None,
+    profile: dict[str, dict[str, float]],
+) -> None:
+    """Log an offline-comparable ANE/scheduler summary for one PP trial."""
+    config = config or {}
+    sequence_length = int(config.get("sequence_length", 0) or 0)
+    prefill_tokens = max(0, pp_len - 1)
+    full_shapes, tail = (0, prefill_tokens)
+    if sequence_length > 0:
+        full_shapes, tail = divmod(prefill_tokens, sequence_length)
+    logger.info(
+        "[benchmark-ane-summary] pp=%d prefill_tokens=%d sequence_length=%d "
+        "expected_full_shapes=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
+        pp_len,
+        prefill_tokens,
+        sequence_length,
+        full_shapes,
+        tail,
+        (
+            f"{prefill_duration_s * 1000.0:.3f}"
+            if prefill_duration_s is not None
+            else "unknown"
+        ),
+    )
+
+    for category, layer_key in (("mlp", "mlp_layers"), ("gdn", "gdn_layers")):
+        values = profile.get(category, {})
+        operations = int(values.get("operations", 0) or 0)
+        layers = int(config.get(layer_key, 0) or 0)
+        observed_shapes = operations / layers if layers > 0 else 0.0
+        expected_operations = full_shapes * layers
+        per_op = max(operations, 1)
+        elapsed_ns = (
+            prefill_duration_s * 1e9
+            if prefill_duration_s is not None and prefill_duration_s > 0
+            else 0.0
+        )
+        logger.info(
+            "[benchmark-ane-profile] pp=%d category=%s operations=%d "
+            "configured_layers=%d expected_operations=%d "
+            "observed_shapes=%.3f input_ready_ms_per_op=%.3f "
+            "ane_region_ms_per_op=%.3f ane0_eval_ms_per_op=%.3f "
+            "ane1_eval_ms_per_op=%.3f gpu_qmm_ms_per_op=%.3f "
+            "gap_before_ms_per_op=%.3f ane0_duty=%.4f ane1_duty=%.4f",
+            pp_len,
+            category,
+            operations,
+            layers,
+            expected_operations,
+            observed_shapes,
+            float(values.get("pack_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("ane_region_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("ane0_eval_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("ane1_eval_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("gpu_qmm_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("gap_before_ns", 0.0) or 0.0) / per_op / 1e6,
+            (
+                float(values.get("ane0_eval_ns", 0.0) or 0.0) / elapsed_ns
+                if elapsed_ns
+                else 0.0
+            ),
+            (
+                float(values.get("ane1_eval_ns", 0.0) or 0.0) / elapsed_ns
+                if elapsed_ns
+                else 0.0
+            ),
+        )
 
 
 async def _run_batch_test(
@@ -1034,35 +1176,43 @@ def _detect_quantization(model_path: str) -> str:
     return "unknown"
 
 
-def _upload_model_name(
-    model_id: str, entry: Any = None, model_dirs: Any = None
-) -> str:
-    """Model name to publish: the org-qualified name oMLX itself displays.
+def _upload_model_name(model_id: str) -> str:
+    """Model name to publish: exactly what oMLX shows and its copy button copies.
 
-    Uses the same derivation as the models UI (HF repo id, then the org/leaf
-    relative path under a configured model dir) so two releases sharing a
-    leaf directory name stay distinguishable on the leaderboard (#1808).
-    Falls back to the trailing path component when no context is available.
+    Quantization and MLX suffixes used to be stripped here, which lost the one
+    detail that distinguishes two builds of the same model on the leaderboard.
+    The trailing path component is taken defensively — discovery registers ids
+    as a single path component today, so this is a no-op for local runs.
     """
-    name = None
-    if entry is not None:
-        try:
-            derived = model_display_name(
-                model_id,
-                getattr(entry, "model_path", None),
-                list(model_dirs or []),
-                source_repo_id=getattr(entry, "source_repo_id", None),
-            )
-            # Echoing the model id back means nothing was derived; fall
-            # through to the leaf split so slash-bearing ids keep their
-            # historical shape.
-            if isinstance(derived, str) and derived and derived != model_id:
-                name = derived
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Benchmark: display-name derivation failed: {e}")
-    if not name:
-        name = model_id.rstrip("/").split("/")[-1]
+    name = model_id.rstrip("/").split("/")[-1]
     return name[:_MAX_MODEL_NAME_LEN]
+
+
+def _upload_model_repo(
+    model_id: str, entry: Any = None, model_dirs: Any = None
+) -> Optional[str]:
+    """Org-qualified repo id to publish alongside the model name (#1808).
+
+    Uses the same derivation as the models UI display name: the HF repo id
+    when known, otherwise the org/leaf relative path under a configured
+    model dir. Returns None when nothing beyond the bare model id can be
+    derived (flat layouts), so the site simply shows no repo for those rows.
+    """
+    if entry is None:
+        return None
+    try:
+        derived = model_display_name(
+            model_id,
+            getattr(entry, "model_path", None),
+            list(model_dirs or []),
+            source_repo_id=getattr(entry, "source_repo_id", None),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Benchmark: repo derivation failed: {e}")
+        return None
+    if not isinstance(derived, str) or derived == model_id or "/" not in derived:
+        return None
+    return derived[:_MAX_MODEL_NAME_LEN]
 
 
 def _sanitize_upload_error(resp: Any) -> str:
@@ -1177,11 +1327,7 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     entry = engine_pool.get_entry(run.request.model_id)
     model_path = entry.model_path if entry else ""
     quantization = _detect_quantization(model_path)
-    model_name = _upload_model_name(
-        run.request.model_id,
-        entry=entry,
-        model_dirs=getattr(engine_pool, "_model_dirs", None),
-    )
+    model_name = _upload_model_name(run.request.model_id)
 
     # Generate submission group
     submission_group = str(uuid.uuid4())
@@ -1531,7 +1677,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total": total_tests,
             },
         )
-        warmup_prompt = _generate_prompt(tokenizer, 32, request.context_profile)
+        warmup_started = time.perf_counter()
+        warmup_prompt_tokens = _warmup_prompt_tokens(request.warmup_mode)
+        warmup_prefill_tokens = warmup_prompt_tokens - 1
+        warmup_prompt = _generate_prompt(
+            tokenizer,
+            warmup_prompt_tokens,
+            request.context_profile,
+        )
         warmup_max_tokens = (
             request.generation_length
             if getattr(engine, "is_diffusion_model", False)
@@ -1541,7 +1694,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
         ):
             pass
-        logger.info("Benchmark: warmup complete")
+        logger.info(
+            "Benchmark: warmup complete "
+            f"(mode={request.warmup_mode.value}, "
+            f"prompt_tokens={warmup_prompt_tokens}, "
+            f"prefill_tokens={warmup_prefill_tokens}, "
+            f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
+        )
 
         # Start host sampling after warmup: Metal shader and JIT compilation
         # would otherwise be folded into the CPU aggregates.
@@ -1555,6 +1714,53 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
         # Phase 3: Single request tests
         single_pp1024_gen_tps = None
+        ane_trace_config: dict[str, Any] | None = None
+        if model_settings is not None and getattr(
+            model_settings, "qwen35_ane_prefill_enabled", False
+        ):
+            gdn_enabled = bool(
+                getattr(model_settings, "qwen35_ane_prefill_gdn", False)
+            )
+            ane_trace_config = {
+                "sequence_length": int(
+                    getattr(
+                        model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                ),
+                "mlp_layers": int(
+                    getattr(model_settings, "qwen35_ane_prefill_max_layers", 0)
+                ),
+                "gdn_layers": (
+                    int(
+                        getattr(
+                            model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            0,
+                        )
+                    )
+                    if gdn_enabled
+                    else 0
+                ),
+            }
+        logger.info(
+            "[benchmark-ane-config] model=%s enabled=%s config=%s",
+            request.model_id,
+            ane_trace_config is not None,
+            ane_trace_config,
+        )
+        scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+        logger.info(
+            "[benchmark-scheduler-config] prefill_step_size=%s "
+            "chunked_prefill=%s speed_priority=%s paged_cache_block_size=%s "
+            "max_num_batched_tokens=%s",
+            getattr(scheduler_config, "prefill_step_size", None),
+            getattr(scheduler_config, "chunked_prefill", None),
+            getattr(scheduler_config, "prefill_speed_priority", None),
+            getattr(scheduler_config, "paged_cache_block_size", None),
+            getattr(scheduler_config, "max_num_batched_tokens", None),
+        )
 
         for pp_len in request.prompt_lengths:
             current_test += 1
@@ -1577,8 +1783,18 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 prompt=prompts[pp_len],
                 max_tokens=request.generation_length,
                 pp_len=pp_len,
+                ane_trace_config=ane_trace_config,
             )
             metrics["system_metrics"] = _sample_window(run, window_start)
+            logger.info(
+                "[benchmark-pp-result] pp=%d processing_tps=%.3f "
+                "ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
+                pp_len,
+                float(metrics.get("processing_tps", 0.0) or 0.0),
+                float(metrics.get("ttft_ms", 0.0) or 0.0),
+                float(metrics.get("e2e_latency_s", 0.0) or 0.0) * 1000.0,
+                int(metrics.get("cached_tokens", 0) or 0),
+            )
 
             result = {
                 "test_type": "single",
@@ -1765,13 +1981,19 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
             messages=[
                 {
                     "role": "user",
-                    "content": _generate_external_prompt(32, request.context_profile),
+                    "content": _generate_external_prompt(
+                        _warmup_prompt_tokens(request.warmup_mode),
+                        request.context_profile,
+                    ),
                 }
             ],
             max_tokens=8,
             temperature=0.0,
         )
-        logger.info("Benchmark: external endpoint warmup complete")
+        logger.info(
+            "Benchmark: external endpoint warmup complete "
+            f"(mode={request.warmup_mode.value})"
+        )
 
         # Single request tests
         for pp_len in request.prompt_lengths:

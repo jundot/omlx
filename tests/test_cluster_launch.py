@@ -20,6 +20,7 @@ from omlx.cluster.launch import (
     _available_launch_ports,
     _cluster_ssh_argv,
     _install_cluster_ssh_wrapper,
+    _local_probe_versions,
     _local_runtime_versions,
     build_mlx_launch_argv,
     discover_remote_python_executable,
@@ -616,7 +617,7 @@ def test_remote_preflight_rejects_an_incomplete_rank_stage(
 
 def test_peer_probe_is_prompt_free_and_reports_runtime_compatibility():
     calls = []
-    versions = _local_runtime_versions()
+    versions = _local_probe_versions()
     status = {
         "protocol_version": "1.0",
         "node": {"hostname": "studio", "recommended_working_set_bytes": 123},
@@ -658,7 +659,7 @@ def test_peer_probe_is_prompt_free_and_reports_runtime_compatibility():
 
 
 def test_peer_probe_rejects_protocol_drift():
-    versions = _local_runtime_versions()
+    versions = _local_probe_versions()
     status = {
         "protocol_version": "future",
         "node": {},
@@ -688,7 +689,7 @@ def test_peer_probe_rejects_protocol_drift():
 
 
 def test_peer_probe_discovers_a_different_linux_python_path():
-    versions = _local_runtime_versions()
+    versions = _local_probe_versions()
     status = {
         "protocol_version": CLUSTER_PROTOCOL_VERSION,
         "node": {"hostname": "spark-a"},
@@ -726,7 +727,7 @@ def test_peer_probe_discovers_a_different_linux_python_path():
 
 
 def test_peer_probe_preserves_packaged_cluster_wrapper_path():
-    versions = _local_runtime_versions()
+    versions = _local_probe_versions()
     status = {
         "protocol_version": CLUSTER_PROTOCOL_VERSION,
         "node": {"hostname": "studio"},
@@ -1012,7 +1013,7 @@ def _packaged_app_peer_runner(status: dict) -> tuple[list[str], object]:
 
 
 def test_packaged_app_peer_is_runtime_ready_without_a_hand_made_shim():
-    versions = _local_runtime_versions()
+    versions = _local_probe_versions()
     status = {
         "protocol_version": CLUSTER_PROTOCOL_VERSION,
         "node": {"hostname": "studio", "distributed_backends": ["ring", "jaccl"]},

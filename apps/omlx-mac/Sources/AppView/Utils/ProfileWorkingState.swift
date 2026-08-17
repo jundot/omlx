@@ -69,6 +69,14 @@ struct ModelSettingsSnapshot: Equatable {
 
     var turboquantKvEnabled: Bool
     var turboquantKvBits: String
+    var qwen35AnePrefillEnabled: Bool
+    var qwen35AnePrefillSequenceLength: String
+    var qwen35AnePrefillFraction: String
+    var qwen35AnePrefillMaxLayers: String
+    var qwen35AnePrefillDualAne: Bool
+    var qwen35AnePrefillGdn: Bool
+    var qwen35AnePrefillGdnFraction: String
+    var qwen35AnePrefillGdnMaxLayers: String
     var indexCacheEnabled: Bool
     var indexCacheFreq: String
     var specprefillEnabled: Bool
@@ -129,6 +137,14 @@ enum ProfileSettingsKey {
     static let trustRemoteCode = "trust_remote_code"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
     static let turboquantKvBits = "turboquant_kv_bits"
+    static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"
+    static let qwen35AnePrefillSequenceLength = "qwen35_ane_prefill_sequence_length"
+    static let qwen35AnePrefillFraction = "qwen35_ane_prefill_fraction"
+    static let qwen35AnePrefillMaxLayers = "qwen35_ane_prefill_max_layers"
+    static let qwen35AnePrefillDualAne = "qwen35_ane_prefill_dual_ane"
+    static let qwen35AnePrefillGdn = "qwen35_ane_prefill_gdn"
+    static let qwen35AnePrefillGdnFraction = "qwen35_ane_prefill_gdn_fraction"
+    static let qwen35AnePrefillGdnMaxLayers = "qwen35_ane_prefill_gdn_max_layers"
     static let indexCacheFreq = "index_cache_freq"
     static let specprefillEnabled = "specprefill_enabled"
     static let specprefillDraftModel = "specprefill_draft_model"

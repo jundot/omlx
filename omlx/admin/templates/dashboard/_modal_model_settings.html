@@ -716,6 +716,107 @@
                                 <!-- Experimental Features -->
                                 <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
+                                <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->
+                                <template x-if="isQwen35AnePrefillModel(selectedModel)">
+                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.qwen35_ane_prefill_enabled = !modelSettings.qwen35_ane_prefill_enabled"
+                                                    :class="modelSettings.qwen35_ane_prefill_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.qwen35_ane_prefill_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+
+                                        <div x-show="modelSettings.qwen35_ane_prefill_enabled" x-transition class="space-y-4 pt-1">
+                                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_prompt_block') }}</label>
+                                                    <select x-model.number="modelSettings.qwen35_ane_prefill_sequence_length"
+                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        <option value="1024">1,024 tokens</option>
+                                                        <option value="2048" selected>2,048 tokens — measured</option>
+                                                        <option value="4096">4,096 tokens</option>
+                                                        <option value="8192">8,192 tokens</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_mlp_fraction') }}</label>
+                                                    <select x-model.number="modelSettings.qwen35_ane_prefill_fraction"
+                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        <option value="0.4">40%</option>
+                                                        <option value="0.45">45%</option>
+                                                        <option value="0.5">50%</option>
+                                                        <option value="0.53" selected>53% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
+                                                        <option value="0.55">55%</option>
+                                                        <option value="0.6">60%</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_mlp_layers') }}</label>
+                                                    <input type="number" x-model.number="modelSettings.qwen35_ane_prefill_max_layers"
+                                                           min="1" max="256" step="1" placeholder="64"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                            </div>
+
+                                            <div class="flex items-start justify-between gap-3 pt-3 border-t border-neutral-200">
+                                                <div class="min-w-0">
+                                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_dual') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_dual_hint') }}</p>
+                                                </div>
+                                                <button type="button"
+                                                        @click="modelSettings.qwen35_ane_prefill_dual_ane = !modelSettings.qwen35_ane_prefill_dual_ane"
+                                                        :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'bg-black' : 'bg-neutral-200'"
+                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    <span :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'translate-x-5' : 'translate-x-0'"
+                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                </button>
+                                            </div>
+
+                                            <div class="flex items-start justify-between gap-3 pt-3 border-t border-neutral-200">
+                                                <div class="min-w-0">
+                                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_gdn') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_gdn_hint') }}</p>
+                                                </div>
+                                                <button type="button"
+                                                        @click="modelSettings.qwen35_ane_prefill_gdn = !modelSettings.qwen35_ane_prefill_gdn"
+                                                        :class="modelSettings.qwen35_ane_prefill_gdn ? 'bg-black' : 'bg-neutral-200'"
+                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    <span :class="modelSettings.qwen35_ane_prefill_gdn ? 'translate-x-5' : 'translate-x-0'"
+                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                </button>
+                                            </div>
+
+                                            <div x-show="modelSettings.qwen35_ane_prefill_gdn" x-transition class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_gdn_fraction') }}</label>
+                                                    <select x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"
+                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        <option value="0.4">40%</option>
+                                                        <option value="0.45">45%</option>
+                                                        <option value="0.5" selected>50% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
+                                                        <option value="0.53">53%</option>
+                                                        <option value="0.55">55%</option>
+                                                        <option value="0.6">60%</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_gdn_layers') }}</label>
+                                                    <input type="number" x-model.number="modelSettings.qwen35_ane_prefill_gdn_max_layers"
+                                                           min="0" max="256" step="1" placeholder="48"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </template>
+
                                 <!-- TurboQuant KV Cache -->
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-start justify-between gap-3">

@@ -1010,6 +1010,21 @@ def _strip_unused_packages(export_dir: Path):
 
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 
+    # venvstacks records native libraries in share/venv/dynlib as symlinks.
+    # Removing packages such as OpenCV and PyArrow leaves those links dangling,
+    # which makes codesign --verify reject the otherwise valid application
+    # bundle. Prune only links whose targets disappeared during stripping.
+    framework_dir = export_dir / "framework-mlx-base"
+    broken_links = [
+        path
+        for path in framework_dir.rglob("*")
+        if path.is_symlink() and not path.exists()
+    ]
+    for path in broken_links:
+        path.unlink()
+    if broken_links:
+        print(f"    Removed {len(broken_links)} dangling native-library links")
+
     # Post-strip invariant: no torch artifact must survive. A partial torch
     # (some files but not enough for xgrammar) would be the worst possible
     # outcome — _torch_stub.find_spec("torch") would return a real spec,

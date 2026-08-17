@@ -1742,6 +1742,27 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        # Qwen3.5/3.6 hybrid (GatedDeltaNet + hd-256 full attention): the
+        # fused prefill routes favor wider chunks. Measured on the 27B
+        # (M3 Ultra, 2026-08-17): chunk 4096 beats the 2048 default +3.2%
+        # at 4k prompts / +1.0% at 16k, 8192 flat vs 4096. Floor the chunk
+        # at 4096 when the machine has headroom; the prefill memory guard
+        # still shrinks chunks under pressure, so small Macs are unchanged.
+        self._qwen35_prefill_floor = 0
+        try:
+            _mt = str(getattr(model, "model_type", "") or "")
+            if not _mt:
+                _mt = str(
+                    getattr(getattr(model, "config", None), "model_type", "") or ""
+                )
+            if _mt.startswith("qwen3_5"):
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3:
+                    self._qwen35_prefill_floor = 4096
+        except Exception:
+            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -3383,6 +3404,8 @@ class Scheduler:
         emitted_boundaries: dict[int, int] = {}
 
         while input_arr.shape[1] > 0:
+            _trace_chunk_start = time.perf_counter()
+            _trace_processed_before = processed_tokens
             remaining = input_arr.shape[1]
             prefill_step_size = self._prefill_step_size_for_progress(
                 processed_tokens, remaining
@@ -3438,6 +3461,7 @@ class Scheduler:
             # eval graph across two streams and adds a per-chunk cross-stream
             # fence, the synchronization pattern implicated in the #2197 and
             # #2183 engine hangs on macOS 26.
+            _trace_model_start = time.perf_counter()
             with mx.stream(self._stream):
                 model_kwargs: dict[str, Any] = {}
                 if embeds_array is not None and embeds_array.shape[1] > 0:
@@ -3459,6 +3483,7 @@ class Scheduler:
                     embeds_array = embeds_array[:, n_to_process:]
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
+            _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
             _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
@@ -3592,6 +3617,29 @@ class Scheduler:
 
             # Reclaim Metal intermediates between prefill chunks.
             _sync_and_clear_cache(self._stream)
+            if getattr(request, "benchmark_trace", False):
+                _trace_total_ms = (
+                    time.perf_counter() - _trace_chunk_start
+                ) * 1000.0
+                _ane_sequence = int(
+                    getattr(request, "benchmark_ane_sequence_length", 0) or 0
+                )
+                logger.info(
+                    "[benchmark-prefill] rid=%s path=external chunk_tokens=%d "
+                    "processed=%d->%d kv_before=%d requested_step=%d "
+                    "ane_shape=%s model_cache_ms=%.3f total_ms=%.3f "
+                    "overhead_ms=%.3f",
+                    request.request_id,
+                    n_to_process,
+                    _trace_processed_before,
+                    processed_tokens,
+                    base_size + _trace_processed_before,
+                    prefill_step_size,
+                    bool(_ane_sequence and n_to_process == _ane_sequence),
+                    _trace_model_ms,
+                    _trace_total_ms,
+                    max(0.0, _trace_total_ms - _trace_model_ms),
+                )
 
         # Emit final boundary snapshot if prompt lands exactly on boundary.
         if boundary_enabled:
@@ -4800,7 +4848,11 @@ class Scheduler:
 
         adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
-            return self.config.prefill_step_size
+            size = self.config.prefill_step_size
+            floor = getattr(self, "_qwen35_prefill_floor", 0)
+            if floor and size < floor:
+                size = floor
+            return size
         from .patches.minimax_m3.generate_patch import (
             _prefill_step_size_for_progress as _minimax_prefill_step_size,
         )
@@ -4891,6 +4943,7 @@ class Scheduler:
             return True
 
         _t_chunk_start = time.perf_counter()
+        _trace_processed_before = state.tokens_processed
         remaining = state.tokens_remaining.shape[1]
         prefill_step_size = self._prefill_step_size_for_progress(
             state.tokens_processed, remaining
@@ -4935,6 +4988,7 @@ class Scheduler:
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
         # chunk eval graph, #2197/#2183).
+        _trace_model_start = time.perf_counter()
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
@@ -4943,6 +4997,7 @@ class Scheduler:
             else:
                 self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
+        _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
             n,
@@ -5050,6 +5105,26 @@ class Scheduler:
         if self._should_clear_after_chunk():
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
+        if getattr(state.request, "benchmark_trace", False):
+            _ane_sequence = int(
+                getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
+            )
+            logger.info(
+                "[benchmark-prefill] rid=%s path=chunked_step chunk_tokens=%d "
+                "processed=%d->%d kv_before=%d requested_step=%d "
+                "ane_shape=%s model_cache_ms=%.3f total_ms=%.3f "
+                "overhead_ms=%.3f",
+                state.request.request_id,
+                n,
+                _trace_processed_before,
+                state.tokens_processed,
+                state.base_size + _trace_processed_before,
+                prefill_step_size,
+                bool(_ane_sequence and n == _ane_sequence),
+                _trace_model_ms,
+                chunk_dt * 1000.0,
+                max(0.0, chunk_dt * 1000.0 - _trace_model_ms),
+            )
         # Full-size chunks only: boundary/tail slivers under-measure, and
         # the running max must reflect sustained capability.
         if chunk_dt > 0.0 and n >= _CONTENDED_CHUNK_FLOOR:
@@ -8023,27 +8098,39 @@ class Scheduler:
             )
             return None
 
-        # Gemma4AssistantDraftModel keeps ``_shared_kv`` / ``_input_embed`` on
-        # the module instance, so multiple in-flight ``_mtp_rounds`` generators
-        # share one drafter and effectively serialize on it: each round has
-        # to ``set_shared_kv`` for its own request before ``draft_block`` runs.
-        # Output stays correct because target-side verify is the source of
-        # truth in speculative decoding (a stale-drafter round just rejects
-        # everything and falls back to a target-only step), but the
-        # per-request tok/s is roughly halved under concurrency. Empirically
-        # at 4 concurrent, vlm_mtp gives ~14 tok/s each vs BatchGenerator's
-        # ~27 tok/s each — BG's batched matmul beats serialized speculative
-        # rounds. So we route only the first eligible request through
-        # vlm_mtp and let subsequent concurrent requests fall back. A future
-        # commit can swap this gate for true batched MTP via
-        # ``_mtp_rounds_batch`` if and when omlx prefill exposes batched
-        # hidden/shared_kv outputs.
+        # The drafter stores request-specific state on the module instance, so
+        # only one vlm_mtp generator can own it at a time. A request that
+        # arrives after MTP has started cannot be migrated here; retain the
+        # existing safe BatchGenerator fallback for that late-arrival case.
         if self._vlm_mtp_active:
             logger.info(
                 "vlm_mtp routing skipped for %s: drafter is busy with %d "
                 "request(s); falling back to BatchGenerator",
                 request.request_id,
                 len(self._vlm_mtp_active),
+            )
+            return None
+
+        # Prefer ordinary batching when a peer is already ready or admitted.
+        # Starting MTP for the first request and falling its peers back creates
+        # a slower mixed decode group, while also paying this path's extra
+        # final target forward. A chunked-prefill request still appears in
+        # ``prefilling`` while it is finalized, so exclude the request itself.
+        waiting_count = len(getattr(self, "waiting", ()))
+        running_count = len(getattr(self, "running", ()))
+        prefilling_count = sum(
+            getattr(prefill, "request_id", None) != request.request_id
+            for prefill in getattr(self, "prefilling", ())
+        )
+        if waiting_count or running_count or prefilling_count:
+            logger.info(
+                "vlm_mtp routing skipped for %s: scheduler contention "
+                "(running=%d waiting=%d prefilling=%d); falling back to "
+                "BatchGenerator",
+                request.request_id,
+                running_count,
+                waiting_count,
+                prefilling_count,
             )
             return None
 

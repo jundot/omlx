@@ -22,6 +22,7 @@ import logging
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 import omlx.scheduler as scheduler_mod
 from omlx.request import RequestStatus
@@ -247,3 +248,74 @@ def test_route_passes_gate_with_empty_processors(caplog):
             )
         assert uid is None
         assert "per-request logits processors" not in caplog.text
+
+
+@pytest.mark.parametrize("peer_state", ["waiting", "running", "prefilling"])
+def test_route_declines_before_model_forward_under_contention(caplog, peer_state):
+    """Any admitted peer should keep the decode group on BatchGenerator."""
+
+    class TargetModel:
+        _language_model = SimpleNamespace(
+            rollback_speculative_cache=lambda *args, **kwargs: None
+        )
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("contended MTP must not run the final forward")
+
+    model = TargetModel()
+    peer = SimpleNamespace(request_id="req-peer")
+    sched = SimpleNamespace(
+        _vlm_mtp_drafter=object(),
+        _vlm_mtp_active={},
+        waiting=[peer] if peer_state == "waiting" else [],
+        running={peer.request_id: peer} if peer_state == "running" else {},
+        prefilling=[peer] if peer_state == "prefilling" else [],
+        model=model,
+        _model_suppress_tokens=set(),
+        _stream=mx.default_stream(mx.default_device()),
+    )
+
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        uid = Scheduler._route_to_vlm_mtp(
+            sched,
+            _make_route_request(),
+            [SimpleNamespace(state=mx.zeros(1))],
+            [42],
+            lambda logits: mx.argmax(logits, axis=-1),
+            object(),
+        )
+
+    assert uid is None
+    assert model.calls == 0
+    assert "scheduler contention" in caplog.text
+
+
+def test_route_does_not_count_current_prefilling_request_as_contention(caplog):
+    """Chunked-prefill finalization must not treat the request as its own peer."""
+    request = _make_route_request()
+    sched = SimpleNamespace(
+        _vlm_mtp_drafter=object(),
+        _vlm_mtp_active={},
+        waiting=[],
+        running={},
+        prefilling=[request],
+        model=SimpleNamespace(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        uid = Scheduler._route_to_vlm_mtp(
+            sched,
+            request,
+            [object()],
+            [42],
+            lambda logits: logits,
+            object(),
+        )
+
+    assert uid is None
+    assert "scheduler contention" not in caplog.text
+    assert "rollback_speculative_cache" in caplog.text

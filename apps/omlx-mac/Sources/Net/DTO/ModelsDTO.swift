@@ -102,6 +102,15 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvBits: Double?
+    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    let qwen35AnePrefillEnabled: Bool?
+    let qwen35AnePrefillSequenceLength: Int?
+    let qwen35AnePrefillFraction: Double?
+    let qwen35AnePrefillMaxLayers: Int?
+    let qwen35AnePrefillDualAne: Bool?
+    let qwen35AnePrefillGdn: Bool?
+    let qwen35AnePrefillGdnFraction: Double?
+    let qwen35AnePrefillGdnMaxLayers: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -166,6 +175,15 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
     var turboquantKvBits: Double? = nil
+    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    var qwen35AnePrefillEnabled: Bool? = nil
+    var qwen35AnePrefillSequenceLength: Int? = nil
+    var qwen35AnePrefillFraction: Double? = nil
+    var qwen35AnePrefillMaxLayers: Int? = nil
+    var qwen35AnePrefillDualAne: Bool? = nil
+    var qwen35AnePrefillGdn: Bool? = nil
+    var qwen35AnePrefillGdnFraction: Double? = nil
+    var qwen35AnePrefillGdnMaxLayers: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

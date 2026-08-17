@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -98,3 +98,97 @@ async def test_sampling_setting_change_keeps_cached_failure():
     assert entry.load_failed is True
     assert entry.load_failure_message == "trust_remote_code=True required"
     assert entry.load_failure_at == 123.0
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_settings_are_persisted():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_sequence_length=2048,
+            qwen35_ane_prefill_fraction=0.53,
+            qwen35_ane_prefill_max_layers=64,
+            qwen35_ane_prefill_dual_ane=True,
+            qwen35_ane_prefill_gdn=True,
+            qwen35_ane_prefill_gdn_fraction=0.50,
+            qwen35_ane_prefill_gdn_max_layers=48,
+        ),
+    )
+
+    assert settings.qwen35_ane_prefill_enabled is True
+    assert settings.qwen35_ane_prefill_sequence_length == 2048
+    assert settings.qwen35_ane_prefill_fraction == 0.53
+    assert settings.qwen35_ane_prefill_max_layers == 64
+    assert settings.qwen35_ane_prefill_dual_ane is True
+    assert settings.qwen35_ane_prefill_gdn is True
+    assert settings.qwen35_ane_prefill_gdn_fraction == 0.50
+    assert settings.qwen35_ane_prefill_gdn_max_layers == 48
+    assert result["requires_reload"] is False
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.engine = MagicMock()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(),
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is True
+    pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_accepts_qwen38_config_type():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_8"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert settings.qwen35_ane_prefill_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_rejects_invalid_block_size():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+
+    with pytest.raises(admin_routes.HTTPException, match="multiple of 64"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                qwen35_ane_prefill_sequence_length=2000
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_rejects_other_model_families():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "gemma4"
+
+    with pytest.raises(admin_routes.HTTPException, match="Qwen3.5/3.6/3.8"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+        )

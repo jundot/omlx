@@ -119,13 +119,47 @@ class TestBuildUploadContext:
         assert ctx["memory_gb"] == 128
         assert ctx["quantization"] == "4bit"
         # entry is a bare MagicMock (no usable path context), so the name
-        # falls back to the trailing component of the model id.
+        # falls back to the trailing component of the model id and no repo
+        # is derived.
         assert ctx["model_name"] == "Qwen3-4bit"
+        assert ctx["model_repo"] is None
         assert ctx["sampling_profile"] == "deterministic"
         assert ctx["batch_size"] == 8
         assert ctx["owner_hash_full"] == "h" * 64 + "a"
         assert ctx["feature_flags"] == []
         assert len(ctx["submission_group"]) == 36
+
+    def test_org_layout_fills_model_repo(self):
+        from pathlib import Path
+
+        request = MagicMock()
+        request.model_id = "Qwen3-4bit"
+        request.sampling_profile = "deterministic"
+        request.batch_size = 8
+
+        entry = MagicMock(spec=["model_path", "source_repo_id"])
+        entry.model_path = "/models/mlx-community/Qwen3-4bit"
+        entry.source_repo_id = None
+        pool = MagicMock()
+        pool.get_entry.return_value = entry
+        pool._settings_manager = None
+        pool._model_dirs = [Path("/models")]
+
+        with (
+            patch.object(accuracy_upload, "get_chip_name", return_value="Apple M4"),
+            patch.object(accuracy_upload, "parse_chip_info", return_value=("M4", "")),
+            patch.object(accuracy_upload, "get_total_memory_gb", return_value=64.0),
+            patch.object(accuracy_upload, "get_gpu_core_count", return_value=20),
+            patch.object(accuracy_upload, "get_os_version", return_value="macOS 15.5"),
+            patch.object(accuracy_upload, "get_io_platform_uuid", return_value=None),
+            patch.object(
+                accuracy_upload, "_detect_quantization", return_value="4bit"
+            ),
+        ):
+            ctx = build_upload_context(request, pool)
+
+        assert ctx["model_repo"] == "mlx-community/Qwen3-4bit"
+        assert ctx["model_name"] == "Qwen3-4bit"
 
 
 def _ctx(**overrides) -> dict:
@@ -137,6 +171,7 @@ def _ctx(**overrides) -> dict:
         "omlx_version": "0.9.9",
         "os_version": "macOS 15.5",
         "model_name": "Qwen3-4bit",
+        "model_repo": "mlx-community/Qwen3-4bit",
         "quantization": "4bit",
         "sampling_profile": "deterministic",
         "batch_size": 8,
@@ -203,6 +238,7 @@ class TestUploadIntelligenceResult:
         assert payload["correct_count"] == 90
         assert payload["total_questions"] == 120
         assert payload["dataset_total"] == 14042
+        assert payload["model_repo"] == "mlx-community/Qwen3-4bit"
         assert payload["category_counts"] == {"anatomy": [4, 4]}
         assert payload["owner_hash"] == "h" * 64 + "a"
         assert payload["feature_flags"][0]["key"] == "turboquant_kv_4bit"

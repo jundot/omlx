@@ -1,6 +1,9 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/vector.h>
 
+#include "qwen35_ane.h"
 #include "qwen35_prefill.h"
 
 namespace nb = nanobind;
@@ -30,7 +33,133 @@ NB_MODULE(_ext, m) {
   m.def(
       "nax_qmm_runtime_active",
       &omlx::qwen35_prefill_kernels::nax_qmm_runtime_active);
-
+  m.def(
+      "qwen35_ane_available",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_available);
+  m.def(
+      "qwen35_ane_profile_set_enabled",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_profile_set_enabled,
+      "enabled"_a);
+  m.def(
+      "qwen35_ane_profile_reset",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_profile_reset);
+  m.def(
+      "qwen35_ane_profile_snapshot",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_profile_snapshot);
+  nb::class_<omlx::qwen35_prefill_kernels::AneLinearModel>(m, "AneLinearModel")
+      .def_prop_ro(
+          "input_dim",
+          &omlx::qwen35_prefill_kernels::AneLinearModel::input_dim)
+      .def_prop_ro(
+          "output_dim",
+          &omlx::qwen35_prefill_kernels::AneLinearModel::output_dim)
+      .def_prop_ro(
+          "sequence_length",
+          &omlx::qwen35_prefill_kernels::AneLinearModel::sequence_length);
+  m.def(
+      "qwen35_ane_compile_linear",
+      static_cast<std::shared_ptr<
+          omlx::qwen35_prefill_kernels::AneLinearModel> (*)(
+          const mlx::core::array &, int, int)>(
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_linear),
+      "weight"_a,
+      "sequence_length"_a,
+      "ane_instance"_a = 0,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_compile_linear_bank",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_linear_bank,
+      "weights"_a,
+      "sequence_length"_a,
+      "ane_instance"_a,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_compile_fp16_linear",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_fp16_linear,
+      "weight"_a,
+      "sequence_length"_a,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_compile_swiglu_down",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_swiglu_down,
+      "gate_weight"_a,
+      "up_weight"_a,
+      "down_weight"_a,
+      "sequence_length"_a,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_affine_qmm_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_q4_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_q4_affine_qmm_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_q4_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_q4_swiglu_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_affine_qmm_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_q4_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_q4_swiglu_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_q4_swiglu_down_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_q4_swiglu_down_t,
+      "x"_a,
+      "gpu_gate_up_weight"_a,
+      "gpu_gate_up_scales"_a,
+      "gpu_gate_up_biases"_a,
+      "gpu_down_weight"_a,
+      "gpu_down_scales"_a,
+      "gpu_down_biases"_a,
+      "ane_model"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
   m.def(
       "qwen35_fa256_attention",
       &omlx::qwen35_prefill_kernels::qwen35_fa256_attention,

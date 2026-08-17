@@ -63,6 +63,7 @@ struct ThroughputBenchScreen: View {
                 models: vm.models,
                 selectedModelId: $vm.selectedModelId,
                 contextProfile: $vm.contextProfile,
+                warmupMode: $vm.warmupMode,
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
@@ -159,6 +160,7 @@ private struct ConfigurationSection: View {
     let models: [ModelDTO]
     @Binding var selectedModelId: String
     @Binding var contextProfile: BenchmarkContextProfile
+    @Binding var warmupMode: BenchmarkWarmupMode
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
@@ -211,6 +213,24 @@ private struct ConfigurationSection: View {
                         PopupOption(value: $0, label: $0.localizedLabel)
                     }
                 )
+                .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.warmup.label",
+                              defaultValue: "Warm-up",
+                              comment: "Row label for the throughput benchmark warm-up mode"),
+                sublabel: String(localized: "bench.throughput.row.warmup.sub",
+                                 defaultValue: "The full block compiles and exercises the 2,048-token ANE prefill path before timing starts.",
+                                 comment: "Explanation of the throughput benchmark warm-up options")) {
+                Segmented(selection: $warmupMode, options: [
+                    (.quick, String(localized: "bench.throughput.warmup.quick",
+                                    defaultValue: "Quick · 32",
+                                    comment: "Short throughput benchmark warm-up option")),
+                    (.ane2048, String(localized: "bench.throughput.warmup.ane2048",
+                                     defaultValue: "Full · 2,048",
+                                     comment: "Full 2048-token ANE benchmark warm-up option")),
+                ])
+                .frame(width: 260)
                 .disabled(running)
             }
 

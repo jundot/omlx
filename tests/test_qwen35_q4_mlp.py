@@ -53,17 +53,13 @@ def test_qwen35_q_affine_qmm_matches_mlx_quantized_matmul(bits):
         bits=bits,
         mode="affine",
     )
-    got = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")(
-        x, weight, scales, biases, 8
-    )
+    got = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")(x, weight, scales, biases, 8)
     mx.eval(ref, got)
 
     diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))
     mx.eval(diff)
     max_abs = float(mx.max(diff).item())
-    rel = float(
-        (mx.max(diff) / (mx.max(mx.abs(ref.astype(mx.float32))) + 1e-9)).item()
-    )
+    rel = float((mx.max(diff) / (mx.max(mx.abs(ref.astype(mx.float32))) + 1e-9)).item())
     assert max_abs <= 1.0
     assert rel <= 0.05
 
@@ -97,10 +93,7 @@ def test_qwen35_q4_mlp_patch_routes_prefill_and_skips_decode(monkeypatch):
     y = mlp(x)
     mx.eval(y)
     assert calls["count"] == 3
-    assert (
-        mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item()
-        <= 1.0
-    )
+    assert mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item() <= 1.0
 
     calls["count"] = 0
     y_decode = mlp(x[:, :1, :])
@@ -146,10 +139,7 @@ def test_qwen35_mixed_bit_mlp_patch_routes_5_bit_down_proj(monkeypatch):
     y = mlp(x)
     mx.eval(y)
     assert calls == {4: 2, 5: 1}
-    assert (
-        mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item()
-        <= 1.0
-    )
+    assert mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item() <= 1.0
 
 
 def test_qwen35_q8_route_uses_bit_specific_min_tokens():
@@ -331,9 +321,7 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
 
     monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
     assert apply_qwen35_q4_prefill_linear_patch() is True
-    out0, out1 = qwen35_lang._target_verify_linears(
-        (supported, unsupported), x, False
-    )
+    out0, out1 = qwen35_lang._target_verify_linears((supported, unsupported), x, False)
     mx.eval(out0, out1)
     assert calls["count"] == 1
 
@@ -415,9 +403,7 @@ def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch)
         # Install the replacement dispatcher only after the patch is in place,
         # the way a later TurboQuant-enabled model load does.
         attn_module = importlib.import_module(qwen35.Attention.__module__)
-        monkeypatch.setattr(
-            attn_module, "scaled_dot_product_attention", sentinel_sdpa
-        )
+        monkeypatch.setattr(attn_module, "scaled_dot_product_attention", sentinel_sdpa)
 
         y = attn(x)
         mx.eval(y)
@@ -482,6 +468,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
     orig_attn_call = qwen35.Attention.__call__
     orig_gdn_call = qwen35.GatedDeltaNet.__call__
     orig_lm_patched = q4patch._LM_LINEAR_PATCHED
+    orig_gdn_backend = q4patch._LM_GDN_PREFILL_BACKEND
 
     saved_attrs = {}
     for cls, attrs in (
@@ -490,6 +477,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             (
                 "_omlx_q4_lm_attention_patched",
                 "_omlx_q4_lm_attention_original_call",
+                "_omlx_q4_lm_attention_wrapper",
             ),
         ),
         (
@@ -497,6 +485,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             (
                 "_omlx_q4_lm_gdn_patched",
                 "_omlx_q4_lm_gdn_original_call",
+                "_omlx_q4_lm_gdn_wrapper",
             ),
         ),
     ):
@@ -546,6 +535,43 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             <= 1.0
         )
 
+        backend_calls = []
+
+        def gdn_backend(module, inputs, target_verify=False):
+            backend_calls.append((module, inputs.shape, target_verify))
+            return (
+                module.in_proj_qkv(inputs),
+                module.in_proj_z(inputs),
+                module.in_proj_b(inputs),
+                module.in_proj_a(inputs),
+            )
+
+        q4patch.register_qwen35_lm_gdn_prefill_backend(gdn_backend)
+        y_gdn_backend = gdn(x)
+        mx.eval(y_gdn_backend)
+        assert backend_calls == [(gdn, x.shape, False)]
+        assert (
+            mx.max(
+                mx.abs(y_gdn_backend.astype(mx.float32) - y_gdn_ref.astype(mx.float32))
+            ).item()
+            <= 1.0
+        )
+
+        # Simulate the MTP lifecycle restoring GDN.__call__ while leaving the
+        # process-wide patch flag and class metadata behind. A subsequent
+        # model load must validate the live callable and reinstall the hook.
+        qwen35.GatedDeltaNet.__call__ = orig_gdn_call
+        assert q4patch._LM_LINEAR_PATCHED is True
+        assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
+        assert (
+            qwen35.GatedDeltaNet.__call__
+            is qwen35.GatedDeltaNet._omlx_q4_lm_gdn_wrapper
+        )
+        backend_calls.clear()
+        y_gdn_reloaded = gdn(x)
+        mx.eval(y_gdn_reloaded)
+        assert backend_calls == [(gdn, x.shape, False)]
+
         calls["count"] = 0
         y_attn_decode = attn(x[:, :1, :])
         y_gdn_decode = gdn(x[:, :1, :])
@@ -555,6 +581,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
         qwen35.Attention.__call__ = orig_attn_call
         qwen35.GatedDeltaNet.__call__ = orig_gdn_call
         q4patch._LM_LINEAR_PATCHED = orig_lm_patched
+        q4patch._LM_GDN_PREFILL_BACKEND = orig_gdn_backend
         for (cls, attr), (value, existed) in saved_attrs.items():
             if existed:
                 setattr(cls, attr, value)

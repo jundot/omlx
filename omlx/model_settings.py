@@ -109,6 +109,18 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
+            ANE/GPU prompt processing.
+        qwen35_ane_prefill_sequence_length: Exact flattened token count routed
+            through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
+            across the ANE instances.
+        qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
+        qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
+        qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
+        qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
+            outputs assigned across the ANE instances.
+        qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -198,6 +210,18 @@ class ModelSettings:
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
+
+    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
+    # Off by default because the fixed-shape ANE models add load-time/runtime
+    # cache memory and rely on undocumented AppleNeuralEngine interfaces.
+    qwen35_ane_prefill_enabled: bool = False
+    qwen35_ane_prefill_sequence_length: int = 2048
+    qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_max_layers: int = 64
+    qwen35_ane_prefill_dual_ane: bool = True
+    qwen35_ane_prefill_gdn: bool = True
+    qwen35_ane_prefill_gdn_fraction: float = 0.50
+    qwen35_ane_prefill_gdn_max_layers: int = 48
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

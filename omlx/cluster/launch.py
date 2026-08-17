@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from omlx.utils import hardware
+
 from .deployment import ClusterDeployment, validate_ssh_target
 from .liveness import read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
@@ -178,10 +180,35 @@ def _package_version(name: str) -> str:
 
 
 def _local_runtime_versions() -> dict[str, str]:
+    """Versions as ``_PREFLIGHT_SCRIPT`` reads them on the peer: metadata."""
+
     return {
         "omlx": _package_version("omlx"),
         "mlx": _package_version("mlx"),
         "mlx-lm": _package_version("mlx-lm"),
+    }
+
+
+def _local_probe_versions() -> dict[str, str]:
+    """Versions as ``probe.py`` reads them on the peer: module constants.
+
+    The two remote paths report differently. ``_PREFLIGHT_SCRIPT`` calls
+    ``importlib.metadata.version``, while ``probe.py`` reports
+    ``mx.__version__`` / ``mlx_lm.__version__`` through these helpers. Comparing
+    a probe result against metadata therefore repeated the #2705 bug for mlx and
+    mlx-lm: an editable or nightly install whose dist-info has drifted from the
+    module blocks two ranks running identical code (#2726).
+
+    Each comparison now reads the local side the same way its own remote does.
+    That also keeps the missing-value sentinel consistent — these return
+    ``"Unknown"`` where ``_package_version`` returns ``"unknown"``, and the two
+    spellings used to read as a mismatch between two ranks that both lacked mlx.
+    """
+
+    return {
+        "omlx": _package_version("omlx"),
+        "mlx": hardware.get_mlx_version(),
+        "mlx-lm": hardware.get_mlx_lm_version(),
     }
 
 
@@ -1302,7 +1329,9 @@ def probe_remote_host(
     # binary.  Reusing that binary directly loses the launcher's PYTHONPATH;
     # carry forward the exact executable that passed this probe instead.
     runtime["python_executable"] = effective_python
-    expected = _local_runtime_versions()
+    # probe.py reports mlx/mlx-lm as module constants, so read ours the same
+    # way rather than from dist-info (#2726).
+    expected = _local_probe_versions()
     remote_versions = {
         "omlx": runtime.get("omlx_version"),
         "mlx": runtime.get("mlx_version"),

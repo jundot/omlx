@@ -40,6 +40,11 @@ enum BenchmarkContextProfile: String, Codable, CaseIterable, Sendable {
     case novelJapanese = "novel_ja"
 }
 
+enum BenchmarkWarmupMode: String, Codable, CaseIterable, Sendable {
+    case quick
+    case ane2048 = "ane_2048"
+}
+
 /// Body for `POST /admin/api/bench/start`. `prompt_lengths` and
 /// `batch_sizes` are server-validated against a known whitelist
 /// (1024…200000 / 2…8). `generation_length` is free-form int.
@@ -51,6 +56,7 @@ enum BenchmarkContextProfile: String, Codable, CaseIterable, Sendable {
 struct BenchStartRequest: Encodable, Sendable {
     let modelId: String
     let contextProfile: BenchmarkContextProfile
+    let warmupMode: BenchmarkWarmupMode
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]

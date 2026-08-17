@@ -39,6 +39,7 @@ from .benchmark import (
     _filter_uploaded_settings,
     _sanitize_upload_error,
     _upload_model_name,
+    _upload_model_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,14 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
 
     entry = engine_pool.get_entry(request.model_id)
     model_path = entry.model_path if entry else ""
+    # Org-qualified repo id, e.g. "mlx-community/Qwen3-4bit" (#1808). None
+    # for flat layouts; the model name then falls back to the model id, and
+    # for HF-cache models the repo's own leaf replaces the "org--name" id.
+    model_repo = _upload_model_repo(
+        request.model_id,
+        entry=entry,
+        model_dirs=getattr(engine_pool, "_model_dirs", None),
+    )
 
     feature_flags: list[dict] = []
     model_settings: dict | None = None
@@ -105,10 +114,9 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
         "omlx_version": __version__,
         "os_version": get_os_version(),
         "model_name": _upload_model_name(
-            request.model_id,
-            entry=entry,
-            model_dirs=getattr(engine_pool, "_model_dirs", None),
+            model_repo if model_repo else request.model_id
         ),
+        "model_repo": model_repo,
         "quantization": _detect_quantization(model_path),
         "sampling_profile": request.sampling_profile,
         "batch_size": request.batch_size,
@@ -232,6 +240,7 @@ async def _do_upload(ctx: dict, result_data: dict) -> dict:
         "omlx_version": ctx["omlx_version"],
         "os_version": ctx["os_version"],
         "model_name": ctx["model_name"],
+        "model_repo": ctx.get("model_repo"),
         "quantization": ctx["quantization"],
         "benchmark": result_data["benchmark"],
         "accuracy": result_data["accuracy"],
