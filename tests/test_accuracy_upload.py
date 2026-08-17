@@ -118,6 +118,8 @@ class TestBuildUploadContext:
         assert ctx["chip_variant"] == "Max"
         assert ctx["memory_gb"] == 128
         assert ctx["quantization"] == "4bit"
+        # entry is a bare MagicMock (no usable path context), so the name
+        # falls back to the trailing component of the model id.
         assert ctx["model_name"] == "Qwen3-4bit"
         assert ctx["sampling_profile"] == "deterministic"
         assert ctx["batch_size"] == 8

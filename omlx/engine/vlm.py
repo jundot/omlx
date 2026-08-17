@@ -47,6 +47,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -2622,8 +2623,11 @@ class VLMBatchedEngine(BaseEngine):
         if not hasattr(template_target, "apply_chat_template"):
             template_target = getattr(self._processor, "tokenizer", self._processor)
         try:
-            prompt = template_target.apply_chat_template(
-                formatted_messages, **template_kwargs
+            prompt = apply_chat_template_with_reasoning_effort_fallback(
+                template_target,
+                formatted_messages,
+                template_kwargs,
+                is_harmony=model_type == "gpt_oss",
             )
         except TypeError:
             # Fallback: template doesn't support some kwargs
@@ -2698,8 +2702,13 @@ class VLMBatchedEngine(BaseEngine):
                     boundary_tokens = 0
                     if prefix_messages:
                         try:
-                            prefix_prompt = template_target.apply_chat_template(
-                                prefix_messages, **prefix_template_kwargs
+                            prefix_prompt = (
+                                apply_chat_template_with_reasoning_effort_fallback(
+                                    template_target,
+                                    prefix_messages,
+                                    prefix_template_kwargs,
+                                    is_harmony=model_type == "gpt_oss",
+                                )
                             )
                         except TypeError:
                             local_kwargs = dict(prefix_template_kwargs)
@@ -2956,7 +2965,12 @@ class VLMBatchedEngine(BaseEngine):
             _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
 
             try:
-                return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
+                )
             except TypeError:
                 if chat_template_kwargs:
                     for key in chat_template_kwargs:

@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
@@ -1814,44 +1815,6 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 # Models API Routes
 # =============================================================================
-
-
-def _model_display_name(
-    model_id: str,
-    model_path: str | Path | None,
-    model_dirs: list[Path],
-    *,
-    source_repo_id: str | None = None,
-) -> str:
-    """Return the UI-only display name for a discovered local model."""
-    repo_id = (source_repo_id or "").strip()
-    if "/" in repo_id:
-        return repo_id
-
-    if not model_path:
-        return model_id
-
-    path_text = str(model_path)
-    if "://" in path_text:
-        return model_id
-
-    try:
-        path = Path(path_text).expanduser().resolve()
-    except (OSError, RuntimeError):
-        path = Path(path_text).expanduser()
-
-    for model_dir in model_dirs:
-        try:
-            rel = path.relative_to(model_dir.expanduser().resolve())
-        except (OSError, RuntimeError, ValueError):
-            continue
-
-        parts = rel.parts
-        if len(parts) >= 2:
-            return f"{parts[0]}/{parts[1]}"
-        return model_id
-
-    return model_id
 
 
 def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:

@@ -33,6 +33,7 @@ from ..memory_monitor import (
     raise_if_prefill_exceeds,
     set_model_info_from_model,
 )
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
@@ -890,8 +891,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
             try:
-                return self._tokenizer_obj.apply_chat_template(
-                    messages, **template_kwargs
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer_obj,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
                 )
             except TypeError:
                 if chat_template_kwargs:

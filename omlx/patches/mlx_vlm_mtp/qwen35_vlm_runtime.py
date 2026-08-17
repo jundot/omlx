@@ -16,8 +16,9 @@ It adds:
   returns ``(logits, pre_norm_hidden, gdn_states)``.
 
 Outer ``Model.sanitize`` is already patched separately by
-``qwen35_vlm_model.py`` (MTP-key preservation + norm +1 shift), so no
-sanitize work is needed here.
+``qwen35_vlm_model.py`` (MTP-key preservation + norm +1 shift). This patch
+also normalizes root ``mtp.*`` keys at weight binding because mlx-vlm skips
+``Model.sanitize`` for MLX-format shards.
 
 The decoder-graph classes (``Qwen3_5DecoderLayer``, ``Qwen3_5Attention``,
 ``Qwen3_5MLP``, ``Qwen3_5GatedDeltaNet``) are not modified. SSM rollback
@@ -77,11 +78,12 @@ def apply() -> bool:
 
 
 def _patch_vlm_outer_model_load_weights() -> None:
-    """Repair miscalibrated MTP-head norms in ``Model.load_weights`` payloads.
+    """Normalize MTP paths and repair norms in ``Model.load_weights`` payloads.
 
-    Older oQ conversions stored the head's q_norm/k_norm/mtp.norm one below
-    the correct MLX value; ``repair_legacy_head_norms`` re-applies the +1 at
-    load time. Idempotent-safe on correctly-converted models.
+    Third-party MLX checkpoints can retain the head at root ``mtp.*`` while
+    the runtime attaches it at ``language_model.mtp``. Older oQ conversions
+    also stored the head's q_norm/k_norm/mtp.norm one below the correct MLX
+    value. Both operations are idempotent-safe on canonical checkpoints.
     """
     try:
         from mlx_vlm.models import qwen3_5 as q35_outer
@@ -98,6 +100,7 @@ def _patch_vlm_outer_model_load_weights() -> None:
     def load_weights(self, weights, strict=True):
         from ..mlx_lm_mtp.norm_repair import repair_legacy_head_norms
 
+        weights = _remap_root_mtp_weights(self, weights)
         try:
             weights, _ = repair_legacy_head_norms(weights)
         except Exception:
@@ -106,6 +109,47 @@ def _patch_vlm_outer_model_load_weights() -> None:
 
     cls.load_weights = load_weights
     cls._omlx_mtp_norm_repair_patched = True
+
+
+def _remap_root_mtp_weights(model: Any, weights: Any) -> Any:
+    """Map legacy root ``mtp.*`` weights onto the VLM language model.
+
+    Some third-party MLX Qwen VLM checkpoints use canonical
+    ``language_model.*`` paths for the backbone but retain the MTP head at
+    root ``mtp.*``. mlx-vlm skips ``Model.sanitize`` for MLX-format shards,
+    so the normal sanitizer remap never runs and strict loading rejects the
+    head. Only rewrite when the runtime MTP module is actually attached.
+    """
+    language_model = getattr(model, "language_model", None)
+    if language_model is None or getattr(language_model, "mtp", None) is None:
+        return weights
+
+    if not isinstance(weights, list):
+        return weights
+
+    keys = {key for key, _ in weights if isinstance(key, str)}
+    remapped = []
+    remapped_count = 0
+    for key, value in weights:
+        if isinstance(key, str) and key.startswith("mtp."):
+            target = "language_model." + key
+            if target in keys:
+                raise ValueError(
+                    "Checkpoint contains both root and canonical MTP weights: "
+                    f"{key!r} and {target!r}"
+                )
+            key = target
+            remapped_count += 1
+        remapped.append((key, value))
+
+    if not remapped_count:
+        return weights
+
+    logger.info(
+        "Remapped %d root mtp.* weight(s) to language_model.mtp.*",
+        remapped_count,
+    )
+    return remapped
 
 
 # ---------------------------------------------------------------------------

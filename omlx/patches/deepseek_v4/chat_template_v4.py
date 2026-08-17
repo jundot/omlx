@@ -9,7 +9,10 @@ The small adapter at the end exposes mlx-lm's ``apply_chat_template`` API.
 
 import copy
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Special Tokens
@@ -82,6 +85,40 @@ REASONING_EFFORT_PROMPTS: Dict[str, str] = {
     ),
 }
 DEFAULT_REASONING_EFFORT = "low"
+
+# Clients send a wider vocabulary than this template's three levels (OpenAI
+# uses minimal/medium/high; Hermes uses xhigh). Map aliases onto the nearest
+# supported level instead of failing the request: a 400 here surfaces as an
+# opaque provider error in agent clients. Unknown values fall back to the
+# default rather than aborting the chat-template render.
+REASONING_EFFORT_ALIASES: Dict[str, str] = {
+    "none": "low",
+    "off": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "moderate": "high",
+    "high": "high",
+    "xhigh": "max",
+    "ultra": "max",
+    "max": "max",
+    "maximum": "max",
+}
+
+
+def normalize_reasoning_effort(value: Optional[str]) -> str:
+    """Map a client-supplied reasoning effort to a supported level."""
+    if not value:
+        return DEFAULT_REASONING_EFFORT
+    normalized = REASONING_EFFORT_ALIASES.get(str(value).strip().lower())
+    if normalized is None:
+        logger.warning(
+            "Unknown reasoning effort %r; falling back to %r",
+            value,
+            DEFAULT_REASONING_EFFORT,
+        )
+        return DEFAULT_REASONING_EFFORT
+    return normalized
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -299,10 +336,7 @@ def render_message(
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
     # Reasoning effort prefix (only at index 0 in thinking mode; "low" adds nothing)
-    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-    assert (
-        reasoning_effort in REASONING_EFFORT_PROMPTS
-    ), f"Invalid reasoning effort: {reasoning_effort}, expected one of {list(REASONING_EFFORT_PROMPTS)}"
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if index == 0 and thinking_mode == "thinking":
         prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
 

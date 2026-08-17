@@ -446,6 +446,106 @@ class TestMoeConfigPatch:
 # ---------------------------------------------------------------------------
 
 
+def _qwen_vlm_with_attached_mtp(*, decode_enabled=True):
+    return SimpleNamespace(
+        language_model=SimpleNamespace(
+            mtp=object(),
+            _omlx_mtp_decode_enabled=decode_enabled,
+        )
+    )
+
+
+def test_root_mtp_weights_remap_to_attached_language_model():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [
+        ("language_model.model.embed_tokens.weight", object()),
+        ("mtp.fc.weight", object()),
+        ("mtp.fc.scales", object()),
+        ("mtp.fc.biases", object()),
+    ]
+
+    result = _remap_root_mtp_weights(_qwen_vlm_with_attached_mtp(), weights)
+
+    assert [key for key, _ in result] == [
+        "language_model.model.embed_tokens.weight",
+        "language_model.mtp.fc.weight",
+        "language_model.mtp.fc.scales",
+        "language_model.mtp.fc.biases",
+    ]
+
+
+def test_root_mtp_weights_remap_when_decode_is_disabled():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    result = _remap_root_mtp_weights(
+        _qwen_vlm_with_attached_mtp(decode_enabled=False),
+        [("mtp.norm.weight", object())],
+    )
+
+    assert result[0][0] == "language_model.mtp.norm.weight"
+
+
+def test_canonical_mtp_weights_pass_through_unchanged():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [("language_model.mtp.fc.weight", object())]
+
+    assert _remap_root_mtp_weights(_qwen_vlm_with_attached_mtp(), weights) is weights
+
+
+def test_root_mtp_weights_without_attached_module_pass_through():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [("mtp.fc.weight", object())]
+    model = SimpleNamespace(language_model=SimpleNamespace())
+
+    assert _remap_root_mtp_weights(model, weights) is weights
+
+
+def test_root_and_canonical_mtp_weights_are_rejected():
+    from omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime import (
+        _remap_root_mtp_weights,
+    )
+
+    weights = [
+        ("mtp.fc.weight", object()),
+        ("language_model.mtp.fc.weight", object()),
+    ]
+
+    with pytest.raises(ValueError, match="both root and canonical MTP weights"):
+        _remap_root_mtp_weights(_qwen_vlm_with_attached_mtp(), weights)
+
+
+def test_qwen_vlm_outer_load_weights_remaps_root_mtp(monkeypatch):
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+    from mlx_vlm.models import qwen3_5 as q35_outer
+
+    class FakeModel:
+        def load_weights(self, weights, strict=True):
+            self.received_weights = weights
+            self.received_strict = strict
+            return "loaded"
+
+    monkeypatch.setattr(q35_outer, "Model", FakeModel)
+    qwen35_vlm_runtime._patch_vlm_outer_model_load_weights()
+
+    model = FakeModel()
+    model.language_model = SimpleNamespace(mtp=object())
+
+    assert model.load_weights([("mtp.fc.weight", object())], strict=False) == "loaded"
+    assert model.received_weights[0][0] == "language_model.mtp.fc.weight"
+    assert model.received_strict is False
+
+
 def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     """Dense Qwen3.5 VLM MTP verify must satisfy mlx-vlm's output contract."""
     from mlx_vlm.models.base import LanguageModelOutput

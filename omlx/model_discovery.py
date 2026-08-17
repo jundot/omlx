@@ -1091,10 +1091,10 @@ def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None
 
     An interrupted download leaves config.json (fetched first) plus a subset of
     the weight shards, so the directory would otherwise register as a normal,
-    load-ready model. Verify against the checkpoint's own manifest:
-    model.safetensors.index.json when it is readable, else the
-    ``-NNNNN-of-NNNNN`` shard filename numbering (the index file itself may not
-    have been downloaded yet).
+    load-ready model. Verify the numbered weight shard set against the
+    checkpoint's own manifest: model.safetensors.index.json when it is
+    readable, else the ``-NNNNN-of-NNNNN`` shard filename numbering (the index
+    file itself may not have been downloaded yet).
 
     Returns (missing count, up to 3 example names, manifest description), or
     None when the directory is complete or makes no shard promises.
@@ -1111,32 +1111,42 @@ def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None
             index = None
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
         if isinstance(weight_map, dict) and weight_map:
-            # Resolve values against the model dir (the HF index convention),
-            # so ./-prefixed or subpath entries are not misreported: only
-            # files the manifest references that are provably absent count.
-            missing = sorted(
-                {
-                    v
-                    for v in weight_map.values()
-                    if isinstance(v, str) and not (model_dir / v).is_file()
-                }
-            )
-            if not missing:
-                return None
-            referenced_count = len(
-                {v for v in weight_map.values() if isinstance(v, str)}
-            )
-            if len(missing) < referenced_count:
-                return len(missing), missing[:3], "model.safetensors.index.json"
-            # Every shard the index references is absent. An interrupted
-            # download keeps the shards it already fetched, so
-            # zero-of-referenced is not that shape — it is a stale index
-            # describing a different sharding of the same checkpoint (seen
-            # in the wild: a 4-shard weight_map shipped over 2 actual
-            # shards). Loaders glob model*.safetensors and never consult
-            # the index, so fall through and judge by the shard files
-            # actually present.
-            index_missing = (len(missing), missing[:3])
+            # The index may also list auxiliary safetensors that are not part
+            # of the numbered model shard set. In particular, mlx-lm downloads
+            # ``model*.safetensors`` into the shared HF cache, while OptiQ
+            # indexes can also list ``optiq/optiq_vision.safetensors``. Treat
+            # only numbered shard references as completeness promises so an
+            # intentionally filtered, text-loadable cache remains discoverable
+            # (#2742).
+            referenced_shards = {
+                value
+                for value in weight_map.values()
+                if isinstance(value, str) and _SHARD_FILE_RE.search(value)
+            }
+            if referenced_shards:
+                # Resolve shard values against the model dir (the HF index
+                # convention), so ./-prefixed or subpath entries are handled.
+                missing = sorted(
+                    {
+                        value
+                        for value in referenced_shards
+                        if not (model_dir / value).is_file()
+                    }
+                )
+                if not missing:
+                    return None
+                referenced_count = len(referenced_shards)
+                if len(missing) < referenced_count:
+                    return len(missing), missing[:3], "model.safetensors.index.json"
+                # Every shard the index references is absent. An interrupted
+                # download keeps the shards it already fetched, so
+                # zero-of-referenced is not that shape — it is a stale index
+                # describing a different sharding of the same checkpoint (seen
+                # in the wild: a 4-shard weight_map shipped over 2 actual
+                # shards). Loaders glob model*.safetensors and never consult
+                # the index, so fall through and judge by the shard files
+                # actually present.
+                index_missing = (len(missing), missing[:3])
 
     try:
         shard_names = [
@@ -1520,6 +1530,51 @@ def _register_model(
         )
     except Exception as e:
         logger.error(f"Failed to discover model {model_id}: {e}")
+
+
+def model_display_name(
+    model_id: str,
+    model_path: str | Path | None,
+    model_dirs: list[Path],
+    *,
+    source_repo_id: str | None = None,
+) -> str:
+    """Return the org-qualified display name for a discovered model.
+
+    Prefers the HF repo id when one is known, then falls back to the
+    org/leaf relative path under a configured model dir (the organized
+    two-level layout), then to the bare model id. This is what the models
+    UI shows and what benchmark uploads publish, so two releases with the
+    same leaf directory name stay distinguishable.
+    """
+    repo_id = (source_repo_id or "").strip()
+    if "/" in repo_id:
+        return repo_id
+
+    if not model_path:
+        return model_id
+
+    path_text = str(model_path)
+    if "://" in path_text:
+        return model_id
+
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except (OSError, RuntimeError):
+        path = Path(path_text).expanduser()
+
+    for model_dir in model_dirs:
+        try:
+            rel = path.relative_to(model_dir.expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        parts = rel.parts
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return model_id
+
+    return model_id
 
 
 def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:

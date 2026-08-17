@@ -1203,6 +1203,40 @@ class TestUploadModelName:
     def test_truncates_to_the_leaderboard_limit(self):
         assert len(_upload_model_name("x" * 300)) == 150
 
+    def test_org_prefix_from_two_level_layout(self):
+        # Organized layout: the org directory qualifies the name, matching
+        # what the local models UI shows (#1808).
+        entry = MagicMock(spec=["model_path", "source_repo_id"])
+        entry.model_path = "/models/mlx-community/Qwen3-30B-A3B-4bit"
+        entry.source_repo_id = None
+        assert (
+            _upload_model_name(
+                "Qwen3-30B-A3B-4bit", entry=entry, model_dirs=[Path("/models")]
+            )
+            == "mlx-community/Qwen3-30B-A3B-4bit"
+        )
+
+    def test_flat_layout_stays_leaf_only(self):
+        # Flat layout: the parent is the scan root, never treated as an org.
+        entry = MagicMock(spec=["model_path", "source_repo_id"])
+        entry.model_path = "/models/Qwen3-30B-A3B-4bit"
+        entry.source_repo_id = None
+        assert (
+            _upload_model_name(
+                "Qwen3-30B-A3B-4bit", entry=entry, model_dirs=[Path("/models")]
+            )
+            == "Qwen3-30B-A3B-4bit"
+        )
+
+    def test_hf_cache_uses_source_repo_id(self):
+        entry = MagicMock(spec=["model_path", "source_repo_id"])
+        entry.model_path = "/cache/models--mlx-community--Qwen3-4bit/snapshots/ab"
+        entry.source_repo_id = "mlx-community/Qwen3-4bit"
+        assert (
+            _upload_model_name("mlx-community--Qwen3-4bit", entry=entry, model_dirs=[])
+            == "mlx-community/Qwen3-4bit"
+        )
+
 
 class TestUploadToOmlxAi:
     @pytest.mark.asyncio

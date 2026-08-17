@@ -13,6 +13,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -111,7 +112,7 @@ class BatchedEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         """Get the model type from config (e.g., 'gpt_oss', 'llama', 'qwen2')."""
-        if self._model is None:
+        if getattr(self, "_model", None) is None:
             return None
         # Try different ways to access model_type
         try:
@@ -573,7 +574,12 @@ class BatchedEngine(BaseEngine):
                 template_kwargs.update(chat_template_kwargs)
 
             try:
-                return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
+                )
             except TypeError:
                 # Tokenizer doesn't support some kwargs, remove them and retry
                 if chat_template_kwargs:

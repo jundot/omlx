@@ -570,6 +570,14 @@ class TestBatchedEngineStats:
 class TestBatchedEngineModelType:
     """Tests for BatchedEngine.model_type property."""
 
+    def test_model_type_none_before_init(self):
+        """Partially constructed engines have no model type yet."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+
+        assert engine.model_type is None
+
     def test_model_type_from_config(self):
         """Test model_type from model.config."""
         from omlx.engine.batched import BatchedEngine

@@ -104,7 +104,11 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
         "gpu_cores": gpu_cores,
         "omlx_version": __version__,
         "os_version": get_os_version(),
-        "model_name": _upload_model_name(request.model_id),
+        "model_name": _upload_model_name(
+            request.model_id,
+            entry=entry,
+            model_dirs=getattr(engine_pool, "_model_dirs", None),
+        ),
         "quantization": _detect_quantization(model_path),
         "sampling_profile": request.sampling_profile,
         "batch_size": request.batch_size,
