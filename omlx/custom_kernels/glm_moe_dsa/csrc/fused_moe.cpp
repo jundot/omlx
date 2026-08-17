@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #include "fused_moe.h"
 
 #include <cstdlib>
@@ -93,6 +95,11 @@ int affine_bytes_per_pack(int bits) {
 
 bool supported_deepseek_affine(int group_size, int bits) {
   return group_size == 64 && (bits == 2 || bits == 3);
+}
+
+bool supported_glm_affine(int group_size, int bits) {
+  return supported_deepseek_affine(group_size, bits) ||
+      (group_size == 64 && bits == 4);
 }
 
 int affine_packed_row_bytes(int K, int bits) {
@@ -644,7 +651,7 @@ class DeepseekAffineGatherBlocksPrimitive : public Primitive {
         bits_(bits),
         variant_(variant) {
     (void)mxfp4_blocks_variant(variant_);
-    if (!supported_deepseek_affine(group_size_, bits_)) {
+    if (!supported_glm_affine(group_size_, bits_)) {
       throw std::invalid_argument(
           "Unsupported DeepSeek affine block-list quantization.");
     }
@@ -660,7 +667,7 @@ class DeepseekAffineGatherBlocksPrimitive : public Primitive {
       int group_size,
       int bits,
       Stream s) {
-    if (s.device == Device::cpu || !supported_deepseek_affine(group_size, bits)) {
+    if (s.device == Device::cpu || !supported_glm_affine(group_size, bits)) {
       return true;
     }
     if (x.dtype() != float16 && x.dtype() != bfloat16) {
@@ -1420,7 +1427,7 @@ array deepseek_affine_gather_qmm_blocks(
     throw std::invalid_argument(msg.str());
   }
 
-  if (!supported_deepseek_affine(group_size, bits)) {
+  if (!supported_glm_affine(group_size, bits)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.deepseek_affine_gather_qmm_blocks] unsupported "
         << "affine quantization group_size=" << group_size << " bits=" << bits

@@ -70,6 +70,27 @@ jobs:
           raise SystemExit(f"native kernels missing from wheel: {failed}" if failed else 0)
           PY
 
+      - name: Test GLM native block kernels
+        if: matrix.python-version == '3.11'
+        run: |
+          /tmp/wheel-smoke/bin/pip install --quiet pytest
+          cd /tmp
+          /tmp/wheel-smoke/bin/python -m pytest \
+            "${GITHUB_WORKSPACE}/tests/test_glm_moe_dsa_patch.py::test_deepseek_affine_block_moe_kernels_match_gather_qmm" \
+            "${GITHUB_WORKSPACE}/tests/test_glm_moe_dsa_patch.py::test_glm_switchglu_4bit_affine_blocks_match_stock_long_prefill" \
+            -o pythonpath= --junitxml=/tmp/glm-native-tests.xml -q
+          /tmp/wheel-smoke/bin/python - <<'PY'
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse("/tmp/glm-native-tests.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 2:
+              raise SystemExit(f"expected 2 native GLM tests, collected {tests}")
+          raise SystemExit(f"native GLM tests skipped: {skipped}" if skipped else 0)
+          PY
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

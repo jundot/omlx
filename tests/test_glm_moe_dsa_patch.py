@@ -667,7 +667,7 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
 
     for dtype in (mx.bfloat16, mx.float16):
         x = mx.random.normal((routes, 1, input_dims), dtype=dtype)
-        for bits in (2, 3):
+        for bits in (2, 3, 4):
             w0 = mx.random.normal(
                 (experts, output_dims, input_dims),
                 dtype=dtype,
@@ -712,6 +712,12 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
                 bits,
                 block_variant,
             )
+            mx.eval(y_ref, y_native)
+            assert float(mx.max(mx.abs(y_ref - y_native)).item()) == 0.0
+
+            if bits == 4:
+                continue
+
             y_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks(
                 x,
                 q0,
@@ -741,8 +747,7 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
 
             y0_pair = y_pair[..., :output_dims]
             y1_pair = y_pair[..., output_dims:]
-            mx.eval(y_ref, y_native, y0_pair, y1_ref, y1_pair)
-            assert float(mx.max(mx.abs(y_ref - y_native)).item()) == 0.0
+            mx.eval(y0_pair, y1_ref, y1_pair)
             assert float(mx.max(mx.abs(y_ref - y0_pair)).item()) == 0.0
             assert float(mx.max(mx.abs(y1_ref - y1_pair)).item()) == 0.0
 
@@ -938,6 +943,235 @@ def test_deepseek_switchglu_does_not_use_native_weighted_sum(monkeypatch):
 
     assert y.shape == (1, 11, 6, 16)
     assert calls["weighted_sum"] == 0
+
+
+def test_glm_route_plan_groups_experts_and_restores_routes_exactly():
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.glm_moe_dsa import switch_layers
+
+    num_tokens = 1031
+    routes_per_token = 8
+    num_experts = 256
+    block_rows = 32
+
+    token = mx.arange(num_tokens, dtype=mx.int32)[:, None]
+    route = mx.arange(routes_per_token, dtype=mx.int32)[None]
+    indices = ((token * 17 + route * 31) % num_experts)[None]
+    x = mx.arange(num_tokens, dtype=mx.float32).reshape(
+        1,
+        num_tokens,
+        1,
+        1,
+        1,
+    )
+
+    sorted_x, sorted_indices, inverse, block_plan = switch_layers._gather_counting_sort(
+        x,
+        indices,
+        num_experts,
+        block_rows,
+    )
+    block_meta, block_count = block_plan
+    mx.eval(sorted_x, sorted_indices, inverse, block_meta, block_count)
+
+    flat_indices = indices.flatten()
+    restored_indices = sorted_indices[inverse]
+    expected_tokens = mx.repeat(
+        mx.arange(num_tokens, dtype=mx.float32),
+        routes_per_token,
+    )
+    restored_tokens = sorted_x.reshape(-1)[inverse]
+    mx.eval(flat_indices, restored_indices, expected_tokens, restored_tokens)
+
+    assert mx.array_equal(restored_indices, flat_indices).item()
+    assert mx.array_equal(restored_tokens, expected_tokens).item()
+    assert mx.all(sorted_indices[1:] >= sorted_indices[:-1]).item()
+
+    active_blocks = block_meta[: int(block_count.item())].tolist()
+    sorted_experts = sorted_indices.tolist()
+    cursor = 0
+    for start, expert, rows in active_blocks:
+        assert start == cursor
+        assert 0 < rows <= block_rows
+        assert sorted_experts[start : start + rows] == [expert] * rows
+        cursor += rows
+    assert cursor == flat_indices.size
+
+
+def test_glm_switchglu_dispatches_4bit_affine_blocks_for_long_prefill(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.glm_moe_dsa import switch_layers
+
+    model = switch_layers.SwitchGLU(
+        64,
+        64,
+        256,
+        fused_gate_up=True,
+        inverse_scatter=True,
+    )
+    model.gate_up_proj = model.gate_up_proj.to_quantized(
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    model.down_proj = model.down_proj.to_quantized(
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "on")
+    monkeypatch.setattr(
+        switch_layers.QuantizedSwitchLinear,
+        "_can_use_affine_blocks",
+        lambda self, x, sorted_indices: x.ndim == 3 and sorted_indices,
+    )
+
+    calls = []
+
+    class CountingSortReachedError(Exception):
+        pass
+
+    def counting_sort_spy(x, indices, num_experts, bm):
+        calls.append((x.ndim, indices.size, num_experts, bm))
+        raise CountingSortReachedError
+
+    monkeypatch.setattr(switch_layers, "_gather_counting_sort", counting_sort_spy)
+
+    x = mx.random.normal((1, 1024, 64), dtype=mx.bfloat16)
+    indices = mx.zeros((1, 1024, 8), dtype=mx.int32)
+    with pytest.raises(CountingSortReachedError):
+        model(x, indices)
+
+    assert calls == [(5, 8192, 256, 32)]
+
+
+def test_glm_switchglu_keeps_short_prefill_on_stock_sort(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.glm_moe_dsa import switch_layers
+
+    model = switch_layers.SwitchGLU(
+        64,
+        64,
+        256,
+        fused_gate_up=True,
+        inverse_scatter=True,
+    )
+    model.gate_up_proj = model.gate_up_proj.to_quantized(
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    model.down_proj = model.down_proj.to_quantized(
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "on")
+    monkeypatch.setattr(
+        switch_layers.QuantizedSwitchLinear,
+        "_can_use_affine_blocks",
+        lambda self, x, sorted_indices: x.ndim == 3 and sorted_indices,
+    )
+
+    class StockSortReachedError(Exception):
+        pass
+
+    def stock_sort_spy(*args, **kwargs):
+        raise StockSortReachedError
+
+    def counting_sort_spy(*args, **kwargs):
+        raise AssertionError("short prefill must not use affine blocks")
+
+    monkeypatch.setattr(switch_layers, "_gather_sort", stock_sort_spy)
+    monkeypatch.setattr(switch_layers, "_gather_counting_sort", counting_sort_spy)
+
+    x = mx.random.normal((1, 1023, 64), dtype=mx.bfloat16)
+    indices = mx.zeros((1, 1023, 8), dtype=mx.int32)
+    with pytest.raises(StockSortReachedError):
+        model(x, indices)
+
+
+def test_glm_affine_block_mode_requires_explicit_opt_in(monkeypatch):
+    from omlx.patches.glm_moe_dsa import switch_layers
+
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "off")
+    assert not switch_layers._affine_blocks_enabled()
+
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "on")
+    assert switch_layers._affine_blocks_enabled()
+
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "")
+    assert not switch_layers._affine_blocks_enabled()
+
+
+def test_glm_switchglu_4bit_affine_blocks_match_stock_long_prefill(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.glm_moe_dsa import switch_layers
+
+    if not switch_layers.glm_fast.has("deepseek_affine_gather_qmm_blocks"):
+        pytest.skip("DeepSeek affine block-list kernels are unavailable")
+
+    mx.random.seed(23)
+    model = switch_layers.SwitchGLU(
+        64,
+        64,
+        256,
+        fused_gate_up=True,
+        inverse_scatter=True,
+    )
+    for name in ("gate_up_proj", "down_proj"):
+        projection = getattr(model, name).to_quantized(
+            group_size=64,
+            bits=4,
+            mode="affine",
+        )
+        projection.scales = projection.scales.astype(mx.bfloat16)
+        projection.biases = projection.biases.astype(mx.bfloat16)
+        setattr(model, name, projection)
+
+    token = mx.arange(2048, dtype=mx.int32)[:, None]
+    route = mx.arange(8, dtype=mx.int32)[None]
+    indices = ((token * 13 + route * 29) % 256)[None]
+    scores = mx.softmax(
+        mx.random.normal(indices.shape, dtype=mx.float32),
+        axis=-1,
+    )
+    x = mx.random.normal((1, 2048, 64), dtype=mx.bfloat16)
+
+    calls = {"blocks": 0}
+    original_blocks = switch_layers.glm_fast.deepseek_affine_gather_qmm_blocks
+
+    def block_spy(*args, **kwargs):
+        calls["blocks"] += 1
+        return original_blocks(*args, **kwargs)
+
+    monkeypatch.setattr(
+        switch_layers.glm_fast,
+        "deepseek_affine_gather_qmm_blocks",
+        block_spy,
+    )
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "on")
+    candidate = model(x, indices, scores=scores, weighted_sum=True)
+    mx.eval(candidate)
+
+    monkeypatch.setattr(switch_layers, "_GLM_AFFINE_BLOCK_MODE", "off")
+    current = model(x, indices, scores=scores, weighted_sum=True)
+    mx.eval(current)
+
+    assert calls == {"blocks": 2}
+    assert candidate.shape == current.shape == (1, 2048, 64)
+    assert mx.allclose(
+        candidate.astype(mx.float32),
+        current.astype(mx.float32),
+        rtol=0.02,
+        atol=0.05,
+    ).item()
 
 
 def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):
