@@ -145,7 +145,7 @@ def _build_patched_load_model() -> Callable:
                 "trust this model."
             )
 
-        weight_files = glob.glob(str(model_path / "model*.safetensors"))
+        weight_files = _utils.glob.glob(str(model_path / "model*.safetensors"))
 
         if not weight_files and strict:
             raise FileNotFoundError(f"No safetensors found in {model_path}")
