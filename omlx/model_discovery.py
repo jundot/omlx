@@ -380,6 +380,8 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    reasoning_effort_options: list[str] | None = None  # Strict whitelist from template (None = free-form or unsupported)
+    reasoning_effort_default: str | None = None  # Template default for reasoning_effort (None = unknown)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
@@ -778,23 +780,13 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
-def detect_thinking_default(model_path: Path) -> bool | None:
-    """Detect a model's effective thinking default from local metadata.
+def _read_chat_template_text(model_path: Path) -> str | None:
+    """Read the model's chat template text from local metadata.
 
-    Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour, including narrow model-family serving
-    recommendations when the raw template deliberately defaults to opt-in:
-
-    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
-      servers pass ``enable_thinking=true`` by default).
-    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
-      enables thinking when ``enable_thinking`` is truthy,
-      ``default(false)``).
-    * **None** — template does not reference ``enable_thinking`` (model has
-      no thinking toggle).
+    Tries the standalone ``chat_template.jinja`` file first, then falls
+    back to the ``chat_template`` key in ``tokenizer_config.json``.
+    Returns None when neither source is available.
     """
-    # Try standalone Jinja file first, then tokenizer_config.json
     template_text = None
     jinja_path = model_path / "chat_template.jinja"
     if jinja_path.exists():
@@ -811,6 +803,26 @@ def detect_thinking_default(model_path: Path) -> bool | None:
             except Exception:
                 pass
 
+    return template_text
+
+
+def detect_thinking_default(model_path: Path) -> bool | None:
+    """Detect a model's effective thinking default from local metadata.
+
+    Inspects the Jinja chat template for ``enable_thinking`` references and
+    determines the default behaviour, including narrow model-family serving
+    recommendations when the raw template deliberately defaults to opt-in:
+
+    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
+      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
+      servers pass ``enable_thinking=true`` by default).
+    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
+      enables thinking when ``enable_thinking`` is truthy,
+      ``default(false)``).
+    * **None** — template does not reference ``enable_thinking`` (model has
+      no thinking toggle).
+    """
+    template_text = _read_chat_template_text(model_path)
     if not template_text or "enable_thinking" not in template_text:
         return None
 
@@ -931,26 +943,65 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
         True if the template references ``preserve_thinking`` (should be
         enabled), None otherwise (template has no such flag).
     """
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
-    if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
-
+    template_text = _read_chat_template_text(model_path)
     if not template_text or "preserve_thinking" not in template_text:
         return None
 
     return True
+
+
+def detect_reasoning_effort(model_path: Path) -> tuple[list[str] | None, str | None]:
+    """Detect the model chat template's ``reasoning_effort`` contract.
+
+    Returns an ``(options, default)`` tuple:
+
+    * ``options`` — strict whitelist of accepted values, or None when the
+      template accepts free-form/numeric values or has no
+      ``reasoning_effort`` parameter at all. Only templates that enforce a
+      tuple-literal membership check (e.g. Qwen 3.8's
+      ``reasoning_effort not in ('xhigh', 'medium', 'low')`` +
+      ``raise_exception``) yield a whitelist; dict maps and numeric ranges
+      are not strict, so they must not be used for validation.
+    * ``default`` — the template's default value, detected from a
+      ``reasoning_effort | default('X')`` filter or an
+      ``if reasoning_effort is not defined -> set reasoning_effort = "X"``
+      block. None when unknown (numeric or implicit defaults are not
+      exposed).
+    """
+    template_text = _read_chat_template_text(model_path)
+    if not template_text or "reasoning_effort" not in template_text:
+        return None, None
+
+    # Strict whitelist: an effort-named variable checked ``in`` / ``not in``
+    # against a tuple literal. Dict maps (``key not in effort_map``) and
+    # numeric ranges do not match.
+    options: list[str] | None = None
+    m = re.search(r"[\w]*effort[\w]*\s+(?:not\s+)?in\s*\(([^)]+)\)", template_text)
+    if m:
+        values = re.findall(r"['\"]([A-Za-z0-9_-]+)['\"]", m.group(1))
+        if values:
+            options = values
+
+    # Default: ``reasoning_effort|default('X')`` filter, else the
+    # ``if reasoning_effort is not defined -> set reasoning_effort = "X"``
+    # block.
+    default: str | None = None
+    m = re.search(
+        r"reasoning_effort\s*\|\s*default\(\s*['\"]([A-Za-z0-9_-]+)['\"]\s*\)",
+        template_text,
+    )
+    if m:
+        default = m.group(1)
+    else:
+        m = re.search(
+            r"reasoning_effort\s+is\s+not\s+defined.{0,160}?\bset\s+reasoning_effort\s*=\s*['\"]([A-Za-z0-9_-]+)['\"]",
+            template_text,
+            re.S,
+        )
+        if m:
+            default = m.group(1)
+
+    return options, default
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1502,6 +1553,7 @@ def _register_model(
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
+        reasoning_effort_options, reasoning_effort_default = detect_reasoning_effort(model_dir)
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
@@ -1514,6 +1566,8 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            reasoning_effort_options=reasoning_effort_options,
+            reasoning_effort_default=reasoning_effort_default,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
