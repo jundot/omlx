@@ -82,6 +82,20 @@ class TestReasoningEffortChatTemplateKwargs:
         assert merged == {"reasoning_effort": 0.9}
         assert isinstance(merged["reasoning_effort"], float)
 
+    def test_none_disables_thinking(self):
+        """'none' is the off switch: enable_thinking=False, no reasoning_effort."""
+        merged = merge_reasoning_effort_chat_template_kwargs(None, "none")
+
+        assert merged == {"enable_thinking": False}
+
+    def test_none_does_not_override_explicit_enable_thinking(self):
+        """An explicit request enable_thinking wins over the implied off."""
+        merged = merge_reasoning_effort_chat_template_kwargs(
+            {"enable_thinking": True}, "none"
+        )
+
+        assert merged == {"enable_thinking": True}
+
 
 class TestCleanOutputText:
     """Tests for clean_output_text function."""
