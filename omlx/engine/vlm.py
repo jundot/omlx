@@ -841,6 +841,56 @@ def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
             )
 
 
+@contextlib.contextmanager
+def _transpose_qwen35_mlx_vision_patch_embed_on_load(model_dir: Path):
+    """Fix channels-first Qwen3.5 vision weights in MLX checkpoints.
+
+    mlx-vlm skips model sanitizers when safetensors metadata declares
+    ``format=mlx``. Some converted Qwen3.5/3.6 checkpoints retain the PyTorch
+    Conv3d layout ``(out, in, time, height, width)`` for the vision patch
+    embedding, while MLX expects ``(out, time, height, width, in)``. Correct
+    only that unambiguously channels-first tensor during loading.
+    """
+    if _read_config_model_type(model_dir) not in {"qwen3_5", "qwen3_5_moe"}:
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original_load_safetensors = _vu._load_safetensors
+    transposed = 0
+
+    def _patched_load_safetensors(path):
+        nonlocal transposed
+        weights = original_load_safetensors(path)
+        key = "vision_tower.patch_embed.proj.weight"
+        value = weights.get(key)
+        if (
+            value is not None
+            and getattr(value, "ndim", None) == 5
+            and value.shape[1] == 3
+            and value.shape[-1] != 3
+        ):
+            weights[key] = value.transpose(0, 2, 3, 4, 1)
+            transposed += 1
+        return weights
+
+    _vu._load_safetensors = _patched_load_safetensors
+    try:
+        yield
+    finally:
+        _vu._load_safetensors = original_load_safetensors
+        if transposed:
+            logger.info(
+                "Transposed Qwen3.5 vision patch embedding to MLX Conv3d "
+                "layout for %s",
+                model_dir.name,
+            )
+
+
 _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
@@ -1519,6 +1569,9 @@ class VLMBatchedEngine(BaseEngine):
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
+                _transpose_qwen35_mlx_vision_patch_embed_on_load(
+                    Path(self._model_name)
+                ),
             ):
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
