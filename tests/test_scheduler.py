@@ -2664,6 +2664,77 @@ class TestSchedulerBoundarySnapshots:
             "unreused_common_prefix_tokens": 3,
         }
 
+    def test_cleanup_finished_recovery_stores_boundary_aligned_live_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """Fix A recovery: when every decode-time capture was skipped by the
+        MTP skew guard but the request finished on a block boundary, the
+        scheduler stores the verified boundary-aligned live cache instead of
+        dropping it — preserving prefix-cache reuse on the next turn."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = True
+
+        request = Request(
+            request_id="req-recover",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7, 8]  # Total = 8 (2 full blocks)
+        request._extracted_cache = [{"state": "live-cache"}]
+        request._model_cache_config = "live-config"
+
+        scheduler.running["req-recover"] = request
+        scheduler.requests["req-recover"] = request
+        # Live cache verifies as boundary-aligned (offset == 8 == total).
+        scheduler._verify_live_boundary_aligned = MagicMock(
+            return_value=[{"state": "boundary-live-cache"}]
+        )
+
+        scheduler._cleanup_finished({"req-recover"})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[0] == "req-recover"
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # full boundary-aligned sequence
+
+    def test_cleanup_finished_recovery_skips_off_boundary_live_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """Fix A recovery must NOT store when the request finished off a block
+        boundary — the live recurrent state cannot be labeled with a boundary
+        token count and would corrupt later prefix hits."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = True
+
+        request = Request(
+            request_id="req-off-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7]  # Total = 7 (not a full block)
+        request._extracted_cache = [{"state": "live-cache"}]
+        request._model_cache_config = "live-config"
+
+        scheduler.running["req-off-boundary"] = request
+        scheduler.requests["req-off-boundary"] = request
+
+        scheduler._cleanup_finished({"req-off-boundary"})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        scheduler.block_aware_cache.clear_request_entry.assert_called_with(
+            "req-off-boundary"
+        )
+
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer
     ):
