@@ -1064,6 +1064,187 @@ async def test_distributed_stream_generate_bounds_retries_and_gives_up():
     assert len(calls) == 4
 
 
+class _UnreachableHttpx:
+    """Stand-in for httpx in _require_cluster_ready: the GET fails."""
+
+    HTTPError = httpx.HTTPError
+
+    class Response:
+        status_code = 500
+
+        def raise_for_status(self):
+            raise httpx.ConnectError("refused", request=None)
+
+    @staticmethod
+    def get(*args, **kwargs):
+        return _UnreachableHttpx.Response()
+
+
+@pytest.mark.asyncio
+async def test_distributed_rejects_unreachable_rank_zero(monkeypatch):
+    engine = DistributedBatchedEngine(_deployment())
+    engine._tokenizer = _Tokenizer()
+
+    class _Unreachable:
+        endpoint = "http://127.0.0.1:1"
+        failure_reason = None
+        stderr_tail = ()
+
+        def status(self):
+            return SimpleNamespace(
+                returncode=None,
+                failure_reason=None,
+                phase="ready",
+                ranks=({"rank": 0}, {"rank": 1}),
+            )
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    engine._supervisor = _Unreachable()
+    monkeypatch.setattr(distributed, "httpx", _UnreachableHttpx)
+
+    with pytest.raises(
+        DistributedInferenceError, match="rank-zero is not reachable"
+    ):
+        engine._require_cluster_ready()
+
+
+@pytest.mark.asyncio
+async def test_start_stops_supervisor_and_clears_state_on_dead_rank_zero(monkeypatch):
+    engine = DistributedBatchedEngine(_deployment())
+
+    stopped = []
+
+    class _LiveThenDead:
+        endpoint = "http://127.0.0.1:1"
+
+        def start(self):
+            return None
+
+        def stop(self):
+            stopped.append(True)
+            return None
+
+    engine._supervisor = _LiveThenDead()
+    monkeypatch.setattr(distributed, "httpx", _UnreachableHttpx)
+
+    class _Utils:
+        @staticmethod
+        def _download(*args, **kwargs):
+            return "/tmp/model"
+
+        @staticmethod
+        def load_config(*args, **kwargs):
+            return {"model_type": "qwen3_5"}
+
+        @staticmethod
+        def load_tokenizer(*args, **kwargs):
+            return _Tokenizer()
+
+    import types
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.utils",
+        types.ModuleType("mlx_lm.utils"),
+    )
+    for name in ("_download", "load_config", "load_tokenizer"):
+        setattr(
+            sys.modules["mlx_lm.utils"],
+            name,
+            getattr(_Utils, name),
+        )
+
+    with pytest.raises(
+        DistributedInferenceError, match="rank-zero is not reachable"
+    ):
+        await engine.start()
+
+    assert stopped == [True], "start() must stop the supervisor on probe failure"
+    assert engine._tokenizer is None, "tokenizer must be cleared after failed start"
+    assert engine._model_type is None, "model type must be cleared after failed start"
+    assert engine._loaded is False
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_incomplete_ranks(monkeypatch):
+    engine = DistributedBatchedEngine(_deployment())
+
+    class _IncompleteSupervisor:
+        endpoint = "http://127.0.0.1:1"
+
+        def status(self):
+            return SimpleNamespace(
+                returncode=None,
+                failure_reason=None,
+                phase="ready",
+                ranks=({"rank": 0},),  # Only 1 of 2 ranks reported ready
+            )
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    class _HealthyHttpx:
+        HTTPError = httpx.HTTPError
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        @staticmethod
+        def get(*args, **kwargs):
+            return _HealthyHttpx.Response()
+
+    engine._supervisor = _IncompleteSupervisor()
+    monkeypatch.setattr(distributed, "httpx", _HealthyHttpx)
+
+    with pytest.raises(
+        DistributedInferenceError, match="distributed cluster incomplete: 1 of 2 ranks"
+    ):
+        engine._require_cluster_ready()
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_rejects_empty_stream_on_rank_drop():
+    """Empty SSE stream on dropped rank raises error instead of empty 200 response."""
+    def handler(request):
+        # Rank zero returns 200 but immediately closes stream (data: [DONE] only)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: [DONE]\n\n",
+        )
+
+    engine = _ready_engine(handler)
+    engine._supervisor.status = lambda: SimpleNamespace(
+        returncode=None,
+        failure_reason="rank 1 connection closed by remote host",
+        stderr_tail=(),
+        phase="failed",
+        ranks=(),
+    )
+
+    try:
+        with pytest.raises(
+            DistributedInferenceError,
+            match="rank 1 connection closed by remote host",
+        ):
+            async for _ in engine.stream_chat([{"role": "user", "content": "hi"}]):
+                pass
+    finally:
+        await engine._client.aclose()
+
+
 @pytest.mark.asyncio
 async def test_distributed_chat_does_not_retry_unrelated_404():
     calls = []
@@ -1167,5 +1348,35 @@ async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
     monkeypatch.setattr(distributed, "check_peers", broken_check_peers)
     try:
         await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_generate_rejects_empty_stream_on_rank_drop():
+    """stream_generate raises error instead of empty output on dropped rank."""
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: [DONE]\n\n",
+        )
+
+    engine = _ready_engine(handler)
+    engine._supervisor.status = lambda: SimpleNamespace(
+        returncode=1,
+        failure_reason="worker exited with code 1",
+        stderr_tail=(),
+        phase="failed",
+        ranks=(),
+    )
+
+    try:
+        with pytest.raises(
+            DistributedInferenceError,
+            match="distributed job exited with code 1",
+        ):
+            async for _ in engine.stream_generate("hi"):
+                pass
     finally:
         await engine._client.aclose()
