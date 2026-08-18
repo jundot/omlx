@@ -635,6 +635,8 @@
   "modal.model_settings.qwen_ane_tune_applying": "Applying...",
   "modal.model_settings.qwen_ane_tune_applied": "Applied",
   "modal.model_settings.qwen_ane_tune_preparing": "Preparing tuner...",
+  "modal.model_settings.qwen_ane_tune_test": "Test",
+  "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Использует встроенную MTP-голову модели для черновой генерации нескольких токенов за шаг. Декодирование до ~1,5× быстрее. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
   "modal.model_settings.mtp_conflict": "Сначала отключите DFlash и TurboQuant KV: они изменяют тот же путь, от которого зависит MTP.",

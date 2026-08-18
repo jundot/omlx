@@ -748,9 +748,10 @@ final class ModelSettingsScreenVM {
                 aneTuningStatus = snapshot
                 if snapshot.status != "running" {
                     aneTuningIsRunning = false
-                    if snapshot.status == "error" {
-                        lastError = snapshot.error ?? "ANE tuning failed."
-                    }
+                    // Benchmark termination is rendered with its partial
+                    // matrix in the tuner row. Reserve lastError for transport
+                    // and settings failures so the reason is not duplicated.
+                    lastError = nil
                     break
                 }
                 try await Task.sleep(for: .seconds(1))

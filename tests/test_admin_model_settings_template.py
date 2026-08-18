@@ -156,6 +156,8 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune_applying",
         "modal.model_settings.qwen_ane_tune_applied",
         "modal.model_settings.qwen_ane_tune_preparing",
+        "modal.model_settings.qwen_ane_tune_test",
+        "modal.model_settings.qwen_ane_tune_throughput",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -214,11 +216,15 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "cancelANETuning()" in html
     assert "applyANETuningRecommendation()" in html
     assert "aneTuningRecommendationText()" in html
+    assert "aneTuningResultText(result)" in html
+    assert "aneTuning.status?.termination_reason" in html
+    assert "aneTuning.status?.results || []" in html
     assert "'/admin/api/bench/ane-tune/start'" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
     assert "qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
     assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
+    assert "if (result?.processing_tps === null" in script
 
 
 def test_qwen_ane_fraction_selects_cover_nax_tuner_results():
