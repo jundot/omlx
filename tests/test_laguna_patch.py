@@ -1144,3 +1144,34 @@ def test_fused_banks_default_off_and_guard_unquantized(monkeypatch):
     out = model(mx.array([[4]], dtype=mx.int32), cache=cache)
     mx.eval(out)
     assert model.model.layers[0].mlp._fusion_ready is False
+
+
+def test_two_output_compiled_tail_diverges_documented():
+    """C1 marker: two-output mx.compile with a shared intermediate is ULP-divergent.
+
+    The Swift challenge compiles the router tail
+    ``(sigmoid(logits), -(sigmoid(logits)+bias))`` into one kernel (challenge
+    commit f8848e0 / submission 8adb56be). In Python MLX 0.32.0 that two-output
+    compiled function is NOT bit-exact (max-abs ~6e-8, deterministic), while
+    each single-output compiled fusion IS. The router tail therefore stays
+    eager in the port (it feeds argpartition expert selection). If this ever
+    becomes bit-exact (diff == 0.0), C1 is resolved and the compiled two-output
+    tail may be re-enabled after re-verification.
+    """
+    lm = _registered_laguna_module()
+    key = mx.random.normal((2, 256), dtype=mx.float32)
+    bias = mx.random.normal((256,), dtype=mx.float32)
+
+    def tail(a, b):
+        s = mx.sigmoid(a)
+        return s, -(s + b.astype(s.dtype))
+
+    compiled = mx.compile(tail, shapeless=True)
+    scores, neg = compiled(key, bias)
+    ref_scores, ref_neg = tail(key, bias)
+    mx.eval(scores, neg, ref_scores, ref_neg)
+    sig_diff = float(mx.max(mx.abs(scores - ref_scores)).item())
+    assert 0.0 < sig_diff <= 1e-4, (
+        "two-output compiled tail divergence changed: "
+        f"max-abs {sig_diff} (0.0 would mean MLX fixed C1)"
+    )

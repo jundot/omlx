@@ -47,8 +47,14 @@ def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
     return swiglu(gate, up)
 
 
+def _compiled_topk_normalize(weights: mx.array) -> mx.array:
+    """Top-k mixture-weight renormalization (``weights / sum(weights)``)."""
+    return weights / mx.sum(weights, axis=-1, keepdims=True)
+
+
 if _COMPILED_FUSIONS:
     _compiled_softplus_gate = mx.compile(_compiled_softplus_gate, shapeless=True)
+    _compiled_topk_normalize = mx.compile(_compiled_topk_normalize, shapeless=True)
     _swiglu = mx.compile(_swiglu, shapeless=True)
 
 # DECODE-ONLY routed gate/up fusion (Swift ``DARKBLOOM_FUSED_ROUTED_GATE_UP``):
@@ -320,13 +326,23 @@ class LagunaTopKRouter(nn.Module):
         # weights selected expert outputs using the original router scores.
         corrected_scores = scores + self.e_score_correction_bias.astype(scores.dtype)
 
+        # NOTE (correctness, challenge commit f8848e0): the Swift challenge
+        # compiles this router tail (``lagunaCompiledRouterTail``: two outputs
+        # consuming the same sigmoid intermediate) into one kernel. In Python
+        # MLX 0.32 a two-output compiled function with a shared intermediate is
+        # ULP-divergent, and this feeds argpartition expert selection, so it
+        # stays eager (see docs/laguna-mlxfast-port-correctness.md C1). Only the
+        # single-output top-k renormalization below is compiled.
         k = self.top_k
         inds = mx.stop_gradient(
             mx.argpartition(-corrected_scores, kth=k - 1, axis=-1)[..., :k]
         )
         weights = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob:
-            weights = weights / mx.sum(weights, axis=-1, keepdims=True)
+            if _COMPILED_FUSIONS:
+                weights = _compiled_topk_normalize(weights)
+            else:
+                weights = weights / mx.sum(weights, axis=-1, keepdims=True)
         return inds, weights.astype(dtype)
 
 
