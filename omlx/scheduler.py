@@ -1592,6 +1592,17 @@ class _BoundarySnapshotProvider:
             if snap is not None:
                 yield snap
 
+    def add_in_memory(self, tc: int, snapshot: Any) -> None:
+        """Register an already-extracted snapshot at ``tc``.
+
+        The snapshot must be in ``_extract_cache_states`` dict format, like
+        every other in-memory entry this provider serves.
+        """
+        if not snapshot:
+            return
+        self._in_memory[tc] = snapshot
+        self._valid_tcs.add(tc)
+
     def commit_gdn_checkpoint(
         self,
         token_count: int,
@@ -2457,8 +2468,7 @@ class Scheduler:
                 # delete now that the future has completed. Cleanup was
                 # deferred from _cleanup_finished to avoid racing the worker's
                 # boundary_snapshot_store.load() calls with rmtree.
-                if self._boundary_snapshot_store is not None:
-                    self._boundary_snapshot_store.cleanup_request(request_id)
+                self._cleanup_retention_boundary_snapshots(request_id)
                 # Worker no longer holds extracted_cache — pop request from
                 # self.requests and drop the cache buffer references so MLX
                 # arrays can be freed.
@@ -5236,6 +5246,15 @@ class Scheduler:
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
+            # Snapshot rotating layer state at the prompt boundary
+            # (offset = prompt_len - 1; the last prompt token is fed to
+            # insert). Rotating caches cannot be sliced back later, and the
+            # generated output region never re-tokenizes identically (channel
+            # markers are stripped by the API layer), so this is the only
+            # point where a reusable rotating state exists. Bounded cost:
+            # window-sized buffers per rotating layer.
+            if getattr(self, "_live_chain_retention_enabled", lambda: False)():
+                self._capture_prompt_boundary_state(request, state.cache)
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
             now = time.monotonic()
@@ -6040,6 +6059,46 @@ class Scheduler:
             self.block_aware_cache, "_gdn_split_layout_supported", None
         )
         return bool(callable(supported) and supported(layer_types))
+
+    def _paged_cached_prefix_tokens(self, prompt_token_ids) -> int:
+        """Read-only probe: prompt tokens the paged prefix cache already holds."""
+        cache = getattr(self, "block_aware_cache", None)
+        if cache is None or not prompt_token_ids:
+            return 0
+        paged = getattr(cache, "paged_cache", None)
+        if paged is None or not getattr(paged, "enable_caching", False):
+            return 0
+        try:
+            _shared, remaining = paged.find_shared_prefix(list(prompt_token_ids))
+            cached = len(prompt_token_ids) - len(remaining)
+        except Exception:
+            return 0
+        return max(0, min(cached, len(prompt_token_ids) - 1))
+
+    def _split_gdn_snapshot_provider(
+        self,
+        request_id: str,
+        total_tokens: int,
+    ) -> _BoundarySnapshotProvider | None:
+        """Return a lazy provider for every durable full-block GDN stage."""
+        if not self._gdn_split_active():
+            return None
+        snapshots = self._boundary_cache_snapshots.get(request_id) or {}
+        block_size = self.config.paged_cache_block_size
+        valid_tcs = sorted(
+            tc
+            for tc, marker in snapshots.items()
+            if marker is None and 0 < tc <= total_tokens and tc % block_size == 0
+        )
+        if not valid_tcs:
+            return None
+        return _BoundarySnapshotProvider(
+            store=self._boundary_snapshot_store,
+            request_id=request_id,
+            valid_tcs=valid_tcs,
+            in_memory_snapshots={},
+            paged_ssd_manager=self.paged_ssd_cache_manager,
+        )
 
     def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
         """Force the leaf KV tensors of an in-memory boundary snapshot concrete.
@@ -7692,14 +7751,973 @@ class Scheduler:
         )
         return True
 
+    # ---- live chain retention helpers ---------------------------------
+
+    _RETAINABLE_CACHE_CLASSES = frozenset(
+        {
+            "KVCache",
+            "RotatingKVCache",
+            "PrefillReadyRotatingKVCache",
+            "BufferedRotatingKVCache",
+            "TurboQuantKVCache",
+            "CacheList",
+        }
+    )
+    _ROTATING_CACHE_CLASSES = frozenset(
+        {
+            "RotatingKVCache",
+            "PrefillReadyRotatingKVCache",
+            "BufferedRotatingKVCache",
+        }
+    )
+
+    @staticmethod
+    def _live_chain_retention_enabled() -> bool:
+        return os.environ.get("OMLX_RETAIN_LIVE_CHAIN", "").strip() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def _capture_prompt_boundary_state(self, request, cache_list) -> None:
+        """Snapshot rotating (non-sliceable) layer state at the prompt boundary.
+
+        Called on the engine thread right after BatchGenerator.insert() of an
+        externally chunk-prefilled request, while ``cache_list`` is still the
+        plain per-request cache at offset = prompt_len - 1.
+        """
+        try:
+            request._retention_prompt_snapshot = None
+            if not cache_list:
+                return
+            # needs_think_prefix is deliberately not excluded here, for the
+            # same reason as the retention gate below.
+            if getattr(request, "vlm_extra_keys_for_cache", None):
+                return
+            offset = None
+            for c in cache_list:
+                o = _first_leaf_cache_offset(c)
+                if o is not None:
+                    offset = int(o)
+                    break
+            prompt = request.prompt_token_ids or []
+            if not offset or offset <= 0 or offset > len(prompt):
+                return
+            # oMLX 0.5.4 can eagerly extract a decoupled prompt-boundary
+            # snapshot for composite/non-sliceable cache trees. DeepSeek V4
+            # layers are CacheList(RotatingKVCache, PoolingCache[, PoolingCache]);
+            # their pooled state cannot be sliced back from the final decode
+            # state, so capture the complete state here. The helper copies
+            # mutable containers and evaluates leaves on the owner stream.
+            extract_prefill = getattr(self, "_extract_prefill_snapshot_states", None)
+            if callable(extract_prefill):
+                extracted_marker = extract_prefill(cache_list)
+                if (
+                    isinstance(extracted_marker, tuple)
+                    and len(extracted_marker) == 2
+                    and extracted_marker[0]
+                    == getattr(self, "_PREFILL_SNAPSHOT_MARKER", None)
+                    and isinstance(extracted_marker[1], list)
+                    and len(extracted_marker[1]) == len(cache_list)
+                ):
+                    request._retention_prompt_snapshot = {
+                        "offset": offset,
+                        "tokens": list(prompt[:offset]),
+                        "cache": extracted_marker[1],
+                    }
+                    logger.debug(
+                        "Live chain: captured generic prompt-boundary state for %s "
+                        "(offset=%d, %d layers)",
+                        request.request_id,
+                        offset,
+                        len(extracted_marker[1]),
+                    )
+                    return
+            rotating = {}
+            for idx, c in enumerate(cache_list):
+                cname = type(c).__name__
+                if cname not in self._RETAINABLE_CACHE_CLASSES:
+                    return
+                if cname in self._ROTATING_CACHE_CLASSES:
+                    state = c.state
+                    meta = getattr(c, "meta_state", ())
+                    if (
+                        not isinstance(state, (list, tuple))
+                        or len(state) < 2
+                        or state[0] is None
+                    ):
+                        return
+                    state, meta = self._normalize_rotating_snapshot_state(
+                        c, state, meta, layer_idx=idx
+                    )
+                    rotating[idx] = ((state[0], state[1]), tuple(meta), cname)
+            arrays = []
+            for (k, v), _meta, _cn in rotating.values():
+                arrays.extend((k, v))
+            if arrays:
+                with mx.stream(self._stream):
+                    mx.eval(*arrays)
+            request._retention_prompt_snapshot = {
+                "offset": offset,
+                "tokens": list(prompt[:offset]),
+                "rotating": rotating,
+            }
+            logger.debug(
+                "Live chain: captured prompt-boundary state for %s "
+                "(offset=%d, %d rotating layers)",
+                request.request_id,
+                offset,
+                len(rotating),
+            )
+        except Exception as e:
+            logger.debug(
+                "Live chain: prompt-state capture failed for %s: %s",
+                getattr(request, "request_id", "?"),
+                e,
+            )
+            request._retention_prompt_snapshot = None
+
+    @staticmethod
+    def _slice_sliceable_layer(cname: str, k, v, end: int):
+        """Slice a sliceable layer's extracted state to ``end`` tokens."""
+        try:
+            if cname == "KVCache":
+                if k.shape[2] < end:
+                    return None, None
+                return k[:, :, :end, :], v[:, :, :end, :]
+            if cname == "TurboQuantKVCache":
+                from mlx_vlm.turboquant import _slice_state
+
+                from .turboquant_kv import _state_length
+
+                if _state_length(k) < end:
+                    return None, None
+                return _slice_state(k, end), _slice_state(v, end)
+        except Exception:
+            pass
+        return None, None
+
+    def _retain_live_chain(self, request_id: str, request) -> None:
+        """Build the retention slot: sliceable layers sliced to the prompt
+        boundary + rotating layers from the insert-time snapshot."""
+        try:
+            snap = getattr(request, "_retention_prompt_snapshot", None)
+            if not snap:
+                logger.debug(
+                    "Live chain: no prompt snapshot for %s; leaving store path",
+                    request_id,
+                )
+                return
+            extracted = request._extracted_cache
+            if not isinstance(extracted, list) or not extracted:
+                return
+            boundary = snap["offset"]
+            # 0.5.4 generic path: the complete prompt-boundary cache was
+            # eagerly extracted at insert time. Keep it directly; in
+            # particular, do not attempt to slice DeepSeek PoolingCache state.
+            if "cache" in snap:
+                layers = snap["cache"]
+                arrays = self._collect_arrays_from_extracted_cache(layers)
+                if arrays:
+                    with mx.stream(self._stream):
+                        mx.eval(*arrays)
+                self._install_retention_slot(
+                    request_id, request, snap["tokens"], layers, "generic"
+                )
+                request._retention_prompt_snapshot = None
+                return
+            layers = []
+            for idx, layer in enumerate(extracted):
+                if not isinstance(layer, dict):
+                    return
+                cname = layer.get("class_name")
+                if cname not in self._RETAINABLE_CACHE_CLASSES:
+                    return
+                if cname in self._ROTATING_CACHE_CLASSES:
+                    rot = snap["rotating"].get(idx)
+                    if rot is None:
+                        return
+                    (k, v), meta, rcname = rot
+                    layers.append(
+                        {
+                            "state": (k, v),
+                            "meta_state": meta,
+                            "class_name": rcname,
+                            "cache_type": rcname,
+                        }
+                    )
+                else:
+                    state = layer.get("state")
+                    if (
+                        not isinstance(state, (list, tuple))
+                        or len(state) < 2
+                        or state[0] is None
+                        or state[1] is None
+                    ):
+                        return
+                    k, v = self._slice_sliceable_layer(
+                        cname, state[0], state[1], boundary
+                    )
+                    if k is None:
+                        return
+                    layers.append(
+                        {
+                            "state": (k, v),
+                            "meta_state": layer.get("meta_state"),
+                            "class_name": cname,
+                            "cache_type": layer.get("cache_type"),
+                        }
+                    )
+            # Materialize before batch_generator.remove() so the retained
+            # arrays own concrete buffers (same rationale as the store
+            # dispatch's full mx.eval on this thread).
+            arrays = self._collect_arrays_from_extracted_cache(layers)
+            if arrays:
+                with mx.stream(self._stream):
+                    mx.eval(*arrays)
+            self._install_retention_slot(
+                request_id, request, snap["tokens"], layers, "sliced"
+            )
+            request._retention_prompt_snapshot = None
+        except Exception as e:
+            logger.warning("Live chain: retention failed for %s: %s", request_id, e)
+
+    # ---- live chain retention: slot spill -----------------------------
+    #
+    # Patch 34 skips the completion-time store for a retained request, so the
+    # retention slot holds the ONLY copy of that prefix. There is exactly one
+    # slot, so a second conversation retaining its own chain used to erase the
+    # first one's cache outright: its next turn missed everywhere and paid a
+    # full cold prefill (measured 0 cached tokens on an interleaved turn; at
+    # ~99k tokens that is 212s instead of 4s). Spill the outgoing slot into the
+    # ordinary cache on the way out instead of dropping it. The sequential case
+    # is unchanged — the next turn adopts and the payload is dropped unstored —
+    # so only real contention pays for the store.
+    #
+    # The spill reuses the slot's own arrays as the store payload, so nothing
+    # extra stays resident while a payload is pending. What it does need is the
+    # block-aligned non-sliceable (GDN) state, which the slot does not have:
+    # the slot sits at the prompt boundary, which is not block aligned. The
+    # durable split sidecar written during prefill carries exactly those
+    # per-block states, so a payload is only built while that sidecar is
+    # available and its cleanup is held off until the payload is resolved.
+
+    def _retention_pending_snapshot_ids(self) -> set:
+        ids = getattr(self, "_retention_pending_snapshot_id_set", None)
+        if ids is None:
+            ids = set()
+            self._retention_pending_snapshot_id_set = ids
+        return ids
+
+    def _retention_spill_futures(self) -> deque:
+        futures = getattr(self, "_retention_spill_future_queue", None)
+        if futures is None:
+            futures = deque()
+            self._retention_spill_future_queue = futures
+        return futures
+
+    def _retention_cleanup_queue(self) -> deque:
+        queue = getattr(self, "_retention_cleanup_id_queue", None)
+        if queue is None:
+            queue = deque()
+            self._retention_cleanup_id_queue = queue
+        return queue
+
+    def _cleanup_retention_boundary_snapshots(self, request_id: str) -> None:
+        """Delete a request's on-disk boundary snapshots unless a pending
+        Patch 34 spill payload still needs them."""
+        if self._boundary_snapshot_store is None:
+            return
+        if request_id in self._retention_pending_snapshot_ids():
+            return
+        self._boundary_snapshot_store.cleanup_request(request_id)
+
+    def _release_retention_pending_snapshots(self, request_id: str) -> None:
+        """Resolve a payload's hold and queue the cleanup it was deferring.
+
+        The rmtree runs from the step loop rather than here: the adoption path
+        releases a payload while preparing the next request, and that is not
+        the place to pay for another request's disk cleanup.
+        """
+        self._retention_pending_snapshot_ids().discard(request_id)
+        if self._boundary_snapshot_store is not None:
+            self._retention_cleanup_queue().append(request_id)
+
+    # ---- live chain retention: rotating/CacheList snapshot source -----
+    #
+    # Slot spill and partial adoption both read per-block state through
+    # _split_gdn_snapshot_provider, which only serves layouts that pass
+    # _gdn_split_layout_supported() — and that gate excludes rotating and
+    # CacheList caches by design (they keep the legacy embedded path). So on
+    # rotating models the spill fell back to the ordinary store (losing the
+    # memory saving this path exists for) and partial adoption never fired. Those
+    # models do capture per-block boundary snapshots during prefill; the
+    # ordinary completion store reads them through _get_boundary_store_override.
+    # Route the same snapshots into the spill payload.
+
+    def _boundary_override_snapshot_provider(self, request_id: str, tokens):
+        """Boundary snapshots for models outside the GDN sidecar layout."""
+        try:
+            override = self._get_boundary_store_override(request_id, list(tokens))
+        except Exception as e:
+            logger.debug(
+                "Live chain: boundary override unavailable for %s: %s", request_id, e
+            )
+            return None
+        if override is None:
+            return None
+        token_sequence, boundary_cache, _config, provider = override
+        if provider is None:
+            return None
+        # The override returns its topmost snapshot separately. Both consumers
+        # address snapshots by token count, and store_cache prefers a snapshot
+        # over the live chain for the terminal block too — which is what we
+        # want here, since the retained chain's non-sliceable state sits at the
+        # prompt boundary rather than at the block boundary being stored.
+        provider.add_in_memory(len(token_sequence), boundary_cache)
+        return provider or None
+
+    def _eval_boundary_provider_snapshots(self, provider) -> None:
+        """Materialize in-memory snapshots before they cross a thread.
+
+        The spill worker slices these, and MLX streams are thread-local: a leaf
+        still lazy by then re-dispatches to a stream that does not exist on the
+        worker. SSD-backed entries load on the worker itself and need nothing.
+        """
+        iter_extracted = getattr(provider, "iter_in_memory_extracted", None)
+        if not callable(iter_extracted):
+            return
+        arrays = []
+        for snapshot in iter_extracted():
+            arrays.extend(self._collect_arrays_from_extracted_cache(snapshot))
+        if arrays:
+            with mx.stream(self._stream):
+                mx.eval(*arrays)
+
+    @classmethod
+    def _boundary_snapshot_owns_layer(cls, snapshot, idx: int) -> bool:
+        """True when the boundary snapshot carries this layer's real state.
+
+        Placeholder layers (and member-filtered CacheList layers) are refilled
+        from the live chain instead, so they still have to be sliced.
+        """
+        if not snapshot or idx >= len(snapshot):
+            return False
+        layer = snapshot[idx]
+        if not isinstance(layer, dict) or "state" not in layer:
+            return False
+        if cls._is_empty_boundary_placeholder(layer):
+            return False
+        return not cls._has_blanked_cachelist_members(layer)
+
+    def _build_deferred_spill_store(self, request_id: str, tokens, layers, request):
+        """Payload for a later spill.
+
+        Returns (skip_completion_store, payload). ``skip_completion_store`` is
+        False when the chain cannot be spilled later, and the caller then
+        leaves the ordinary completion-time store alone rather than trading a
+        cache copy for nothing.
+        """
+        block_size = getattr(self.config, "paged_cache_block_size", 0)
+        if getattr(self, "block_aware_cache", None) is None or block_size <= 0:
+            # Nothing the completion-time store would have kept either.
+            return True, None
+        boundary_len = (len(tokens) // block_size) * block_size
+        if boundary_len <= 0:
+            # Shorter than one block: the ordinary store drops the trailing
+            # partial block, so skipping it costs nothing and there is no
+            # payload to build.
+            return True, None
+        if getattr(self, "_store_cache_executor", None) is None:
+            # Only a synchronous store is available, and stalling the
+            # inference thread on a spill is worse than storing now.
+            return False, None
+        snapshot_owner_id = request_id
+        provider = self._split_gdn_snapshot_provider(request_id, boundary_len)
+        if provider is None:
+            # Rotating/CacheList layouts never reach the sidecar
+            # provider, but their prefill snapshots are just as usable.
+            provider = self._boundary_override_snapshot_provider(request_id, tokens)
+        if provider is not None:
+            self._retention_pending_snapshot_ids().add(request_id)
+            self._eval_boundary_provider_snapshots(provider)
+        else:
+            # A request that adopted its prefix only prefilled the
+            # remainder, so it captured no block-aligned snapshots of its own.
+            # The ones it adopted still describe that prefix exactly.
+            inherited = self._inherited_payload_source(request, tokens, block_size)
+            if inherited is not None:
+                boundary_len, provider, snapshot_owner_id = inherited
+            elif self._detect_boundary_snapshot_need():
+                # Non-sliceable state with no durable per-block snapshots to
+                # pair with the slice. Let the normal store path run.
+                return False, None
+        return True, {
+            "request_id": request_id,
+            "snapshot_owner_id": snapshot_owner_id,
+            "tokens": list(tokens[:boundary_len]),
+            "cache": layers,
+            "config": getattr(request, "_model_cache_config", None),
+            "snapshots": provider,
+        }
+
+    # ---- live chain retention: carry the payload across adoption ------
+    #
+    # 34c spills the slot when it is *replaced* so a contended chain still
+    # leaves something behind. Adoption is the slot's other exit, and it was
+    # left releasing the payload unstored on the reasoning that "the chain
+    # lives on in the adopting request". That holds only while the adopting
+    # request can build a payload of its own — and it cannot: it prefilled
+    # just the remainder, so _get_boundary_store_override() finds no
+    # block-aligned snapshot for it, and neither does the ordinary store.
+    # Measured on a rotating-cache model, every other turn re-prefilled the
+    # whole prompt (50K prompt, six turns: 19.78s -> 130.33s). The prefix that was
+    # adopted did not change, so the snapshots taken of it are still exact —
+    # carry them forward instead of dropping them.
+
+    def _inherit_retention_payload(self, request) -> None:
+        """Consume the slot, handing its spill payload to the adopting request.
+
+        Unlike _discard_retention_slot() this keeps the snapshot hold: the payload is
+        still live, just owned by a different request now.
+        """
+        slot = getattr(self, "_retention_slot", None)
+        self._retention_slot = None
+        if not slot:
+            return
+        pending = slot.get("pending_store")
+        if pending is None:
+            return
+        self._release_inherited_payload(request)
+        # Only the snapshots and the tokens they describe are wanted. Carrying
+        # the payload's "cache" would pin the pre-adoption chain for the whole
+        # request: adoption wraps those arrays but growing the chain in place
+        # reallocates, so the old buffers would stay resident alongside the new
+        # ones — a second copy, which is the duplication this path exists to remove.
+        request._retention_inherited_store = {
+            "request_id": pending["request_id"],
+            "snapshot_owner_id": (
+                pending.get("snapshot_owner_id") or pending["request_id"]
+            ),
+            # Read defensively: a missing bookkeeping key must not take the
+            # adoption down with it — the inheritance is an optimisation.
+            "tokens": pending.get("tokens") or [],
+            "snapshots": pending.get("snapshots"),
+        }
+
+    def _release_inherited_payload(self, request) -> None:
+        """Drop an inheritance the request never turned into a new payload."""
+        inherited = getattr(request, "_retention_inherited_store", None)
+        if inherited is None:
+            return
+        request._retention_inherited_store = None
+        owner = inherited.get("snapshot_owner_id") or inherited.get("request_id")
+        if owner:
+            self._release_retention_pending_snapshots(owner)
+
+    def _inherited_payload_source(self, request, tokens, block_size):
+        """(boundary, provider, owner) from an adopted payload, or None.
+
+        Walks down block boundaries so a *partial* adoption — which may have
+        landed below the inherited payload's own boundary — still finds the
+        deepest snapshot that both sides agree on.
+        """
+        inherited = getattr(request, "_retention_inherited_store", None)
+        if not inherited:
+            return None
+        provider = inherited.get("snapshots")
+        inherited_tokens = inherited.get("tokens") or []
+        if provider is None or not inherited_tokens:
+            return None
+        boundary = (min(len(inherited_tokens), len(tokens)) // block_size) * block_size
+        while boundary > 0:
+            if boundary in provider and (
+                list(tokens[:boundary]) == list(inherited_tokens[:boundary])
+            ):
+                break
+            boundary -= block_size
+        if boundary <= 0:
+            return None
+        owner = inherited.get("snapshot_owner_id") or inherited["request_id"]
+        # Consumed: the hold now belongs to the payload being built.
+        request._retention_inherited_store = None
+        logger.info(
+            "Live chain: reusing adopted boundary snapshots for %s "
+            "(%d tokens, owner=%s)",
+            getattr(request, "request_id", "?"),
+            boundary,
+            owner,
+        )
+        return boundary, provider, owner
+
+    def _install_retention_slot(
+        self, request_id: str, request, tokens, layers, kind: str
+    ):
+        """Spill whatever the slot held, then retain this chain in its place."""
+        try:
+            skip_store, pending = self._build_deferred_spill_store(
+                request_id, tokens, layers, request
+            )
+        except Exception as e:
+            # Fall back to the pre-34c behaviour rather than losing the
+            # retention itself.
+            logger.debug(
+                "Live chain: spill payload unavailable for %s: %s", request_id, e
+            )
+            skip_store, pending = True, None
+        self._spill_retention_slot(f"replaced by {request_id}")
+        self._retention_slot = {
+            "tokens": tokens,
+            "cache": layers,
+            "config": getattr(request, "_model_cache_config", None),
+            "request_id": request_id,
+            "pending_store": pending,
+        }
+        if skip_store:
+            request._retention_chain_retained = True
+            request._extracted_cache = None
+        logger.info(
+            "Live chain: retained %s live chain for %s at prompt boundary "
+            "(%d tokens, %d layers, spill=%s)",
+            kind,
+            request_id,
+            len(tokens),
+            len(layers),
+            "pending" if pending is not None else "none",
+        )
+
+    def _spill_retention_slot(self, reason: str) -> None:
+        """Consume the current slot, storing its chain if a payload is held."""
+        slot = getattr(self, "_retention_slot", None)
+        self._retention_slot = None
+        if not slot:
+            return
+        pending = slot.get("pending_store")
+        if pending is None:
+            return
+        self._submit_spill_store(pending, reason)
+
+    def _discard_retention_slot(self) -> None:
+        """Drop the slot without storing (recovery paths, adoption)."""
+        slot = getattr(self, "_retention_slot", None)
+        self._retention_slot = None
+        if not slot:
+            return
+        pending = slot.get("pending_store")
+        if pending is not None:
+            self._release_retention_pending_snapshots(
+                pending.get("snapshot_owner_id") or pending["request_id"]
+            )
+
+    def _submit_spill_store(self, pending, reason: str) -> None:
+        request_id = pending["request_id"]
+        # An inherited payload's snapshots belong to the request
+        # that captured them, not to the one storing them now.
+        owner_id = pending.get("snapshot_owner_id") or request_id
+        tokens = pending["tokens"]
+        cache = pending["cache"]
+        try:
+            executor = self._store_cache_executor
+            if executor is None:
+                # Synchronous store would stall the inference thread for the
+                # whole host memcpy; the chain is not worth that.
+                self._release_retention_pending_snapshots(owner_id)
+                return
+            # The store path's memory ceiling check, applied to the spill.
+            if self._memory_hard_limit_bytes > 0 and self.memory_monitor is not None:
+                est = self.memory_monitor.estimate_prompt_kv_bytes(len(tokens))
+                current = self._current_usage_bytes(refresh_mlx_active=True)
+                margin = 512 * 1024 * 1024
+                if current + est + margin > self._memory_hard_limit_bytes:
+                    logger.warning(
+                        "Live chain: spill store skipped for %s: current=%.2fGB + "
+                        "est=%.2fGB + margin=%.2fGB > ceiling=%.2fGB",
+                        request_id,
+                        current / 1e9,
+                        est / 1e9,
+                        margin / 1e9,
+                        self._memory_hard_limit_bytes / 1e9,
+                    )
+                    self._release_retention_pending_snapshots(owner_id)
+                    return
+            # Same dispatch invariant as the completion-time store: the worker
+            # slices and views these arrays on another thread, and MLX streams
+            # are thread-local, so they must be concrete before it runs.
+            arrays = self._collect_arrays_from_extracted_cache(cache)
+            if arrays:
+                with mx.stream(self._stream):
+                    mx.eval(*arrays)
+            # SSD write-through rather than the completion store's pressure
+            # check. A spilled chain belongs to a conversation that just lost
+            # the slot and may never come back, and spills happen exactly when
+            # several conversations are interleaved — populating the hot cache
+            # with those would push out blocks that active conversations are
+            # still using, and on a memory-tight machine it is the hot budget
+            # that is scarce. The chain is still restorable, just from disk.
+            hot_cache_write_back = False
+            future = executor.submit(
+                self._async_store_cache_worker,
+                request_id,
+                tokens,
+                cache,
+                pending["config"],
+                pending["snapshots"],
+                None,
+                None,
+                None,
+                hot_cache_write_back,
+            )
+            self._retention_spill_futures().append((owner_id, future))
+            logger.info(
+                "Live chain: spilling retained chain for %s to cache "
+                "(%d tokens, %s)",
+                request_id,
+                len(tokens),
+                reason,
+            )
+        except Exception as e:
+            logger.warning("Live chain: spill store failed for %s: %s", request_id, e)
+            self._release_retention_pending_snapshots(owner_id)
+
+    def _drain_spill_futures(self) -> None:
+        """Release snapshot holds once spill workers finish, then run the
+        cleanups that releasing queued."""
+        futures = getattr(self, "_retention_spill_future_queue", None)
+        if futures:
+            self._drain_spill_futures_inner(futures)
+        queue = getattr(self, "_retention_cleanup_id_queue", None)
+        while queue:
+            request_id = queue.popleft()
+            try:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            except Exception as e:
+                logger.debug(
+                    "Live chain: boundary snapshot cleanup failed for %s: %s",
+                    request_id,
+                    e,
+                )
+
+    def _drain_spill_futures_inner(self, futures: deque) -> None:
+        pending: deque = deque()
+        while futures:
+            request_id, future = futures.popleft()
+            if not future.done():
+                pending.append((request_id, future))
+                continue
+            try:
+                exc = future.exception()
+            except concurrent.futures.CancelledError:
+                logger.warning(
+                    "Live chain: spill store for %s was cancelled", request_id
+                )
+            else:
+                if exc is not None:
+                    logger.warning(
+                        "Live chain: spill store for %s raised: %s", request_id, exc
+                    )
+            self._release_retention_pending_snapshots(request_id)
+        self._retention_spill_future_queue = pending
+
+    def _try_adopt_retained_chain(self, request) -> bool:
+        if not self._live_chain_retention_enabled():
+            return False
+        slot = getattr(self, "_retention_slot", None)
+        if not slot:
+            return False
+        prompt = request.prompt_token_ids or []
+        tokens = slot["tokens"]
+        n = len(tokens)
+        if n == 0:
+            return False
+        if getattr(request, "vlm_extra_keys_for_cache", None):
+            return False
+        if len(prompt) <= n:
+            # Too short to extend the retained chain, but it can still share a
+            # block-aligned prefix with it.
+            return self._try_partial_adopt_retained_chain(request, slot, prompt, tokens)
+        if list(prompt[:n]) != tokens:
+            i = 0
+            m = min(n, len(prompt))
+            while i < m and tokens[i] == prompt[i]:
+                i += 1
+            logger.info(
+                "Live chain: retained chain mismatch for %s "
+                "(common prefix %d of %d retained / %d prompt; "
+                "retained[%d:%d]=%s prompt[%d:%d]=%s)",
+                request.request_id,
+                i,
+                n,
+                len(prompt),
+                max(0, i - 2),
+                min(n, i + 6),
+                tokens[max(0, i - 2) : min(n, i + 6)],
+                max(0, i - 2),
+                min(len(prompt), i + 6),
+                list(prompt[max(0, i - 2) : min(len(prompt), i + 6)]),
+            )
+            return self._try_partial_adopt_retained_chain(request, slot, prompt, tokens)
+        # Defer to the paged path when it would serve more cached tokens
+        # (e.g. a turn that bypassed the insert snapshot stored fresher
+        # blocks than the slot's older boundary).
+        paged_est = self._paged_cached_prefix_tokens(prompt)
+        if paged_est > n:
+            logger.info(
+                "Live chain: paged path serves more for %s (%d > %d); skipping adoption",
+                request.request_id,
+                paged_est,
+                n,
+            )
+            return False
+        caches = []
+        for layer_idx, layer in enumerate(slot["cache"]):
+            obj = self._construct_retained_layer(layer)
+            if obj is None:
+                logger.warning(
+                    "Live chain: layer %d (%s) reconstruction failed; "
+                    "falling back to paged path",
+                    layer_idx,
+                    layer.get("class_name") if isinstance(layer, dict) else "?",
+                )
+                return False
+            caches.append(obj)
+        # Consume the slot: the adopted caches wrap the same arrays and the
+        # request grows them in place; keeping both would re-create the
+        # duplication this patch removes. The payload goes with the
+        # chain rather than being dropped — the adopting request cannot
+        # capture snapshots of a prefix it never prefilled, and these still
+        # describe it exactly. Nothing is stored here, so the sequential path
+        # still pays nothing.
+        self._inherit_retention_payload(request)
+        request.prompt_cache = caches
+        request.block_table = None
+        request.cached_tokens = n
+        request.shared_prefix_blocks = 0
+        request.remaining_tokens = request.prompt_token_ids[n:]
+        logger.info(
+            "Live chain: adopted retained chain for %s (cached=%d, remaining=%d)",
+            request.request_id,
+            n,
+            len(request.remaining_tokens),
+        )
+        return True
+
+    # ---- live chain retention: partial adoption -----------------------
+    #
+    # A junction mismatch used to cost the whole prefill even when the prompts
+    # diverged in their last few tokens: exact adoption is all-or-nothing, and
+    # the retained chain is the only copy of the prefix (34c stores it only
+    # once the slot is replaced, which happens at the END of this very
+    # request). Everything needed to serve the shared part is already at hand
+    # at mismatch time — the slot's sliceable layers slice to any offset, and
+    # the non-sliceable (GDN) state has durable per-block snapshots that 34c
+    # keeps alive while a payload is pending. So adopt the largest block
+    # boundary at or below the divergence point and re-prefill the rest.
+
+    def _try_partial_adopt_retained_chain(self, request, slot, prompt, tokens) -> bool:
+        try:
+            pending = slot.get("pending_store")
+            provider = pending.get("snapshots") if pending else None
+            if provider is None:
+                return False
+            block_size = getattr(self.config, "paged_cache_block_size", 0)
+            if block_size <= 0:
+                return False
+            common = 0
+            limit = min(len(tokens), len(prompt))
+            while common < limit and tokens[common] == prompt[common]:
+                common += 1
+            boundary = (common // block_size) * block_size
+            # Leave at least one token to prefill: a fully cached prompt has
+            # nothing to run the next forward pass on.
+            while boundary >= len(prompt):
+                boundary -= block_size
+            while boundary > 0 and boundary not in provider:
+                boundary -= block_size
+            if boundary <= 0:
+                return False
+            paged_est = self._paged_cached_prefix_tokens(prompt)
+            if paged_est >= boundary:
+                return False
+            snapshot = provider[boundary]
+            if not snapshot or len(snapshot) != len(slot["cache"]):
+                return False
+            sliced = self._slice_cache_to_boundary(slot["cache"], boundary, snapshot)
+            if sliced is None:
+                return False
+            merged = self._merge_boundary_with_full_cache(snapshot, sliced)
+            caches = []
+            for layer_idx, layer in enumerate(merged):
+                obj = self._construct_retained_layer(layer)
+                if obj is None:
+                    logger.warning(
+                        "Live chain: layer %d (%s) reconstruction failed; "
+                        "falling back to paged path",
+                        layer_idx,
+                        layer.get("class_name") if isinstance(layer, dict) else "?",
+                    )
+                    return False
+                caches.append(obj)
+            # The snapshot layers were just read off disk; materialize them
+            # before the slot changes hands (payload inheritance keeps the directory
+            # alive, but these leaves must be concrete either way).
+            arrays = self._collect_arrays_from_extracted_cache(merged)
+            if arrays:
+                with mx.stream(self._stream):
+                    mx.eval(*arrays)
+            self._inherit_retention_payload(request)
+            request.prompt_cache = caches
+            request.block_table = None
+            request.cached_tokens = boundary
+            request.shared_prefix_blocks = 0
+            request.remaining_tokens = request.prompt_token_ids[boundary:]
+            logger.info(
+                "Live chain: partially adopted retained chain for %s at block "
+                "boundary (cached=%d of %d common, remaining=%d)",
+                request.request_id,
+                boundary,
+                common,
+                len(request.remaining_tokens),
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Live chain: partial adoption failed for %s: %s",
+                getattr(request, "request_id", "?"),
+                e,
+            )
+            return False
+
+    def _slice_cache_to_boundary(self, cache, boundary: int, snapshot=None):
+        """Slice the sliceable layers of a retained chain to ``boundary``.
+
+        Non-sliceable layers are passed through untouched; the caller replaces
+        them with the boundary snapshot's own state. Rotating layers are
+        named in _RETAINABLE_CACHE_CLASSES but _slice_sliceable_layer cannot
+        slice them, so ask the snapshot first — a layer it owns is about to be
+        replaced anyway, and failing to slice it used to reject the whole
+        partial adoption on every rotating model.
+        """
+        sliced = []
+        for idx, layer in enumerate(cache):
+            if not isinstance(layer, dict):
+                return None
+            cname = layer.get("class_name")
+            snapshot_owns = self._boundary_snapshot_owns_layer(snapshot, idx)
+            if snapshot_owns or cname not in self._RETAINABLE_CACHE_CLASSES:
+                sliced.append(layer)
+                continue
+            state = layer.get("state")
+            if (
+                not isinstance(state, (list, tuple))
+                or len(state) < 2
+                or state[0] is None
+                or state[1] is None
+            ):
+                sliced.append(layer)
+                continue
+            k, v = self._slice_sliceable_layer(cname, state[0], state[1], boundary)
+            if k is None:
+                return None
+            new_layer = dict(layer)
+            new_layer["state"] = (k, v)
+            sliced.append(new_layer)
+        return sliced
+
+    def _construct_retained_layer(self, layer):
+        try:
+            class_name = layer.get("class_name")
+            state = layer.get("state")
+            meta = layer.get("meta_state")
+            if not isinstance(state, (list, tuple)) or len(state) < 2:
+                return None
+            if state[0] is None or state[1] is None:
+                return None
+            # 0.5.4 cache architecture exposes generic N-tuple handlers,
+            # including CacheList recursion and DeepSeek PoolingCache. Prefer
+            # that route so every sub-cache retains all state elements.
+            if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+                try:
+                    handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
+                    if class_name == "CacheList":
+                        return handler.reconstruct_cache(
+                            {"sub_states": list(state)},
+                            tuple(meta) if meta else None,
+                        )
+                    # Qwen3.5 hybrid: mlx_vlm linear
+                    # layers are bare ArraysCache(size=2) with variable-length
+                    # state; the base deserialize_state zips () axis info and
+                    # reconstructs an EMPTY cache -> IndexError on cache[0]
+                    # during the next prefill. Feed the states list directly.
+                    if class_name in ("ArraysCache", "SizedArraysCache"):
+                        return handler.reconstruct_cache(
+                            {"states": list(state)},
+                            tuple(meta) if meta else None,
+                        )
+                    if hasattr(handler, "deserialize_state"):
+                        rebuilt = handler.deserialize_state(
+                            tuple(state), tuple(meta) if meta else meta
+                        )
+                        if rebuilt is not None:
+                            return rebuilt
+                except Exception:
+                    pass
+            if class_name == "KVCache":
+                from mlx_lm.models.cache import KVCache
+
+                obj = KVCache()
+                obj.state = (state[0], state[1])
+                return obj
+            if class_name in self._ROTATING_CACHE_CLASSES:
+                if not HAS_CACHE_TYPE_HANDLERS or CacheTypeRegistry is None:
+                    return None
+                try:
+                    handler = CacheTypeRegistry.get_handler_by_class_name(class_name)
+                except Exception:
+                    handler = CacheTypeRegistry.get_handler_by_class_name(
+                        "RotatingKVCache"
+                    )
+                return handler.reconstruct_cache(
+                    {"keys": state[0], "values": state[1]},
+                    tuple(meta) if meta else None,
+                )
+            if class_name == "TurboQuantKVCache":
+                from mlx_vlm.turboquant import TurboQuantKVCache
+
+                from .turboquant_kv import _rebuild_codecs, _state_length
+
+                tq_bits, tq_seed = 4.0, 0
+                if isinstance(meta, (list, tuple)) and len(meta) >= 3:
+                    tq_bits = float(meta[1])
+                    tq_seed = int(meta[2])
+                tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
+                tq.keys = state[0]
+                tq.values = state[1]
+                tq.offset = _state_length(state[0])
+                _rebuild_codecs(tq, state[0], state[1])
+                return tq
+        except Exception as e:
+            logger.debug(
+                "Live chain: construct %s failed: %s",
+                layer.get("class_name") if isinstance(layer, dict) else "?",
+                e,
+            )
+        return None
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
+            return
+
+        # Adopt the retained live chain when this prompt exactly
+        # extends it (fast path; falls through to the paged path otherwise).
+        if self._try_adopt_retained_chain(request):
+            self._try_specprefill_scoring(request)
+            self._prefix_cache_prepared.add(request.request_id)
             return
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
-            block_table, remaining = self.block_aware_cache.fetch_cache(
+            block_table, _remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
                 extra_keys=request.vlm_extra_keys_for_cache,
@@ -8892,8 +9910,7 @@ class Scheduler:
 
         # Drop any boundary snapshot for this request.
         self._boundary_cache_snapshots.pop(request_id, None)
-        if self._boundary_snapshot_store is not None:
-            self._boundary_snapshot_store.cleanup_request(request_id)
+        self._cleanup_retention_boundary_snapshots(request_id)
 
         # Remove from prefill progress tracker.
         get_prefill_tracker().remove(request_id)
@@ -10260,6 +11277,12 @@ class Scheduler:
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
+                # Renew the prompt-boundary snapshot after a retained
+                # chain was adopted. Its remaining suffix normally takes this
+                # direct path, not _insert_prefilled_request(). Without this
+                # hook only alternating turns can reuse the live chain.
+                if self._live_chain_retention_enabled():
+                    self._capture_prompt_boundary_state(request, cache_to_use)
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 now = time.monotonic()
@@ -10607,6 +11630,33 @@ class Scheduler:
             # registration. batch_generator.remove(uid) is deferred and
             # picked up at the next step's _drain_pending_async_removes.
             store_future = None
+            # Live chain retention: retain the
+            # finished request's chain state at the prompt boundary (sliceable
+            # layers sliced from the full extraction, rotating layers from the
+            # insert-time snapshot) instead of serializing it into hot-cache
+            # bytes, so the chain is resident once (wired) rather than twice
+            # (wired + CPU bytes). The next exact-extension request adopts the
+            # arrays directly (no restore concat, no store worker). Opt-in via
+            # OMLX_RETAIN_LIVE_CHAIN=1; requests without an insert snapshot
+            # fall back to the normal store path.
+            if (
+                self._live_chain_retention_enabled()
+                and request is not None
+                and request.prompt_token_ids
+                and getattr(request, "_extracted_cache", None) is not None
+                # needs_think_prefix is deliberately not excluded: what is
+                # retained is the prompt boundary (prompt[:len-1]), so think
+                # tokens in the output range are out of scope — the upstream
+                # store path narrows cacheable_sequence to prompt_token_ids
+                # for reasoning models and keeps the same range. Adoption
+                # self-verifies with an exact token comparison.
+                and not getattr(request, "vlm_extra_keys_for_cache", None)
+            ):
+                self._retain_live_chain(request_id, request)
+            # Whatever adoption handed this request is resolved by
+            # now — either folded into the new payload or no longer wanted.
+            if request is not None:
+                self._release_inherited_payload(request)
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
                     # Internal probes (context benchmark) opt out of the
@@ -10615,7 +11665,13 @@ class Scheduler:
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
                     skip_store = getattr(request, "skip_cache_store", False)
-                    if skip_store or (
+                    if getattr(request, "_retention_chain_retained", False):
+                        # Chain retained in-slot — skip both the
+                        # extracted-cache store and the parser-stop boundary
+                        # store. Control falls through to the no-store
+                        # block-leak guard below.
+                        prompt_boundary_store = None
+                    elif skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
                     ):
@@ -10939,8 +11995,8 @@ class Scheduler:
             # races the worker's boundary_snapshot_store.load() calls. If
             # an async store_future is in flight, defer cleanup until the
             # worker finishes (handled in _drain_pending_async_removes).
-            if self._boundary_snapshot_store is not None and store_future is None:
-                self._boundary_snapshot_store.cleanup_request(request_id)
+            if store_future is None:
+                self._cleanup_retention_boundary_snapshots(request_id)
 
             # Track as finished
             self.finished_req_ids.add(request_id)
@@ -11020,6 +12076,7 @@ class Scheduler:
         # Clear batch generator (this is the source of the corruption)
         self.batch_generator = None
         self._current_sampler_params = None
+        self._discard_retention_slot()  # Drop retained chain on recovery
         self._boundary_cache_snapshots.clear()
         if self._boundary_snapshot_store is not None:
             self._boundary_snapshot_store.cleanup_all()
@@ -11261,8 +12318,7 @@ class Scheduler:
             request.generation_overflow_retries += 1
             request_id = request.request_id
             self._boundary_cache_snapshots.pop(request_id, None)
-            if self._boundary_snapshot_store is not None:
-                self._boundary_snapshot_store.cleanup_request(request_id)
+            self._cleanup_retention_boundary_snapshots(request_id)
             get_prefill_tracker().remove(request_id)
             if request.generation_overflow_retries > max_generation_overflow_retries:
                 failed_ids.append(request_id)
@@ -11428,6 +12484,9 @@ class Scheduler:
         drained_async_removes = self._drain_pending_async_removes()
         if drained_async_removes:
             output.has_work = True
+
+        # Release the boundary-snapshot hold of finished slot spills.
+        self._drain_spill_futures()
 
         # Check memory pressure and evict if needed (tiered cache)
         if self.memory_monitor is not None:
@@ -11780,6 +12839,7 @@ class Scheduler:
         self._prefix_cache_prepared.clear()
         self.batch_generator = None
         self._current_sampler_params = None
+        self._discard_retention_slot()  # Drop retained chain on recovery
         self._boundary_cache_snapshots.clear()
         if self._boundary_snapshot_store is not None:
             self._boundary_snapshot_store.cleanup_all()
