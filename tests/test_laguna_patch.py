@@ -1188,3 +1188,38 @@ def test_compiled_combine_matches_eager():
     ref = mx.sum(y * weights[..., None], axis=-2) * 2.5 + shared
     mx.eval(out, ref)
     assert mx.array_equal(out, ref)
+
+
+def test_normalize_then_combine_equals_folded():
+    """eb76e2b8 equivalence gate: router-side normalize + combine is bit-identical
+    to the Swift's folded lagunaCompiledNormalizedExpertCombine.
+
+    The submission folds top-k renormalization into the expert combine
+    (deferred). oMLX keeps the normalize in the router (8adb56be) and the
+    combine separate (9a37e4dc); this pins that the two compositions are
+    bit-identical, so the folded variant adds nothing and is not re-ported.
+    """
+    import mlx.nn as nn
+
+    lm = _registered_laguna_module()
+    scale = 2.5
+    outputs = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
+    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
+    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
+
+    # oMLX path: normalize in the router, then the compiled combine.
+    normalized = weights / mx.sum(weights, axis=-1, keepdims=True)
+    typed = normalized.astype(outputs.dtype)
+    routed = mx.sum(outputs * typed[..., None], axis=-2)
+    separate = routed * scale + shared
+
+    # Swift folded path (lagunaCompiledNormalizedExpertCombine body).
+    folded = (
+        mx.sum(outputs * (weights / mx.sum(weights, axis=-1, keepdims=True)).astype(
+            outputs.dtype
+        )[..., None], axis=-2)
+        * scale
+        + shared
+    )
+    mx.eval(separate, folded)
+    assert mx.array_equal(separate, folded)
