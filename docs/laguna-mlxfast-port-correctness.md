@@ -28,6 +28,7 @@ migration `4799830` and are not part of the current model surface).
 | 96 | 2026-07-24 | `9a37e4dc-b518-446c-a3f0-e4e90a581674` | `b424bc8` — compiled weighted expert combine | `6181a829` | ✅ bit-exact (same reduction order) | +3.96% decode aggregate | compiled, default ON |
 | 97 | 2026-07-24 | `eb76e2b8-de50-44d5-9137-953c6e40d28e` | `4d9eecb` — folded-normalized expert combine (deferred top-k) | `90c997ed` | ✅ bit-exact (pinned: router-normalize + combine ≡ folded) | n/a (covered by 95+96) | reproduced equivalently, no re-ported code |
 | 98 | 2026-07-24 | `dc738a8d-a8b9-4187-abc3-68f61099fb67` | `7e61f8d` — residual-variant expert combines | `4b27cc88` | ✅ bit-exact (IEEE add commutative) | +3.96% decode aggregate | compiled, default ON |
+| 99 | 2026-08-02 | `a02330a7-430d-45b1-82f3-9314e115555e` | `018eb60` — compiled fusions re-applied to vendored `Laguna.swift` + `CausalMaskCache` in KVCache | (see 93–98) | ✅ compiled fusions covered by 93–98 / ⛔ CausalMaskCache NOT ported (C3) | n/a | compiled fusions covered; mask cache documented (C3) |
 
 ## Concern register (token/bit-exactness issues, with challenge commits)
 
@@ -44,6 +45,12 @@ migration `4799830` and are not part of the current model surface).
 - **Challenge commit:** `4799830` (`lagunaLastTokenHidden`) — the Laguna migration, not a submission; recorded for completeness.
 - **Optimization:** slice post-norm hidden to the last position before `lm_head` so prefill never computes the `[L-1, vocab]` slab.
 - **Token-exactness note (not a bug):** a `[1,1,H]` head matmul is ULP-divergent from the `[B,L,H]` full matmul (measured ~1.8e-7) — the same matmul-width **frame divergence** the challenge contract documents. The DFlash reference layer tolerates it; the real-checkpoint greedy trajectory is token-identical with and without the slice. oMLX's DFlash target path already implements it (`logits_last_only`), pinned by `test_target_ops_logits_last_only_slices_before_lm_head`.
+
+### C4 — Group-32 affine INT8 attention re-quantization is LOSSY
+
+- **Submission / challenge commit:** `e23551d8-87aa-4544-962a-32da86f094e2` / `e8ede96` (`lagunaAttentionINT8Enabled`, default ON with `LAGUNA_ATTENTION_INT8=0` escape).
+- **Optimization:** re-represent the BF16 attention projections (`q/k/v/o/g_proj`, ~2.9 GB of the ~4.3 GB per-decode-step weight traffic) as group-32 affine INT8 at init — 9 bits/weight vs BF16's 16, removing ~1.25 GB/step.
+- **Token-exactness issue:** this is an explicitly **lossy** re-quantization (the submission itself documents it; it lives inside the track envelope's permitted "representation set" but is not bit-exact vs the reference). It is not reproduced in oMLX: the port bar requires bit-exact parity or a documented exception. If oMLX ever adopts it, it must be a default-OFF toggle with lossiness documented and a token-diff gate against the BF16 reference.
 
 ## How to update
 
