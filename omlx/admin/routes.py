@@ -269,7 +269,7 @@ class GlobalSettingsRequest(BaseModel):
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
-    gdn_sidecar_state_dtype: str | None = None
+    gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
@@ -3378,7 +3378,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
-            "gdn_sidecar_state_dtype": global_settings.cache.gdn_sidecar_state_dtype,
+            "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
@@ -3881,14 +3881,14 @@ async def update_global_settings(
                 detail="gdn_ssd_pending_max_size must be positive",
             )
     if (
-        request.gdn_sidecar_state_dtype is not None
-        and request.gdn_sidecar_state_dtype.lower()
+        request.gdn_sidecar_precision is not None
+        and request.gdn_sidecar_precision.lower()
         not in {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
     ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_sidecar_precision must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             ),
         )
@@ -3917,9 +3917,9 @@ async def update_global_settings(
             request.gdn_ssd_pending_max_size
         )
         cache_changed = True
-    if request.gdn_sidecar_state_dtype is not None:
+    if request.gdn_sidecar_precision is not None:
         global_settings.cache.gdn_sidecar_state_dtype = (
-            request.gdn_sidecar_state_dtype.lower()
+            request.gdn_sidecar_precision.lower()
         )
         cache_changed = True
     if request.hot_cache_max_size is not None:

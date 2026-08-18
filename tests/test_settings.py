@@ -396,7 +396,7 @@ class TestCacheSettings:
         assert settings.get_gdn_snapshot_storage() == "auto"
         assert settings.get_gdn_ssd_split_enabled() is True
         assert settings.gdn_ssd_pending_max_size == "512MB"
-        assert settings.gdn_sidecar_state_dtype == "rht_int16"
+        assert settings.gdn_sidecar_state_dtype == "fp32"
         assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
@@ -437,7 +437,7 @@ class TestCacheSettings:
             "gdn_ssd_split_enabled": False,
             "gdn_snapshot_storage": "auto",
             "gdn_ssd_pending_max_size": "512MB",
-            "gdn_sidecar_state_dtype": "rht_int16",
+            "gdn_sidecar_precision": "fp32",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
@@ -463,7 +463,7 @@ class TestCacheSettings:
             {
                 "gdn_ssd_split_enabled": True,
                 "gdn_ssd_pending_max_size": "1GB",
-                "gdn_sidecar_state_dtype": "int8",
+                "gdn_sidecar_precision": "int8",
             }
         )
         assert settings.gdn_ssd_split_enabled is True
@@ -492,7 +492,7 @@ class TestCacheSettings:
         assert restored.gdn_ssd_split_enabled is None
         assert restored.get_gdn_snapshot_storage() == "auto"
         assert restored.get_gdn_ssd_split_enabled() is True
-        assert restored.gdn_sidecar_state_dtype == "rht_int16"
+        assert restored.gdn_sidecar_state_dtype == "fp32"
 
     def test_from_dict_rejects_conflicting_mode_and_legacy_bool(self):
         settings = CacheSettings.from_dict(
@@ -515,18 +515,42 @@ class TestCacheSettings:
         settings = CacheSettings.from_dict(
             {
                 "gdn_ssd_split_enabled": True,
-                "gdn_sidecar_state_dtype": "rht_int8",
+                "gdn_sidecar_precision": "rht_int8",
             }
         )
         assert settings.gdn_sidecar_state_dtype == "rht_int8"
-        assert settings.to_dict()["gdn_sidecar_state_dtype"] == "rht_int8"
+        assert settings.to_dict()["gdn_sidecar_precision"] == "rht_int8"
+
+    def test_from_dict_ignores_v060_gdn_sidecar_state_dtype(self):
+        """The v0.6.0 persisted lossy default must migrate back to fp32."""
+        settings = CacheSettings.from_dict(
+            {
+                "gdn_ssd_split_enabled": True,
+                "gdn_sidecar_state_dtype": "rht_int16",
+            }
+        )
+
+        assert settings.gdn_sidecar_state_dtype == "fp32"
+        assert "gdn_sidecar_state_dtype" not in settings.to_dict()
+        assert settings.to_dict()["gdn_sidecar_precision"] == "fp32"
+
+    def test_new_gdn_sidecar_precision_wins_over_v060_key(self):
+        """An explicit selection made with the new key survives reloads."""
+        settings = CacheSettings.from_dict(
+            {
+                "gdn_sidecar_state_dtype": "rht_int16",
+                "gdn_sidecar_precision": "bf16",
+            }
+        )
+
+        assert settings.gdn_sidecar_state_dtype == "bf16"
 
     @pytest.mark.parametrize(
         "raw", ["RHT_INT8", "Rht_Int8", "RHT_INT16", "INT8", "BF16", "FP32"]
     )
     def test_from_dict_normalizes_gdn_state_dtype_case(self, raw):
         settings = CacheSettings.from_dict(
-            {"gdn_ssd_split_enabled": True, "gdn_sidecar_state_dtype": raw}
+            {"gdn_ssd_split_enabled": True, "gdn_sidecar_precision": raw}
         )
         assert settings.gdn_sidecar_state_dtype == raw.lower()
 
@@ -534,7 +558,7 @@ class TestCacheSettings:
     def test_non_string_gdn_state_dtype_is_stringified_not_raised(self, raw):
         """from_dict never raises; validate() is where the value is judged."""
         settings = CacheSettings.from_dict(
-            {"gdn_ssd_split_enabled": True, "gdn_sidecar_state_dtype": raw}
+            {"gdn_ssd_split_enabled": True, "gdn_sidecar_precision": raw}
         )
         assert isinstance(settings.gdn_sidecar_state_dtype, str)
         assert settings.gdn_sidecar_state_dtype not in {
@@ -549,7 +573,7 @@ class TestCacheSettings:
         original = CacheSettings.from_dict(
             {
                 "gdn_ssd_split_enabled": True,
-                "gdn_sidecar_state_dtype": "rht_int8",
+                "gdn_sidecar_precision": "rht_int8",
                 "gdn_ssd_pending_max_size": "512MB",
             }
         )
@@ -1118,6 +1142,32 @@ class TestGlobalSettings:
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.auth.api_key == "secret"
             assert settings.mcp.config_path == "/mcp.json"
+
+    def test_load_and_save_migrates_v060_gdn_sidecar_precision(
+        self, tmp_path, monkeypatch
+    ):
+        """A v0.6.0 settings file resets its persisted lossy default."""
+        monkeypatch.delenv("OMLX_GDN_SIDECAR_STATE_DTYPE", raising=False)
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "version": "1.0",
+                    "cache": {
+                        "gdn_ssd_split_enabled": True,
+                        "gdn_sidecar_state_dtype": "rht_int16",
+                    },
+                }
+            )
+        )
+
+        settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.cache.gdn_sidecar_state_dtype == "fp32"
+
+        settings.save()
+        persisted_cache = json.loads(settings_file.read_text())["cache"]
+        assert "gdn_sidecar_state_dtype" not in persisted_cache
+        assert persisted_cache["gdn_sidecar_precision"] == "fp32"
 
     def test_load_nonexistent_file_uses_defaults(self):
         """Test loading with no settings file uses defaults."""
@@ -1930,7 +1980,7 @@ class TestGlobalSettings:
         assert scheduler_config.initial_cache_blocks == 256  # default
         assert scheduler_config.gdn_ssd_split_enabled is True
         assert scheduler_config.gdn_ssd_pending_max_bytes == 512 * 1024**2
-        assert scheduler_config.gdn_sidecar_state_dtype == "rht_int16"
+        assert scheduler_config.gdn_sidecar_state_dtype == "fp32"
 
     def test_to_scheduler_config_initial_cache_blocks(self):
         """Test that initial_cache_blocks passes through to SchedulerConfig."""

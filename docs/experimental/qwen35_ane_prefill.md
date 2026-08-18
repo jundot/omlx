@@ -37,6 +37,14 @@ The implementation uses undocumented APIs and can stop working after a macOS
 update. It also requantizes the selected weights to per-output-channel INT8,
 so it is an approximate acceleration path rather than bit-exact inference.
 
+On NAX GPUs (the M5 family) the tensor units run the quantized prefill
+matmuls faster than the ANE INT8 offload, so enabling the feature there
+regressed both prefill and decode in field testing. The patch therefore
+skips itself when NAX is available and logs the reason, mirroring the FA-256
+gate. `OMLX_QWEN35_ANE_PREFILL=1` forces the path on for benchmarking, and
+`OMLX_QWEN35_ANE_PREFILL=0` keeps it off everywhere regardless of the
+per-model setting.
+
 ## Per-model settings
 
 ```json
@@ -59,6 +67,25 @@ therefore exposes 112 procedures from only two resident programs, instead of
 stopping at 60 dual MLPs. Extensions predating procedure banks retain the
 120-program fallback budget. Other sequence lengths require separately
 compiled fixed-shape banks and should be benchmarked before use.
+
+Loading a bank maps its entire weight blob into the owning ANE's device
+address window at program-create. That window is about 4 GiB per ANE
+instance, so the dual 53%/50% Qwen3.8-27B layout at roughly 3.75 GiB per
+bank fits one bank per die on M3 Ultra but cannot host both banks on a
+single-die chip such as M3 Max, where the load fails with 0x20004. When a
+bank fails to load, oMLX first retries with two near-half banks per
+instance and then with progressively smaller split banks before falling
+back to per-layer programs; `OMLX_QWEN35_ANE_BANK_MAX_BYTES`
+forces an initial per-bank cap for testing, counted on the source weights
+handed to the bank compiler (about four times the compiled INT8 program
+size). An interleaved M3 Ultra A/B measured split banks about 1% faster at
+prefill with a slightly shorter eager load, but the monolithic bank was
+bit-stable across five repeated greedy runs while split runs occasionally
+diverged at a greedy tie, so the monolithic bank remains the first attempt
+and splitting stays a load-failure fallback. The per-layer fallback
+prioritizes MLPs within its 120-program budget and logs when GDN layers are
+dropped instead of leaving them silently on the GPU, and benchmark traces
+report the compiled MLP and GDN counts alongside the configured ones.
 
 The macOS app exposes the same controls under **Models → model settings →
 Advanced → Experimental → Qwen ANE Prefill** for detected Qwen3.5/3.6/3.8

@@ -508,14 +508,14 @@ class TestUpdateGlobalSettingsGdnSplit:
         assert "gdn_ssd_pending_max_size" in exc_info.value.detail
         gs.save.assert_not_called()
 
-    def test_saves_auto_storage_policy_with_rht_int16_default(self):
+    def test_saves_auto_storage_policy_with_explicit_rht_int16(self):
         gs = GlobalSettings()
         gs.save = MagicMock()
         gs.cache.gdn_ssd_split_enabled = False
         gs.cache.gdn_sidecar_state_dtype = "fp32"
         request = GlobalSettingsRequest(
             gdn_snapshot_storage="auto",
-            gdn_sidecar_state_dtype="rht_int16",
+            gdn_sidecar_precision="rht_int16",
         )
 
         with _patched_global_settings(gs):
@@ -871,12 +871,19 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
     scheduler already coerces reduced -> fp32 when split is off.
     """
 
+    def test_ignores_v060_request_field_name(self):
+        request = GlobalSettingsRequest(
+            **{"gdn_sidecar_state_dtype": "rht_int16"}
+        )
+
+        assert request.gdn_sidecar_precision is None
+
     def test_accepts_rht_int8_with_split_enabled(self):
         gs = _make_global_settings()
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
         gs.cache.gdn_sidecar_state_dtype = "fp32"
-        request = GlobalSettingsRequest(gdn_sidecar_state_dtype="rht_int8")
+        request = GlobalSettingsRequest(gdn_sidecar_precision="rht_int8")
 
         with _patched_global_settings(gs):
             result = asyncio.run(
@@ -892,7 +899,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = False
         gs.cache.gdn_sidecar_state_dtype = "fp32"
-        request = GlobalSettingsRequest(gdn_sidecar_state_dtype="rht_int8")
+        request = GlobalSettingsRequest(gdn_sidecar_precision="rht_int8")
 
         with _patched_global_settings(gs):
             result = asyncio.run(
@@ -928,7 +935,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
         gs.cache.gdn_sidecar_state_dtype = "fp32"
-        request = GlobalSettingsRequest(gdn_sidecar_state_dtype=value)
+        request = GlobalSettingsRequest(gdn_sidecar_precision=value)
 
         with _patched_global_settings(gs):
             result = asyncio.run(
@@ -944,7 +951,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         gs.cache.hot_cache_only = False
         gs.cache.gdn_ssd_split_enabled = True
         gs.cache.gdn_sidecar_state_dtype = "int8"
-        request = GlobalSettingsRequest(gdn_sidecar_state_dtype=value)
+        request = GlobalSettingsRequest(gdn_sidecar_precision=value)
 
         with _patched_global_settings(gs):
             with pytest.raises(HTTPException) as exc_info:
@@ -953,7 +960,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
                 )
 
         assert exc_info.value.status_code == 400
-        assert "gdn_sidecar_state_dtype" in exc_info.value.detail
+        assert "gdn_sidecar_precision" in exc_info.value.detail
         assert gs.cache.gdn_sidecar_state_dtype == "int8"
         gs.save.assert_not_called()
 
@@ -968,7 +975,7 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         request = GlobalSettingsRequest(
             cache_enabled=False,
             gdn_ssd_pending_max_size="1GB",
-            gdn_sidecar_state_dtype="fp8",
+            gdn_sidecar_precision="fp8",
         )
 
         with _patched_global_settings(gs):

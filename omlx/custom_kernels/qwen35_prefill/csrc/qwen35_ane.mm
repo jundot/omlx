@@ -1126,9 +1126,11 @@ class AneHybridQ4Primitive : public Primitive {
 public:
   AneHybridQ4Primitive(Stream stream, std::shared_ptr<AneLinearModel> model,
                        int bits, int variant, int group_size,
-                       bool fuse_swiglu = false)
+                       bool fuse_swiglu = false, int profile_category = -1)
       : Primitive(stream), model_(std::move(model)), variant_(variant),
-        bits_(bits), group_size_(group_size), fuse_swiglu_(fuse_swiglu) {}
+        bits_(bits), group_size_(group_size), fuse_swiglu_(fuse_swiglu),
+        profile_category_(profile_category >= 0 ? profile_category
+                                                : (fuse_swiglu ? 0 : 1)) {}
 
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error("ANE hybrid qmm has no CPU implementation.");
@@ -1149,6 +1151,18 @@ public:
     const int M = static_cast<int>(x.size() / K);
     const int gpu_n = static_cast<int>(weight.shape(0));
     const int ane_n = model_->output_dim();
+    const bool profiling = ane_profile_enabled();
+    const int profile_category = profile_category_;
+    const uint64_t operation_start = profiling ? profile_now_ns() : 0;
+    if (profiling) {
+      profile_add(profile_category, kOperations, 1);
+      const uint64_t previous =
+          g_previous_ane_done_ns.load(std::memory_order_relaxed);
+      if (previous && operation_start > previous) {
+        profile_add(profile_category, kGapBeforeNs,
+                    operation_start - previous);
+      }
+    }
     output.set_data(allocator::malloc(output.nbytes()));
     array gpu_output({M, gpu_n}, x.dtype(), nullptr, {});
     gpu_output.set_data(allocator::malloc(gpu_output.nbytes()));
@@ -1180,6 +1194,10 @@ public:
     // still launched concurrently below.
     producer_buffer->waitUntilCompleted();
     producer_buffer->release();
+    if (profiling) {
+      profile_add(profile_category, kPackNs,
+                  profile_now_ns() - operation_start);
+    }
 
     std::string qmm_name = "qwen35_q" + std::to_string(bits_) +
                            (group_size_ == 128 ? "_affine_qmm128_t_"
@@ -1199,24 +1217,54 @@ public:
     encoder.dispatch_threadgroups(
         MTL::Size((gpu_n + 63) / 64, (M + 63) / 64, 1), MTL::Size(32, 2, 2));
     encoder.end_encoding();
+    id<MTLCommandBuffer> qmm_buffer =
+        (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
+            encoder.get_command_buffer()));
+    if (profiling) {
+      [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        const double duration = completed.GPUEndTime - completed.GPUStartTime;
+        if (duration > 0) {
+          profile_add(profile_category, kGpuQmmNs,
+                      static_cast<uint64_t>(duration * 1e9));
+        }
+      }];
+    }
 
     // Keep the wait in a third command buffer. Metal may hold an entire
     // command buffer at an encoded wait, even when compute encoders precede
     // it, which serializes the otherwise independent GPU remainder behind
     // ANE. Submitting the qmm first makes the intended overlap explicit.
     encoder.commit();
+    const uint64_t launch = profiling ? profile_now_ns() : 0;
     auto model = model_;
-    std::thread([model = std::move(model), ticket] {
+    std::thread([model = std::move(model), ticket, profiling, profile_category,
+                 launch] {
       // Launch only after the GPU qmm has been committed. Starting the private
       // ANE evaluation earlier can contend on a driver submission lock and
       // delay the GPU command buffer itself.
+      const uint64_t start = profiling ? profile_now_ns() : 0;
       model->execute(ticket);
+      if (profiling) {
+        const uint64_t end = profile_now_ns();
+        profile_add(profile_category, kAne0LaunchNs, start - launch);
+        profile_add(profile_category, kAne0EvalNs, end - start);
+      }
     }).detach();
     // Do not submit a future Metal wait here: on current M3 Ultra drivers it
     // can stall the already-queued qmm behind ANE. Both devices are running at
     // this point, so a host wait preserves their overlap and immediately
     // exposes asynchronous ANE failures before the merge is encoded.
     model_->wait(ticket);
+    if (profiling) {
+      const uint64_t done = profile_now_ns();
+      profile_add(profile_category, kAneRegionNs, done - launch);
+      g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
+      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+        profile_add(profile_category, kAneLast, 1);
+      } else {
+        profile_add(profile_category, kGpuLast, 1);
+      }
+    }
 
     auto merge = device.get_kernel(
         std::string(fuse_swiglu_ ? "qwen35_ane_merge_swiglu_output_"
@@ -1258,11 +1306,13 @@ public:
     const auto &rhs = static_cast<const AneHybridQ4Primitive &>(other);
     return model_.get() == rhs.model_.get() && bits_ == rhs.bits_ &&
            variant_ == rhs.variant_ &&
-           group_size_ == rhs.group_size_ && fuse_swiglu_ == rhs.fuse_swiglu_;
+           group_size_ == rhs.group_size_ && fuse_swiglu_ == rhs.fuse_swiglu_ &&
+           profile_category_ == rhs.profile_category_;
   }
   auto state() const {
     return std::make_tuple(reinterpret_cast<uintptr_t>(model_.get()), bits_,
-                           variant_, group_size_, fuse_swiglu_);
+                           variant_, group_size_, fuse_swiglu_,
+                           profile_category_);
   }
 
 private:
@@ -1271,6 +1321,7 @@ private:
   int bits_;
   int group_size_;
   bool fuse_swiglu_;
+  int profile_category_;
 };
 
 class DualAneHybridPrimitive : public Primitive {
@@ -1278,10 +1329,13 @@ public:
   DualAneHybridPrimitive(Stream stream,
                          std::shared_ptr<AneLinearModel> model0,
                          std::shared_ptr<AneLinearModel> model1, int bits,
-                         int variant, int group_size, bool fuse_swiglu = false)
+                         int variant, int group_size, bool fuse_swiglu = false,
+                         int profile_category = -1)
       : Primitive(stream), model0_(std::move(model0)),
         model1_(std::move(model1)), variant_(variant), bits_(bits),
-        group_size_(group_size), fuse_swiglu_(fuse_swiglu) {}
+        group_size_(group_size), fuse_swiglu_(fuse_swiglu),
+        profile_category_(profile_category >= 0 ? profile_category
+                                                : (fuse_swiglu ? 0 : 1)) {}
 
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error("Dual ANE hybrid qmm has no CPU implementation.");
@@ -1304,7 +1358,7 @@ public:
     const int ane0_n = model0_->output_dim();
     const int ane1_n = model1_->output_dim();
     const bool profiling = ane_profile_enabled();
-    const int profile_category = fuse_swiglu_ ? 0 : 1;
+    const int profile_category = profile_category_;
     const uint64_t operation_start = profiling ? profile_now_ns() : 0;
     if (profiling) {
       profile_add(profile_category, kOperations, 1);
@@ -1449,12 +1503,14 @@ public:
     return model0_.get() == rhs.model0_.get() &&
            model1_.get() == rhs.model1_.get() && bits_ == rhs.bits_ &&
            variant_ == rhs.variant_ && group_size_ == rhs.group_size_ &&
-           fuse_swiglu_ == rhs.fuse_swiglu_;
+           fuse_swiglu_ == rhs.fuse_swiglu_ &&
+           profile_category_ == rhs.profile_category_;
   }
   auto state() const {
     return std::make_tuple(reinterpret_cast<uintptr_t>(model0_.get()),
                            reinterpret_cast<uintptr_t>(model1_.get()), bits_,
-                           variant_, group_size_, fuse_swiglu_);
+                           variant_, group_size_, fuse_swiglu_,
+                           profile_category_);
   }
 
 private:
@@ -1464,6 +1520,7 @@ private:
   int bits_;
   int group_size_;
   bool fuse_swiglu_;
+  int profile_category_;
 };
 
 class AneHybridQ4SwiGLUDownPrimitive : public Primitive {
@@ -1621,7 +1678,8 @@ private:
 array qwen35_ane_affine_qmm_t(
     const array &x, const array &gpu_weight, const array &gpu_scales,
     const array &gpu_biases, const std::shared_ptr<AneLinearModel> &ane_model,
-    int bits, int variant, int group_size, StreamOrDevice s) {
+    int bits, int variant, int group_size, int profile_category,
+    StreamOrDevice s) {
   auto stream = to_stream(s);
   if (!ane_model || stream.device == Device::cpu ||
       (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
@@ -1648,16 +1706,18 @@ array qwen35_ane_affine_qmm_t(
   shape.back() = ane_model->output_dim() + gpu_n;
   return array(std::move(shape), x.dtype(),
                std::make_shared<AneHybridQ4Primitive>(
-                   stream, ane_model, bits, variant, group_size),
+                   stream, ane_model, bits, variant, group_size,
+                   /* fuse_swiglu */ false, profile_category),
                std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
 }
 
 array qwen35_ane_q4_affine_qmm_t(
     const array &x, const array &gpu_weight, const array &gpu_scales,
     const array &gpu_biases, const std::shared_ptr<AneLinearModel> &ane_model,
-    int variant, int group_size, StreamOrDevice s) {
+    int variant, int group_size, int profile_category, StreamOrDevice s) {
   return qwen35_ane_affine_qmm_t(x, gpu_weight, gpu_scales, gpu_biases,
-                                 ane_model, 4, variant, group_size, s);
+                                 ane_model, 4, variant, group_size,
+                                 profile_category, s);
 }
 
 array qwen35_ane_q4_swiglu_t(
@@ -1700,7 +1760,7 @@ array qwen35_ane_dual_affine_qmm_t(
     const array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model0,
     const std::shared_ptr<AneLinearModel> &ane_model1, int bits, int variant,
-    int group_size, StreamOrDevice s) {
+    int group_size, int profile_category, StreamOrDevice s) {
   auto stream = to_stream(s);
   if (!ane_model0 || !ane_model1 || stream.device == Device::cpu ||
       (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
@@ -1731,7 +1791,8 @@ array qwen35_ane_dual_affine_qmm_t(
   return array(
       std::move(shape), x.dtype(),
       std::make_shared<DualAneHybridPrimitive>(
-          stream, ane_model0, ane_model1, bits, variant, group_size),
+          stream, ane_model0, ane_model1, bits, variant, group_size,
+          /* fuse_swiglu */ false, profile_category),
       std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
 }
 

@@ -15,6 +15,7 @@ GDN_I18N_KEYS = {
     "settings.advanced.gdn_pending_write_limit_hint",
     "settings.advanced.gdn_sidecar_state_precision",
     "settings.advanced.gdn_sidecar_state_precision_hint",
+    "settings.advanced.gdn_sidecar_state_precision_warning",
     "settings.advanced.gdn_sidecar_state_precision_rht_int16",
     "settings.advanced.gdn_sidecar_state_precision_fp32",
     "settings.advanced.gdn_sidecar_state_precision_bf16",
@@ -38,6 +39,8 @@ def test_settings_template_exposes_gdn_storage_policy_and_codecs():
     assert 'value="rht_int16"' in template
     assert 'value="fp32"' in template
     assert 'value="rht_int8"' in template
+    assert "globalSettings.cache.gdn_sidecar_precision !== 'fp32'" in template
+    assert "text-red-600" in template
 
 
 def test_gdn_cache_policy_i18n_keys_exist_in_every_locale():
@@ -56,6 +59,7 @@ def test_dashboard_posts_canonical_gdn_fields_only():
     payload = script[payload_start:payload_end]
 
     assert "gdn_snapshot_storage:" in payload
-    assert "gdn_sidecar_state_dtype:" in payload
+    assert "gdn_sidecar_precision:" in payload
+    assert "gdn_sidecar_state_dtype:" not in payload
     assert "gdn_ssd_pending_max_size:" in payload
     assert "gdn_ssd_split_enabled:" not in payload

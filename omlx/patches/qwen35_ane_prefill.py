@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import threading
 import weakref
 from collections.abc import Callable
@@ -18,6 +19,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
+
+from omlx.custom_kernels.nax import is_nax_available
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,11 @@ _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionar
 # all slices into one multi-procedure program per ANE instance and bypass this
 # fallback-only budget.
 _ANE_RESIDENT_PROGRAM_LIMIT = 120
+# First retry cap for split procedure banks after a monolithic bank fails to
+# load. Program-create maps a bank's whole weight blob into the owning ANE's
+# ~4 GiB device address window, so single-die chips reject two monolithic
+# dual banks; 1 GiB spans keep every create well under the window.
+_ANE_BANK_RETRY_MAX_BYTES = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -800,6 +808,124 @@ def _install_dispatch() -> bool:
     return installed
 
 
+def _bank_chunk_spans(
+    weights: list[mx.array], max_bytes: int
+) -> list[tuple[int, int]]:
+    """Split procedure weights into contiguous spans of at most ``max_bytes``.
+
+    A span always holds at least one procedure, so an oversized single
+    procedure still gets its own bank.
+    """
+    spans: list[tuple[int, int]] = []
+    start = 0
+    span_bytes = 0
+    for index, weight in enumerate(weights):
+        nbytes = weight.nbytes
+        if index > start and span_bytes + nbytes > max_bytes:
+            spans.append((start, index))
+            start = index
+            span_bytes = 0
+        span_bytes += nbytes
+    spans.append((start, len(weights)))
+    return spans
+
+
+def _compile_dual_banks(
+    weights0: list[mx.array],
+    weights1: list[mx.array],
+    sequence_length: int,
+) -> tuple[list[Any], list[Any], int] | None:
+    """Compile the two instance-pinned procedure banks with a split ladder.
+
+    A monolithic bank maps its entire weight blob into the owning ANE's
+    ~4 GiB device address window at program-create, so a single-die chip that
+    must host both dual banks rejects the layout that fits one bank per die
+    on M3 Ultra (issue #2781, load failure 0x20004). Smaller banks keep every
+    program-create under the window while per-eval mapping pages between
+    them, matching the behaviour that lets the per-layer path work there.
+
+    Returns ``(models0, models1, resident_program_count)``, or ``None`` when
+    every attempt failed and the caller should use the per-layer fallback.
+    ``OMLX_QWEN35_ANE_BANK_MAX_BYTES`` forces an initial per-bank byte cap.
+    The cap counts the packed source weights handed to the bank compiler,
+    which run about four times the compiled INT8 program size.
+    """
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    cap = 0
+    raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
+    if raw:
+        try:
+            cap = max(int(raw), 0)
+        except ValueError:
+            logger.warning(
+                "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
+            )
+    total_bytes = sum(weight.nbytes for weight in weights0)
+    largest_bytes = max((weight.nbytes for weight in weights0), default=0)
+
+    for _ in range(4):
+        spans = (
+            [(0, len(weights0))] if cap <= 0 else _bank_chunk_spans(weights0, cap)
+        )
+        try:
+            models0: list[Any] = []
+            models1: list[Any] = []
+            for start, stop in spans:
+                models0.extend(
+                    fast.qwen35_ane_compile_linear_bank(
+                        weights0[start:stop], sequence_length, 1
+                    )
+                )
+                models1.extend(
+                    fast.qwen35_ane_compile_linear_bank(
+                        weights1[start:stop], sequence_length, 2
+                    )
+                )
+        except Exception:
+            # Drop banks that loaded before the failure so their device
+            # mappings are released before the smaller retry.
+            models0 = models1 = []
+            logger.warning(
+                "ANE procedure bank compilation failed (%d banks per "
+                "instance, %d procedures, %.2f GiB per instance)",
+                len(spans),
+                len(weights0),
+                total_bytes / (1 << 30),
+                exc_info=True,
+            )
+            if all(stop - start == 1 for start, stop in spans):
+                break
+            if cap <= 0:
+                # First retry aims at two near-halves per instance: the fewest
+                # banks that can load where the monolithic bank cannot, and the
+                # fewest resident programs. A measured M3 Ultra A/B stayed
+                # bit-stable across greedy reruns at two banks while many
+                # small banks occasionally diverged at a greedy tie.
+                cap = max(total_bytes // 2 + largest_bytes, 1)
+            else:
+                cap = min(cap // 2, _ANE_BANK_RETRY_MAX_BYTES)
+            if cap < 1:
+                break
+            logger.info(
+                "Retrying ANE procedure banks split at %d MB per bank",
+                cap // (1 << 20),
+            )
+            continue
+        if len(spans) > 1:
+            logger.info(
+                "Compiled %d ANE procedures into %d split banks per instance",
+                len(weights0),
+                len(spans),
+            )
+        return models0, models1, 2 * len(spans)
+
+    logger.warning(
+        "Packed dual-ANE compilation failed; falling back to per-layer programs"
+    )
+    return None
+
+
 def _enable_dual_procedure_banks(
     model: Any,
     mlp_candidates: list[Any],
@@ -868,20 +994,12 @@ def _enable_dual_procedure_banks(
         weights0 = [entry[2] for entry in all_prepared]
         weights1 = [entry[3] for entry in all_prepared]
         mx.eval(*weights0, *weights1)
-        try:
-            models0 = fast.qwen35_ane_compile_linear_bank(
-                weights0, config.sequence_length, 1
-            )
-            models1 = fast.qwen35_ane_compile_linear_bank(
-                weights1, config.sequence_length, 2
-            )
-        except Exception:
-            logger.warning(
-                "Packed dual-ANE compilation failed; falling back to "
-                "per-layer programs",
-                exc_info=True,
-            )
+        banked_models = _compile_dual_banks(
+            weights0, weights1, config.sequence_length
+        )
+        if banked_models is None:
             return None
+        models0, models1, resident_program_count = banked_models
 
         if len(models0) != len(all_prepared) or len(models1) != len(all_prepared):
             raise RuntimeError("ANE procedure bank returned an incomplete model list")
@@ -903,7 +1021,7 @@ def _enable_dual_procedure_banks(
         len(prepared_mlps),
         len(prepared_mlps),
         len(prepared_gdns),
-        2,
+        resident_program_count,
     )
 
 
@@ -934,6 +1052,22 @@ def enable_qwen35_ane_prefill(
         raise ValueError("ANE GDN prefill fraction must be between 0.05 and 0.90")
     if gdn_max_layers < 0:
         raise ValueError("ANE GDN prefill max_layers must be non-negative")
+
+    env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
+    if env in ("0", "false", "off"):
+        logger.info("Qwen ANE prefill disabled by OMLX_QWEN35_ANE_PREFILL")
+        return 0
+    if env not in ("1", "true", "on") and is_nax_available():
+        # Auto: on NAX GPUs (M5 family) the tensor units run the quantized
+        # prefill matmuls faster than the ANE INT8 offload, so the hybrid
+        # split makes the ANE the bottleneck while the fixed-shape scheduler
+        # alignment also drops the wider Qwen prefill floor (M5 Pro report:
+        # 17.6k-token TTFT 54.7s -> 65-88s on 0.6.1, issue #2779).
+        # OMLX_QWEN35_ANE_PREFILL=1 forces the path on for benchmarking.
+        logger.info(
+            "Qwen ANE prefill skipped: NAX GPU, tensor-unit prefill is faster"
+        )
+        return 0
 
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
@@ -971,16 +1105,18 @@ def enable_qwen35_ane_prefill(
     )
     if banked is not None:
         count, dual_count, gdn_count, resident_programs = banked
+        model._omlx_ane_mlp_prefill_count = count
         model._omlx_ane_gdn_prefill_count = gdn_count
         model._omlx_ane_dual_prefill_count = dual_count
         model._omlx_ane_resident_program_count = resident_programs
         model._omlx_ane_procedure_count = count + gdn_count
         if count:
             logger.info(
-                "Eagerly compiled %d MLP and %d GDN procedures into two "
+                "Eagerly compiled %d MLP and %d GDN procedures into %d "
                 "instance-pinned ANE programs (sequence_length=%d)",
                 count,
                 gdn_count,
+                resident_programs,
                 sequence_length,
             )
         return count
@@ -988,9 +1124,11 @@ def enable_qwen35_ane_prefill(
     count = 0
     dual_count = 0
     resident_programs = 0
+    mlp_budget_exhausted = False
     for module in candidates:
         requested_programs = 2 if dual_ane else 1
         if resident_programs + requested_programs > _ANE_RESIDENT_PROGRAM_LIMIT:
+            mlp_budget_exhausted = True
             break
         try:
             state = _compile_pair(module, config)
@@ -1011,6 +1149,7 @@ def enable_qwen35_ane_prefill(
         count += 1
 
     gdn_count = 0
+    gdn_budget_exhausted = False
     if gdn and gdn_max_layers:
         gdn_config = _AneGDNConfig(sequence_length, gdn_fraction, variant, dual_ane)
         for module in model.modules() if hasattr(model, "modules") else ():
@@ -1018,6 +1157,7 @@ def enable_qwen35_ane_prefill(
                 break
             requested_programs = 2 if dual_ane else 1
             if resident_programs + requested_programs > _ANE_RESIDENT_PROGRAM_LIMIT:
+                gdn_budget_exhausted = True
                 break
             if not _eligible_gdn(module):
                 continue
@@ -1037,9 +1177,11 @@ def enable_qwen35_ane_prefill(
             _register_gdn_module(module)
             resident_programs += 2 if getattr(state, "model1", None) is not None else 1
             gdn_count += 1
+    model._omlx_ane_mlp_prefill_count = count
     model._omlx_ane_gdn_prefill_count = gdn_count
     model._omlx_ane_dual_prefill_count = dual_count
     model._omlx_ane_resident_program_count = resident_programs
+    model._omlx_ane_procedure_count = count + gdn_count
 
     if count:
         logger.info(
@@ -1050,12 +1192,20 @@ def enable_qwen35_ane_prefill(
             fraction,
             dual_ane,
         )
-    if dual_ane and count < len(candidates):
+    if mlp_budget_exhausted or gdn_budget_exhausted:
         logger.info(
             "Stopped eager ANE preparation at the %d-program private-runtime "
-            "budget (%d dual MLPs)",
+            "budget (%d MLPs, %d dual)",
             _ANE_RESIDENT_PROGRAM_LIMIT,
+            count,
             dual_count,
+        )
+    if gdn and gdn_max_layers and gdn_budget_exhausted:
+        logger.warning(
+            "ANE program budget exhausted before GDN completed; %d of %d "
+            "requested GDN layers compiled and the rest stay on GPU",
+            gdn_count,
+            gdn_max_layers,
         )
     if gdn_count:
         logger.info(
