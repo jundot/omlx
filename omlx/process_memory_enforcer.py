@@ -185,7 +185,7 @@ def get_effective_metal_cap_bytes() -> int:
 
 
 def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
-    """Clamp a wired-limit recommendation to leave the OS 5% of RAM.
+    """Clamp and align a wired-limit recommendation to leave 5% of RAM.
 
     Wiring within a few GiB of physical RAM invites jetsam during a
     large-model load burst, and a jetsammed/hard-killed process strands
@@ -198,6 +198,10 @@ def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     the enforcement path still honors whatever the kernel sysctl allows,
     including user-set values above this recommendation.
 
+    ``iogpu.wired_limit_mb`` accepts whole MiB. Floor the recommendation
+    to that unit so the displayed command cannot cross the byte-level
+    safety threshold and the UI compares against a realizable value.
+
     Resolved through the settings module at call time so tests that patch
     omlx.settings.get_system_memory control this the same way they control
     the static ceiling.
@@ -208,7 +212,10 @@ def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
         return desired_bytes
     if total <= 0:
         return desired_bytes
-    return max(0, min(desired_bytes, total - total // 20))
+
+    suggestion = max(0, min(desired_bytes, total - total // 20))
+    mib = 1024**2
+    return suggestion // mib * mib
 
 
 def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
