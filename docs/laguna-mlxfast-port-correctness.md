@@ -24,6 +24,7 @@ submission" commits, mapped below.
 | 93 | `8b4de42b-d6bd-4da8-814d-b0b3ae6cf2f2` (`c9e1043`: compiled softplus gate, compiled SiLU product) | `Validate submission 8b4de42b…` | ✅ bit-exact (identical expression trees; compile fuses elementwise only) | +3.96% decode aggregate (with 95–98) | compiled, default ON |
 | 94 | `613aaf69-9016-4d57-b799-bdd22d51c5c9` (`62c6697`: fused routed + shared gate/up banks; fused QKV) | `Validate submission 613aaf69…` | ✅ bit-exact (per-row independence of gather-QMM/qmm) | routed: neutral; shared: −2.3% | opt-in OFF; fused QKV NOT ported (Swift ablation: no decode gain) |
 | 95 | `8adb56be-8f8f-4611-8914-8daf052b5f21` (`f8848e0`: compiled top-k normalize; compiled two-output router tail) | `Validate submission 8adb56be…` | ✅ bit-exact (top-k normalize is single-output) / ⛔ NOT bit-exact if compiled (router tail, C1) | n/a | top-k normalize compiled, ON; router tail kept eager (C1) |
+| 96 | `9a37e4dc-b518-446c-a3f0-e4e90a581674` (`b424bc8`: compiled weighted expert combine) | `Validate submission 9a37e4dc…` | ✅ bit-exact (single-output; same reduction order) | +3.96% decode aggregate (with 93–95, 97–98) | compiled, default ON |
 
 ## Concern register (token/bit-exactness issues, with challenge commits)
 

@@ -57,6 +57,28 @@ if _COMPILED_FUSIONS:
     _compiled_topk_normalize = mx.compile(_compiled_topk_normalize, shapeless=True)
     _swiglu = mx.compile(_swiglu, shapeless=True)
 
+
+def _make_compiled_expert_combine(scale: float):
+    """Weighted routed-expert reduction, routed scale, and shared-expert add."""
+
+    def _combine(y: mx.array, weights: mx.array, shared: mx.array) -> mx.array:
+        routed = mx.sum(y * weights[..., None], axis=-2)
+        return routed * scale + shared
+
+    return mx.compile(_combine, shapeless=True)
+
+
+# One compiled weighted-expert combine per routed-scaling value, shared across
+# every sparse block (the real checkpoint uses a single 2.5 factor).
+_COMPILED_COMBINES: dict[float, Any] = {}
+
+
+def _compiled_combine_for(scale: float):
+    combine = _COMPILED_COMBINES.get(scale)
+    if combine is None:
+        combine = _COMPILED_COMBINES[scale] = _make_compiled_expert_combine(scale)
+    return combine
+
 # DECODE-ONLY routed gate/up fusion (Swift ``DARKBLOOM_FUSED_ROUTED_GATE_UP``):
 # after load, retain a row-concatenated NVFP4 ``[gate; up]`` bank per sparse
 # layer and serve single-token decode's gate/up from ONE gather-QMM instead of
@@ -452,6 +474,10 @@ class LagunaSparseMoeBlock(nn.Module):
             y = self._moe_fused_forward(x, inds)
         else:
             y = self.switch_mlp(x, inds)
+        if _COMPILED_FUSIONS:
+            return _compiled_combine_for(self.routed_scaling_factor)(
+                y, scores, self.shared_expert(x)
+            )
         y = mx.sum(y * scores[..., None], axis=-2)
         if self.routed_scaling_factor != 1.0:
             y = y * self.routed_scaling_factor

@@ -1175,3 +1175,16 @@ def test_two_output_compiled_tail_diverges_documented():
         "two-output compiled tail divergence changed: "
         f"max-abs {sig_diff} (0.0 would mean MLX fixed C1)"
     )
+
+
+def test_compiled_combine_matches_eager():
+    """The compiled weighted-expert combine reproduces the eager reduction."""
+    lm = _registered_laguna_module()
+    combine = lm._compiled_combine_for(2.5)
+    y = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
+    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
+    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
+    out = combine(y, weights, shared)
+    ref = mx.sum(y * weights[..., None], axis=-2) * 2.5 + shared
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
