@@ -1061,3 +1061,86 @@ def test_compiled_fusions_bit_exact(monkeypatch):
     assert mx.array_equal(pre_on, pre_off)
     assert mx.array_equal(dec_on, dec_off)
     assert int(mx.max(mx.abs(dec_on - dec_off)).item()) == 0
+
+
+# --- mlxfast-challenge port: fused gate/up banks (Validate submission 613aaf69) ---
+
+
+def test_fused_routed_gate_up_parity_is_bit_exact(monkeypatch):
+    """Fused [gate; up] decode bank must be bit-identical to the stock path.
+
+    Toggles the actual registered model module (``mlx_lm.models.laguna``): the
+    loader exec's ``laguna_model.py`` into that module and the model reads its
+    ``_FUSED_ROUTED_GATE_UP`` global from there.
+    """
+    lm = _registered_laguna_module()
+    model = _quantized_sparse_model()
+
+    def run(fusion_on):
+        monkeypatch.setattr(lm, "_FUSED_ROUTED_GATE_UP", fusion_on)
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill, decode)
+        return prefill, decode
+
+    pre_on, dec_on = run(True)
+    pre_off, dec_off = run(False)
+
+    block = model.model.layers[0].mlp
+    assert block._fusion_ready is True
+    assert block._fused_gateup_split == 32
+    assert block._fused_gateup_weight.shape == (4, 64, 8)
+
+    assert mx.array_equal(pre_on, pre_off)
+    assert mx.array_equal(dec_on, dec_off)
+
+
+def test_fused_shared_gate_up_parity_is_bit_exact(monkeypatch):
+    """Fused shared-expert [gate; up] NVFP4 bank must be bit-identical."""
+    lm = _registered_laguna_module()
+    model = _quantized_sparse_model()
+    for layer in model.model.layers:
+        sp = layer.mlp
+        if type(sp).__name__ == "LagunaSparseMoeBlock":
+            se = sp.shared_expert
+            se.gate_proj = se.gate_proj.to_quantized(16, 4, mode="nvfp4")
+            se.up_proj = se.up_proj.to_quantized(16, 4, mode="nvfp4")
+            se.down_proj = se.down_proj.to_quantized(16, 4, mode="nvfp4")
+
+    def run(fused):
+        monkeypatch.setattr(lm, "_FUSED_SHARED_GATE_UP", fused)
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill, decode)
+        return prefill, decode
+
+    pre_on, dec_on = run(True)
+    pre_off, dec_off = run(False)
+    se = model.model.layers[0].mlp.shared_expert
+    assert se._fusion_ready is True
+    assert mx.array_equal(pre_on, pre_off)
+    assert mx.array_equal(dec_on, dec_off)
+
+
+def test_fused_banks_default_off_and_guard_unquantized(monkeypatch):
+    """Fusion defaults OFF (neutral on current MLX); unquantized banks refuse."""
+    lm = _registered_laguna_module()
+    assert lm._FUSED_ROUTED_GATE_UP is False
+    assert lm._FUSED_SHARED_GATE_UP is False
+    monkeypatch.setattr(lm, "_FUSED_ROUTED_GATE_UP", True)
+    monkeypatch.setattr(lm, "_FUSED_SHARED_GATE_UP", True)
+    model = _quantized_sparse_model()
+    for layer in model.model.layers:
+        sp = layer.mlp
+        if type(sp).__name__ == "LagunaSparseMoeBlock":
+            from mlx_lm.models.switch_layers import SwitchLinear
+
+            sp.switch_mlp.gate_proj = SwitchLinear(64, 32, 4)
+            sp.switch_mlp.up_proj = SwitchLinear(64, 32, 4)
+            sp.switch_mlp.down_proj = SwitchLinear(32, 64, 4)
+    cache = model.make_cache()
+    out = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+    mx.eval(out)
+    assert model.model.layers[0].mlp._fusion_ready is False
