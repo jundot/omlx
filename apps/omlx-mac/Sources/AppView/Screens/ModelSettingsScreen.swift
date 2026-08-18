@@ -1124,6 +1124,54 @@ private struct ExperimentalSection: View {
                     ))
                         .labelsHidden().toggleStyle(.switch)
                 }
+                Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
+                                  defaultValue: "Tune ANE Split",
+                                  comment: "Row label for the Qwen ANE/GPU split tuner"),
+                    sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                                     defaultValue: "Benchmarks GPU-only, MLP, and MLP+GDN splits on this Mac. Uses temporary settings and takes several minutes; saved settings change only when you apply the result.",
+                                     comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if vm.aneTuningIsRunning {
+                            if let status = vm.aneTuningStatus {
+                                Text(status.message)
+                                    .font(.omlxText(11))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .lineLimit(1)
+                                ProgressView(
+                                    value: Double(status.current),
+                                    total: Double(max(status.total, 1))
+                                )
+                                .frame(width: 190)
+                            } else {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Button("Cancel") {
+                                Task { await vm.cancelANETuning(client: client) }
+                            }
+                            .buttonStyle(.omlx(.destructive, size: .small))
+                        } else if let recommendation = vm.aneTuningStatus?.recommendation {
+                            Text(aneRecommendationText(recommendation))
+                                .font(.omlxText(11))
+                                .foregroundStyle(theme.textSecondary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.trailing)
+                            Button(vm.aneTuningIsApplying ? "Applying…" : "Apply result") {
+                                Task {
+                                    await vm.applyANETuningRecommendation(client: client)
+                                }
+                            }
+                            .buttonStyle(.omlx(.primary, size: .small))
+                            .disabled(vm.aneTuningIsApplying)
+                        } else {
+                            Button("Tune for this Mac") {
+                                Task { await vm.startANETuning(client: client) }
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                        }
+                    }
+                    .frame(minWidth: 210, alignment: .trailing)
+                }
                 if vm.qwen35AnePrefillEnabled {
                     Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
                                       defaultValue: "ANE Prompt Block",
@@ -1569,6 +1617,31 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.vlm_mtp.sub",
                       defaultValue: "Multi-token prediction for vision-language models via an assistant drafter.",
                       comment: "Default sublabel for the VLM MTP toggle")
+    }
+
+    private func aneRecommendationText(
+        _ recommendation: ANETuningRecommendationDTO
+    ) -> String {
+        if !recommendation.enabled {
+            return String(
+                format: "GPU-only recommended (%.1f tok/s)",
+                recommendation.processingTps
+            )
+        }
+        let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
+        let suffix: String
+        if recommendation.gdnEnabled {
+            let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
+            suffix = "MLP \(mlp)% · GDN \(gdn)%"
+        } else {
+            suffix = "MLP \(mlp)% · GDN off"
+        }
+        return String(
+            format: "%@ · %.1f tok/s (%+.1f%%)",
+            suffix,
+            recommendation.processingTps,
+            recommendation.speedupPercent
+        )
     }
 }
 

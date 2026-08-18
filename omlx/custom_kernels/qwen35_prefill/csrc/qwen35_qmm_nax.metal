@@ -16,7 +16,7 @@
 #include "mlx/backend/metal/kernels/quantized_nax.h"
 // clang-format on
 
-#define define_qwen35_q_affine_qmm_t_nax(bits)                                \
+#define define_qwen35_q_affine_qmm_t_nax(bits, group_size, suffix)             \
   template <                                                                   \
       typename T,                                                              \
       const int BM,                                                            \
@@ -24,7 +24,7 @@
       const int BN,                                                            \
       const int WM,                                                            \
       const int WN>                                                            \
-  [[kernel]] void qwen35_q##bits##_affine_qmm_t_nax(                          \
+  [[kernel]] void qwen35_q##bits##_affine_qmm##suffix##_t_nax(                \
       const device uint32_t* w [[buffer(0)]],                                  \
       const device T* scales [[buffer(1)]],                                    \
       const device T* biases [[buffer(2)]],                                    \
@@ -41,7 +41,7 @@
                                                                                \
     threadgroup T Ws[BN * BK_padded];                                          \
                                                                                \
-    qmm_t_nax_tgp_impl<T, 64, bits, true, BM, BK, BN, WM, WN>(                 \
+    qmm_t_nax_tgp_impl<T, group_size, bits, true, BM, BK, BN, WM, WN>(         \
         w,                                                                     \
         scales,                                                                \
         biases,                                                                \
@@ -57,11 +57,13 @@
         simd_lid);                                                             \
   }
 
-#define instantiate_qwen35_q_affine_qmm_t_nax(bits, type, bm, bk, bn, wm, wn) \
+#define instantiate_qwen35_q_affine_qmm_t_nax(                                \
+    bits, group_suffix, type, bm, bk, bn, wm, wn)                              \
   instantiate_kernel(                                                         \
-      "qwen35_q" #bits "_affine_qmm_t_nax_" #type "_bm_" #bm "_bk_" #bk      \
+      "qwen35_q" #bits "_affine_qmm" #group_suffix "_t_nax_" #type           \
+      "_bm_" #bm "_bk_" #bk                                                 \
       "_bn_" #bn "_wm_" #wm "_wn_" #wn,                                      \
-      qwen35_q##bits##_affine_qmm_t_nax,                                      \
+      qwen35_q##bits##_affine_qmm##group_suffix##_t_nax,                      \
       type,                                                                   \
       bm,                                                                     \
       bk,                                                                     \
@@ -73,30 +75,52 @@
 // Variant 0 matches the tile MLX ships for affine_qmm_t_nax (64/64/64, 2x2);
 // the rest are the tuning surface for the M5 sweep. BK is capped at the
 // group size (64): QuantizedBlockLoader requires group_size >= columns.
-#define instantiate_qwen35_q_affine_nax_variants(bits)                        \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 64, 64, 64, 2, 2);   \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 64, 64, 64, 2, 2);  \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 32, 64, 64, 2, 2);   \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 32, 64, 64, 2, 2);  \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 128, 64, 64, 2, 2);  \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 128, 64, 64, 2, 2); \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 64, 64, 128, 2, 2);  \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 64, 64, 128, 2, 2); \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 64, 32, 64, 2, 2);   \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 64, 32, 64, 2, 2);  \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 64, 64, 64, 4, 1);   \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 64, 64, 64, 4, 1);  \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, float16_t, 64, 64, 64, 1, 4);   \
-  instantiate_qwen35_q_affine_qmm_t_nax(bits, bfloat16_t, 64, 64, 64, 1, 4)
+#define instantiate_qwen35_q_affine_nax_variants(bits, group_suffix)          \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 64, 64, 64, 2, 2);                       \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 64, 64, 64, 2, 2);                      \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 32, 64, 64, 2, 2);                       \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 32, 64, 64, 2, 2);                      \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 128, 64, 64, 2, 2);                      \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 128, 64, 64, 2, 2);                     \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 64, 64, 128, 2, 2);                      \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 64, 64, 128, 2, 2);                     \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 64, 32, 64, 2, 2);                       \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 64, 32, 64, 2, 2);                      \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 64, 64, 64, 4, 1);                       \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 64, 64, 64, 4, 1);                      \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, float16_t, 64, 64, 64, 1, 4);                       \
+  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
+      bits, group_suffix, bfloat16_t, 64, 64, 64, 1, 4)
 
-define_qwen35_q_affine_qmm_t_nax(4)
-define_qwen35_q_affine_qmm_t_nax(5)
-define_qwen35_q_affine_qmm_t_nax(6)
-define_qwen35_q_affine_qmm_t_nax(8)
+define_qwen35_q_affine_qmm_t_nax(4, 64, )
+define_qwen35_q_affine_qmm_t_nax(5, 64, )
+define_qwen35_q_affine_qmm_t_nax(6, 64, )
+define_qwen35_q_affine_qmm_t_nax(8, 64, )
+define_qwen35_q_affine_qmm_t_nax(4, 128, 128)
+define_qwen35_q_affine_qmm_t_nax(5, 128, 128)
+define_qwen35_q_affine_qmm_t_nax(6, 128, 128)
+define_qwen35_q_affine_qmm_t_nax(8, 128, 128)
 
-instantiate_qwen35_q_affine_nax_variants(4);
-instantiate_qwen35_q_affine_nax_variants(5);
-instantiate_qwen35_q_affine_nax_variants(6);
-instantiate_qwen35_q_affine_nax_variants(8);
+instantiate_qwen35_q_affine_nax_variants(4, );
+instantiate_qwen35_q_affine_nax_variants(5, );
+instantiate_qwen35_q_affine_nax_variants(6, );
+instantiate_qwen35_q_affine_nax_variants(8, );
+instantiate_qwen35_q_affine_nax_variants(4, 128);
+instantiate_qwen35_q_affine_nax_variants(5, 128);
+instantiate_qwen35_q_affine_nax_variants(6, 128);
+instantiate_qwen35_q_affine_nax_variants(8, 128);
 
 #endif // __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)

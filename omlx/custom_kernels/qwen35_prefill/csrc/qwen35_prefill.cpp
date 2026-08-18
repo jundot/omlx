@@ -649,7 +649,8 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
           kname,
           "qwen35_q",
           bits_,
-          "_affine_qmm_t_nax_",
+          group_size_ == 128 ? "_affine_qmm128_t_nax_"
+                             : "_affine_qmm_t_nax_",
           qwen_type_name(x.dtype()),
           "_bm_",
           cfg.bm,
@@ -991,10 +992,9 @@ array qwen35_q_affine_qmm_t(
         "[omlx_qwen35_prefill.qwen35_q_affine_qmm_t] unsupported shape.");
   }
 
-  // NAX only supports group_size=64; demote rather than throwing when the
-  // NAX tile does not fit or the runtime lacks tensor units / the NAX metallib.
-  bool nax = use_nax && group_size == 64 && is_nax_available() &&
-      nax_qmm_kernels_built() &&
+  // Demote rather than throwing when the NAX tile does not fit or the runtime
+  // lacks tensor units / the separately built NAX metallib.
+  bool nax = use_nax && is_nax_available() && nax_qmm_kernels_built() &&
       nax_qmm_runtime_ok.load(std::memory_order_relaxed);
   if (nax) {
     const auto nax_cfg = qwen_q_affine_nax_variant(nax_variant);

@@ -850,27 +850,22 @@ def test_enable_rejects_unsafe_fixed_shape_settings(
         )
 
 
-def test_enable_skips_on_nax_gpu(monkeypatch):
+def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
-    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: True)
-    installed = []
-    monkeypatch.setattr(
-        ane_patch, "_install_dispatch", lambda: installed.append(True) or True
-    )
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_compile_pair", lambda mlp, config: object())
     model = _Model(2)
 
     count = ane_patch.enable_qwen35_ane_prefill(model, sequence_length=2048)
 
-    assert count == 0
-    assert installed == []
-    assert not any(
-        hasattr(layer, "_omlx_ane_prefill_config") for layer in model.layers
-    )
+    assert count == 2
 
 
 def test_enable_env_forces_ane_on_nax_gpu(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "1")
-    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: True)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
@@ -887,7 +882,6 @@ def test_enable_env_forces_ane_on_nax_gpu(monkeypatch):
 
 def test_enable_env_kill_switch_wins(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "0")
-    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
     installed = []
     monkeypatch.setattr(
         ane_patch, "_install_dispatch", lambda: installed.append(True) or True
