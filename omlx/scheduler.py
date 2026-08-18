@@ -6263,20 +6263,30 @@ class Scheduler:
                     layer_state["meta_state"] = _copy_containers(
                         layer_state.get("meta_state")
                     )
+                # Walk with an explicit stack rather than a recursive nested
+                # function. A recursive closure holds itself through its own
+                # cell, so the closure — and everything else it captured —
+                # becomes cyclic garbage that only the generational collector
+                # can reclaim. The captured leaf list names every array in the
+                # boundary state, and mx.array is tiny on the Python heap while
+                # backing GBs of Metal memory, so the collector has no reason to
+                # run and the whole chain stays resident. Caches that grow in
+                # place (KVCache) hide this because the stranded references
+                # alias the live buffers; caches that reallocate on growth
+                # (TurboQuant) strand a full extra chain per snapshot — measured
+                # at 0.74 GiB per turn on a 32k Qwen3.8-27B conversation.
                 leaves: list[Any] = []
-
-                def _collect(value: Any) -> None:
+                pending: list[Any] = [
+                    layer_state.get("state") for layer_state in extracted
+                ]
+                while pending:
+                    value = pending.pop()
                     if isinstance(value, mx.array):
                         leaves.append(value)
                     elif isinstance(value, (list, tuple)):
-                        for item in value:
-                            _collect(item)
+                        pending.extend(value)
                     elif isinstance(value, dict):
-                        for item in value.values():
-                            _collect(item)
-
-                for layer_state in extracted:
-                    _collect(layer_state.get("state"))
+                        pending.extend(value.values())
                 if leaves:
                     mx.eval(leaves)
             return (self._PREFILL_SNAPSHOT_MARKER, extracted)
