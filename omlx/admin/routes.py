@@ -2468,10 +2468,10 @@ async def update_model_settings(
             int(value) if value and value > 0 else 2048
         )
     if "dflash_draft_sink_size" in sent:
-        # Negative is invalid; 0 is a legal sink-size (no sink tokens).
+        # Negative / None → oMLX default 0 (no sink tokens).
         value = request.dflash_draft_sink_size
         current_settings.dflash_draft_sink_size = (
-            int(value) if value is not None and value >= 0 else None
+            int(value) if value is not None and value >= 0 else 0
         )
     if "dflash_block_size" in sent:
         value = request.dflash_block_size

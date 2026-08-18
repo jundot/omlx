@@ -7118,7 +7118,7 @@
                         ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
                         : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? 2048,
-                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? null,
+                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
                     dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model?.dflash_compatible !== false,
@@ -7839,7 +7839,7 @@
                                 guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
                                 guided_grammar: this.modelSettings.guided_grammar_enabled
                                     ? (this.modelSettings.guided_grammar || null)
-                                    : null,
+                                    : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
@@ -7910,7 +7910,7 @@
                                     && this.modelSettings.dflash_draft_sink_size !== undefined
                                     && this.modelSettings.dflash_draft_sink_size !== ''
                                     ? parseInt(this.modelSettings.dflash_draft_sink_size)
-                                    : null,
+                                    : 0,
                                 dflash_block_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_block_size
                                     ? parseInt(this.modelSettings.dflash_block_size)
@@ -8069,7 +8069,7 @@
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = 2048;
-                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;

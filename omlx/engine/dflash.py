@@ -404,11 +404,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 2048
         )
-        self._draft_sink_size = (
+        draft_sink_size = (
             getattr(model_settings, "dflash_draft_sink_size", None)
             if model_settings
             else None
         )
+        self._draft_sink_size = 0 if draft_sink_size is None else draft_sink_size
         self._block_size = (
             getattr(model_settings, "dflash_block_size", None)
             if model_settings

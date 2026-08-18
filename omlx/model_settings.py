@@ -140,7 +140,7 @@ class ModelSettings:
         dflash_draft_window_size: Draft model sliding-attention window (default 2048).
             Helps stabilise acceptance rate on long-context prompts.
         dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (None = dflash default 64).
+            (default 0, disabling sink tokens).
         dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
@@ -255,10 +255,10 @@ class ModelSettings:
         False  # Requires in-memory cache and an omlx paged SSD cache dir
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. oMLX uses a 2048-token draft window by default;
-    # the remaining None values let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG.
+    # DFlash runtime tuning knobs. oMLX uses a 2048-token draft window and no
+    # attention-sink tokens by default; remaining None values use dflash-mlx defaults.
     dflash_draft_window_size: Optional[int] = 2048
-    dflash_draft_sink_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = 0
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 

@@ -21678,19 +21678,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Attention-sink tokens always kept in the window. Empty = dflash default (64)."
+            "value" : "Attention-sink tokens always kept in the window. Empty = oMLX default (0)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение DFlash по умолчанию (64)."
+            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение oMLX по умолчанию (0)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "注意力 sink Token 始终保留在窗口中。空 = dflash 默认（64）。"
+            "value" : "注意力 sink Token 始终保留在窗口中。留空 = oMLX 默认值（0）。"
           }
         }
       }

@@ -28,7 +28,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_ssd_cache is False
         # oMLX overrides dflash-mlx's draft-window default for long contexts.
         assert settings.dflash_draft_window_size == 2048
-        assert settings.dflash_draft_sink_size is None
+        assert settings.dflash_draft_sink_size == 0
         assert settings.dflash_block_size is None
         assert settings.dflash_verify_mode is None
 
@@ -56,8 +56,8 @@ class TestDFlashModelSettings:
         assert "dflash_draft_quant_group_size" not in d
         assert "dflash_max_ctx" not in d
         assert d["dflash_draft_window_size"] == 2048
+        assert d["dflash_draft_sink_size"] == 0
         # Remaining tuning knobs default to None → omitted from on-disk JSON.
-        assert "dflash_draft_sink_size" not in d
         assert "dflash_block_size" not in d
         assert "dflash_verify_mode" not in d
 
@@ -101,6 +101,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
         assert settings.dflash_draft_window_size == 2048
+        assert settings.dflash_draft_sink_size == 0
 
     def test_from_dict_ignores_removed_speculative_tokens(self):
         """dflash_speculative_tokens (removed in v2) is silently dropped."""
@@ -628,7 +629,7 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
         )
         assert engine._draft_window_size == 2048
-        assert engine._draft_sink_size is None
+        assert engine._draft_sink_size == 0
         assert engine._block_size is None
         assert engine._verify_mode is None
 
@@ -654,16 +655,20 @@ class TestDFlashEngineInit:
         assert engine._block_size == 5
         assert engine._verify_mode == "adaptive"
 
-    def test_none_window_setting_uses_omlx_default(self):
-        """Explicit null from an older settings file still upgrades to 2048."""
+    def test_none_runtime_settings_use_omlx_defaults(self):
+        """Explicit nulls from an older settings file upgrade to oMLX defaults."""
         from omlx.engine.dflash import DFlashEngine
 
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
-            model_settings=ModelSettings(dflash_draft_window_size=None),
+            model_settings=ModelSettings(
+                dflash_draft_window_size=None,
+                dflash_draft_sink_size=None,
+            ),
         )
         assert engine._draft_window_size == 2048
+        assert engine._draft_sink_size == 0
 
     def test_build_runtime_context_passes_knobs(self):
         """The new kwargs reach dflash-mlx and end up in RuntimeContext.runtime."""
@@ -688,7 +693,7 @@ class TestDFlashEngineInit:
         assert runtime.verify_mode == "dflash"
 
     def test_build_runtime_context_defaults_to_omlx_window(self):
-        """No settings → oMLX uses window 2048; dflash-mlx fills other defaults."""
+        """No settings → oMLX uses window 2048 and sink size 0."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -701,7 +706,7 @@ class TestDFlashEngineInit:
         ctx = engine._build_runtime_context()
         runtime = ctx.runtime
         assert runtime.draft_window_size == 2048
-        assert runtime.draft_sink_size == 64
+        assert runtime.draft_sink_size == 0
         assert runtime.verify_mode == "adaptive"
 
     def test_l2_max_bytes_from_settings(self, tmp_path):

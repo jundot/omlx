@@ -1449,10 +1449,10 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Draft Sink Size",
                                   comment: "Row label for the DFlash attention-sink tokens field"),
                     sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (64).",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = oMLX default (0).",
                                      comment: "Sublabel for the DFlash draft sink size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
-                              placeholder: "64", mono: true, width: 110)
+                              placeholder: "0", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.block_size.label",
                                   defaultValue: "Runtime Block Size",
