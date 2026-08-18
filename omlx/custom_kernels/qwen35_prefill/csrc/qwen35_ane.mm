@@ -1739,7 +1739,7 @@ array qwen35_ane_affine_qmm_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
-      (bits != 4 && bits != 5) ||
+      (bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
       (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument("Unsupported ANE hybrid qmm configuration.");
   }
@@ -1820,7 +1820,7 @@ array qwen35_ane_dual_affine_qmm_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
-      (bits != 4 && bits != 5) ||
+      (bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
       (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument(
         "Unsupported dual ANE hybrid qmm configuration.");

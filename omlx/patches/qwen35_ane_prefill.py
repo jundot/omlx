@@ -65,6 +65,7 @@ class _CombinedMLPState:
     gpu_outputs: int
     model1: Any | None = None
     group_size: int = 128
+    bits: int = 4
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ def _affine_spec(
     linear: Any,
     dtype: mx.Dtype,
     *,
-    allowed_bits: tuple[int, ...] = (4, 5),
+    allowed_bits: tuple[int, ...] = (4, 5, 6, 8),
 ) -> tuple[int, int] | None:
     """Return a supported affine ``(bits, group_size)`` pair for ``linear``."""
     bits = getattr(linear, "bits", None)
@@ -168,8 +169,8 @@ def _eligible_pair(mlp: Any) -> bool:
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate_dtype = getattr(getattr(gate, "scales", None), "dtype", None)
-    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4,))
-    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4,))
+    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4, 5, 6, 8))
+    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4, 5, 6, 8))
     down_spec = _affine_spec(
         down,
         getattr(getattr(down, "scales", None), "dtype", None),
@@ -202,11 +203,15 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
         mlp._omlx_ane_prefill_cache = cache
 
     output_dim = int(gate.weight.shape[0])
+    bits = int(gate.bits)
     group_size = int(gate.group_size)
     dual_ane = bool(
         config.dual_ane
-        and fast.has_symbol("qwen35_ane_dual_q4_swiglu_t")
         and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+        and (
+            bits != 4
+            or fast.has_symbol("qwen35_ane_dual_q4_swiglu_t")
+        )
     )
     alignment = 128 if dual_ane else 64
     ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
@@ -236,7 +241,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
                             linear.scales[start:end],
                             linear.biases[start:end],
                             group_size=group_size,
-                            bits=4,
+                            bits=bits,
                         ).astype(mx.float32)
                         for linear in (gate, up)
                     ],
@@ -283,6 +288,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
             gpu_outputs=gpu_outputs,
             model1=model1,
             group_size=group_size,
+            bits=bits,
         )
         cache[key] = state
         logger.debug(
@@ -303,6 +309,7 @@ def _prepare_pair_for_bank(
     if not _eligible_pair(mlp):
         return None
     output_dim = int(gate.weight.shape[0])
+    bits = int(gate.bits)
     group_size = int(gate.group_size)
     ane_outputs = (int(output_dim * config.fraction) // 128) * 128
     gpu_outputs = output_dim - ane_outputs
@@ -318,7 +325,7 @@ def _prepare_pair_for_bank(
                         linear.scales[start:end],
                         linear.biases[start:end],
                         group_size=group_size,
-                        bits=4,
+                        bits=bits,
                     ).astype(mx.float32)
                     for linear in (gate, up)
                 ],
@@ -349,6 +356,7 @@ def _prepare_pair_for_bank(
             gpu_outputs=gpu_outputs,
             model1=None,
             group_size=group_size,
+            bits=bits,
         ),
         dense0,
         dense1,
@@ -651,8 +659,10 @@ def _backend(
             return None
     if state is None:
         return None
-    if state.scales.dtype != x.dtype or int(state.weight.shape[1]) * 8 != int(
-        x.shape[-1]
+    if (
+        state.scales.dtype != x.dtype
+        or int(state.weight.shape[1]) * 32
+        != int(x.shape[-1]) * state.bits
     ):
         return None
 
@@ -660,7 +670,7 @@ def _backend(
         from omlx.custom_kernels.qwen35_prefill import fast
         from omlx.patches.qwen35_q4_mlp import _linear_qmm
 
-        if state.model1 is not None:
+        if state.model1 is not None and state.bits == 4:
             activation = fast.qwen35_ane_dual_q4_swiglu_t(
                 x,
                 state.weight,
@@ -672,7 +682,9 @@ def _backend(
                 state.group_size,
             )
             return _linear_qmm(mlp.down_proj, activation, config.variant)
-        if fast.has_symbol("qwen35_ane_q4_swiglu_t"):
+        if state.model1 is None and state.bits == 4 and fast.has_symbol(
+            "qwen35_ane_q4_swiglu_t"
+        ):
             activation = fast.qwen35_ane_q4_swiglu_t(
                 x,
                 state.weight,
@@ -684,32 +696,70 @@ def _backend(
             )
             return _linear_qmm(mlp.down_proj, activation, config.variant)
 
-        combined = fast.qwen35_ane_q4_affine_qmm_t(
-            x,
-            state.weight,
-            state.scales,
-            state.biases,
-            state.model,
-            config.variant,
-            state.group_size,
-        )
+        if state.model1 is not None:
+            combined = fast.qwen35_ane_dual_affine_qmm_t(
+                x,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.model1,
+                state.bits,
+                config.variant,
+                state.group_size,
+            )
+        elif state.bits == 4:
+            combined = fast.qwen35_ane_q4_affine_qmm_t(
+                x,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                config.variant,
+                state.group_size,
+            )
+        else:
+            combined = fast.qwen35_ane_affine_qmm_t(
+                x,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.bits,
+                config.variant,
+                state.group_size,
+            )
         ane_end = 2 * state.ane_outputs
         gpu_gate_end = ane_end + state.gpu_outputs
-
-        gate = mx.concatenate(
-            (
+        if state.model1 is None:
+            gate_parts = (
                 combined[..., : state.ane_outputs],
                 combined[..., ane_end:gpu_gate_end],
-            ),
-            axis=-1,
-        )
-        up = mx.concatenate(
-            (
+            )
+            up_parts = (
                 combined[..., state.ane_outputs : ane_end],
                 combined[..., gpu_gate_end:],
-            ),
-            axis=-1,
-        )
+            )
+        else:
+            # Each instance owns a consecutive hidden slice, but each ANE
+            # procedure returns its local gate rows followed by its local up
+            # rows. Reassemble those four regions before appending the GPU
+            # suffix. The q4 path performs this merge inside its fused Metal
+            # kernel; wider quantizations use this generic path.
+            half = state.ane_outputs // 2
+            gate_parts = (
+                combined[..., :half],
+                combined[..., state.ane_outputs : state.ane_outputs + half],
+                combined[..., ane_end:gpu_gate_end],
+            )
+            up_parts = (
+                combined[..., half:state.ane_outputs],
+                combined[..., state.ane_outputs + half : ane_end],
+                combined[..., gpu_gate_end:],
+            )
+
+        gate = mx.concatenate(gate_parts, axis=-1)
+        up = mx.concatenate(up_parts, axis=-1)
 
         return _linear_qmm(
             mlp.down_proj,
