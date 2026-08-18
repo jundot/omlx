@@ -1,12 +1,35 @@
 import os
 import sys
+from pathlib import Path
 
 from setuptools import setup
-
 
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
 DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
+DOTENV_PATH = Path(__file__).resolve().parent / ".env"
+
+
+def _load_dotenv(path: Path = DOTENV_PATH) -> None:
+    """Seed os.environ from a gitignored .env so build flags persist locally.
+
+    Lets a checkout opt into OMLX_WITH_CUSTOM_KERNEL (and the deployment
+    target / CMAKE_ARGS overrides below) without exporting anything in the
+    shell or touching a tracked file.  Real environment variables win, so
+    CI and one-off `OMLX_WITH_CUSTOM_KERNEL=1 pip install` keep working.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key = key.strip()
+        if key:
+            os.environ.setdefault(key, value.strip().strip("\"'"))
 
 
 def _with_custom_kernel() -> bool:
@@ -72,4 +95,5 @@ def _custom_kernel_build_kwargs() -> dict:
 
 
 if __name__ == "__main__":
+    _load_dotenv()
     setup(**_custom_kernel_build_kwargs())
