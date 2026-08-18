@@ -82,6 +82,15 @@ class TestReasoningEffortChatTemplateKwargs:
         assert merged == {"reasoning_effort": 0.9}
         assert isinstance(merged["reasoning_effort"], float)
 
+    def test_effort_merge_preserves_thinking_toggle(self):
+        """Anthropic path: thinking.type sets enable_thinking first, then the
+        effort merge must add reasoning_effort without touching it."""
+        merged = {"enable_thinking": True}
+
+        result = merge_reasoning_effort_chat_template_kwargs(merged, "high")
+
+        assert result == {"enable_thinking": True, "reasoning_effort": "high"}
+
 
 class TestCleanOutputText:
     """Tests for clean_output_text function."""

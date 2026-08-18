@@ -5634,6 +5634,21 @@ async def create_anthropic_message(
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
 
+        # Pass through output_config.effort (e.g. Claude Code's /effort
+        # selector) via the shared reasoning-effort merge. An explicit
+        # reasoning_effort in chat_template_kwargs or model settings still
+        # wins (setdefault).
+        oc_effort = (
+            request.output_config.get("effort")
+            if isinstance(request.output_config, dict)
+            else None
+        )
+        if oc_effort is not None:
+            merged_ct_kwargs = merge_reasoning_effort_chat_template_kwargs(
+                merged_ct_kwargs,
+                oc_effort,
+            ) or {}
+
         _entry = get_engine_pool().get_entry(resolved_model)
 
         logger.debug(
