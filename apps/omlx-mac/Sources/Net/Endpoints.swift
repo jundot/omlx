@@ -30,6 +30,7 @@ enum AdminAPI {
     static func modelSettingsReset(_ id: String) -> String { "\(modelSettings(id))/reset" }
     static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
     static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
+    static func importMtplx(_ id: String) -> String { "\(models)/\(id)/import-mtplx" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }

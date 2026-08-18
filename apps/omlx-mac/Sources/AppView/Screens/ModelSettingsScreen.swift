@@ -1599,6 +1599,30 @@ private struct AccelerationSection: View {
                 }
             }
 
+
+            if vm.canImportMtplxSidecar {
+                Row(label: String(localized: "settings.acceleration.mtplx_import.label",
+                                  defaultValue: "MTPLX Side-car",
+                                  comment: "Row label for the one-time MTPLX side-car import action"),
+                    sublabel: String(localized: "settings.acceleration.mtplx_import.sub",
+                                     defaultValue: "Import the model's MTP head into its checkpoint index to unlock Lightning MTP.",
+                                     comment: "Sublabel for the MTPLX side-car import action")) {
+                    Button {
+                        Task { await vm.importMtplxSidecar(client: client) }
+                    } label: {
+                        if vm.isImportingMtplxSidecar {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(String(localized: "settings.acceleration.mtplx_import.button",
+                                        defaultValue: "Import MTPLX Side-car",
+                                        comment: "Button title that imports an MTPLX MTP side-car"))
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(vm.isImportingMtplxSidecar)
+                }
+            }
+
             // DFlash
             Row(label: String(localized: "settings.experimental.dflash.label",
                               defaultValue: "DFlash",
