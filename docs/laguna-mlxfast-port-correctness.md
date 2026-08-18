@@ -60,6 +60,23 @@ migration `4799830` and are not part of the current model surface).
 - **Optimization:** re-represent the BF16 attention projections (`q/k/v/o/g_proj`, ~2.9 GB of the ~4.3 GB per-decode-step weight traffic) as group-32 affine INT8 at init — 9 bits/weight vs BF16's 16, removing ~1.25 GB/step.
 - **Token-exactness issue:** this is an explicitly **lossy** re-quantization (the submission itself documents it; it lives inside the track envelope's permitted "representation set" but is not bit-exact vs the reference). It is not reproduced in oMLX: the port bar requires bit-exact parity or a documented exception. If oMLX ever adopts it, it must be a default-OFF toggle with lossiness documented and a token-diff gate against the BF16 reference.
 
+## Laguna commits beyond the 8 submissions (all examined)
+
+Every other commit that touched the Laguna model surface (migrations, vendored
+model, harness, kernels, docs) was examined for safely-portable logic:
+
+| Commit | What it changed | Disposition |
+|---|---|---|
+| `4799830` (07-21) | Laguna migration (base model) | 📋 pieces documented: `lagunaLastTokenHidden` → C2; constructor warmup → N3-style note; NVFP4-only-expert + YaRN mscale already verified in oMLX |
+| `3d9ec53`/`25f8a50`/`67513ac`/`3b21af3` (07-22) | editablePaths fixes, Gemma naming cleanup | 📋 structural, no optimization |
+| `6d679f4` (07-22) | NVFP4 v2 quantization layout | 📋 oMLX `sanitize()` already handles NVFP4 loading |
+| `b00280b` (07-24) | vendored Laguna.swift header (reference vs scored) | 📋 docs, no logic |
+| `ca6149b` (07-26) | low-memory startup profile | 📋 N1: not ported (oMLX `set_cache_limit(total)` is a load-bearing #300 panic guard) |
+| `7632313d`/`2ac117b`/`a1914e5`/`78f6c12` (07-29/30) | DFlash vendor + Criterion-E harness | 📋 N4: benchmark-integrity / harness invariants, not model optimizations |
+| `55aec0f` (08-01) | editable-surface: expose sort/reduce kernels + dispatch wrappers | 📋 challenge-structure (moves stock MLX kernels into editable scope), no model logic; the header change only clarifies which path is scored |
+| `8c6e218` (08-01) | docs audit | 📋 docs |
+| pre-Laguna shared-file commits (`f5ed2be`, `165d3d1`, `ef0a57b`, `fe9d166`, `75ca2a0`, `2ebae10`, `f310c09`, `2a5428a`, `5fc87e3`, `c118b23`) | harness hardening, streaming weight load (`DenseTensorStore`), Gemma-era kernel vendoring | 📋 techniques documented; streaming load is not a decode optimization and mlx-lm loads the cache |
+
 ## How to update
 
 Every ported submission updates its registry row with the port commit and a
