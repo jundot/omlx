@@ -25,6 +25,20 @@ mx::array dsa_indexer_scores(
     int mask_q_offset = 0,
     mx::StreamOrDevice s = {});
 
+// v25 M2 from-scratch MMA score kernel (zero-per-head-barrier structure,
+// ~1.37x over the Steel kernel on M2 Ultra, bit-exact). Serves ONLY:
+// bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal. Callers must
+// gate on those and fall back to dsa_indexer_scores otherwise. mask_ratio/
+// mask_q_offset carry the same fused pooled-ratio mask semantics as
+// dsa_indexer_scores.
+mx::array dsa_indexer_scores_mma(
+    const mx::array& queries,
+    const mx::array& keys,
+    const mx::array& weights,
+    int mask_ratio = 0,
+    int mask_q_offset = 0,
+    mx::StreamOrDevice s = {});
+
 mx::array dsa_topk_indices(
     const mx::array& scores,
     int topk,

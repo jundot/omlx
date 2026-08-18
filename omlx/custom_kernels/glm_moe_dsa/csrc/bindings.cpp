@@ -43,6 +43,15 @@ NB_MODULE(_ext, m) {
       "mask_q_offset"_a = 0,
       "stream"_a = nb::none());
   m.def(
+      "dsa_indexer_scores_mma",
+      &omlx::glm_kernels::dsa_indexer_scores_mma,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "mask_ratio"_a = 0,
+      "mask_q_offset"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
       "scores"_a,
