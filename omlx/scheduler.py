@@ -1496,6 +1496,11 @@ class SchedulerConfig:
     initial_cache_blocks: int = (
         256  # Starting blocks (grows dynamically to max_cache_blocks)
     )
+    # Fixed ANE prefill shape, when the engine enabled the hybrid ANE path.
+    # Pooling-cache models clamp prefill chunks to block boundaries, so the
+    # block size must match this shape or the fixed-shape ANE ops never see
+    # an eligible chunk.
+    ane_prefill_block_size: int = 0
 
     # paged SSD cache settings (oMLX only supports paged SSD-based caching)
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
@@ -2626,6 +2631,9 @@ class Scheduler:
         hi = self._ROTATING_BLOCK_SIZE_MAX
         if self._detect_pooling_cache():
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+            ane_block = int(getattr(self.config, "ane_prefill_block_size", 0) or 0)
+            if ane_block:
+                lo = hi = ane_block
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size

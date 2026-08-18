@@ -167,6 +167,9 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune_test",
         "modal.model_settings.qwen_ane_tune_throughput",
         "modal.model_settings.qwen_ane_tail_padding",
+        "modal.model_settings.deepseek_ane",
+        "modal.model_settings.deepseek_ane_hint",
+        "modal.model_settings.deepseek_ane_cache_hint",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):

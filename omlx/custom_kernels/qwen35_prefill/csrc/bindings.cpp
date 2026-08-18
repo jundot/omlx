@@ -108,11 +108,12 @@ NB_MODULE(_ext, m) {
       "qwen35_ane_compile_linear",
       static_cast<std::shared_ptr<
           omlx::qwen35_prefill_kernels::AneLinearModel> (*)(
-          const mlx::core::array &, int, int)>(
+          const mlx::core::array &, int, int, int)>(
       &omlx::qwen35_prefill_kernels::qwen35_ane_compile_linear),
       "weight"_a,
       "sequence_length"_a,
       "ane_instance"_a = 0,
+      "groups"_a = 1,
       nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_linear_bank",

@@ -47,6 +47,59 @@ def set_dspark_verify_armed(flag: bool) -> None:
     set_armed(flag)
 
 
+# Optional ANE prefill backends. They see every eligible call and return None
+# to fall through to the normal GPU path (decode, verify, non-fixed shapes).
+_ANE_LINEAR_BACKEND = None
+_ANE_MLP_BACKEND = None
+
+
+def register_ane_linear_backend(backend) -> None:
+    """Install the optional ANE prefill backend for eligible plain linears."""
+    global _ANE_LINEAR_BACKEND
+    _ANE_LINEAR_BACKEND = backend
+
+
+def register_ane_mlp_backend(backend) -> None:
+    """Install the optional ANE prefill backend for the shared-expert MLP."""
+    global _ANE_MLP_BACKEND
+    _ANE_MLP_BACKEND = backend
+
+
+def _ane_linear(linear: nn.Module, x: mx.array) -> mx.array:
+    backend = _ANE_LINEAR_BACKEND
+    if backend is not None:
+        out = backend(linear, x)
+        if out is not None:
+            return out
+    return linear(x)
+
+
+_ANE_STACKED_Q_BACKEND = None
+
+
+def register_ane_stacked_q_backend(backend) -> None:
+    """Install the optional ANE backend for the stacked attn+indexer wq_b."""
+    global _ANE_STACKED_Q_BACKEND
+    _ANE_STACKED_Q_BACKEND = backend
+
+
+def _ane_stacked_q(
+    attn_linear: nn.Module, indexer_linear: nn.Module | None, value: mx.array
+):
+    """Project the attention q, folding the indexer q into the same hybrid op.
+
+    Returns ``(attn_q_raw, indexer_q_raw)``; the second element is ``None``
+    whenever the stacked backend did not run, and the caller must then leave
+    the indexer to do its own projection.
+    """
+    backend = _ANE_STACKED_Q_BACKEND
+    if backend is not None and indexer_linear is not None:
+        split = backend(attn_linear, value)
+        if split is not None:
+            return split
+    return _ane_linear(attn_linear, value), None
+
+
 def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx.array:
     out = attn.rope(out, offset, inverse=True)
 
@@ -82,7 +135,7 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
                 axis=1,
             )
         return attn.wo_b(projected)
-    return attn.wo_b(project_a(out))
+    return _ane_linear(attn.wo_b, project_a(out))
 
 
 def _batched_m1_attention(
@@ -893,6 +946,11 @@ class DeepseekV4MLP(nn.Module):
         self.fp32_swiglu = False
 
     def __call__(self, x: mx.array) -> mx.array:
+        backend = _ANE_MLP_BACKEND
+        if backend is not None and not is_dspark_verify_armed():
+            hybrid = backend(self, x)
+            if hybrid is not None:
+                return hybrid
         paired = False
         if is_dspark_verify_armed():
             from omlx.patches.deepseek_v4.verify_qmv import (
@@ -1626,7 +1684,7 @@ class LocalAttention(nn.Module):
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = _ane_linear(self.wq_b, self.q_norm(self.wq_a(x)))
         q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
@@ -1738,7 +1796,7 @@ class CompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = _ane_linear(self.wq_b, self.q_norm(self.wq_a(x)))
         q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
@@ -1909,7 +1967,10 @@ class SparseCompressedAttention(nn.Module):
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
+        q_raw, indexer_q_raw = _ane_stacked_q(
+            self.wq_b, getattr(self.indexer, "wq_b", None), q_residual
+        )
+        q = q_raw.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
@@ -2045,7 +2106,22 @@ class SparseCompressedAttention(nn.Module):
                 (B, L, pooled.shape[1]),
             )
         else:
-            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+            projected_q = None
+            if indexer_q_raw is not None:
+                projected_q = self.rope(
+                    indexer_q_raw.reshape(
+                        B, L, self.indexer.n_heads, self.indexer.head_dim
+                    ).transpose(0, 2, 1, 3),
+                    offset,
+                )
+            topk = self.indexer(
+                x,
+                q_residual,
+                self.rope,
+                idx_cache,
+                offset,
+                projected_q=projected_q,
+            )
         sparse_mask = None
         if pmask is not None and topk is not None:
             sparse_mask = mx.take_along_axis(

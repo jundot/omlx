@@ -585,6 +585,14 @@ class EnginePool:
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
                 )
 
+        dsv4_ane_active = bool(data.get("deepseek_ane_prefill_enabled", False))
+        add("deepseek_ane_prefill_enabled", dsv4_ane_active)
+        if dsv4_ane_active:
+            add(
+                "deepseek_ane_prefill_sequence_length",
+                data.get("deepseek_ane_prefill_sequence_length", 4096),
+            )
+
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
         )

@@ -151,6 +151,9 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    # DeepSeek-V4 hybrid ANE prefill
+    deepseek_ane_prefill_enabled: bool | None = None
+    deepseek_ane_prefill_sequence_length: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2472,6 +2475,28 @@ async def update_model_settings(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
         )
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + wq_b + stacked indexer).
+    if "deepseek_ane_prefill_enabled" in sent:
+        enabled = bool(request.deepseek_ane_prefill_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and not config_type.startswith("deepseek_v4"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek ANE prefill is available only for DeepSeek-V4 "
+                    "models."
+                ),
+            )
+        current_settings.deepseek_ane_prefill_enabled = enabled
+    if "deepseek_ane_prefill_sequence_length" in sent:
+        value = request.deepseek_ane_prefill_sequence_length
+        if value is None or value < 1024 or value % 64:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+            )
+        current_settings.deepseek_ane_prefill_sequence_length = int(value)
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

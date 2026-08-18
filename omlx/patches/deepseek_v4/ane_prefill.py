@@ -1,0 +1,444 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Opt-in ANE/GPU hybrid prefill for DeepSeek-V4-Flash dense projections.
+
+Splits the mxfp8 shared-expert gate/up pair and the wq_b attention
+projection (with the sparse-layer indexer wq_b stacked into the same
+procedure) between an INT8 ANE channel prefix and an affine-q8 GPU suffix,
+reusing the Qwen ANE runtime (procedure banks, split ladder, fixed-shape
+eligibility). Routed experts, wo_a/wo_b, decode, and DSpark verify calls
+keep the existing GPU path. Enabled through the per-model
+``deepseek_ane_prefill_*`` settings on the batched engine.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import os
+from dataclasses import dataclass, replace
+from typing import Any
+
+import mlx.core as mx
+
+from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.deepseek_v4.decode_consistency import is_armed
+from omlx.patches.qwen35_ane_prefill import _compile_dual_banks, _eligible_input
+
+logger = logging.getLogger(__name__)
+
+# The suffix is requantized from mxfp8 to affine q8 so the existing hybrid
+# merge primitive can dispatch it; measured GPU time is format-neutral.
+_SUFFIX_BITS = 8
+_SUFFIX_GROUP_SIZE = 64
+# Fractions follow the Phase A shape microbench optima. The indexer wq_b
+# rides inside the attention wq_b op (same q_residual input), so it adds no
+# operations of its own. wo_b is deliberately not accelerated: its per-op
+# host synchronization exceeded the offload savings in-model at K=8192.
+_FRACTIONS = {"mlp": 0.5, "wq_b": 0.5, "indexer_wq_b": 0.5}
+
+
+@dataclass(frozen=True)
+class _AneConfig:
+    sequence_length: int
+
+
+@dataclass(frozen=True)
+class _LinearState:
+    model: Any
+    model1: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+
+
+@dataclass(frozen=True)
+class _MlpState:
+    model: Any
+    model1: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+
+
+@dataclass(frozen=True)
+class _StackedState:
+    model: Any
+    model1: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+    split: int
+
+
+def _mxfp8_linear_dims(linear: Any) -> tuple[int, int] | None:
+    """Return (out_features, in_features) for an eligible mxfp8 linear."""
+    if getattr(linear, "mode", None) != "mxfp8":
+        return None
+    if getattr(linear, "bits", None) != 8 or getattr(linear, "group_size", None) != 32:
+        return None
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    if weight is None or scales is None:
+        return None
+    if weight.dtype != mx.uint32 or scales.dtype != mx.uint8 or weight.ndim != 2:
+        return None
+    if "bias" in linear:
+        return None
+    out_features = int(weight.shape[0])
+    in_features = int(weight.shape[1]) * 4
+    if in_features % _SUFFIX_GROUP_SIZE:
+        return None
+    return out_features, in_features
+
+
+def _dequant_rows(linear: Any, start: int, stop: int) -> mx.array:
+    return mx.dequantize(
+        linear.weight[start:stop],
+        linear.scales[start:stop],
+        group_size=32,
+        bits=8,
+        mode="mxfp8",
+    )
+
+
+def _requant_suffix(rows: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    weight, scales, biases = mx.quantize(
+        rows, group_size=_SUFFIX_GROUP_SIZE, bits=_SUFFIX_BITS
+    )
+    return mx.contiguous(weight), mx.contiguous(scales), mx.contiguous(biases)
+
+
+def _split_rows(out_features: int, fraction: float) -> tuple[int, int] | None:
+    per_instance = int(out_features * fraction / 2 // 128) * 128
+    gpu_outputs = out_features - 2 * per_instance
+    if per_instance < 128 or gpu_outputs < 64 or gpu_outputs % 64:
+        return None
+    return per_instance, gpu_outputs
+
+
+def _prepare_linear(
+    linear: Any, fraction: float
+) -> tuple[_LinearState, mx.array, mx.array] | None:
+    dims = _mxfp8_linear_dims(linear)
+    if dims is None:
+        return None
+    out_features, _ = dims
+    split = _split_rows(out_features, fraction)
+    if split is None:
+        return None
+    per_instance, gpu_outputs = split
+    dense0 = mx.contiguous(
+        _dequant_rows(linear, 0, per_instance).astype(mx.float32)
+    )
+    dense1 = mx.contiguous(
+        _dequant_rows(linear, per_instance, 2 * per_instance).astype(mx.float32)
+    )
+    suffix = _requant_suffix(
+        mx.contiguous(_dequant_rows(linear, 2 * per_instance, out_features))
+    )
+    state = _LinearState(None, None, *suffix, 2 * per_instance, gpu_outputs)
+    return state, dense0, dense1
+
+
+def _prepare_mlp(mlp: Any) -> tuple[_MlpState, mx.array, mx.array] | None:
+    gate_dims = _mxfp8_linear_dims(getattr(mlp, "gate_proj", None))
+    up_dims = _mxfp8_linear_dims(getattr(mlp, "up_proj", None))
+    if gate_dims is None or gate_dims != up_dims:
+        return None
+    out_features, _ = gate_dims
+    split = _split_rows(out_features, _FRACTIONS["mlp"])
+    if split is None:
+        return None
+    per_instance, gpu_outputs = split
+    ane_outputs = 2 * per_instance
+
+    def block(start: int, stop: int) -> mx.array:
+        return mx.concatenate(
+            (
+                _dequant_rows(mlp.gate_proj, start, stop),
+                _dequant_rows(mlp.up_proj, start, stop),
+            )
+        )
+
+    dense0 = mx.contiguous(block(0, per_instance).astype(mx.float32))
+    dense1 = mx.contiguous(block(per_instance, ane_outputs).astype(mx.float32))
+    suffix = _requant_suffix(mx.contiguous(block(ane_outputs, out_features)))
+    state = _MlpState(None, None, *suffix, ane_outputs, gpu_outputs)
+    return state, dense0, dense1
+
+
+def _prepare_stacked(
+    attn_linear: Any, indexer_linear: Any, fraction: float
+) -> tuple[_StackedState, mx.array, mx.array] | None:
+    attn_dims = _mxfp8_linear_dims(attn_linear)
+    indexer_dims = _mxfp8_linear_dims(indexer_linear)
+    if attn_dims is None or indexer_dims is None or attn_dims[1] != indexer_dims[1]:
+        return None
+    attn_out = attn_dims[0]
+    out_features = attn_out + indexer_dims[0]
+    split = _split_rows(out_features, fraction)
+    if split is None:
+        return None
+    per_instance, gpu_outputs = split
+
+    def stacked_rows(start: int, stop: int) -> mx.array:
+        parts = []
+        if start < attn_out:
+            parts.append(_dequant_rows(attn_linear, start, min(stop, attn_out)))
+        if stop > attn_out:
+            parts.append(
+                _dequant_rows(
+                    indexer_linear, max(start - attn_out, 0), stop - attn_out
+                )
+            )
+        return parts[0] if len(parts) == 1 else mx.concatenate(parts)
+
+    dense0 = mx.contiguous(stacked_rows(0, per_instance).astype(mx.float32))
+    dense1 = mx.contiguous(
+        stacked_rows(per_instance, 2 * per_instance).astype(mx.float32)
+    )
+    suffix = _requant_suffix(
+        mx.contiguous(stacked_rows(2 * per_instance, out_features))
+    )
+    state = _StackedState(
+        None, None, *suffix, 2 * per_instance, gpu_outputs, attn_out
+    )
+    return state, dense0, dense1
+
+
+def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
+    config = getattr(owner, "_omlx_ane_config", None)
+    if config is None or getattr(owner, "_omlx_ane_failed", False):
+        return None
+    if is_armed() or not _eligible_input(x, config):
+        return None
+    state = owner._omlx_ane_state
+    if state.scales.dtype != x.dtype:
+        return None
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        return fast.qwen35_ane_dual_affine_qmm_t(
+            x,
+            state.weight,
+            state.scales,
+            state.biases,
+            state.model,
+            state.model1,
+            _SUFFIX_BITS,
+            8,
+            _SUFFIX_GROUP_SIZE,
+        )
+    except Exception:
+        owner._omlx_ane_failed = True
+        logger.warning(
+            "Disabling ANE prefill for one DeepSeek projection after a "
+            "runtime failure",
+            exc_info=True,
+        )
+        return None
+
+
+def _linear_backend(linear: Any, x: mx.array) -> mx.array | None:
+    # The dual raw merge emits [instance0 rows, instance1 rows, gpu rows],
+    # which is the original channel order for a contiguous row split.
+    if not isinstance(getattr(linear, "_omlx_ane_state", None), _LinearState):
+        return None
+    return _hybrid_combined(linear, x)
+
+
+def _stacked_backend(attn_linear: Any, x: mx.array):
+    state = getattr(attn_linear, "_omlx_ane_state", None)
+    if not isinstance(state, _StackedState):
+        return None
+    combined = _hybrid_combined(attn_linear, x)
+    if combined is None:
+        return None
+    return combined[..., : state.split], combined[..., state.split :]
+
+
+def _mlp_backend(mlp: Any, x: mx.array) -> mx.array | None:
+    if not isinstance(getattr(mlp, "_omlx_ane_state", None), _MlpState):
+        return None
+    combined = _hybrid_combined(mlp, x)
+    if combined is None:
+        return None
+    state = mlp._omlx_ane_state
+    half = state.ane_outputs // 2
+    gate = mx.concatenate(
+        (
+            combined[..., 0:half],
+            combined[..., 2 * half : 3 * half],
+            combined[..., 4 * half : 4 * half + state.gpu_outputs],
+        ),
+        axis=-1,
+    )
+    up = mx.concatenate(
+        (
+            combined[..., half : 2 * half],
+            combined[..., 3 * half : 4 * half],
+            combined[..., 4 * half + state.gpu_outputs :],
+        ),
+        axis=-1,
+    )
+    module = importlib.import_module("mlx_lm.models.deepseek_v4")
+    if getattr(mlp, "fp32_swiglu", False):
+        hidden = module._limited_swiglu(
+            gate.astype(mx.float32),
+            up.astype(mx.float32),
+            mlp.swiglu_limit,
+        ).astype(x.dtype)
+    else:
+        hidden = module._limited_swiglu(gate, up, mlp.swiglu_limit)
+    return mlp.down_proj(hidden)
+
+
+def enable_deepseek_v4_ane_prefill(
+    model: Any, *, sequence_length: int = 2048
+) -> int:
+    """Enable the hybrid ANE backend on eligible DeepSeek-V4 projections.
+
+    Returns the number of accelerated projections; zero is a safe no-op.
+    """
+    if sequence_length < 1024 or sequence_length % 64:
+        raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
+
+    env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
+    if env in ("0", "false", "off"):
+        return 0
+    if env not in ("1", "true", "on") and is_nax_available():
+        logger.info(
+            "DeepSeek ANE prefill skipped: NAX GPU, tensor-unit prefill is faster"
+        )
+        return 0
+
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        if not fast.qwen35_ane_available():
+            logger.warning(
+                "Private ANE runtime unavailable; DeepSeek ANE prefill skipped"
+            )
+            return 0
+        if not fast.has_symbol("qwen35_ane_compile_linear_bank") or not fast.has_symbol(
+            "qwen35_ane_dual_affine_qmm_t"
+        ):
+            logger.warning(
+                "ANE extension predates procedure banks; DeepSeek ANE prefill "
+                "skipped"
+            )
+            return 0
+    except Exception:
+        logger.warning("ANE native extension unavailable; DeepSeek ANE prefill skipped")
+        return 0
+
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if not layers:
+        return 0
+
+    config = _AneConfig(sequence_length)
+    prepared: list[tuple[Any, Any, mx.array, mx.array]] = []
+    mlp_count = 0
+    stacked_count = 0
+    for layer in layers:
+        attn = getattr(layer, "attn", None)
+        shared = getattr(getattr(layer, "ffn", None), "shared_experts", None)
+        if shared is not None:
+            try:
+                prep = _prepare_mlp(shared)
+            except Exception:
+                logger.warning(
+                    "Skipping one DeepSeek shared expert while preparing its "
+                    "ANE procedure",
+                    exc_info=True,
+                )
+                prep = None
+            if prep is not None:
+                prepared.append((shared, *prep))
+                mlp_count += 1
+        linear = getattr(attn, "wq_b", None)
+        if linear is None:
+            continue
+        prep = None
+        indexer_linear = getattr(getattr(attn, "indexer", None), "wq_b", None)
+        if indexer_linear is not None:
+            try:
+                prep = _prepare_stacked(
+                    linear, indexer_linear, _FRACTIONS["wq_b"]
+                )
+            except Exception:
+                logger.warning(
+                    "Skipping one DeepSeek stacked wq_b while preparing its "
+                    "ANE procedure",
+                    exc_info=True,
+                )
+            if prep is not None:
+                stacked_count += 1
+        if prep is None:
+            try:
+                prep = _prepare_linear(linear, _FRACTIONS["wq_b"])
+            except Exception:
+                logger.warning(
+                    "Skipping one DeepSeek wq_b while preparing its ANE "
+                    "procedure",
+                    exc_info=True,
+                )
+                prep = None
+        if prep is not None:
+            prepared.append((linear, *prep))
+    if not prepared:
+        return 0
+
+    weights0 = [entry[2] for entry in prepared]
+    weights1 = [entry[3] for entry in prepared]
+    # Evaluate the requantized suffixes here as well: leaving them lazy would
+    # replay their dequant/quantize chains on whichever thread first evaluates
+    # a prefill chunk, with stream state from this loader thread.
+    suffix_arrays = [
+        tensor
+        for entry in prepared
+        for tensor in (entry[1].weight, entry[1].scales, entry[1].biases)
+    ]
+    mx.eval(*weights0, *weights1, *suffix_arrays)
+    banked = _compile_dual_banks(weights0, weights1, sequence_length)
+    if banked is None:
+        logger.warning("DeepSeek ANE prefill disabled: bank compilation failed")
+        return 0
+    models0, models1, resident_programs = banked
+    for index, (owner, state, _, _) in enumerate(prepared):
+        owner._omlx_ane_config = config
+        owner._omlx_ane_state = replace(
+            state, model=models0[index], model1=models1[index]
+        )
+
+    module = importlib.import_module("mlx_lm.models.deepseek_v4")
+    module.register_ane_linear_backend(_linear_backend)
+    module.register_ane_mlp_backend(_mlp_backend)
+    register_stacked = getattr(module, "register_ane_stacked_q_backend", None)
+    if register_stacked is not None:
+        register_stacked(_stacked_backend)
+
+    count = len(prepared)
+    model._omlx_ane_mlp_prefill_count = mlp_count
+    model._omlx_ane_gdn_prefill_count = 0
+    model._omlx_ane_dual_prefill_count = count
+    model._omlx_ane_resident_program_count = resident_programs
+    model._omlx_ane_procedure_count = count
+    logger.info(
+        "Eagerly compiled %d DeepSeek ANE procedures (%d shared experts, "
+        "%d attention projections, %d with the indexer wq_b stacked in) "
+        "into %d instance-pinned ANE programs (sequence_length=%d)",
+        count,
+        mlp_count,
+        count - mlp_count,
+        stacked_count,
+        resident_programs,
+        sequence_length,
+    )
+    return count

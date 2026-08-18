@@ -157,7 +157,9 @@ uint64_t append_blob_chunk(NSMutableData *blob, const void *bytes,
   return chunk_offset;
 }
 
-NSString *int8_linear_mil(int input_dim, int output_dim, int sequence_length) {
+NSString *int8_linear_mil(int input_dim, int output_dim, int sequence_length,
+                          int groups = 1) {
+  const int group_input_dim = input_dim / groups;
   return [NSString
       stringWithFormat:
           @"program(1.3)\n"
@@ -183,14 +185,14 @@ NSString *int8_linear_mil(int input_dim, int output_dim, int sequence_length) {
            "val=tensor<int32, [4]>([0,0,0,0])];\n"
            "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), "
            "val=tensor<int32, [2]>([1,1])];\n"
-           "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+           "    int32 gr = const()[name=string(\"gr\"), val=int32(%d)];\n"
            "    tensor<fp16, [1, %d, 1, %d]> y = conv(dilations=dl, groups=gr, "
            "pad=pd, pad_type=pt, strides=st, weight=w, x=x)"
            "[name=string(\"conv\")];\n"
            "  } -> (y);\n}\n",
-          input_dim, sequence_length, output_dim, input_dim, output_dim,
-          input_dim, output_dim, output_dim, output_dim, input_dim, output_dim,
-          sequence_length];
+          input_dim, sequence_length, output_dim, group_input_dim, output_dim,
+          group_input_dim, output_dim, output_dim, output_dim, group_input_dim,
+          groups, output_dim, sequence_length];
 }
 
 NSString *int8_linear_bank_mil(
@@ -521,21 +523,25 @@ static std::chrono::seconds ane_wait_timeout() {
 class AneLinearModel::Impl {
 public:
   Impl(const float *weight, int output_dim, int input_dim, int sequence_length,
-       bool use_fp16 = false, int ane_instance = 0)
+       bool use_fp16 = false, int ane_instance = 0, int groups = 1)
       : input_dim_(input_dim), output_dim_(output_dim),
         sequence_length_(sequence_length) {
     @autoreleasepool {
       load_ane_framework();
       execution_options_ = [ane_execution_options(ane_instance) copy];
 
-      auto quantized = quantize_rows(weight, output_dim_, input_dim_);
+      // Grouped weights hold one row per output channel of length
+      // input_dim / groups; the input surface still spans the full width.
+      const int row_dim = input_dim_ / groups;
+      auto quantized = quantize_rows(weight, output_dim_, row_dim);
       auto dense = use_fp16 ? fp16_rows(weight, output_dim_, input_dim_)
                             : std::vector<_Float16>{};
 
       NSData *mil = [(use_fp16 ? fp16_linear_mil(
                                       input_dim_, output_dim_, sequence_length_)
                                 : int8_linear_mil(
-                                      input_dim_, output_dim_, sequence_length_))
+                                      input_dim_, output_dim_, sequence_length_,
+                                      groups))
           dataUsingEncoding:NSUTF8StringEncoding];
       NSData *data_blob = use_fp16
                               ? make_blob(dense.data(),
@@ -612,6 +618,10 @@ public:
         throw std::runtime_error(error_text(@"ANE model load failed", error));
       }
       model_ = [model retain];
+      // The loaded program no longer needs the staged MIL/weight files, and
+      // removing them here instead of in the destructor keeps a killed or
+      // crashed process from leaking multi-GB temp directories.
+      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
                                     sequence_length_ * sizeof(_Float16));
@@ -1158,7 +1168,7 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_linear(const array &weight,
 }
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_linear(
-    const array &weight, int sequence_length, int ane_instance) {
+    const array &weight, int sequence_length, int ane_instance, int groups) {
   if (!qwen35_ane_available()) {
     throw std::runtime_error("Private ANE runtime is unavailable.");
   }
@@ -1167,12 +1177,16 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_linear(
     throw std::invalid_argument(
         "ANE compile weight must be a contiguous rank-2 float32 MLX array.");
   }
-  if (sequence_length <= 1 || weight.shape(0) <= 0 || weight.shape(1) <= 0) {
+  if (sequence_length <= 1 || weight.shape(0) <= 0 || weight.shape(1) <= 0 ||
+      groups < 1 || weight.shape(0) % groups) {
     throw std::invalid_argument("Invalid fixed shape for ANE linear model.");
   }
+  // Grouped weights arrive as [out_total, in_per_group]; the model's input
+  // width is the concatenation of every group's input block.
   auto impl = std::make_unique<AneLinearModel::Impl>(
       weight.data<float>(), static_cast<int>(weight.shape(0)),
-      static_cast<int>(weight.shape(1)), sequence_length, false, ane_instance);
+      static_cast<int>(weight.shape(1)) * groups, sequence_length, false,
+      ane_instance, groups);
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
 }
 
@@ -1313,6 +1327,9 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
       throw std::runtime_error(
           error_text(@"ANE procedure bank load failed", error));
     }
+    // Drop the staged bank files now that the program is resident; waiting
+    // for the destructor leaks the directory when the process is killed.
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
 
     auto program =
         std::make_shared<SharedAneProgram>(model, directory, execution_options);

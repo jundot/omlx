@@ -61,6 +61,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
+    "deepseek_ane_prefill_enabled",
+    "deepseek_ane_prefill_sequence_length",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
