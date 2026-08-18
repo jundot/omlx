@@ -397,12 +397,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 20 * 1024**3
         )
-        # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
-        # `getattr` returns None for missing attrs so older settings files keep working.
+        # oMLX uses a larger draft window than dflash-mlx's internal default.
+        # Treat missing/None values as 2048 so older settings files are upgraded too.
         self._draft_window_size = (
-            getattr(model_settings, "dflash_draft_window_size", None)
+            getattr(model_settings, "dflash_draft_window_size", None) or 2048
             if model_settings
-            else None
+            else 2048
         )
         self._draft_sink_size = (
             getattr(model_settings, "dflash_draft_sink_size", None)

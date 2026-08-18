@@ -2462,10 +2462,10 @@ async def update_model_settings(
             request.dflash_ssd_cache_max_bytes
         )
     if "dflash_draft_window_size" in sent:
-        # 0 / None / negative → fall back to dflash-mlx internal default (1024).
+        # 0 / None / negative → fall back to the oMLX default (2048).
         value = request.dflash_draft_window_size
         current_settings.dflash_draft_window_size = (
-            int(value) if value and value > 0 else None
+            int(value) if value and value > 0 else 2048
         )
     if "dflash_draft_sink_size" in sent:
         # Negative is invalid; 0 is a legal sink-size (no sink tokens).
