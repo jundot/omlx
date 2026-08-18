@@ -21690,7 +21690,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "注意力 sink Token 始终保留在窗口中。留空 = dflash 默认值（0）。"
+            "value" : "注意力 sink Token 始终保留在窗口中。空 = dflash 默认（0）。"
           }
         }
       }
@@ -21954,7 +21954,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "草稿模型滑动注意力窗口。留空 = dflash 默认值（2048）。"
+            "value" : "草稿模型滑动注意力窗口。空 = dflash 默认（2048）。"
           }
         }
       }
