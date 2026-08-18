@@ -506,6 +506,10 @@
             logTotalLines: 0,
             logLastUpdated: '',
             logMinLevel: 'TRACE',
+            // Exact-match mode: show only this level instead of "this and
+            // above". Set by modifier-clicking a level button (Cmd on macOS,
+            // Ctrl elsewhere). Null = normal minimum-level filtering.
+            logExactLevel: null,
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -9772,9 +9776,23 @@
             // Log viewer functions
             filteredLogContent() {
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+
+                // Exact mode: only lines at the chosen level. Continuation
+                // lines (tracebacks, multi-line request bodies) carry no level
+                // prefix, so they inherit visibility from the line that owns
+                // them — same rule as the minimum-level path below.
+                if (this.logExactLevel) {
+                    let visible = false;
+                    return this.logContent.split('\n').filter(line => {
+                        const m = line.match(levelRe);
+                        if (m) visible = m[1] === this.logExactLevel;
+                        return visible;
+                    }).join('\n');
+                }
+
                 const minIdx = LEVELS.indexOf(this.logMinLevel);
                 if (minIdx <= 0) return this.logContent;
-                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
                 let visible = true;
                 return this.logContent.split('\n').filter(line => {
                     const m = line.match(levelRe);
@@ -9783,9 +9801,31 @@
                 }).join('\n');
             },
 
+            // Plain click sets the minimum level; Cmd-click (macOS) or
+            // Ctrl-click (elsewhere) toggles exact-match on that level.
+            selectLogLevel(lvl, event) {
+                if (event && (event.metaKey || event.ctrlKey)) {
+                    this.logExactLevel = this.logExactLevel === lvl ? null : lvl;
+                    if (this.logExactLevel) this.logMinLevel = lvl;
+                    return;
+                }
+                this.logExactLevel = null;
+                this.logMinLevel = lvl;
+            },
+
             levelButtonClass(lvl) {
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
                 const idx = LEVELS.indexOf(lvl);
+                // Exact mode: only the pinned level reads as active, so the
+                // "range" styling never implies levels that are filtered out.
+                if (this.logExactLevel) {
+                    // bg-emerald-600 (not -700): only the shades already in the
+                    // compiled tailwind.css render — an uncompiled class leaves
+                    // the button with no background under text-white.
+                    return lvl === this.logExactLevel
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-neutral-100 text-neutral-300';
+                }
                 const minIdx = LEVELS.indexOf(this.logMinLevel);
                 // Levels at or above the minimum are all shown dark so the
                 // included range is obvious; the selected minimum keeps the ring.
