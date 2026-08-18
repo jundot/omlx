@@ -7229,6 +7229,7 @@
             },
             async applyProfileToForm(profile) {
                 const seq = ++this._applySeq;
+                this.profileError = '';
                 try {
                     const r = await fetch(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
@@ -7256,8 +7257,12 @@
                         if (m) m.settings = { ...settings };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to apply profile';
                     }
                 } catch (e) {
+                    this.profileError = String(e);
                     console.error('Failed to apply profile:', e);
                 }
             },

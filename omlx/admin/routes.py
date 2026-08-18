@@ -2962,7 +2962,10 @@ async def apply_model_profile(
     entry = _require_model(model_id)
     is_diffusion_model = _entry_is_diffusion_model(entry)
     sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
-    applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
+    try:
+        applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
     if is_diffusion_model:

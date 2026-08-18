@@ -1158,6 +1158,10 @@ class ModelSettingsManager:
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
+            # Keep persistent profile application consistent with request-time
+            # profile overlays: output-shaping settings win over the speed-only
+            # VLM MTP toggle when the merged settings need logits processors.
+            merged, _ = resolve_vlm_mtp_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:
