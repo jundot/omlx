@@ -1192,7 +1192,7 @@ private struct ExperimentalSection: View {
                                       defaultValue: "MLP on ANE",
                                       comment: "Row label for the Qwen MLP ANE workload fraction"),
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_fraction.sub",
-                                         defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder. 53% is the measured optimum.",
+                                         defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
                                          comment: "Sublabel explaining the Qwen MLP ANE workload fraction")) {
                         Popup(
                             selection: saved(
@@ -1244,7 +1244,7 @@ private struct ExperimentalSection: View {
                                           defaultValue: "GDN on ANE",
                                           comment: "Row label for the Qwen GDN ANE workload fraction"),
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_fraction.sub",
-                                             defaultValue: "GDN projection channels assigned to both ANEs. 50% is the measured optimum.",
+                                             defaultValue: "GDN projection channels assigned to both ANEs; the GPU handles the remainder.",
                                              comment: "Sublabel explaining the Qwen GDN ANE workload fraction")) {
                             Popup(
                                 selection: saved(
