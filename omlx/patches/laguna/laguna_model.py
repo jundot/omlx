@@ -68,15 +68,42 @@ def _make_compiled_expert_combine(scale: float):
     return mx.compile(_combine, shapeless=True)
 
 
+def _make_compiled_expert_combine_residual(scale: float):
+    """Weighted reduction, scale, shared-expert add, and the decoder residual.
+
+    ``residual + (routed * scale + shared)`` is bit-exact against the eager
+    ``h + (routed*scale + shared)`` composed in the decoder layer, because IEEE
+    addition is commutative (the two adds have identical operands).
+    """
+
+    def _combine(
+        y: mx.array, weights: mx.array, shared: mx.array, residual: mx.array
+    ) -> mx.array:
+        routed = mx.sum(y * weights[..., None], axis=-2)
+        return residual + (routed * scale + shared)
+
+    return mx.compile(_combine, shapeless=True)
+
+
 # One compiled weighted-expert combine per routed-scaling value, shared across
 # every sparse block (the real checkpoint uses a single 2.5 factor).
 _COMPILED_COMBINES: dict[float, Any] = {}
+_COMPILED_COMBINES_RESIDUAL: dict[float, Any] = {}
 
 
 def _compiled_combine_for(scale: float):
     combine = _COMPILED_COMBINES.get(scale)
     if combine is None:
         combine = _COMPILED_COMBINES[scale] = _make_compiled_expert_combine(scale)
+    return combine
+
+
+def _compiled_combine_residual_for(scale: float):
+    combine = _COMPILED_COMBINES_RESIDUAL.get(scale)
+    if combine is None:
+        combine = _COMPILED_COMBINES_RESIDUAL[scale] = (
+            _make_compiled_expert_combine_residual(scale)
+        )
     return combine
 
 # DECODE-ONLY routed gate/up fusion (Swift ``DARKBLOOM_FUSED_ROUTED_GATE_UP``):
@@ -463,7 +490,9 @@ class LagunaSparseMoeBlock(nn.Module):
             _swiglu(x_gate, x_up), inds, sorted_indices=False
         ).squeeze(-2)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(
+        self, x: mx.array, residual: mx.array | None = None
+    ) -> mx.array:
         inds, scores = self.gate(x)
         if (
             _FUSED_ROUTED_GATE_UP
@@ -475,13 +504,19 @@ class LagunaSparseMoeBlock(nn.Module):
         else:
             y = self.switch_mlp(x, inds)
         if _COMPILED_FUSIONS:
+            shared = self.shared_expert(x)
+            if residual is not None:
+                return _compiled_combine_residual_for(self.routed_scaling_factor)(
+                    y, scores, shared, residual
+                )
             return _compiled_combine_for(self.routed_scaling_factor)(
-                y, scores, self.shared_expert(x)
+                y, scores, shared
             )
         y = mx.sum(y * scores[..., None], axis=-2)
         if self.routed_scaling_factor != 1.0:
             y = y * self.routed_scaling_factor
-        return y + self.shared_expert(x)
+        moe = y + self.shared_expert(x)
+        return residual + moe if residual is not None else moe
 
 
 class Attention(nn.Module):
@@ -652,8 +687,11 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        mlp_input = self.post_attention_layernorm(h)
+        if isinstance(self.mlp, LagunaSparseMoeBlock):
+            # Fold the decoder residual add into the (compiled) sparse combine.
+            return self.mlp(mlp_input, residual=h)
+        return h + self.mlp(mlp_input)
 
 
 class LagunaModel(nn.Module):

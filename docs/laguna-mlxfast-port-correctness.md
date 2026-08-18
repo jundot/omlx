@@ -26,6 +26,13 @@ submission" commits, mapped below.
 | 95 | `8adb56be-8f8f-4611-8914-8daf052b5f21` (`f8848e0`: compiled top-k normalize; compiled two-output router tail) | `Validate submission 8adb56be…` | ✅ bit-exact (top-k normalize is single-output) / ⛔ NOT bit-exact if compiled (router tail, C1) | n/a | top-k normalize compiled, ON; router tail kept eager (C1) |
 | 96 | `9a37e4dc-b518-446c-a3f0-e4e90a581674` (`b424bc8`: compiled weighted expert combine) | `Validate submission 9a37e4dc…` | ✅ bit-exact (single-output; same reduction order) | +3.96% decode aggregate (with 93–95, 97–98) | compiled, default ON |
 | 97 | `eb76e2b8-de50-44d5-9137-953c6e40d28e` (`4d9eecb`: folded-normalized expert combine, deferred top-k normalize) | `Validate submission eb76e2b8…` | ✅ bit-exact (pinned equivalent: router-normalize + combine ≡ folded) | n/a (no new win; covered by 95+96) | reproduced equivalently, no re-ported code |
+| 98 | `dc738a8d-a8b9-4187-abc3-68f61099fb67` (`7e61f8d`: residual-variant expert combines + decoder residual plumbing) | `Validate submission dc738a8d…` | ✅ bit-exact (IEEE add is commutative: `residual + (routed*scale+shared)` ≡ `h + moe`) | +3.96% decode aggregate (all compiled-fusion submissions) | compiled, default ON |
+
+### C2 — `logits_last_only` head slicing is ULP-divergent (frame divergence)
+
+- **Challenge commit:** `4799830` (`lagunaLastTokenHidden`) — the Laguna migration, not a submission; recorded for completeness.
+- **Optimization:** slice post-norm hidden to the last position before `lm_head` so prefill never computes the `[L-1, vocab]` slab.
+- **Token-exactness note (not a bug):** a `[1,1,H]` head matmul is ULP-divergent from the `[B,L,H]` full matmul (measured ~1.8e-7) — the same matmul-width **frame divergence** the challenge contract documents. The DFlash reference layer tolerates it; the real-checkpoint greedy trajectory is token-identical with and without the slice. oMLX's DFlash target path already implements it (`logits_last_only`), pinned by `test_target_ops_logits_last_only_slices_before_lm_head`.
 
 ## Concern register (token/bit-exactness issues, with challenge commits)
 

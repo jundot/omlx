@@ -1223,3 +1223,18 @@ def test_normalize_then_combine_equals_folded():
     )
     mx.eval(separate, folded)
     assert mx.array_equal(separate, folded)
+
+
+def test_compiled_combine_residual_matches_eager():
+    """The compiled residual combine reproduces the eager h + moe bit-exactly."""
+    lm = _registered_laguna_module()
+    combine = lm._compiled_combine_residual_for(2.5)
+    y = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
+    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
+    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
+    residual = mx.random.normal((1, 1, 64), dtype=mx.float32)
+    out = combine(y, weights, shared, residual)
+    moe = mx.sum(y * weights[..., None], axis=-2) * 2.5 + shared
+    ref = residual + moe
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
