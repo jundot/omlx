@@ -29,6 +29,7 @@ migration `4799830` and are not part of the current model surface).
 | 97 | 2026-07-24 | `eb76e2b8-de50-44d5-9137-953c6e40d28e` | `4d9eecb` — folded-normalized expert combine (deferred top-k) | `90c997ed` | ✅ bit-exact (pinned: router-normalize + combine ≡ folded) | n/a (covered by 95+96) | reproduced equivalently, no re-ported code |
 | 98 | 2026-07-24 | `dc738a8d-a8b9-4187-abc3-68f61099fb67` | `7e61f8d` — residual-variant expert combines | `4b27cc88` | ✅ bit-exact (IEEE add commutative) | +3.96% decode aggregate | compiled, default ON |
 | 99 | 2026-08-02 | `a02330a7-430d-45b1-82f3-9314e115555e` | `018eb60` — compiled fusions re-applied to vendored `Laguna.swift` + `CausalMaskCache` in KVCache | (see 93–98) | ✅ compiled fusions covered by 93–98 / ⛔ CausalMaskCache NOT ported (C3) | n/a | compiled fusions covered; mask cache documented (C3) |
+| 100 | 2026-08-02 | `e23551d8-87aa-4544-962a-32da86f094e2` | `e8ede96` — group-32 affine INT8 re-quantization of attention projections | — | ⛔ NOT bit-exact (LOSSY requant, C4) | removes ~1.25 GB/step weight traffic | NOT ported (C4) |
 
 ## Concern register (token/bit-exactness issues, with challenge commits)
 
@@ -45,6 +46,13 @@ migration `4799830` and are not part of the current model surface).
 - **Challenge commit:** `4799830` (`lagunaLastTokenHidden`) — the Laguna migration, not a submission; recorded for completeness.
 - **Optimization:** slice post-norm hidden to the last position before `lm_head` so prefill never computes the `[L-1, vocab]` slab.
 - **Token-exactness note (not a bug):** a `[1,1,H]` head matmul is ULP-divergent from the `[B,L,H]` full matmul (measured ~1.8e-7) — the same matmul-width **frame divergence** the challenge contract documents. The DFlash reference layer tolerates it; the real-checkpoint greedy trajectory is token-identical with and without the slice. oMLX's DFlash target path already implements it (`logits_last_only`), pinned by `test_target_ops_logits_last_only_slices_before_lm_head`.
+
+### C3 — Causal-mask memo is NOT portable to mlx-lm's rotating cache
+
+- **Submission / challenge commit:** `a02330a7-430d-45b1-82f3-9314e115555e` / `018eb60` (`CausalMaskCache` in `MLXLMCommon/KVCache.swift`).
+- **Optimization:** memoize the sliding-window causal mask keyed on `(n, offset, windowSize)` — the Swift asserts a saturated rotating ring rebuilds a byte-identical mask every decode step, so the memo skips the per-step rebuild (two host→device index uploads + GreaterEqual/Add/Less/And; 5× per DFlash drafter round).
+- **Token-exactness issue (why NOT ported):** mlx-lm's `RotatingKVCache.make_mask` is NOT constant across saturated decode steps — the rolled window mask advances with the ring's wrap state (verified on MLX 0.32: two consecutive saturated-ring decode steps produce different masks). A memo keyed on `(n, idx, window)` would return a STALE mask → wrong attention → token corruption. Additionally, oMLX's stock Laguna config sizes the ring to the window (`make_cache` → `RotatingKVCache(max_size=sliding_window)`), so the decode mask is `None` and there is nothing to memoize at all.
+- **Status:** documented, not ported. The compiled-fusions half of the same submission is already covered by rows 93–98.
 
 ### C4 — Group-32 affine INT8 attention re-quantization is LOSSY
 
