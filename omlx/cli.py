@@ -1416,6 +1416,15 @@ Example directory structure:
     # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
     # Non-launch commands keep the previous strictness by rejecting unknowns.
     args, extra_args = parser.parse_known_args()
+    # argparse's parse_known_args doesn't always consume the `--` separator
+    # itself (only when needed to resolve its own positionals), so it can
+    # leak into extra_args verbatim. Left in place, that literal "--" is
+    # forwarded to the underlying tool binary, which (for Commander.js-based
+    # CLIs like Claude Code) treats it as its own end-of-options marker —
+    # turning everything after it into positional prompt text instead of
+    # flags. Strip a single leading "--" before forwarding.
+    if extra_args and extra_args[0] == "--":
+        extra_args = extra_args[1:]
 
     if args.command == "launch":
         launch_command(args, extra_args=extra_args)
