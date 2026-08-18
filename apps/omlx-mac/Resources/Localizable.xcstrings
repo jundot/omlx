@@ -21678,19 +21678,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Attention-sink tokens always kept in the window. Empty = oMLX default (0)."
+            "value" : "Attention-sink tokens always kept in the window. Empty = dflash default (0)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение oMLX по умолчанию (0)."
+            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение DFlash по умолчанию (0)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "注意力 sink Token 始终保留在窗口中。留空 = oMLX 默认值（0）。"
+            "value" : "注意力 sink Token 始终保留在窗口中。留空 = dflash 默认值（0）。"
           }
         }
       }
@@ -21942,19 +21942,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Draft model sliding-attention window. Empty = oMLX default (2048)."
+            "value" : "Draft model sliding-attention window. Empty = dflash default (2048)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sliding-attention-окно draft-модели. Пусто = значение oMLX по умолчанию (2048)."
+            "value" : "Sliding-attention-окно draft-модели. Пусто = значение DFlash по умолчанию (2048)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "草稿模型滑动注意力窗口。留空 = oMLX 默认值（2048）。"
+            "value" : "草稿模型滑动注意力窗口。留空 = dflash 默认值（2048）。"
           }
         }
       }

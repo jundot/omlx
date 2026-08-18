@@ -1440,7 +1440,7 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Draft Window Size",
                                   comment: "Row label for the DFlash draft sliding-attention window size field"),
                     sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
-                                     defaultValue: "Draft model sliding-attention window. Empty = oMLX default (2048).",
+                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (2048).",
                                      comment: "Sublabel for the DFlash draft window size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
                               placeholder: "2048", mono: true, width: 110)
@@ -1449,7 +1449,7 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Draft Sink Size",
                                   comment: "Row label for the DFlash attention-sink tokens field"),
                     sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = oMLX default (0).",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
                                      comment: "Sublabel for the DFlash draft sink size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
                               placeholder: "0", mono: true, width: 110)
