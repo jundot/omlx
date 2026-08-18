@@ -223,3 +223,4 @@ class ResponseObject(BaseModel):
     metadata: Optional[Dict[str, str]] = Field(default_factory=dict)
     truncation: Optional[str] = None
     error: Optional[Dict[str, Any]] = None
+    incomplete_details: Optional[Dict[str, str]] = None

@@ -6303,9 +6303,13 @@ async def create_response(
                 cached_tokens=output.cached_tokens,
             )
 
+            # Surface max_output_tokens truncation so clients can tell an
+            # incomplete turn from a natural stop. The Responses API has no
+            # finish_reason field; status + incomplete_details is the signal.
+            truncated = getattr(output, "finish_reason", None) == "length"
             response_obj = ResponseObject(
                 model=request.model,
-                status="completed",
+                status="incomplete" if truncated else "completed",
                 output=output_items,
                 usage=usage,
                 tools=request.tools or [],
@@ -6314,6 +6318,7 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
+                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
             )
 
             # Store response
@@ -7015,13 +7020,16 @@ async def stream_responses_api(
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
-    # 13. response.completed — MUST always be sent
+    # 13. response.completed — MUST always be sent. Surface max_output_tokens
+    # truncation as status="incomplete" so clients see the turn was cut off
+    # (the Responses API has no finish_reason field).
+    truncated = getattr(last_output, "finish_reason", None) == "length"
     final_response = {
         "id": response_id,
         "object": "response",
         "created_at": initial_response.created_at,
         "model": request.model,
-        "status": "completed",
+        "status": "incomplete" if truncated else "completed",
         "output": output_items,
         "usage": usage_data,
         "tool_choice": request.tool_choice or "auto",
@@ -7034,6 +7042,8 @@ async def stream_responses_api(
         "top_p": request.top_p,
         "max_output_tokens": request.max_output_tokens,
     }
+    if truncated:
+        final_response["incomplete_details"] = {"reason": "max_output_tokens"}
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id
 
