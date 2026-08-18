@@ -397,12 +397,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 20 * 1024**3
         )
-        # oMLX uses a larger draft window than dflash-mlx's internal default.
-        # Treat missing/None values as 2048 so older settings files are upgraded too.
         self._draft_window_size = (
-            getattr(model_settings, "dflash_draft_window_size", None) or 2048
+            getattr(model_settings, "dflash_draft_window_size", None)
             if model_settings
-            else 2048
+            else None
         )
         draft_sink_size = (
             getattr(model_settings, "dflash_draft_sink_size", None)
@@ -496,6 +494,31 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         return build_runtime_context(cfg)
 
+    @staticmethod
+    def _checkpoint_draft_window_size(draft_meta: Any) -> int | None:
+        """Return a positive ``config.sliding_window`` from draft metadata."""
+        if not isinstance(draft_meta, dict):
+            return None
+        config = draft_meta.get("config")
+        value = (
+            config.get("sliding_window")
+            if isinstance(config, dict)
+            else getattr(config, "sliding_window", None)
+        )
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            window_size = int(value)
+        except (TypeError, ValueError):
+            return None
+        return window_size if window_size > 0 else None
+
+    def _resolve_draft_window_size(self, draft_meta: Any) -> int | None:
+        """Keep an explicit setting; otherwise use the checkpoint config."""
+        if self._draft_window_size is not None:
+            return self._draft_window_size
+        return self._checkpoint_draft_window_size(draft_meta)
+
     async def start(self) -> None:
         if self._loaded:
             return
@@ -587,10 +610,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 target_ops=target_bundle.target_ops,
             )
             draft_backend = EagerDraftBackend()
-            return target_bundle, draft, draft_backend
+            return target_bundle, draft, draft_backend, draft_meta
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
-        target_bundle, self._draft_model, self._draft_backend = result
+        target_bundle, self._draft_model, self._draft_backend, draft_meta = result
+        self._draft_window_size = self._resolve_draft_window_size(draft_meta)
+        runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model
         self._tokenizer_obj = target_bundle.tokenizer

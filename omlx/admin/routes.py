@@ -2462,10 +2462,10 @@ async def update_model_settings(
             request.dflash_ssd_cache_max_bytes
         )
     if "dflash_draft_window_size" in sent:
-        # 0 / None / negative → fall back to the oMLX default (2048).
+        # 0 / None / negative → use config.sliding_window when present.
         value = request.dflash_draft_window_size
         current_settings.dflash_draft_window_size = (
-            int(value) if value and value > 0 else 2048
+            int(value) if value and value > 0 else None
         )
     if "dflash_draft_sink_size" in sent:
         # Negative / None → oMLX default 0 (no sink tokens).

@@ -26,8 +26,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
-        # oMLX overrides dflash-mlx's draft-window default for long contexts.
-        assert settings.dflash_draft_window_size == 2048
+        assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size == 0
         assert settings.dflash_block_size is None
         assert settings.dflash_verify_mode is None
@@ -55,7 +54,7 @@ class TestDFlashModelSettings:
         assert "dflash_draft_quant_activation_bits" not in d
         assert "dflash_draft_quant_group_size" not in d
         assert "dflash_max_ctx" not in d
-        assert d["dflash_draft_window_size"] == 2048
+        assert "dflash_draft_window_size" not in d
         assert d["dflash_draft_sink_size"] == 0
         # Remaining tuning knobs default to None → omitted from on-disk JSON.
         assert "dflash_block_size" not in d
@@ -100,7 +99,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
-        assert settings.dflash_draft_window_size == 2048
+        assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size == 0
 
     def test_from_dict_ignores_removed_speculative_tokens(self):
@@ -466,7 +465,7 @@ class TestDFlashEngineInit:
                     captured["bound_target"] = target_model
                     captured["bound_target_ops"] = target_ops
 
-            return FakeDraft(), {}
+            return FakeDraft(), {"config": {"sliding_window": 2048}}
 
         monkeypatch.setattr(
             dflash_loading, "load_target_bundle", fake_load_target_bundle
@@ -513,6 +512,8 @@ class TestDFlashEngineInit:
             assert captured["fused_target"] is engine._target_model
             assert captured["bound_target"] is engine._target_model
             assert captured["bound_target_ops"] is engine._target_ops
+            assert engine._draft_window_size == 2048
+            assert engine._runtime_context.runtime.draft_window_size == 2048
         finally:
             await engine.stop()
 
@@ -628,7 +629,7 @@ class TestDFlashEngineInit:
             model_name="test-model",
             draft_model_path="test-draft",
         )
-        assert engine._draft_window_size == 2048
+        assert engine._draft_window_size is None
         assert engine._draft_sink_size == 0
         assert engine._block_size is None
         assert engine._verify_mode is None
@@ -655,8 +656,8 @@ class TestDFlashEngineInit:
         assert engine._block_size == 5
         assert engine._verify_mode == "adaptive"
 
-    def test_none_runtime_settings_use_omlx_defaults(self):
-        """Explicit nulls from an older settings file upgrade to oMLX defaults."""
+    def test_none_runtime_settings_remain_unset_before_checkpoint_load(self):
+        """Explicit null window remains unset until draft metadata is loaded."""
         from omlx.engine.dflash import DFlashEngine
 
         engine = DFlashEngine(
@@ -667,8 +668,36 @@ class TestDFlashEngineInit:
                 dflash_draft_sink_size=None,
             ),
         )
-        assert engine._draft_window_size == 2048
+        assert engine._draft_window_size is None
         assert engine._draft_sink_size == 0
+
+    @pytest.mark.parametrize(
+        ("draft_meta", "expected"),
+        [
+            ({"config": {"sliding_window": 2048}}, 2048),
+            ({"config": SimpleNamespace(sliding_window=4096)}, 4096),
+            ({"config": {"sliding_window": None}}, None),
+            ({"config": {"sliding_window": 0}}, None),
+            ({"config": {"sliding_window": "invalid"}}, None),
+            ({"config": {}}, None),
+            ({}, None),
+        ],
+    )
+    def test_checkpoint_draft_window_size(self, draft_meta, expected):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._checkpoint_draft_window_size(draft_meta) == expected
+
+    def test_explicit_window_overrides_checkpoint_config(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_draft_window_size=512),
+        )
+        draft_meta = {"config": {"sliding_window": 2048}}
+        assert engine._resolve_draft_window_size(draft_meta) == 512
 
     def test_build_runtime_context_passes_knobs(self):
         """The new kwargs reach dflash-mlx and end up in RuntimeContext.runtime."""
@@ -692,8 +721,8 @@ class TestDFlashEngineInit:
         assert runtime.draft_sink_size == 16
         assert runtime.verify_mode == "dflash"
 
-    def test_build_runtime_context_defaults_to_omlx_window(self):
-        """No settings → oMLX uses window 2048 and sink size 0."""
+    def test_build_runtime_context_leaves_window_unset(self):
+        """No setting leaves the window unset; checkpoint resolution happens at load."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -705,7 +734,7 @@ class TestDFlashEngineInit:
         )
         ctx = engine._build_runtime_context()
         runtime = ctx.runtime
-        assert runtime.draft_window_size == 2048
+        assert engine._draft_window_size is None
         assert runtime.draft_sink_size == 0
         assert runtime.verify_mode == "adaptive"
 

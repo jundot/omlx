@@ -312,7 +312,7 @@ final class ModelSettingsScreenVM {
     var dflashDraftQuantGroupSize: String = ""
     var dflashMaxCtx: String = ""
     var dflashVerifyMode: String = ""
-    var dflashDraftWindowSize: String = "2048"
+    var dflashDraftWindowSize: String = ""
     var dflashDraftSinkSize: String = "0"
     var dflashBlockSize: String = ""
     var dflashInMemoryCache: Bool = false
@@ -537,7 +537,7 @@ final class ModelSettingsScreenVM {
                 self.dflashDraftQuantGroupSize = s?.dflashDraftQuantGroupSize.map(String.init) ?? ""
                 self.dflashMaxCtx = s?.dflashMaxCtx.map(String.init) ?? ""
                 self.dflashVerifyMode = s?.dflashVerifyMode ?? ""
-                self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? "2048"
+                self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
                 self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? "0"
                 self.dflashBlockSize = s?.dflashBlockSize.map(String.init) ?? ""
                 self.dflashInMemoryCache = s?.dflashInMemoryCache ?? false
