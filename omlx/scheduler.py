@@ -22,7 +22,7 @@ import threading
 import time
 from array import array
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -64,6 +64,23 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
     supports_vlm_mtp_processing,
+)
+from .speculative.semantic_hints import (
+    SemanticHintCandidate,
+    SemanticHintConfig,
+    SemanticHintRequestContext,
+    render_live_target_hint,
+    start_semantic_hint_request_context,
+)
+from .speculative.semantic_verification import (
+    PrimedStateMachine,
+    SemanticVerificationError,
+    VerifiedContinuation,
+    assert_dense_kv_offset,
+    cold_recompute_dense_kv_cache,
+    dense_kv_offsets,
+    trim_dense_kv_cache_exact,
+    verify_greedy_suffix,
 )
 from .speculative.vlm_mtp import (
     VLMMTPDrafter,
@@ -233,6 +250,40 @@ class _VLMMTPResponse:
 
 
 @dataclass
+class _SemanticHintDecodeState:
+    """One-request target-derived output queue before public handback."""
+
+    request: Request
+    continuation: VerifiedContinuation
+    baseline_cache: list[Any]
+    sampler: Callable[[Any], Any]
+    state_machine: Any
+    logits_processors: list[Any]
+    matcher_state: Any
+    emitted: int = 0
+    finish_cache_prepared: bool = False
+
+    @property
+    def drained(self) -> bool:
+        return self.emitted >= len(self.continuation.token_ids)
+
+
+@dataclass
+class _SemanticHintResponse:
+    """GenerationBatch.Response-compatible target-derived token."""
+
+    uid: int
+    token: int
+    logprobs: Any
+    finish_reason: str | None
+    current_state: str | None
+    match_sequence: list[int] | None
+    prompt_cache: Any = None
+    all_tokens: Any = None
+    _semantic_state: _SemanticHintDecodeState | None = None
+
+
+@dataclass
 class _StopOutputState:
     """Request-local output held while it can still match a stop string."""
 
@@ -265,6 +316,13 @@ def _env_int(name: str, default: int = 0) -> int:
     except ValueError:
         logger.warning("Ignoring invalid integer env %s=%r", name, value)
         return default
+
+
+def _semantic_config_value(config: Any, name: str) -> Any:
+    """Read one runtime model-config field from a mapping or object."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
 
 
 def _collect_mx_arrays(value, out: list[mx.array]) -> None:
@@ -2044,6 +2102,13 @@ class Scheduler:
         # Per-request settings snapshot for vlm_mtp routing (block size etc.).
         # Injected by VLMBatchedEngine.set_vlm_mtp_drafter alongside the drafter.
         self._vlm_mtp_draft_block_size: int | None = None
+
+        # Bounded semantic-hint verification. Negative UIDs live far below
+        # the VLM-MTP range so the two private one-request lanes cannot collide.
+        self._semantic_hint_active: dict[int, _SemanticHintDecodeState] = {}
+        self._semantic_hint_next_uid: int = -1_000_000_000
+        self._semantic_hint_cache_layout_supported: bool | None = None
+        self._semantic_hint_module_tree_excluded: bool | None = None
 
         # Phase timing instrumentation for cache-on overhead diagnostics.
         # Accumulated wall-time per phase + invocation count, dumped at request
@@ -4517,7 +4582,9 @@ class Scheduler:
         stalled_for = now - self._memory_admission_blocked_since
         self.waiting.popleft()
         self._release_paged_cache_for_request(request_id)
-        self.requests.pop(request_id, None)
+        removed = self.requests.pop(request_id, None)
+        if removed is not None:
+            self._cancel_semantic_hint(removed)
         self._clear_request_admission_bookkeeping(request_id)
         get_prefill_tracker().remove(request_id)
         self._clear_memory_admission_blocker(request_id)
@@ -4581,7 +4648,9 @@ class Scheduler:
         stalled_for = now - self._store_cache_admission_blocked_since
         self.waiting.popleft()
         self._release_paged_cache_for_request(request_id)
-        self.requests.pop(request_id, None)
+        removed = self.requests.pop(request_id, None)
+        if removed is not None:
+            self._cancel_semantic_hint(removed)
         self._clear_request_admission_bookkeeping(request_id)
         get_prefill_tracker().remove(request_id)
 
@@ -5372,6 +5441,24 @@ class Scheduler:
         if request.sampling_params.seed is not None:
             mx.random.seed(request.sampling_params.seed)
 
+        per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
+        # This helper is also exercised unbound against lightweight scheduler
+        # fixtures. Semantic hints are an optional sidecar, so a fixture that
+        # does not provide the sidecar hook follows the ordinary prefilled
+        # request path. On a real Scheduler, invoke the hook unchanged and let
+        # any error from it propagate rather than masking scheduler failures.
+        semantic_hint_activator = getattr(self, "_try_activate_semantic_hint", None)
+        if callable(semantic_hint_activator) and semantic_hint_activator(
+            request,
+            state.cache,
+            state.last_token,
+            state.sampler,
+            state.sm,
+            per_row_lps,
+            scheduled,
+        ):
+            return
+
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
         # routing only existed on the non-chunked prefill exit -- so any prompt
@@ -5409,7 +5496,6 @@ class Scheduler:
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
-        per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
         # ops; keep them on the engine stream so the next decode step's eval
         # graph stays single-stream (#2235, see _remove_uid_from_active_batch).
@@ -5510,7 +5596,9 @@ class Scheduler:
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
                 self._drop_boundary_snapshots_for_request(rid)
-                self.requests.pop(rid, None)
+                removed = self.requests.pop(rid, None)
+                if removed is not None:
+                    self._cancel_semantic_hint(removed)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
                 _sync_and_clear_cache(self._stream)
@@ -5534,6 +5622,7 @@ class Scheduler:
                 # non-memory errors) do we emit the client-facing error.
                 if self._requeue_or_fail_prefill(request, e):
                     continue
+                self._cancel_semantic_hint(request)
                 # Surface the failure to the engine. Without this, the
                 # request is silently dropped and the client hangs.
                 rejected.append(
@@ -8458,6 +8547,539 @@ class Scheduler:
                 draft_block_size,
             )
 
+    def _model_has_semantic_hint_exclusion_marker(self) -> bool:
+        """Detect model state outside the proven dense full-attention lane."""
+        seen: set[int] = set()
+        pending = [self.model]
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            if any(
+                bool(getattr(current, marker, False))
+                for marker in (
+                    "_omlx_mtp_decode_enabled",
+                    "_omlx_mtp_chain",
+                    "_uses_mrope",
+                )
+            ):
+                return True
+            for config_name in ("config", "args"):
+                config = getattr(current, config_name, None)
+                if config is None:
+                    continue
+                model_type = str(
+                    _semantic_config_value(config, "model_type") or ""
+                ).lower()
+                if any(
+                    marker in model_type
+                    for marker in ("hybrid", "mamba", "recurrent", "rwkv", "ssm")
+                ):
+                    return True
+                if _semantic_config_value(config, "sliding_window") not in (
+                    None,
+                    False,
+                    0,
+                ):
+                    return True
+                layer_types = _semantic_config_value(config, "layer_types")
+                if layer_types and any(
+                    str(layer_type).lower() != "full_attention"
+                    for layer_type in layer_types
+                ):
+                    return True
+                if _semantic_config_value(
+                    config, "quantization"
+                ) or _semantic_config_value(config, "quantization_config"):
+                    return True
+            for name in ("_language_model", "language_model", "model"):
+                child = getattr(current, name, None)
+                if child is not None and child is not current:
+                    pending.append(child)
+
+        # Standard mlx-lm affine quantization may no longer be represented in
+        # the runtime config. Inspect the loaded module tree when available.
+        leaf_modules = getattr(self.model, "leaf_modules", None)
+        if callable(leaf_modules):
+            if self._semantic_hint_module_tree_excluded is None:
+                try:
+                    import mlx.nn as nn
+                    from mlx.utils import tree_flatten
+
+                    self._semantic_hint_module_tree_excluded = any(
+                        isinstance(module, nn.QuantizedLinear)
+                        for _, module in tree_flatten(
+                            leaf_modules(), is_leaf=nn.Module.is_module
+                        )
+                    )
+                except Exception:
+                    # The lane explicitly excludes unproven quantized models.
+                    # If a loaded module tree cannot be inspected, fail closed.
+                    self._semantic_hint_module_tree_excluded = True
+            return self._semantic_hint_module_tree_excluded
+        return False
+
+    @property
+    def supports_semantic_hint_verification(self) -> bool:
+        """Static capability gate for the bounded regular BatchedEngine lane."""
+        config = SemanticHintConfig.from_env()
+        if not config.enabled or not config.is_local:
+            return False
+        if self.config.max_num_seqs != 1 or self.config.completion_batch_size != 1:
+            return False
+        if not callable(getattr(self.tokenizer, "apply_chat_template", None)):
+            return False
+        try:
+            model_excluded = self._model_has_semantic_hint_exclusion_marker()
+        except Exception:
+            return False
+        if (
+            self._turboquant_kv_bits is not None
+            or self._specprefill_draft_model is not None
+            or self._vlm_mtp_drafter is not None
+            or model_excluded
+        ):
+            return False
+        if self._semantic_hint_cache_layout_supported is None:
+            try:
+                cache = make_prompt_cache(self.model)
+                self._semantic_hint_cache_layout_supported = bool(cache) and all(
+                    type(layer) is _MLXKVCache for layer in cache
+                )
+            except Exception:
+                self._semantic_hint_cache_layout_supported = False
+        return self._semantic_hint_cache_layout_supported
+
+    @staticmethod
+    def _cancel_semantic_hint(request: Request) -> None:
+        request.semantic_hint_candidate = None
+        context = getattr(request, "semantic_hint_context", None)
+        if context is not None:
+            with suppress(Exception):
+                context.cancel()
+            request.semantic_hint_context = None
+
+    def _semantic_hint_candidate_eligible(
+        self,
+        request: Request,
+        cache: list[Any] | None,
+        tokens_to_process: list[int],
+        logits_processors: list[Any],
+    ) -> bool:
+        """Comprehensive call-free gate evaluated after scheduler admission."""
+        candidate = getattr(request, "semantic_hint_candidate", None)
+        if not isinstance(candidate, SemanticHintCandidate):
+            return False
+        if not self.supports_semantic_hint_verification:
+            return False
+        if self._num_admitted_requests() != 0:
+            return False
+
+        params = request.sampling_params
+        prompt = request.prompt_token_ids
+        if (
+            not prompt
+            or not tokens_to_process
+            or tokens_to_process[-1] != prompt[-1]
+            or len(prompt) > candidate.config.max_prompt_tokens
+        ):
+            return False
+        if (
+            params.temperature != 0
+            or params.max_tokens <= 0
+            or params.xtc_probability != 0
+            or params.repetition_penalty != 1
+            or params.presence_penalty != 0
+            or params.frequency_penalty != 0
+            or params.thinking_budget is not None
+            or params.compiled_grammar is not None
+            or logits_processors
+        ):
+            return False
+        if (
+            request.images
+            or request.videos
+            or request.vlm_inputs_embeds is not None
+            or request.specprefill_indices is not None
+            or getattr(request, "_specprefill_enabled", False)
+        ):
+            return False
+        if not candidate.config.enabled or not candidate.config.is_local:
+            return False
+
+        expected_prefix = len(prompt) - len(tokens_to_process)
+        if expected_prefix < 0:
+            return False
+        if cache is not None:
+            try:
+                offsets = dense_kv_offsets(cache)
+            except SemanticVerificationError:
+                return False
+            if any(offset != expected_prefix for offset in offsets):
+                return False
+        elif expected_prefix != 0:
+            return False
+        return True
+
+    def _maybe_start_semantic_hint(
+        self,
+        request: Request,
+        cache: list[Any] | None,
+        tokens_to_process: list[int],
+        logits_processors: list[Any],
+    ) -> None:
+        """Launch the sidecar only after every call-free admission gate passes."""
+        candidate = getattr(request, "semantic_hint_candidate", None)
+        if not self._semantic_hint_candidate_eligible(
+            request, cache, tokens_to_process, logits_processors
+        ):
+            self._cancel_semantic_hint(request)
+            return
+        assert isinstance(candidate, SemanticHintCandidate)
+        try:
+            request.semantic_hint_context = start_semantic_hint_request_context(
+                candidate
+            )
+        except Exception:
+            request.semantic_hint_context = None
+        finally:
+            request.semantic_hint_candidate = None
+
+    def _semantic_hint_request_eligible(
+        self,
+        request: Request,
+        cache: list[Any] | None,
+        last_token: list[int],
+        logits_processors: list[Any],
+    ) -> bool:
+        params = request.sampling_params
+        context = request.semantic_hint_context
+        if not isinstance(context, SemanticHintRequestContext):
+            return False
+        if not self.supports_semantic_hint_verification:
+            return False
+        if (
+            cache is None
+            or len(last_token) != 1
+            or not request.prompt_token_ids
+            or last_token[0] != request.prompt_token_ids[-1]
+            or len(request.prompt_token_ids) > context.config.max_prompt_tokens
+        ):
+            return False
+        if (
+            params.temperature != 0
+            or params.max_tokens <= 0
+            or params.xtc_probability != 0
+            or params.repetition_penalty != 1
+            or params.presence_penalty != 0
+            or params.frequency_penalty != 0
+            or params.thinking_budget is not None
+            or params.compiled_grammar is not None
+            or logits_processors
+        ):
+            return False
+        if (
+            request.images
+            or request.videos
+            or request.vlm_inputs_embeds is not None
+            or request.specprefill_indices is not None
+            or getattr(request, "_specprefill_enabled", False)
+        ):
+            return False
+        try:
+            assert_dense_kv_offset(cache, len(request.prompt_token_ids) - 1)
+        except SemanticVerificationError:
+            return False
+        return True
+
+    def _try_activate_semantic_hint(
+        self,
+        request: Request,
+        cache: list[Any] | None,
+        last_token: list[int],
+        sampler: Callable[[Any], Any],
+        state_machine: Any,
+        logits_processors: list[Any],
+        scheduled: list[Request],
+    ) -> bool:
+        """Poll once after prefill and stand up an isolated verified queue."""
+        context = getattr(request, "semantic_hint_context", None)
+        if not self._semantic_hint_request_eligible(
+            request, cache, last_token, logits_processors
+        ):
+            self._cancel_semantic_hint(request)
+            return False
+        if not isinstance(context, SemanticHintRequestContext) or cache is None:
+            self._cancel_semantic_hint(request)
+            return False
+
+        try:
+            hint = context.poll_once()
+            if hint is None:
+                return False
+            rendered = render_live_target_hint(
+                context=context,
+                hint=hint,
+                tokenizer=self.tokenizer,
+                live_prompt_token_ids=request.prompt_token_ids,
+            )
+            if len(rendered.suffix_token_ids) > context.config.max_suffix_tokens:
+                raise SemanticVerificationError("semantic suffix exceeds token bound")
+            continuation = verify_greedy_suffix(
+                model=self.model,
+                baseline_cache=cache,
+                prompt_token_ids=request.prompt_token_ids,
+                suffix_token_ids=rendered.suffix_token_ids,
+                stream=self._stream,
+            )
+            state = _SemanticHintDecodeState(
+                request=request,
+                continuation=continuation,
+                baseline_cache=cache,
+                sampler=sampler,
+                state_machine=state_machine,
+                logits_processors=list(logits_processors),
+                matcher_state=state_machine.make_state(),
+            )
+        except Exception as exc:
+            # Verification owns a detached cache, so the ordinary prefill
+            # cache remains untouched and can be inserted immediately.
+            logger.info(
+                "OoO-Spec hint dropped for %s before live mutation (%s)",
+                request.request_id,
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            self._cancel_semantic_hint(request)
+
+        uid = self._semantic_hint_next_uid
+        self._semantic_hint_next_uid -= 1
+        request_id = request.request_id
+        previous_request_state = (
+            request.batch_uid,
+            request.status,
+            request.generation_started_at,
+            request.last_activity_at,
+        )
+        counted_prompt = False
+        try:
+            self._semantic_hint_active[uid] = state
+            self.request_id_to_uid[request_id] = uid
+            self.uid_to_request_id[uid] = request_id
+            now = time.monotonic()
+            request.batch_uid = uid
+            request.status = RequestStatus.RUNNING
+            request.generation_started_at = now
+            request.last_activity_at = now
+            self.running[request_id] = request
+            scheduled.append(request)
+            self.total_prompt_tokens += request.num_prompt_tokens
+            counted_prompt = True
+            logger.info(
+                "OoO-Spec target queue active for %s: accepted=%d queued=%d",
+                request_id,
+                continuation.accepted_tokens,
+                len(continuation.token_ids),
+            )
+            return True
+        except Exception as exc:
+            self._semantic_hint_active.pop(uid, None)
+            if self.request_id_to_uid.get(request_id) == uid:
+                self.request_id_to_uid.pop(request_id, None)
+            self.uid_to_request_id.pop(uid, None)
+            if self.running.get(request_id) is request:
+                self.running.pop(request_id, None)
+            for index, scheduled_request in enumerate(scheduled):
+                if scheduled_request is request:
+                    del scheduled[index]
+                    break
+            if counted_prompt:
+                self.total_prompt_tokens -= request.num_prompt_tokens
+            (
+                request.batch_uid,
+                request.status,
+                request.generation_started_at,
+                request.last_activity_at,
+            ) = previous_request_state
+            logger.warning(
+                "OoO-Spec activation rolled back for %s (%s)",
+                request_id,
+                type(exc).__name__,
+            )
+            return False
+
+    def _step_semantic_hints(self) -> list[_SemanticHintResponse]:
+        """Expose exactly one target-derived token per active request/step."""
+        responses: list[_SemanticHintResponse] = []
+        for uid, state in list(self._semantic_hint_active.items()):
+            if state.drained:
+                continue
+            token = state.continuation.token_ids[state.emitted]
+            logprobs = state.continuation.logprobs[state.emitted]
+            state.emitted += 1
+            finish_reason = (
+                "length"
+                if state.emitted >= state.request.sampling_params.max_tokens
+                else None
+            )
+            state.matcher_state, match_sequence, current_state = (
+                state.state_machine.match(state.matcher_state, token)
+            )
+            if match_sequence is not None and current_state is None:
+                finish_reason = "stop"
+            responses.append(
+                _SemanticHintResponse(
+                    uid=uid,
+                    token=token,
+                    logprobs=logprobs,
+                    finish_reason=finish_reason,
+                    current_state=current_state,
+                    match_sequence=match_sequence,
+                    _semantic_state=state,
+                )
+            )
+        return responses
+
+    def _prepare_semantic_finish_cache(self, response: _SemanticHintResponse) -> None:
+        """Trim an unexposed queue tail, cold-replaying if exact trim fails."""
+        state = response._semantic_state
+        if state is None or state.finish_cache_prepared:
+            return
+        prompt = list(state.request.prompt_token_ids or ())
+        exposed = list(state.continuation.token_ids[: state.emitted])
+        expected_before = len(prompt) + len(state.continuation.token_ids)
+        unexposed = len(state.continuation.token_ids) - state.emitted
+        cache = state.continuation.cache
+        try:
+            trim_dense_kv_cache_exact(
+                cache,
+                unexposed,
+                expected_before=expected_before,
+            )
+        except SemanticVerificationError:
+            logger.warning(
+                "OoO-Spec finish trim failed for %s; cold-replaying %d tokens",
+                state.request.request_id,
+                len(prompt) + len(exposed),
+            )
+            cache = cold_recompute_dense_kv_cache(
+                model=self.model,
+                baseline_cache=state.baseline_cache,
+                baseline_offset=len(prompt) - 1,
+                token_ids=[prompt[-1], *exposed],
+                stream=self._stream,
+            )
+            state.continuation = VerifiedContinuation(
+                cache=cache,
+                token_ids=state.continuation.token_ids,
+                logprobs=state.continuation.logprobs,
+                accepted_tokens=state.continuation.accepted_tokens,
+            )
+        assert_dense_kv_offset(cache, len(prompt) + len(exposed))
+        # Semantic rows use private negative UIDs and therefore have no public
+        # GenerationBatch row from which parser/text-fallback termination can
+        # extract cache. Always attach the already-trimmed target cache here so
+        # ordinary completion storage receives the exact exposed prefix.
+        response.prompt_cache = cache
+        response.all_tokens = [*prompt, *exposed]
+        state.finish_cache_prepared = True
+
+    def _handoff_semantic_hint(self, uid: int, state: _SemanticHintDecodeState) -> None:
+        """Trim/replay one token into public BatchGenerator after queue drain."""
+        request = state.request
+        prompt = list(request.prompt_token_ids or ())
+        queue = list(state.continuation.token_ids)
+        if not queue or state.emitted != len(queue):
+            raise SemanticVerificationError("semantic handback queue is not drained")
+        replay_token = queue[-1]
+        all_tokens = [*prompt, *queue[:-1]]
+        remaining = request.sampling_params.max_tokens - state.emitted
+        if remaining <= 0:
+            raise SemanticVerificationError("semantic handback exceeded length limit")
+
+        cache = state.continuation.cache
+        try:
+            trim_dense_kv_cache_exact(
+                cache,
+                1,
+                expected_before=len(prompt) + len(queue),
+            )
+        except SemanticVerificationError:
+            logger.warning(
+                "OoO-Spec handback trim failed for %s; cold-replaying baseline",
+                request.request_id,
+            )
+            cache = cold_recompute_dense_kv_cache(
+                model=self.model,
+                baseline_cache=state.baseline_cache,
+                baseline_offset=len(prompt) - 1,
+                token_ids=[prompt[-1], *queue[:-1]],
+                stream=self._stream,
+            )
+        assert_dense_kv_offset(cache, len(all_tokens))
+        primed_sm = PrimedStateMachine(state.state_machine, state.matcher_state)
+
+        def insert(target_cache: list[Any]) -> list[int]:
+            generator = self.batch_generator
+            if generator is None:
+                raise SemanticVerificationError("public BatchGenerator is unavailable")
+            with mx.stream(self._stream):
+                return list(
+                    generator.insert(
+                        [[replay_token]],
+                        max_tokens=[remaining],
+                        caches=[target_cache],
+                        all_tokens=[all_tokens],
+                        samplers=[state.sampler],
+                        logits_processors=[state.logits_processors],
+                        state_machines=[primed_sm],
+                    )
+                )
+
+        try:
+            uids = insert(cache)
+        except Exception:
+            # A failed insert may have partially mutated BatchGenerator or its
+            # cache argument. Batch-one ownership lets us discard it and
+            # rebuild the ordinary serial state from tokens.
+            _unregister_uid_rows_for_model(self.model)
+            self.batch_generator = self._create_batch_generator(request.sampling_params)
+            cache = cold_recompute_dense_kv_cache(
+                model=self.model,
+                baseline_cache=state.baseline_cache,
+                baseline_offset=len(prompt) - 1,
+                token_ids=[prompt[-1], *queue[:-1]],
+                stream=self._stream,
+            )
+            uids = insert(cache)
+        if len(uids) != 1:
+            raise SemanticVerificationError("public handback did not return one uid")
+
+        new_uid = uids[0]
+        _register_uid_rows(
+            self.model,
+            [new_uid],
+            [state.sampler],
+            [state.logits_processors],
+        )
+        self._semantic_hint_active.pop(uid, None)
+        self.uid_to_request_id.pop(uid, None)
+        self.request_id_to_uid[request.request_id] = new_uid
+        self.uid_to_request_id[new_uid] = request.request_id
+        request.batch_uid = new_uid
+        logger.debug(
+            "OoO-Spec handed %s back to BatchGenerator (uid=%d)",
+            request.request_id,
+            new_uid,
+        )
+
+    def _handoff_drained_semantic_hints(self, finished_ids: set[str]) -> None:
+        for uid, state in list(self._semantic_hint_active.items()):
+            if state.drained and state.request.request_id not in finished_ids:
+                self._handoff_semantic_hint(uid, state)
+
     def _route_to_vlm_mtp(
         self,
         request: Request,
@@ -9043,6 +9665,9 @@ class Scheduler:
         per-uid generator state is owned by ``_vlm_mtp_active`` and gets
         dropped when ``_step_vlm_mtp`` marks the entry finished.
         """
+        if uid in self._semantic_hint_active:
+            self._semantic_hint_active.pop(uid, None)
+            return
         if uid < 0:
             return
         if self.batch_generator is None:
@@ -9227,6 +9852,11 @@ class Scheduler:
             request = self.requests.get(request_id)
             if request is None:
                 return False
+
+        # Semantic-hint sidecars own detached verification state. Cancel them
+        # only once this request remains eligible for abort cleanup: an async
+        # store-cache worker above can still own the request and its buffers.
+        self._cancel_semantic_hint(request)
 
         self._clear_request_admission_bookkeeping(request_id)
 
@@ -9434,6 +10064,7 @@ class Scheduler:
             req = self.requests.pop(request_id, None)
             self._clear_request_admission_bookkeeping(request_id)
             if req is not None:
+                self._cancel_semantic_hint(req)
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.running.clear()
@@ -9442,6 +10073,7 @@ class Scheduler:
             req = self.requests.pop(request.request_id, None)
             self._clear_request_admission_bookkeeping(request.request_id)
             if req is not None:
+                self._cancel_semantic_hint(req)
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.prefilling.clear()
@@ -9451,6 +10083,7 @@ class Scheduler:
             req = self.requests.pop(request.request_id, None)
             self._clear_request_admission_bookkeeping(request.request_id)
             if req is not None:
+                self._cancel_semantic_hint(req)
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.waiting.clear()
@@ -9477,6 +10110,7 @@ class Scheduler:
             req = self.requests.pop(request_id, None)
             self._clear_request_admission_bookkeeping(request_id)
             if req is not None:
+                self._cancel_semantic_hint(req)
                 req._extracted_cache = None
                 req.prompt_cache = None
         # Clear stale uid mappings for every failed id. Running requests hold
@@ -9506,6 +10140,7 @@ class Scheduler:
         _unregister_uid_rows_for_model(self.model)
         self.batch_generator = None
         self._current_sampler_params = None
+        self._semantic_hint_active.clear()
         # Reclaim fragmented Metal buffers after generation failure.
         # Without this, subsequent requests may hit the same resource
         # limit even though Python references have been cleared.
@@ -10205,6 +10840,7 @@ class Scheduler:
             sampler, logits_processors = self._build_sampler_and_processors(
                 request.sampling_params, request
             )
+            per_row_lps = list(logits_processors) if logits_processors else []
 
             # Pre-flight memory guard: estimate peak memory for this request
             # and reject if it would exceed the hard limit. The check
@@ -10223,7 +10859,9 @@ class Scheduler:
                     f"memory guard: {preflight_rejection.message}"
                 )
                 self._release_paged_cache_for_request(request.request_id)
-                self.requests.pop(request.request_id, None)
+                removed = self.requests.pop(request.request_id, None)
+                if removed is not None:
+                    self._cancel_semantic_hint(removed)
                 self._clear_request_admission_bookkeeping(request.request_id)
                 rejected_outputs.append(
                     _prefill_memory_error_output(
@@ -10234,6 +10872,16 @@ class Scheduler:
                     )
                 )
                 continue
+
+            # Every request/admission/model/cache gate is now known. Launch
+            # the loopback sidecar here so eligible full/chunked target prefill
+            # can overlap it; ineligible requests have made zero provider calls.
+            self._maybe_start_semantic_hint(
+                request,
+                cache_to_use,
+                tokens_to_process,
+                per_row_lps,
+            )
 
             # SpecPrefill: replace tokens with selected subset and pre-fill
             # cache via sparse_prefill before inserting into BatchGenerator.
@@ -10450,7 +11098,6 @@ class Scheduler:
                     and len(tokens_to_process) > chunk_threshold + 1
                 ):
                     sm = self._build_state_machine(request)
-                    per_row_lps = list(logits_processors) if logits_processors else []
                     state = self._begin_prefill(
                         request, tokens_to_process, cache_to_use
                     )
@@ -10484,7 +11131,9 @@ class Scheduler:
                             e,
                         )
                         self._release_paged_cache_for_request(request.request_id)
-                        self.requests.pop(request.request_id, None)
+                        removed = self.requests.pop(request.request_id, None)
+                        if removed is not None:
+                            self._cancel_semantic_hint(removed)
                         self._clear_request_admission_bookkeeping(request.request_id)
                         get_prefill_tracker().remove(request.request_id)
                         _sync_and_clear_cache(self._stream)
@@ -10513,6 +11162,7 @@ class Scheduler:
                         _sync_and_clear_cache(self._stream)
                         if self._requeue_or_fail_prefill(request, e):
                             continue
+                        self._cancel_semantic_hint(request)
                         rejected_outputs.append(
                             RequestOutput(
                                 request_id=request.request_id,
@@ -10567,7 +11217,9 @@ class Scheduler:
                     self.uid_to_request_id.pop(temp_uid, None)
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
-                    self.requests.pop(request.request_id, None)
+                    removed = self.requests.pop(request.request_id, None)
+                    if removed is not None:
+                        self._cancel_semantic_hint(removed)
                     self._clear_request_admission_bookkeeping(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
                     _sync_and_clear_cache(self._stream)
@@ -10595,6 +11247,7 @@ class Scheduler:
                     _sync_and_clear_cache(self._stream)
                     if self._requeue_or_fail_prefill(request, e):
                         continue
+                    self._cancel_semantic_hint(request)
                     rejected_outputs.append(
                         RequestOutput(
                             request_id=request.request_id,
@@ -10644,6 +11297,17 @@ class Scheduler:
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
 
+            if self._try_activate_semantic_hint(
+                request,
+                cache_to_use,
+                tokens_to_process,
+                sampler,
+                sm,
+                per_row_lps,
+                scheduled,
+            ):
+                continue
+
             # TurboQuant KV is quantized at the end of _do_external_prefill
             # (fp16 prefill → quantize once); _merge_caches() turns the per
             # request TQ cache into a BatchTurboQuantKVCache on insert.
@@ -10692,7 +11356,6 @@ class Scheduler:
             # bubbles into the engine retry loop and presents as a hang.
             # See vllm-mlx-patched commit 8d4052b for the same root cause
             # in a sibling project, and #934 for the user-visible symptom.
-            per_row_lps = list(logits_processors) if logits_processors else []
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
             # step's eval graph stays single-stream (#2235, see
@@ -10903,8 +11566,11 @@ class Scheduler:
                 ),
             )
 
-            if not is_finished:
+            if not is_finished and not isinstance(response, _SemanticHintResponse):
                 self._maybe_capture_boundary_snapshot(request, response.uid)
+
+            if is_finished and isinstance(response, _SemanticHintResponse):
+                self._prepare_semantic_finish_cache(response)
 
             # Handle finished requests
             if is_finished:
@@ -11524,6 +12190,7 @@ class Scheduler:
         _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._semantic_hint_active.clear()
 
         # Cancel any pending deferred Metal cache clear
         self._deferred_clear_at = None
@@ -11554,6 +12221,7 @@ class Scheduler:
         _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._semantic_hint_active.clear()
         self._deferred_clear_at = None
         self._request_detokenizers.clear()
         self._output_parser_sessions.clear()
@@ -11570,6 +12238,7 @@ class Scheduler:
 
     def _reset_request_for_reprefill(self, request: Request) -> None:
         """Reset request-owned decode state so it can be prefilled again."""
+        self._cancel_semantic_hint(request)
         request.status = RequestStatus.WAITING
         request.batch_uid = None
         request.prompt_cache = None
@@ -11799,6 +12468,9 @@ class Scheduler:
             )
             return False
         request.prefill_oom_retries += 1
+        # This helper is called unbound by established lightweight fixtures.
+        # Cancellation is static and needs no scheduler-owned state.
+        Scheduler._cancel_semantic_hint(request)
 
         # Reclaim before requeue so the retry starts from a lower baseline.
         self._reclaim_prefill_headroom()
@@ -11863,6 +12535,7 @@ class Scheduler:
         only the uncached suffix instead of recomputing the prompt cold
         (#2180).
         """
+        self._cancel_semantic_hint(request)
         self._pending_prefill_eviction_request = eviction
         request.status = RequestStatus.WAITING
         request.batch_uid = None
@@ -11960,7 +12633,9 @@ class Scheduler:
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
             if (
-                self.batch_generator is not None or self._vlm_mtp_active
+                self.batch_generator is not None
+                or self._vlm_mtp_active
+                or self._semantic_hint_active
             ) and self.running:
                 _t_decode_start = time.perf_counter()
                 if self.batch_generator is not None:
@@ -11972,6 +12647,8 @@ class Scheduler:
                 # is per-uid.
                 if self._vlm_mtp_active:
                     responses.extend(self._step_vlm_mtp())
+                if self._semantic_hint_active:
+                    responses.extend(self._step_semantic_hints())
                 _decode_dt = time.perf_counter() - _t_decode_start
                 self._repay_decode_debt(_decode_dt)
                 self._sample_decode_rate(len(responses), _decode_dt)
@@ -11981,6 +12658,7 @@ class Scheduler:
                     outputs, finished_ids = self._process_batch_responses(responses)
                     output.outputs.extend(outputs)
                     output.finished_request_ids.update(finished_ids)
+                    self._handoff_drained_semantic_hints(finished_ids)
 
                     # Periodic decode cache materialization for models whose
                     # KV cache update graph can otherwise grow for thousands of
@@ -12258,6 +12936,7 @@ class Scheduler:
         _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._semantic_hint_active.clear()
         self._generation_overflow_recovery_ids.clear()
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests

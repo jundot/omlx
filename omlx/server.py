@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -3794,7 +3794,7 @@ async def create_chat_completion(
             req_xtc_probability=getattr(request, "xtc_probability", None),
             req_xtc_threshold=getattr(request, "xtc_threshold", None),
         )
-        chat_kwargs = {
+        chat_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
@@ -3896,6 +3896,13 @@ async def create_chat_completion(
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
+
+        # Preflight ensures a lazy BatchedEngine is loaded before this dynamic
+        # capability check. Keep these compatibility fields out of every other
+        # engine; the bounded lane requires an explicit single-call contract.
+        if getattr(engine, "supports_semantic_hint_verification", False):
+            chat_kwargs["parallel_tool_calls"] = request.parallel_tool_calls
+            chat_kwargs["tool_choice"] = request.tool_choice
 
         await _raise_if_llm_lease_abort_requested(lease)
 

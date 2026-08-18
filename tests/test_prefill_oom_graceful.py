@@ -933,6 +933,8 @@ def _fake_request(rid="req-1"):
         _model_cache_config=object(),
         think_prefix_sent=True,
         _prefill_saved_rope_deltas=None,
+        semantic_hint_candidate=object(),
+        semantic_hint_context=None,
     )
 
 
@@ -960,6 +962,9 @@ def test_requeue_memory_error_requeues_then_resets_state():
     assert req.block_table is None
     assert req.remaining_tokens == req.prompt_token_ids
     assert req.output_token_ids == []
+    # The optional semantic sidecar is cancelled even though this test uses an
+    # unbound Scheduler method on a minimal fixture.
+    assert req.semantic_hint_candidate is None
 
 
 def test_requeue_budget_exhausts_to_clean_error():

@@ -230,6 +230,13 @@ class Request:
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
 
+    # Call-free immutable semantic-hint input. Only the scheduler may turn it
+    # into a live context after full admission/request eligibility passes.
+    semantic_hint_candidate: Any = None
+
+    # Scheduler-owned one-shot mailbox, present only during eligible prefill.
+    semantic_hint_context: Any = None
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
