@@ -550,7 +550,17 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 self.in_proj_b,
                 self.in_proj_a,
             )
-            if not any(should_route(linear, inputs) for linear in input_linears):
+            # Give the registered accelerator first refusal before applying
+            # the standalone GPU-qmm threshold.  In particular, q8 GPU qmm
+            # deliberately waits for 16K tokens, while a fixed 2K ANE/GPU
+            # split is already profitable and must still reach its backend.
+            projections = None
+            backend = _LM_GDN_PREFILL_BACKEND
+            if backend is not None:
+                projections = backend(self, inputs, bool(n_confirmed))
+            if projections is None and not any(
+                should_route(linear, inputs) for linear in input_linears
+            ):
                 if n_confirmed:
                     return orig_gdn(
                         self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
@@ -558,10 +568,6 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             B, S, _ = inputs.shape
-            projections = None
-            backend = _LM_GDN_PREFILL_BACKEND
-            if backend is not None:
-                projections = backend(self, inputs, bool(n_confirmed))
             if projections is None:
                 qkv = qmm_or_linear(self.in_proj_qkv, inputs)
                 z = qmm_or_linear(self.in_proj_z, inputs)

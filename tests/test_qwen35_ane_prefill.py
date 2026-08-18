@@ -697,6 +697,38 @@ def test_gdn_backend_restores_projection_order_and_keeps_b_a_exact(monkeypatch):
     assert a.tolist() == [[[2]]]
 
 
+def test_post_ane_q8_linear_uses_stock_below_the_native_threshold(monkeypatch):
+    class Linear:
+        bits = 8
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            return x
+
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(
+        q4_patch,
+        "_linear_qmm",
+        lambda *args: pytest.fail("short q8 should remain on stock MLX"),
+    )
+    linear = Linear()
+    x = mx.zeros((1, 2048, 64), dtype=mx.bfloat16)
+
+    result = ane_patch._post_ane_linear(
+        linear,
+        x,
+        8,
+        q8_threshold_env="OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS",
+    )
+
+    assert result is x
+    assert linear.calls == 1
+
+
 def test_backend_reassembles_combined_gate_and_up_outputs(monkeypatch):
     combined = mx.array(
         [
@@ -905,6 +937,7 @@ def test_q6_backend_uses_generic_dual_suffix_and_reassembles_instances(monkeypat
         6,
         8,
         16,
+        0,
     )
     assert captured["gate"].tolist() == [[[1.0, 2.0, 3.0]]]
     assert captured["up"].tolist() == [[[10.0, 20.0, 30.0]]]

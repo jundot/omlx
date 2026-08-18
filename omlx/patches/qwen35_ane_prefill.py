@@ -372,6 +372,29 @@ def _gdn_linears(gdn: Any) -> tuple[Any, Any, Any, Any]:
     )
 
 
+def _post_ane_linear(
+    linear: Any,
+    x: mx.array,
+    variant: int,
+    *,
+    q8_threshold_env: str,
+) -> mx.array:
+    """Use the measured short-q8 winner for projections outside the split.
+
+    The custom q8 tile only overtakes MLX's stock affine matmul at long token
+    counts. ANE operates on a fixed 2K shape, so forcing that tile for the MLP
+    down or the small GDN b/a projections would give back part of the offload
+    gain. Other quantizations retain the existing exact native route.
+    """
+    from omlx.patches.qwen35_q4_mlp import _linear_qmm
+
+    if getattr(linear, "bits", None) == 8:
+        q8_min_tokens = int(os.environ.get(q8_threshold_env, "16384"))
+        if x.ndim >= 3 and int(x.shape[-2]) < q8_min_tokens:
+            return linear(x)
+    return _linear_qmm(linear, x, variant)
+
+
 def _register_gdn_module(gdn: Any) -> None:
     qkv, _, _, _ = _gdn_linears(gdn)
     if qkv is not None:
@@ -595,8 +618,6 @@ def _gdn_backend(
         return None
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
-        from omlx.patches.qwen35_q4_mlp import _linear_qmm
-
         if state.model1 is not None:
             combined = fast.qwen35_ane_dual_affine_qmm_t(
                 x,
@@ -608,6 +629,7 @@ def _gdn_backend(
                 state.bits,
                 config.variant,
                 state.group_size,
+                1,
             )
         else:
             combined = fast.qwen35_ane_affine_qmm_t(
@@ -619,12 +641,23 @@ def _gdn_backend(
                 state.bits,
                 config.variant,
                 state.group_size,
+                1,
             )
         z = combined[..., : state.z_outputs]
         mixed_qkv = combined[..., state.z_outputs : state.z_outputs + state.qkv_outputs]
         _, _, b_proj, a_proj = _gdn_linears(gdn)
-        b = _linear_qmm(b_proj, x, config.variant)
-        a = _linear_qmm(a_proj, x, config.variant)
+        b = _post_ane_linear(
+            b_proj,
+            x,
+            config.variant,
+            q8_threshold_env="OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS",
+        )
+        a = _post_ane_linear(
+            a_proj,
+            x,
+            config.variant,
+            q8_threshold_env="OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS",
+        )
         return mixed_qkv, z, b, a
     except Exception:
         gdn._omlx_ane_gdn_failed = True
@@ -668,8 +701,6 @@ def _backend(
 
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
-        from omlx.patches.qwen35_q4_mlp import _linear_qmm
-
         if state.model1 is not None and state.bits == 4:
             activation = fast.qwen35_ane_dual_q4_swiglu_t(
                 x,
@@ -681,7 +712,12 @@ def _backend(
                 config.variant,
                 state.group_size,
             )
-            return _linear_qmm(mlp.down_proj, activation, config.variant)
+            return _post_ane_linear(
+                mlp.down_proj,
+                activation,
+                config.variant,
+                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
+            )
         if state.model1 is None and state.bits == 4 and fast.has_symbol(
             "qwen35_ane_q4_swiglu_t"
         ):
@@ -694,7 +730,12 @@ def _backend(
                 config.variant,
                 state.group_size,
             )
-            return _linear_qmm(mlp.down_proj, activation, config.variant)
+            return _post_ane_linear(
+                mlp.down_proj,
+                activation,
+                config.variant,
+                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
+            )
 
         if state.model1 is not None:
             combined = fast.qwen35_ane_dual_affine_qmm_t(
@@ -707,6 +748,7 @@ def _backend(
                 state.bits,
                 config.variant,
                 state.group_size,
+                0,
             )
         elif state.bits == 4:
             combined = fast.qwen35_ane_q4_affine_qmm_t(
@@ -728,6 +770,7 @@ def _backend(
                 state.bits,
                 config.variant,
                 state.group_size,
+                0,
             )
         ane_end = 2 * state.ane_outputs
         gpu_gate_end = ane_end + state.gpu_outputs
@@ -761,10 +804,11 @@ def _backend(
         gate = mx.concatenate(gate_parts, axis=-1)
         up = mx.concatenate(up_parts, axis=-1)
 
-        return _linear_qmm(
+        return _post_ane_linear(
             mlp.down_proj,
             swiglu(gate, up),
             config.variant,
+            q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
         )
     except Exception:
         mlp._omlx_ane_prefill_failed = True
