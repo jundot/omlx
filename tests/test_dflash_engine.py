@@ -29,6 +29,7 @@ class TestDFlashModelSettings:
         # New long-context tuning knobs (issue #1276). None → dflash-mlx default.
         assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size is None
+        assert settings.dflash_block_size is None
         assert settings.dflash_verify_mode is None
 
     def test_no_speculative_tokens_field(self):
@@ -57,6 +58,7 @@ class TestDFlashModelSettings:
         # Tuning knobs default to None → omitted from on-disk JSON.
         assert "dflash_draft_window_size" not in d
         assert "dflash_draft_sink_size" not in d
+        assert "dflash_block_size" not in d
         assert "dflash_verify_mode" not in d
 
     def test_from_dict_with_dflash_fields(self):
@@ -115,11 +117,13 @@ class TestDFlashModelSettings:
             "dflash_enabled": True,
             "dflash_draft_window_size": 2048,
             "dflash_draft_sink_size": 32,
+            "dflash_block_size": 5,
             "dflash_verify_mode": "adaptive",
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_draft_window_size == 2048
         assert settings.dflash_draft_sink_size == 32
+        assert settings.dflash_block_size == 5
         assert settings.dflash_verify_mode == "adaptive"
 
     def test_roundtrip_serialization(self):
@@ -311,6 +315,7 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_block_size=5),
         )
         target_model = object()
         target_ops = object()
@@ -356,6 +361,9 @@ class TestDFlashEngineInit:
         event_iter, _, stop_ids = engine._stream_dflash_events(
             prompt_tokens=[1, 2],
             max_tokens=3,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
         )
 
         assert list(event_iter) == []
@@ -363,6 +371,10 @@ class TestDFlashEngineInit:
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
+        assert captured["temperature"] == 1.0
+        assert captured["top_p"] == 0.95
+        assert captured["top_k"] == 20
+        assert captured["block_tokens"] == 5
         assert fake_flow.snapshot is None
         assert prefix_kwargs["max_new_tokens"] == 3
         model_provider = prefix_kwargs["model_provider"]
@@ -616,6 +628,7 @@ class TestDFlashEngineInit:
         )
         assert engine._draft_window_size is None
         assert engine._draft_sink_size is None
+        assert engine._block_size is None
         assert engine._verify_mode is None
 
     def test_long_context_knobs_read_from_settings(self):
@@ -631,11 +644,13 @@ class TestDFlashEngineInit:
             model_settings=ModelSettings(
                 dflash_draft_window_size=2048,
                 dflash_draft_sink_size=32,
+                dflash_block_size=5,
                 dflash_verify_mode="adaptive",
             ),
         )
         assert engine._draft_window_size == 2048
         assert engine._draft_sink_size == 32
+        assert engine._block_size == 5
         assert engine._verify_mode == "adaptive"
 
     def test_build_runtime_context_passes_knobs(self):
@@ -1375,7 +1390,8 @@ class TestDFlashCachedTokensWiring:
         )
         fake_flow = SimpleNamespace(hit_tokens=4273)
 
-        def fake_stream_events(*, prompt_tokens, max_tokens):
+        def fake_stream_events(*, prompt_tokens, max_tokens, temperature, top_p, top_k):
+            assert (temperature, top_p, top_k) == (0.7, 0.9, 0)
             return iter([summary]), fake_flow, [2]
 
         monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)

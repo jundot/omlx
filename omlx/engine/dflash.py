@@ -409,6 +409,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else None
         )
+        self._block_size = (
+            getattr(model_settings, "dflash_block_size", None)
+            if model_settings
+            else None
+        )
         self._verify_mode = (
             getattr(model_settings, "dflash_verify_mode", None)
             if model_settings
@@ -529,21 +534,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # Native MTP load on the same process would see leftover dflash
             # hooks and crash with TypeError on n_confirmed (issue #1388).
             # Idempotent — only wraps once per process.
-            from ..patches.dflash_draft_config import (
-                install_dflash_draft_config_normalizer,
-            )
             from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
 
             install_dflash_lifecycle_wrap()
-            # Newer z-lab drafts ship transformers 5.x-style configs that nest
-            # rope_theta under rope_parameters and block_size under
-            # dflash_config, but DFlashDraftModelArgs requires both at the
-            # config root with no defaults. Without this, load_draft_bundle
-            # crashes with a missing-positional-argument TypeError and
-            # engine_pool falls back to the vlm engine (issue #2317).
-            # Idempotent — only wraps once per process.
-            install_dflash_draft_config_normalizer()
-
             target_bundle = load_target_bundle(
                 self._model_name,
                 quantize_kv_cache=bool(
@@ -1115,6 +1108,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self,
         prompt_tokens: list[int],
         max_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
@@ -1156,6 +1152,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             suppress_token_ids=(
                 sorted(self._suppress_token_ids) if self._suppress_token_ids else None
             ),
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            block_tokens=self._block_size,
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
             snapshot_service=prefix_flow.snapshot_service,
@@ -1196,6 +1196,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         prompt_tokens: list[int],
         max_tokens: int,
         temperature: float,
+        top_p: float,
+        top_k: int,
         tools: list[dict] | None,
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
@@ -1217,6 +1219,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
             )
             cache_manager = self._begin_runtime_cache_request()
             self._record_prefill_guard_active_memory()
@@ -1428,6 +1433,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
                 )
                 cache_manager = self._begin_runtime_cache_request()
                 self._record_prefill_guard_active_memory()
@@ -1649,6 +1657,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             prompt_tokens,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
             tools,
             queue,
             loop,

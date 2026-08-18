@@ -90,6 +90,7 @@ struct ModelSettingsSnapshot: Equatable {
     var dflashDraftQuantActivationBits: String
     var dflashDraftQuantGroupSize: String
     var dflashMaxCtx: String
+    var dflashBlockSize: String
     var dflashVerifyMode: String
     var dflashDraftWindowSize: String
     var dflashDraftSinkSize: String
@@ -160,6 +161,7 @@ enum ProfileSettingsKey {
     static let dflashVerifyMode = "dflash_verify_mode"
     static let dflashDraftWindowSize = "dflash_draft_window_size"
     static let dflashDraftSinkSize = "dflash_draft_sink_size"
+    static let dflashBlockSize = "dflash_block_size"
     static let dflashInMemoryCache = "dflash_in_memory_cache"
     static let dflashInMemoryCacheMaxBytes = "dflash_in_memory_cache_max_bytes"
     static let dflashInMemoryCacheMaxEntries = "dflash_in_memory_cache_max_entries"

@@ -135,6 +135,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashSsdCacheMaxBytes: Int64?
     let dflashDraftWindowSize: Int?
     let dflashDraftSinkSize: Int?
+    let dflashBlockSize: Int?
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
@@ -206,6 +207,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashSsdCacheMaxBytes: Int64? = nil
     var dflashDraftWindowSize: Int? = nil
     var dflashDraftSinkSize: Int? = nil
+    var dflashBlockSize: Int? = nil
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil

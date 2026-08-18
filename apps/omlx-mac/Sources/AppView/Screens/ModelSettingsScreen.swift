@@ -1406,6 +1406,15 @@ private struct ExperimentalSection: View {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
                               placeholder: "64", mono: true, width: 110)
                 }
+                Row(label: String(localized: "settings.experimental.dflash.block_size.label",
+                                  defaultValue: "Runtime Block Size",
+                                  comment: "Row label for the DFlash runtime block size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
+                                     defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
+                                     comment: "Sublabel for the DFlash runtime block size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashBlockSize),
+                              placeholder: "checkpoint", mono: true, width: 110)
+                }
                 Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
                                   defaultValue: "DFlash in-memory cache",
                                   comment: "Row label for the DFlash L1 in-memory cache toggle"),

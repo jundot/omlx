@@ -68,6 +68,7 @@
                 "dflash_ssd_cache_max_bytes": 21474836480,
                 "dflash_draft_window_size": null,
                 "dflash_draft_sink_size": null,
+                "dflash_block_size": null,
                 "dflash_verify_mode": null,
                 "mtp_enabled": false,
                 "vlm_mtp_enabled": false,

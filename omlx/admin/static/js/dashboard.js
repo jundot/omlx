@@ -54,6 +54,7 @@
         'dflash_ssd_cache_max_bytes',
         'dflash_draft_window_size',
         'dflash_draft_sink_size',
+        'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
         'vlm_mtp_enabled',
@@ -7080,6 +7081,7 @@
                         : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: s.dflash_draft_sink_size ?? null,
+                    dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
@@ -7664,6 +7666,10 @@
                                     && this.modelSettings.dflash_draft_sink_size !== ''
                                     ? parseInt(this.modelSettings.dflash_draft_sink_size)
                                     : null,
+                                dflash_block_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_block_size
+                                    ? parseInt(this.modelSettings.dflash_block_size)
+                                    : null,
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
@@ -7722,6 +7728,7 @@
                                     dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
                                     dflash_draft_window_size: null,
                                     dflash_draft_sink_size: null,
+                                    dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
                                     vlm_mtp_enabled: false,
@@ -7818,6 +7825,7 @@
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
                         this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;

@@ -346,6 +346,7 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_ssd_cache",
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
+    "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
     "mtp_num_draft_tokens",
