@@ -122,7 +122,7 @@ dependencies = [
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
     # dflash-mlx with DFlash2 support, based on jundot's production fork.
-    "dflash-mlx @ git+https://github.com/z-lab/dflash-mlx@fc7ff5c4aff94b5f58a955b927cfbcbdc177eddb",
+    "dflash-mlx @ git+https://github.com/z-lab/dflash-mlx@415cc48d83846cfcd0d5b9da3c83e4f1478acda6",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 
