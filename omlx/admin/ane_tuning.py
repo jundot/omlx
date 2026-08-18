@@ -71,8 +71,10 @@ class ANETuningRun:
     current: int = 0
     total: int = 0
     results: list[dict[str, Any]] = field(default_factory=list)
+    fractions: list[float] = field(default_factory=list)
     recommendation: dict[str, Any] | None = None
     error_message: str = ""
+    termination_reason: str = ""
     task: asyncio.Task | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -92,8 +94,32 @@ def _fraction_grid() -> list[float]:
 
 
 def create_run(request: ANETuningRequest) -> ANETuningRun:
-    run = ANETuningRun(tuning_id=str(uuid.uuid4()), request=request)
-    run.total = 1 + len(_fraction_grid()) * 2
+    fractions = _fraction_grid()
+    planned = [_Candidate("GPU only", False)]
+    planned.extend(
+        _Candidate(f"MLP {fraction:.0%}", True, fraction)
+        for fraction in fractions
+    )
+    # The exact MLP fraction for the second phase is selected after the first
+    # phase.  Reserve those rows now so an interrupted run still returns the
+    # complete matrix, with unmeasured values left blank.
+    planned.extend(
+        _Candidate(
+            f"Best MLP + GDN {fraction:.0%}",
+            True,
+            None,
+            True,
+            fraction,
+        )
+        for fraction in fractions
+    )
+    run = ANETuningRun(
+        tuning_id=str(uuid.uuid4()),
+        request=request,
+        fractions=fractions,
+        results=[_empty_result(candidate) for candidate in planned],
+    )
+    run.total = len(run.results)
     _runs[run.tuning_id] = run
     return run
 
@@ -125,7 +151,75 @@ def run_snapshot(run: ANETuningRun) -> dict[str, Any]:
         "results": list(run.results),
         "recommendation": run.recommendation,
         "error": run.error_message or None,
+        "termination_reason": run.termination_reason or None,
     }
+
+
+def _empty_result(candidate: _Candidate) -> dict[str, Any]:
+    return {
+        "label": candidate.label,
+        "enabled": candidate.enabled,
+        "mlp_fraction": candidate.mlp_fraction,
+        "gdn_enabled": candidate.gdn_enabled,
+        "gdn_fraction": candidate.gdn_fraction,
+        "state": "pending",
+        "processing_tps": None,
+        "samples": [],
+        "speedup_percent": None,
+        "error": None,
+    }
+
+
+def _exception_reason(exc: BaseException) -> str:
+    detail = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
+
+
+def _refresh_speedups(run: ANETuningRun) -> None:
+    baseline = run.results[0].get("processing_tps") if run.results else None
+    if baseline is None or baseline <= 0:
+        return
+    for result in run.results:
+        processing_tps = result.get("processing_tps")
+        if processing_tps is None:
+            continue
+        result["speedup_percent"] = round(
+            (processing_tps / baseline - 1.0) * 100.0, 2
+        )
+
+
+async def _measure_result_slot(
+    run: ANETuningRun,
+    result_index: int,
+    engine_pool: Any,
+    base_settings: Any,
+    candidate: _Candidate,
+) -> None:
+    slot = _empty_result(candidate)
+    slot["state"] = "running"
+    run.results[result_index] = slot
+    run.phase = "measuring"
+    run.message = f"Testing {candidate.label}…"
+    try:
+        result = await _measure_candidate(
+            run, engine_pool, base_settings, candidate
+        )
+    except asyncio.CancelledError:
+        slot["state"] = "cancelled"
+        slot["error"] = "Cancelled by user"
+        raise
+    except Exception as exc:
+        slot["state"] = "failed"
+        slot["error"] = _exception_reason(exc)
+        raise
+    else:
+        result["state"] = "completed"
+        result["speedup_percent"] = None
+        result["error"] = None
+        run.results[result_index] = result
+        run.current += 1
+        _refresh_speedups(run)
 
 
 def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Candidate):
@@ -236,7 +330,7 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         for model_id in list(engine_pool.get_loaded_model_ids()):
             await engine_pool._unload_engine(model_id)
 
-        fractions = _fraction_grid()
+        fractions = run.fractions
         # Coordinate search keeps the number of expensive eager-compilation
         # reloads bounded: tune MLP alone, then tune GDN around the winning MLP.
         candidates = [_Candidate("GPU only", False)]
@@ -244,44 +338,56 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             _Candidate(f"MLP {fraction:.0%}", True, fraction)
             for fraction in fractions
         )
-        run.total = 1 + len(fractions) * 2
-
-        for candidate in candidates:
-            run.phase = "measuring"
-            run.message = f"Testing {candidate.label}…"
-            result = await _measure_candidate(
-                run, engine_pool, base_settings, candidate
+        for result_index, candidate in enumerate(candidates):
+            await _measure_result_slot(
+                run,
+                result_index,
+                engine_pool,
+                base_settings,
+                candidate,
             )
-            run.results.append(result)
-            run.current += 1
 
         best_mlp = max(
-            (result for result in run.results if result["enabled"]),
+            (
+                result
+                for result in run.results
+                if result["enabled"]
+                and not result["gdn_enabled"]
+                and result["processing_tps"] is not None
+            ),
             key=lambda result: result["processing_tps"],
         )
-        for fraction in fractions:
-            candidate = _Candidate(
+        gdn_start = len(candidates)
+        gdn_candidates = [
+            _Candidate(
                 f"MLP {best_mlp['mlp_fraction']:.0%} + GDN {fraction:.0%}",
                 True,
                 float(best_mlp["mlp_fraction"]),
                 True,
                 fraction,
             )
-            run.phase = "measuring"
-            run.message = f"Testing {candidate.label}…"
-            result = await _measure_candidate(
-                run, engine_pool, base_settings, candidate
+            for fraction in fractions
+        ]
+        for offset, candidate in enumerate(gdn_candidates):
+            run.results[gdn_start + offset] = _empty_result(candidate)
+        for offset, candidate in enumerate(gdn_candidates):
+            await _measure_result_slot(
+                run,
+                gdn_start + offset,
+                engine_pool,
+                base_settings,
+                candidate,
             )
-            run.results.append(result)
-            run.current += 1
 
-        baseline = run.results[0]["processing_tps"]
-        for result in run.results:
-            result["speedup_percent"] = round(
-                (result["processing_tps"] / baseline - 1.0) * 100.0, 2
-            )
-
-        best = max(run.results, key=lambda result: result["processing_tps"])
+        completed_results = [
+            result
+            for result in run.results
+            if result["processing_tps"] is not None
+        ]
+        best = max(
+            completed_results,
+            key=lambda result: result["processing_tps"],
+        )
         # A sub-1% lead is smaller than the normal run-to-run noise and is not
         # enough to justify private-API load time and memory overhead.
         if best["enabled"] and best["speedup_percent"] < 1.0:
@@ -302,12 +408,19 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         run.status = "cancelled"
         run.phase = "cancelled"
         run.message = "Tuning cancelled"
+        run.termination_reason = (
+            f"Cancelled by user after {run.current} of {run.total} tests completed."
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("ANE tuning failed for %s", run.request.model_id)
         run.status = "error"
         run.phase = "error"
-        run.error_message = str(exc)
-        run.message = "Tuning failed"
+        run.error_message = _exception_reason(exc)
+        run.termination_reason = (
+            f"Stopped after {run.current} of {run.total} tests: "
+            f"{run.error_message}"
+        )
+        run.message = "Tuning stopped early"
     finally:
         _restore_speed_priority(engine_pool, previous_speed_priority)
         try:

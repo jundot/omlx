@@ -121,3 +121,61 @@ async def test_tuner_keeps_gpu_for_sub_noise_gain(monkeypatch):
     assert run.status == "completed"
     assert run.recommendation["enabled"] is False
     assert run.recommendation["processing_tps"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
+    monkeypatch.setattr(ane_tuning, "_fraction_grid", lambda: [0.25, 0.5])
+
+    async def measure(run, pool, settings, candidate):
+        if candidate.mlp_fraction == 0.5 and not candidate.gdn_enabled:
+            raise MemoryError("Metal heap exhausted")
+        tps = 100.0 if not candidate.enabled else 105.0
+        return {
+            "label": candidate.label,
+            "enabled": candidate.enabled,
+            "mlp_fraction": candidate.mlp_fraction,
+            "gdn_enabled": candidate.gdn_enabled,
+            "gdn_fraction": candidate.gdn_fraction,
+            "processing_tps": tps,
+            "samples": [tps],
+        }
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings()
+        ),
+        get_loaded_model_ids=lambda: [],
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+    snapshot = ane_tuning.run_snapshot(run)
+
+    assert run.status == "error"
+    assert run.current == 2
+    assert run.total == 5
+    assert len(snapshot["results"]) == 5
+    assert [result["state"] for result in snapshot["results"]] == [
+        "completed",
+        "completed",
+        "failed",
+        "pending",
+        "pending",
+    ]
+    assert [result["processing_tps"] for result in snapshot["results"]] == [
+        100.0,
+        105.0,
+        None,
+        None,
+        None,
+    ]
+    assert snapshot["results"][1]["speedup_percent"] == 5.0
+    assert snapshot["results"][2]["error"] == "MemoryError: Metal heap exhausted"
+    assert snapshot["termination_reason"] == (
+        "Stopped after 2 of 5 tests: MemoryError: Metal heap exhausted"
+    )
+    assert snapshot["recommendation"] is None

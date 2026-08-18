@@ -240,9 +240,11 @@ struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
     let mlpFraction: Double?
     let gdnEnabled: Bool
     let gdnFraction: Double?
-    let processingTps: Double
+    let state: String?
+    let processingTps: Double?
     let samples: [Double]
     let speedupPercent: Double?
+    let error: String?
 
     var id: String { label }
 }
@@ -268,6 +270,7 @@ struct ANETuningStatusResponse: Codable, Sendable {
     let results: [ANETuningCandidateDTO]
     let recommendation: ANETuningRecommendationDTO?
     let error: String?
+    let terminationReason: String?
 }
 
 struct ANETuningCancelResponse: Codable, Sendable {

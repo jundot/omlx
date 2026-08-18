@@ -871,6 +871,30 @@
                                             <p x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
                                                x-cloak class="text-xs text-neutral-600"
                                                x-text="aneTuningRecommendationText()"></p>
+                                            <p x-show="aneTuningForSelectedModel() && aneTuning.status?.termination_reason"
+                                               x-cloak
+                                               :class="aneTuning.status?.status === 'error' ? 'text-red-600' : 'text-amber-600'"
+                                               class="text-xs"
+                                               x-text="aneTuning.status?.termination_reason"></p>
+
+                                            <div x-show="aneTuningForSelectedModel() && aneTuning.status?.results?.length"
+                                                 x-cloak class="overflow-hidden rounded-lg border border-neutral-200 bg-white">
+                                                <div class="grid grid-cols-[minmax(0,1fr)_7rem] gap-3 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-neutral-500 bg-neutral-50">
+                                                    <span>{{ t('modal.model_settings.qwen_ane_tune_test') }}</span>
+                                                    <span class="text-right">{{ t('modal.model_settings.qwen_ane_tune_throughput') }}</span>
+                                                </div>
+                                                <template x-for="(result, index) in aneTuning.status?.results || []"
+                                                          :key="`${index}-${result.label}`">
+                                                    <div class="grid grid-cols-[minmax(0,1fr)_7rem] gap-3 px-3 py-1.5 text-xs border-t border-neutral-100">
+                                                        <span class="truncate"
+                                                              :class="result.state === 'failed' ? 'text-red-600' : 'text-neutral-600'"
+                                                              :title="result.error || result.label"
+                                                              x-text="result.label"></span>
+                                                        <span class="text-right tabular-nums text-neutral-800"
+                                                              x-text="aneTuningResultText(result)"></span>
+                                                    </div>
+                                                </template>
+                                            </div>
                                             <p x-show="aneTuningForSelectedModel() && aneTuning.error"
                                                x-cloak class="text-xs text-red-600" x-text="aneTuning.error"></p>
                                         </div>

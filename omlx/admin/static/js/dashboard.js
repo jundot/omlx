@@ -7538,6 +7538,22 @@
                 return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
             },
 
+            aneTuningResultText(result) {
+                if (result?.processing_tps === null
+                    || result?.processing_tps === undefined) {
+                    // Keep unfinished rows visible but leave their result cell
+                    // blank, including the candidate that stopped the run.
+                    return '';
+                }
+                const speed = Number(result.processing_tps).toFixed(1);
+                if (result.speedup_percent === null
+                    || result.speedup_percent === undefined) {
+                    return speed;
+                }
+                const speedup = Number(result.speedup_percent);
+                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+            },
+
             _scheduleANETuningPoll() {
                 if (this._aneTuningPollTimer) {
                     clearTimeout(this._aneTuningPollTimer);
@@ -7612,13 +7628,16 @@
                         throw new Error(data.detail || 'Failed to read ANE tuning progress.');
                     }
                     if (this.aneTuning.tuningId !== tuningId) return;
+                    if (!data.termination_reason && data.status === 'error') {
+                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                    }
                     this.aneTuning.status = data;
                     this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
                     this.aneTuning.running = data.status === 'running';
                     this.aneTuning.cancelling = false;
-                    if (data.status === 'error') {
-                        this.aneTuning.error = data.error || data.message || 'ANE tuning failed.';
-                    } else if (data.status === 'cancelled') {
+                    if (data.status === 'error' || data.status === 'cancelled') {
+                        // Early termination belongs beside the partial result
+                        // matrix. Keep this field for request/transport errors.
                         this.aneTuning.error = '';
                     }
                     this._scheduleANETuningPoll();

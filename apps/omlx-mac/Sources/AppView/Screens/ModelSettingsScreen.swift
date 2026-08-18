@@ -1169,8 +1169,56 @@ private struct ExperimentalSection: View {
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         }
+
+                        if let status = vm.aneTuningStatus {
+                            if let reason = status.terminationReason,
+                               !reason.isEmpty {
+                                Text(reason)
+                                    .font(.omlxText(10))
+                                    .foregroundStyle(
+                                        status.status == "error"
+                                            ? Color.red
+                                            : theme.textSecondary
+                                    )
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.trailing)
+                            }
+
+                            if !status.results.isEmpty {
+                                VStack(spacing: 3) {
+                                    HStack(spacing: 8) {
+                                        Text("Test")
+                                        Spacer(minLength: 8)
+                                        Text("Prompt tok/s")
+                                    }
+                                    .font(.omlxText(9, weight: .semibold))
+                                    .foregroundStyle(theme.textSecondary)
+
+                                    Divider()
+
+                                    ForEach(status.results) { result in
+                                        HStack(spacing: 8) {
+                                            Text(result.label)
+                                                .lineLimit(1)
+                                                .foregroundStyle(
+                                                    result.state == "failed"
+                                                        ? Color.red
+                                                        : theme.textSecondary
+                                                )
+                                            Spacer(minLength: 8)
+                                            Text(aneCandidateResultText(result))
+                                                .monospacedDigit()
+                                                .foregroundStyle(theme.text)
+                                                .frame(minWidth: 78, alignment: .trailing)
+                                        }
+                                        .font(.omlxText(10))
+                                    }
+                                }
+                                .frame(width: 285)
+                            }
+                        }
                     }
-                    .frame(minWidth: 210, alignment: .trailing)
+                    .frame(minWidth: 285, alignment: .trailing)
                 }
                 if vm.qwen35AnePrefillEnabled {
                     Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
@@ -1651,6 +1699,20 @@ private struct ExperimentalSection: View {
             recommendation.processingTps,
             recommendation.speedupPercent
         )
+    }
+
+    private func aneCandidateResultText(
+        _ result: ANETuningCandidateDTO
+    ) -> String {
+        guard let processingTps = result.processingTps else {
+            // Deliberately blank: the row remains visible so an interrupted
+            // run shows which tests did not complete.
+            return ""
+        }
+        if let speedup = result.speedupPercent {
+            return String(format: "%.1f (%+.1f%%)", processingTps, speedup)
+        }
+        return String(format: "%.1f", processingTps)
     }
 }
 
