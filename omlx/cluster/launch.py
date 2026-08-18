@@ -1919,6 +1919,7 @@ class DistributedJobSupervisor:
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2.0)
+        self._reap_remote_ranks()
         for reader in self._readers:
             reader.join(timeout=0.5)
         self._readers.clear()
@@ -1936,6 +1937,111 @@ class DistributedJobSupervisor:
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None
+
+    def _reap_remote_ranks(self) -> None:
+        """Kill rank workers on peer hosts that the local group kill cannot reach.
+
+        ``mlx.launch`` runs each rank through SSH in its own process group on
+        its host. When local supervision stops, an uncooperative remote rank
+        (for example, blocked in a Metal/JACCL collective) remains resident,
+        pinning unified memory and breaking future admission.
+
+        Each rank writes a marker at
+        ``{state_dir}/{deployment_id}-rank-{rank}.json``. Read that marker
+        over SSH, validate that the PID matches the expected deployment,
+        plan, and rank, verify the process command line before signaling,
+        and escalate SIGTERM -> wait -> SIGKILL -> confirmed dead.
+        """
+        if not self.deployment or not self.deployment.hosts:
+            return
+        for rank, host in enumerate(self.deployment.hosts):
+            if host.ssh in ("127.0.0.1", "localhost", "::1"):
+                continue
+            filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
+            script = (
+                "import json,os,pathlib,signal,subprocess,sys,time\n"
+                f"root=pathlib.Path({self.state_dir!r}).expanduser()\n"
+                f"p=root / {filename!r}\n"
+                f"dep_id={self.deployment.deployment_id!r}\n"
+                f"p_hash={self.deployment.plan_hash!r}\n"
+                f"rank_idx={rank!r}\n"
+                "if not p.is_file(): raise SystemExit(0)\n"
+                "try:\n"
+                "  d=json.loads(p.read_text())\n"
+                "except Exception:\n"
+                "  raise SystemExit(0)\n"
+                "if d.get('deployment_id') != dep_id or d.get('plan_hash') != p_hash or d.get('rank') != rank_idx:\n"
+                "  raise SystemExit(0)\n"
+                "pid=d.get('pid')\n"
+                "if not isinstance(pid,int) or isinstance(pid,bool) or pid<=0 or pid==os.getpid():\n"
+                "  raise SystemExit(0)\n"
+                "def is_dead(target_pid):\n"
+                "  try:\n"
+                "    os.kill(target_pid,0)\n"
+                "  except ProcessLookupError:\n"
+                "    return True\n"
+                "  except PermissionError:\n"
+                "    pass\n"
+                "  try:\n"
+                "    res=subprocess.run(['ps','-p',str(target_pid),'-o','stat='],capture_output=True,text=True,check=False)\n"
+                "    st=res.stdout.strip()\n"
+                "    if not st or 'Z' in st:\n"
+                "      return True\n"
+                "  except Exception:\n"
+                "    pass\n"
+                "  return False\n"
+                "if is_dead(pid):\n"
+                "  try: p.unlink()\n"
+                "  except OSError: pass\n"
+                "  raise SystemExit(0)\n"
+                "try:\n"
+                "  res=subprocess.run(['ps','-p',str(pid),'-o','args='],capture_output=True,text=True,check=False)\n"
+                "  cmd=res.stdout.strip()\n"
+                "  if not cmd:\n"
+                "    res=subprocess.run(['ps','-p',str(pid),'-o','command='],capture_output=True,text=True,check=False)\n"
+                "    cmd=res.stdout.strip()\n"
+                "except Exception:\n"
+                "  cmd=''\n"
+                "if not ('omlx.cluster.inference_worker' in cmd and dep_id in cmd):\n"
+                "  raise SystemExit(0)\n"
+                "try:\n"
+                "  os.kill(pid,signal.SIGTERM)\n"
+                "except ProcessLookupError:\n"
+                "  try: p.unlink()\n"
+                "  except OSError: pass\n"
+                "  raise SystemExit(0)\n"
+                "deadline=time.monotonic()+3.0\n"
+                "dead=False\n"
+                "while time.monotonic()<deadline:\n"
+                "  if is_dead(pid):\n"
+                "    dead=True; break\n"
+                "  time.sleep(0.05)\n"
+                "if not dead:\n"
+                "  try:\n"
+                "    os.kill(pid,signal.SIGKILL)\n"
+                "  except ProcessLookupError:\n"
+                "    dead=True\n"
+                "  if not dead:\n"
+                "    kill_deadline=time.monotonic()+2.0\n"
+                "    while time.monotonic()<kill_deadline:\n"
+                "      if is_dead(pid):\n"
+                "        dead=True; break\n"
+                "      time.sleep(0.05)\n"
+                "if dead:\n"
+                "  try: p.unlink()\n"
+                "  except OSError: pass\n"
+            )
+            try:
+                _run_cluster_ssh(
+                    host.ssh,
+                    f"python3 -c {shlex.quote(script)}",
+                    timeout=8.0,
+                    runner=subprocess.run,
+                )
+            except (DistributedLaunchError, OSError):
+                # Best effort: an unreachable peer or disconnected link
+                # cannot leave a resident rank behind.
+                continue
 
     def _exit_detail(self, returncode: int | None) -> str:
         failure_reason = self._failure_reason() or self._runtime_failure_reason()
