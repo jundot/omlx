@@ -60,39 +60,6 @@ migration `4799830` and are not part of the current model surface).
 - **Optimization:** re-represent the BF16 attention projections (`q/k/v/o/g_proj`, ~2.9 GB of the ~4.3 GB per-decode-step weight traffic) as group-32 affine INT8 at init — 9 bits/weight vs BF16's 16, removing ~1.25 GB/step.
 - **Token-exactness issue:** this is an explicitly **lossy** re-quantization (the submission itself documents it; it lives inside the track envelope's permitted "representation set" but is not bit-exact vs the reference). It is not reproduced in oMLX: the port bar requires bit-exact parity or a documented exception. If oMLX ever adopts it, it must be a default-OFF toggle with lossiness documented and a token-diff gate against the BF16 reference.
 
-## Pre-Laguna submissions: triage (not ported as code)
-
-104 Validate/Accept submission commits exist in the challenge repo total. 8
-are Laguna-era (rows 93-100 above). The other 96 target the challenge's two
-earlier models - DeepSeek V4 Flash (31) and Gemma 4 31B (63) plus 2 Python-era
-stub commits - and are **not ported as code**, for three verified reasons:
-
-1. **Already-present-equivalent in oMLX.** The challenge's DeepSeek-era
-   compiled-fusion submissions (Sinkhorn `68cd907e`/`ac5841c0`, collapse/expand
-   `8ef14a14`, head-tail `e8601677`) and the model-agnostic knobs (compiled
-   decode, `MLX_MAX_MB_PER_BUFFER`/`MLX_MAX_OPS_PER_BUFFER`, init-time
-   allocator drain, warmup) map to optimizations oMLX's `deepseek_v4` patch set
-   already implements (e.g. a fused sinkhorn+collapse Metal kernel in
-   `hyper_connection.py`) or to the documented N1/N3 notes.
-2. **Swift-runtime-specific, not reproducible.** The DeepSeek-era expert
-   streaming (stagers/prefetchers/resident scales: ~25 submissions) and the
-   Gemma-era `Gemma4FastEngine` Metal-kernel fusions (co-tiled/packed layouts,
-   staged prefill tiles, gelu-epilogue/BN32 kernels, MTP exact-two/four vector
-   kernels, prompt lookup, tied-head co-tiling: ~50 submissions) are
-   optimizations of the challenge's own Swift reimplementations. oMLX serves
-   DeepSeek V4 Flash and Gemma 4 through mlx-lm stock architectures plus oMLX
-   patches - there is no shared runtime to port into, and a faithful port would
-   be a re-implementation of removed code against a different kernel stack.
-3. **Pruned by the challenge itself.** The organizer's later commits removed
-   most of this code (`fe9d166` prune dead A/B variants, `51b9dd2` dead code
-   removal, `461af5b` Gemma-MTP-era removal, `4799830` Laguna migration), so
-   the surviving Laguna model surface contains none of it.
-
-If an oMLX effort later targets the DeepSeek V4 Flash or Gemma 4 paths
-directly, the per-submission rows are recoverable from the challenge git log
-(`git log --format="%h %ad %s" --date=short layr-labs/main | tac`) with the
-submission UUIDs and key flags recorded in the commit walk.
-
 ## How to update
 
 Every ported submission updates its registry row with the port commit and a
