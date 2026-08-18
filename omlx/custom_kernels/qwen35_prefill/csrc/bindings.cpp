@@ -98,6 +98,7 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "profile_category"_a = 1,
       "stream"_a = nb::none());
   m.def(
       "qwen35_ane_q4_affine_qmm_t",
@@ -109,6 +110,7 @@ NB_MODULE(_ext, m) {
       "ane_model"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "profile_category"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "qwen35_ane_q4_swiglu_t",
@@ -133,6 +135,7 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "profile_category"_a = 1,
       "stream"_a = nb::none());
   m.def(
       "qwen35_ane_dual_q4_swiglu_t",

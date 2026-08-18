@@ -195,7 +195,7 @@ class TestPagedSSDCacheConfig:
         assert config.max_size == "100GB"
         assert config.gdn_snapshot_storage == "auto"
         assert config.effective_gdn_ssd_split_enabled is False
-        assert config.gdn_sidecar_state_dtype == "rht_int16"
+        assert config.gdn_sidecar_state_dtype == "fp32"
 
     def test_custom_values(self):
         """Test custom configuration values."""

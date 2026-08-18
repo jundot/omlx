@@ -1,3 +1,4 @@
+import logging
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -230,6 +231,37 @@ def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
     assert model._omlx_ane_resident_program_count == 4
 
 
+def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ANE_RESIDENT_PROGRAM_LIMIT", 4)
+    monkeypatch.setattr(
+        ane_patch,
+        "_compile_pair",
+        lambda mlp, config: SimpleNamespace(model1=object()),
+    )
+    model = _Model(2)
+
+    with caplog.at_level(logging.INFO):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=2,
+            dual_ane=True,
+            gdn=True,
+        )
+
+    assert count == 2
+    assert model._omlx_ane_gdn_prefill_count == 0
+    assert model._omlx_ane_procedure_count == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("budget exhausted before GDN" in message for message in messages)
+    assert any("Stopped eager ANE preparation" in message for message in messages)
+
+
 def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
@@ -267,6 +299,156 @@ def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
     assert {id(layer._omlx_ane_prefill_state.model1) for layer in model.layers} == {
         id(value) for value in compiled[1][3]
     }
+
+
+def test_bank_chunk_spans_respects_byte_cap():
+    weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(4)]
+
+    spans = ane_patch._bank_chunk_spans(weights, 2 * 16)
+
+    assert spans == [(0, 2), (2, 4)]
+    assert ane_patch._bank_chunk_spans(weights, 1) == [(0, 1), (1, 2), (2, 3), (3, 4)]
+    assert ane_patch._bank_chunk_spans(weights, 1 << 30) == [(0, 4)]
+
+
+def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    compiled = []
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        compiled.append((len(weights), ane_instance))
+        if len(weights) > 2:
+            raise RuntimeError("ANE procedure bank load failed: 0x20004")
+        return [object() for _ in weights]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(4)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    # Ladder: monolithic fails, the near-half retry (3 procedures with the
+    # slack term) fails too, and the halved cap lands on single-procedure
+    # banks that succeed.
+    assert count == 4
+    assert compiled == [
+        (4, 1),
+        (3, 1),
+        (1, 1),
+        (1, 2),
+        (1, 1),
+        (1, 2),
+        (1, 1),
+        (1, 2),
+        (1, 1),
+        (1, 2),
+    ]
+    assert model._omlx_ane_resident_program_count == 8
+    assert model._omlx_ane_procedure_count == 4
+    assert all(
+        layer._omlx_ane_prefill_state.model1 is not None for layer in model.layers
+    )
+
+
+def test_enable_first_retry_is_a_near_half_split(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    compiled = []
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        compiled.append((len(weights), ane_instance))
+        if len(weights) == 4:
+            raise RuntimeError("ANE procedure bank load failed: 0x20004")
+        return [object() for _ in weights]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(4)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    assert compiled == [(4, 1), (3, 1), (3, 2), (1, 1), (1, 2)]
+    assert model._omlx_ane_resident_program_count == 4
+
+
+def test_enable_env_cap_forces_split_banks(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "1")
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    compiled = []
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        compiled.append((len(weights), ane_instance))
+        return [object() for _ in weights]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(4)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    assert all(size == 1 for size, _ in compiled)
+    assert len(compiled) == 8
+    assert model._omlx_ane_resident_program_count == 8
+
+
+def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    per_layer = []
+
+    def compile_pair(mlp, config):
+        per_layer.append(mlp)
+        return SimpleNamespace(model1=object())
+
+    monkeypatch.setattr(ane_patch, "_compile_pair", compile_pair)
+    model = _Model(4)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    assert len(per_layer) == 4
+    assert model._omlx_ane_dual_prefill_count == 4
 
 
 def test_compile_pair_builds_one_combined_ane_program(monkeypatch):
@@ -666,3 +848,46 @@ def test_enable_rejects_unsafe_fixed_shape_settings(
             fraction=fraction,
             max_layers=max_layers,
         )
+
+
+def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_compile_pair", lambda mlp, config: object())
+    model = _Model(2)
+
+    count = ane_patch.enable_qwen35_ane_prefill(model, sequence_length=2048)
+
+    assert count == 2
+
+
+def test_enable_env_forces_ane_on_nax_gpu(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "1")
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_compile_pair", lambda mlp, config: object())
+    model = _Model(2)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model, sequence_length=2048, max_layers=2
+    )
+
+    assert count == 2
+
+
+def test_enable_env_kill_switch_wins(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "0")
+    installed = []
+    monkeypatch.setattr(
+        ane_patch, "_install_dispatch", lambda: installed.append(True) or True
+    )
+
+    count = ane_patch.enable_qwen35_ane_prefill(_Model(1), sequence_length=2048)
+
+    assert count == 0
+    assert installed == []

@@ -97,6 +97,49 @@ async def test_private_rank_zero_client_has_finite_inactivity_timeouts():
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_request_read_timeout_defaults_from_env_var(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")
+    engine = DistributedBatchedEngine(_deployment())
+    client = engine._new_client("http://127.0.0.1:1")
+    try:
+        assert client.timeout.read == 600.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_env_var_takes_backseat_to_explicit_arg(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")
+    engine = DistributedBatchedEngine(_deployment(), request_read_timeout=12.5)
+    client = engine._new_client("http://127.0.0.1:1")
+    try:
+        assert client.timeout.read == 12.5
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_env_var_rejects_non_numeric(monkeypatch):
+    monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "not-a-number")
+    with pytest.raises(ValueError, match="must be a number"):
+        DistributedBatchedEngine(_deployment())
+
+
+@pytest.mark.asyncio
+async def test_request_read_timeout_rejects_non_finite_and_non_positive(monkeypatch):
+    for bad in ("nan", "inf", "0", "-5"):
+        monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", bad)
+        with pytest.raises(ValueError, match="finite positive"):
+            DistributedBatchedEngine(_deployment())
+
+    monkeypatch.delenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT")
+    with pytest.raises(ValueError, match="finite positive"):
+        DistributedBatchedEngine(_deployment(), request_read_timeout=float("nan"))
+    with pytest.raises(ValueError, match="finite positive"):
+        DistributedBatchedEngine(_deployment(), request_read_timeout=0.0)
+
+
 def _stalled_engine():
     def handler(request):
         raise httpx.ReadTimeout("collective stalled", request=request)
@@ -144,6 +187,77 @@ async def test_distributed_stream_bounds_rank_zero_read_stalls():
         await engine._client.aclose()
 
     assert len(status_calls) == 2, "availability must be rechecked after timeout"
+
+
+def test_chat_payload_folds_thinking_budget_into_chat_template_kwargs():
+    engine = DistributedBatchedEngine(_deployment())
+    payload = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={
+            "chat_template_kwargs": {"reasoning_effort": "low"},
+            "thinking_budget": 2048,
+        },
+    )
+    assert payload["chat_template_kwargs"] == {
+        "reasoning_effort": "low",
+        "thinking_budget": 2048,
+    }
+
+
+def test_chat_payload_without_thinking_budget_leaves_template_kwargs_untouched():
+    engine = DistributedBatchedEngine(_deployment())
+    payload = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={"chat_template_kwargs": {"reasoning_effort": "low"}},
+    )
+    assert payload["chat_template_kwargs"] == {"reasoning_effort": "low"}
+
+
+def test_completion_payload_folds_thinking_budget_into_chat_template_kwargs():
+    engine = DistributedBatchedEngine(_deployment())
+    payload = engine._completion_payload(
+        prompt="hi",
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={"thinking_budget": 512},
+    )
+    assert payload["chat_template_kwargs"] == {"thinking_budget": 512}
+
+
+def test_model_thinking_budget_is_supported_by_distributed_engine():
+    engine = DistributedBatchedEngine(
+        _deployment(),
+        model_settings=SimpleNamespace(thinking_budget_enabled=True),
+    )
+
+    engine._validate_model_settings()
 
 
 @pytest.mark.asyncio
@@ -629,11 +743,8 @@ async def test_experimental_token_only_output_rejects_seeded_single_request():
 async def test_distributed_preflight_rejects_features_before_stream_starts():
     engine = _ready_engine(lambda request: httpx.Response(500))
     try:
-        with pytest.raises(ValueError, match="thinking budgets"):
-            await engine.preflight_chat(
-                [{"role": "user", "content": "hello"}],
-                thinking_budget=512,
-            )
+        # thinking_budget is now supported: it is forwarded to the rank inside
+        # chat_template_kwargs instead of being rejected.
         with pytest.raises(ValueError, match="SpecPrefill"):
             await engine.preflight_chat(
                 [{"role": "user", "content": "hello"}],

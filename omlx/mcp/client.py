@@ -212,7 +212,7 @@ class MCPClient:
             self._streamable_http_client = streamable_http_client(
                 url=self.config.url, http_client=self._http_client
             )
-            self._read, self._write, _ = await self._streamable_http_client.__aenter__()
+            self._read, self._write = await self._streamable_http_client.__aenter__()
             self._session = ClientSession(self._read, self._write)
             await self._session.__aenter__()
         except Exception:

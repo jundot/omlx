@@ -90,6 +90,13 @@ enum AdminAPI {
     static let benchStart      = "\(prefix)/bench/start"
     static func benchResults(_ benchId: String) -> String { "\(prefix)/bench/\(benchId)/results" }
     static func benchCancel(_ benchId: String) -> String  { "\(prefix)/bench/\(benchId)/cancel" }
+    static let aneTuneStart = "\(prefix)/bench/ane-tune/start"
+    static func aneTuneResults(_ tuningId: String) -> String {
+        "\(prefix)/bench/ane-tune/\(tuningId)/results"
+    }
+    static func aneTuneCancel(_ tuningId: String) -> String {
+        "\(prefix)/bench/ane-tune/\(tuningId)/cancel"
+    }
 
     // PR 13 — Accuracy bench
     static let accuracyQueueAdd    = "\(prefix)/bench/accuracy/queue/add"

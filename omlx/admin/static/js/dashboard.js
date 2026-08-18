@@ -117,7 +117,7 @@
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_state_dtype: 'rht_int16' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
@@ -229,6 +229,18 @@
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            aneTuning: {
+                tuningId: null,
+                modelId: null,
+                running: false,
+                cancelling: false,
+                applying: false,
+                applied: false,
+                total: 0,
+                status: null,
+                error: '',
+            },
+            _aneTuningPollTimer: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -1465,7 +1477,7 @@
                     this.discoverClusterPeers(),
                     this.loadClusterJoinStatus(),
                 ]);
-                await this.initializeClusterSetup();
+                await this.initializeClusterSetup({ preview: false });
             },
 
             async runClusterWorkerSmoke() {
@@ -1799,7 +1811,7 @@
                         ? localCapacityBytes
                         : Number(local.capacity_bytes || 0),
                     reserve_gib: Number(local.reserve_gib || 0),
-                    role: 'workstation',
+                    role: local.role || 'workstation',
                     accelerator: this.clusterStatus?.node?.accelerator || 'metal',
                     accelerator_vendor:
                         this.clusterStatus?.node?.accelerator_vendor || 'apple',
@@ -1909,7 +1921,7 @@
             // cluster. A deployment remains authoritative on restart; without
             // one, all RDMA peers are selected instead of forcing a three-Mac
             // user to choose one and silently ignore the rest.
-            async initializeClusterSetup() {
+            async initializeClusterSetup({ preview = true } = {}) {
                 const deployment = (this.clusterDeployments || [])[0] || null;
                 if (
                     this._clusterKnownNodesNeedsSync
@@ -2030,7 +2042,7 @@
                     if (recommended) this.selectClusterModel(recommended);
                 }
                 this.normalizeClusterTensorParallelSize();
-                await this.previewClusterWeightBalance();
+                if (preview) await this.previewClusterWeightBalance();
             },
 
             // 2-second "Copied!" affordance on the exchange token, matching
@@ -3431,16 +3443,42 @@
                         busy: true,
                     };
                 }
-                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                // Strictly false, not merely not-true: a payload that predates
+                // the runtime fields carries no verdict, and rendering it red
+                // would invent a measurement nobody took.
+                if (this.clusterPeerProbe.runtime_compatible === false) {
                     const mismatches = Array.isArray(
                         this.clusterPeerProbe.runtime_mismatches
                     ) ? this.clusterPeerProbe.runtime_mismatches.filter(Boolean) : [];
+                    // bootstrap_required means oMLX is absent or unverifiable on
+                    // that Mac, not that two runtimes disagree. The two need
+                    // different actions, so they must not share a headline.
+                    if (this.clusterPeerProbe.bootstrap_required) {
+                        return {
+                            key: 'bootstrap',
+                            label: 'Worker runtime setup needed',
+                            detail: this.clusterConnectionError
+                                || mismatches[0]
+                                || 'This worker is reachable, but its oMLX runtime could not be verified.',
+                            tone: 'amber',
+                            busy: false,
+                        };
+                    }
                     return {
                         key: 'runtime-mismatch',
                         label: 'Worker runtime mismatch',
                         detail: mismatches.join(' · ')
                             || 'The worker runtime differs from this Mac.',
                         tone: 'red',
+                        busy: false,
+                    };
+                }
+                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                    return {
+                        key: 'runtime-unverified',
+                        label: 'Worker runtime not verified',
+                        detail: 'This worker is reachable, but oMLX could not verify its runtime yet.',
+                        tone: 'amber',
                         busy: false,
                     };
                 }
@@ -6408,7 +6446,7 @@
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
                             gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
-                            gdn_sidecar_state_dtype: this.globalSettings.cache.gdn_sidecar_state_dtype,
+                            gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_context_window_policy: this.globalSettings.sampling.max_context_window_policy || null,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
@@ -7231,6 +7269,7 @@
             },
             async applyProfileToForm(profile) {
                 const seq = ++this._applySeq;
+                this.profileError = '';
                 try {
                     const r = await fetch(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
@@ -7258,8 +7297,12 @@
                         if (m) m.settings = { ...settings };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to apply profile';
                     }
                 } catch (e) {
+                    this.profileError = String(e);
                     console.error('Failed to apply profile:', e);
                 }
             },
@@ -7456,6 +7499,208 @@
                     console.error('Delete template failed:', e);
                 } finally {
                     this.templateDeleteConfirm = null;
+                }
+            },
+
+            aneTuningForSelectedModel() {
+                return !!this.selectedModel
+                    && this.aneTuning.modelId === this.selectedModel.id;
+            },
+
+            aneTuningProgressPercent() {
+                const current = Number(this.aneTuning.status?.current || 0);
+                const total = Number(
+                    this.aneTuning.status?.total || this.aneTuning.total || 0
+                );
+                if (total <= 0) return 0;
+                return Math.max(0, Math.min(100, current / total * 100));
+            },
+
+            aneTuningRecommendationText() {
+                const recommendation = this.aneTuning.status?.recommendation;
+                if (!recommendation) return '';
+                const speed = Number(recommendation.processing_tps || 0).toFixed(1);
+                const speedup = Number(recommendation.speedup_percent || 0);
+                const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
+                if (!recommendation.enabled) {
+                    return `GPU only · ${speed} prompt tok/s · ${speedupText}`;
+                }
+                const parts = [
+                    `MLP ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                ];
+                if (recommendation.gdn_enabled) {
+                    parts.push(
+                        `GDN ${Math.round(Number(recommendation.gdn_fraction) * 100)}%`
+                    );
+                } else {
+                    parts.push('GDN off');
+                }
+                return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
+            },
+
+            _scheduleANETuningPoll() {
+                if (this._aneTuningPollTimer) {
+                    clearTimeout(this._aneTuningPollTimer);
+                }
+                if (!this.aneTuning.running) return;
+                this._aneTuningPollTimer = setTimeout(
+                    () => this.pollANETuning(),
+                    1000,
+                );
+            },
+
+            async startANETuning() {
+                if (!this.selectedModel || this.aneTuning.running) return;
+                const modelId = this.selectedModel.id;
+                if (this._aneTuningPollTimer) {
+                    clearTimeout(this._aneTuningPollTimer);
+                    this._aneTuningPollTimer = null;
+                }
+                this.aneTuning = {
+                    tuningId: null,
+                    modelId,
+                    running: true,
+                    cancelling: false,
+                    applying: false,
+                    applied: false,
+                    total: 0,
+                    status: null,
+                    error: '',
+                };
+                try {
+                    const response = await fetch('/admin/api/bench/ane-tune/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: modelId,
+                            sequence_length: parseInt(
+                                this.modelSettings.qwen35_ane_prefill_sequence_length
+                            ) || 2048,
+                            repeats: 2,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to start ANE tuning.');
+                    }
+                    this.aneTuning.tuningId = data.tuning_id;
+                    this.aneTuning.total = Number(data.total || 0);
+                    await this.pollANETuning();
+                } catch (error) {
+                    this.aneTuning.running = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async pollANETuning() {
+                const tuningId = this.aneTuning.tuningId;
+                if (!tuningId || !this.aneTuning.running) return;
+                try {
+                    const response = await fetch(
+                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results`
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to read ANE tuning progress.');
+                    }
+                    if (this.aneTuning.tuningId !== tuningId) return;
+                    this.aneTuning.status = data;
+                    this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
+                    this.aneTuning.running = data.status === 'running';
+                    this.aneTuning.cancelling = false;
+                    if (data.status === 'error') {
+                        this.aneTuning.error = data.error || data.message || 'ANE tuning failed.';
+                    } else if (data.status === 'cancelled') {
+                        this.aneTuning.error = '';
+                    }
+                    this._scheduleANETuningPoll();
+                } catch (error) {
+                    this.aneTuning.running = false;
+                    this.aneTuning.cancelling = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async cancelANETuning() {
+                const tuningId = this.aneTuning.tuningId;
+                if (!tuningId || !this.aneTuning.running || this.aneTuning.cancelling) return;
+                this.aneTuning.cancelling = true;
+                try {
+                    const response = await fetch(
+                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel`,
+                        { method: 'POST' },
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to cancel ANE tuning.');
+                    }
+                    await this.pollANETuning();
+                } catch (error) {
+                    this.aneTuning.cancelling = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async applyANETuningRecommendation() {
+                if (!this.selectedModel || !this.aneTuningForSelectedModel()) return;
+                const recommendation = this.aneTuning.status?.recommendation;
+                if (!recommendation || this.aneTuning.applying) return;
+                const patch = {
+                    qwen35_ane_prefill_enabled: !!recommendation.enabled,
+                    qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                };
+                if (recommendation.enabled) {
+                    patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
+                    patch.qwen35_ane_prefill_dual_ane = true;
+                    patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
+                    if (recommendation.gdn_enabled) {
+                        patch.qwen35_ane_prefill_gdn_fraction = Number(
+                            recommendation.gdn_fraction
+                        );
+                    }
+                }
+
+                this.aneTuning.applying = true;
+                this.aneTuning.error = '';
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(patch),
+                        },
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
+                    }
+                    Object.assign(this.modelSettings, patch);
+                    const model = this.models.find(item => item.id === this.selectedModel.id);
+                    if (model && data.settings) {
+                        model.settings = { ...data.settings };
+                    }
+                    this.aneTuning.applied = true;
+                } catch (error) {
+                    this.aneTuning.error = error.message || String(error);
+                } finally {
+                    this.aneTuning.applying = false;
                 }
             },
 

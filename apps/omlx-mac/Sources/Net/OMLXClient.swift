@@ -446,6 +446,20 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.benchCancel(benchId))
     }
 
+    @discardableResult
+    func startANETuning(_ body: ANETuningStartRequest) async throws -> ANETuningStartResponse {
+        try await post(AdminAPI.aneTuneStart, body: body)
+    }
+
+    func getANETuningResults(tuningId: String) async throws -> ANETuningStatusResponse {
+        try await get(AdminAPI.aneTuneResults(tuningId))
+    }
+
+    @discardableResult
+    func cancelANETuning(tuningId: String) async throws -> ANETuningCancelResponse {
+        try await postEmpty(AdminAPI.aneTuneCancel(tuningId))
+    }
+
     // PR 13 — Accuracy bench
 
     @discardableResult

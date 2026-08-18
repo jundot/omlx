@@ -864,10 +864,22 @@ def _log_ane_benchmark_trace(
         ),
     )
 
-    for category, layer_key in (("mlp", "mlp_layers"), ("gdn", "gdn_layers")):
+    for category, layer_key, compiled_key in (
+        ("mlp", "mlp_layers", "compiled_mlp_layers"),
+        ("gdn", "gdn_layers", "compiled_gdn_layers"),
+    ):
         values = profile.get(category, {})
         operations = int(values.get("operations", 0) or 0)
-        layers = int(config.get(layer_key, 0) or 0)
+        configured_layers = int(config.get(layer_key, 0) or 0)
+        compiled_value = config.get(compiled_key)
+        compiled_layers = (
+            None if compiled_value is None else int(compiled_value)
+        )
+        # Expectations follow what the patch actually compiled; the settings
+        # value is only the fallback when the runtime state is unknown.
+        layers = (
+            compiled_layers if compiled_layers is not None else configured_layers
+        )
         observed_shapes = operations / layers if layers > 0 else 0.0
         expected_operations = full_shapes * layers
         per_op = max(operations, 1)
@@ -878,7 +890,7 @@ def _log_ane_benchmark_trace(
         )
         logger.info(
             "[benchmark-ane-profile] pp=%d category=%s operations=%d "
-            "configured_layers=%d expected_operations=%d "
+            "configured_layers=%d compiled_layers=%s expected_operations=%d "
             "observed_shapes=%.3f input_ready_ms_per_op=%.3f "
             "ane_region_ms_per_op=%.3f ane0_eval_ms_per_op=%.3f "
             "ane1_eval_ms_per_op=%.3f gpu_qmm_ms_per_op=%.3f "
@@ -886,7 +898,8 @@ def _log_ane_benchmark_trace(
             pp_len,
             category,
             operations,
-            layers,
+            configured_layers,
+            "unknown" if compiled_layers is None else compiled_layers,
             expected_operations,
             observed_shapes,
             float(values.get("pack_ns", 0.0) or 0.0) / per_op / 1e6,
@@ -1722,6 +1735,18 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             gdn_enabled = bool(
                 getattr(model_settings, "qwen35_ane_prefill_gdn", False)
             )
+            # The settings flag only records intent. The load-time patch stores
+            # what it actually compiled on the model, so the trace and the
+            # uploaded metadata reflect the runtime state (the patch can find
+            # no eligible layers or drop layers at the program budget).
+            loaded_model = getattr(engine, "_model", None)
+            compiled_mlp = getattr(
+                loaded_model, "_omlx_ane_mlp_prefill_count", None
+            )
+            compiled_gdn = getattr(
+                loaded_model, "_omlx_ane_gdn_prefill_count", None
+            )
+            ane_active = bool(compiled_mlp or compiled_gdn)
             ane_trace_config = {
                 "sequence_length": int(
                     getattr(
@@ -1744,7 +1769,29 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     if gdn_enabled
                     else 0
                 ),
+                "compiled_mlp_layers": (
+                    None if compiled_mlp is None else int(compiled_mlp)
+                ),
+                "compiled_gdn_layers": (
+                    None if compiled_gdn is None else int(compiled_gdn)
+                ),
+                "active": ane_active,
             }
+            if not ane_active:
+                run.feature_flags = [
+                    flag
+                    for flag in run.feature_flags
+                    if flag.get("key") != "qwen35_ane_prefill"
+                ]
+                run.experimental_features = [
+                    feature
+                    for feature in run.experimental_features
+                    if feature != "qwen35_ane_prefill"
+                ]
+                logger.info(
+                    "Qwen ANE prefill is enabled in settings but inactive at "
+                    "runtime; benchmark metadata reports it as off"
+                )
         logger.info(
             "[benchmark-ane-config] model=%s enabled=%s config=%s",
             request.model_id,

@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from omlx.admin.benchmark import (
     _filter_uploaded_settings,
     _generate_prompt,
     _load_bench_corpus,
+    _log_ane_benchmark_trace,
     _run_batch_test,
     _run_single_test,
     _upload_model_name,
@@ -2103,3 +2105,53 @@ class TestRunExternalBenchmark:
         assert run.events[-1]["type"] == "error"
         assert "cancelled" in run.events[-1]["message"].lower()
         client.aclose.assert_awaited()
+
+
+# =============================================================================
+# ANE benchmark trace tests
+# =============================================================================
+
+
+class TestAneBenchmarkTrace:
+    def test_expectations_follow_compiled_layers(self, caplog):
+        with caplog.at_level(logging.INFO):
+            _log_ane_benchmark_trace(
+                pp_len=16385,
+                prefill_duration_s=1.0,
+                config={
+                    "sequence_length": 2048,
+                    "mlp_layers": 64,
+                    "gdn_layers": 48,
+                    "compiled_mlp_layers": 60,
+                    "compiled_gdn_layers": 0,
+                    "active": True,
+                },
+                profile={"mlp": {"operations": 480}, "gdn": {}},
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        mlp_line = next(m for m in messages if "category=mlp" in m)
+        assert "configured_layers=64" in mlp_line
+        assert "compiled_layers=60" in mlp_line
+        assert "expected_operations=480" in mlp_line
+        gdn_line = next(m for m in messages if "category=gdn" in m)
+        assert "compiled_layers=0" in gdn_line
+        assert "expected_operations=0" in gdn_line
+
+    def test_settings_layers_remain_the_fallback_when_unknown(self, caplog):
+        with caplog.at_level(logging.INFO):
+            _log_ane_benchmark_trace(
+                pp_len=4096,
+                prefill_duration_s=None,
+                config={"sequence_length": 2048, "mlp_layers": 64},
+                profile={},
+            )
+
+        mlp_line = next(
+            record.getMessage()
+            for record in caplog.records
+            if "category=mlp" in record.getMessage()
+        )
+        assert "configured_layers=64" in mlp_line
+        assert "compiled_layers=unknown" in mlp_line
+        assert "expected_operations=64" in mlp_line

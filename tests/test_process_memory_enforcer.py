@@ -1385,7 +1385,8 @@ class TestMetalWiredLimit:
         # left untouched.
         mock_mx.set_wired_limit.assert_not_called()
         total = 512 * 1024**3
-        assert enforcer._metal_wired_limit_request == total - total // 20
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert enforcer._metal_wired_limit_request == expected
         assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
@@ -2639,7 +2640,8 @@ class TestWiredLimitSuggestionClamp:
         with self._with_total(total):
             clamped = pme._wired_limit_suggestion_bytes(desired)
         # 5% of 512 GiB = 25.6 GiB reserve
-        assert clamped == total - total // 20
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert clamped == expected
         assert clamped < desired
 
     def test_small_mac_recommendation_unchanged(self):
@@ -2655,7 +2657,17 @@ class TestWiredLimitSuggestionClamp:
         total = 4 * 1024**3
         with self._with_total(total):
             clamped = pme._wired_limit_suggestion_bytes(8 * 1024**3)
-        assert clamped == total - total // 20
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert clamped == expected
+
+    def test_128_gib_suggestion_floors_to_whole_mib(self):
+        """The sysctl accepts whole MiB, so the 95% threshold must not be
+        rounded up past the safe byte limit in the admin UI."""
+        total = 128 * 1024**3
+        desired = 122 * 1024**3
+        with self._with_total(total):
+            suggestion = pme._wired_limit_suggestion_bytes(desired)
+        assert suggestion == 124518 * 1024**2
 
     def test_log_hint_uses_clamped_value(self, caplog):
         total = 512 * 1024**3
@@ -2680,21 +2692,17 @@ class TestWiredLimitSuggestionClamp:
         """A user cap at the recommended level must not trigger the raise hint
         even when the static ceiling is higher (the #2184 report followed the
         old hint into a jetsam crash-loop)."""
-        total = 512 * 1024**3
-        desired = total - 8 * 1024**3  # 504 GiB ceiling
-        user_cap = total - total // 20  # exactly the recommendation
+        total = 128 * 1024**3
+        desired = 122 * 1024**3
+        user_cap = 124518 * 1024**2  # highest whole-MiB value below 95%
         with (
             self._with_total(total),
-            patch.object(
-                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
-            ),
+            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=user_cap),
             patch.object(pme.mx, "set_wired_limit", return_value=0),
             caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
         ):
             pme._apply_metal_wired_limit(desired)
-        assert not [
-            r for r in caplog.records if "Raise it with" in r.message
-        ]
+        assert not [r for r in caplog.records if "Raise it with" in r.message]
 
     def test_near_physical_user_cap_warns_jetsam(self, caplog):
         total = 512 * 1024**3
