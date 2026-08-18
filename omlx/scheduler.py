@@ -6306,7 +6306,25 @@ class Scheduler:
             if isinstance(value, list):
                 return [_copy_containers(v) for v in value]
             if isinstance(value, tuple):
-                return tuple(_copy_containers(v) for v in value)
+                copied = tuple(_copy_containers(v) for v in value)
+                # NamedTuple states must keep their concrete type: consumers
+                # dispatch on isinstance, not on arity. TurboQuant keeps its
+                # per-codec state in NamedTuples (TurboQuantPolarProdState,
+                # TurboQuantSplitState, ...), and rebuilding them as plain
+                # tuples makes every later _slice_state/_state_length call
+                # raise "Unsupported TurboQuant state type: <class 'tuple'>".
+                if type(value) is not tuple:
+                    make = getattr(type(value), "_make", None)
+                    if callable(make):
+                        try:
+                            return make(copied)
+                        except Exception:
+                            return copied
+                    try:
+                        return type(value)(copied)
+                    except Exception:
+                        return copied
+                return copied
             return value
 
         try:
