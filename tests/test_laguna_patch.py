@@ -969,3 +969,95 @@ def test_laguna_attention_resolves_sdpa_through_module():
     code = laguna_model.Attention.__call__.__code__
     assert "mlx_lm_base" in code.co_names
     assert "scaled_dot_product_attention" in code.co_names
+
+
+# --- mlxfast-challenge port: compiled fusions (Validate submission 8b4de42b) ---
+
+
+def _nvfp4_sparse_config(**overrides):
+    """Sparse-MoE NVFP4-shaped config exercising the fused decode path."""
+    cfg = _minimal_laguna_config(
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        mlp_only_layers=[],
+        mlp_layer_types=["sparse", "sparse"],
+        moe_routed_scaling_factor=2.5,
+    )
+    cfg.update(overrides)
+    return cfg
+
+
+def _registered_laguna_module():
+    """The exec'd model module the loader registers (patch must precede it)."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+    import mlx_lm.models.laguna as lm
+
+    return lm
+
+
+def _quantized_sparse_model():
+    """Small 2-layer sparse model with NVFP4 group-16 4-bit switch banks."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(**_nvfp4_sparse_config())
+    model = laguna.Model(args)
+    for layer in model.model.layers:
+        sp = layer.mlp
+        if type(sp).__name__ == "LagunaSparseMoeBlock":
+            sw = sp.switch_mlp
+            sw.gate_proj = sw.gate_proj.to_quantized(16, 4, mode="nvfp4")
+            sw.up_proj = sw.up_proj.to_quantized(16, 4, mode="nvfp4")
+            sw.down_proj = sw.down_proj.to_quantized(16, 4, mode="nvfp4")
+    return model
+
+
+def test_compiled_softplus_gate_matches_eager():
+    """Compiled softplus gate is bit-identical to the eager float32 path."""
+    import mlx.nn as nn
+
+    lm = _registered_laguna_module()
+    gate = mx.random.normal((1, 1, 4), dtype=mx.float32)
+    out = lm._compiled_softplus_gate(gate)
+    ref = nn.softplus(gate.astype(mx.float32)).astype(gate.dtype)
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
+
+
+def test_compiled_swiglu_matches_eager():
+    """Compiled SiLU product is bit-identical to mlx_lm's swiglu."""
+    from mlx_lm.models.activations import swiglu
+
+    lm = _registered_laguna_module()
+    gate = mx.random.normal((1, 1, 8, 32), dtype=mx.float32)
+    up = mx.random.normal((1, 1, 8, 32), dtype=mx.float32)
+    out = lm._swiglu(gate, up)
+    ref = swiglu(gate, up)
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
+
+
+def test_compiled_fusions_bit_exact(monkeypatch):
+    """Compiled fusions reproduce eager output exactly on one model instance."""
+    lm = _registered_laguna_module()
+    model = _quantized_sparse_model()
+
+    def run(compiled):
+        monkeypatch.setattr(lm, "_COMPILED_FUSIONS", compiled)
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill, decode)
+        return prefill, decode
+
+    pre_on, dec_on = run(True)
+    pre_off, dec_off = run(False)
+    assert mx.array_equal(pre_on, pre_off)
+    assert mx.array_equal(dec_on, dec_off)
+    assert int(mx.max(mx.abs(dec_on - dec_off)).item()) == 0

@@ -11,6 +11,7 @@ The mixed-cache method follows the proposed upstream follow-up in
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,30 @@ from mlx_lm.models.base import BaseModelArgs, create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
+
+# Compiled ``mx.compile(shapeless=True)`` fusions, ported from the Swift
+# challenge's ``lagunaCompiled*`` closures. Each body is the IDENTICAL
+# expression tree the eager code builds (same ops, same order, no
+# reassociation; compile only fuses elementwise ops, never reductions), so
+# every output is bit-exact against the uncompiled path, but the elementwise
+# tail is lowered once instead of rebuilt on every decode step. Set
+# OMLX_LAGUNA_COMPILED_FUSIONS=0 to disable.
+_COMPILED_FUSIONS = os.environ.get("OMLX_LAGUNA_COMPILED_FUSIONS", "1") != "0"
+
+
+def _compiled_softplus_gate(gate: mx.array) -> mx.array:
+    """Softplus output gate computed in float32, cast back to the input dtype."""
+    return nn.softplus(gate.astype(mx.float32)).astype(gate.dtype)
+
+
+def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
+    """SiLU(gate) * up (single-output, elementwise -> bit-exact when compiled)."""
+    return swiglu(gate, up)
+
+
+if _COMPILED_FUSIONS:
+    _compiled_softplus_gate = mx.compile(_compiled_softplus_gate, shapeless=True)
+    _swiglu = mx.compile(_swiglu, shapeless=True)
 
 
 @dataclass
@@ -182,7 +207,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        return self.down_proj(_swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class LagunaTopKRouter(nn.Module):
@@ -352,7 +377,12 @@ class Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
 
         if self.gating:
-            gate = nn.softplus(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
+            if _COMPILED_FUSIONS:
+                gate = _compiled_softplus_gate(self.g_proj(x))
+            else:
+                gate = nn.softplus(self.g_proj(x).astype(mx.float32)).astype(
+                    output.dtype
+                )
             if self.gate_per_head:
                 shape = output.shape
                 output = (
