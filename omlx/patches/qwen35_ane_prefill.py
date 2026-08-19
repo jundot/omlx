@@ -511,6 +511,93 @@ def _prepare_pair_for_bank(
     )
 
 
+def _prepare_pair_runtime_state(
+    mlp: Any,
+    config: _AnePrefillConfig,
+    model: Any,
+    model1: Any,
+) -> _CombinedMLPState | None:
+    """Prepare only the mutable CPU/GPU slices for a compiled ANE width.
+
+    Hardware tuning compiles one representative procedure for each ANE width
+    into a small calibration bank.  CPU and GPU boundaries can then move
+    without dequantizing or recompiling the ANE prefix again.  Keeping this
+    helper beside the production preparation code also guarantees that the
+    tuner exercises the same row alignment, q4 eligibility, and down-split
+    implementation as normal inference.
+    """
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    if not _eligible_pair(mlp):
+        return None
+    output_dim = int(gate.weight.shape[0])
+    bits = int(gate.bits)
+    group_size = int(gate.group_size)
+    ane_outputs = (int(output_dim * config.fraction) // 128) * 128
+    cpu_enabled = bool(
+        config.cpu_fraction > 0
+        and bits == 4
+        and config.dual_ane
+        and gate.scales.dtype == mx.float16
+        and up.scales.dtype == mx.float16
+        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_t")
+    )
+    cpu_outputs = (
+        (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
+    )
+    gpu_start = ane_outputs + cpu_outputs
+    gpu_outputs = output_dim - gpu_start
+    if ane_outputs <= 0 or gpu_outputs <= 0 or gpu_outputs % 64:
+        return None
+
+    cpu_weight = None
+    if cpu_outputs:
+        cpu_weight = mx.contiguous(
+            mx.concatenate(
+                [
+                    mx.dequantize(
+                        linear.weight[ane_outputs:gpu_start],
+                        linear.scales[ane_outputs:gpu_start],
+                        linear.biases[ane_outputs:gpu_start],
+                        group_size=group_size,
+                        bits=bits,
+                    ).astype(mx.float16)
+                    for linear in (gate, up)
+                ],
+                axis=0,
+            )
+        )
+    weight = mx.contiguous(
+        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
+    )
+    scales = mx.contiguous(
+        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
+    )
+    biases = mx.contiguous(
+        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
+    )
+    values = [weight, scales, biases]
+    if cpu_weight is not None:
+        values.append(cpu_weight)
+    mx.eval(*values)
+    return _CombinedMLPState(
+        model=model,
+        weight=weight,
+        scales=scales,
+        biases=biases,
+        ane_outputs=ane_outputs,
+        gpu_outputs=gpu_outputs,
+        model1=model1,
+        group_size=group_size,
+        bits=bits,
+        cpu_weight=cpu_weight,
+        cpu_outputs=cpu_outputs,
+        down_cpu=_prepare_cpu_linear(mlp.down_proj, config.cpu_down_fraction),
+    )
+
+
 def _gdn_linears(gdn: Any) -> tuple[Any, Any, Any, Any]:
     return (
         getattr(gdn, "in_proj_qkv", None),

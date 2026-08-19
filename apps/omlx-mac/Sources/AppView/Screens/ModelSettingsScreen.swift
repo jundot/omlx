@@ -1128,7 +1128,7 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
                     sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Benchmarks GPU-only, MLP, and MLP+GDN splits on this Mac. Uses temporary settings and takes several minutes; saved settings change only when you apply the result.",
+                                     defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Saved settings change only when you apply the result.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
                         if vm.aneTuningIsRunning {
@@ -1198,7 +1198,7 @@ private struct ExperimentalSection: View {
 
                                     ForEach(status.results) { result in
                                         HStack(spacing: 8) {
-                                            Text(result.label)
+                                            Text(result.detail ?? result.label)
                                                 .lineLimit(1)
                                                 .foregroundStyle(
                                                     result.state == "failed"
@@ -1758,16 +1758,21 @@ private struct ExperimentalSection: View {
             )
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
-        let suffix: String
+        var parts = ["MLP ANE \(mlp)%"]
         if recommendation.gdnEnabled {
             let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
-            suffix = "MLP \(mlp)% · GDN \(gdn)%"
+            parts.append("GDN ANE \(gdn)%")
         } else {
-            suffix = "MLP \(mlp)% · GDN off"
+            parts.append("GDN off")
+        }
+        if recommendation.cpuEnabled == true {
+            let gate = Int(((recommendation.cpuFraction ?? 0) * 100).rounded())
+            let down = Int(((recommendation.cpuDownFraction ?? 0) * 100).rounded())
+            parts.append("CPU \(gate)%/\(down)%")
         }
         return String(
             format: "%@ · %.1f tok/s (%+.1f%%)",
-            suffix,
+            parts.joined(separator: " · "),
             recommendation.processingTps,
             recommendation.speedupPercent
         )
@@ -1777,6 +1782,9 @@ private struct ExperimentalSection: View {
         _ result: ANETuningCandidateDTO
     ) -> String {
         guard let processingTps = result.processingTps else {
+            if let latencyMs = result.latencyMs {
+                return String(format: "%.2f ms", latencyMs)
+            }
             // Deliberately blank: the row remains visible so an interrupted
             // run shows which tests did not complete.
             return ""

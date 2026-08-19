@@ -7550,12 +7550,22 @@
                 } else {
                     parts.push('GDN off');
                 }
+                if (recommendation.cpu_enabled) {
+                    parts.push(
+                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
+                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
+                    );
+                }
                 return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
             },
 
             aneTuningResultText(result) {
                 if (result?.processing_tps === null
                     || result?.processing_tps === undefined) {
+                    if (result?.latency_ms !== null
+                        && result?.latency_ms !== undefined) {
+                        return `${Number(result.latency_ms).toFixed(2)} ms`;
+                    }
                     // Keep unfinished rows visible but leave their result cell
                     // blank, including the candidate that stopped the run.
                     return '';
@@ -7703,6 +7713,24 @@
                         patch.qwen35_ane_prefill_gdn_fraction = Number(
                             recommendation.gdn_fraction
                         );
+                    }
+                    patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                    patch.qwen35_ane_prefill_cpu_fraction = Number(
+                        recommendation.cpu_fraction || 0
+                    );
+                    patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                        recommendation.cpu_down_fraction || 0
+                    );
+                    if (recommendation.cpu_threads !== null
+                        && recommendation.cpu_threads !== undefined) {
+                        patch.qwen35_ane_prefill_cpu_threads = Number(
+                            recommendation.cpu_threads
+                        );
+                    }
+                    if (recommendation.cpu_shared_resource !== null
+                        && recommendation.cpu_shared_resource !== undefined) {
+                        patch.qwen35_ane_prefill_cpu_shared_resource =
+                            !!recommendation.cpu_shared_resource;
                     }
                 }
 

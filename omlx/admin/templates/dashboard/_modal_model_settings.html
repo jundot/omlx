@@ -806,6 +806,7 @@
                                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_fraction') }}</label>
                                                         <select x-model.number="modelSettings.qwen35_ane_prefill_cpu_fraction"
                                                                 class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                            <option value="0">{{ t('modal.model_settings.qwen_ane_cpu_down_disabled') }}</option>
                                                             <option value="0.05">5%</option>
                                                             <option value="0.1">10%</option>
                                                             <option value="0.125">12.5%</option>
@@ -813,6 +814,8 @@
                                                             <option value="0.135">13.5%</option>
                                                             <option value="0.14">14%</option>
                                                             <option value="0.15">15%</option>
+                                                            <option value="0.2">20%</option>
+                                                            <option value="0.25">25%</option>
                                                         </select>
                                                     </div>
                                                     <div>
@@ -824,6 +827,8 @@
                                                             <option value="0.15">15%</option>
                                                             <option value="0.2">20%</option>
                                                             <option value="0.25">25%</option>
+                                                            <option value="0.35">35%</option>
+                                                            <option value="0.5">50%</option>
                                                         </select>
                                                     </div>
                                                     <div>
@@ -960,7 +965,7 @@
                                                         <span class="truncate"
                                                               :class="result.state === 'failed' ? 'text-red-600' : 'text-neutral-600'"
                                                               :title="result.error || result.label"
-                                                              x-text="result.label"></span>
+                                                              x-text="result.detail || result.label"></span>
                                                         <span class="text-right tabular-nums text-neutral-800"
                                                               x-text="aneTuningResultText(result)"></span>
                                                     </div>

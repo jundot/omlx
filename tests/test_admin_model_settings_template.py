@@ -224,7 +224,12 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
     assert "qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
     assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
+    assert "qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
+    assert "qwen35_ane_prefill_cpu_fraction = Number(" in script
+    assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
+    assert "recommendation.cpu_shared_resource" in script
     assert "if (result?.processing_tps === null" in script
+    assert "result?.latency_ms !== null" in script
 
 
 def test_qwen_ane_fraction_selects_cover_nax_tuner_results():

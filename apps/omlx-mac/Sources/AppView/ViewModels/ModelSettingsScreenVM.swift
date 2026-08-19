@@ -214,6 +214,7 @@ final class ModelSettingsScreenVM {
     ]
 
     static let qwen35AneCpuFractionOptions: [(String, String)] = [
+        ("0", "Disabled"),
         ("0.05", "5%"),
         ("0.1", "10%"),
         ("0.125", "12.5%"),
@@ -221,6 +222,8 @@ final class ModelSettingsScreenVM {
         ("0.135", "13.5%"),
         ("0.14", "14%"),
         ("0.15", "15%"),
+        ("0.2", "20%"),
+        ("0.25", "25%"),
     ]
 
     static let qwen35AneCpuThreadOptions: [(String, String)] = [
@@ -237,6 +240,8 @@ final class ModelSettingsScreenVM {
         ("0.15", "15%"),
         ("0.2", "20%"),
         ("0.25", "25%"),
+        ("0.35", "35%"),
+        ("0.5", "50%"),
     ]
 
     /// `config_model_type` values that surface IndexCache in the HTML
@@ -846,6 +851,11 @@ final class ModelSettingsScreenVM {
             if recommendation.gdnEnabled {
                 patch.qwen35AnePrefillGdnFraction = recommendation.gdnFraction
             }
+            patch.qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
+            patch.qwen35AnePrefillCpuFraction = recommendation.cpuFraction
+            patch.qwen35AnePrefillCpuDownFraction = recommendation.cpuDownFraction
+            patch.qwen35AnePrefillCpuThreads = recommendation.cpuThreads
+            patch.qwen35AnePrefillCpuSharedResource = recommendation.cpuSharedResource
         }
 
         do {
@@ -859,6 +869,19 @@ final class ModelSettingsScreenVM {
             qwen35AnePrefillGdn = recommendation.gdnEnabled
             if let fraction = recommendation.gdnFraction {
                 qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
+            }
+            qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
+            if let fraction = recommendation.cpuFraction {
+                qwen35AnePrefillCpuFraction = Self.formatPct(fraction)
+            }
+            if let fraction = recommendation.cpuDownFraction {
+                qwen35AnePrefillCpuDownFraction = Self.formatPct(fraction)
+            }
+            if let threads = recommendation.cpuThreads {
+                qwen35AnePrefillCpuThreads = String(threads)
+            }
+            if let sharedResource = recommendation.cpuSharedResource {
+                qwen35AnePrefillCpuSharedResource = sharedResource
             }
             lastError = nil
         } catch {

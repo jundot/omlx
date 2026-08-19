@@ -105,6 +105,17 @@ working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
+The split tuner calibrates four workload controls: MLP gate/up work on ANE,
+MLP gate/up work on CPU, MLP down-projection work on CPU, and GDN work on
+ANE. It packages several widths from one real MLP and GDN layer into a small
+temporary procedure bank, measures the production native paths, and then
+eagerly compiles only the predicted full-model candidate. Timings from that
+application-level run rebalance the ANE, CPU, and GPU branch rates once before
+a final verification. This avoids a four-dimensional full-model grid while
+still making end-to-end prompt throughput the recommendation criterion. CPU
+dimensions are skipped automatically when the checkpoint or native extension
+does not support FP16 CPU sharing.
+
 When the feature is active, oMLX aligns the scheduler's prompt chunk size with
 the configured fixed ANE shape. This also overrides the wider Qwen prefill
 floor used on high-memory systems. A 4,096-token ANE shape is supported, but a

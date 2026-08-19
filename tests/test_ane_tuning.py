@@ -30,7 +30,9 @@ def test_nax_fraction_grid_covers_faster_gpu_balance(monkeypatch):
 def test_candidate_settings_are_transient_copy():
     base = ModelSettings()
     request = ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048)
-    candidate = ane_tuning._Candidate("test", True, 0.25, True, 0.35)
+    candidate = ane_tuning._Candidate(
+        "test", True, 0.25, True, 0.35, True, 0.125, 0.20
+    )
 
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
 
@@ -38,37 +40,86 @@ def test_candidate_settings_are_transient_copy():
     assert tuned.qwen35_ane_prefill_enabled is True
     assert tuned.qwen35_ane_prefill_fraction == 0.25
     assert tuned.qwen35_ane_prefill_gdn_fraction == 0.35
+    assert tuned.qwen35_ane_prefill_cpu_enabled is True
+    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.125
+    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.20
     assert base.qwen35_ane_prefill_enabled is False
     assert base.qwen35_ane_prefill_fraction == 0.53
 
 
+def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    candidate = ane_tuning._Candidate(
+        "predicted", True, 0.5, True, 0.6, True, 0.125, 0.25
+    )
+    result = {
+        "_profile": {
+            "mlp": {
+                "operations": 192,
+                "ane0_eval_ns": 19.03e6 * 192,
+                "ane1_eval_ns": 18.97e6 * 192,
+                "cpu_completion_ns": 16.33e6 * 192,
+                "gpu_completion_ns": 16.20e6 * 192,
+            },
+            "gdn": {
+                "operations": 144,
+                "ane0_eval_ns": 11.47e6 * 144,
+                "ane1_eval_ns": 11.48e6 * 144,
+                "gpu_completion_ns": 8.72e6 * 144,
+            },
+        }
+    }
+
+    refined = ane_tuning._profile_refinement(candidate, result)
+
+    assert refined.mlp_fraction == 0.465
+    assert refined.cpu_fraction == 0.135
+    assert refined.cpu_down_fraction == 0.25
+    assert refined.gdn_fraction == 0.53
+
+
 @pytest.mark.asyncio
 async def test_tuner_recommends_best_combined_split(monkeypatch):
-    monkeypatch.setattr(ane_tuning, "_fraction_grid", lambda: [0.25, 0.5])
-
     async def measure(run, pool, settings, candidate):
-        if not candidate.enabled:
-            tps = 100.0
-        elif candidate.gdn_enabled:
-            tps = 125.0 if candidate.gdn_fraction == 0.5 else 115.0
-        else:
-            tps = 110.0 if candidate.mlp_fraction == 0.5 else 105.0
+        tps = 100.0 if not candidate.enabled else 125.0
         return {
             "label": candidate.label,
             "enabled": candidate.enabled,
             "mlp_fraction": candidate.mlp_fraction,
             "gdn_enabled": candidate.gdn_enabled,
             "gdn_fraction": candidate.gdn_fraction,
+            "cpu_enabled": candidate.cpu_enabled,
+            "cpu_fraction": candidate.cpu_fraction,
+            "cpu_down_fraction": candidate.cpu_down_fraction,
             "processing_tps": tps,
             "samples": [tps],
         }
 
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.5,
+            cpu_fraction=0.125,
+            cpu_down_fraction=0.2,
+            gdn_enabled=True,
+            gdn_fraction=0.5,
+            cpu_enabled=True,
+            cpu_threads=8,
+            cpu_shared_resource=True,
+        )
+
     monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+    async def get_engine(*args, **kwargs):
+        return object()
+
     pool = SimpleNamespace(
         _settings_manager=SimpleNamespace(
             get_settings=lambda model_id: ModelSettings()
         ),
         get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
     )
     run = ane_tuning.create_run(
         ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
@@ -77,12 +128,17 @@ async def test_tuner_recommends_best_combined_split(monkeypatch):
     await ane_tuning.run_tuning(run, pool)
 
     assert run.status == "completed"
-    assert run.current == 5
+    assert run.current == run.total
     assert run.recommendation == {
         "enabled": True,
         "mlp_fraction": 0.5,
         "gdn_enabled": True,
         "gdn_fraction": 0.5,
+        "cpu_enabled": True,
+        "cpu_fraction": 0.125,
+        "cpu_down_fraction": 0.2,
+        "cpu_threads": 8,
+        "cpu_shared_resource": True,
         "processing_tps": 125.0,
         "speedup_percent": 25.0,
         "sequence_length": 2048,
@@ -91,8 +147,6 @@ async def test_tuner_recommends_best_combined_split(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tuner_keeps_gpu_for_sub_noise_gain(monkeypatch):
-    monkeypatch.setattr(ane_tuning, "_fraction_grid", lambda: [0.5])
-
     async def measure(run, pool, settings, candidate):
         tps = 100.5 if candidate.enabled else 100.0
         return {
@@ -101,16 +155,29 @@ async def test_tuner_keeps_gpu_for_sub_noise_gain(monkeypatch):
             "mlp_fraction": candidate.mlp_fraction,
             "gdn_enabled": candidate.gdn_enabled,
             "gdn_fraction": candidate.gdn_fraction,
+            "cpu_enabled": candidate.cpu_enabled,
+            "cpu_fraction": candidate.cpu_fraction,
+            "cpu_down_fraction": candidate.cpu_down_fraction,
             "processing_tps": tps,
             "samples": [tps],
         }
 
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            0.5, 0.125, 0.2, True, 0.5, True, 8, True
+        )
+
     monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+    async def get_engine(*args, **kwargs):
+        return object()
+
     pool = SimpleNamespace(
         _settings_manager=SimpleNamespace(
             get_settings=lambda model_id: ModelSettings()
         ),
         get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
     )
     run = ane_tuning.create_run(
         ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
@@ -125,28 +192,35 @@ async def test_tuner_keeps_gpu_for_sub_noise_gain(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
-    monkeypatch.setattr(ane_tuning, "_fraction_grid", lambda: [0.25, 0.5])
-
     async def measure(run, pool, settings, candidate):
-        if candidate.mlp_fraction == 0.5 and not candidate.gdn_enabled:
-            raise MemoryError("Metal heap exhausted")
-        tps = 100.0 if not candidate.enabled else 105.0
+        tps = 100.0
         return {
             "label": candidate.label,
             "enabled": candidate.enabled,
             "mlp_fraction": candidate.mlp_fraction,
             "gdn_enabled": candidate.gdn_enabled,
             "gdn_fraction": candidate.gdn_fraction,
+            "cpu_enabled": candidate.cpu_enabled,
+            "cpu_fraction": candidate.cpu_fraction,
+            "cpu_down_fraction": candidate.cpu_down_fraction,
             "processing_tps": tps,
             "samples": [tps],
         }
 
+    async def calibrate(run, engine, settings):
+        raise MemoryError("Metal heap exhausted")
+
     monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+    async def get_engine(*args, **kwargs):
+        return object()
+
     pool = SimpleNamespace(
         _settings_manager=SimpleNamespace(
             get_settings=lambda model_id: ModelSettings()
         ),
         get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
     )
     run = ane_tuning.create_run(
         ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
@@ -156,26 +230,27 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
     snapshot = ane_tuning.run_snapshot(run)
 
     assert run.status == "error"
-    assert run.current == 2
-    assert run.total == 5
-    assert len(snapshot["results"]) == 5
+    assert run.current == 1
+    assert len(snapshot["results"]) == 6
     assert [result["state"] for result in snapshot["results"]] == [
         "completed",
-        "completed",
         "failed",
+        "pending",
+        "pending",
         "pending",
         "pending",
     ]
     assert [result["processing_tps"] for result in snapshot["results"]] == [
         100.0,
-        105.0,
+        None,
+        None,
         None,
         None,
         None,
     ]
-    assert snapshot["results"][1]["speedup_percent"] == 5.0
-    assert snapshot["results"][2]["error"] == "MemoryError: Metal heap exhausted"
+    assert snapshot["results"][0]["speedup_percent"] == 0.0
+    assert snapshot["results"][1]["error"] == "MemoryError: Metal heap exhausted"
     assert snapshot["termination_reason"] == (
-        "Stopped after 2 of 5 tests: MemoryError: Metal heap exhausted"
+        f"Stopped after 1 of {run.total} tests: MemoryError: Metal heap exhausted"
     )
     assert snapshot["recommendation"] is None
