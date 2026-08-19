@@ -679,11 +679,18 @@ async def _calibrate_components(
 
     gate = mlp.gate_proj
     bits = int(gate.bits)
-    cpu_supported = bool(
+    cpu_gate_supported = bool(
         run.request.allow_cpu
-        and bits == 4
+        and bits in (4, 5, 6, 8)
         and gate.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_t")
+        and mlp.up_proj.scales.dtype == mx.float16
+        and fast.has_symbol(patch._cpu_gate_kernel_symbol(bits))
+    )
+    down = mlp.down_proj
+    cpu_down_supported = bool(
+        run.request.allow_cpu
+        and gate.scales.dtype == mx.float16
+        and down.scales.dtype == mx.float16
         and fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t")
     )
     gdn_cpu_supported = bool(
@@ -691,11 +698,12 @@ async def _calibrate_components(
         and run.request.allow_cpu_gdn
         and run.request.allow_ane_gdn
         and gdn is not None
+        and gate.scales.dtype == mx.float16
         and gdn.in_proj_qkv.scales.dtype == mx.float16
         and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
     )
     cpu_shared = bool(
-        (cpu_supported or gdn_cpu_supported)
+        (cpu_gate_supported or cpu_down_supported or gdn_cpu_supported)
         and run.request.allow_cpu_shared_resource
         and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
         and fast.qwen35_cpu_shared_resource_available()
@@ -706,12 +714,12 @@ async def _calibrate_components(
     fractions = run.fractions
     cpu_fractions = (
         _cpu_fraction_grid()
-        if cpu_supported and run.request.allow_cpu_gate
+        if cpu_gate_supported and run.request.allow_cpu_gate
         else [0.0]
     )
     down_fractions = (
         _cpu_down_fraction_grid()
-        if cpu_supported and run.request.allow_cpu_down
+        if cpu_down_supported and run.request.allow_cpu_down
         else [0.0]
     )
     gdn_cpu_fractions = (

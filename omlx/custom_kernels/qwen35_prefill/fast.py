@@ -88,6 +88,7 @@ NATIVE_SYMBOLS = (
     "qwen35_cpu_fp16_affine_qmm_t",
     "qwen35_ane_dual_affine_qmm_t",
     "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+    "qwen35_ane_dual_cpu_fp16_swiglu_t",
     "qwen35_ane_dual_q4_swiglu_t",
     "qwen35_ane_dual_affine_swiglu_t",
     "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
@@ -161,6 +162,40 @@ def qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
             *args, cpu_shared_resource
         )
     return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(*args)
+
+
+def qwen35_ane_dual_cpu_fp16_swiglu_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_swiglu_t"
+    ):
+        raise RuntimeError("ANE/CPU/GPU fp16 hybrid SwiGLU is unavailable")
+    return _ext.qwen35_ane_dual_cpu_fp16_swiglu_t(
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        bits,
+        variant,
+        group_size,
+        cpu_threads,
+        cpu_shared_resource,
+    )
 
 
 def qwen35_ane_dual_cpu_fp16_affine_qmm_t(

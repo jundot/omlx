@@ -184,6 +184,22 @@ NB_MODULE(_ext, m) {
       "cpu_shared_resource"_a = false,
       "stream"_a = nb::none());
   m.def(
+      "qwen35_ane_dual_cpu_fp16_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_cpu_fp16_swiglu_t,
+      "x"_a,
+      "cpu_weight"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "cpu_threads"_a = 0,
+      "cpu_shared_resource"_a = false,
+      "stream"_a = nb::none());
+  m.def(
       "qwen35_ane_dual_q4_swiglu_t",
       &omlx::qwen35_prefill_kernels::qwen35_ane_dual_q4_swiglu_t,
       "x"_a,

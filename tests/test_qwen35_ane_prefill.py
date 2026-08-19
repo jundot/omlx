@@ -69,6 +69,66 @@ class _GDN(nn.Module):
         self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
 
 
+class _Q6MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=6
+        )
+        self.up_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=6
+        )
+        self.down_proj = nn.QuantizedLinear(
+            256, 128, bias=False, group_size=64, bits=6
+        )
+        for linear in (self.gate_proj, self.up_proj, self.down_proj):
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+
+
+class _Q6GDN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=6
+        )
+        self.in_proj_z = nn.QuantizedLinear(
+            128, 128, bias=False, group_size=64, bits=6
+        )
+        self.in_proj_b = nn.QuantizedLinear(
+            128, 48, bias=False, group_size=64, bits=6
+        )
+        self.in_proj_a = nn.QuantizedLinear(
+            128, 48, bias=False, group_size=64, bits=6
+        )
+        for linear in (
+            self.in_proj_qkv,
+            self.in_proj_z,
+            self.in_proj_b,
+            self.in_proj_a,
+        ):
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+
+
+def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
+    assert ane_patch._eligible_pair(_Q6MLP())
+    assert ane_patch._eligible_gdn(_Q6GDN())
+
+
+@pytest.mark.parametrize(
+    ("bits", "symbol"),
+    [
+        (4, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"),
+        (5, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+        (6, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+        (8, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+    ],
+)
+def test_cpu_gate_kernel_keeps_q4_specialized(bits, symbol):
+    assert ane_patch._cpu_gate_kernel_symbol(bits) == symbol
+
+
 class _OQ4eMLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1021,6 +1081,44 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
         8,
         128,
     )
+@pytest.mark.parametrize("bits", [5, 6, 8])
+def test_prepare_pair_enables_cpu_gate_share_for_q5_plus(monkeypatch, bits):
+    mlp = SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=bits
+        ),
+        up_proj=nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=bits
+        ),
+        down_proj=nn.QuantizedLinear(
+            256, 128, bias=False, group_size=64, bits=bits
+        ),
+    )
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_dual_cpu_fp16_swiglu_t",
+    )
+
+    state = ane_patch._prepare_pair_runtime_state(
+        mlp,
+        ane_patch._AnePrefillConfig(
+            2048, 0.5, 8, dual_ane=True, cpu_fraction=0.25
+        ),
+        object(),
+        object(),
+    )
+
+    assert state is not None
+    assert state.bits == bits
+    assert state.cpu_outputs == 64
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (128, 128)
+    assert state.gpu_outputs == 64
+    assert state.weight.shape == (128, 4 * bits)
 
 
 def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
@@ -1363,6 +1461,151 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
         8,
         128,
     )
+
+
+@pytest.mark.parametrize(
+    ("bits", "expected_kernel"),
+    [(4, "q4"), (5, "generic"), (6, "generic"), (8, "generic")],
+)
+def test_cpu_gate_uses_bit_appropriate_fused_swiglu(
+    monkeypatch, bits, expected_kernel
+):
+    activation = mx.zeros((1, 1, 4), dtype=mx.float16)
+    captured = {}
+
+    def generic_fused(*args):
+        captured["kernel"] = "generic"
+        captured["args"] = args
+        return activation
+
+    def q4_fused(*args):
+        captured["kernel"] = "q4"
+        captured["args"] = args
+        return activation
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t", q4_fused
+    )
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_swiglu_t", generic_fused
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_post_ane_linear",
+        lambda linear, value, *args, **kwargs: value,
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._CombinedMLPState(
+        model=model0,
+        model1=model1,
+        weight=mx.zeros((4, 4 * bits), dtype=mx.uint32),
+        scales=mx.zeros((4, 2), dtype=mx.float16),
+        biases=mx.zeros((4, 2), dtype=mx.float16),
+        ane_outputs=2,
+        gpu_outputs=2,
+        group_size=64,
+        bits=bits,
+        cpu_weight=mx.zeros((4, 128), dtype=mx.float16),
+        cpu_outputs=2,
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.25,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    expected_args = (
+        x,
+        state.cpu_weight,
+        state.weight,
+        state.scales,
+        state.biases,
+        model0,
+        model1,
+    )
+    if bits != 4:
+        expected_args += (bits,)
+    expected_args += (
+        8,
+        64,
+        12,
+        True,
+    )
+    assert captured == {"kernel": expected_kernel, "args": expected_args}
+
+
+def test_q6_backend_uses_generic_dual_suffix_and_reassembles_instances(monkeypatch):
+    # ANE0 gate/up, ANE1 gate/up, then GPU gate/up.
+    combined = mx.array(
+        [[[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]]],
+        dtype=mx.bfloat16,
+    )
+    captured = {}
+
+    def generic_dual(*args):
+        captured["args"] = args
+        return combined
+
+    def capture_swiglu(gate, up):
+        captured["gate"] = gate
+        captured["up"] = up
+        return gate
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", generic_dual)
+    monkeypatch.setattr(ane_patch, "swiglu", capture_swiglu)
+
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(q4_patch, "_linear_qmm", lambda linear, x, variant: x)
+    model0, model1 = object(), object()
+    state = ane_patch._CombinedMLPState(
+        model=model0,
+        model1=model1,
+        weight=mx.zeros((2, 3), dtype=mx.uint32),
+        scales=mx.zeros((2, 1), dtype=mx.bfloat16),
+        biases=mx.zeros((2, 1), dtype=mx.bfloat16),
+        ane_outputs=2,
+        gpu_outputs=1,
+        group_size=16,
+        bits=6,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(1, 0.5, 8, True),
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result, captured["gate"], captured["up"])
+
+    assert captured["args"] == (
+        x,
+        state.weight,
+        state.scales,
+        state.biases,
+        model0,
+        model1,
+        6,
+        8,
+        16,
+        0,
+    )
+    assert captured["gate"].tolist() == [[[1.0, 2.0, 3.0]]]
+    assert captured["up"].tolist() == [[[10.0, 20.0, 30.0]]]
 
 
 def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):

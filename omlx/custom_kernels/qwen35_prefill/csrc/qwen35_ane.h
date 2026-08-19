@@ -136,6 +136,16 @@ mlx::core::array qwen35_ane_dual_cpu_fp16_affine_qmm_t(
     int cpu_threads = 0, bool cpu_shared_resource = false,
     mlx::core::StreamOrDevice s = {});
 
+mlx::core::array qwen35_ane_dual_cpu_fp16_swiglu_t(
+    const mlx::core::array &x, const mlx::core::array &cpu_weight,
+    const mlx::core::array &gpu_weight, const mlx::core::array &gpu_scales,
+    const mlx::core::array &gpu_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int bits,
+    int variant = 8, int group_size = 128, int cpu_threads = 0,
+    bool cpu_shared_resource = false,
+    mlx::core::StreamOrDevice s = {});
+
 mlx::core::array qwen35_ane_dual_q4_swiglu_t(
     const mlx::core::array &x, const mlx::core::array &gpu_weight,
     const mlx::core::array &gpu_scales, const mlx::core::array &gpu_biases,

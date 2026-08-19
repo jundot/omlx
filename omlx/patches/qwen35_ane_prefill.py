@@ -162,7 +162,7 @@ def _affine_spec(
 def _fused_swiglu_symbol(bits: int, *, dual: bool) -> str:
     if bits == 4:
         return "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
-    if bits in (6, 8):
+    if bits in (5, 6, 8):
         return (
             "qwen35_ane_dual_affine_swiglu_t"
             if dual
@@ -205,8 +205,8 @@ def _eligible_pair(mlp: Any) -> bool:
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate_dtype = getattr(getattr(gate, "scales", None), "dtype", None)
-    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4, 6, 8))
-    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4, 6, 8))
+    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4, 5, 6, 8))
+    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4, 5, 6, 8))
     down_spec = _affine_spec(
         down,
         getattr(getattr(down, "scales", None), "dtype", None),
@@ -223,6 +223,14 @@ def _eligible_pair(mlp: Any) -> bool:
         and int(down.weight.shape[0])
         == int(gate.weight.shape[1]) * 32 // int(getattr(gate, "bits", 0))
     )
+
+
+def _cpu_gate_kernel_symbol(bits: int) -> str | None:
+    if bits == 4:
+        return "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+    if bits in (5, 6, 8):
+        return "qwen35_ane_dual_cpu_fp16_swiglu_t"
+    return None
 
 
 def _prepare_cpu_linear(
@@ -291,10 +299,9 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and dual_ane
-        and bits == 4
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_t")
+        and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
     )
     cpu_outputs = (
         (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
@@ -430,11 +437,10 @@ def _prepare_pair_for_bank(
     ane_outputs = (int(output_dim * config.fraction) // 128) * 128
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and bits == 4
         and config.dual_ane
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_t")
+        and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
     )
     cpu_outputs = (
         (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
@@ -543,11 +549,10 @@ def _prepare_pair_runtime_state(
     ane_outputs = (int(output_dim * config.fraction) // 128) * 128
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and bits == 4
         and config.dual_ane
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_t")
+        and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
     )
     cpu_outputs = (
         (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
@@ -1170,36 +1175,61 @@ def _backend(
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
-        if state.model1 is not None:
+        if state.model1 is not None and state.cpu_weight is not None:
             if state.bits == 4:
-                if state.cpu_weight is not None:
-                    activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
-                        x,
-                        state.cpu_weight,
-                        state.weight,
-                        state.scales,
-                        state.biases,
-                        state.model,
-                        state.model1,
-                        config.variant,
-                        state.group_size,
-                        config.cpu_threads,
-                        config.cpu_shared_resource,
-                    )
-                else:
-                    activation = fast.qwen35_ane_dual_q4_swiglu_t(
-                        x,
-                        state.weight,
-                        state.scales,
-                        state.biases,
-                        state.model,
-                        state.model1,
-                        config.variant,
-                        state.group_size,
-                    )
+                activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+                    x,
+                    state.cpu_weight,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.model1,
+                    config.variant,
+                    state.group_size,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
             else:
-                if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
-                    return None
+                activation = fast.qwen35_ane_dual_cpu_fp16_swiglu_t(
+                    x,
+                    state.cpu_weight,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.model1,
+                    state.bits,
+                    config.variant,
+                    state.group_size,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
+            return _post_ane_linear(
+                mlp.down_proj,
+                activation,
+                config.variant,
+                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
+                cpu_state=state.down_cpu,
+                cpu_threads=config.cpu_threads,
+                cpu_shared_resource=config.cpu_shared_resource,
+            )
+
+        if state.model1 is not None:
+            if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
+                return None
+            if state.bits == 4:
+                activation = fast.qwen35_ane_dual_q4_swiglu_t(
+                    x,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.model1,
+                    config.variant,
+                    state.group_size,
+                )
+            else:
                 activation = fast.qwen35_ane_dual_affine_swiglu_t(
                     x,
                     state.weight,
