@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
+<a href="https://inspect.software/software/jundot/omlx"><img src="https://raw.githubusercontent.com/inspect-software/badges/main/v1/j/jundot/omlx.svg" alt="inspect.software score badge for jundot/omlx" /></a>
 </p>
 
 <p align="center">
