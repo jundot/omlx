@@ -6,6 +6,7 @@
         'deepseek_v32', 'glm_moe_dsa',
     ]);
     const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
+    const DEEPSEEK_ANE_CONFIG_PREFIXES = ['deepseek_v4'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -36,6 +37,8 @@
         'qwen35_ane_prefill_gdn',
         'qwen35_ane_prefill_gdn_fraction',
         'qwen35_ane_prefill_gdn_max_layers',
+        'deepseek_ane_prefill_enabled',
+        'deepseek_ane_prefill_sequence_length',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -223,6 +226,8 @@
                 qwen35_ane_prefill_gdn: true,
                 qwen35_ane_prefill_gdn_fraction: 0.5,
                 qwen35_ane_prefill_gdn_max_layers: 48,
+                deepseek_ane_prefill_enabled: false,
+                deepseek_ane_prefill_sequence_length: 4096,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -6921,6 +6926,13 @@
                 return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
             },
 
+            isDeepseekAnePrefillModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return DEEPSEEK_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
+            },
+
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
             },
@@ -7097,6 +7109,8 @@
                     qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
                     qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
                     qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
+                    deepseek_ane_prefill_enabled: s.deepseek_ane_prefill_enabled || false,
+                    deepseek_ane_prefill_sequence_length: s.deepseek_ane_prefill_sequence_length || 4096,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -7861,6 +7875,8 @@
                                 qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
                                     : 48,
+                                deepseek_ane_prefill_enabled: !!this.modelSettings.deepseek_ane_prefill_enabled,
+                                deepseek_ane_prefill_sequence_length: parseInt(this.modelSettings.deepseek_ane_prefill_sequence_length) || 4096,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled

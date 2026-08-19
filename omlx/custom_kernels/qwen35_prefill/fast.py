@@ -140,6 +140,21 @@ def qwen35_ane_profile_snapshot() -> dict[str, dict[str, float]]:
     }
 
 
+def qwen35_ane_compile_linear_grouped(
+    weight: mx.array, sequence_length: int, ane_instance: int, groups: int
+):
+    """Compile a grouped (block-diagonal) linear as one ANE program.
+
+    ``weight`` is [out_total, in_per_group]; row block g consumes input
+    channel block g, matching MIL grouped 1x1 conv semantics.
+    """
+    if not qwen35_ane_available() or _ext is None:
+        raise RuntimeError("Private ANE runtime is unavailable")
+    return _ext.qwen35_ane_compile_linear(
+        weight, sequence_length, ane_instance, groups
+    )
+
+
 def qwen35_ane_compile_linear(
     weight: mx.array, sequence_length: int, ane_instance: int = 0
 ):

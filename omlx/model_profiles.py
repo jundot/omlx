@@ -53,6 +53,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_gdn",
     "qwen35_ane_prefill_gdn_fraction",
     "qwen35_ane_prefill_gdn_max_layers",
+    "deepseek_ane_prefill_enabled",
+    "deepseek_ane_prefill_sequence_length",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

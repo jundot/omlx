@@ -397,6 +397,8 @@ class TestProfileFieldFiltering:
     def test_qwen_ane_prefill_fields_round_trip_as_model_specific(self, mgr):
         settings = {
             "qwen35_ane_prefill_enabled": True,
+            "deepseek_ane_prefill_enabled": True,
+            "deepseek_ane_prefill_sequence_length": 4096,
             "qwen35_ane_prefill_sequence_length": 2048,
             "qwen35_ane_prefill_fraction": 0.53,
             "qwen35_ane_prefill_max_layers": 64,

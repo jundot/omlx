@@ -46,7 +46,7 @@ private:
   std::unique_ptr<Impl> impl_;
 
   friend std::shared_ptr<AneLinearModel>
-  qwen35_ane_compile_linear(const mlx::core::array &, int, int);
+  qwen35_ane_compile_linear(const mlx::core::array &, int, int, int);
   friend std::vector<std::shared_ptr<AneLinearModel>>
   qwen35_ane_compile_linear_bank(const std::vector<mlx::core::array> &, int,
                                  int);
@@ -67,7 +67,7 @@ qwen35_ane_compile_linear(const mlx::core::array &weight, int sequence_length);
 
 std::shared_ptr<AneLinearModel>
 qwen35_ane_compile_linear(const mlx::core::array &weight, int sequence_length,
-                          int ane_instance);
+                          int ane_instance, int groups = 1);
 
 std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     const std::vector<mlx::core::array> &weights, int sequence_length,

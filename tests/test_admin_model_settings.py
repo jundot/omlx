@@ -192,3 +192,51 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_settings_are_persisted():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_sequence_length=4096,
+        ),
+    )
+
+    assert settings.deepseek_ane_prefill_enabled is True
+    assert settings.deepseek_ane_prefill_sequence_length == 4096
+    assert result["requires_reload"] is False
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_other_model_families():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+
+    with pytest.raises(admin_routes.HTTPException, match="DeepSeek-V4"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(deepseek_ane_prefill_enabled=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_invalid_block_size():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="multiple of 64"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_sequence_length=4000
+            ),
+        )

@@ -242,6 +242,12 @@ _FEATURE_FLAG_SPECS = (
         "qwen35_ane_prefill",
         "Qwen ANE Prefill",
     ),
+    _FeatureFlagSpec(
+        "deepseek_ane_prefill_enabled",
+        "deepseek_ane_prefill",
+        "deepseek_ane_prefill",
+        "DeepSeek ANE Prefill",
+    ),
 )
 
 
@@ -1791,6 +1797,25 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 logger.info(
                     "Qwen ANE prefill is enabled in settings but inactive at "
                     "runtime; benchmark metadata reports it as off"
+                )
+        if model_settings is not None and getattr(
+            model_settings, "deepseek_ane_prefill_enabled", False
+        ):
+            loaded_model = getattr(engine, "_model", None)
+            if not getattr(loaded_model, "_omlx_ane_procedure_count", 0):
+                run.feature_flags = [
+                    flag
+                    for flag in run.feature_flags
+                    if flag.get("key") != "deepseek_ane_prefill"
+                ]
+                run.experimental_features = [
+                    feature
+                    for feature in run.experimental_features
+                    if feature != "deepseek_ane_prefill"
+                ]
+                logger.info(
+                    "DeepSeek ANE prefill is enabled in settings but inactive "
+                    "at runtime; benchmark metadata reports it as off"
                 )
         logger.info(
             "[benchmark-ane-config] model=%s enabled=%s config=%s",

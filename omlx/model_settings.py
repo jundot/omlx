@@ -121,6 +121,11 @@ class ModelSettings:
         qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
             outputs assigned across the ANE instances.
         qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
+        deepseek_ane_prefill_enabled: Enable private fixed-shape DeepSeek-V4
+            hybrid ANE prefill (shared expert, wq_b, stacked indexer wq_b).
+        deepseek_ane_prefill_sequence_length: Exact flattened token count routed
+            through the DeepSeek ANE procedures; also realigns the paged cache
+            block size, rebuilding this model's SSD cache once.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -224,6 +229,13 @@ class ModelSettings:
     qwen35_ane_prefill_gdn: bool = True
     qwen35_ane_prefill_gdn_fraction: float = 0.50
     qwen35_ane_prefill_gdn_max_layers: int = 48
+
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + wq_b + stacked indexer
+    # wq_b). Off by default for the same reasons as the Qwen variant; also
+    # realigns the paged cache block size to the fixed ANE shape, so enabling
+    # it rebuilds this model's SSD cache once.
+    deepseek_ane_prefill_enabled: bool = False
+    deepseek_ane_prefill_sequence_length: int = 4096
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
