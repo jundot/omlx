@@ -243,6 +243,38 @@ template <typename T>
 }
 
 template <typename T>
+[[kernel]] void qwen35_ane_merge_dual_cpu_output(
+    const device float16_t *ane0_planar [[buffer(0)]],
+    const device float16_t *ane1_planar [[buffer(1)]],
+    const device float16_t *cpu_rows [[buffer(2)]],
+    const device T *gpu_rows [[buffer(3)]],
+    device T *output [[buffer(4)]], constant int &M [[buffer(5)]],
+    constant int &ane0_n [[buffer(6)]],
+    constant int &ane1_n [[buffer(7)]],
+    constant int &cpu_n [[buffer(8)]],
+    constant int &gpu_n [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint n = gid.x;
+  const uint m = gid.y;
+  const uint total_n = static_cast<uint>(ane0_n + ane1_n + cpu_n + gpu_n);
+  if (m >= static_cast<uint>(M) || n >= total_n) {
+    return;
+  }
+  if (n < static_cast<uint>(ane0_n)) {
+    output[m * total_n + n] = static_cast<T>(ane0_planar[n * M + m]);
+  } else if (n < static_cast<uint>(ane0_n + ane1_n)) {
+    const uint local = n - static_cast<uint>(ane0_n);
+    output[m * total_n + n] = static_cast<T>(ane1_planar[local * M + m]);
+  } else if (n < static_cast<uint>(ane0_n + ane1_n + cpu_n)) {
+    const uint local = n - static_cast<uint>(ane0_n + ane1_n);
+    output[m * total_n + n] = static_cast<T>(cpu_rows[m * cpu_n + local]);
+  } else {
+    const uint local = n - static_cast<uint>(ane0_n + ane1_n + cpu_n);
+    output[m * total_n + n] = gpu_rows[m * gpu_n + local];
+  }
+}
+
+template <typename T>
 [[kernel]] void qwen35_ane_swiglu_suffix(
     const device T *gate_up [[buffer(0)]], device T *activation [[buffer(1)]],
     constant int &M [[buffer(2)]], constant int &N [[buffer(3)]],
@@ -293,6 +325,8 @@ template <typename T>
                      qwen35_ane_merge_dual_swiglu_output, type);               \
   instantiate_kernel("qwen35_ane_merge_dual_cpu_swiglu_output_" #type,        \
                      qwen35_ane_merge_dual_cpu_swiglu_output, type);           \
+  instantiate_kernel("qwen35_ane_merge_dual_cpu_output_" #type,               \
+                     qwen35_ane_merge_dual_cpu_output, type);                  \
   instantiate_kernel("qwen35_ane_swiglu_suffix_" #type,                        \
                      qwen35_ane_swiglu_suffix, type);                           \
   instantiate_kernel("qwen35_ane_sum_output_" #type,                           \

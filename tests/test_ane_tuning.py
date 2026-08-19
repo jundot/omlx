@@ -31,7 +31,7 @@ def test_candidate_settings_are_transient_copy():
     base = ModelSettings()
     request = ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048)
     candidate = ane_tuning._Candidate(
-        "test", True, 0.25, True, 0.35, True, 0.125, 0.20
+        "test", True, 0.25, True, 0.35, True, 0.125, 0.20, 0.10
     )
 
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
@@ -43,6 +43,7 @@ def test_candidate_settings_are_transient_copy():
     assert tuned.qwen35_ane_prefill_cpu_enabled is True
     assert tuned.qwen35_ane_prefill_cpu_fraction == 0.125
     assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.20
+    assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.10
     assert base.qwen35_ane_prefill_enabled is False
     assert base.qwen35_ane_prefill_fraction == 0.53
 
@@ -78,6 +79,32 @@ def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
     assert refined.cpu_fraction == 0.135
     assert refined.cpu_down_fraction == 0.25
     assert refined.gdn_fraction == 0.53
+
+
+def test_full_model_profile_rebalances_three_way_gdn_prediction(monkeypatch):
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    candidate = ane_tuning._Candidate(
+        "predicted", True, 0.5, True, 0.6, True, 0.0, 0.0, 0.15
+    )
+    operations = 144
+    result = {
+        "_profile": {
+            "gdn": {
+                "operations": operations,
+                "ane0_eval_ns": 11.47e6 * operations,
+                "ane1_eval_ns": 11.48e6 * operations,
+                "cpu_completion_ns": 5.0e6 * operations,
+                "gpu_completion_ns": 8.72e6 * operations,
+            }
+        }
+    }
+
+    refined = ane_tuning._profile_refinement(candidate, result)
+
+    assert refined.gdn_fraction == 0.465
+    assert refined.cpu_gdn_fraction == 0.25
 
 
 @pytest.mark.asyncio
@@ -137,6 +164,7 @@ async def test_tuner_recommends_best_combined_split(monkeypatch):
         "cpu_enabled": True,
         "cpu_fraction": 0.125,
         "cpu_down_fraction": 0.2,
+        "cpu_gdn_fraction": None,
         "cpu_threads": 8,
         "cpu_shared_resource": True,
         "processing_tps": 125.0,

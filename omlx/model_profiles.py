@@ -56,6 +56,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_enabled",
     "qwen35_ane_prefill_cpu_fraction",
     "qwen35_ane_prefill_cpu_down_fraction",
+    "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
     "dflash_enabled",

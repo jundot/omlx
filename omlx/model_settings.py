@@ -127,6 +127,8 @@ class ModelSettings:
             projection assigned to the CPU.
         qwen35_ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
             down projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
+            z+qkv projection outputs assigned to the CPU after the ANE prefix.
         qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use Apple's private
@@ -237,6 +239,7 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_enabled: bool = False
     qwen35_ane_prefill_cpu_fraction: float = 0.135
     qwen35_ane_prefill_cpu_down_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
 

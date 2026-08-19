@@ -222,6 +222,12 @@ def main() -> None:
         type=int,
         help="Benchmark several CPU worker counts after one ANE compilation",
     )
+    parser.add_argument(
+        "--cpu-gdn-fraction-grid",
+        nargs="+",
+        type=float,
+        help="Benchmark several CPU GDN shares after one ANE compilation",
+    )
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
@@ -247,6 +253,12 @@ def main() -> None:
         help="Optional fp16 CPU share of each MLP down projection",
     )
     parser.add_argument(
+        "--cpu-gdn-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fp16 CPU share of the residual GDN qkv projection",
+    )
+    parser.add_argument(
         "--disable-gdn",
         action="store_true",
         help="benchmark MLP offload without compiling or dispatching GDN",
@@ -261,6 +273,10 @@ def main() -> None:
         value < 0 or value > 64 for value in args.cpu_threads_grid
     ):
         parser.error("CPU worker counts must be between 0 and 64")
+    if args.cpu_gdn_fraction_grid and any(
+        value < 0 or value > 0.50 for value in args.cpu_gdn_fraction_grid
+    ):
+        parser.error("CPU GDN fractions must be between 0 and 0.50")
 
     native_ext = inject_extension(args.extension) if args.extension else None
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -323,6 +339,7 @@ def main() -> None:
                 dual_ane=True,
                 cpu_fraction=args.cpu_fraction,
                 cpu_down_fraction=args.cpu_down_fraction,
+                cpu_gdn_fraction=args.cpu_gdn_fraction,
                 cpu_threads=args.cpu_threads,
                 cpu_shared_resource=not args.disable_cpu_shared_resource,
             )
@@ -331,13 +348,20 @@ def main() -> None:
             mlp_layers = 0
             compile_seconds = 0.0
 
-        variants: list[tuple[str, int | None]] = [(mode, None)]
+        variants: list[tuple[str, int | None, float | None]] = [
+            (mode, None, None)
+        ]
         if mode == "dual" and args.cpu_threads_grid:
             variants = [
-                (f"dual_cpu_threads_{threads}", threads)
+                (f"dual_cpu_threads_{threads}", threads, None)
                 for threads in args.cpu_threads_grid
             ]
-        for result_key, cpu_threads in variants:
+        if mode == "dual" and args.cpu_gdn_fraction_grid:
+            variants = [
+                (f"dual_cpu_gdn_{fraction:.3f}", None, fraction)
+                for fraction in args.cpu_gdn_fraction_grid
+            ]
+        for result_key, cpu_threads, cpu_gdn_fraction in variants:
             if cpu_threads is not None:
                 for module in model.modules():
                     config = getattr(module, "_omlx_ane_prefill_config", None)
@@ -345,6 +369,35 @@ def main() -> None:
                         module._omlx_ane_prefill_config = replace(
                             config, cpu_threads=cpu_threads
                         )
+                    gdn_config = getattr(module, "_omlx_ane_gdn_config", None)
+                    if gdn_config is not None:
+                        module._omlx_ane_gdn_config = replace(
+                            gdn_config, cpu_threads=cpu_threads
+                        )
+            if cpu_gdn_fraction is not None:
+                from omlx.patches import qwen35_ane_prefill as ane_patch
+
+                for module in model.modules():
+                    gdn_config = getattr(module, "_omlx_ane_gdn_config", None)
+                    gdn_state = getattr(module, "_omlx_ane_gdn_state", None)
+                    if gdn_config is None or gdn_state is None:
+                        continue
+                    updated_config = replace(
+                        gdn_config, cpu_fraction=cpu_gdn_fraction
+                    )
+                    updated_state = ane_patch._prepare_gdn_runtime_state(
+                        module,
+                        updated_config,
+                        gdn_state.model,
+                        gdn_state.model1,
+                    )
+                    if updated_state is None:
+                        raise RuntimeError(
+                            f"CPU GDN fraction {cpu_gdn_fraction:.3f} is ineligible"
+                        )
+                    module._omlx_ane_gdn_config = updated_config
+                    module._omlx_ane_gdn_state = updated_state
+                mx.clear_cache()
             measured, output = benchmark_mode(model, tokens, args.repeats)
             measured.update(
                 {
@@ -355,6 +408,11 @@ def main() -> None:
                     else args.cpu_threads,
                     "cpu_shared_resource": not args.disable_cpu_shared_resource,
                     "cpu_down_fraction": args.cpu_down_fraction,
+                    "cpu_gdn_fraction": (
+                        cpu_gdn_fraction
+                        if cpu_gdn_fraction is not None
+                        else args.cpu_gdn_fraction
+                    ),
                     "dual_mlp_layers": int(
                         getattr(model, "_omlx_ane_dual_prefill_count", 0)
                     )

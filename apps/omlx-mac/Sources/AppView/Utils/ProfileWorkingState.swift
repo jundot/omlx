@@ -152,6 +152,7 @@ enum ProfileSettingsKey {
     static let qwen35AnePrefillCpuEnabled = "qwen35_ane_prefill_cpu_enabled"
     static let qwen35AnePrefillCpuFraction = "qwen35_ane_prefill_cpu_fraction"
     static let qwen35AnePrefillCpuDownFraction = "qwen35_ane_prefill_cpu_down_fraction"
+    static let qwen35AnePrefillCpuGdnFraction = "qwen35_ane_prefill_cpu_gdn_fraction"
     static let qwen35AnePrefillCpuThreads = "qwen35_ane_prefill_cpu_threads"
     static let qwen35AnePrefillCpuSharedResource = "qwen35_ane_prefill_cpu_shared_resource"
     static let indexCacheFreq = "index_cache_freq"

@@ -631,6 +631,7 @@
   "modal.model_settings.qwen_ane_cpu_hint": "Requires a separate Qwen q4 checkpoint clone with floating tensors converted to FP16. Retune the MLP ANE share when enabled.",
   "modal.model_settings.qwen_ane_cpu_fraction": "MLP on CPU",
   "modal.model_settings.qwen_ane_cpu_down_fraction": "Down projection on CPU",
+  "modal.model_settings.qwen_ane_cpu_gdn_fraction": "GDN on CPU",
   "modal.model_settings.qwen_ane_cpu_down_disabled": "Disabled",
   "modal.model_settings.qwen_ane_cpu_threads": "CPU workers",
   "modal.model_settings.qwen_ane_cpu_threads_auto": "Automatic",

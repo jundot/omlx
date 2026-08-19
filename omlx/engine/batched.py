@@ -462,6 +462,17 @@ class BatchedEngine(BaseEngine):
                             False,
                         )
                         else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
                         cpu_threads=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_cpu_threads",

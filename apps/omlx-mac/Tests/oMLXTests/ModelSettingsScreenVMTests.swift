@@ -101,6 +101,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertThrowsError(try QwenAneSettingsValidator.cpuThreads("8.5").get())
         XCTAssertThrowsError(try QwenAneSettingsValidator.cpuThreads("65").get())
         XCTAssertEqual(try? QwenAneSettingsValidator.gdnFraction("0.527").get(), 0.527)
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.cpuGdnFraction("0.047", gdnFraction: "0.527").get(),
+            0.047
+        )
+        XCTAssertThrowsError(
+            try QwenAneSettingsValidator.cpuGdnFraction("0.5", gdnFraction: "0.5").get()
+        )
     }
 
     func testQwenAneSettingsAreIncludedInWorkingProfile() {
@@ -121,6 +128,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["qwen35_ane_prefill_cpu_enabled"]?.value as? Bool, true)
         XCTAssertEqual(settings["qwen35_ane_prefill_cpu_fraction"]?.value as? Double, 0.135)
         XCTAssertEqual(settings["qwen35_ane_prefill_cpu_down_fraction"]?.value as? Double, 0.0)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_gdn_fraction"]?.value as? Double, 0.0)
         XCTAssertEqual(settings["qwen35_ane_prefill_cpu_threads"]?.value as? Int, 8)
         XCTAssertEqual(settings["qwen35_ane_prefill_cpu_shared_resource"]?.value as? Bool, true)
     }
@@ -156,6 +164,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             "qwen35_ane_prefill_cpu_enabled": true,
             "qwen35_ane_prefill_cpu_fraction": 0.135,
             "qwen35_ane_prefill_cpu_down_fraction": 0.2,
+            "qwen35_ane_prefill_cpu_gdn_fraction": 0.05,
             "qwen35_ane_prefill_cpu_threads": 8,
             "qwen35_ane_prefill_cpu_shared_resource": true
         }
@@ -166,6 +175,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(dto.qwen35AnePrefillCpuEnabled, true)
         XCTAssertEqual(dto.qwen35AnePrefillCpuFraction, 0.135)
         XCTAssertEqual(dto.qwen35AnePrefillCpuDownFraction, 0.2)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuGdnFraction, 0.05)
         XCTAssertEqual(dto.qwen35AnePrefillCpuThreads, 8)
         XCTAssertEqual(dto.qwen35AnePrefillCpuSharedResource, true)
 
@@ -175,6 +185,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         patch.qwen35AnePrefillCpuEnabled = true
         patch.qwen35AnePrefillCpuFraction = 0.135
         patch.qwen35AnePrefillCpuDownFraction = 0.2
+        patch.qwen35AnePrefillCpuGdnFraction = 0.05
         patch.qwen35AnePrefillCpuThreads = 8
         patch.qwen35AnePrefillCpuSharedResource = true
         let encoder = JSONEncoder()
@@ -185,6 +196,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_enabled"] as? Bool, true)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_fraction"] as? Double, 0.135)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_down_fraction"] as? Double, 0.2)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_gdn_fraction"] as? Double, 0.05)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_threads"] as? Int, 8)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_shared_resource"] as? Bool, true)
     }

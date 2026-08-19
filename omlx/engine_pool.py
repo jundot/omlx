@@ -409,6 +409,10 @@ class EnginePool:
                     data.get("qwen35_ane_prefill_cpu_down_fraction", 0.0),
                 )
                 add(
+                    "qwen35_ane_prefill_cpu_gdn_fraction",
+                    data.get("qwen35_ane_prefill_cpu_gdn_fraction", 0.0),
+                )
+                add(
                     "qwen35_ane_prefill_cpu_threads",
                     data.get("qwen35_ane_prefill_cpu_threads", 8),
                 )

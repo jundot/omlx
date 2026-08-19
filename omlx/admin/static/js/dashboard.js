@@ -39,6 +39,7 @@
         'qwen35_ane_prefill_cpu_enabled',
         'qwen35_ane_prefill_cpu_fraction',
         'qwen35_ane_prefill_cpu_down_fraction',
+        'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
         'specprefill_enabled',
@@ -231,6 +232,7 @@
                 qwen35_ane_prefill_cpu_enabled: false,
                 qwen35_ane_prefill_cpu_fraction: 0.135,
                 qwen35_ane_prefill_cpu_down_fraction: 0,
+                qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 trust_remote_code: false,
@@ -7110,6 +7112,7 @@
                     qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
                     qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
                     qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
                     qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
                     qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
                     specprefill_enabled: s.specprefill_enabled || false,
@@ -7554,6 +7557,7 @@
                     parts.push(
                         `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
                         `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
+                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
                     );
                 }
                 return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
@@ -7721,6 +7725,9 @@
                     patch.qwen35_ane_prefill_cpu_down_fraction = Number(
                         recommendation.cpu_down_fraction || 0
                     );
+                    patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                        recommendation.cpu_gdn_fraction || 0
+                    );
                     if (recommendation.cpu_threads !== null
                         && recommendation.cpu_threads !== undefined) {
                         patch.qwen35_ane_prefill_cpu_threads = Number(
@@ -7878,6 +7885,8 @@
                     if (error) return error;
                     error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
                     if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
+                    if (error) return error;
                     error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
                     if (error) return error;
                     if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
@@ -7892,6 +7901,11 @@
                 if (this.modelSettings.qwen35_ane_prefill_gdn) {
                     error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
                     if (error) return error;
+                    if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
+                        && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
+                        return 'GDN ANE and CPU fractions must total less than 1.0.';
+                    }
                     error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
                     if (error) return error;
                 }
@@ -7994,6 +8008,9 @@
                                 qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
                                     : 0,
+                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
+                                    : 0,
                                 qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
                                     : 8,
@@ -8095,6 +8112,7 @@
                                     qwen35_ane_prefill_cpu_enabled: false,
                                     qwen35_ane_prefill_cpu_fraction: 0.135,
                                     qwen35_ane_prefill_cpu_down_fraction: 0,
+                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
                                     qwen35_ane_prefill_cpu_threads: 8,
                                     qwen35_ane_prefill_cpu_shared_resource: true,
                                     specprefill_enabled: false,
@@ -8197,6 +8215,7 @@
                         this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
                         this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction = 0;
                         this.modelSettings.qwen35_ane_prefill_cpu_threads = 8;
                         this.modelSettings.qwen35_ane_prefill_cpu_shared_resource = true;
                         this.modelSettings.specprefill_enabled = false;

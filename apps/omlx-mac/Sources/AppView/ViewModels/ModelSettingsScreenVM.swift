@@ -41,6 +41,7 @@ final class ModelSettingsScreenVM {
         case qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnMaxLayers
         case qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuFraction
         case qwen35AnePrefillCpuDownFraction
+        case qwen35AnePrefillCpuGdnFraction
         case qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuSharedResource
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
@@ -275,6 +276,7 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillCpuEnabled: Bool = false
     var qwen35AnePrefillCpuFraction: String = "0.135"
     var qwen35AnePrefillCpuDownFraction: String = "0"
+    var qwen35AnePrefillCpuGdnFraction: String = "0"
     var qwen35AnePrefillCpuThreads: String = "8"
     var qwen35AnePrefillCpuSharedResource: Bool = true
     var aneTuningID: String?
@@ -379,7 +381,7 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillGdnFraction, .qwen35AnePrefillGdnMaxLayers:
             return true
         case .qwen35AnePrefillCpuEnabled, .qwen35AnePrefillCpuFraction,
-             .qwen35AnePrefillCpuDownFraction:
+             .qwen35AnePrefillCpuDownFraction, .qwen35AnePrefillCpuGdnFraction:
             return true
         case .qwen35AnePrefillCpuThreads, .qwen35AnePrefillCpuSharedResource:
             return true
@@ -520,6 +522,7 @@ final class ModelSettingsScreenVM {
                 self.qwen35AnePrefillCpuEnabled = s?.qwen35AnePrefillCpuEnabled ?? false
                 self.qwen35AnePrefillCpuFraction = s?.qwen35AnePrefillCpuFraction.map { Self.formatPct($0) } ?? "0.135"
                 self.qwen35AnePrefillCpuDownFraction = s?.qwen35AnePrefillCpuDownFraction.map { Self.formatPct($0) } ?? "0"
+                self.qwen35AnePrefillCpuGdnFraction = s?.qwen35AnePrefillCpuGdnFraction.map { Self.formatPct($0) } ?? "0"
                 self.qwen35AnePrefillCpuThreads = s?.qwen35AnePrefillCpuThreads.map(String.init) ?? "8"
                 self.qwen35AnePrefillCpuSharedResource = s?.qwen35AnePrefillCpuSharedResource ?? true
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
@@ -677,7 +680,10 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillDualAne: patch.qwen35AnePrefillDualAne = qwen35AnePrefillDualAne
         case .qwen35AnePrefillGdn:     patch.qwen35AnePrefillGdn = qwen35AnePrefillGdn
         case .qwen35AnePrefillGdnFraction:
-            switch QwenAneSettingsValidator.gdnFraction(qwen35AnePrefillGdnFraction) {
+            switch QwenAneSettingsValidator.gdnFraction(
+                qwen35AnePrefillGdnFraction,
+                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
+            ) {
             case .success(let value): patch.qwen35AnePrefillGdnFraction = value
             case .failure(let error): lastError = error.message; return
             }
@@ -699,6 +705,14 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillCpuDownFraction:
             switch QwenAneSettingsValidator.cpuDownFraction(qwen35AnePrefillCpuDownFraction) {
             case .success(let value): patch.qwen35AnePrefillCpuDownFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillCpuGdnFraction:
+            switch QwenAneSettingsValidator.cpuGdnFraction(
+                qwen35AnePrefillCpuGdnFraction,
+                gdnFraction: qwen35AnePrefillGdnFraction
+            ) {
+            case .success(let value): patch.qwen35AnePrefillCpuGdnFraction = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillCpuThreads:
@@ -833,6 +847,7 @@ final class ModelSettingsScreenVM {
             patch.qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
             patch.qwen35AnePrefillCpuFraction = recommendation.cpuFraction
             patch.qwen35AnePrefillCpuDownFraction = recommendation.cpuDownFraction
+            patch.qwen35AnePrefillCpuGdnFraction = recommendation.cpuGdnFraction
             patch.qwen35AnePrefillCpuThreads = recommendation.cpuThreads
             patch.qwen35AnePrefillCpuSharedResource = recommendation.cpuSharedResource
         }
@@ -855,6 +870,9 @@ final class ModelSettingsScreenVM {
             }
             if let fraction = recommendation.cpuDownFraction {
                 qwen35AnePrefillCpuDownFraction = Self.formatPct(fraction)
+            }
+            if let fraction = recommendation.cpuGdnFraction {
+                qwen35AnePrefillCpuGdnFraction = Self.formatPct(fraction)
             }
             if let threads = recommendation.cpuThreads {
                 qwen35AnePrefillCpuThreads = String(threads)
@@ -1127,6 +1145,7 @@ final class ModelSettingsScreenVM {
                 if qwen35AnePrefillCpuEnabled {
                     putDouble(ProfileSettingsKey.qwen35AnePrefillCpuFraction, qwen35AnePrefillCpuFraction)
                     putDouble(ProfileSettingsKey.qwen35AnePrefillCpuDownFraction, qwen35AnePrefillCpuDownFraction)
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillCpuGdnFraction, qwen35AnePrefillCpuGdnFraction)
                     putInt(ProfileSettingsKey.qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuThreads)
                     putBool(ProfileSettingsKey.qwen35AnePrefillCpuSharedResource, qwen35AnePrefillCpuSharedResource)
                 }
@@ -1515,8 +1534,21 @@ enum QwenAneSettingsValidator {
         }
     }
 
-    static func gdnFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
-        fraction(raw, label: "GDN ANE fraction", range: 0.05...0.90)
+    static func gdnFraction(
+        _ raw: String, cpuFraction: String = "0"
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "GDN ANE fraction", range: 0.05...0.90) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            switch fraction(cpuFraction, label: "CPU GDN fraction", range: 0...0.50) {
+            case .failure(let error): return .failure(error)
+            case .success(let cpu):
+                guard value + cpu < 1 else {
+                    return .failure(.init(message: "GDN ANE and CPU fractions must total less than 1.0."))
+                }
+                return .success(value)
+            }
+        }
     }
 
     static func cpuFraction(
@@ -1539,6 +1571,23 @@ enum QwenAneSettingsValidator {
 
     static func cpuDownFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
         fraction(raw, label: "CPU MLP down fraction", range: 0...0.50)
+    }
+
+    static func cpuGdnFraction(
+        _ raw: String, gdnFraction: String
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "CPU GDN fraction", range: 0...0.50) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            switch fraction(gdnFraction, label: "GDN ANE fraction", range: 0.05...0.90) {
+            case .failure(let error): return .failure(error)
+            case .success(let ane):
+                guard value + ane < 1 else {
+                    return .failure(.init(message: "GDN ANE and CPU fractions must total less than 1.0."))
+                }
+                return .success(value)
+            }
+        }
     }
 
     static func cpuThreads(_ raw: String) -> Result<Int, SamplingValidationError> {

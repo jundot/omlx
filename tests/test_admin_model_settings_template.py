@@ -207,6 +207,7 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
         "qwen35_ane_prefill_fraction",
         "qwen35_ane_prefill_cpu_fraction",
         "qwen35_ane_prefill_cpu_down_fraction",
+        "qwen35_ane_prefill_cpu_gdn_fraction",
         "qwen35_ane_prefill_cpu_threads",
         "qwen35_ane_prefill_gdn_fraction",
     ):
@@ -238,6 +239,7 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
     assert "qwen35_ane_prefill_cpu_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
+    assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script
     assert "if (result?.processing_tps === null" in script
     assert "result?.latency_ms !== null" in script
@@ -249,6 +251,7 @@ def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     assert "validateQwenAneSettings()" in script
     assert "ANE prompt block must be a multiple of 64." in script
     assert "MLP ANE and CPU fractions must total less than 1.0." in script
+    assert "GDN ANE and CPU fractions must total less than 1.0." in script
     assert "CPU worker count must be between 0 and 64." in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
     assert "qwen35_ane_prefill_fraction: Number(" in script
@@ -270,6 +273,7 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false" in state
     assert "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135" in state
     assert "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0" in state
+    assert "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0" in state
     assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
     assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
 

@@ -1331,6 +1331,20 @@ private struct ExperimentalSection: View {
                                     Task { await vm.save(.qwen35AnePrefillCpuDownFraction, client: client) }
                                 }
                         }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_gdn_fraction.label",
+                                          defaultValue: "GDN on CPU",
+                                          comment: "Row label for the Qwen GDN CPU workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_gdn_fraction.sub",
+                                             defaultValue: "Residual GDN QKV channels assigned to CPU FP16 matrix multiplication alongside ANE and GPU.",
+                                             comment: "Sublabel explaining the Qwen GDN CPU workload fraction")) {
+                            TextInput(text: $vm.qwen35AnePrefillCpuGdnFraction,
+                                      placeholder: "0", mono: true,
+                                      isNumeric: true, range: 0...0.50,
+                                      step: 0.005, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillCpuGdnFraction, client: client) }
+                                }
+                        }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.label",
                                           defaultValue: "Performance-Aware Scheduling",
                                           comment: "Row label for the shared-resource CPU scheduler hint"),
@@ -1766,7 +1780,8 @@ private struct ExperimentalSection: View {
         if recommendation.cpuEnabled == true {
             let gate = Int(((recommendation.cpuFraction ?? 0) * 100).rounded())
             let down = Int(((recommendation.cpuDownFraction ?? 0) * 100).rounded())
-            parts.append("CPU \(gate)%/\(down)%")
+            let gdn = Int(((recommendation.cpuGdnFraction ?? 0) * 100).rounded())
+            parts.append("CPU \(gate)%/\(down)%/\(gdn)%")
         }
         return String(
             format: "%@ · %.1f tok/s (%+.1f%%)",

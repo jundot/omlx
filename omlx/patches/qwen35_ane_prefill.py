@@ -57,6 +57,9 @@ class _AneGDNConfig:
     fraction: float
     variant: int
     dual_ane: bool = False
+    cpu_fraction: float = 0.0
+    cpu_threads: int = 8
+    cpu_shared_resource: bool = True
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,8 @@ class _CombinedGDNState:
     model1: Any | None = None
     b_outputs: int = 0
     a_outputs: int = 0
+    cpu_weight: mx.array | None = None
+    cpu_outputs: int = 0
 
 
 def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
@@ -730,25 +735,42 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     dual_ane = bool(config.dual_ane and fast.has_symbol("qwen35_ane_dual_affine_qmm_t"))
     alignment = 128 if dual_ane else 64
     ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
-    gpu_outputs = total_outputs - ane_outputs
+    cpu_enabled = bool(
+        config.cpu_fraction > 0
+        and dual_ane
+        and qkv.scales.dtype == mx.float16
+        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+    )
+    cpu_outputs = (
+        (int(total_outputs * config.cpu_fraction) // 64) * 64
+        if cpu_enabled
+        else 0
+    )
+    gpu_outputs = total_outputs - ane_outputs - cpu_outputs
     # The native GPU suffix accepts one quantization format. Put all of z on
     # ANE so an oQ4e-style q5-z/q4-qkv mix leaves a homogeneous qkv suffix.
     if ane_outputs < z_outputs:
         return None
     qkv_offset = ane_outputs - z_outputs
-    packed_suffix = _pack_affine_gdn_suffix(qkv, b, a, qkv_offset, qkv_spec)
+    packed_suffix = (
+        None
+        if cpu_outputs
+        else _pack_affine_gdn_suffix(qkv, b, a, qkv_offset, qkv_spec)
+    )
     b_outputs = a_outputs = 0
     if packed_suffix is None:
         if gpu_outputs <= 0 or gpu_outputs % 64:
             return None
-        weight = mx.contiguous(qkv.weight[qkv_offset:])
-        scales = mx.contiguous(qkv.scales[qkv_offset:])
-        biases = mx.contiguous(qkv.biases[qkv_offset:])
+        gpu_offset = qkv_offset + cpu_outputs
+        weight = mx.contiguous(qkv.weight[gpu_offset:])
+        scales = mx.contiguous(qkv.scales[gpu_offset:])
+        biases = mx.contiguous(qkv.biases[gpu_offset:])
     else:
         weight, scales, biases, b_outputs, a_outputs = packed_suffix
     key = (
         config.sequence_length,
         ane_outputs,
+        cpu_outputs,
         qkv_spec,
         z_spec,
         (
@@ -797,7 +819,22 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         else:
             dense0 = dense_logical_slice(0, ane_outputs)
             dense1 = None
+        qkv_offset = ane_outputs - z_outputs
+        gpu_offset = qkv_offset + cpu_outputs
+        cpu_weight = None
+        if cpu_outputs:
+            cpu_weight = mx.contiguous(
+                mx.dequantize(
+                    qkv.weight[qkv_offset:gpu_offset],
+                    qkv.scales[qkv_offset:gpu_offset],
+                    qkv.biases[qkv_offset:gpu_offset],
+                    group_size=qkv_group_size,
+                    bits=qkv_bits,
+                ).astype(mx.float16)
+            )
         values = [dense0, weight, scales, biases]
+        if cpu_weight is not None:
+            values.append(cpu_weight)
         if dense1 is not None:
             values.append(dense1)
         mx.eval(*values)
@@ -823,6 +860,8 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
             model1=model1,
             b_outputs=b_outputs,
             a_outputs=a_outputs,
+            cpu_weight=cpu_weight,
+            cpu_outputs=cpu_outputs,
         )
         cache[key] = state
         return state
@@ -844,18 +883,36 @@ def _prepare_gdn_for_bank(
         return None
     qkv_bits, qkv_group_size = qkv_spec
     ane_outputs = (int(total_outputs * config.fraction) // 128) * 128
-    gpu_outputs = total_outputs - ane_outputs
-    if ane_outputs < z_outputs:
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    cpu_enabled = bool(
+        config.cpu_fraction > 0
+        and config.dual_ane
+        and qkv.scales.dtype == mx.float16
+        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+    )
+    cpu_outputs = (
+        (int(total_outputs * config.cpu_fraction) // 64) * 64
+        if cpu_enabled
+        else 0
+    )
+    gpu_outputs = total_outputs - ane_outputs - cpu_outputs
+    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
         return None
     qkv_offset = ane_outputs - z_outputs
-    packed_suffix = _pack_affine_gdn_suffix(qkv, b, a, qkv_offset, qkv_spec)
+    packed_suffix = (
+        None
+        if cpu_outputs
+        else _pack_affine_gdn_suffix(qkv, b, a, qkv_offset, qkv_spec)
+    )
     b_outputs = a_outputs = 0
     if packed_suffix is None:
         if gpu_outputs <= 0 or gpu_outputs % 64:
             return None
-        weight = mx.contiguous(qkv.weight[qkv_offset:])
-        scales = mx.contiguous(qkv.scales[qkv_offset:])
-        biases = mx.contiguous(qkv.biases[qkv_offset:])
+        gpu_offset = qkv_offset + cpu_outputs
+        weight = mx.contiguous(qkv.weight[gpu_offset:])
+        scales = mx.contiguous(qkv.scales[gpu_offset:])
+        biases = mx.contiguous(qkv.biases[gpu_offset:])
     else:
         weight, scales, biases, b_outputs, a_outputs = packed_suffix
 
@@ -886,7 +943,26 @@ def _prepare_gdn_for_bank(
     split = ane_outputs // 2
     dense0 = dense_logical_slice(0, split)
     dense1 = dense_logical_slice(split, ane_outputs)
-    mx.eval(dense0, dense1, weight, scales, biases)
+    qkv_offset = ane_outputs - z_outputs
+    gpu_offset = qkv_offset + cpu_outputs
+    cpu_weight = None
+    if cpu_outputs:
+        cpu_weight = mx.contiguous(
+            mx.dequantize(
+                qkv.weight[qkv_offset:gpu_offset],
+                qkv.scales[qkv_offset:gpu_offset],
+                qkv.biases[qkv_offset:gpu_offset],
+                group_size=qkv_group_size,
+                bits=qkv_bits,
+            ).astype(mx.float16)
+        )
+    weight = mx.contiguous(qkv.weight[gpu_offset:])
+    scales = mx.contiguous(qkv.scales[gpu_offset:])
+    biases = mx.contiguous(qkv.biases[gpu_offset:])
+    values = [dense0, dense1, weight, scales, biases]
+    if cpu_weight is not None:
+        values.append(cpu_weight)
+    mx.eval(*values)
     return (
         _CombinedGDNState(
             model=None,
@@ -900,9 +976,80 @@ def _prepare_gdn_for_bank(
             model1=None,
             b_outputs=b_outputs,
             a_outputs=a_outputs,
+            cpu_weight=cpu_weight,
+            cpu_outputs=cpu_outputs,
         ),
         dense0,
         dense1,
+    )
+
+
+def _prepare_gdn_runtime_state(
+    gdn: Any,
+    config: _AneGDNConfig,
+    model: Any,
+    model1: Any,
+) -> _CombinedGDNState | None:
+    """Move the CPU/GPU QKV boundary without recompiling the ANE prefix."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not _eligible_gdn(gdn):
+        return None
+    qkv, z, _, _ = _gdn_linears(gdn)
+    qkv_spec = _affine_spec(qkv, qkv.scales.dtype)
+    if qkv_spec is None:
+        return None
+    bits, group_size = qkv_spec
+    z_outputs = int(z.weight.shape[0])
+    qkv_outputs = int(qkv.weight.shape[0])
+    total_outputs = z_outputs + qkv_outputs
+    ane_outputs = (int(total_outputs * config.fraction) // 128) * 128
+    cpu_enabled = bool(
+        config.cpu_fraction > 0
+        and config.dual_ane
+        and qkv.scales.dtype == mx.float16
+        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+    )
+    cpu_outputs = (
+        (int(total_outputs * config.cpu_fraction) // 64) * 64
+        if cpu_enabled
+        else 0
+    )
+    gpu_outputs = total_outputs - ane_outputs - cpu_outputs
+    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+        return None
+    qkv_offset = ane_outputs - z_outputs
+    gpu_offset = qkv_offset + cpu_outputs
+    cpu_weight = None
+    if cpu_outputs:
+        cpu_weight = mx.contiguous(
+            mx.dequantize(
+                qkv.weight[qkv_offset:gpu_offset],
+                qkv.scales[qkv_offset:gpu_offset],
+                qkv.biases[qkv_offset:gpu_offset],
+                group_size=group_size,
+                bits=bits,
+            ).astype(mx.float16)
+        )
+    weight = mx.contiguous(qkv.weight[gpu_offset:])
+    scales = mx.contiguous(qkv.scales[gpu_offset:])
+    biases = mx.contiguous(qkv.biases[gpu_offset:])
+    values = [weight, scales, biases]
+    if cpu_weight is not None:
+        values.append(cpu_weight)
+    mx.eval(*values)
+    return _CombinedGDNState(
+        model=model,
+        weight=weight,
+        scales=scales,
+        biases=biases,
+        qkv_outputs=qkv_outputs,
+        z_outputs=z_outputs,
+        bits=bits,
+        group_size=group_size,
+        model1=model1,
+        cpu_weight=cpu_weight,
+        cpu_outputs=cpu_outputs,
     )
 
 
@@ -931,7 +1078,23 @@ def _gdn_backend(
         from omlx.custom_kernels.qwen35_prefill import fast
         from omlx.patches.qwen35_q4_mlp import _post_ane_qmm_or_linear
 
-        if state.model1 is not None:
+        if state.model1 is not None and state.cpu_weight is not None:
+            combined = fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+                x,
+                state.cpu_weight,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.model1,
+                state.bits,
+                config.variant,
+                state.group_size,
+                1,
+                config.cpu_threads,
+                config.cpu_shared_resource,
+            )
+        elif state.model1 is not None:
             combined = fast.qwen35_ane_dual_affine_qmm_t(
                 x,
                 state.weight,
@@ -1353,6 +1516,7 @@ def _enable_dual_procedure_banks(
     gdn: bool,
     gdn_fraction: float,
     gdn_max_layers: int,
+    cpu_gdn_fraction: float = 0.0,
 ) -> tuple[int, int, int, int] | None:
     from omlx.custom_kernels.qwen35_prefill import fast
 
@@ -1378,7 +1542,13 @@ def _enable_dual_procedure_banks(
     prepared_mlps: list[tuple[Any, _CombinedMLPState, mx.array, mx.array]] = []
     prepared_gdns: list[tuple[Any, _CombinedGDNState, mx.array, mx.array]] = []
     gdn_config = _AneGDNConfig(
-        config.sequence_length, gdn_fraction, config.variant, True
+        config.sequence_length,
+        gdn_fraction,
+        config.variant,
+        True,
+        cpu_fraction=cpu_gdn_fraction,
+        cpu_threads=config.cpu_threads,
+        cpu_shared_resource=config.cpu_shared_resource,
     )
     with _COMPILE_LOCK:
         for module in mlp_candidates:
@@ -1468,6 +1638,7 @@ def enable_qwen35_ane_prefill(
     dual_ane: bool = True,
     cpu_fraction: float = 0.0,
     cpu_down_fraction: float = 0.0,
+    cpu_gdn_fraction: float = 0.0,
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
 ) -> int:
@@ -1492,6 +1663,8 @@ def enable_qwen35_ane_prefill(
         raise ValueError(
             "ANE CPU down-projection fraction must be between 0.0 and 0.50"
         )
+    if not 0.0 <= cpu_gdn_fraction <= 0.50:
+        raise ValueError("ANE CPU GDN fraction must be between 0.0 and 0.50")
     if not 0 <= cpu_threads <= 64:
         raise ValueError("ANE CPU worker count must be between 0 and 64")
 
@@ -1534,7 +1707,9 @@ def enable_qwen35_ane_prefill(
         if len(candidates) >= max_layers:
             break
 
-    if (cpu_fraction > 0 or cpu_down_fraction > 0) and candidates:
+    if (
+        cpu_fraction > 0 or cpu_down_fraction > 0 or cpu_gdn_fraction > 0
+    ) and candidates:
         gate = getattr(candidates[0], "gate_proj", None)
         if getattr(getattr(gate, "scales", None), "dtype", None) != mx.float16:
             logger.warning(
@@ -1544,6 +1719,7 @@ def enable_qwen35_ane_prefill(
             config = replace(
                 config, cpu_fraction=0.0, cpu_down_fraction=0.0
             )
+            cpu_gdn_fraction = 0.0
         elif cpu_shared_resource:
             if fast.qwen35_cpu_shared_resource_available():
                 logger.info(
@@ -1565,6 +1741,7 @@ def enable_qwen35_ane_prefill(
         gdn=gdn,
         gdn_fraction=gdn_fraction,
         gdn_max_layers=gdn_max_layers,
+        cpu_gdn_fraction=cpu_gdn_fraction,
     )
     if banked is not None:
         count, dual_count, gdn_count, resident_programs = banked
@@ -1614,7 +1791,15 @@ def enable_qwen35_ane_prefill(
     gdn_count = 0
     gdn_budget_exhausted = False
     if gdn and gdn_max_layers:
-        gdn_config = _AneGDNConfig(sequence_length, gdn_fraction, variant, dual_ane)
+        gdn_config = _AneGDNConfig(
+            sequence_length,
+            gdn_fraction,
+            variant,
+            dual_ane,
+            cpu_fraction=cpu_gdn_fraction,
+            cpu_threads=cpu_threads,
+            cpu_shared_resource=config.cpu_shared_resource,
+        )
         for module in model.modules() if hasattr(model, "modules") else ():
             if gdn_count >= gdn_max_layers:
                 break

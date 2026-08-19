@@ -1085,6 +1085,90 @@ def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
     assert dense1.shape == (128, 128)
 
 
+def test_prepare_gdn_splits_residual_qkv_across_cpu_and_gpu(monkeypatch):
+    gdn = _OQ4eGDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+    )
+
+    prepared = ane_patch._prepare_gdn_for_bank(
+        gdn,
+        ane_patch._AneGDNConfig(
+            2048, 0.5, 8, dual_ane=True, cpu_fraction=0.20
+        ),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert dense0.shape == (64, 128)
+    assert dense1.shape == (64, 128)
+    assert state.cpu_outputs == 64
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (64, 128)
+    assert state.weight.shape == (192, 16)
+    assert state.scales.shape == (192, 2)
+
+
+def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch):
+    combined = mx.array([[[1, 2, 10, 20, 30, 40]]], dtype=mx.float16)
+    calls = []
+
+    def hybrid(*args):
+        calls.append(args)
+        return combined
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_cpu_fp16_affine_qmm_t", hybrid)
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(
+        q4_patch,
+        "_linear_qmm",
+        lambda linear, x, variant: mx.zeros((*x.shape[:-1], 1), dtype=x.dtype),
+    )
+    state = ane_patch._CombinedGDNState(
+        model=object(),
+        model1=object(),
+        weight=mx.zeros((2, 16), dtype=mx.uint32),
+        scales=mx.zeros((2, 2), dtype=mx.float16),
+        biases=mx.zeros((2, 2), dtype=mx.float16),
+        qkv_outputs=4,
+        z_outputs=2,
+        bits=4,
+        group_size=64,
+        cpu_weight=mx.zeros((1, 128), dtype=mx.float16),
+        cpu_outputs=1,
+    )
+    gdn = SimpleNamespace(
+        in_proj_qkv=object(),
+        in_proj_z=object(),
+        in_proj_b=object(),
+        in_proj_a=object(),
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(
+            1, 0.4, 8, True, 0.1, 6, True
+        ),
+        _omlx_ane_gdn_state=state,
+    )
+    x = mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    mixed_qkv, z, _, _ = ane_patch._gdn_backend(gdn, x)
+    mx.eval(mixed_qkv, z)
+
+    assert len(calls) == 1
+    assert calls[0][-2:] == (6, True)
+    assert z.tolist() == [[[1.0, 2.0]]]
+    assert mixed_qkv.tolist() == [[[10.0, 20.0, 30.0, 40.0]]]
+
+
 def test_gdn_backend_restores_projection_order_and_keeps_b_a_exact(monkeypatch):
     combined = mx.array([[[1, 2, 10, 20, 30, 40]]], dtype=mx.bfloat16)
     captured = []
