@@ -60,7 +60,7 @@ absent).
 | 23 | 2026-08-16 | `776d7168-e968-40c4-808e-f643ec1953a7` | `4aacc53` — `asyncEval` the replayed recurrent states after a wide-prefix replay | — | ✅ | covered: omlx dispatches the draft chain and rollback with `mx.async_eval` (single-sync cycle design); replay roots are consumed by the next cycle's graph build |
 | 24 | 2026-08-17 | `5c523482-452c-4662-a303-a3b359c81030` | `cdb06b7` — packed GDN prework mixer with in-kernel beta (0xC0DB sigmoid ULP map) | — | ✅ | no port: C++ Metal kernel; the sigmoid ULP hazard is Metal-kernel-internal and does not exist in mlx's graph sigmoid |
 | 25 | 2026-08-17 | `03dedda8-fc70-4e3e-881f-5384a17af405` | `32b94cb` | ⏳ | ⏳ | pending |
-| 26 | 2026-08-17 | `a451f3b3-20c6-4dcd-9a9f-e7f21d937a58` | `d077e68` | ⏳ | ⏳ | pending |
+| 26 | 2026-08-17 | `a451f3b3-20c6-4dcd-9a9f-e7f21d937a58` | `d077e68` — cost model refined to per-draft-row marginal costs hᵢ | — | ✅ | covered: `_DepthController` scores each depth with measured per-row marginal cost (warmup sweep + measured slope between depths) — the hᵢ generalization, machine-measured |
 | 27 | 2026-08-17 | `febb7e27-935c-4a1a-bee4-d7387950ea2d` | `cbdc3a8` — Qwen35 +90 + head declaration | ⏳ | ⏳ | pending |
 | 28 | 2026-08-17 | `316bd671-e06a-4aaf-a276-8d59f3fedc5d` | `111b757` | ⏳ | ⏳ | pending |
 | 29 | 2026-08-17 | `39fdbf62-60e4-4ab7-bf09-0d1b5a0b618a` | `ed4dfd6` | ⏳ | ⏳ | pending |
