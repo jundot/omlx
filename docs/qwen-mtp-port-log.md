@@ -63,7 +63,7 @@ absent).
 | 26 | 2026-08-17 | `a451f3b3-20c6-4dcd-9a9f-e7f21d937a58` | `d077e68` — cost model refined to per-draft-row marginal costs hᵢ | — | ✅ | covered: `_DepthController` scores each depth with measured per-row marginal cost (warmup sweep + measured slope between depths) — the hᵢ generalization, machine-measured |
 | 27 | 2026-08-17 | `febb7e27-935c-4a1a-bee4-d7387950ea2d` | `cbdc3a8` — proposal-head precision islands (selected exact BF16 rows in the declared head) | — | ✅ | no port: head-artifact + proposal-side model feature tied to a declared head; omlx runs the pinned bf16 head. Draft-side only, target decides emitted tokens |
 | 28 | 2026-08-17 | `316bd671-e06a-4aaf-a276-8d59f3fedc5d` | `111b757` — warm the `callWithHiddenAndNormed` shapes + top-2 kernels at every row count | — | ✅ | no port: warmup-only (timed-window JIT avoidance); omlx has no scored timed window |
-| 29 | 2026-08-17 | `39fdbf62-60e4-4ab7-bf09-0d1b5a0b618a` | `ed4dfd6` | ⏳ | ⏳ | pending |
+| 29 | 2026-08-17 | `39fdbf62-60e4-4ab7-bf09-0d1b5a0b618a` | `ed4dfd6` — warm additions + head precision islands re-declared | — | ✅ | no port: warmup-only + head declaration (as 27/28) |
 | 30 | 2026-08-18 | `b1e2591b-13f2-4b17-baf1-2956ca9242df` | `036fd9c` | ⏳ | ⏳ | pending |
 | 31 | 2026-08-18 | `824dc272-b560-4dc6-bf6c-42f58944f4cb` | `8dabcfb` — quantized kernels | ⏳ | ⏳ | pending |
 | 32 | 2026-08-18 | `72ce82dc-f751-485d-a7b3-94ab6471cf87` | `dccba74` — quantized kernels | ⏳ | ⏳ | pending |
