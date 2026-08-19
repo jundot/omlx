@@ -746,6 +746,8 @@
   "acc_bench.config.external_extra_body": "Extra Request Body (JSON)",
   "bench.config.single_request": "단일 요청 테스트",
   "bench.config.generation_hint": "생성 길이: 128 tokens (고정)",
+  "bench.config.ane_aligned_prompt": "ANE-aligned prompts (+1 token)",
+  "bench.config.ane_aligned_prompt_hint": "Runs PP4097/8193/etc. so prefill contains exact 2,048-token blocks. These diagnostic results stay local.",
   "bench.config.batch_tests": "연속 배칭 테스트",
   "bench.config.batch_hint": "배칭 테스트는 pp1024 / tg128 사용",
   "bench.config.run_button": "벤치마크 실행",

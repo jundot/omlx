@@ -746,6 +746,8 @@
   "acc_bench.config.external_extra_body": "额外请求体（JSON）",
   "bench.config.single_request": "单请求测试",
   "bench.config.generation_hint": "生成长度：128 tokens（固定）",
+  "bench.config.ane_aligned_prompt": "ANE-aligned prompts (+1 token)",
+  "bench.config.ane_aligned_prompt_hint": "Runs PP4097/8193/etc. so prefill contains exact 2,048-token blocks. These diagnostic results stay local.",
   "bench.config.batch_tests": "连续批处理测试",
   "bench.config.batch_hint": "批处理测试使用 pp1024 / tg128",
   "bench.config.run_button": "运行基准测试",

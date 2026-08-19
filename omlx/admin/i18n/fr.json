@@ -746,6 +746,8 @@
   "acc_bench.config.external_extra_body": "Extra Request Body (JSON)",
   "bench.config.single_request": "Tests de requête unique",
   "bench.config.generation_hint": "Longueur de génération : 128 tokens (fixe)",
+  "bench.config.ane_aligned_prompt": "ANE-aligned prompts (+1 token)",
+  "bench.config.ane_aligned_prompt_hint": "Runs PP4097/8193/etc. so prefill contains exact 2,048-token blocks. These diagnostic results stay local.",
   "bench.config.batch_tests": "Tests de traitement par lot continu",
   "bench.config.batch_hint": "Les tests par lot utilisent pp1024 / tg128",
   "bench.config.run_button": "Exécuter le benchmark",

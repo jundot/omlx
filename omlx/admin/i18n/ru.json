@@ -746,6 +746,8 @@
   "acc_bench.config.external_extra_body": "Дополнительное тело запроса (JSON)",
   "bench.config.single_request": "Тесты по одному запросу",
   "bench.config.generation_hint": "Длина генерации: 128 токенов (фиксировано)",
+  "bench.config.ane_aligned_prompt": "ANE-aligned prompts (+1 token)",
+  "bench.config.ane_aligned_prompt_hint": "Runs PP4097/8193/etc. so prefill contains exact 2,048-token blocks. These diagnostic results stay local.",
   "bench.config.batch_tests": "Непрерывные пакетные тесты",
   "bench.config.batch_hint": "Пакетные тесты используют pp1024 / tg128",
   "bench.config.run_button": "Запустить тест",

@@ -3340,7 +3340,7 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
-        if request.benchmark_trace:
+        if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
@@ -3452,7 +3452,7 @@ class Scheduler:
                 loop_label="external",
                 request_id=request.request_id,
             )
-            if request.benchmark_trace:
+            if getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
@@ -4907,7 +4907,7 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
-        if request.benchmark_trace:
+        if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
@@ -5001,7 +5001,7 @@ class Scheduler:
             loop_label="chunked_step",
             request_id=state.request.request_id,
         )
-        if state.request.benchmark_trace:
+        if getattr(state.request, "benchmark_trace", False):
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
@@ -10475,10 +10475,18 @@ class Scheduler:
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
-                benchmark_prefill_chunks=list(request.benchmark_prefill_chunks),
-                benchmark_requested_steps=list(request.benchmark_requested_steps),
-                benchmark_boundary_enabled=request.benchmark_boundary_enabled,
-                benchmark_cache_block_size=request.benchmark_cache_block_size,
+                benchmark_prefill_chunks=list(
+                    getattr(request, "benchmark_prefill_chunks", [])
+                ),
+                benchmark_requested_steps=list(
+                    getattr(request, "benchmark_requested_steps", [])
+                ),
+                benchmark_boundary_enabled=bool(
+                    getattr(request, "benchmark_boundary_enabled", False)
+                ),
+                benchmark_cache_block_size=int(
+                    getattr(request, "benchmark_cache_block_size", 0) or 0
+                ),
             )
 
             if not is_finished:
