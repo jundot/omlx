@@ -7839,7 +7839,7 @@
                                 guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
                                 guided_grammar: this.modelSettings.guided_grammar_enabled
                                     ? (this.modelSettings.guided_grammar || null)
-                                    : 0,
+                                    : null,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,

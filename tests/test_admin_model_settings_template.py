@@ -129,6 +129,17 @@ def test_model_settings_feature_labels_use_i18n_keys():
     assert ">DFlash</span>" not in status_html
 
 
+def test_model_settings_save_uses_null_for_disabled_guided_grammar():
+    script = _dashboard_script()
+    method = script.split("async saveModelSettings() {", 1)[1].split(
+        "async loadGenerationDefaults() {", 1
+    )[0]
+
+    assert """guided_grammar: this.modelSettings.guided_grammar_enabled
+                                    ? (this.modelSettings.guided_grammar || null)
+                                    : null,""" in method
+
+
 def test_model_settings_feature_i18n_keys_exist_in_every_locale():
     root = Path(__file__).resolve().parents[1]
     i18n_dir = root / "omlx/admin/i18n"
