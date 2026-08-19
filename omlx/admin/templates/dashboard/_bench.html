@@ -140,6 +140,16 @@
                                     </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.generation_hint') }}</p>
+                                <label class="inline-flex items-start gap-2 cursor-pointer mt-3">
+                                    <input type="checkbox"
+                                           x-model="benchAlignPromptToAne"
+                                           :disabled="benchRunning"
+                                           class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                    <span>
+                                        <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.ane_aligned_prompt') }}</span>
+                                        <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.ane_aligned_prompt_hint') }}</span>
+                                    </span>
+                                </label>
                             </div>
 
                             <!-- Batch Config -->

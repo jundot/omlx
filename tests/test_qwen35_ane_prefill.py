@@ -134,7 +134,7 @@ def _make_affine_gdn(bits, group_size):
 
 
 @pytest.mark.parametrize("sequence_length", [2048, 4096])
-def test_configure_scheduler_uses_the_compiled_ane_shape(sequence_length):
+def test_configure_scheduler_preserves_wide_prompt_chunks(sequence_length):
     scheduler = SimpleNamespace(
         config=SimpleNamespace(prefill_step_size=2048),
         _qwen35_prefill_floor=4096,
@@ -146,8 +146,134 @@ def test_configure_scheduler_uses_the_compiled_ane_shape(sequence_length):
     )
 
     assert configured is True
-    assert scheduler.config.prefill_step_size == sequence_length
-    assert scheduler._qwen35_prefill_floor == 0
+    assert scheduler.config.prefill_step_size == 2048
+    assert scheduler._qwen35_prefill_floor == 4096
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        (2047, None),
+        (2048, (1, 0)),
+        (4095, (1, 2047)),
+        (4096, (2, 0)),
+        (8191, (3, 2047)),
+    ],
+)
+def test_wide_tile_plan_uses_every_complete_block(rows, expected):
+    x = mx.zeros((1, rows, 8), dtype=mx.float16)
+    assert ane_patch._tiled_input_plan(x, 2048) == expected
+
+
+def test_mlp_wide_call_tiles_full_blocks_and_keeps_gpu_tail(monkeypatch):
+    calls = []
+
+    def exact(_mlp, block, _target_verify=False):
+        calls.append(("ane", int(block.shape[-2])))
+        return mx.full(block.shape, 7, dtype=block.dtype)
+
+    def linear(label, offset):
+        def run(value):
+            calls.append((label, int(value.shape[-2])))
+            return value + offset
+
+        return run
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    monkeypatch.setattr(ane_patch, "swiglu", lambda gate, up: gate + up)
+    mlp = SimpleNamespace(
+        gate_proj=linear("gate", 10),
+        up_proj=linear("up", 20),
+        down_proj=linear("down", 0),
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(2048, 0.53, 8),
+    )
+
+    result = ane_patch._backend(
+        mlp, mx.zeros((1, 4095, 8), dtype=mx.float16)
+    )
+    mx.eval(result)
+
+    assert result.shape == (1, 4095, 8)
+    assert calls == [
+        ("ane", 2048),
+        ("gate", 2047),
+        ("up", 2047),
+        ("down", 2047),
+    ]
+    assert result[:, :2048].tolist()[0][0][0] == 7
+    assert result[:, 2048:].tolist()[0][0][0] == 30
+
+
+def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
+    calls = []
+
+    def exact(_mlp, block, _target_verify=False):
+        calls.append(int(block.shape[-2]))
+        return block
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    monkeypatch.setattr(ane_patch, "swiglu", lambda gate, up: gate + up)
+    mlp = SimpleNamespace(
+        gate_proj=lambda value: value,
+        up_proj=lambda value: value,
+        down_proj=lambda value: value,
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(2048, 0.25, 8),
+    )
+    result = ane_patch._backend(
+        mlp, mx.zeros((1, 4095, 8), dtype=mx.float16)
+    )
+    assert result is not None
+    mx.eval(result)
+    assert calls == [2048]
+    assert result.shape == (1, 4095, 8)
+
+
+def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
+    calls = []
+
+    def exact(_gdn, block, _target_verify=False):
+        calls.append(("ane", int(block.shape[-2])))
+        return tuple(
+            mx.full((1, block.shape[-2], 1), value, dtype=block.dtype)
+            for value in (1, 2, 3, 4)
+        )
+
+    class Linear:
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self, block):
+            calls.append((self.value, int(block.shape[-2])))
+            return mx.full(
+                (1, block.shape[-2], 1), self.value, dtype=block.dtype
+            )
+
+    monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    linears = [Linear(value) for value in (10, 20, 30, 40)]
+    gdn = SimpleNamespace(
+        in_proj_qkv=linears[0],
+        in_proj_z=linears[1],
+        in_proj_b=linears[2],
+        in_proj_a=linears[3],
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(2048, 0.50, 8),
+    )
+
+    result = ane_patch._gdn_backend(
+        gdn, mx.zeros((1, 4095, 8), dtype=mx.float16)
+    )
+    assert result is not None
+    mx.eval(*result)
+
+    assert [part.shape for part in result] == [(1, 4095, 1)] * 4
+    assert calls == [
+        ("ane", 2048),
+        (10, 2047),
+        (20, 2047),
+        (30, 2047),
+        (40, 2047),
+    ]
+    assert [part[0, 0, 0].item() for part in result] == [1, 2, 3, 4]
+    assert [part[0, -1, 0].item() for part in result] == [10, 20, 30, 40]
 
 
 def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):

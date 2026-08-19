@@ -170,6 +170,11 @@ def main() -> None:
     parser.add_argument("model", type=Path)
     parser.add_argument("--extension", type=Path)
     parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument(
+        "--ane-sequence-length",
+        type=int,
+        help="Fixed ANE program rows (defaults to --tokens; use 2048 to test wide tiling)",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
         "--modes",
@@ -182,6 +187,7 @@ def main() -> None:
     parser.add_argument("--dual-mlp-fraction", type=float, default=0.53)
     parser.add_argument("--dual-gdn-fraction", type=float, default=0.50)
     args = parser.parse_args()
+    ane_sequence_length = args.ane_sequence_length or args.tokens
     if "single" in args.modes and "dual" in args.modes:
         parser.error(
             "benchmark single and dual ANE in separate processes so resident "
@@ -217,7 +223,7 @@ def main() -> None:
             started = time.perf_counter()
             mlp_layers = enable_qwen35_ane_prefill(
                 model,
-                sequence_length=args.tokens,
+                sequence_length=ane_sequence_length,
                 fraction=args.single_mlp_fraction,
                 gdn=True,
                 gdn_fraction=args.single_gdn_fraction,
@@ -228,7 +234,7 @@ def main() -> None:
             started = time.perf_counter()
             mlp_layers = enable_qwen35_ane_prefill(
                 model,
-                sequence_length=args.tokens,
+                sequence_length=ane_sequence_length,
                 fraction=args.dual_mlp_fraction,
                 gdn=True,
                 gdn_fraction=args.dual_gdn_fraction,

@@ -37,8 +37,6 @@ _ANE_RESIDENT_PROGRAM_LIMIT = 120
 # ~4 GiB device address window, so single-die chips reject two monolithic
 # dual banks; 1 GiB spans keep every create well under the window.
 _ANE_BANK_RETRY_MAX_BYTES = 1 << 30
-
-
 @dataclass(frozen=True)
 class _AnePrefillConfig:
     sequence_length: int
@@ -156,11 +154,35 @@ def _eligible_input(x: mx.array, config: _AnePrefillConfig) -> bool:
     return int(x.size // input_dim) == config.sequence_length
 
 
+def _tiled_input_plan(
+    x: mx.array,
+    sequence_length: int,
+) -> tuple[int, int] | None:
+    """Return ``(full_blocks, tail_rows)`` for a tileable wide prefill.
+
+    Only a single prompt is tiled.  Flattening a real batch would lose the
+    sequence boundaries required by the GDN recurrence.  Exact fixed shapes
+    continue through the original fast path and do not use this planner.
+    """
+    if (
+        x.dtype not in (mx.float16, mx.bfloat16)
+        or x.ndim != 3
+        or int(x.shape[0]) != 1
+        or sequence_length <= 0
+    ):
+        return None
+    rows = int(x.shape[-2])
+    full_blocks, tail_rows = divmod(rows, sequence_length)
+    if full_blocks < 1:
+        return None
+    return full_blocks, tail_rows
+
+
 def configure_qwen35_ane_prefill_scheduler(
     scheduler: Any,
     sequence_length: int,
 ) -> bool:
-    """Align scheduler prompt chunks with the compiled fixed ANE shape."""
+    """Keep normal wide prompt chunks; projection backends tile internally."""
     if sequence_length < 1024 or sequence_length % 64:
         raise ValueError(
             "ANE prefill sequence_length must be a multiple of 64 >= 1024"
@@ -168,12 +190,12 @@ def configure_qwen35_ane_prefill_scheduler(
     config = getattr(scheduler, "config", None)
     if config is None:
         return False
-    config.prefill_step_size = int(sequence_length)
-    if hasattr(scheduler, "_qwen35_prefill_floor"):
-        scheduler._qwen35_prefill_floor = 0
     logger.info(
-        "Qwen ANE prefill scheduler aligned to fixed shape %d",
+        "Qwen ANE prefill preserving scheduler chunks; projection tile=%d "
+        "(step=%d, floor=%d)",
         sequence_length,
+        int(getattr(config, "prefill_step_size", 0) or 0),
+        int(getattr(scheduler, "_qwen35_prefill_floor", 0) or 0),
     )
     return True
 
@@ -647,7 +669,7 @@ def _prepare_gdn_for_bank(
     )
 
 
-def _gdn_backend(
+def _gdn_backend_exact(
     gdn: Any, x: mx.array, target_verify: bool = False
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
     config = getattr(gdn, "_omlx_ane_gdn_config", None)
@@ -715,7 +737,52 @@ def _gdn_backend(
         return None
 
 
-def _backend(
+def _gdn_backend(
+    gdn: Any, x: mx.array, target_verify: bool = False
+) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
+    """Route exact or internally tiled tokenwise GDN input projections.
+
+    The recurrent GDN update remains outside this backend, so concatenating
+    independently projected row blocks is algebraically identical to one wide
+    projection. Inputs without a complete fixed-shape tile fall through to the
+    original GPU operation.
+    """
+    config = getattr(gdn, "_omlx_ane_gdn_config", None)
+    if config is None or target_verify:
+        return None
+    input_dim = int(x.shape[-1]) if x.ndim else 0
+    rows = int(x.size // input_dim) if input_dim else 0
+    if rows == config.sequence_length:
+        return _gdn_backend_exact(gdn, x, target_verify)
+
+    plan = _tiled_input_plan(
+        x,
+        config.sequence_length,
+    )
+    if plan is None:
+        return None
+    full_blocks, tail_rows = plan
+    projected: list[tuple[mx.array, mx.array, mx.array, mx.array]] = []
+    for block in range(full_blocks):
+        start = block * config.sequence_length
+        stop = start + config.sequence_length
+        block_x = mx.contiguous(x[:, start:stop, :])
+        output = _gdn_backend_exact(gdn, block_x, target_verify)
+        if output is None:
+            return None
+        projected.append(output)
+
+    if tail_rows:
+        tail_x = x[:, full_blocks * config.sequence_length :, :]
+        projected.append(tuple(linear(tail_x) for linear in _gdn_linears(gdn)))
+
+    return tuple(
+        mx.concatenate([part[index] for part in projected], axis=-2)
+        for index in range(4)
+    )
+
+
+def _backend_exact(
     mlp: Any,
     x: mx.array,
     target_verify: bool = False,
@@ -841,6 +908,50 @@ def _backend(
             exc_info=True,
         )
         return None
+
+
+def _backend(
+    mlp: Any,
+    x: mx.array,
+    target_verify: bool = False,
+) -> mx.array | None:
+    """Route exact or internally tiled MLP rows without shrinking attention.
+
+    Full fixed-shape blocks use the existing ANE/GPU/CPU implementation.  A
+    residual tail stays on the ordinary quantized linears. Inputs without a
+    complete fixed-shape tile fall through to the original wide GPU operation.
+    """
+    config = getattr(mlp, "_omlx_ane_prefill_config", None)
+    if config is None or target_verify:
+        return None
+    input_dim = int(x.shape[-1]) if x.ndim else 0
+    rows = int(x.size // input_dim) if input_dim else 0
+    if rows == config.sequence_length:
+        return _backend_exact(mlp, x, target_verify)
+
+    plan = _tiled_input_plan(
+        x,
+        config.sequence_length,
+    )
+    if plan is None:
+        return None
+    full_blocks, tail_rows = plan
+    outputs: list[mx.array] = []
+    for block in range(full_blocks):
+        start = block * config.sequence_length
+        stop = start + config.sequence_length
+        block_x = mx.contiguous(x[:, start:stop, :])
+        output = _backend_exact(mlp, block_x, target_verify)
+        if output is None:
+            return None
+        outputs.append(output)
+
+    if tail_rows:
+        tail_x = x[:, full_blocks * config.sequence_length :, :]
+        gate = mlp.gate_proj(tail_x)
+        up = mlp.up_proj(tail_x)
+        outputs.append(mlp.down_proj(swiglu(gate, up)))
+    return mx.concatenate(outputs, axis=-2)
 
 
 def _wrap_class(cls: type) -> None:

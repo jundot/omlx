@@ -3340,6 +3340,9 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
+        if request.benchmark_trace:
+            request.benchmark_boundary_enabled = boundary_enabled
+            request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
@@ -3449,6 +3452,9 @@ class Scheduler:
                 loop_label="external",
                 request_id=request.request_id,
             )
+            if request.benchmark_trace:
+                request.benchmark_prefill_chunks.append(int(n_to_process))
+                request.benchmark_requested_steps.append(int(prefill_step_size))
 
             _throttle_pre = get_phys_footprint()
             # External prefill bypasses BatchGenerator, so it must establish
@@ -3624,18 +3630,28 @@ class Scheduler:
                 _ane_sequence = int(
                     getattr(request, "benchmark_ane_sequence_length", 0) or 0
                 )
+                _ane_full_tiles, _ane_tail_tokens = (0, n_to_process)
+                if _ane_sequence > 0:
+                    _ane_full_tiles, _ane_tail_tokens = divmod(
+                        n_to_process, _ane_sequence
+                    )
                 logger.info(
                     "[benchmark-prefill] rid=%s path=external chunk_tokens=%d "
                     "processed=%d->%d kv_before=%d requested_step=%d "
-                    "ane_shape=%s model_cache_ms=%.3f total_ms=%.3f "
-                    "overhead_ms=%.3f",
+                    "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
+                    "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                    "total_ms=%.3f overhead_ms=%.3f",
                     request.request_id,
                     n_to_process,
                     _trace_processed_before,
                     processed_tokens,
                     base_size + _trace_processed_before,
                     prefill_step_size,
-                    bool(_ane_sequence and n_to_process == _ane_sequence),
+                    boundary_enabled,
+                    block_size if boundary_enabled else 0,
+                    _ane_sequence,
+                    _ane_full_tiles,
+                    _ane_tail_tokens,
                     _trace_model_ms,
                     _trace_total_ms,
                     max(0.0, _trace_total_ms - _trace_model_ms),
@@ -4891,6 +4907,9 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
+        if request.benchmark_trace:
+            request.benchmark_boundary_enabled = boundary_enabled
+            request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         if (
             boundary_enabled
@@ -4982,6 +5001,9 @@ class Scheduler:
             loop_label="chunked_step",
             request_id=state.request.request_id,
         )
+        if state.request.benchmark_trace:
+            state.request.benchmark_prefill_chunks.append(int(n))
+            state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
         _throttle_pre = get_phys_footprint()
         # Chunked prefill also bypasses BatchGenerator and must establish the
@@ -5109,18 +5131,26 @@ class Scheduler:
             _ane_sequence = int(
                 getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
             )
+            _ane_full_tiles, _ane_tail_tokens = (0, n)
+            if _ane_sequence > 0:
+                _ane_full_tiles, _ane_tail_tokens = divmod(n, _ane_sequence)
             logger.info(
                 "[benchmark-prefill] rid=%s path=chunked_step chunk_tokens=%d "
                 "processed=%d->%d kv_before=%d requested_step=%d "
-                "ane_shape=%s model_cache_ms=%.3f total_ms=%.3f "
-                "overhead_ms=%.3f",
+                "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
+                "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                "total_ms=%.3f overhead_ms=%.3f",
                 state.request.request_id,
                 n,
                 _trace_processed_before,
                 state.tokens_processed,
                 state.base_size + _trace_processed_before,
                 prefill_step_size,
-                bool(_ane_sequence and n == _ane_sequence),
+                state.boundary_enabled,
+                state.block_size if state.boundary_enabled else 0,
+                _ane_sequence,
+                _ane_full_tiles,
+                _ane_tail_tokens,
                 _trace_model_ms,
                 chunk_dt * 1000.0,
                 max(0.0, chunk_dt * 1000.0 - _trace_model_ms),
@@ -10445,6 +10475,10 @@ class Scheduler:
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
+                benchmark_prefill_chunks=list(request.benchmark_prefill_chunks),
+                benchmark_requested_steps=list(request.benchmark_requested_steps),
+                benchmark_boundary_enabled=request.benchmark_boundary_enabled,
+                benchmark_cache_block_size=request.benchmark_cache_block_size,
             )
 
             if not is_finished:

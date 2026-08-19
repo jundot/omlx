@@ -684,6 +684,7 @@
             // Benchmark state
             benchModelId: '',
             benchContextProfile: 'code_python',
+            benchAlignPromptToAne: false,
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
@@ -9082,6 +9083,7 @@
                         body: JSON.stringify({
                             model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
                             context_profile: this.benchContextProfile,
+                            align_prompt_to_ane: this.benchAlignPromptToAne,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
