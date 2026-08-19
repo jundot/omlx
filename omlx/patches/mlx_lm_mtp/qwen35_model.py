@@ -100,10 +100,128 @@ def apply() -> bool:
     _patch_outer_model(q35)
     _patch_qwen3_5_moe()
 
+    _patch_attention_packed_qkv(q35)
+
     if not hasattr(q35.TextModel, "_omlx_mtp_patched"):
         q35.TextModel._omlx_mtp_patched = "patch"
         logger.info("Qwen3.5/3.6 MTP model patch applied (PR 990)")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Qwen3NextAttention — packed Q/K/V concat on N (challenge 088f763b).
+# ---------------------------------------------------------------------------
+
+_PACKED_QKV_ENV = "OMLX_QWEN_PACKED_QKV"
+
+
+def _packed_qkv_enabled() -> bool:
+    """Default on; ``OMLX_QWEN_PACKED_QKV=0`` restores the exact
+    pre-change three-projection path (the ablation seam)."""
+    import os
+
+    return os.environ.get(_PACKED_QKV_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _try_build_packed_qkv(attn: Any) -> Optional[tuple]:
+    """One affine quantized GEMM for Q+gate/K/V by concatenating the already
+    packed weights on the output axis. Rows are independent, so the single
+    matmul is bit-exact with three separate quantized_matmul calls; an
+    unquantized projection (bf16 MTP head) or mismatched quantization falls
+    back to None and the stock path stays."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    q = getattr(attn, "q_proj", None)
+    k = getattr(attn, "k_proj", None)
+    v = getattr(attn, "v_proj", None)
+    if not all(isinstance(p, nn.QuantizedLinear) for p in (q, k, v)):
+        return None
+    gs = q.group_size
+    bits = q.bits
+    if not (k.group_size == gs and v.group_size == gs):
+        return None
+    if not (k.bits == bits and v.bits == bits):
+        return None
+    if q.biases is None or k.biases is None or v.biases is None:
+        return None
+    w = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
+    s = mx.concatenate([q.scales, k.scales, v.scales], axis=0)
+    z = mx.concatenate([q.biases, k.biases, v.biases], axis=0)
+    return (w, s, z, gs, bits, q.weight.shape[0], k.weight.shape[0])
+
+
+def _patch_attention_packed_qkv(q35: Any) -> None:
+    """Replace ``Qwen3NextAttention.__call__`` with a packed-Q/K/V body.
+
+    Engages only for instances tagged ``_omlx_qwen35_scope`` (qwen3_5
+    DecoderLayer marks its full-attention sublayer) whose q/k/v projections
+    are all compatible QuantizedLinear; every other instance keeps the stock
+    three-projection path byte-for-byte.
+    """
+    cls = q35.Attention
+    if _is_our_method(cls, "__call__", "_omlx_packed_qkv_marker"):
+        return
+
+    import mlx.core as mx
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    def __call__(self, x, mask=None, cache=None):
+        pack = getattr(self, "_omlx_packed_qkv", None)
+        if pack is None:
+            if getattr(self, "_omlx_qwen35_scope", False) and _packed_qkv_enabled():
+                pack = _try_build_packed_qkv(self)
+            if pack is None:
+                pack = False
+            self._omlx_packed_qkv = pack
+
+        B, L, _ = x.shape
+        if pack is False:
+            q_proj_output = self.q_proj(x)
+            keys_in = self.k_proj(x)
+            values_in = self.v_proj(x)
+        else:
+            w, s, z, gs, bits, q_out, k_out = pack
+            y = mx.quantized_matmul(
+                x, w, s, z, transpose=True, group_size=gs, bits=bits
+            )
+            q_proj_output = y[..., :q_out]
+            keys_in = y[..., q_out : q_out + k_out]
+            values_in = y[..., q_out + k_out :]
+
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(B, L, -1)
+        keys = keys_in
+        values = values_in
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
+
+    __call__._omlx_packed_qkv_marker = True
+    cls.__call__ = __call__
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +485,22 @@ def _patch_decoder_layer(q35: Any) -> None:
     cls = q35.DecoderLayer
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
+
+    if not getattr(cls, "_omlx_mtp_init_wrapped", False):
+        original_init = cls.__init__
+
+        def __init__(self, args, layer_idx):
+            original_init(self, args, layer_idx)
+            # Mark full-attention sublayers built inside the qwen3_5 decoder
+            # so the packed-Q/K/V attention path (challenge 088f763b) engages
+            # only for this model family, never for qwen3_next models that
+            # share the Qwen3NextAttention class.
+            sa = getattr(self, "self_attn", None)
+            if sa is not None:
+                sa._omlx_qwen35_scope = True
+
+        cls.__init__ = __init__
+        cls._omlx_mtp_init_wrapped = True
 
     def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
         if self.is_linear:
