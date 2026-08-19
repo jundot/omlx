@@ -365,6 +365,7 @@ class TestDFlashEngineInit:
             temperature=1.0,
             top_p=0.95,
             top_k=20,
+            min_p=0.05,
         )
 
         assert list(event_iter) == []
@@ -375,6 +376,7 @@ class TestDFlashEngineInit:
         assert captured["temperature"] == 1.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == 20
+        assert captured["min_p"] == 0.05
         assert captured["block_tokens"] == 5
         assert fake_flow.snapshot is None
         assert prefix_kwargs["max_new_tokens"] == 3
@@ -1436,8 +1438,10 @@ class TestDFlashCachedTokensWiring:
         )
         fake_flow = SimpleNamespace(hit_tokens=4273)
 
-        def fake_stream_events(*, prompt_tokens, max_tokens, temperature, top_p, top_k):
-            assert (temperature, top_p, top_k) == (0.7, 0.9, 0)
+        def fake_stream_events(
+            *, prompt_tokens, max_tokens, temperature, top_p, top_k, min_p
+        ):
+            assert (temperature, top_p, top_k, min_p) == (0.7, 0.9, 0, 0.0)
             return iter([summary]), fake_flow, [2]
 
         monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)

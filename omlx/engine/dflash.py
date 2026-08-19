@@ -1149,6 +1149,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         temperature: float = 0.0,
         top_p: float = 1.0,
         top_k: int = 0,
+        min_p: float = 0.0,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
@@ -1193,6 +1194,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             block_tokens=self._block_size,
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
@@ -1236,6 +1238,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         temperature: float,
         top_p: float,
         top_k: int,
+        min_p: float,
+        seed: int | None,
         tools: list[dict] | None,
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
@@ -1254,12 +1258,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         cache_manager = None
         try:
             self._record_prefill_guard_active_memory()
+            if seed is not None:
+                # Best-effort per-request reproducibility, matching the
+                # batched engine's mx.random.seed handling.
+                mx.random.seed(int(seed))
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                min_p=min_p,
             )
             cache_manager = self._begin_runtime_cache_request()
             self._record_prefill_guard_active_memory()
@@ -1448,6 +1457,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
 
         tools = kwargs.pop("tools", None)
+        seed = kwargs.pop("seed", None)
 
         from ..engine_core import get_mlx_executor
 
@@ -1468,12 +1478,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             parser_session = self._create_output_parser_session(tools)
             try:
                 self._record_prefill_guard_active_memory()
+                if seed is not None:
+                    # Best-effort per-request reproducibility, matching the
+                    # batched engine's mx.random.seed handling.
+                    mx.random.seed(int(seed))
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
+                    min_p=min_p,
                 )
                 cache_manager = self._begin_runtime_cache_request()
                 self._record_prefill_guard_active_memory()
@@ -1663,6 +1678,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return
 
         tools = kwargs.pop("tools", None)
+        seed = kwargs.pop("seed", None)
 
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
@@ -1697,6 +1713,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             temperature,
             top_p,
             top_k,
+            min_p,
+            seed,
             tools,
             queue,
             loop,
