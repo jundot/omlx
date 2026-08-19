@@ -67,7 +67,7 @@ absent).
 | 30 | 2026-08-18 | `b1e2591b-13f2-4b17-baf1-2956ca9242df` | `036fd9c` — draft rerank: coarse affine-2 compact readout picks 32 rows, affine-4 compact readout reranks them; head declaration | — | ✅ | no port: rerank Metal kernel + head artifact (draft-side). omlx keeps the pinned head; the proposal readout stays graph argmax |
 | 31 | 2026-08-18 | `824dc272-b560-4dc6-bf6c-42f58944f4cb` | `8dabcfb` — affine2/g64 single-row fast QMV for the coarse compact readout | — | ✅ | no port: C++ Metal kernel in vendored mlx-swift (2-bit qmv); Python mlx has no 2-bit quantized_matmul and the coarse readout is head-artifact-side |
 | 32 | 2026-08-18 | `72ce82dc-f751-485d-a7b3-94ab6471cf87` | `dccba74` — affine2/g64 32-values-per-lane QMV variant | — | ✅ | no port: C++ Metal kernel (as 31) |
-| 33 | 2026-08-18 | `4f76de6e-d9cf-4a52-8aa1-57dc4c0e2a16` | `c0e34af` — session + RuntimeStartupMemoryPolicy | ⏳ | ⏳ | pending |
+| 33 | 2026-08-18 | `4f76de6e-d9cf-4a52-8aa1-57dc4c0e2a16` | `c0e34af` — Metal residency-set resize to hold the post-warm footprint | — | ✅ | no port: Metal runtime memory policy (wired-limit / residency set) — Python mlx owns its own memory management; omlx cache-limit guard (set_cache_limit) already covers working-set sizing |
 | 34 | 2026-08-18 | `b0994092-554a-452c-8d4c-78fecda724b4` | `1cb1f43` — session +19 | ⏳ | ⏳ | pending |
 | 35 | 2026-08-19 | `59b321ee-eb5c-40ec-bb49-5218e4b8cd31` | `9e1ff9e` — session +70 | ⏳ | ⏳ | pending |
 
