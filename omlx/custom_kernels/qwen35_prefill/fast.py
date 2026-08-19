@@ -85,11 +85,90 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_q4_swiglu_t",
     "qwen35_ane_affine_swiglu_t",
     "qwen35_ane_compile_linear_bank",
+    "qwen35_cpu_fp16_affine_qmm_t",
     "qwen35_ane_dual_affine_qmm_t",
     "qwen35_ane_dual_q4_swiglu_t",
     "qwen35_ane_dual_affine_swiglu_t",
+    "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_q4_swiglu_down_t",
 )
+
+
+def qwen35_cpu_fp16_affine_qmm_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_cpu_fp16_affine_qmm_t"):
+        raise RuntimeError("CPU/GPU fp16 hybrid qmm native kernel is unavailable")
+    args = (
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        bits,
+        variant,
+        group_size,
+        cpu_threads,
+    )
+    if hasattr(_ext, "qwen35_cpu_shared_resource_available"):
+        return _ext.qwen35_cpu_fp16_affine_qmm_t(
+            *args, cpu_shared_resource
+        )
+    return _ext.qwen35_cpu_fp16_affine_qmm_t(*args)
+
+
+def qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+    x: mx.array,
+    cpu_weight: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+    ):
+        raise RuntimeError("ANE/CPU/GPU fp16 hybrid SwiGLU is unavailable")
+    args = (
+        x,
+        cpu_weight,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+        cpu_threads,
+    )
+    if hasattr(_ext, "qwen35_cpu_shared_resource_available"):
+        return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+            *args, cpu_shared_resource
+        )
+    return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(*args)
+
+
+def qwen35_cpu_shared_resource_available() -> bool:
+    """Whether the private shared-resource scheduler hint is accepted."""
+    return bool(
+        _ext is not None
+        and hasattr(_ext, "qwen35_cpu_shared_resource_available")
+        and _ext.qwen35_cpu_shared_resource_available()
+    )
 
 
 def qwen35_ane_available() -> bool:
@@ -110,6 +189,9 @@ _ANE_PROFILE_KEYS = (
     "ane0_launch_ns",
     "ane1_launch_ns",
     "gpu_qmm_ns",
+    "gpu_completion_ns",
+    "cpu_matmul_ns",
+    "cpu_completion_ns",
     "ane_last",
     "gpu_last",
     "gap_before_ns",

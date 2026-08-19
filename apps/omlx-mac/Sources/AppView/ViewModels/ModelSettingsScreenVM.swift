@@ -39,6 +39,9 @@ final class ModelSettingsScreenVM {
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
         case qwen35AnePrefillDualAne, qwen35AnePrefillGdn
         case qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnMaxLayers
+        case qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuFraction
+        case qwen35AnePrefillCpuDownFraction
+        case qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuSharedResource
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
@@ -203,10 +206,37 @@ final class ModelSettingsScreenVM {
         ("0.35", "35%"),
         ("0.4", "40%"),
         ("0.45", "45%"),
+        ("0.465", "46.5%"),
         ("0.5", "50%"),
         ("0.53", "53%"),
         ("0.55", "55%"),
         ("0.6", "60%"),
+    ]
+
+    static let qwen35AneCpuFractionOptions: [(String, String)] = [
+        ("0.05", "5%"),
+        ("0.1", "10%"),
+        ("0.125", "12.5%"),
+        ("0.13", "13%"),
+        ("0.135", "13.5%"),
+        ("0.14", "14%"),
+        ("0.15", "15%"),
+    ]
+
+    static let qwen35AneCpuThreadOptions: [(String, String)] = [
+        ("0", "Automatic"),
+        ("8", "8"),
+        ("12", "12"),
+        ("16", "16"),
+        ("24", "24"),
+    ]
+
+    static let qwen35AneCpuDownFractionOptions: [(String, String)] = [
+        ("0", "Disabled"),
+        ("0.1", "10%"),
+        ("0.15", "15%"),
+        ("0.2", "20%"),
+        ("0.25", "25%"),
     ]
 
     /// `config_model_type` values that surface IndexCache in the HTML
@@ -288,6 +318,11 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillGdn: Bool = true
     var qwen35AnePrefillGdnFraction: String = "0.5"
     var qwen35AnePrefillGdnMaxLayers: String = "48"
+    var qwen35AnePrefillCpuEnabled: Bool = false
+    var qwen35AnePrefillCpuFraction: String = "0.135"
+    var qwen35AnePrefillCpuDownFraction: String = "0"
+    var qwen35AnePrefillCpuThreads: String = "8"
+    var qwen35AnePrefillCpuSharedResource: Bool = true
     var aneTuningID: String?
     var aneTuningIsRunning: Bool = false
     var aneTuningStatus: ANETuningStatusResponse?
@@ -388,6 +423,11 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillDualAne, .qwen35AnePrefillGdn:
             return true
         case .qwen35AnePrefillGdnFraction, .qwen35AnePrefillGdnMaxLayers:
+            return true
+        case .qwen35AnePrefillCpuEnabled, .qwen35AnePrefillCpuFraction,
+             .qwen35AnePrefillCpuDownFraction:
+            return true
+        case .qwen35AnePrefillCpuThreads, .qwen35AnePrefillCpuSharedResource:
             return true
         case .indexCacheEnabled, .indexCacheFreq:
             return true
@@ -523,6 +563,11 @@ final class ModelSettingsScreenVM {
                 self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
                 self.qwen35AnePrefillGdnFraction = s?.qwen35AnePrefillGdnFraction.map { Self.formatPct($0) } ?? "0.5"
                 self.qwen35AnePrefillGdnMaxLayers = s?.qwen35AnePrefillGdnMaxLayers.map(String.init) ?? "48"
+                self.qwen35AnePrefillCpuEnabled = s?.qwen35AnePrefillCpuEnabled ?? false
+                self.qwen35AnePrefillCpuFraction = s?.qwen35AnePrefillCpuFraction.map { Self.formatPct($0) } ?? "0.135"
+                self.qwen35AnePrefillCpuDownFraction = s?.qwen35AnePrefillCpuDownFraction.map { Self.formatPct($0) } ?? "0"
+                self.qwen35AnePrefillCpuThreads = s?.qwen35AnePrefillCpuThreads.map(String.init) ?? "8"
+                self.qwen35AnePrefillCpuSharedResource = s?.qwen35AnePrefillCpuSharedResource ?? true
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -669,6 +714,16 @@ final class ModelSettingsScreenVM {
             patch.qwen35AnePrefillGdnFraction = Double(qwen35AnePrefillGdnFraction)
         case .qwen35AnePrefillGdnMaxLayers:
             patch.qwen35AnePrefillGdnMaxLayers = Int(qwen35AnePrefillGdnMaxLayers)
+        case .qwen35AnePrefillCpuEnabled:
+            patch.qwen35AnePrefillCpuEnabled = qwen35AnePrefillCpuEnabled
+        case .qwen35AnePrefillCpuFraction:
+            patch.qwen35AnePrefillCpuFraction = Double(qwen35AnePrefillCpuFraction)
+        case .qwen35AnePrefillCpuDownFraction:
+            patch.qwen35AnePrefillCpuDownFraction = Double(qwen35AnePrefillCpuDownFraction)
+        case .qwen35AnePrefillCpuThreads:
+            patch.qwen35AnePrefillCpuThreads = Int(qwen35AnePrefillCpuThreads)
+        case .qwen35AnePrefillCpuSharedResource:
+            patch.qwen35AnePrefillCpuSharedResource = qwen35AnePrefillCpuSharedResource
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:
@@ -1065,6 +1120,13 @@ final class ModelSettingsScreenVM {
                 if qwen35AnePrefillGdn {
                     putDouble(ProfileSettingsKey.qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnFraction)
                     putInt(ProfileSettingsKey.qwen35AnePrefillGdnMaxLayers, qwen35AnePrefillGdnMaxLayers)
+                }
+                putBool(ProfileSettingsKey.qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuEnabled)
+                if qwen35AnePrefillCpuEnabled {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillCpuFraction, qwen35AnePrefillCpuFraction)
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillCpuDownFraction, qwen35AnePrefillCpuDownFraction)
+                    putInt(ProfileSettingsKey.qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuThreads)
+                    putBool(ProfileSettingsKey.qwen35AnePrefillCpuSharedResource, qwen35AnePrefillCpuSharedResource)
                 }
             }
             if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {

@@ -397,6 +397,25 @@ class EnginePool:
                     "qwen35_ane_prefill_gdn_max_layers",
                     data.get("qwen35_ane_prefill_gdn_max_layers", 48),
                 )
+            cpu_active = bool(data.get("qwen35_ane_prefill_cpu_enabled", False))
+            add("qwen35_ane_prefill_cpu_enabled", cpu_active)
+            if cpu_active:
+                add(
+                    "qwen35_ane_prefill_cpu_fraction",
+                    data.get("qwen35_ane_prefill_cpu_fraction", 0.135),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_down_fraction",
+                    data.get("qwen35_ane_prefill_cpu_down_fraction", 0.0),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_threads",
+                    data.get("qwen35_ane_prefill_cpu_threads", 8),
+                )
+                add(
+                    "qwen35_ane_prefill_cpu_shared_resource",
+                    data.get("qwen35_ane_prefill_cpu_shared_resource", True),
+                )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"

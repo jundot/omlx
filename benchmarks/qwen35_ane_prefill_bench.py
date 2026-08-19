@@ -10,6 +10,7 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -92,12 +93,18 @@ def benchmark_mode(
         fast.qwen35_ane_profile_reset()
 
     samples = []
+    graph_build_samples = []
+    execution_samples = []
     for _ in range(repeats):
         started = time.perf_counter()
         output = run_body(model, tokens)
+        graph_built = time.perf_counter()
         mx.eval(output)
         mx.synchronize()
-        samples.append(time.perf_counter() - started)
+        finished = time.perf_counter()
+        samples.append(finished - started)
+        graph_build_samples.append(graph_built - started)
+        execution_samples.append(finished - graph_built)
     median = statistics.median(samples)
     profile_result: dict[str, Any] = {}
     if profile:
@@ -110,7 +117,7 @@ def benchmark_mode(
                 "input_ready_ms_per_op": metrics["pack_ns"] / operations / 1e6
                 if operations
                 else 0.0,
-                "ane_region_ms_per_op": metrics["ane_region_ns"]
+                "parallel_region_ms_per_op": metrics["ane_region_ns"]
                 / operations
                 / 1e6
                 if operations
@@ -140,6 +147,21 @@ def benchmark_mode(
                 / 1e6
                 if operations
                 else 0.0,
+                "gpu_completion_ms_per_op": metrics["gpu_completion_ns"]
+                / operations
+                / 1e6
+                if operations
+                else 0.0,
+                "cpu_matmul_ms_per_op": metrics["cpu_matmul_ns"]
+                / operations
+                / 1e6
+                if operations
+                else 0.0,
+                "cpu_completion_ms_per_op": metrics["cpu_completion_ns"]
+                / operations
+                / 1e6
+                if operations
+                else 0.0,
                 "gap_before_ms_per_op": metrics["gap_before_ns"]
                 / operations
                 / 1e6
@@ -164,6 +186,9 @@ def benchmark_mode(
         {
             "median_seconds": median,
             "samples_seconds": samples,
+            "median_graph_build_ms": statistics.median(graph_build_samples) * 1e3,
+            "graph_build_samples_ms": [value * 1e3 for value in graph_build_samples],
+            "median_execution_ms": statistics.median(execution_samples) * 1e3,
             "prompt_tokens_per_second": int(tokens.size) / median,
             **({"ane_profile": profile_result} if profile_result else {}),
         },
@@ -180,6 +205,23 @@ def main() -> None:
         action="store_true",
         help="load through oMLX's text-model path, matching the app benchmark",
     )
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=8,
+        help="worker count for the optional fp16 CPU share (default: 8; 0=auto)",
+    )
+    parser.add_argument(
+        "--disable-cpu-shared-resource",
+        action="store_true",
+        help="disable performance-aware shared-resource CPU scheduling",
+    )
+    parser.add_argument(
+        "--cpu-threads-grid",
+        nargs="+",
+        type=int,
+        help="Benchmark several CPU worker counts after one ANE compilation",
+    )
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
@@ -193,6 +235,18 @@ def main() -> None:
     parser.add_argument("--dual-mlp-fraction", type=float, default=0.53)
     parser.add_argument("--dual-gdn-fraction", type=float, default=0.50)
     parser.add_argument(
+        "--cpu-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fp16 CPU share of each MLP gate/up projection",
+    )
+    parser.add_argument(
+        "--cpu-down-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fp16 CPU share of each MLP down projection",
+    )
+    parser.add_argument(
         "--disable-gdn",
         action="store_true",
         help="benchmark MLP offload without compiling or dispatching GDN",
@@ -203,6 +257,10 @@ def main() -> None:
             "benchmark single and dual ANE in separate processes so resident "
             "programs from the first mode do not consume the second mode's budget"
         )
+    if args.cpu_threads_grid and any(
+        value < 0 or value > 64 for value in args.cpu_threads_grid
+    ):
+        parser.error("CPU worker counts must be between 0 and 64")
 
     native_ext = inject_extension(args.extension) if args.extension else None
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -251,6 +309,7 @@ def main() -> None:
                 gdn=not args.disable_gdn,
                 gdn_fraction=args.single_gdn_fraction,
                 dual_ane=False,
+                cpu_fraction=0.0,
             )
             compile_seconds = time.perf_counter() - started
         elif mode == "dual":
@@ -262,46 +321,74 @@ def main() -> None:
                 gdn=not args.disable_gdn,
                 gdn_fraction=args.dual_gdn_fraction,
                 dual_ane=True,
+                cpu_fraction=args.cpu_fraction,
+                cpu_down_fraction=args.cpu_down_fraction,
+                cpu_threads=args.cpu_threads,
+                cpu_shared_resource=not args.disable_cpu_shared_resource,
             )
             compile_seconds = time.perf_counter() - started
         else:
             mlp_layers = 0
             compile_seconds = 0.0
 
-        measured, output = benchmark_mode(model, tokens, args.repeats)
-        measured.update(
-            {
-                "compile_seconds": compile_seconds,
-                "mlp_layers": mlp_layers,
-                "dual_mlp_layers": int(
-                    getattr(model, "_omlx_ane_dual_prefill_count", 0)
-                )
-                if mode != "gpu"
-                else 0,
-                "resident_programs": int(
-                    getattr(model, "_omlx_ane_resident_program_count", 0)
-                )
-                if mode != "gpu"
-                else 0,
-                "procedures": int(
-                    getattr(model, "_omlx_ane_procedure_count", 0)
-                )
-                if mode != "gpu"
-                else 0,
-                "gdn_layers": int(getattr(model, "_omlx_ane_gdn_prefill_count", 0))
-                if mode != "gpu"
-                else 0,
-            }
-        )
-        if mode == "gpu":
-            reference = output
-        elif reference is not None:
-            measured["accuracy_vs_gpu"] = accuracy(model, reference, output)
-            measured["speedup_vs_gpu"] = (
-                results["gpu"]["median_seconds"] / measured["median_seconds"]
+        variants: list[tuple[str, int | None]] = [(mode, None)]
+        if mode == "dual" and args.cpu_threads_grid:
+            variants = [
+                (f"dual_cpu_threads_{threads}", threads)
+                for threads in args.cpu_threads_grid
+            ]
+        for result_key, cpu_threads in variants:
+            if cpu_threads is not None:
+                for module in model.modules():
+                    config = getattr(module, "_omlx_ane_prefill_config", None)
+                    if config is not None:
+                        module._omlx_ane_prefill_config = replace(
+                            config, cpu_threads=cpu_threads
+                        )
+            measured, output = benchmark_mode(model, tokens, args.repeats)
+            measured.update(
+                {
+                    "compile_seconds": compile_seconds,
+                    "mlp_layers": mlp_layers,
+                    "cpu_threads": cpu_threads
+                    if cpu_threads is not None
+                    else args.cpu_threads,
+                    "cpu_shared_resource": not args.disable_cpu_shared_resource,
+                    "cpu_down_fraction": args.cpu_down_fraction,
+                    "dual_mlp_layers": int(
+                        getattr(model, "_omlx_ane_dual_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "resident_programs": int(
+                        getattr(model, "_omlx_ane_resident_program_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "procedures": int(
+                        getattr(model, "_omlx_ane_procedure_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "gdn_layers": int(
+                        getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                }
             )
-        results[mode] = measured
-        print(f"{mode.upper()} {json.dumps(measured, sort_keys=True)}", flush=True)
+            if mode == "gpu":
+                reference = output
+            elif reference is not None:
+                measured["accuracy_vs_gpu"] = accuracy(model, reference, output)
+                measured["speedup_vs_gpu"] = (
+                    results["gpu"]["median_seconds"] / measured["median_seconds"]
+                )
+            results[result_key] = measured
+            print(
+                f"{result_key.upper()} {json.dumps(measured, sort_keys=True)}",
+                flush=True,
+            )
 
     print("RESULT " + json.dumps(results, sort_keys=True), flush=True)
 

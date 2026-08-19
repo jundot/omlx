@@ -235,8 +235,14 @@ def test_qwen_ane_fraction_selects_cover_nax_tuner_results():
         "<!-- TurboQuant KV Cache -->",
     )
 
-    for value in ("0.15", "0.25", "0.35", "0.45", "0.53"):
-        assert section.count(f'<option value="{value}"') == 2
+    for field in (
+        "qwen35_ane_prefill_fraction",
+        "qwen35_ane_prefill_gdn_fraction",
+    ):
+        select = section.split(f'x-model.number="modelSettings.{field}"', 1)[1]
+        select = select.split("</select>", 1)[0]
+        for value in ("0.15", "0.25", "0.35", "0.45", "0.53"):
+            assert f'<option value="{value}"' in select
 
 
 def test_qwen_ane_web_defaults_match_configured_profile():
@@ -252,6 +258,11 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
     assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
     assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
+    assert "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false" in state
+    assert "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135" in state
+    assert "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0" in state
+    assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
+    assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
 
 
 def test_js_embedded_translations_escape_apostrophes():

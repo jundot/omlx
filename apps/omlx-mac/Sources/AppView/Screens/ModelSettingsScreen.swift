@@ -1275,6 +1275,78 @@ private struct ExperimentalSection: View {
                         ))
                             .labelsHidden().toggleStyle(.switch)
                     }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.cpu.label",
+                                      defaultValue: "Share MLP Work with CPU",
+                                      comment: "Row label for optional CPU participation in Qwen MLP prefill"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.cpu.sub",
+                                         defaultValue: "Requires a separate q4 checkpoint clone whose floating tensors are FP16. Retune the ANE MLP share when enabled.",
+                                         comment: "Constraint and tuning guidance for Qwen CPU prefill sharing")) {
+                        Toggle("", isOn: saved(
+                            $vm.qwen35AnePrefillCpuEnabled,
+                            field: .qwen35AnePrefillCpuEnabled
+                        ))
+                            .labelsHidden().toggleStyle(.switch)
+                            .disabled(!vm.qwen35AnePrefillDualAne)
+                    }
+                    if vm.qwen35AnePrefillCpuEnabled {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_fraction.label",
+                                          defaultValue: "MLP on CPU",
+                                          comment: "Row label for the Qwen MLP CPU workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_fraction.sub",
+                                             defaultValue: "Gate/up output channels assigned to CPU FP16 matrix multiplication.",
+                                             comment: "Sublabel explaining the Qwen MLP CPU workload fraction")) {
+                            Popup(
+                                selection: saved(
+                                    $vm.qwen35AnePrefillCpuFraction,
+                                    field: .qwen35AnePrefillCpuFraction
+                                ),
+                                width: 190,
+                                options: ModelSettingsScreenVM.qwen35AneCpuFractionOptions
+                            )
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_threads.label",
+                                          defaultValue: "CPU Workers",
+                                          comment: "Row label for the requested Accelerate CPU worker count"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_threads.sub",
+                                             defaultValue: "Eight is the measured starting point. Automatic delegates worker selection to Accelerate.",
+                                             comment: "Sublabel explaining the Qwen CPU worker setting")) {
+                            Popup(
+                                selection: saved(
+                                    $vm.qwen35AnePrefillCpuThreads,
+                                    field: .qwen35AnePrefillCpuThreads
+                                ),
+                                width: 190,
+                                options: ModelSettingsScreenVM.qwen35AneCpuThreadOptions
+                            )
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.label",
+                                          defaultValue: "Down Projection on CPU",
+                                          comment: "Row label for the Qwen MLP down-projection CPU workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.sub",
+                                             defaultValue: "Optional second-stage split. Disabled by default; 20% was the best isolated starting point.",
+                                             comment: "Sublabel explaining the Qwen down-projection CPU workload fraction")) {
+                            Popup(
+                                selection: saved(
+                                    $vm.qwen35AnePrefillCpuDownFraction,
+                                    field: .qwen35AnePrefillCpuDownFraction
+                                ),
+                                width: 190,
+                                options: ModelSettingsScreenVM.qwen35AneCpuDownFractionOptions
+                            )
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.label",
+                                          defaultValue: "Performance-Aware Scheduling",
+                                          comment: "Row label for the shared-resource CPU scheduler hint"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.sub",
+                                             defaultValue: "Distributes independent CPU shards across processor clusters and falls back automatically when unsupported.",
+                                             comment: "Sublabel explaining performance-aware CPU scheduling")) {
+                            Toggle("", isOn: saved(
+                                $vm.qwen35AnePrefillCpuSharedResource,
+                                field: .qwen35AnePrefillCpuSharedResource
+                            ))
+                                .labelsHidden().toggleStyle(.switch)
+                        }
+                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.gdn.label",
                                       defaultValue: "Accelerate GDN",
                                       comment: "Row label for Qwen GDN ANE acceleration"),

@@ -250,6 +250,73 @@ def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_cpu_shared_resource_scheduler_is_capability_guarded(
+    monkeypatch, available
+):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(
+        fast, "qwen35_cpu_shared_resource_available", lambda: available
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    captured = []
+
+    def enable_banks(model, candidates, config, **kwargs):
+        captured.append(config)
+        return (1, 1, 0, 2)
+
+    monkeypatch.setattr(ane_patch, "_enable_dual_procedure_banks", enable_banks)
+    model = _Model(1)
+    model.layers[0].gate_proj.scales = model.layers[0].gate_proj.scales.astype(
+        mx.float16
+    )
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        cpu_fraction=0.125,
+        cpu_threads=8,
+        cpu_shared_resource=True,
+    )
+
+    assert count == 1
+    assert captured[0].cpu_threads == 8
+    assert captured[0].cpu_shared_resource is available
+
+
+def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
+    mlp = _MLP()
+    linear = mlp.down_proj
+    linear.scales = linear.scales.astype(mx.float16)
+    linear.biases = linear.biases.astype(mx.float16)
+    state = ane_patch._prepare_cpu_linear(linear, 0.5)
+
+    assert state is not None
+    assert state.weight.shape == (64, 256)
+    assert state.gpu_weight.shape[0] == 64
+
+    captured = []
+
+    def hybrid(*args):
+        captured.append(args)
+        return mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    monkeypatch.setattr(fast, "qwen35_cpu_fp16_affine_qmm_t", hybrid)
+    result = ane_patch._post_ane_linear(
+        linear,
+        mx.zeros((1, 1, 256), dtype=mx.float16),
+        8,
+        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
+        cpu_state=state,
+        cpu_threads=8,
+        cpu_shared_resource=True,
+    )
+
+    assert result.shape == (1, 1, 128)
+    assert captured[0][-2:] == (8, True)
+
+
 def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
