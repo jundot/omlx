@@ -94,8 +94,10 @@ class ModelFit:
     # fit above is the FEWEST-node plan; a model that fits one Mac reports
     # tensor_parallel_size=1 even on a 2-node cluster. The dashboard needs
     # these to know a multi-node deploy of a pipeline-incapable model can
-    # only be tensor.
-    supports_pipeline: bool = True
+    # only be tensor. Both default False (fail closed, like the planner's
+    # _supports_pipeline for an unknown model_type) — a constructor that
+    # skips them must not advertise capabilities nobody verified.
+    supports_pipeline: bool = False
     supports_tensor_parallel: bool = False
 
     @property

@@ -10475,11 +10475,15 @@ class Scheduler:
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
-                benchmark_prefill_chunks=list(
-                    getattr(request, "benchmark_prefill_chunks", [])
+                benchmark_prefill_chunks=(
+                    list(getattr(request, "benchmark_prefill_chunks", []))
+                    if getattr(request, "benchmark_trace", False)
+                    else []
                 ),
-                benchmark_requested_steps=list(
-                    getattr(request, "benchmark_requested_steps", [])
+                benchmark_requested_steps=(
+                    list(getattr(request, "benchmark_requested_steps", []))
+                    if getattr(request, "benchmark_trace", False)
+                    else []
                 ),
                 benchmark_boundary_enabled=bool(
                     getattr(request, "benchmark_boundary_enabled", False)

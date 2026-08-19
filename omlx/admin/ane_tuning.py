@@ -289,11 +289,10 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
 def _prefill_step_size(engine: Any) -> int | None:
     """The configured prefill step size, if determinable.
 
-    On an ANE-enabled engine configure_qwen35_ane_prefill_scheduler aligns
-    the scheduler's own config copy to the compiled sequence length and
-    zeroes the qwen35 prefill floor, so the shared config read here is a
-    hint at best. The delivered chunk can also be cut by the cache block
-    boundary or the memory guard, which is why callers point at
+    The scheduler keeps its normal chunk width and the ANE tiles wider
+    chunks internally, so sequence_length must not exceed the delivered
+    width. The delivered chunk can be cut below this value by the cache
+    block boundary or the memory guard, which is why callers point at
     chunk_tokens in the serve log as the authority.
     """
     config = getattr(engine, "_scheduler_config", None)
@@ -422,9 +421,11 @@ async def _measure_candidate(
         step = _prefill_step_size(engine)
         hint = (
             f"the scheduler is configured for {step}-token prefill chunks, "
-            f"so try sequence_length={step}"
+            f"so set sequence_length={step} or smaller (wider chunks tile "
+            "onto the compiled shape, narrower ones cannot)"
             if step
-            else "sequence_length must match the scheduler's prefill chunk size"
+            else "sequence_length must not exceed the scheduler's prefill "
+            "chunk width"
         )
         raise RuntimeError(
             "The ANE compiled but never executed for "

@@ -7,7 +7,6 @@ import ipaddress
 import json
 import os
 import platform
-import pwd
 import re
 import shutil
 import socket
@@ -382,21 +381,6 @@ def _warning_for(result: CommandResult, label: str) -> str | None:
     return f"{label} probe unavailable: {detail}"
 
 
-def local_login_name() -> str:
-    """This account's real login short name — never the display/full name.
-
-    Keyed by UID rather than getpass.getuser(), which trusts $USER/$LOGNAME and
-    can report a spoofed or inherited value. Advertised in cluster status so a
-    peer forms a correct ``user@host`` instead of relying on OpenSSH's fallback
-    to the caller's own account name.
-    """
-
-    try:
-        return pwd.getpwuid(os.getuid()).pw_name
-    except (KeyError, OSError):
-        return os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-
-
 def _advertised_python_executable() -> str:
     """The interpreter another Mac should run over SSH to reach this node.
 
@@ -602,7 +586,6 @@ def collect_cluster_status(
     return ClusterStatus(
         collected_at=timestamp.isoformat(),
         hostname=socket.gethostname(),
-        ssh_user=local_login_name(),
         platform=platform.platform(),
         chip_name=chip_name,
         physical_memory_bytes=physical_memory_bytes,

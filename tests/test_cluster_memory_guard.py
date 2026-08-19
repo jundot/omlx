@@ -959,62 +959,54 @@ def test_the_tier_the_operator_chose_is_the_tier_that_is_measured(monkeypatch):
     assert ceiling_breakdown("safe")["static"] == safe["static"]
 
 
-def test_operator_memory_settings_initializes_uninitialized_settings(monkeypatch):
-    """When settings are uninitialized (as in a fresh worker/probe process),
-    _operator_memory_settings calls init_settings() instead of silently defaulting
-    to stock balanced/0."""
-    from types import SimpleNamespace
+def test_operator_memory_settings_reads_real_settings_when_uninitialized(
+    monkeypatch, tmp_path
+):
+    """A fresh worker/probe process never calls init_settings, so the operator's
+    persisted tier must come from a real settings.json read, and the read must
+    not publish the process-wide singleton as a side effect."""
+    import json
+
     import omlx.settings as settings_module
     from omlx.cluster.memory_guard import _operator_memory_settings
 
-    initialized = False
-
-    def fake_get_settings():
-        if not initialized:
-            raise RuntimeError("Settings not initialized. Call init_settings() first.")
-        return SimpleNamespace(
-            memory=SimpleNamespace(
-                memory_guard_tier="custom",
-                memory_guard_custom_ceiling_gb=44.0,
-                prefill_memory_guard=True,
-            )
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            {
+                "memory": {
+                    "memory_guard_tier": "custom",
+                    "memory_guard_custom_ceiling_gb": 44.0,
+                }
+            }
         )
-
-    def fake_init_settings(*args, **kwargs):
-        nonlocal initialized
-        initialized = True
-        return fake_get_settings()
-
-    monkeypatch.setattr(settings_module, "get_settings", fake_get_settings)
-    monkeypatch.setattr(settings_module, "init_settings", fake_init_settings)
+    )
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path))
+    monkeypatch.setattr(settings_module, "_global_settings", None)
 
     tier, custom_gb, enabled = _operator_memory_settings()
-    assert initialized is True
+
     assert tier == "custom"
     assert custom_gb == 44.0
     assert enabled is True
+    assert settings_module._global_settings is None
 
 
-def test_operator_memory_settings_does_not_initialize_on_other_runtime_error(monkeypatch):
-    from types import SimpleNamespace
+def test_operator_memory_settings_falls_back_when_load_fails(monkeypatch):
     import omlx.settings as settings_module
     from omlx.cluster.memory_guard import _operator_memory_settings
 
-    init_called = False
-
     def fake_get_settings():
-        raise RuntimeError('Some other failure')
+        raise RuntimeError("Settings not initialized")
 
-    def fake_init_settings(*args, **kwargs):
-        nonlocal init_called
-        init_called = True
-        return SimpleNamespace()
+    def fake_load(cls, *args, **kwargs):
+        raise OSError("settings.json unreadable")
 
-    monkeypatch.setattr(settings_module, 'get_settings', fake_get_settings)
-    monkeypatch.setattr(settings_module, 'init_settings', fake_init_settings)
+    monkeypatch.setattr(settings_module, "get_settings", fake_get_settings)
+    monkeypatch.setattr(
+        settings_module.GlobalSettings, "load", classmethod(fake_load)
+    )
 
     tier, custom_gb, enabled = _operator_memory_settings()
-    assert init_called is False
-    assert tier == 'balanced'
+    assert tier == "balanced"
     assert custom_gb == 0.0
     assert enabled is True

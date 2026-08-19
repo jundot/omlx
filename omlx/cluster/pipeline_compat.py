@@ -183,13 +183,17 @@ def _install_nemotron_h_pipeline(
         inputs: Any,
         cache: Any | None = None,
         n_confirmed: int = 0,
-        **_unused: Any,
     ) -> Any:
-        # The base MTP patch threads ``n_confirmed`` (and occasionally other
-        # kwargs) through every model ``__call__``. MTP is inactive on the
-        # distributed path — the worker always drives this with
-        # ``n_confirmed == 0`` — so we accept and ignore it rather than
-        # rejecting the call. Mirrors the mlx-vlm runtimes' ``pop`` convention.
+        # The base MTP patch threads ``n_confirmed`` through every model
+        # ``__call__``. MTP is inactive on the distributed path — the worker
+        # always drives this with ``n_confirmed == 0`` — so accept the kwarg
+        # but refuse a non-zero value loudly: silently ignoring it would
+        # return wrong tokens for a caller that assumed MTP semantics.
+        if n_confirmed:
+            raise ValueError(
+                "n_confirmed is an MTP contract; MTP is not supported on the "
+                "distributed nemotron_h path"
+            )
         hidden_states = pipeline_model.embeddings(inputs)
         # ``pipeline()`` sets these for the pipeline-parallel path. On the
         # pure tensor-parallel path mlx-lm never calls ``pipeline()`` (each
@@ -205,24 +209,12 @@ def _install_nemotron_h_pipeline(
                 layer.block_type in {"M", "*"} for layer in layers
             )
 
-        # The first attention / SSM cache slots. ``pipeline()`` publishes these;
-        # recompute them here when it did not run (tensor-parallel path). These
-        # are local cache indices over this rank's layers, matching ``cache``.
-        fa_idx = getattr(pipeline_model, "fa_idx", _MISSING)
-        ssm_idx = getattr(pipeline_model, "ssm_idx", _MISSING)
-        if fa_idx is _MISSING or ssm_idx is _MISSING:
-            fa_idx = None
-            ssm_idx = None
-            cache_index = 0
-            for layer in layers:
-                if layer.block_type == "*":
-                    if fa_idx is None:
-                        fa_idx = cache_index
-                    cache_index += 1
-                elif layer.block_type == "M":
-                    if ssm_idx is None:
-                        ssm_idx = cache_index
-                    cache_index += 1
+        # The first attention / SSM cache slots. ``NemotronHModel.__init__``
+        # always sets both, and ``pipeline()`` re-publishes them for its stage
+        # subset, so a plain read is valid on both paths — a model without
+        # them should fail loudly here, not get silently recomputed indices.
+        fa_idx = pipeline_model.fa_idx
+        ssm_idx = pipeline_model.ssm_idx
 
         attention_mask = (
             create_attention_mask(hidden_states, cache[fa_idx])

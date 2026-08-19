@@ -113,15 +113,27 @@ class IncidentStore:
         self._lock = threading.RLock()
         self._incidents: list[Incident] = []
         self._next_seq = 1
+        self._epoch = uuid.uuid4().hex[:16]
         self.load_error: str | None = None
         try:
             self._load()
         except ValueError as exc:
             # A corrupt optional incident log must never prevent the local
             # oMLX server and GUI from starting. Fail closed: report none.
+            # ``_next_seq`` resets to 1 here, so the fresh ``_epoch`` from
+            # ``__init__`` stays — it is what tells an open dashboard tab its
+            # cursor no longer means anything (a cursor above the reset seq
+            # would otherwise silence the feed for that tab forever).
             self._incidents = []
             self._next_seq = 1
             self.load_error = str(exc)
+
+    @property
+    def epoch(self) -> str:
+        """Identity of this seq numbering; changes when the log is reset."""
+
+        with self._lock:
+            return self._epoch
 
     def _load(self) -> None:
         with self._lock:
@@ -144,12 +156,16 @@ class IncidentStore:
             self._incidents = incidents[-_MAX_INCIDENTS:]
             highest = max((incident.seq for incident in incidents), default=0)
             self._next_seq = max(int(payload.get("next_seq", 0)), highest + 1, 1)
+            stored_epoch = payload.get("epoch")
+            if isinstance(stored_epoch, str) and stored_epoch:
+                self._epoch = stored_epoch
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": 1,
             "next_seq": self._next_seq,
+            "epoch": self._epoch,
             "incidents": [incident.to_dict() for incident in self._incidents],
         }
         descriptor, temporary = tempfile.mkstemp(

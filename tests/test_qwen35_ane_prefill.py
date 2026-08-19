@@ -150,6 +150,79 @@ def test_configure_scheduler_preserves_wide_prompt_chunks(sequence_length):
     assert scheduler._qwen35_prefill_floor == 4096
 
 
+def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=2048),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    # Boundary snapshots cap delivered chunks at the 2048 block edge, so a
+    # 4096 shape can never receive a full tile and must warn loudly.
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
+    assert "never execute" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+    assert "never execute" not in caplog.text
+
+    caplog.clear()
+    no_boundary = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048),
+        _qwen35_prefill_floor=4096,
+    )
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(no_boundary, 4096)
+    assert "never execute" not in caplog.text
+
+
+def test_short_chunks_exit_before_the_tiling_planner(monkeypatch):
+    monkeypatch.setattr(
+        ane_patch,
+        "_tiled_input_plan",
+        lambda *args: pytest.fail("planner must not run for short chunks"),
+    )
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(2048, 0.5, 8)
+    )
+    assert ane_patch._backend(mlp, mx.zeros((1, 64, 8), dtype=mx.float16)) is None
+    gdn = SimpleNamespace(_omlx_ane_gdn_config=ane_patch._AneGDNConfig(2048, 0.5, 8))
+    assert ane_patch._gdn_backend(gdn, mx.zeros((1, 64, 8), dtype=mx.float16)) is None
+
+
+def test_wide_tile_tail_routes_native_qmm_from_min_tokens(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    routed = []
+    monkeypatch.setattr(
+        q4_patch,
+        "_linear_qmm",
+        lambda linear, value, variant: routed.append(int(value.shape[-2])) or value,
+    )
+    monkeypatch.setattr(
+        ane_patch, "_backend_exact", lambda _mlp, block, _tv=False: block
+    )
+    monkeypatch.setattr(ane_patch, "swiglu", lambda gate, up: gate + up)
+    mlp = SimpleNamespace(
+        gate_proj=lambda value: value,
+        up_proj=lambda value: value,
+        down_proj=lambda value: value,
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(4096, 0.5, 8),
+    )
+
+    result = ane_patch._backend(
+        mlp, mx.zeros((1, 4096 + 2048, 8), dtype=mx.float16)
+    )
+
+    assert result is not None
+    mx.eval(result)
+    # The 2048-row tail sits at the min-tokens boundary, so gate, up, and
+    # down all take the native qmm route instead of stock MLX.
+    assert routed == [2048, 2048, 2048]
+
+
 @pytest.mark.parametrize(
     ("rows", "expected"),
     [

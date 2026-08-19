@@ -107,21 +107,22 @@ _CUDA_CEILING_FRACTION = {
 def _operator_memory_settings() -> tuple[str, float, bool]:
     """The memory-guard settings this Mac's operator actually chose.
 
-    Returns ``(tier, custom_ceiling_gb, guard_enabled)``, initializing
-    settings from the local base path if uninitialized, and falling back
-    to stock defaults only when settings cannot be loaded.
+    Returns ``(tier, custom_ceiling_gb, guard_enabled)``, reading settings
+    from the local base path when the process never initialized them, and
+    falling back to stock defaults only when settings cannot be loaded.
+
+    The uninitialized-process read is deliberately ``GlobalSettings.load()``,
+    not ``init_settings()``: a memory-guard helper must not publish the
+    process-wide settings singleton as a side effect of one preference read.
     """
 
     try:
-        from omlx.settings import get_settings, init_settings
+        from omlx.settings import GlobalSettings, get_settings
 
         try:
             settings = get_settings()
-        except RuntimeError as exc:
-            if 'not initialized' in str(exc).lower():
-                settings = init_settings()
-            else:
-                raise
+        except RuntimeError:
+            settings = GlobalSettings.load()
         memory = settings.memory
         return (
             str(getattr(memory, "memory_guard_tier", "") or "balanced"),

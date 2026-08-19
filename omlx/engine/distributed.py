@@ -38,10 +38,11 @@ def _reasoning_effort_retry_payloads(
     this failed response — which value it rejected. This mirrors the same
     alias-then-drop fallback ladder reactively, at the HTTP boundary.
 
-    Returns at most two payloads (alias fallback, then reasoning_effort
-    dropped entirely), so a client that always sends an unsupported value can
-    never turn into an unbounded retry loop. Returns ``[]`` when the failure
-    is not about reasoning_effort, or there is nothing to retry.
+    Returns at most three payloads (normalized value, alias fallback, then
+    reasoning_effort dropped entirely), so a client that always sends an
+    unsupported value can never turn into an unbounded retry loop. Returns
+    ``[]`` when the failure is not about reasoning_effort, or there is
+    nothing to retry.
     """
 
     if "reasoning effort" not in detail.lower():
@@ -54,18 +55,38 @@ def _reasoning_effort_retry_payloads(
         return []
 
     variants: list[dict[str, Any]] = []
-    normalized = _normalized_input(value)
-    candidate = _fallback_candidate(normalized)
-    if candidate is not None and candidate != normalized:
+
+    def _variant(effort: Any) -> dict[str, Any]:
         retry = dict(payload)
         retry["chat_template_kwargs"] = {
             **chat_template_kwargs,
-            "reasoning_effort": candidate,
+            "reasoning_effort": effort,
         }
-        variants.append(retry)
+        return retry
+
+    # Local engines normalize ("High" -> "high") before their first render
+    # attempt (reasoning_effort.py), so the normalized tier must come first
+    # here too or the same request behaves differently on a cluster.
+    normalized = _normalized_input(value)
+    if normalized != value:
+        variants.append(_variant(normalized))
+    candidate = _fallback_candidate(normalized)
+    if candidate is not None and candidate != normalized:
+        variants.append(_variant(candidate))
+    logger.info(
+        "rank-zero rejected reasoning_effort=%r; retrying with %s, then "
+        "without it",
+        value,
+        [
+            var["chat_template_kwargs"]["reasoning_effort"]
+            for var in variants
+        ],
+    )
 
     dropped_kwargs = {
-        key: val for key, val in chat_template_kwargs.items() if key != "reasoning_effort"
+        key: val
+        for key, val in chat_template_kwargs.items()
+        if key != "reasoning_effort"
     }
     dropped = dict(payload)
     if dropped_kwargs:
@@ -776,14 +797,17 @@ class DistributedBatchedEngine(BatchedEngine):
                                 raise DistributedInferenceError(
                                     "rank-zero backend emitted invalid chat usage"
                                 )
-                            prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
+                            prompt_tokens = int(
+                                usage.get("prompt_tokens", prompt_tokens)
+                            )
                             completion_tokens = int(
                                 usage.get("completion_tokens", completion_tokens)
                             )
                             details = usage.get("prompt_tokens_details") or {}
                             if not isinstance(details, dict):
                                 raise DistributedInferenceError(
-                                    "rank-zero backend emitted invalid chat token details"
+                                    "rank-zero backend emitted invalid "
+                                    "chat token details"
                                 )
                             cached_tokens = int(details.get("cached_tokens", 0))
                         choices = event.get("choices") or []
@@ -830,10 +854,14 @@ class DistributedBatchedEngine(BatchedEngine):
                                 if isinstance(function.get("name"), str):
                                     target["function"]["name"] += function["name"]
                                 if isinstance(function.get("arguments"), str):
-                                    target["function"]["arguments"] += function["arguments"]
+                                    target["function"]["arguments"] += (
+                                        function["arguments"]
+                                    )
 
                         new_text = ""
-                        reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                        reasoning = delta.get("reasoning") or delta.get(
+                            "reasoning_content"
+                        )
                         if isinstance(reasoning, str) and reasoning:
                             if not reasoning_open:
                                 new_text += "<think>"
@@ -1075,7 +1103,9 @@ class DistributedBatchedEngine(BatchedEngine):
                                 raise DistributedInferenceError(
                                     "rank-zero backend emitted invalid usage"
                                 )
-                            prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
+                            prompt_tokens = int(
+                                usage.get("prompt_tokens", prompt_tokens)
+                            )
                             completion_tokens = int(
                                 usage.get("completion_tokens", completion_tokens)
                             )

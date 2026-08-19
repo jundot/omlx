@@ -2159,7 +2159,11 @@ def test_cluster_incidents_cursor_only_returns_unseen(tmp_path, monkeypatch):
     ]
 
     caught_up = client.get(f"/admin/api/cluster/incidents?since={latest}")
-    assert caught_up.json() == {"incidents": [], "latest_seq": latest}
+    caught_up_payload = caught_up.json()
+    assert caught_up_payload["incidents"] == []
+    assert caught_up_payload["latest_seq"] == latest
+    # The epoch names the seq numbering so a client can detect a log reset.
+    assert isinstance(caught_up_payload["epoch"], str) and caught_up_payload["epoch"]
 
 
 def test_dismissed_incident_stays_in_diagnostics_bundle(tmp_path, monkeypatch):

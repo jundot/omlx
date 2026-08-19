@@ -139,11 +139,6 @@ class ClusterStatus:
     fabric_kind: str | None = None
     fabric_group_id: str | None = None
     fabric_verified: bool = False
-    # This node's real login short name. Advertised so a coordinator can form an
-    # explicit ``user@host`` SSH target instead of a bare hostname, which
-    # OpenSSH resolves against the *caller's* account (or the caller's ssh_config
-    # ``User``) — the wrong user on a cluster whose Macs have different accounts.
-    ssh_user: str = ""
 
     @property
     def thunderbolt_peer_connected(self) -> bool:
@@ -155,7 +150,6 @@ class ClusterStatus:
             "collected_at": self.collected_at,
             "node": {
                 "hostname": self.hostname,
-                "ssh_user": self.ssh_user,
                 "platform": self.platform,
                 "chip_name": self.chip_name,
                 "physical_memory_bytes": self.physical_memory_bytes,

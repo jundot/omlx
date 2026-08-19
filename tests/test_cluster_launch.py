@@ -451,7 +451,11 @@ def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
     assert "StrictHostKeyChecking=accept-new" in argv
     assert "CheckHostIP=no" in argv
     assert "system_profiler" not in argv[-1]
-    assert "127.0.0.1:9000/health" in argv[-1]
+    # The fast path probes the configured server port first and keeps 9000 as
+    # a legacy candidate; both must stay in the port loop.
+    assert "for port in" in argv[-1]
+    assert "9000" in argv[-1]
+    assert "/health" in argv[-1]
     assert kwargs["timeout"] == 8.0
 
 
@@ -709,7 +713,10 @@ def test_peer_probe_discovers_a_different_linux_python_path():
         commands.append(command)
         if "omlx.cli" in command and command.startswith("/opt/omlx/bin/python"):
             return subprocess.CompletedProcess(argv, 0, json.dumps(status), "")
-        if "import sys,omlx" in command and command.startswith("/opt/omlx/bin/python"):
+        # Path-shaped candidates echo themselves (import os,omlx) so a
+        # launcher path survives discovery instead of being unwrapped to the
+        # bare interpreter it fronts.
+        if "import os,omlx" in command and command.startswith("/opt/omlx/bin/python"):
             return subprocess.CompletedProcess(argv, 0, "/opt/omlx/bin/python\n", "")
         return subprocess.CompletedProcess(argv, 127, "", "not found")
 
@@ -1577,7 +1584,7 @@ def test_supervisor_reaps_remote_ranks_via_ssh_sigterm(monkeypatch, tmp_path):
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=2.0)
         assert victim.poll() is not None
-        assert not marker_file.exists()
+        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
@@ -1643,7 +1650,7 @@ def test_supervisor_reaps_remote_ranks_escalates_to_sigkill(monkeypatch, tmp_pat
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=5.0)
         assert victim.poll() is not None
-        assert not marker_file.exists()
+        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()

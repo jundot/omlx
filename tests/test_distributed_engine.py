@@ -851,6 +851,48 @@ async def test_distributed_chat_retries_unsupported_reasoning_effort():
 
 
 @pytest.mark.asyncio
+async def test_distributed_chat_tries_the_normalized_value_first():
+    # Local engines normalize before the first render, so "High" succeeds
+    # locally; the cluster path must land on the same value, not jump
+    # straight to the alias tier.
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+        return httpx.Response(
+            404,
+            json={"error": "Unexpected reasoning effort High."},
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "High"},
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["High", "high"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
 async def test_distributed_generate_retries_unsupported_reasoning_effort():
     calls = []
 
@@ -928,28 +970,29 @@ async def test_distributed_stream_chat_retries_unsupported_reasoning_effort():
 
 @pytest.mark.asyncio
 async def test_distributed_stream_generate_bounds_retries_and_gives_up():
-    # Every attempt is rejected: must try at most 1 (original) + 2 (fallback
-    # tiers) = 3 times, then raise -- never an unbounded loop.
+    # Every attempt is rejected. "High" walks the full ladder — original,
+    # normalized ("high"), alias ("xhigh"), dropped — exactly 4 requests,
+    # then raise; never an unbounded loop.
     calls = []
 
     def handler(request):
         calls.append(1)
         return httpx.Response(
             404,
-            json={"error": "Unexpected reasoning effort weird."},
+            json={"error": "Unexpected reasoning effort High."},
         )
 
     engine = _ready_engine(handler)
     try:
         with pytest.raises(DistributedInferenceError, match="HTTP 404"):
             async for _ in engine.stream_generate(
-                "hi", chat_template_kwargs={"reasoning_effort": "weird"}
+                "hi", chat_template_kwargs={"reasoning_effort": "High"}
             ):
                 pass
     finally:
         await engine._client.aclose()
 
-    assert len(calls) <= 3
+    assert len(calls) == 4
 
 
 @pytest.mark.asyncio

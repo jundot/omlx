@@ -2616,9 +2616,15 @@ async def update_model_settings(
         entry.is_pinned = request.is_pinned
     if request.is_default is not None:
         current_settings.is_default = request.is_default
-        # Update server_state.default_model if setting as default
-        if request.is_default and server_state:
-            server_state.default_model = model_id
+        if server_state:
+            if request.is_default:
+                server_state.default_model = model_id
+            elif server_state.default_model == model_id:
+                # Unsetting the model that IS the current default must clear
+                # the pointer, not just this model's own flag -- otherwise the
+                # server keeps treating an unpinned model as default until the
+                # next restart re-derives it from persisted settings.
+                server_state.default_model = None
     if request.is_hidden is not None:
         current_settings.is_hidden = request.is_hidden
     if request.is_favorite is not None:

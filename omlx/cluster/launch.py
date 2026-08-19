@@ -31,7 +31,7 @@ from typing import Any
 from omlx.utils import hardware
 
 from .deployment import ClusterDeployment, validate_ssh_target
-from .liveness import read_marker, read_remote_marker
+from .liveness import _LOOPBACK_TARGETS, read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
 from .ssh_policy import cluster_ssh_options
@@ -1961,7 +1961,7 @@ class DistributedJobSupervisor:
             self._temporary.cleanup()
             self._temporary = None
 
-    def _reap_remote_ranks(self) -> None:
+    def _reap_remote_ranks(self, *, runner: SSHRunner = subprocess.run) -> None:
         """Kill rank workers on peer hosts that the local group kill cannot reach.
 
         ``mlx.launch`` runs each rank through SSH in its own process group on
@@ -1974,11 +1974,17 @@ class DistributedJobSupervisor:
         over SSH, validate that the PID matches the expected deployment,
         plan, and rank, verify the process command line before signaling,
         and escalate SIGTERM -> wait -> SIGKILL -> confirmed dead.
+
+        The marker file is deliberately left in place: it holds the rank's
+        failure phase and error, which ``_runtime_failure_reason`` and the
+        liveness views read after exactly this teardown. The script reports
+        what it did as one JSON line so a failed reap is visible in the logs
+        instead of passing as a clean stop.
         """
         if not self.deployment or not self.deployment.hosts:
             return
         for rank, host in enumerate(self.deployment.hosts):
-            if host.ssh in ("127.0.0.1", "localhost", "::1"):
+            if host.ssh in _LOOPBACK_TARGETS:
                 continue
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
             script = (
@@ -1988,16 +1994,20 @@ class DistributedJobSupervisor:
                 f"dep_id={self.deployment.deployment_id!r}\n"
                 f"p_hash={self.deployment.plan_hash!r}\n"
                 f"rank_idx={rank!r}\n"
-                "if not p.is_file(): raise SystemExit(0)\n"
+                "def out(action):\n"
+                "  print(json.dumps({'rank':rank_idx,'action':action}))\n"
+                "  sys.stdout.flush()\n"
+                "if not p.is_file():\n"
+                "  out('no-marker'); raise SystemExit(0)\n"
                 "try:\n"
                 "  d=json.loads(p.read_text())\n"
                 "except Exception:\n"
-                "  raise SystemExit(0)\n"
+                "  out('marker-unreadable'); raise SystemExit(0)\n"
                 "if d.get('deployment_id') != dep_id or d.get('plan_hash') != p_hash or d.get('rank') != rank_idx:\n"
-                "  raise SystemExit(0)\n"
+                "  out('identity-mismatch'); raise SystemExit(0)\n"
                 "pid=d.get('pid')\n"
                 "if not isinstance(pid,int) or isinstance(pid,bool) or pid<=0 or pid==os.getpid():\n"
-                "  raise SystemExit(0)\n"
+                "  out('identity-mismatch'); raise SystemExit(0)\n"
                 "def is_dead(target_pid):\n"
                 "  try:\n"
                 "    os.kill(target_pid,0)\n"
@@ -2014,9 +2024,7 @@ class DistributedJobSupervisor:
                 "    pass\n"
                 "  return False\n"
                 "if is_dead(pid):\n"
-                "  try: p.unlink()\n"
-                "  except OSError: pass\n"
-                "  raise SystemExit(0)\n"
+                "  out('already-dead'); raise SystemExit(0)\n"
                 "try:\n"
                 "  res=subprocess.run(['ps','-p',str(pid),'-o','args='],capture_output=True,text=True,check=False)\n"
                 "  cmd=res.stdout.strip()\n"
@@ -2026,45 +2034,80 @@ class DistributedJobSupervisor:
                 "except Exception:\n"
                 "  cmd=''\n"
                 "if not ('omlx.cluster.inference_worker' in cmd and dep_id in cmd):\n"
-                "  raise SystemExit(0)\n"
+                "  out('pid-reused'); raise SystemExit(0)\n"
                 "try:\n"
                 "  os.kill(pid,signal.SIGTERM)\n"
                 "except ProcessLookupError:\n"
-                "  try: p.unlink()\n"
-                "  except OSError: pass\n"
-                "  raise SystemExit(0)\n"
+                "  out('already-dead'); raise SystemExit(0)\n"
                 "deadline=time.monotonic()+3.0\n"
-                "dead=False\n"
                 "while time.monotonic()<deadline:\n"
                 "  if is_dead(pid):\n"
-                "    dead=True; break\n"
+                "    out('terminated'); raise SystemExit(0)\n"
                 "  time.sleep(0.05)\n"
-                "if not dead:\n"
-                "  try:\n"
-                "    os.kill(pid,signal.SIGKILL)\n"
-                "  except ProcessLookupError:\n"
-                "    dead=True\n"
-                "  if not dead:\n"
-                "    kill_deadline=time.monotonic()+2.0\n"
-                "    while time.monotonic()<kill_deadline:\n"
-                "      if is_dead(pid):\n"
-                "        dead=True; break\n"
-                "      time.sleep(0.05)\n"
-                "if dead:\n"
-                "  try: p.unlink()\n"
-                "  except OSError: pass\n"
+                "try:\n"
+                "  os.kill(pid,signal.SIGKILL)\n"
+                "except ProcessLookupError:\n"
+                "  out('terminated'); raise SystemExit(0)\n"
+                "kill_deadline=time.monotonic()+2.0\n"
+                "while time.monotonic()<kill_deadline:\n"
+                "  if is_dead(pid):\n"
+                "    out('killed'); raise SystemExit(0)\n"
+                "  time.sleep(0.05)\n"
+                "out('kill-failed')\n"
             )
             try:
-                _run_cluster_ssh(
+                completed = _run_cluster_ssh(
                     host.ssh,
                     f"python3 -c {shlex.quote(script)}",
                     timeout=8.0,
-                    runner=subprocess.run,
+                    runner=runner,
                 )
-            except (DistributedLaunchError, OSError):
+            except (DistributedLaunchError, OSError) as exc:
                 # Best effort: an unreachable peer or disconnected link
-                # cannot leave a resident rank behind.
+                # cannot leave a resident rank behind. Still say so — a
+                # reap that never ran must not read as a clean stop.
+                logger.warning(
+                    "remote rank reap unreachable for rank %d on %s: %s",
+                    rank,
+                    host.ssh,
+                    exc,
+                )
                 continue
+            action = ""
+            for line in reversed(completed.stdout.strip().splitlines()):
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("action"):
+                    action = str(payload["action"])
+                    break
+            if action == "kill-failed":
+                logger.warning(
+                    "remote rank %d on %s survived SIGKILL; its memory stays "
+                    "resident until cleaned up manually",
+                    rank,
+                    host.ssh,
+                )
+            elif action in ("terminated", "killed"):
+                logger.info(
+                    "reaped remote rank %d on %s (%s)", rank, host.ssh, action
+                )
+            elif action:
+                logger.debug(
+                    "remote rank reap for rank %d on %s: %s",
+                    rank,
+                    host.ssh,
+                    action,
+                )
+            else:
+                logger.warning(
+                    "remote rank reap for rank %d on %s returned no report "
+                    "(exit %s)",
+                    rank,
+                    host.ssh,
+                    completed.returncode,
+                )
 
     def _exit_detail(self, returncode: int | None) -> str:
         failure_reason = self._failure_reason() or self._runtime_failure_reason()
@@ -2090,7 +2133,7 @@ class DistributedJobSupervisor:
         failures: list[str] = []
         for rank, host in enumerate(self.deployment.hosts):
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
-            if host.ssh in {"127.0.0.1", "localhost", "::1"}:
+            if host.ssh in _LOOPBACK_TARGETS:
                 marker = read_marker(
                     Path(self.state_dir).expanduser() / filename
                 )

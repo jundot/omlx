@@ -81,6 +81,27 @@ def test_corrupt_incident_log_fails_closed(tmp_path):
     assert payload["incidents"][0]["message"] == "after corruption"
 
 
+def test_epoch_survives_reload_but_changes_on_a_corrupt_reset(tmp_path):
+    store = IncidentStore(tmp_path)
+    _record(store, "first")
+    original_epoch = store.epoch
+
+    # A clean reload keeps the numbering identity: open tabs keep their
+    # cursor.
+    reloaded = IncidentStore(tmp_path)
+    assert reloaded.epoch == original_epoch
+
+    # A corrupt-log reset restarts seq at 1 — a cursor from the old numbering
+    # would silence the feed forever, so the epoch must change to tell
+    # clients to restart from 0.
+    path = tmp_path / "cluster" / "incidents.json"
+    path.write_text("{not json", encoding="utf-8")
+    reset = IncidentStore(tmp_path)
+    assert reset.epoch != original_epoch
+    _record(reset, "after corruption")
+    assert IncidentStore(tmp_path).epoch == reset.epoch
+
+
 def test_list_since_seq_excludes_already_seen_records(tmp_path):
     store = IncidentStore(tmp_path)
     first = _record(store, "first")

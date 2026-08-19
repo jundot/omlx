@@ -640,20 +640,37 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
         # only need ``group_count >= degree`` (see D1b in the cluster plan).
         quant = config.get("quantization")
         if isinstance(quant, dict):
-            group_size = _config_int(quant, "group_size", 0)
-            if group_size > 0:
-                attn_dim = _config_int(config, "num_attention_heads", 0) * _config_int(
-                    config, "head_dim", 0
+            # oQ mixed-precision checkpoints add per-module override dicts
+            # inside ``quantization`` (see _patch_mlx_lm_load_config). The
+            # top-level group_size alone under-constrains those: a down_proj
+            # overridden to a coarser group can have a prime group count the
+            # top-level size hides, approving a degree that then raises
+            # mid-load. Constrain against every group size present; a size
+            # that does not divide a projection cannot have quantized it.
+            group_sizes = {_config_int(quant, "group_size", 0)}
+            for override in quant.values():
+                if isinstance(override, dict):
+                    group_sizes.add(_config_int(override, "group_size", 0))
+            group_sizes.discard(0)
+            if group_sizes:
+                head_dim = _config_int(config, "head_dim", 0) or (
+                    _config_int(config, "hidden_size", 0, maximum=1_000_000)
+                    // max(_config_int(config, "num_attention_heads", 1), 1)
                 )
+                attn_dim = _config_int(config, "num_attention_heads", 0) * head_dim
                 mamba_dim = _config_int(
                     config, "mamba_num_heads", 0
                 ) * _config_int(config, "mamba_head_dim", 0)
                 shared_dim = _config_int(
-                    config, "moe_shared_expert_intermediate_size", 0
+                    config,
+                    "moe_shared_expert_intermediate_size",
+                    0,
+                    maximum=1_000_000,
                 )
                 for dim in (attn_dim, mamba_dim, shared_dim):
-                    if dim > 0 and dim % group_size == 0:
-                        values.append(dim // group_size)
+                    for group_size in group_sizes:
+                        if dim > 0 and dim % group_size == 0:
+                            values.append(dim // group_size)
     return tuple(dict.fromkeys(values))
 
 
@@ -1038,7 +1055,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     )
 
 
-_LAYOUT_CACHE: dict[str, tuple[tuple[float, float], ModelLayout]] = {}
+# Directory mtime + config mtime + per-shard (name, mtime, size). The shard
+# stats matter: an in-place shard overwrite changes neither the directory's
+# mtime (no entry added or removed) nor config.json's, and a stale layout
+# would silently mis-size every plan built from it.
+_LayoutFingerprint = tuple[float, float, tuple[tuple[str, float, int], ...]]
+_LAYOUT_CACHE: dict[str, tuple[_LayoutFingerprint, ModelLayout]] = {}
 _LAYOUT_CACHE_LOCK = threading.Lock()
 
 
@@ -1072,9 +1094,14 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
 
     resolved = str(root.resolve())
     try:
-        fingerprint = (
+        shard_stats = []
+        for shard_path in sorted(root.glob("*.safetensors")):
+            stat = shard_path.stat()
+            shard_stats.append((shard_path.name, stat.st_mtime, stat.st_size))
+        fingerprint: _LayoutFingerprint | None = (
             root.stat().st_mtime,
             (root / "config.json").stat().st_mtime,
+            tuple(shard_stats),
         )
     except OSError:
         fingerprint = None

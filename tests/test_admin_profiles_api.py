@@ -702,6 +702,49 @@ class TestActiveProfileDriftClearing:
         assert r.json()["settings"].get("active_profile_name") is None
 
 
+class TestDefaultModelPointer:
+    """``server_state.default_model`` must track is_default in both directions.
+
+    Unlike is_pinned (which always writes straight through to the engine pool
+    entry), is_default also maintains a second, redundant "current default"
+    pointer on server_state for fast lookup. Setting is_default=True updates
+    it; unsetting is_default=False must clear it too, but only when THIS
+    model is the one currently pointed at -- unsetting a model that was never
+    the pointer target must leave someone else's default alone.
+    """
+
+    def test_setting_default_updates_the_pointer(self, client):
+        c, _ = client
+        r = c.put("/admin/api/models/model-a/settings", json={"is_default": True})
+        assert r.status_code == 200, r.text
+        assert admin_routes._get_server_state().default_model == "model-a"
+        assert r.json()["settings"]["is_default"] is True
+
+    def test_unsetting_the_current_default_clears_the_pointer(self, client):
+        c, _ = client
+        c.put("/admin/api/models/model-a/settings", json={"is_default": True})
+        assert admin_routes._get_server_state().default_model == "model-a"
+
+        r = c.put("/admin/api/models/model-a/settings", json={"is_default": False})
+        assert r.status_code == 200, r.text
+        assert admin_routes._get_server_state().default_model is None
+        assert r.json()["settings"]["is_default"] is False
+
+    def test_unsetting_a_model_that_is_not_the_pointer_leaves_it_alone(self, client):
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["model-b"] = _FakeEntry("model-b")
+
+        c.put("/admin/api/models/model-a/settings", json={"is_default": True})
+        assert admin_routes._get_server_state().default_model == "model-a"
+
+        # model-b was never the pointer target; unsetting its (already-false)
+        # is_default must not disturb model-a's default status.
+        r = c.put("/admin/api/models/model-b/settings", json={"is_default": False})
+        assert r.status_code == 200, r.text
+        assert admin_routes._get_server_state().default_model == "model-a"
+
+
 class TestExposeAsModelAPI:
     """Request models and UI round-trip for the expose-as-model flag."""
 

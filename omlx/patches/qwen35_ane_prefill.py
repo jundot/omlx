@@ -178,6 +178,27 @@ def _tiled_input_plan(
     return full_blocks, tail_rows
 
 
+def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
+    # Wide-tile tails follow the same routing thresholds as the non-ANE
+    # prefill fallback: the native qmm only pays off from the patch's
+    # min-tokens boundary (2048 default, 16384 for q8); shorter tails use
+    # stock MLX.
+    from omlx.patches.qwen35_q4_mlp import (
+        _Q8_MIN_TOKENS,
+        _linear_qmm,
+        _route_min_tokens_for_bits,
+    )
+
+    bits = getattr(linear, "bits", None)
+    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
+    q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+    if x.shape[-2] < _route_min_tokens_for_bits(bits, min_tokens, q8_min_tokens):
+        return linear(x)
+    return _linear_qmm(linear, x, variant)
+
+
 def configure_qwen35_ane_prefill_scheduler(
     scheduler: Any,
     sequence_length: int,
@@ -190,12 +211,31 @@ def configure_qwen35_ane_prefill_scheduler(
     config = getattr(scheduler, "config", None)
     if config is None:
         return False
+    step = int(getattr(config, "prefill_step_size", 0) or 0)
+    floor = int(getattr(scheduler, "_qwen35_prefill_floor", 0) or 0)
+    delivered_cap = max(step, floor)
+    block_size = int(getattr(config, "paged_cache_block_size", 0) or 0)
+    if getattr(scheduler, "block_aware_cache", None) is not None and block_size:
+        # Boundary snapshots cut every prefill chunk at the next cache block
+        # edge, so the block size caps the delivered width regardless of the
+        # configured step or the qwen35 floor.
+        delivered_cap = min(delivered_cap, block_size) if delivered_cap else block_size
+    if delivered_cap and sequence_length > delivered_cap:
+        logger.warning(
+            "Qwen ANE prefill sequence_length=%d exceeds the delivered prefill "
+            "chunk width (~%d tokens). Chunks narrower than the compiled shape "
+            "cannot tile onto it, so the ANE will compile but never execute. "
+            "Set sequence_length=%d or smaller.",
+            sequence_length,
+            delivered_cap,
+            delivered_cap,
+        )
     logger.info(
         "Qwen ANE prefill preserving scheduler chunks; projection tile=%d "
         "(step=%d, floor=%d)",
         sequence_length,
-        int(getattr(config, "prefill_step_size", 0) or 0),
-        int(getattr(scheduler, "_qwen35_prefill_floor", 0) or 0),
+        step,
+        floor,
     )
     return True
 
@@ -802,6 +842,10 @@ def _gdn_backend(
     rows = int(x.size // input_dim) if input_dim else 0
     if rows == config.sequence_length:
         return _gdn_backend_exact(gdn, x, target_verify)
+    if rows < config.sequence_length:
+        # Decode and short chunks exit before the tiling planner; this wrapper
+        # runs on every GDN call of every layer of every decode step.
+        return None
 
     plan = _tiled_input_plan(
         x,
@@ -822,7 +866,12 @@ def _gdn_backend(
 
     if tail_rows:
         tail_x = x[:, full_blocks * config.sequence_length :, :]
-        projected.append(tuple(linear(tail_x) for linear in _gdn_linears(gdn)))
+        projected.append(
+            tuple(
+                _tail_qmm_or_linear(linear, tail_x, config.variant)
+                for linear in _gdn_linears(gdn)
+            )
+        )
 
     return tuple(
         mx.concatenate([part[index] for part in projected], axis=-2)
@@ -965,7 +1014,7 @@ def _backend(
 ) -> mx.array | None:
     """Route exact or internally tiled MLP rows without shrinking attention.
 
-    Full fixed-shape blocks use the existing ANE/GPU implementation. A
+    Full fixed-shape blocks use the existing ANE/GPU implementation.  A
     residual tail stays on the ordinary quantized linears. Inputs without a
     complete fixed-shape tile fall through to the original wide GPU operation.
     """
@@ -976,6 +1025,10 @@ def _backend(
     rows = int(x.size // input_dim) if input_dim else 0
     if rows == config.sequence_length:
         return _backend_exact(mlp, x, target_verify)
+    if rows < config.sequence_length:
+        # Decode and short chunks exit before the tiling planner; this wrapper
+        # runs on every MLP call of every layer of every decode step.
+        return None
 
     plan = _tiled_input_plan(
         x,
@@ -996,9 +1049,11 @@ def _backend(
 
     if tail_rows:
         tail_x = x[:, full_blocks * config.sequence_length :, :]
-        gate = mlp.gate_proj(tail_x)
-        up = mlp.up_proj(tail_x)
-        outputs.append(mlp.down_proj(swiglu(gate, up)))
+        gate = _tail_qmm_or_linear(mlp.gate_proj, tail_x, config.variant)
+        up = _tail_qmm_or_linear(mlp.up_proj, tail_x, config.variant)
+        outputs.append(
+            _tail_qmm_or_linear(mlp.down_proj, swiglu(gate, up), config.variant)
+        )
     return mx.concatenate(outputs, axis=-2)
 
 

@@ -937,11 +937,15 @@ class BatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
-                    benchmark_prefill_chunks=list(
-                        getattr(output, "benchmark_prefill_chunks", [])
+                    benchmark_prefill_chunks=(
+                        list(chunks)
+                        if (chunks := getattr(output, "benchmark_prefill_chunks", []))
+                        else []
                     ),
-                    benchmark_requested_steps=list(
-                        getattr(output, "benchmark_requested_steps", [])
+                    benchmark_requested_steps=(
+                        list(steps)
+                        if (steps := getattr(output, "benchmark_requested_steps", []))
+                        else []
                     ),
                     benchmark_boundary_enabled=bool(
                         getattr(output, "benchmark_boundary_enabled", False)

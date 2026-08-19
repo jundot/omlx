@@ -555,6 +555,9 @@ def _shard_nemotron_h(
                 mixer.in_proj.scales = mx.contiguous(mixer.in_proj.scales[indices])
             if getattr(mixer.in_proj, "biases", None) is not None:
                 mixer.in_proj.biases = mx.contiguous(mixer.in_proj.biases[indices])
+            # The affine layer bias (mamba_proj_bias) is per output row too.
+            if getattr(mixer.in_proj, "bias", None) is not None:
+                mixer.in_proj.bias = mx.contiguous(mixer.in_proj.bias[indices])
             mixer.out_proj = shard_linear(
                 mixer.out_proj, "sharded-to-all", group=group
             )

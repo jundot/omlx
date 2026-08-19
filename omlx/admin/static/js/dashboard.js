@@ -353,6 +353,7 @@
             clusterIncidents: [],
             _clusterIncidentSeq: 0,
             _clusterIncidentsById: null,
+            _clusterIncidentEpoch: '',
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -1510,6 +1511,17 @@
                     }
                     if (!response.ok) return;
                     const payload = await response.json();
+                    // The epoch names the seq numbering. A corrupt-log reset
+                    // restarts seq at 1 under a new epoch; keeping the old
+                    // cursor there would silence the feed for this tab
+                    // forever, so restart the merge from scratch.
+                    if (payload.epoch && payload.epoch !== this._clusterIncidentEpoch) {
+                        if (this._clusterIncidentEpoch) {
+                            this._clusterIncidentSeq = 0;
+                            this._clusterIncidentsById = null;
+                        }
+                        this._clusterIncidentEpoch = payload.epoch;
+                    }
                     const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
                     if (!this._clusterIncidentsById) this._clusterIncidentsById = new Map();
                     for (const incident of incidents) {
@@ -1878,7 +1890,9 @@
                 if (this.clusterAutoconfigureLoading
                     || this.clusterActivationLoading
                     || this.clusterLinkSetupLoading) {
-                    return;
+                    // Report the skip so callers holding a pending-sync flag
+                    // keep it armed for the next tick instead of dropping it.
+                    return false;
                 }
                 this.clusterModelInventory = null;
                 this.clusterCatalogue = null;
@@ -2041,6 +2055,7 @@
                 if (nodesChanged) {
                     this.invalidateClusterPlan();
                 }
+                return true;
             },
 
             // Turn every unambiguous fast-link discovery into the default
@@ -2054,8 +2069,13 @@
                     && this.clusterStatus
                     && this.clusterWorkerPeers().length
                 ) {
-                    this.syncClusterNodesFromPeers();
-                    this._clusterKnownNodesNeedsSync = false;
+                    // Clear the flag only when the sync actually ran: it
+                    // skips itself during activation loads, and dropping the
+                    // flag on a skipped run lost the joining node until the
+                    // next join event re-armed it.
+                    if (this.syncClusterNodesFromPeers() === true) {
+                        this._clusterKnownNodesNeedsSync = false;
+                    }
                 }
                 if (!this.clusterWorkerPeers().length) {
                     const deployedPeers = (deployment?.hosts || []).filter(
@@ -3473,7 +3493,14 @@
                 const nodes = Math.max(1, this.clusterPlanNodes.length);
                 const fitted = Number(fit?.tensor_parallel_size || 1);
                 if (Number(fit?.nodes_required || 1) >= nodes) return fitted;
-                if (fit?.supports_pipeline === false) return nodes;
+                // Force full tensor only when the architecture actually
+                // supports it — both flags can be false (unsplittable), and
+                // tp=nodes there turns the accurate "cannot combine Macs"
+                // refusal into a confusing heads-divisibility error.
+                if (
+                    fit?.supports_pipeline === false
+                    && fit?.supports_tensor_parallel === true
+                ) return nodes;
                 // Pipeline is possible too: keep whatever is selected.
                 return Number(this.clusterPlanTensorParallelSize) || 1;
             },
@@ -3481,14 +3508,17 @@
             normalizeClusterTensorParallelSize() {
                 const options = this.clusterTensorParallelOptions();
                 const current = Number(this.clusterPlanTensorParallelSize);
-                // Guard against the status poll transiently reporting a single
-                // node (options === [1]): resetting to 1 there silently threw
-                // away a user's multi-way tensor choice every ~10s. Only correct
-                // a genuinely out-of-range value, and snap to the largest degree
+                // Snap an out-of-range value to the largest available degree
                 // (tensor parallelism) rather than 1 (pipeline) — several
-                // architectures (VLMs) support tensor but not the MLX-LM pipeline
-                // forward path, so 1 would make the only valid plan fail.
-                if (options.length > 1 && !options.includes(current)) {
+                // architectures (VLMs) support tensor but not the MLX-LM
+                // pipeline forward path, so 1 would make the only valid plan
+                // fail. This must also fire when the cluster genuinely shrank
+                // to one node (options === [1]); leaving a stale multi-way
+                // size there sends /plan a world size that cannot divide. The
+                // transient-poll wipe this used to cause is prevented
+                // upstream: the poll skips resync mid-activation and only
+                // rebuilds the node set when it actually changed.
+                if (!options.includes(current)) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
                     this.invalidateClusterPlan();
@@ -3505,6 +3535,7 @@
                     && Number(this.clusterPlanTensorParallelSize) === 1
                     && fit?.fits === true
                     && fit.supports_pipeline === false
+                    && fit.supports_tensor_parallel === true
                 ) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
@@ -6791,8 +6822,15 @@
                     });
 
                     if (response.ok) {
-                        if (field === 'is_default' && value === true) {
-                            this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                        if (field === 'is_default') {
+                            if (value === true) {
+                                // Exactly this model is default now; every other
+                                // model's flag clears.
+                                this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                            } else {
+                                const model = this.models.find(m => m.id === modelId);
+                                if (model) model.is_default = false;
+                            }
                         } else if (field === 'is_pinned') {
                             const model = this.models.find(m => m.id === modelId);
                             if (model) model.pinned = value;

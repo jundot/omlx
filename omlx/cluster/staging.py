@@ -509,9 +509,12 @@ def stage_manifest(
             for name in sidecar_files(source_root)
         }
     else:
+        # Send the ~-form: the peer's inventory snippet expanduser()s it in
+        # its own home, so a cross-user source reports its real shard map
+        # instead of an empty directory at the coordinator's absolute path.
         shards, sidecar_sizes = remote_model_staging_inventory(
             source_host,
-            remote_dir,
+            home_relative_model_path(str(model_path)),
             python_executable=source_python_executable,
         )
     # A peer with a different macOS account has a different $HOME, so the
@@ -936,7 +939,17 @@ def stage_files_from_source(
     import time
     from concurrent.futures import ThreadPoolExecutor
 
-    source_dir = str(Path(model_path).expanduser())
+    # model_path is the coordinator's own absolute form. On a remote source
+    # whose macOS account differs it names nothing, so resolve the ~-form in
+    # the source peer's OWN home before using it as the scp source path —
+    # the same treatment the destination side already gets from the caller.
+    source_dir = (
+        str(Path(model_path).expanduser())
+        if is_local_host(source_host)
+        else remote_model_dir(
+            source_host, home_relative_model_path(str(model_path))
+        )
+    )
     destination_dir = destination_dir or source_dir
     expected = dict(expected_sizes)
     # The caller supplies only this rank's required shards plus common
