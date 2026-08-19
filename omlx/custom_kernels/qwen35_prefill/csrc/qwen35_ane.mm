@@ -1177,12 +1177,19 @@ BNNSNDArrayDescriptor cpu_matrix_descriptor(void *data, int rows, int cols,
 using DispatchApplyAttrStorage = uint64_t[8];
 using DispatchApplyAttrInitFn = void (*)(DispatchApplyAttrStorage *);
 using DispatchApplyAttrDestroyFn = void (*)(DispatchApplyAttrStorage *);
+using DispatchApplyAttrEntity = unsigned long;
 using DispatchApplyAttrSetParallelismFn = void (*)(DispatchApplyAttrStorage *,
-                                                   intptr_t, uint64_t);
+                                                   DispatchApplyAttrEntity,
+                                                   size_t);
 using DispatchApplyWithAttrFn = void (*)(size_t, DispatchApplyAttrStorage *,
                                          void (^)(size_t));
 
-constexpr uint64_t kDispatchApplySharedResource = 1;
+// Request one worker per CPU cluster. This is the public libdispatch
+// equivalent of the shared-cluster scheduling policy used by the former
+// __bsdthread_ctl implementation. The number of requested work shards is
+// still supplied as the iteration count to dispatch_apply_with_attr.
+constexpr DispatchApplyAttrEntity kDispatchApplyAttrEntityCluster = 2;
+constexpr size_t kDispatchApplyThreadsPerCluster = 1;
 
 struct DispatchApplyAttrApi {
   DispatchApplyAttrInitFn init;
@@ -1215,15 +1222,15 @@ bool cpu_shared_resource_policy_available() {
 
 class ScopedDispatchApplyAttributes {
 public:
-  explicit ScopedDispatchApplyAttributes(int parallelism) {
+  ScopedDispatchApplyAttributes() {
     const auto &api = dispatch_apply_attr_api();
     if (!api) {
       return;
     }
     api.init(&attributes_);
     active_ = true;
-    api.set_parallelism(&attributes_, static_cast<intptr_t>(parallelism),
-                        kDispatchApplySharedResource);
+    api.set_parallelism(&attributes_, kDispatchApplyAttrEntityCluster,
+                        kDispatchApplyThreadsPerCluster);
   }
 
   ~ScopedDispatchApplyAttributes() {
@@ -1332,7 +1339,7 @@ void cpu_fp16_matmul(const array &input, const array &weight, array &output,
         failure->store(3, std::memory_order_relaxed);
       }
     };
-    ScopedDispatchApplyAttributes attributes(shards);
+    ScopedDispatchApplyAttributes attributes;
     if (use_shared_resource && attributes.active()) {
       dispatch_apply_attr_api().apply(static_cast<size_t>(shards),
                                       attributes.get(), work);
