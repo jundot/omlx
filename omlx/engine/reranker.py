@@ -11,6 +11,7 @@ or chat completion.
 import asyncio
 import gc
 import logging
+import time
 from typing import Any, Dict
 
 import mlx.core as mx
@@ -18,6 +19,7 @@ import mlx.core as mx
 from ..engine_core import get_mlx_executor
 from ..models.reranker import MLXRerankerModel, RerankOutput
 from .base import BaseNonStreamingEngine
+from .forward_fairness import ForwardFairnessGate
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,13 @@ class RerankerEngine(BaseNonStreamingEngine):
     since reranking is computed in a single forward pass.
     """
 
-    def __init__(self, model_name: str, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_name: str,
+        trust_remote_code: bool = False,
+        *,
+        scheduler_config: Any | None = None,
+    ):
         """
         Initialize the reranker engine.
 
@@ -41,11 +49,18 @@ class RerankerEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             trust_remote_code: Allow loaders to execute custom Python shipped
                 with the model repo. Off by default for security (issue #926).
+            scheduler_config: Shared scheduler configuration; the reranker
+                only reads the live ``decode_fairness`` toggle from it.
         """
         super().__init__()
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._model: MLXRerankerModel | None = None
+        # Reranker forwards bypass the Scheduler, so they must take part
+        # in decode fairness themselves (see forward_fairness.py).
+        self._fairness = ForwardFairnessGate(
+            f"rerank:{model_name}:{id(self):x}", scheduler_config
+        )
 
     @property
     def model_name(self) -> str:
@@ -126,12 +141,24 @@ class RerankerEngine(BaseNonStreamingEngine):
 
         model = self._model
 
+        fairness = self._fairness
+
         def _rerank_sync():
-            return model.rerank(
-                query=query,
-                documents=documents,
-                max_length=max_length,
-            )
+            contended = fairness.wait_turn()
+            start_ts = time.perf_counter()
+            try:
+                return model.rerank(
+                    query=query,
+                    documents=documents,
+                    max_length=max_length,
+                )
+            finally:
+                mx.synchronize()
+                fairness.settle(
+                    time.perf_counter() - start_ts,
+                    max(1, len(documents)),
+                    contended,
+                )
 
         activity_id = self._begin_activity(
             "reranking",

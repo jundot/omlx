@@ -2247,6 +2247,7 @@ class EnginePool:
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(
