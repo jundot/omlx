@@ -49,6 +49,18 @@ def test_candidate_settings_are_transient_copy():
     assert base.qwen35_ane_prefill_fraction == 0.53
 
 
+def test_candidate_settings_preserve_single_ane_mode():
+    base = ModelSettings(qwen35_ane_prefill_dual_ane=False)
+    request = ane_tuning.ANETuningRequest(model_id="qwen")
+    candidate = ane_tuning._Candidate(
+        "single", True, 0.45, True, 0.45, True, 0.14, 0.20, 0.13
+    )
+
+    tuned = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert tuned.qwen35_ane_prefill_dual_ane is False
+
+
 def test_candidate_settings_apply_tuner_boolean_overrides():
     base = ModelSettings(qwen35_ane_prefill_cpu_shared_resource=True)
     request = ane_tuning.ANETuningRequest(

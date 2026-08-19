@@ -682,6 +682,26 @@ def test_bank_chunk_spans_respects_byte_cap():
     assert ane_patch._bank_chunk_spans(weights, 1 << 30) == [(0, 4)]
 
 
+def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
+    weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(3)]
+    calls = []
+
+    def compile_bank(values, sequence_length, ane_instance):
+        calls.append((len(values), sequence_length, ane_instance))
+        return [object() for _ in values]
+
+    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+
+    result = ane_patch._compile_single_banks(weights, 2048)
+
+    assert result is not None
+    models, resident = result
+    assert len(models) == 3
+    assert resident == 1
+    assert calls == [(3, 2048, 0)]
+
+
 def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
@@ -914,6 +934,24 @@ def test_prepare_pair_accepts_oq4e_group64_with_q5_down():
     assert state.scales.shape == (256, 2)
     assert dense0.shape == (128, 128)
     assert dense1.shape == (128, 128)
+
+
+def test_prepare_pair_single_ane_keeps_one_full_prefix():
+    mlp = _MLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    prepared = ane_patch._prepare_pair_for_bank(
+        mlp,
+        ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=False),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.ane_outputs == 128
+    assert dense0.shape == (256, 128)
+    assert dense1 is None
 
 
 def test_eligible_pair_preserves_q4_and_accepts_affine_q8():
@@ -1380,6 +1418,30 @@ def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
     assert state.scales.shape == (128, 2)
     assert dense0.shape == (128, 128)
     assert dense1.shape == (128, 128)
+
+
+def test_prepare_gdn_single_ane_keeps_one_full_prefix():
+    gdn = _OQ4eGDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    prepared = ane_patch._prepare_gdn_for_bank(
+        gdn,
+        ane_patch._AneGDNConfig(2048, 0.75, 8, dual_ane=False),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.z_outputs == 128
+    assert state.qkv_outputs == 256
+    assert dense0.shape == (256, 128)
+    assert dense1 is None
 
 
 def test_prepare_gdn_splits_residual_qkv_across_cpu_and_gpu(monkeypatch):

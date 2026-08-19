@@ -374,7 +374,9 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
         and request.allow_cpu_shared_resource
         and getattr(base, "qwen35_ane_prefill_cpu_shared_resource", True)
     )
-    settings.qwen35_ane_prefill_dual_ane = True
+    settings.qwen35_ane_prefill_dual_ane = bool(
+        getattr(base, "qwen35_ane_prefill_dual_ane", True)
+    )
     return settings
 
 
@@ -750,6 +752,8 @@ def _calibrate_components_sync(
     from ..custom_kernels.qwen35_prefill import fast
     from ..patches import qwen35_ane_prefill as patch
 
+    dual_ane = bool(getattr(base_settings, "qwen35_ane_prefill_dual_ane", True))
+
     model = _loaded_model(engine)
     modules = list(model.modules()) if hasattr(model, "modules") else []
     mlp = next((module for module in modules if patch._eligible_pair(module)), None)
@@ -765,6 +769,7 @@ def _calibrate_components_sync(
     bits = int(gate.bits)
     cpu_gate_supported = bool(
         run.request.allow_cpu
+        and dual_ane
         and bits in (4, 5, 6, 8)
         and gate.scales.dtype == mx.float16
         and mlp.up_proj.scales.dtype == mx.float16
@@ -779,6 +784,7 @@ def _calibrate_components_sync(
     )
     gdn_cpu_supported = bool(
         run.request.allow_cpu
+        and dual_ane
         and run.request.allow_cpu_gdn
         and run.request.allow_ane_gdn
         and gdn is not None
@@ -818,7 +824,7 @@ def _calibrate_components_sync(
             run.request.sequence_length,
             fraction,
             8,
-            True,
+            dual_ane,
             cpu_threads=cpu_threads,
             cpu_shared_resource=cpu_shared,
         )
@@ -829,7 +835,7 @@ def _calibrate_components_sync(
     if gdn is not None:
         for fraction in fractions:
             config = patch._AneGDNConfig(
-                run.request.sequence_length, fraction, 8, True
+                run.request.sequence_length, fraction, 8, dual_ane
             )
             value = patch._prepare_gdn_for_bank(gdn, config)
             if value is not None:
@@ -838,15 +844,29 @@ def _calibrate_components_sync(
     if not any(kind == "mlp" for kind, *_ in prepared):
         raise RuntimeError("No valid MLP calibration widths could be prepared")
 
-    mx.eval(*[entry[3] for entry in prepared], *[entry[4] for entry in prepared])
-    banked = patch._compile_dual_banks(
-        [entry[3] for entry in prepared],
-        [entry[4] for entry in prepared],
-        run.request.sequence_length,
-    )
-    if banked is None:
-        raise RuntimeError("Representative ANE calibration bank could not be loaded")
-    models0, models1, _ = banked
+    dense0 = [entry[3] for entry in prepared]
+    if dual_ane:
+        dense1 = [entry[4] for entry in prepared]
+        if any(weight is None for weight in dense1):
+            raise RuntimeError("A dual-ANE calibration width was prepared incompletely")
+        mx.eval(*dense0, *dense1)
+        banked = patch._compile_dual_banks(
+            dense0,
+            dense1,
+            run.request.sequence_length,
+        )
+        if banked is None:
+            raise RuntimeError("Representative ANE calibration bank could not be loaded")
+        models0, models1, _ = banked
+    else:
+        mx.eval(*dense0)
+        single_banked = patch._compile_single_banks(
+            dense0, run.request.sequence_length
+        )
+        if single_banked is None:
+            raise RuntimeError("Representative ANE calibration bank could not be loaded")
+        models0, _ = single_banked
+        models1 = [None] * len(models0)
     ane_models: dict[tuple[str, float], tuple[Any, Any, Any]] = {}
     for index, (kind, fraction, state, _, _) in enumerate(prepared):
         ane_models[(kind, fraction)] = (models0[index], models1[index], state)
@@ -884,7 +904,7 @@ def _calibrate_components_sync(
                 run.request.sequence_length,
                 fraction,
                 8,
-                True,
+                dual_ane,
                 cpu_fraction=cpu_fraction,
                 cpu_threads=cpu_threads,
                 cpu_shared_resource=cpu_shared,
@@ -923,7 +943,7 @@ def _calibrate_components_sync(
             run.request.sequence_length,
             best_mlp,
             8,
-            True,
+            dual_ane,
             cpu_fraction=best_cpu,
             cpu_down_fraction=down_fraction,
             cpu_threads=cpu_threads,
@@ -971,7 +991,7 @@ def _calibrate_components_sync(
                     run.request.sequence_length,
                     fraction,
                     8,
-                    True,
+                    dual_ane,
                     cpu_fraction=cpu_fraction,
                     cpu_threads=cpu_threads,
                     cpu_shared_resource=cpu_shared,

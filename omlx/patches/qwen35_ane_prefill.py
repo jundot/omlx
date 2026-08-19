@@ -484,7 +484,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
 
 def _prepare_pair_for_bank(
     mlp: Any, config: _AnePrefillConfig
-) -> tuple[_CombinedMLPState, mx.array, mx.array] | None:
+) -> tuple[_CombinedMLPState, mx.array, mx.array | None] | None:
     from omlx.custom_kernels.qwen35_prefill import fast
 
     gate = getattr(mlp, "gate_proj", None)
@@ -494,12 +494,16 @@ def _prepare_pair_for_bank(
     output_dim = int(gate.weight.shape[0])
     bits = int(gate.bits)
     group_size = int(gate.group_size)
-    if bits != 4 and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=True)):
+    dual_ane = bool(config.dual_ane)
+    if bits != 4 and not fast.has_symbol(
+        _fused_swiglu_symbol(bits, dual=dual_ane)
+    ):
         return None
-    ane_outputs = (int(output_dim * config.fraction) // 128) * 128
+    alignment = 128 if dual_ane else 64
+    ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and config.dual_ane
+        and dual_ane
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
         and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
@@ -529,9 +533,13 @@ def _prepare_pair_for_bank(
             )
         )
 
-    split = ane_outputs // 2
-    dense0 = dense_slice(0, split)
-    dense1 = dense_slice(split, ane_outputs)
+    if dual_ane:
+        split = ane_outputs // 2
+        dense0 = dense_slice(0, split)
+        dense1 = dense_slice(split, ane_outputs)
+    else:
+        dense0 = dense_slice(0, ane_outputs)
+        dense1 = None
     cpu_weight = None
     if cpu_outputs:
         cpu_weight = mx.contiguous(
@@ -558,7 +566,9 @@ def _prepare_pair_for_bank(
     biases = mx.contiguous(
         mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
     )
-    values = [dense0, dense1, weight, scales, biases]
+    values = [dense0, weight, scales, biases]
+    if dense1 is not None:
+        values.append(dense1)
     if cpu_weight is not None:
         values.append(cpu_weight)
     mx.eval(*values)
@@ -608,7 +618,8 @@ def _prepare_pair_runtime_state(
     output_dim = int(gate.weight.shape[0])
     bits = int(gate.bits)
     group_size = int(gate.group_size)
-    ane_outputs = (int(output_dim * config.fraction) // 128) * 128
+    alignment = 128 if config.dual_ane else 64
+    ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and config.dual_ane
@@ -936,7 +947,7 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
 
 def _prepare_gdn_for_bank(
     gdn: Any, config: _AneGDNConfig
-) -> tuple[_CombinedGDNState, mx.array, mx.array] | None:
+) -> tuple[_CombinedGDNState, mx.array, mx.array | None] | None:
     if not _eligible_gdn(gdn):
         return None
     qkv, z, b, a = _gdn_linears(gdn)
@@ -949,12 +960,14 @@ def _prepare_gdn_for_bank(
     if qkv_spec is None or z_spec is None:
         return None
     qkv_bits, qkv_group_size = qkv_spec
-    ane_outputs = (int(total_outputs * config.fraction) // 128) * 128
+    dual_ane = bool(config.dual_ane)
+    alignment = 128 if dual_ane else 64
+    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
     from omlx.custom_kernels.qwen35_prefill import fast
 
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and config.dual_ane
+        and dual_ane
         and qkv.scales.dtype == mx.float16
         and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
     )
@@ -1007,9 +1020,13 @@ def _prepare_gdn_for_bank(
             offset += outputs
         return mx.contiguous(mx.concatenate(parts, axis=0))
 
-    split = ane_outputs // 2
-    dense0 = dense_logical_slice(0, split)
-    dense1 = dense_logical_slice(split, ane_outputs)
+    if dual_ane:
+        split = ane_outputs // 2
+        dense0 = dense_logical_slice(0, split)
+        dense1 = dense_logical_slice(split, ane_outputs)
+    else:
+        dense0 = dense_logical_slice(0, ane_outputs)
+        dense1 = None
     qkv_offset = ane_outputs - z_outputs
     gpu_offset = qkv_offset + cpu_outputs
     cpu_weight = None
@@ -1026,7 +1043,9 @@ def _prepare_gdn_for_bank(
     weight = mx.contiguous(qkv.weight[gpu_offset:])
     scales = mx.contiguous(qkv.scales[gpu_offset:])
     biases = mx.contiguous(qkv.biases[gpu_offset:])
-    values = [dense0, dense1, weight, scales, biases]
+    values = [dense0, weight, scales, biases]
+    if dense1 is not None:
+        values.append(dense1)
     if cpu_weight is not None:
         values.append(cpu_weight)
     mx.eval(*values)
@@ -1070,7 +1089,8 @@ def _prepare_gdn_runtime_state(
     z_outputs = int(z.weight.shape[0])
     qkv_outputs = int(qkv.weight.shape[0])
     total_outputs = z_outputs + qkv_outputs
-    ane_outputs = (int(total_outputs * config.fraction) // 128) * 128
+    alignment = 128 if config.dual_ane else 64
+    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and config.dual_ane
@@ -1701,6 +1721,72 @@ def _compile_dual_banks(
     logger.warning(
         "Packed dual-ANE compilation failed; falling back to per-layer programs"
     )
+    return None
+
+
+def _compile_single_banks(
+    weights: list[mx.array],
+    sequence_length: int,
+) -> tuple[list[Any], int] | None:
+    """Compile instance-0 procedure banks with the same split retry ladder."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    cap = 0
+    raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
+    if raw:
+        try:
+            cap = max(int(raw), 0)
+        except ValueError:
+            logger.warning(
+                "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
+            )
+    total_bytes = sum(weight.nbytes for weight in weights)
+    largest_bytes = max((weight.nbytes for weight in weights), default=0)
+
+    for _ in range(4):
+        spans = (
+            [(0, len(weights))] if cap <= 0 else _bank_chunk_spans(weights, cap)
+        )
+        try:
+            models: list[Any] = []
+            for start, stop in spans:
+                models.extend(
+                    fast.qwen35_ane_compile_linear_bank(
+                        weights[start:stop], sequence_length, 0
+                    )
+                )
+        except Exception:
+            models = []
+            logger.warning(
+                "Single-ANE procedure bank compilation failed (%d banks, "
+                "%d procedures, %.2f GiB)",
+                len(spans),
+                len(weights),
+                total_bytes / (1 << 30),
+                exc_info=True,
+            )
+            if all(stop - start == 1 for start, stop in spans):
+                break
+            if cap <= 0:
+                cap = max(total_bytes // 2 + largest_bytes, 1)
+            else:
+                cap = min(cap // 2, _ANE_BANK_RETRY_MAX_BYTES)
+            if cap < 1:
+                break
+            logger.info(
+                "Retrying single-ANE procedure banks split at %d MB per bank",
+                cap // (1 << 20),
+            )
+            continue
+        if len(spans) > 1:
+            logger.info(
+                "Compiled %d single-ANE procedures into %d split banks",
+                len(weights),
+                len(spans),
+            )
+        return models, len(spans)
+
+    logger.warning("Packed single-ANE calibration bank compilation failed")
     return None
 
 
