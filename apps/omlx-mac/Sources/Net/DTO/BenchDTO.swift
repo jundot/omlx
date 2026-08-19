@@ -57,6 +57,7 @@ struct BenchStartRequest: Encodable, Sendable {
     let modelId: String
     let contextProfile: BenchmarkContextProfile
     let warmupMode: BenchmarkWarmupMode
+    let alignPromptToAne: Bool
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]

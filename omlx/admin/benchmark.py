@@ -111,6 +111,7 @@ class BenchmarkRequest(BaseModel):
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
+    align_prompt_to_ane: bool = False
     force_lm_engine: bool = False
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
@@ -138,6 +139,19 @@ class BenchmarkRequest(BaseModel):
                     f"Invalid batch size {bs}. Must be one of {VALID_BATCH_SIZES}"
                 )
         return sorted(v)
+
+
+def _single_prompt_lengths(request: BenchmarkRequest) -> list[int]:
+    """Return the actual prompt lengths used by single-request trials.
+
+    Generation reserves the last prompt token for first-token logits. Adding
+    one to the standard PP sizes therefore turns PP4096 into exactly 4096
+    prefill rows. Results intentionally report the actual length (PP4097), so
+    aligned local diagnostics cannot be mistaken for standard leaderboard
+    measurements.
+    """
+    adjustment = 1 if request.align_prompt_to_ane else 0
+    return [length + adjustment for length in request.prompt_lengths]
 
 
 @dataclass
@@ -1668,7 +1682,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Generate prompts for all needed lengths
         tokenizer = engine.tokenizer
         prompts: dict[int, list[int]] = {}
-        for pp_len in request.prompt_lengths:
+        single_prompt_lengths = _single_prompt_lengths(request)
+        for pp_len in single_prompt_lengths:
             prompts[pp_len] = _generate_prompt(
                 tokenizer,
                 pp_len,
@@ -1816,7 +1831,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(scheduler_config, "max_num_batched_tokens", None),
         )
 
-        for pp_len in request.prompt_lengths:
+        for pp_len in single_prompt_lengths:
             current_test += 1
             await _send_event(
                 run,
@@ -1945,6 +1960,22 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             },
         )
 
+        # Aligned prompts intentionally use non-standard PP4097/8193/etc.
+        # Keep them local rather than mixing them into PP4096 leaderboard
+        # buckets or depending on the remote service accepting arbitrary PP.
+        if request.align_prompt_to_ane:
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "ane_aligned_prompt"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "ane_aligned_prompt",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
         # Upload results to omlx.ai (failures don't affect benchmark status)
         try:
             await _upload_to_omlx_ai(run, engine_pool)
@@ -2050,7 +2081,7 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
         )
 
         # Single request tests
-        for pp_len in request.prompt_lengths:
+        for pp_len in _single_prompt_lengths(request):
             current_test += 1
             await _send_event(
                 run,

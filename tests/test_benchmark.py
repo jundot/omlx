@@ -129,6 +129,27 @@ class TestBenchmarkRequest:
         )
         assert req.warmup_mode is BenchmarkWarmupMode.ANE_2048
 
+    def test_ane_aligned_prompt_adds_one_to_single_trials(self):
+        from omlx.admin.benchmark import _single_prompt_lengths
+
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[4096, 8192],
+            align_prompt_to_ane=True,
+        )
+
+        assert _single_prompt_lengths(req) == [4097, 8193]
+
+    def test_standard_prompt_lengths_remain_unchanged(self):
+        from omlx.admin.benchmark import _single_prompt_lengths
+
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[4096, 8192],
+        )
+
+        assert _single_prompt_lengths(req) == [4096, 8192]
+
     def test_unknown_warmup_mode_is_rejected(self):
         with pytest.raises(ValueError, match="warmup_mode"):
             BenchmarkRequest(
