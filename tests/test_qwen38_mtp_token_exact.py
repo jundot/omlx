@@ -18,14 +18,11 @@ Usage:
 """
 from __future__ import annotations
 
-import json
 import os
-import sys
 
 import pytest
 
 from omlx.patches.mlx_lm_mtp import (
-    apply_mlx_lm_mtp_patch,
     set_mtp_active,
     set_mtp_depth,
 )

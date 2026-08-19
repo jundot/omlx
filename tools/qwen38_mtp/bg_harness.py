@@ -88,11 +88,13 @@ def main():
     os.makedirs(OUT, exist_ok=True)
 
     if args.cmd == "compare":
-        serial = json.load(open(f"{OUT}/serial.json"))["ids"]
+        with open(f"{OUT}/serial.json") as f:
+            serial = json.load(f)["ids"]
         files = [args.arg] + ([args.arg2] if args.arg2 else [])
         bad = False
         for f in files:
-            cand = json.load(open(f"{OUT}/{f}"))["ids"]
+            with open(f"{OUT}/{f}") as fh:
+                cand = json.load(fh)["ids"]
             n = min(len(serial), len(cand))
             mism = [i for i in range(n) if serial[i] != cand[i]]
             ok = not mism and len(serial) == len(cand)
@@ -107,16 +109,16 @@ def main():
     if args.cmd == "serial":
         model, tok = load_model(False, None)
         toks, dt = decode(model, tok, ntok)
-        json.dump({"ids": toks, "ms_tok": dt / ntok * 1000},
-                  open(f"{OUT}/serial.json", "w"))
+        with open(f"{OUT}/serial.json", "w") as f:
+            json.dump({"ids": toks, "ms_tok": dt / ntok * 1000}, f)
         return
 
     depth = int(args.arg2) if args.arg2 else 2
     model, tok = load_model(True, depth)
     toks, dt = decode(model, tok, ntok)
     fname = f"mtp_d{depth}.json"
-    json.dump({"ids": toks, "ms_tok": dt / ntok * 1000, "depth": depth},
-              open(f"{OUT}/{fname}", "w"))
+    with open(f"{OUT}/{fname}", "w") as f:
+        json.dump({"ids": toks, "ms_tok": dt / ntok * 1000, "depth": depth}, f)
     print(f"mtp_d{depth} ids[:12]={toks[:12]} len={len(toks)}")
 
 
