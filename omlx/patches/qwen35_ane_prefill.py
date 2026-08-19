@@ -1283,8 +1283,6 @@ def _backend_exact(
             )
 
         if state.model1 is not None:
-            if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
-                return None
             if state.bits == 4:
                 activation = fast.qwen35_ane_dual_q4_swiglu_t(
                     x,
@@ -1297,6 +1295,8 @@ def _backend_exact(
                     state.group_size,
                 )
             else:
+                if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
+                    return None
                 activation = fast.qwen35_ane_dual_affine_swiglu_t(
                     x,
                     state.weight,

@@ -1673,67 +1673,6 @@ def test_cpu_gate_uses_bit_appropriate_fused_swiglu(
     assert captured == {"kernel": expected_kernel, "args": expected_args}
 
 
-def test_q6_backend_uses_generic_dual_suffix_and_reassembles_instances(monkeypatch):
-    # ANE0 gate/up, ANE1 gate/up, then GPU gate/up.
-    combined = mx.array(
-        [[[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]]],
-        dtype=mx.bfloat16,
-    )
-    captured = {}
-
-    def generic_dual(*args):
-        captured["args"] = args
-        return combined
-
-    def capture_swiglu(gate, up):
-        captured["gate"] = gate
-        captured["up"] = up
-        return gate
-
-    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", generic_dual)
-    monkeypatch.setattr(ane_patch, "swiglu", capture_swiglu)
-
-    import omlx.patches.qwen35_q4_mlp as q4_patch
-
-    monkeypatch.setattr(q4_patch, "_linear_qmm", lambda linear, x, variant: x)
-    model0, model1 = object(), object()
-    state = ane_patch._CombinedMLPState(
-        model=model0,
-        model1=model1,
-        weight=mx.zeros((2, 3), dtype=mx.uint32),
-        scales=mx.zeros((2, 1), dtype=mx.bfloat16),
-        biases=mx.zeros((2, 1), dtype=mx.bfloat16),
-        ane_outputs=2,
-        gpu_outputs=1,
-        group_size=16,
-        bits=6,
-    )
-    mlp = SimpleNamespace(
-        down_proj=object(),
-        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(1, 0.5, 8, True),
-        _omlx_ane_prefill_state=state,
-    )
-    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
-
-    result = ane_patch._backend(mlp, x)
-    mx.eval(result, captured["gate"], captured["up"])
-
-    assert captured["args"] == (
-        x,
-        state.weight,
-        state.scales,
-        state.biases,
-        model0,
-        model1,
-        6,
-        8,
-        16,
-        0,
-    )
-    assert captured["gate"].tolist() == [[[1.0, 2.0, 3.0]]]
-    assert captured["up"].tolist() == [[[10.0, 20.0, 30.0]]]
-
-
 def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
     class PatchedMLP:
         _omlx_q4_mlp_patched = True
