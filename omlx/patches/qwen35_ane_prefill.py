@@ -37,15 +37,6 @@ _ANE_RESIDENT_PROGRAM_LIMIT = 120
 # ~4 GiB device address window, so single-die chips reject two monolithic
 # dual banks; 1 GiB spans keep every create well under the window.
 _ANE_BANK_RETRY_MAX_BYTES = 1 << 30
-# A partial wide call only uses the fixed-shape programs when the accelerated
-# rows and output-channel share predict a material amount of work removed from
-# the GPU.  This is deliberately conservative for NAX machines, where a small
-# ANE split can otherwise lose more from token tiling than it saves.  Exact
-# multiples always route.  The environment override is primarily useful for
-# hardware bring-up and crossover measurements.
-_DEFAULT_MIN_TILED_SAVINGS = 0.15
-
-
 @dataclass(frozen=True)
 class _AnePrefillConfig:
     sequence_length: int
@@ -188,9 +179,8 @@ def _eligible_input(x: mx.array, config: _AnePrefillConfig) -> bool:
 def _tiled_input_plan(
     x: mx.array,
     sequence_length: int,
-    offload_fraction: float,
 ) -> tuple[int, int] | None:
-    """Return ``(full_blocks, tail_rows)`` for a profitable wide prefill.
+    """Return ``(full_blocks, tail_rows)`` for a tileable wide prefill.
 
     Only a single prompt is tiled.  Flattening a real batch would lose the
     sequence boundaries required by the GDN recurrence.  Exact fixed shapes
@@ -206,25 +196,6 @@ def _tiled_input_plan(
     rows = int(x.shape[-2])
     full_blocks, tail_rows = divmod(rows, sequence_length)
     if full_blocks < 1:
-        return None
-    if tail_rows == 0:
-        return full_blocks, 0
-
-    try:
-        minimum_savings = float(
-            os.environ.get(
-                "OMLX_QWEN35_ANE_MIN_TILED_SAVINGS",
-                str(_DEFAULT_MIN_TILED_SAVINGS),
-            )
-        )
-    except ValueError:
-        minimum_savings = _DEFAULT_MIN_TILED_SAVINGS
-    minimum_savings = min(max(minimum_savings, 0.0), 1.0)
-    accelerated_coverage = full_blocks * sequence_length / rows
-    estimated_savings = accelerated_coverage * min(
-        max(offload_fraction, 0.0), 1.0
-    )
-    if estimated_savings < minimum_savings:
         return None
     return full_blocks, tail_rows
 
@@ -1200,8 +1171,8 @@ def _gdn_backend(
 
     The recurrent GDN update remains outside this backend, so concatenating
     independently projected row blocks is algebraically identical to one wide
-    projection.  A non-profitable partial plan returns ``None`` before doing
-    any work, allowing the caller to retain its original wide GPU operation.
+    projection. Inputs without a complete fixed-shape tile fall through to the
+    original GPU operation.
     """
     config = getattr(gdn, "_omlx_ane_gdn_config", None)
     if config is None or target_verify:
@@ -1214,7 +1185,6 @@ def _gdn_backend(
     plan = _tiled_input_plan(
         x,
         config.sequence_length,
-        config.fraction + config.cpu_fraction,
     )
     if plan is None:
         return None
@@ -1444,9 +1414,8 @@ def _backend(
     """Route exact or internally tiled MLP rows without shrinking attention.
 
     Full fixed-shape blocks use the existing ANE/GPU/CPU implementation.  A
-    residual tail stays on the ordinary quantized linears.  If the configured
-    offload share cannot plausibly repay the tiling overhead, return ``None``
-    before dispatch so the outer MLP executes once at its original wide shape.
+    residual tail stays on the ordinary quantized linears. Inputs without a
+    complete fixed-shape tile fall through to the original wide GPU operation.
     """
     config = getattr(mlp, "_omlx_ane_prefill_config", None)
     if config is None or target_verify:
@@ -1459,7 +1428,6 @@ def _backend(
     plan = _tiled_input_plan(
         x,
         config.sequence_length,
-        config.fraction + config.cpu_fraction,
     )
     if plan is None:
         return None

@@ -839,6 +839,24 @@ async def _run_single_test(
         prefill_duration_s=trace_prefill_duration_s,
         config=ane_trace_config,
         profile=ane_profile,
+        scheduler_trace=(
+            {
+                "chunk_tokens": list(
+                    getattr(last_output, "benchmark_prefill_chunks", [])
+                ),
+                "requested_steps": list(
+                    getattr(last_output, "benchmark_requested_steps", [])
+                ),
+                "boundary_enabled": bool(
+                    getattr(last_output, "benchmark_boundary_enabled", False)
+                ),
+                "cache_block_size": int(
+                    getattr(last_output, "benchmark_cache_block_size", 0) or 0
+                ),
+            }
+            if last_output is not None
+            else None
+        ),
     )
 
     return _compute_single_metrics(
@@ -861,20 +879,52 @@ def _log_ane_benchmark_trace(
     prefill_duration_s: float | None,
     config: dict[str, Any] | None,
     profile: dict[str, dict[str, float]],
+    scheduler_trace: dict[str, Any] | None = None,
 ) -> None:
     """Log an offline-comparable ANE/scheduler summary for one PP trial."""
     config = config or {}
+    scheduler_trace = scheduler_trace or {}
     sequence_length = int(config.get("sequence_length", 0) or 0)
     prefill_tokens = max(0, pp_len - 1)
+    chunk_tokens = [
+        int(value)
+        for value in scheduler_trace.get("chunk_tokens", [])
+        if int(value) > 0
+    ]
+    requested_steps = [
+        int(value)
+        for value in scheduler_trace.get("requested_steps", [])
+        if int(value) > 0
+    ]
+    accounting_widths = chunk_tokens or [prefill_tokens]
     full_shapes, tail = (0, prefill_tokens)
     if sequence_length > 0:
-        full_shapes, tail = divmod(prefill_tokens, sequence_length)
+        divisions = [divmod(width, sequence_length) for width in accounting_widths]
+        full_shapes = sum(full for full, _ in divisions)
+        tail = sum(remainder for _, remainder in divisions)
+
+    def width_histogram(values: list[int]) -> str:
+        counts: dict[int, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        return ",".join(
+            f"{width}x{count}" for width, count in sorted(counts.items(), reverse=True)
+        ) or "none"
+
     logger.info(
         "[benchmark-ane-summary] pp=%d prefill_tokens=%d sequence_length=%d "
-        "expected_full_shapes=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
+        "model_calls=%d model_call_widths=%s requested_steps=%s "
+        "boundary_enabled=%s cache_block_size=%d accounting=%s "
+        "full_ane_tiles=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
         pp_len,
         prefill_tokens,
         sequence_length,
+        len(chunk_tokens),
+        width_histogram(chunk_tokens),
+        width_histogram(requested_steps),
+        bool(scheduler_trace.get("boundary_enabled", False)),
+        int(scheduler_trace.get("cache_block_size", 0) or 0),
+        "observed" if chunk_tokens else "prompt_estimate",
         full_shapes,
         tail,
         (
@@ -911,7 +961,7 @@ def _log_ane_benchmark_trace(
         logger.info(
             "[benchmark-ane-profile] pp=%d category=%s operations=%d "
             "configured_layers=%d compiled_layers=%s expected_operations=%d "
-            "observed_shapes=%.3f input_ready_ms_per_op=%.3f "
+            "observed_ane_tiles_per_layer=%.3f input_ready_ms_per_op=%.3f "
             "ane_region_ms_per_op=%.3f ane0_eval_ms_per_op=%.3f "
             "ane1_eval_ms_per_op=%.3f gpu_qmm_ms_per_op=%.3f "
             "gap_before_ms_per_op=%.3f ane0_duty=%.4f ane1_duty=%.4f",
@@ -1819,16 +1869,29 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             ane_trace_config is not None,
             ane_trace_config,
         )
-        scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+        configured_scheduler = getattr(engine_pool, "_scheduler_config", None)
+        runtime_scheduler = getattr(
+            getattr(getattr(engine, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        effective_scheduler = getattr(runtime_scheduler, "config", None)
         logger.info(
-            "[benchmark-scheduler-config] prefill_step_size=%s "
-            "chunked_prefill=%s speed_priority=%s paged_cache_block_size=%s "
-            "max_num_batched_tokens=%s",
-            getattr(scheduler_config, "prefill_step_size", None),
-            getattr(scheduler_config, "chunked_prefill", None),
-            getattr(scheduler_config, "prefill_speed_priority", None),
-            getattr(scheduler_config, "paged_cache_block_size", None),
-            getattr(scheduler_config, "max_num_batched_tokens", None),
+            "[benchmark-scheduler-config] configured_step=%s effective_step=%s "
+            "effective_qwen_floor=%s configured_block_size=%s "
+            "effective_block_size=%s boundary_cache_available=%s "
+            "configured_chunked_prefill=%s effective_chunked_prefill=%s "
+            "speed_priority=%s max_num_batched_tokens=%s",
+            getattr(configured_scheduler, "prefill_step_size", None),
+            getattr(effective_scheduler, "prefill_step_size", None),
+            getattr(runtime_scheduler, "_qwen35_prefill_floor", None),
+            getattr(configured_scheduler, "paged_cache_block_size", None),
+            getattr(effective_scheduler, "paged_cache_block_size", None),
+            bool(getattr(runtime_scheduler, "block_aware_cache", None)),
+            getattr(configured_scheduler, "chunked_prefill", None),
+            getattr(effective_scheduler, "chunked_prefill", None),
+            getattr(effective_scheduler, "prefill_speed_priority", None),
+            getattr(effective_scheduler, "max_num_batched_tokens", None),
         )
 
         for pp_len in single_prompt_lengths:

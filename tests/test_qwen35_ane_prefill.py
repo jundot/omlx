@@ -211,19 +211,18 @@ def test_configure_scheduler_preserves_wide_prompt_chunks(sequence_length):
 
 
 @pytest.mark.parametrize(
-    ("rows", "fraction", "expected"),
+    ("rows", "expected"),
     [
-        (2047, 0.53, None),
-        (2048, 0.01, (1, 0)),
-        (4095, 0.53, (1, 2047)),
-        (4095, 0.25, None),
-        (4096, 0.01, (2, 0)),
-        (8191, 0.25, (3, 2047)),
+        (2047, None),
+        (2048, (1, 0)),
+        (4095, (1, 2047)),
+        (4096, (2, 0)),
+        (8191, (3, 2047)),
     ],
 )
-def test_wide_tile_profitability_guard(rows, fraction, expected):
+def test_wide_tile_plan_uses_every_complete_block(rows, expected):
     x = mx.zeros((1, rows, 8), dtype=mx.float16)
-    assert ane_patch._tiled_input_plan(x, 2048, fraction) == expected
+    assert ane_patch._tiled_input_plan(x, 2048) == expected
 
 
 def test_mlp_wide_call_tiles_full_blocks_and_keeps_gpu_tail(monkeypatch):
@@ -265,19 +264,28 @@ def test_mlp_wide_call_tiles_full_blocks_and_keeps_gpu_tail(monkeypatch):
     assert result[:, 2048:].tolist()[0][0][0] == 30
 
 
-def test_unprofitable_wide_mlp_returns_before_dispatch(monkeypatch):
-    monkeypatch.setattr(
-        ane_patch,
-        "_backend_exact",
-        lambda *_args, **_kwargs: pytest.fail("guard must run before ANE"),
-    )
+def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
+    calls = []
+
+    def exact(_mlp, block, _target_verify=False):
+        calls.append(int(block.shape[-2]))
+        return block
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    monkeypatch.setattr(ane_patch, "swiglu", lambda gate, up: gate + up)
     mlp = SimpleNamespace(
+        gate_proj=lambda value: value,
+        up_proj=lambda value: value,
+        down_proj=lambda value: value,
         _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(2048, 0.25, 8),
     )
     result = ane_patch._backend(
         mlp, mx.zeros((1, 4095, 8), dtype=mx.float16)
     )
-    assert result is None
+    assert result is not None
+    mx.eval(result)
+    assert calls == [2048]
+    assert result.shape == (1, 4095, 8)
 
 
 def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):

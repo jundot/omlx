@@ -145,6 +145,14 @@ class Request:
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False
     benchmark_ane_sequence_length: int = 0
+    # Effective prefill widths observed by the scheduler. These are populated
+    # only for benchmark_trace requests so the benchmark summary can distinguish
+    # a requested scheduler step from the model calls actually delivered after
+    # cache-boundary and memory clamps.
+    benchmark_prefill_chunks: List[int] = field(default_factory=list)
+    benchmark_requested_steps: List[int] = field(default_factory=list)
+    benchmark_boundary_enabled: bool = False
+    benchmark_cache_block_size: int = 0
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
@@ -309,6 +317,11 @@ class RequestOutput:
     # Structured internal error classification for API-layer mapping.
     error_code: Optional[str] = None
     error_metadata: Optional[Dict[str, Any]] = None
+    # Internal benchmark instrumentation copied from the originating request.
+    benchmark_prefill_chunks: List[int] = field(default_factory=list)
+    benchmark_requested_steps: List[int] = field(default_factory=list)
+    benchmark_boundary_enabled: bool = False
+    benchmark_cache_block_size: int = 0
 
     @property
     def usage(self) -> Dict[str, int]:
