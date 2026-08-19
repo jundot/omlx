@@ -993,3 +993,28 @@ def test_operator_memory_settings_initializes_uninitialized_settings(monkeypatch
     assert tier == "custom"
     assert custom_gb == 44.0
     assert enabled is True
+
+
+def test_operator_memory_settings_does_not_initialize_on_other_runtime_error(monkeypatch):
+    from types import SimpleNamespace
+    import omlx.settings as settings_module
+    from omlx.cluster.memory_guard import _operator_memory_settings
+
+    init_called = False
+
+    def fake_get_settings():
+        raise RuntimeError('Some other failure')
+
+    def fake_init_settings(*args, **kwargs):
+        nonlocal init_called
+        init_called = True
+        return SimpleNamespace()
+
+    monkeypatch.setattr(settings_module, 'get_settings', fake_get_settings)
+    monkeypatch.setattr(settings_module, 'init_settings', fake_init_settings)
+
+    tier, custom_gb, enabled = _operator_memory_settings()
+    assert init_called is False
+    assert tier == 'balanced'
+    assert custom_gb == 0.0
+    assert enabled is True

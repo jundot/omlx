@@ -117,8 +117,11 @@ def _operator_memory_settings() -> tuple[str, float, bool]:
 
         try:
             settings = get_settings()
-        except RuntimeError:
-            settings = init_settings()
+        except RuntimeError as exc:
+            if 'not initialized' in str(exc).lower():
+                settings = init_settings()
+            else:
+                raise
         memory = settings.memory
         return (
             str(getattr(memory, "memory_guard_tier", "") or "balanced"),
