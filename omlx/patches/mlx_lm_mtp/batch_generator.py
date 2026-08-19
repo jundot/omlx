@@ -2670,6 +2670,21 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 
+# Snapshots of finished sequences' Lightning MTP stats, drained by the admin
+# benchmark so acceptance telemetry can ride along with each measured point. Bounded: the
+# benchmark drains between points and rejects concurrent runs (409), so
+# attribution holds; anything beyond the bound is stale traffic nobody reads.
+_MTP_STATS_SNAPSHOTS: "deque[dict]" = deque(maxlen=64)
+
+
+def drain_mtp_stats_snapshots() -> "list[dict]":
+    """Return and clear the finished-sequence stats snapshots (oldest first)."""
+    out: list[dict] = []
+    while _MTP_STATS_SNAPSHOTS:
+        out.append(_MTP_STATS_SNAPSHOTS.popleft())
+    return out
+
+
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
 
@@ -2721,6 +2736,29 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.sample_ms,
         stats.cache_ops_ms,
     )
+    if getattr(stats, "_snapshotted", False):
+        # A sequence that parks on its terminal token logs the SAME stats
+        # object twice (park exit, then finish). The INFO line repeating is
+        # harmless; a second snapshot would double every counter in the
+        # benchmark summary, so snapshot each stats object exactly once.
+        return
+    try:
+        stats._snapshotted = True
+        _MTP_STATS_SNAPSHOTS.append(
+            {
+                "uid": str(uid),
+                "finish": str(finish_reason),
+                "tokens": total_emits,
+                "cycles": stats.cycles,
+                "accepts": stats.accepts,
+                "drafted": total_drafted,
+                "zero_cycles": stats.zero_cycles,
+            }
+        )
+    except Exception:
+        # Telemetry must never take down a finishing sequence: the finish
+        # paths call this logger unguarded, so any snapshot failure stays here.
+        logger.debug("MTP stats snapshot dropped", exc_info=True)
 
 
 def _bump_emit_stat(state: _MtpState, source: str) -> None:

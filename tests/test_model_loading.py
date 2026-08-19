@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
+import logging
 import sys
 import types
 from unittest.mock import MagicMock
@@ -376,6 +377,27 @@ class TestVlmMtpPreLoadDispatch:
         # already installed by apply_mlx_vlm_mtp_patch.
         assert calls == ["attach=True", "sanitize", "runtime"]
 
+    def test_no_warning_when_head_tensors_present(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The missing-tensors WARNING must fire ONLY when tensors are absent;
+        # a checkpoint with real heads and mtp_enabled=True loads quietly.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        with caplog.at_level(logging.WARNING):
+            maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        assert not [
+            r for r in caplog.records if "Lightning MTP requested" in r.message
+        ]
+
     def test_vlm_patches_applied_when_mtp_disabled_for_vlm(self, tmp_path, monkeypatch):
         # Issue #1404: persisted ``mtp.*`` weights must still get a binding
         # site on the LanguageModel tree when entering through VLMBatchedEngine
@@ -430,6 +452,121 @@ class TestVlmMtpPreLoadDispatch:
         runtime_mock.assert_called_once()
         attach_mock.assert_called_once_with(False)
         assert calls == ["attach=False", "sanitize", "runtime"]
+
+    def test_weightless_checkpoint_with_mtp_requested_warns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # A config that declares MTP heads without shipping mtp.* tensors
+        # already fails closed (attach gate + BatchGenerator module check),
+        # but with mtp_enabled=True the only load-time signal used to be the
+        # "Speculative backend selected ... (active)" INFO — which reports
+        # the requested setting, not the outcome. The operator must get a
+        # WARNING saying standard decode remains active.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        with caplog.at_level(logging.WARNING, logger=model_loading.logger.name):
+            maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        attach_mock.assert_called_once_with(False)
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "Lightning MTP requested" in r.message
+        ]
+        assert len(warnings) == 1
+        assert "standard decode remains active" in warnings[0].getMessage()
+
+    def test_weightless_warning_survives_runtime_patch_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The warning is emitted at the weight-scan site, not under the
+        # runtime patch's success branch — a patch that fails to apply must
+        # not suppress it.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        runtime_mock.side_effect = lambda: calls.append("runtime") or False
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        with caplog.at_level(logging.WARNING, logger=model_loading.logger.name):
+            maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        assert any(
+            "Lightning MTP requested" in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_weightless_warning_survives_patch_import_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The warning is emitted before the mlx_vlm_mtp import, so an
+        # environment where that package cannot import at all still tells
+        # the operator that Lightning MTP will not run.
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(
+                set_mtp_active=MagicMock(),
+                apply_mlx_lm_mtp_patch=MagicMock(return_value=True),
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_vlm_mtp", None)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        with caplog.at_level(logging.WARNING, logger=model_loading.logger.name):
+            maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        assert any(
+            "Lightning MTP requested" in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_weightless_checkpoint_without_mtp_request_does_not_warn(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Same weightless checkpoint with mtp_enabled=False is a normal,
+        # intentional configuration — it must stay at INFO/DEBUG.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        with caplog.at_level(logging.INFO, logger=model_loading.logger.name):
+            maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        attach_mock.assert_called_once_with(False)
+        assert not [
+            r for r in caplog.records if r.levelno >= logging.WARNING
+        ]
 
     def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
         # BatchedEngine / DFlashEngine / LLM loader paths must NOT touch
