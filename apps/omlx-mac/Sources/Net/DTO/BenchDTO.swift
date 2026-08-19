@@ -226,6 +226,12 @@ struct ANETuningStartRequest: Encodable, Sendable {
     let modelId: String
     let sequenceLength: Int
     let repeats: Int
+    let allowCpu: Bool
+    let allowCpuGate: Bool
+    let allowCpuDown: Bool
+    let allowAneGdn: Bool
+    let allowCpuGdn: Bool
+    let allowCpuSharedResource: Bool
 }
 
 struct ANETuningStartResponse: Codable, Sendable {

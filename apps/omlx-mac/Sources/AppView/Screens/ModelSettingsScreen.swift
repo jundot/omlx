@@ -1131,6 +1131,25 @@ private struct ExperimentalSection: View {
                                      defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Saved settings change only when you apply the result.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
+                        if !vm.aneTuningIsRunning {
+                            Menu("Tuner overrides") {
+                                Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
+                                Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
+                                    .disabled(!vm.aneTuningAllowCPU)
+                                Toggle("Allow CPU down projection", isOn: $vm.aneTuningAllowCPUDown)
+                                    .disabled(!vm.aneTuningAllowCPU)
+                                Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
+                                Toggle("Allow GDN on CPU", isOn: $vm.aneTuningAllowCPUGDN)
+                                    .disabled(!vm.aneTuningAllowCPU || !vm.aneTuningAllowANEGDN)
+                                Toggle(
+                                    "Allow performance-aware CPU scheduling",
+                                    isOn: $vm.aneTuningAllowCPUSharedResource
+                                )
+                                .disabled(!vm.aneTuningAllowCPU)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                        }
                         if vm.aneTuningIsRunning {
                             if let status = vm.aneTuningStatus {
                                 Text(status.message)
@@ -1163,6 +1182,10 @@ private struct ExperimentalSection: View {
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
                             .disabled(vm.aneTuningIsApplying)
+                            Button("Tune again") {
+                                Task { await vm.startANETuning(client: client) }
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
                         } else {
                             Button("Tune for this Mac") {
                                 Task { await vm.startANETuning(client: client) }

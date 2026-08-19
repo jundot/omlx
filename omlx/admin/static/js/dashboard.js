@@ -252,6 +252,14 @@
                 status: null,
                 error: '',
             },
+            aneTuningOverrides: {
+                allowCpu: true,
+                allowCpuGate: true,
+                allowCpuDown: true,
+                allowAneGdn: true,
+                allowCpuGdn: true,
+                allowCpuSharedResource: true,
+            },
             _aneTuningPollTimer: null,
 
             // Profile / template / preset state
@@ -7622,6 +7630,17 @@
                                 this.modelSettings.qwen35_ane_prefill_sequence_length
                             ) || 2048,
                             repeats: 2,
+                            allow_cpu: this.aneTuningOverrides.allowCpu,
+                            allow_cpu_gate: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuGate,
+                            allow_cpu_down: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuDown,
+                            allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
+                            allow_cpu_gdn: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowAneGdn
+                                && this.aneTuningOverrides.allowCpuGdn,
+                            allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuSharedResource,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));

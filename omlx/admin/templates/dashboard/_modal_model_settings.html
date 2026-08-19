@@ -897,8 +897,56 @@
                                                                 : (aneTuning.applying
                                                                     ? '{{ t('modal.model_settings.qwen_ane_tune_applying')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : '{{ t('modal.model_settings.qwen_ane_tune_apply')|replace('\\', '\\\\')|replace("'", "\\'") }}')"></button>
+                                                    <button type="button"
+                                                            x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
+                                                            @click="startANETuning()"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
+                                                        {{ t('modal.model_settings.qwen_ane_tune_again') }}
+                                                    </button>
                                                 </div>
                                             </div>
+
+                                            <details x-show="!aneTuning.running" x-cloak
+                                                     class="rounded-lg border border-neutral-200 bg-white px-3 py-2">
+                                                <summary class="cursor-pointer select-none text-xs font-medium text-neutral-700">
+                                                    {{ t('modal.model_settings.qwen_ane_tune_overrides') }}
+                                                </summary>
+                                                <div class="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-xs text-neutral-600">
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="!aneTuningOverrides.allowCpu ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_gate') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuGate"
+                                                               :disabled="!aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="!aneTuningOverrides.allowCpu ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_down') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuDown"
+                                                               :disabled="!aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_ane_gdn') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowAneGdn" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="(!aneTuningOverrides.allowCpu || !aneTuningOverrides.allowAneGdn) ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_gdn') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuGdn"
+                                                               :disabled="!aneTuningOverrides.allowCpu || !aneTuningOverrides.allowAneGdn"
+                                                               class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="!aneTuningOverrides.allowCpu ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_scheduler') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuSharedResource"
+                                                               :disabled="!aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                </div>
+                                            </details>
 
                                             <div x-show="aneTuningForSelectedModel() && aneTuning.running" x-cloak class="space-y-1.5">
                                                 <div class="flex items-center justify-between gap-3 text-xs text-neutral-600">

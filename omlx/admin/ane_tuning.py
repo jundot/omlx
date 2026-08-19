@@ -44,6 +44,12 @@ class ANETuningRequest(BaseModel):
     model_id: str
     sequence_length: int = 2048
     repeats: int = 2
+    allow_cpu: bool = True
+    allow_cpu_gate: bool = True
+    allow_cpu_down: bool = True
+    allow_ane_gdn: bool = True
+    allow_cpu_gdn: bool = True
+    allow_cpu_shared_resource: bool = True
 
     @field_validator("sequence_length")
     @classmethod
@@ -151,12 +157,25 @@ def create_run(request: ANETuningRequest) -> ANETuningRun:
     )
     # This is an upper bound until the loaded checkpoint tells us whether CPU
     # sharing and GDN are eligible. The live snapshot is reduced afterwards.
-    run.total = (
-        3
-        + len(fractions) * len(_cpu_fraction_grid())
-        + len(_cpu_down_fraction_grid())
-        + len(fractions) * len(_cpu_gdn_fraction_grid())
+    cpu_gate_points = (
+        len(_cpu_fraction_grid())
+        if request.allow_cpu and request.allow_cpu_gate
+        else 1
     )
+    cpu_down_points = (
+        len(_cpu_down_fraction_grid())
+        if request.allow_cpu and request.allow_cpu_down
+        else 1
+    )
+    gdn_points = 0
+    if request.allow_ane_gdn:
+        cpu_gdn_points = (
+            len(_cpu_gdn_fraction_grid())
+            if request.allow_cpu and request.allow_cpu_gdn
+            else 1
+        )
+        gdn_points = len(fractions) * cpu_gdn_points
+    run.total = 3 + len(fractions) * cpu_gate_points + cpu_down_points + gdn_points
     _runs[run.tuning_id] = run
     return run
 
@@ -317,16 +336,44 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     settings.qwen35_ane_prefill_sequence_length = request.sequence_length
     if candidate.mlp_fraction is not None:
         settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction
-    settings.qwen35_ane_prefill_gdn = candidate.gdn_enabled
-    if candidate.gdn_fraction is not None:
+    settings.qwen35_ane_prefill_gdn = bool(
+        candidate.gdn_enabled and request.allow_ane_gdn
+    )
+    if candidate.gdn_fraction is not None and request.allow_ane_gdn:
         settings.qwen35_ane_prefill_gdn_fraction = candidate.gdn_fraction
-    settings.qwen35_ane_prefill_cpu_enabled = candidate.cpu_enabled
-    if candidate.cpu_fraction is not None:
+    settings.qwen35_ane_prefill_cpu_enabled = bool(
+        candidate.cpu_enabled and request.allow_cpu
+    )
+    if (
+        candidate.cpu_fraction is not None
+        and request.allow_cpu
+        and request.allow_cpu_gate
+    ):
         settings.qwen35_ane_prefill_cpu_fraction = candidate.cpu_fraction
-    if candidate.cpu_down_fraction is not None:
+    else:
+        settings.qwen35_ane_prefill_cpu_fraction = 0.0
+    if (
+        candidate.cpu_down_fraction is not None
+        and request.allow_cpu
+        and request.allow_cpu_down
+    ):
         settings.qwen35_ane_prefill_cpu_down_fraction = candidate.cpu_down_fraction
-    if candidate.cpu_gdn_fraction is not None:
+    else:
+        settings.qwen35_ane_prefill_cpu_down_fraction = 0.0
+    if (
+        candidate.cpu_gdn_fraction is not None
+        and request.allow_cpu
+        and request.allow_ane_gdn
+        and request.allow_cpu_gdn
+    ):
         settings.qwen35_ane_prefill_cpu_gdn_fraction = candidate.cpu_gdn_fraction
+    else:
+        settings.qwen35_ane_prefill_cpu_gdn_fraction = 0.0
+    settings.qwen35_ane_prefill_cpu_shared_resource = bool(
+        request.allow_cpu
+        and request.allow_cpu_shared_resource
+        and getattr(base, "qwen35_ane_prefill_cpu_shared_resource", True)
+    )
     settings.qwen35_ane_prefill_dual_ane = True
     return settings
 
@@ -624,23 +671,32 @@ async def _calibrate_components(
     mlp = next((module for module in modules if patch._eligible_pair(module)), None)
     if mlp is None:
         raise RuntimeError("No eligible Qwen MLP layer is available for calibration")
-    gdn = next((module for module in modules if patch._eligible_gdn(module)), None)
+    gdn = (
+        next((module for module in modules if patch._eligible_gdn(module)), None)
+        if run.request.allow_ane_gdn
+        else None
+    )
 
     gate = mlp.gate_proj
     bits = int(gate.bits)
     cpu_supported = bool(
-        bits == 4
+        run.request.allow_cpu
+        and bits == 4
         and gate.scales.dtype == mx.float16
         and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_t")
         and fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t")
     )
     gdn_cpu_supported = bool(
-        gdn is not None
+        run.request.allow_cpu
+        and run.request.allow_cpu_gdn
+        and run.request.allow_ane_gdn
+        and gdn is not None
         and gdn.in_proj_qkv.scales.dtype == mx.float16
         and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
     )
     cpu_shared = bool(
         (cpu_supported or gdn_cpu_supported)
+        and run.request.allow_cpu_shared_resource
         and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
         and fast.qwen35_cpu_shared_resource_available()
     )
@@ -648,8 +704,16 @@ async def _calibrate_components(
         getattr(base_settings, "qwen35_ane_prefill_cpu_threads", 8) or 8
     )
     fractions = run.fractions
-    cpu_fractions = _cpu_fraction_grid() if cpu_supported else [0.0]
-    down_fractions = _cpu_down_fraction_grid() if cpu_supported else [0.0]
+    cpu_fractions = (
+        _cpu_fraction_grid()
+        if cpu_supported and run.request.allow_cpu_gate
+        else [0.0]
+    )
+    down_fractions = (
+        _cpu_down_fraction_grid()
+        if cpu_supported and run.request.allow_cpu_down
+        else [0.0]
+    )
     gdn_cpu_fractions = (
         _cpu_gdn_fraction_grid() if gdn_cpu_supported else [0.0]
     )
@@ -854,7 +918,11 @@ async def _calibrate_components(
         _complete_phase(
             run,
             _GDN_SLOT,
-            detail="Not eligible in this checkpoint",
+            detail=(
+                "Disabled by tuner override"
+                if not run.request.allow_ane_gdn
+                else "Not eligible in this checkpoint"
+            ),
             latency_ms=None,
             gdn_enabled=False,
         )

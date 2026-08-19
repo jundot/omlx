@@ -151,6 +151,14 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune",
         "modal.model_settings.qwen_ane_tune_hint",
         "modal.model_settings.qwen_ane_tune_start",
+        "modal.model_settings.qwen_ane_tune_again",
+        "modal.model_settings.qwen_ane_tune_overrides",
+        "modal.model_settings.qwen_ane_tune_allow_cpu",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_gate",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_down",
+        "modal.model_settings.qwen_ane_tune_allow_ane_gdn",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_gdn",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_scheduler",
         "modal.model_settings.qwen_ane_tune_cancel",
         "modal.model_settings.qwen_ane_tune_apply",
         "modal.model_settings.qwen_ane_tune_applying",
@@ -231,6 +239,9 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "aneTuningResultText(result)" in html
     assert "aneTuning.status?.termination_reason" in html
     assert "aneTuning.status?.results || []" in html
+    assert 'x-model="aneTuningOverrides.allowCpu"' in html
+    assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
+    assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
     assert "'/admin/api/bench/ane-tune/start'" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
@@ -238,6 +249,9 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
     assert "qwen35_ane_prefill_cpu_fraction = Number(" in script
+    assert "allow_cpu: this.aneTuningOverrides.allowCpu" in script
+    assert "allow_ane_gdn: this.aneTuningOverrides.allowAneGdn" in script
+    assert "allow_cpu_gdn: this.aneTuningOverrides.allowCpu" in script
     assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script

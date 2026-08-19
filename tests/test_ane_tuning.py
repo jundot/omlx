@@ -48,6 +48,46 @@ def test_candidate_settings_are_transient_copy():
     assert base.qwen35_ane_prefill_fraction == 0.53
 
 
+def test_candidate_settings_apply_tuner_boolean_overrides():
+    base = ModelSettings(qwen35_ane_prefill_cpu_shared_resource=True)
+    request = ane_tuning.ANETuningRequest(
+        model_id="qwen",
+        allow_cpu=False,
+        allow_cpu_gate=False,
+        allow_cpu_down=False,
+        allow_ane_gdn=False,
+        allow_cpu_gdn=False,
+        allow_cpu_shared_resource=False,
+    )
+    candidate = ane_tuning._Candidate(
+        "constrained", True, 0.45, True, 0.45, True, 0.14, 0.20, 0.13
+    )
+
+    tuned = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert tuned.qwen35_ane_prefill_enabled is True
+    assert tuned.qwen35_ane_prefill_gdn is False
+    assert tuned.qwen35_ane_prefill_cpu_enabled is False
+    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.0
+    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.0
+    assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.0
+    assert tuned.qwen35_ane_prefill_cpu_shared_resource is False
+
+
+def test_tuner_overrides_reduce_planned_search_matrix():
+    full = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="full"))
+    constrained = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(
+            model_id="constrained",
+            allow_cpu=False,
+            allow_ane_gdn=False,
+        )
+    )
+
+    assert constrained.total == 9
+    assert constrained.total < full.total
+
+
 def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
     monkeypatch.setattr(
         ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]

@@ -283,6 +283,12 @@ final class ModelSettingsScreenVM {
     var aneTuningIsRunning: Bool = false
     var aneTuningStatus: ANETuningStatusResponse?
     var aneTuningIsApplying: Bool = false
+    var aneTuningAllowCPU: Bool = true
+    var aneTuningAllowCPUGate: Bool = true
+    var aneTuningAllowCPUDown: Bool = true
+    var aneTuningAllowANEGDN: Bool = true
+    var aneTuningAllowCPUGDN: Bool = true
+    var aneTuningAllowCPUSharedResource: Bool = true
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -793,7 +799,16 @@ final class ModelSettingsScreenVM {
                 ANETuningStartRequest(
                     modelId: modelID,
                     sequenceLength: sequenceLength,
-                    repeats: 2
+                    repeats: 2,
+                    allowCpu: aneTuningAllowCPU,
+                    allowCpuGate: aneTuningAllowCPU && aneTuningAllowCPUGate,
+                    allowCpuDown: aneTuningAllowCPU && aneTuningAllowCPUDown,
+                    allowAneGdn: aneTuningAllowANEGDN,
+                    allowCpuGdn: aneTuningAllowCPU
+                        && aneTuningAllowANEGDN
+                        && aneTuningAllowCPUGDN,
+                    allowCpuSharedResource: aneTuningAllowCPU
+                        && aneTuningAllowCPUSharedResource
                 )
             )
             aneTuningID = started.tuningId

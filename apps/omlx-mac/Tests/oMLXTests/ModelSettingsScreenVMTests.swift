@@ -201,6 +201,32 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_shared_resource"] as? Bool, true)
     }
 
+    func testANETunerOverridesEncodeForStartRequest() throws {
+        let request = ANETuningStartRequest(
+            modelId: "qwen",
+            sequenceLength: 2048,
+            repeats: 2,
+            allowCpu: false,
+            allowCpuGate: false,
+            allowCpuDown: true,
+            allowAneGdn: false,
+            allowCpuGdn: false,
+            allowCpuSharedResource: false
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let data = try encoder.encode(request)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        XCTAssertEqual(object?["allow_cpu"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_gate"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_down"] as? Bool, true)
+        XCTAssertEqual(object?["allow_ane_gdn"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_gdn"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_shared_resource"] as? Bool, false)
+    }
+
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {
         ModelDTO(
             id: id,
