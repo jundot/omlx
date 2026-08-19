@@ -80,6 +80,72 @@ def _compact_draft_enabled() -> bool:
 _KV_ONLY_HISTORY_ENV = "OMLX_QWEN_KV_ONLY_HISTORY"
 
 
+_FUSED_PROJ_ENV = "OMLX_QWEN_FUSED_PROJ"
+
+
+def _fused_proj_enabled() -> bool:
+    """Default on (challenge 45c257f1). ``OMLX_QWEN_FUSED_PROJ=0`` restores
+    the separate projection launches (the ablation seam)."""
+    import os
+
+    return os.environ.get(_FUSED_PROJ_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _try_build_fused_in_proj(gdn: Any) -> Optional[tuple]:
+    """Concatenate the GDN input projections (qkv, z, b, a) on the output
+    axis for one affine quantized matmul. Rows are independent, so this is
+    bit-exact with four separate launches. Returns None when any projection
+    is unquantized or the quantizations mismatch."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    ps = [
+        getattr(gdn, "in_proj_qkv", None),
+        getattr(gdn, "in_proj_z", None),
+        getattr(gdn, "in_proj_b", None),
+        getattr(gdn, "in_proj_a", None),
+    ]
+    if not all(isinstance(p, nn.QuantizedLinear) for p in ps):
+        return None
+    gs = ps[0].group_size
+    bits = ps[0].bits
+    if not all(p.group_size == gs and p.bits == bits for p in ps):
+        return None
+    if any(p.biases is None for p in ps):
+        return None
+    w = mx.concatenate([p.weight for p in ps], axis=0)
+    s = mx.concatenate([p.scales for p in ps], axis=0)
+    z = mx.concatenate([p.biases for p in ps], axis=0)
+    outs = [p.weight.shape[0] for p in ps]
+    return (w, s, z, gs, bits, outs[0], outs[1], outs[2])
+
+
+def _try_build_fused_gate_up(mlp: Any) -> Optional[tuple]:
+    """Concatenate the SwiGLU gate/up projections on the output axis for one
+    affine quantized matmul (challenge 45c257f1). Returns None when either
+    projection is unquantized or the quantizations mismatch."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    g = getattr(mlp, "gate_proj", None)
+    u = getattr(mlp, "up_proj", None)
+    if not isinstance(g, nn.QuantizedLinear) or not isinstance(u, nn.QuantizedLinear):
+        return None
+    if g.group_size != u.group_size or g.bits != u.bits:
+        return None
+    if g.biases is None or u.biases is None:
+        return None
+    w = mx.concatenate([g.weight, u.weight], axis=0)
+    s = mx.concatenate([g.scales, u.scales], axis=0)
+    z = mx.concatenate([g.biases, u.biases], axis=0)
+    return (w, s, z, g.group_size, g.bits, g.weight.shape[0])
+
+
 def _kv_only_history_enabled() -> bool:
     """Opt-in (challenge a3104b04). Token-exact but measured neutral on
     M4 Max (87.30 vs 87.43 ms/tok, 128-tok MTP) — per the port bar a
@@ -140,6 +206,7 @@ def apply() -> bool:
     _patch_qwen3_5_moe()
 
     _patch_attention_packed_qkv(q35)
+    _patch_mlp_gate_up_fusion(q35)
     _patch_gdn_compiled_fusions(q35)
 
     if not hasattr(q35.TextModel, "_omlx_mtp_patched"):
@@ -148,10 +215,49 @@ def apply() -> bool:
     return True
 
 
+def _patch_mlp_gate_up_fusion(q35: Any) -> None:
+    """Replace ``Qwen3NextMLP.__call__`` with a packed gate/up body
+    (challenge 45c257f1). The two SwiGLU projections run as ONE affine
+    matmul over concat-on-N rows — rows are independent, so it is bit-exact
+    with the separate launches; the concat is built lazily from the attached
+    quantized linears and cached on the instance. Unquantized (bf16 MTP head)
+    or mismatched projections fall back."""
+    cls = q35.MLP
+    if _is_our_method(cls, "__call__", "_omlx_mlp_fused_marker"):
+        return
+
+    import mlx.core as mx
+
+    def __call__(self, x):
+        pack = getattr(self, "_omlx_fused_gate_up", None)
+        if pack is None:
+            if (
+                getattr(self, "_omlx_qwen35_scope", False)
+                and _fused_proj_enabled()
+            ):
+                pack = _try_build_fused_gate_up(self)
+            if pack is None:
+                pack = False
+            self._omlx_fused_gate_up = pack
+        if pack is False:
+            return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        w, s, z, gs, bits, gate_out = pack
+        y = mx.quantized_matmul(
+            x, w, s, z, transpose=True, group_size=gs, bits=bits
+        )
+        gate = y[..., :gate_out]
+        up = y[..., gate_out:]
+        return self.down_proj(swiglu(gate, up))
+
+    from mlx_lm.models.qwen3_next import swiglu
+
+    __call__._omlx_mlp_fused_marker = True
+    cls.__call__ = __call__
+
+
 # ---------------------------------------------------------------------------
 # GatedDeltaNet — compiled post-norm SiLU product (challenge 6cb6c963).
 # ---------------------------------------------------------------------------
-
 _COMPILED_FUSIONS_ENV = "OMLX_QWEN_COMPILED_FUSIONS"
 
 
@@ -508,6 +614,11 @@ def _patch_gated_delta_net(q35: Any) -> None:
     the same helper can run on the prefix (n_confirmed tokens) and the
     suffix (draft tokens) separately, snapshotting the SSM/conv state in
     between for rollback on draft rejection.
+
+    ``_fused_in_proj`` (challenge 45c257f1) packs the four input projections
+    (qkv, z, b, a) into one concat-on-N affine matmul — rows are independent,
+    so it is bit-exact with the separate launches; unquantized (bf16 head)
+    or mismatched projections fall back.
     """
     cls = q35.GatedDeltaNet
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
@@ -517,6 +628,27 @@ def _patch_gated_delta_net(q35: Any) -> None:
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
     from mlx_lm.models.gated_delta import gated_delta_update
+
+    def _fused_in_proj(self, inputs):
+        """One affine quantized matmul for qkv+z+b+a, sliced back."""
+        pack = getattr(self, "_omlx_fused_in_proj", None)
+        if pack is None:
+            if _fused_proj_enabled():
+                pack = _try_build_fused_in_proj(self)
+            if pack is None:
+                pack = False
+            self._omlx_fused_in_proj = pack
+        if pack is False:
+            return None
+        w, s, z, gs, bits, qkv_out, z_out, b_out = pack
+        y = mx.quantized_matmul(
+            inputs, w, s, z, transpose=True, group_size=gs, bits=bits
+        )
+        qkv = y[..., :qkv_out]
+        z = y[..., qkv_out : qkv_out + z_out]
+        b = y[..., qkv_out + z_out : qkv_out + z_out + b_out]
+        a = y[..., qkv_out + z_out + b_out :]
+        return qkv, z, b, a
 
     def _process_chunk(
         self,
@@ -577,10 +709,19 @@ def _patch_gated_delta_net(q35: Any) -> None:
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        # Fused qkv+z+b+a input projection (challenge 45c257f1): one affine
+        # matmul over concat-on-N rows, bit-exact with the separate launches.
+        fused = self._fused_in_proj(inputs)
+        if fused is None:
+            qkv = self.in_proj_qkv(inputs)
+            z = self.in_proj_z(inputs).reshape(
+                B, S, self.num_v_heads, self.head_v_dim
+            )
+            b = self.in_proj_b(inputs)
+            a = self.in_proj_a(inputs)
+        else:
+            qkv, z, b, a = fused
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -630,6 +771,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
         return out
 
     cls._process_chunk = _process_chunk
+    cls._fused_in_proj = _fused_in_proj
     __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
 
@@ -655,6 +797,9 @@ def _patch_decoder_layer(q35: Any) -> None:
             sa = getattr(self, "self_attn", None)
             if sa is not None:
                 sa._omlx_qwen35_scope = True
+            mlp = getattr(self, "mlp", None)
+            if mlp is not None:
+                mlp._omlx_qwen35_scope = True
 
         cls.__init__ = __init__
         cls._omlx_mtp_init_wrapped = True
