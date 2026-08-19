@@ -56,7 +56,7 @@ absent).
 | 19 | 2026-08-16 | `22ce3162-41e8-4d8b-8199-bbbc555e00a6` | `e3b4531` — packed GDN prework mixer Metal kernel (conv+SiLU+split+norm+g in one launch; beta stays graph) | — | ✅ | no port: C++ Metal kernel. Python GDN prework runs the same primitives as graph ops; the one-input sigmoid ULP hazard (0xC0DB) is Metal-kernel-specific |
 | 20 | 2026-08-16 | `aa7c3e0c-20d1-4b27-a80c-e622e7880999` | `df404e0` — SIMD-shuffle draft top-1 reduction kernel | — | ✅ | no port: C++ Metal kernel; the draft proposal argmax is a graph `mx.argmax` in omlx with the same total order (value-desc, id-asc) |
 | 21 | 2026-08-16 | `e6c5ef35-0d86-4cec-a5d6-366e2e59cdcd` | `7351e62` — margin-confidence gate in the cost model + fused gate-up SiLU Metal pass | — | ✅ | policy half covered by `_DepthController` (acceptance EMAs already condition on observed margins); SiLU fusion is a C++ Metal kernel — no port |
-| 22 | 2026-08-16 | `f03469a9-d889-4bca-8061-a4ad3178c7d2` | `c7468c5` — draftPolicy 1-line | ⏳ | ⏳ | policy-only submission |
+| 22 | 2026-08-16 | `f03469a9-d889-4bca-8061-a4ad3178c7d2` | `c7468c5` — `segmentedStreakGate = 2` (draft-policy constant) | — | ✅ | covered: streak/segmented gating is a Swift-session policy constant; omlx `_DepthController` owns depth choice with its own gates (hysteresis, exit streaks) |
 | 23 | 2026-08-16 | `776d7168-e968-40c4-808e-f643ec1953a7` | `4aacc53` — session +5 | ⏳ | ⏳ | pending |
 | 24 | 2026-08-17 | `5c523482-452c-4662-a303-a3b359c81030` | `cdb06b7` | ⏳ | ⏳ | pending |
 | 25 | 2026-08-17 | `03dedda8-fc70-4e3e-881f-5384a17af405` | `32b94cb` | ⏳ | ⏳ | pending |
