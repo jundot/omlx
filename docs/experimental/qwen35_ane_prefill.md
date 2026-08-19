@@ -105,12 +105,20 @@ working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
-When the feature is active, oMLX aligns the scheduler's prompt chunk size with
-the configured fixed ANE shape. This also overrides the wider Qwen prefill
-floor used on high-memory systems. A 4,096-token ANE shape is supported, but a
-4K benchmark request prefills only 4,095 tokens because the final token is
-reserved for generation kickoff. The default remains 2,048 so 4K prompts still
-route one full chunk through ANE.
+The split tuner calibrates MLP gate/up and GDN work between ANE and GPU. It
+packages several widths from one real MLP and GDN layer into a small temporary
+procedure bank, measures the production native paths, and eagerly compiles
+only the predicted full-model candidate. Timings from that application-level
+run rebalance the ANE and GPU branch rates once before a final verification.
+This avoids a full-model grid while retaining end-to-end prompt throughput as
+the recommendation criterion.
+
+The scheduler retains its normal prompt chunk width. Wider model calls are
+tiled internally into fixed-shape ANE blocks, with any ineligible tail left on
+the GPU. A standard 4K benchmark request prefills 4,095 tokens because the
+final token is reserved for generation kickoff; the optional aligned mode adds
+one prompt token so the measured prefill contains exactly two 2,048-token ANE
+tiles.
 
 The throughput-benchmark screen also offers a **Full · 2,048** warm-up. The
 scheduler reserves the last prompt token for the first decode step, so this

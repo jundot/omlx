@@ -73,14 +73,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.qwen35AnePrefillGdnMaxLayers, "48")
     }
 
-    func testQwenAneFractionFormatterMatchesPickerValues() {
+    func testQwenAneFractionFormatterPreservesSettingsValues() {
         XCTAssertEqual(ModelSettingsScreenVM.formatPct(0.5), "0.5")
         XCTAssertEqual(ModelSettingsScreenVM.formatPct(0.53), "0.53")
-        XCTAssertTrue(
-            ModelSettingsScreenVM.qwen35AneFractionOptions.contains {
-                $0.0 == ModelSettingsScreenVM.formatPct(0.50)
-            }
-        )
+        XCTAssertEqual(ModelSettingsScreenVM.formatPct(0.527), "0.527")
+    }
+
+    func testQwenAneArbitraryInputValidation() {
+        XCTAssertEqual(try? QwenAneSettingsValidator.promptBlock("2112").get(), 2112)
+        XCTAssertThrowsError(try QwenAneSettingsValidator.promptBlock("2100").get())
+        XCTAssertEqual(try? QwenAneSettingsValidator.mlpFraction("0.467").get(), 0.467)
+        XCTAssertThrowsError(try QwenAneSettingsValidator.mlpFraction("0.91").get())
+        XCTAssertEqual(try? QwenAneSettingsValidator.gdnFraction("0.527").get(), 0.527)
     }
 
     func testQwenAneSettingsAreIncludedInWorkingProfile() {

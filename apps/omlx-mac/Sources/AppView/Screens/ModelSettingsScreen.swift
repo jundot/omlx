@@ -1128,9 +1128,16 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
                     sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Benchmarks GPU-only, MLP, and MLP+GDN splits on this Mac. Uses temporary settings and takes several minutes; saved settings change only when you apply the result.",
+                                     defaultValue: "Calibrates ANE and GPU work on real model layers, then verifies the predicted split end to end. Saved settings change only when you apply the result.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
+                        if !vm.aneTuningIsRunning {
+                            Menu("Tuner overrides") {
+                                Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                        }
                         if vm.aneTuningIsRunning {
                             if let status = vm.aneTuningStatus {
                                 Text(status.message)
@@ -1169,8 +1176,56 @@ private struct ExperimentalSection: View {
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         }
+
+                        if let status = vm.aneTuningStatus {
+                            if let reason = status.terminationReason,
+                               !reason.isEmpty {
+                                Text(reason)
+                                    .font(.omlxText(10))
+                                    .foregroundStyle(
+                                        status.status == "error"
+                                            ? Color.red
+                                            : theme.textSecondary
+                                    )
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.trailing)
+                            }
+
+                            if !status.results.isEmpty {
+                                VStack(spacing: 3) {
+                                    HStack(spacing: 8) {
+                                        Text("Test")
+                                        Spacer(minLength: 8)
+                                        Text("Prompt tok/s")
+                                    }
+                                    .font(.omlxText(9, weight: .semibold))
+                                    .foregroundStyle(theme.textSecondary)
+
+                                    Divider()
+
+                                    ForEach(status.results) { result in
+                                        HStack(spacing: 8) {
+                                            Text(result.detail ?? result.label)
+                                                .lineLimit(1)
+                                                .foregroundStyle(
+                                                    result.state == "failed"
+                                                        ? Color.red
+                                                        : theme.textSecondary
+                                                )
+                                            Spacer(minLength: 8)
+                                            Text(aneCandidateResultText(result))
+                                                .monospacedDigit()
+                                                .foregroundStyle(theme.text)
+                                                .frame(minWidth: 78, alignment: .trailing)
+                                        }
+                                        .font(.omlxText(10))
+                                    }
+                                }
+                                .frame(width: 285)
+                            }
+                        }
                     }
-                    .frame(minWidth: 210, alignment: .trailing)
+                    .frame(minWidth: 285, alignment: .trailing)
                 }
                 if vm.qwen35AnePrefillEnabled {
                     Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
@@ -1179,14 +1234,13 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.sequence.sub",
                                          defaultValue: "Only prompt chunks exactly matching this token count use the ANE path. 2,048 is the measured default.",
                                          comment: "Sublabel explaining the fixed Qwen ANE prompt block size")) {
-                        Popup(
-                            selection: saved(
-                                $vm.qwen35AnePrefillSequenceLength,
-                                field: .qwen35AnePrefillSequenceLength
-                            ),
-                            width: 190,
-                            options: ModelSettingsScreenVM.qwen35AneSequenceLengthOptions
-                        )
+                        TextInput(text: $vm.qwen35AnePrefillSequenceLength,
+                                  placeholder: "2048", mono: true,
+                                  isNumeric: true, range: 1024...262_144,
+                                  step: 64, width: 190)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillSequenceLength, client: client) }
+                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
@@ -1194,14 +1248,13 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_fraction.sub",
                                          defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
                                          comment: "Sublabel explaining the Qwen MLP ANE workload fraction")) {
-                        Popup(
-                            selection: saved(
-                                $vm.qwen35AnePrefillFraction,
-                                field: .qwen35AnePrefillFraction
-                            ),
-                            width: 190,
-                            options: ModelSettingsScreenVM.qwen35AneFractionOptions
-                        )
+                        TextInput(text: $vm.qwen35AnePrefillFraction,
+                                  placeholder: "0.53", mono: true,
+                                  isNumeric: true, range: 0.05...0.90,
+                                  step: 0.005, width: 190)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillFraction, client: client) }
+                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_layers.label",
                                       defaultValue: "MLP Layer Limit",
@@ -1246,14 +1299,13 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_fraction.sub",
                                              defaultValue: "GDN projection channels assigned to both ANEs; the GPU handles the remainder.",
                                              comment: "Sublabel explaining the Qwen GDN ANE workload fraction")) {
-                            Popup(
-                                selection: saved(
-                                    $vm.qwen35AnePrefillGdnFraction,
-                                    field: .qwen35AnePrefillGdnFraction
-                                ),
-                                width: 190,
-                                options: ModelSettingsScreenVM.qwen35AneFractionOptions
-                            )
+                            TextInput(text: $vm.qwen35AnePrefillGdnFraction,
+                                      placeholder: "0.5", mono: true,
+                                      isNumeric: true, range: 0.05...0.90,
+                                      step: 0.005, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillGdnFraction, client: client) }
+                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_layers.label",
                                           defaultValue: "GDN Layer Limit",
@@ -1262,7 +1314,9 @@ private struct ExperimentalSection: View {
                                              defaultValue: "Maximum eligible GDN layers prepared eagerly. The selected default covers 48 layers.",
                                              comment: "Sublabel explaining the maximum number of Qwen GDN ANE layers")) {
                             TextInput(text: $vm.qwen35AnePrefillGdnMaxLayers,
-                                      placeholder: "48", mono: true, width: 90)
+                                      placeholder: "48", mono: true,
+                                      isNumeric: true, range: 0...256,
+                                      step: 1, width: 190)
                                 .onSubmit {
                                     Task { await vm.save(.qwen35AnePrefillGdnMaxLayers, client: client) }
                                 }
@@ -1638,19 +1692,36 @@ private struct ExperimentalSection: View {
             )
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
-        let suffix: String
+        var parts = ["MLP ANE \(mlp)%"]
         if recommendation.gdnEnabled {
             let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
-            suffix = "MLP \(mlp)% · GDN \(gdn)%"
+            parts.append("GDN ANE \(gdn)%")
         } else {
-            suffix = "MLP \(mlp)% · GDN off"
+            parts.append("GDN off")
         }
         return String(
             format: "%@ · %.1f tok/s (%+.1f%%)",
-            suffix,
+            parts.joined(separator: " · "),
             recommendation.processingTps,
             recommendation.speedupPercent
         )
+    }
+
+    private func aneCandidateResultText(
+        _ result: ANETuningCandidateDTO
+    ) -> String {
+        guard let processingTps = result.processingTps else {
+            if let latencyMs = result.latencyMs {
+                return String(format: "%.2f ms", latencyMs)
+            }
+            // Deliberately blank: the row remains visible so an interrupted
+            // run shows which tests did not complete.
+            return ""
+        }
+        if let speedup = result.speedupPercent {
+            return String(format: "%.1f (%+.1f%%)", processingTps, speedup)
+        }
+        return String(format: "%.1f", processingTps)
     }
 }
 

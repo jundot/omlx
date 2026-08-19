@@ -573,6 +573,16 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
     for name in ("in_proj_b", "in_proj_a"):
         setattr(gdn, name, _quantized_bf16(getattr(gdn, name), bits=8))
 
+    gdn_q8 = qwen35.GatedDeltaNet(args)
+    for name in (
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_b",
+        "in_proj_a",
+        "out_proj",
+    ):
+        setattr(gdn_q8, name, _quantized_bf16(getattr(gdn_q8, name), bits=8))
+
     orig_attn_call = qwen35.Attention.__call__
     orig_gdn_call = qwen35.GatedDeltaNet.__call__
     orig_lm_patched = q4patch._LM_LINEAR_PATCHED
@@ -664,6 +674,15 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             ).item()
             <= 1.0
         )
+
+        # The q8 standalone GPU tile is intentionally disabled below 16K,
+        # but that threshold must not prevent the independent 2K ANE backend
+        # from receiving the GDN projections.
+        backend_calls.clear()
+        y_gdn_q8_backend = gdn_q8(x)
+        mx.eval(y_gdn_q8_backend)
+        assert backend_calls == [(gdn_q8, x.shape, False)]
+        assert y_gdn_q8_backend.shape == x.shape
 
         # Simulate the MTP lifecycle restoring GDN.__call__ while leaving the
         # process-wide patch flag and class metadata behind. A subsequent

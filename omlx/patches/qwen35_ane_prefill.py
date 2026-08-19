@@ -403,6 +403,54 @@ def _prepare_pair_for_bank(
     )
 
 
+def _prepare_pair_runtime_state(
+    mlp: Any,
+    config: _AnePrefillConfig,
+    model: Any,
+    model1: Any,
+) -> _CombinedMLPState | None:
+    """Prepare the GPU suffix for an already compiled ANE width.
+
+    Hardware tuning compiles one representative procedure for each ANE width
+    into a small calibration bank. Keeping this helper beside the production
+    preparation code guarantees that the tuner exercises the same row
+    alignment and quantized suffix implementation as normal inference.
+    """
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    if not _eligible_pair(mlp):
+        return None
+    output_dim = int(gate.weight.shape[0])
+    bits = int(gate.bits)
+    group_size = int(gate.group_size)
+    ane_outputs = (int(output_dim * config.fraction) // 128) * 128
+    gpu_outputs = output_dim - ane_outputs
+    if ane_outputs <= 0 or gpu_outputs <= 0 or gpu_outputs % 64:
+        return None
+
+    weight = mx.contiguous(
+        mx.concatenate((gate.weight[ane_outputs:], up.weight[ane_outputs:]), axis=0)
+    )
+    scales = mx.contiguous(
+        mx.concatenate((gate.scales[ane_outputs:], up.scales[ane_outputs:]), axis=0)
+    )
+    biases = mx.contiguous(
+        mx.concatenate((gate.biases[ane_outputs:], up.biases[ane_outputs:]), axis=0)
+    )
+    mx.eval(weight, scales, biases)
+    return _CombinedMLPState(
+        model=model,
+        weight=weight,
+        scales=scales,
+        biases=biases,
+        ane_outputs=ane_outputs,
+        gpu_outputs=gpu_outputs,
+        model1=model1,
+        group_size=group_size,
+        bits=bits,
+    )
+
+
 def _gdn_linears(gdn: Any) -> tuple[Any, Any, Any, Any]:
     return (
         getattr(gdn, "in_proj_qkv", None),
@@ -917,7 +965,7 @@ def _backend(
 ) -> mx.array | None:
     """Route exact or internally tiled MLP rows without shrinking attention.
 
-    Full fixed-shape blocks use the existing ANE/GPU/CPU implementation.  A
+    Full fixed-shape blocks use the existing ANE/GPU implementation. A
     residual tail stays on the ordinary quantized linears. Inputs without a
     complete fixed-shape tile fall through to the original wide GPU operation.
     """

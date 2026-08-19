@@ -44,8 +44,12 @@ def cosine(a: mx.array, b: mx.array) -> float:
 
 def accuracy(model: Any, reference: mx.array, candidate: mx.array) -> dict[str, Any]:
     lm = model.language_model
-    reference_logits = lm.lm_head(reference[:, -1:, :])
-    candidate_logits = lm.lm_head(candidate[:, -1:, :])
+    if hasattr(lm, "lm_head"):
+        reference_logits = lm.lm_head(reference[:, -1:, :])
+        candidate_logits = lm.lm_head(candidate[:, -1:, :])
+    else:
+        reference_logits = lm.model.embed_tokens.as_linear(reference[:, -1:, :])
+        candidate_logits = lm.model.embed_tokens.as_linear(candidate[:, -1:, :])
     difference = candidate.astype(mx.float32) - reference.astype(mx.float32)
     mx.eval(reference_logits, candidate_logits, difference)
     return {
@@ -63,6 +67,8 @@ def accuracy(model: Any, reference: mx.array, candidate: mx.array) -> dict[str, 
 
 
 def run_body(model: Any, tokens: mx.array) -> mx.array:
+    if getattr(model, "_omlx_benchmark_force_lm", False):
+        return hidden_tensor(model.language_model.model(tokens))
     return hidden_tensor(
         model.language_model(tokens, skip_logits=True, return_hidden=True)
     )
@@ -169,6 +175,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=Path)
     parser.add_argument("--extension", type=Path)
+    parser.add_argument(
+        "--force-lm",
+        action="store_true",
+        help="load through oMLX's text-model path, matching the app benchmark",
+    )
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument(
         "--ane-sequence-length",
@@ -186,6 +197,11 @@ def main() -> None:
     parser.add_argument("--single-gdn-fraction", type=float, default=0.40)
     parser.add_argument("--dual-mlp-fraction", type=float, default=0.53)
     parser.add_argument("--dual-gdn-fraction", type=float, default=0.50)
+    parser.add_argument(
+        "--disable-gdn",
+        action="store_true",
+        help="benchmark MLP offload without compiling or dispatching GDN",
+    )
     args = parser.parse_args()
     ane_sequence_length = args.ane_sequence_length or args.tokens
     if "single" in args.modes and "dual" in args.modes:
@@ -195,19 +211,32 @@ def main() -> None:
         )
 
     native_ext = inject_extension(args.extension) if args.extension else None
-    from mlx_vlm.utils import load_model
-
     from omlx.custom_kernels.qwen35_prefill import fast
     from omlx.patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
-    from omlx.patches.qwen35_q4_mlp import apply_qwen35_q4_mlp_patch
+    from omlx.patches.qwen35_q4_mlp import (
+        apply_qwen35_q4_lm_prefill_linear_patch,
+        apply_qwen35_q4_mlp_patch,
+    )
 
     native_ext = native_ext or fast._ext
     if native_ext is None:
         raise RuntimeError("The Qwen3.5 native extension is unavailable")
 
     print(f"Loading {args.model}", flush=True)
-    model = load_model(args.model, lazy=False, strict=False)
+    if args.force_lm:
+        from omlx.utils.model_loading import load_text_model
+
+        model, _ = load_text_model(str(args.model))
+        model._omlx_benchmark_force_lm = True
+    else:
+        from mlx_vlm.utils import load_model
+
+        model = load_model(args.model, lazy=False, strict=False)
     apply_qwen35_q4_mlp_patch()
+    if args.force_lm:
+        # The app installs this after loading so it wraps the final class
+        # implementation (including the optional MTP compatibility patch).
+        apply_qwen35_q4_lm_prefill_linear_patch()
     mx.random.seed(0)
     tokens = mx.random.randint(0, 1000, shape=(1, args.tokens), dtype=mx.int32)
     mx.eval(tokens)
@@ -225,7 +254,7 @@ def main() -> None:
                 model,
                 sequence_length=ane_sequence_length,
                 fraction=args.single_mlp_fraction,
-                gdn=True,
+                gdn=not args.disable_gdn,
                 gdn_fraction=args.single_gdn_fraction,
                 dual_ane=False,
             )
@@ -236,7 +265,7 @@ def main() -> None:
                 model,
                 sequence_length=ane_sequence_length,
                 fraction=args.dual_mlp_fraction,
-                gdn=True,
+                gdn=not args.disable_gdn,
                 gdn_fraction=args.dual_gdn_fraction,
                 dual_ane=True,
             )

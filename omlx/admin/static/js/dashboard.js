@@ -240,6 +240,9 @@
                 status: null,
                 error: '',
             },
+            aneTuningOverrides: {
+                allowAneGdn: true,
+            },
             _aneTuningPollTimer: null,
 
             // Profile / template / preset state
@@ -7726,6 +7729,26 @@
                 return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
             },
 
+            aneTuningResultText(result) {
+                if (result?.processing_tps === null
+                    || result?.processing_tps === undefined) {
+                    if (result?.latency_ms !== null
+                        && result?.latency_ms !== undefined) {
+                        return `${Number(result.latency_ms).toFixed(2)} ms`;
+                    }
+                    // Keep unfinished rows visible but leave their result cell
+                    // blank, including the candidate that stopped the run.
+                    return '';
+                }
+                const speed = Number(result.processing_tps).toFixed(1);
+                if (result.speedup_percent === null
+                    || result.speedup_percent === undefined) {
+                    return speed;
+                }
+                const speedup = Number(result.speedup_percent);
+                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+            },
+
             _scheduleANETuningPoll() {
                 if (this._aneTuningPollTimer) {
                     clearTimeout(this._aneTuningPollTimer);
@@ -7765,6 +7788,7 @@
                                 this.modelSettings.qwen35_ane_prefill_sequence_length
                             ) || 2048,
                             repeats: 2,
+                            allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -7800,13 +7824,16 @@
                         throw new Error(data.detail || 'Failed to read ANE tuning progress.');
                     }
                     if (this.aneTuning.tuningId !== tuningId) return;
+                    if (!data.termination_reason && data.status === 'error') {
+                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                    }
                     this.aneTuning.status = data;
                     this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
                     this.aneTuning.running = data.status === 'running';
                     this.aneTuning.cancelling = false;
-                    if (data.status === 'error') {
-                        this.aneTuning.error = data.error || data.message || 'ANE tuning failed.';
-                    } else if (data.status === 'cancelled') {
+                    if (data.status === 'error' || data.status === 'cancelled') {
+                        // Early termination belongs beside the partial result
+                        // matrix. Keep this field for request/transport errors.
                         this.aneTuning.error = '';
                     }
                     this._scheduleANETuningPoll();
@@ -7964,8 +7991,58 @@
                 }
             },
 
+            validateQwenAneSettings() {
+                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
+
+                const integer = (value, label, minimum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
+                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    return null;
+                };
+                const fraction = (value, label, minimum, maximum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (number < minimum || number > maximum) {
+                        return `${label} must be between ${minimum} and ${maximum}.`;
+                    }
+                    return null;
+                };
+
+                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
+                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                if (!error && sequenceLength % 64 !== 0) {
+                    error = 'ANE prompt block must be a multiple of 64.';
+                }
+                if (error) return error;
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                if (error) return error;
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                if (error) return error;
+
+                if (this.modelSettings.qwen35_ane_prefill_gdn) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    if (error) return error;
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    if (error) return error;
+                }
+                return null;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenAneValidationError = this.validateQwenAneSettings();
+                if (qwenAneValidationError) {
+                    alert(qwenAneValidationError);
+                    return;
+                }
 
                 this.savingModelSettings = true;
                 try {
@@ -8040,12 +8117,12 @@
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                qwen35_ane_prefill_sequence_length: parseInt(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
-                                qwen35_ane_prefill_max_layers: parseInt(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
+                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length),
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
+                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers),
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction),
                                 qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
                                     : 48,

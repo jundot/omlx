@@ -178,6 +178,7 @@ def qwen35_ane_affine_qmm_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    profile_category: int = 1,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_affine_qmm_t"):
         raise RuntimeError("ANE hybrid affine qmm native kernel is unavailable")
@@ -190,6 +191,7 @@ def qwen35_ane_affine_qmm_t(
         bits,
         variant,
         group_size,
+        profile_category,
     )
 
 
@@ -300,6 +302,7 @@ def qwen35_ane_dual_affine_qmm_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    profile_category: int = 1,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_qmm_t"):
         raise RuntimeError("Dual ANE hybrid affine qmm native kernel is unavailable")
@@ -313,6 +316,7 @@ def qwen35_ane_dual_affine_qmm_t(
         bits,
         variant,
         group_size,
+        profile_category,
     )
 
 
