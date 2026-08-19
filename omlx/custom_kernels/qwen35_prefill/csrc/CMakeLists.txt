@@ -44,7 +44,8 @@ target_compile_definitions(
 target_link_libraries(
   omlx_qwen35_prefill_kernel_ops
   PUBLIC mlx
-  PRIVATE "-framework Foundation" "-framework IOSurface" "-framework Metal")
+  PRIVATE "-framework Accelerate" "-framework Foundation"
+          "-framework IOSurface" "-framework Metal")
 
 if(MLX_BUILD_METAL)
   set(OMLX_QWEN35_PREFILL_METAL_SOURCES

@@ -71,6 +71,11 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.qwen35AnePrefillGdn)
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.5")
         XCTAssertEqual(vm.qwen35AnePrefillGdnMaxLayers, "48")
+        XCTAssertFalse(vm.qwen35AnePrefillCpuEnabled)
+        XCTAssertEqual(vm.qwen35AnePrefillCpuFraction, "0.135")
+        XCTAssertEqual(vm.qwen35AnePrefillCpuDownFraction, "0")
+        XCTAssertEqual(vm.qwen35AnePrefillCpuThreads, "8")
+        XCTAssertTrue(vm.qwen35AnePrefillCpuSharedResource)
     }
 
     func testQwenAneFractionFormatterPreservesSettingsValues() {
@@ -82,14 +87,33 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testQwenAneArbitraryInputValidation() {
         XCTAssertEqual(try? QwenAneSettingsValidator.promptBlock("2112").get(), 2112)
         XCTAssertThrowsError(try QwenAneSettingsValidator.promptBlock("2100").get())
-        XCTAssertEqual(try? QwenAneSettingsValidator.mlpFraction("0.467").get(), 0.467)
-        XCTAssertThrowsError(try QwenAneSettingsValidator.mlpFraction("0.91").get())
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.mlpFraction("0.467", cpuFraction: "0.137").get(),
+            0.467
+        )
+        XCTAssertThrowsError(
+            try QwenAneSettingsValidator.mlpFraction("0.9", cpuFraction: "0.1").get()
+        )
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.cpuFraction("0.137", mlpFraction: "0.467").get(),
+            0.137
+        )
+        XCTAssertThrowsError(try QwenAneSettingsValidator.cpuThreads("8.5").get())
+        XCTAssertThrowsError(try QwenAneSettingsValidator.cpuThreads("65").get())
         XCTAssertEqual(try? QwenAneSettingsValidator.gdnFraction("0.527").get(), 0.527)
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.cpuGdnFraction("0.047", gdnFraction: "0.527").get(),
+            0.047
+        )
+        XCTAssertThrowsError(
+            try QwenAneSettingsValidator.cpuGdnFraction("0.5", gdnFraction: "0.5").get()
+        )
     }
 
     func testQwenAneSettingsAreIncludedInWorkingProfile() {
         let vm = ModelSettingsScreenVM()
         vm.qwen35AnePrefillEnabled = true
+        vm.qwen35AnePrefillCpuEnabled = true
 
         let settings = vm.currentSettingsDict()
 
@@ -101,6 +125,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["qwen35_ane_prefill_gdn"]?.value as? Bool, true)
         XCTAssertEqual(settings["qwen35_ane_prefill_gdn_fraction"]?.value as? Double, 0.5)
         XCTAssertEqual(settings["qwen35_ane_prefill_gdn_max_layers"]?.value as? Int, 48)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_fraction"]?.value as? Double, 0.135)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_down_fraction"]?.value as? Double, 0.0)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_gdn_fraction"]?.value as? Double, 0.0)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_threads"]?.value as? Int, 8)
+        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_shared_resource"]?.value as? Bool, true)
     }
 
     func testQwenAneCompatibilityUsesQwenConfigFamily() {
@@ -130,21 +160,71 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             "qwen35_ane_prefill_dual_ane": true,
             "qwen35_ane_prefill_gdn": true,
             "qwen35_ane_prefill_gdn_fraction": 0.5,
-            "qwen35_ane_prefill_gdn_max_layers": 48
+            "qwen35_ane_prefill_gdn_max_layers": 48,
+            "qwen35_ane_prefill_cpu_enabled": true,
+            "qwen35_ane_prefill_cpu_fraction": 0.135,
+            "qwen35_ane_prefill_cpu_down_fraction": 0.2,
+            "qwen35_ane_prefill_cpu_gdn_fraction": 0.05,
+            "qwen35_ane_prefill_cpu_threads": 8,
+            "qwen35_ane_prefill_cpu_shared_resource": true
         }
         """#
         let dto = try decoder.decode(ModelSettingsDTO.self, from: Data(json.utf8))
         XCTAssertEqual(dto.qwen35AnePrefillFraction, 0.53)
         XCTAssertEqual(dto.qwen35AnePrefillGdnFraction, 0.5)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuEnabled, true)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuFraction, 0.135)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuDownFraction, 0.2)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuGdnFraction, 0.05)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuThreads, 8)
+        XCTAssertEqual(dto.qwen35AnePrefillCpuSharedResource, true)
 
         var patch = ModelSettingsPatch()
         patch.qwen35AnePrefillEnabled = true
         patch.qwen35AnePrefillFraction = 0.53
+        patch.qwen35AnePrefillCpuEnabled = true
+        patch.qwen35AnePrefillCpuFraction = 0.135
+        patch.qwen35AnePrefillCpuDownFraction = 0.2
+        patch.qwen35AnePrefillCpuGdnFraction = 0.05
+        patch.qwen35AnePrefillCpuThreads = 8
+        patch.qwen35AnePrefillCpuSharedResource = true
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, true)
         XCTAssertEqual(object?["qwen35_ane_prefill_fraction"] as? Double, 0.53)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_fraction"] as? Double, 0.135)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_down_fraction"] as? Double, 0.2)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_gdn_fraction"] as? Double, 0.05)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_threads"] as? Int, 8)
+        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_shared_resource"] as? Bool, true)
+    }
+
+    func testANETunerOverridesEncodeForStartRequest() throws {
+        let request = ANETuningStartRequest(
+            modelId: "qwen",
+            sequenceLength: 2048,
+            repeats: 2,
+            allowCpu: false,
+            allowCpuGate: false,
+            allowCpuDown: true,
+            allowAneGdn: false,
+            allowCpuGdn: false,
+            allowCpuSharedResource: false
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let data = try encoder.encode(request)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        XCTAssertEqual(object?["allow_cpu"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_gate"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_down"] as? Bool, true)
+        XCTAssertEqual(object?["allow_ane_gdn"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_gdn"] as? Bool, false)
+        XCTAssertEqual(object?["allow_cpu_shared_resource"] as? Bool, false)
     }
 
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {

@@ -771,6 +771,69 @@
                                                 </button>
                                             </div>
 
+                                            <div class="pt-3 border-t border-neutral-200 space-y-3">
+                                                <div class="flex items-start justify-between gap-3">
+                                                    <div class="min-w-0">
+                                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_cpu') }}</span>
+                                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_hint') }}</p>
+                                                    </div>
+                                                    <button type="button"
+                                                            @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
+                                                            :disabled="!modelSettings.qwen35_ane_prefill_dual_ane"
+                                                            :class="[
+                                                                modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                                !modelSettings.qwen35_ane_prefill_dual_ane ? 'opacity-40 cursor-not-allowed' : ''
+                                                            ]"
+                                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                        <span :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                    </button>
+                                                </div>
+                                                <div x-show="modelSettings.qwen35_ane_prefill_cpu_enabled" x-transition class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_fraction') }}</label>
+                                                        <input type="number"
+                                                               x-model.number="modelSettings.qwen35_ane_prefill_cpu_fraction"
+                                                               min="0" max="0.25" step="0.005" required placeholder="0.135"
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_down_fraction') }}</label>
+                                                        <input type="number"
+                                                               x-model.number="modelSettings.qwen35_ane_prefill_cpu_down_fraction"
+                                                               min="0" max="0.50" step="0.005" required placeholder="0"
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_gdn_fraction') }}</label>
+                                                        <input type="number"
+                                                               x-model.number="modelSettings.qwen35_ane_prefill_cpu_gdn_fraction"
+                                                               min="0" max="0.50" step="0.005" required placeholder="0"
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_threads') }}</label>
+                                                        <input type="number"
+                                                               x-model.number="modelSettings.qwen35_ane_prefill_cpu_threads"
+                                                               min="0" max="64" step="1" required placeholder="8"
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    </div>
+                                                </div>
+                                                <div x-show="modelSettings.qwen35_ane_prefill_cpu_enabled" x-transition class="flex items-start justify-between gap-3">
+                                                    <div class="min-w-0">
+                                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_cpu_scheduler') }}</span>
+                                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_scheduler_hint') }}</p>
+                                                    </div>
+                                                    <button type="button"
+                                                            @click="modelSettings.qwen35_ane_prefill_cpu_shared_resource = !modelSettings.qwen35_ane_prefill_cpu_shared_resource"
+                                                            :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'bg-black' : 'bg-neutral-200'"
+                                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                        <span :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'translate-x-5' : 'translate-x-0'"
+                                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                    </button>
+                                                </div>
+                                            </div>
+
                                             <div class="flex items-start justify-between gap-3 pt-3 border-t border-neutral-200">
                                                 <div class="min-w-0">
                                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_gdn') }}</span>
@@ -803,13 +866,6 @@
                                         </div>
 
                                         <div class="pt-4 border-t border-neutral-200 space-y-3">
-                                            <label x-show="!aneTuning.running"
-                                                   class="flex items-center justify-end gap-2 text-xs text-neutral-600">
-                                                <input type="checkbox"
-                                                       x-model="aneTuningOverrides.allowAneGdn"
-                                                       class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                                <span>{{ t('modal.model_settings.qwen_ane_tune_allow_ane_gdn') }}</span>
-                                            </label>
                                             <div class="flex items-start justify-between gap-4">
                                                 <div class="min-w-0">
                                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_tune') }}</span>
@@ -841,8 +897,56 @@
                                                                 : (aneTuning.applying
                                                                     ? '{{ t('modal.model_settings.qwen_ane_tune_applying')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : '{{ t('modal.model_settings.qwen_ane_tune_apply')|replace('\\', '\\\\')|replace("'", "\\'") }}')"></button>
+                                                    <button type="button"
+                                                            x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
+                                                            @click="startANETuning()"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
+                                                        {{ t('modal.model_settings.qwen_ane_tune_again') }}
+                                                    </button>
                                                 </div>
                                             </div>
+
+                                            <details x-show="!aneTuning.running" x-cloak
+                                                     class="rounded-lg border border-neutral-200 bg-white px-3 py-2">
+                                                <summary class="cursor-pointer select-none text-xs font-medium text-neutral-700">
+                                                    {{ t('modal.model_settings.qwen_ane_tune_overrides') }}
+                                                </summary>
+                                                <div class="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-xs text-neutral-600">
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="!aneTuningOverrides.allowCpu ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_gate') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuGate"
+                                                               :disabled="!aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="!aneTuningOverrides.allowCpu ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_down') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuDown"
+                                                               :disabled="!aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_ane_gdn') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowAneGdn" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="(!aneTuningOverrides.allowCpu || !aneTuningOverrides.allowAneGdn) ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_gdn') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuGdn"
+                                                               :disabled="!aneTuningOverrides.allowCpu || !aneTuningOverrides.allowAneGdn"
+                                                               class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3"
+                                                           :class="!aneTuningOverrides.allowCpu ? 'opacity-40' : ''">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_cpu_scheduler') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowCpuSharedResource"
+                                                               :disabled="!aneTuningOverrides.allowCpu" class="rounded border-neutral-300">
+                                                    </label>
+                                                </div>
+                                            </details>
 
                                             <div x-show="aneTuningForSelectedModel() && aneTuning.running" x-cloak class="space-y-1.5">
                                                 <div class="flex items-center justify-between gap-3 text-xs text-neutral-600">
@@ -877,7 +981,7 @@
                                                         <span class="truncate"
                                                               :class="result.state === 'failed' ? 'text-red-600' : 'text-neutral-600'"
                                                               :title="result.error || result.label"
-                                                              x-text="result.label"></span>
+                                                              x-text="result.detail || result.label"></span>
                                                         <span class="text-right tabular-nums text-neutral-800"
                                                               x-text="aneTuningResultText(result)"></span>
                                                     </div>

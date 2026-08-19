@@ -151,7 +151,14 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune",
         "modal.model_settings.qwen_ane_tune_hint",
         "modal.model_settings.qwen_ane_tune_start",
+        "modal.model_settings.qwen_ane_tune_again",
+        "modal.model_settings.qwen_ane_tune_overrides",
+        "modal.model_settings.qwen_ane_tune_allow_cpu",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_gate",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_down",
         "modal.model_settings.qwen_ane_tune_allow_ane_gdn",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_gdn",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_scheduler",
         "modal.model_settings.qwen_ane_tune_cancel",
         "modal.model_settings.qwen_ane_tune_apply",
         "modal.model_settings.qwen_ane_tune_applying",
@@ -206,6 +213,10 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
     for field in (
         "qwen35_ane_prefill_sequence_length",
         "qwen35_ane_prefill_fraction",
+        "qwen35_ane_prefill_cpu_fraction",
+        "qwen35_ane_prefill_cpu_down_fraction",
+        "qwen35_ane_prefill_cpu_gdn_fraction",
+        "qwen35_ane_prefill_cpu_threads",
         "qwen35_ane_prefill_gdn_fraction",
     ):
         binding = f'x-model.number="modelSettings.{field}"'
@@ -214,6 +225,7 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
         assert "</select>" not in after.split(">", 1)[0]
 
     assert 'min="1024" step="64"' in section
+    assert 'min="0" max="64" step="1"' in section
 
 
 def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
@@ -227,13 +239,22 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "aneTuningResultText(result)" in html
     assert "aneTuning.status?.termination_reason" in html
     assert "aneTuning.status?.results || []" in html
+    assert 'x-model="aneTuningOverrides.allowCpu"' in html
+    assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
+    assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
     assert "'/admin/api/bench/ane-tune/start'" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
     assert "qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
     assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
-    assert "aneTuningOverrides.allowAneGdn" in html
+    assert "qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
+    assert "qwen35_ane_prefill_cpu_fraction = Number(" in script
+    assert "allow_cpu: this.aneTuningOverrides.allowCpu" in script
     assert "allow_ane_gdn: this.aneTuningOverrides.allowAneGdn" in script
+    assert "allow_cpu_gdn: this.aneTuningOverrides.allowCpu" in script
+    assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
+    assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
+    assert "recommendation.cpu_shared_resource" in script
     assert "if (result?.processing_tps === null" in script
     assert "result?.latency_ms !== null" in script
 
@@ -243,6 +264,9 @@ def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
 
     assert "validateQwenAneSettings()" in script
     assert "ANE prompt block must be a multiple of 64." in script
+    assert "MLP ANE and CPU fractions must total less than 1.0." in script
+    assert "GDN ANE and CPU fractions must total less than 1.0." in script
+    assert "CPU worker count must be between 0 and 64." in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
     assert "qwen35_ane_prefill_fraction: Number(" in script
 
@@ -260,6 +284,12 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
     assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
     assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
+    assert "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false" in state
+    assert "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135" in state
+    assert "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0" in state
+    assert "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0" in state
+    assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
+    assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
 
 
 def test_js_embedded_translations_escape_apostrophes():

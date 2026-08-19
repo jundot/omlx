@@ -121,6 +121,18 @@ class ModelSettings:
         qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
             outputs assigned across the ANE instances.
         qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
+        qwen35_ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
+            with the CPU. Requires a separately preprocessed FP16 checkpoint.
+        qwen35_ane_prefill_cpu_fraction: Fraction of each eligible gate/up
+            projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
+            down projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
+            z+qkv projection outputs assigned to the CPU after the ANE prefix.
+        qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
+            (zero lets Accelerate choose).
+        qwen35_ane_prefill_cpu_shared_resource: Use Apple's private
+            shared-resource scheduler hint with manually sharded CPU work.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -224,6 +236,12 @@ class ModelSettings:
     qwen35_ane_prefill_gdn: bool = True
     qwen35_ane_prefill_gdn_fraction: float = 0.50
     qwen35_ane_prefill_gdn_max_layers: int = 48
+    qwen35_ane_prefill_cpu_enabled: bool = False
+    qwen35_ane_prefill_cpu_fraction: float = 0.135
+    qwen35_ane_prefill_cpu_down_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_threads: int = 8
+    qwen35_ane_prefill_cpu_shared_resource: bool = True
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

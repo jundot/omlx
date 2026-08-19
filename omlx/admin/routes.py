@@ -143,6 +143,12 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_gdn: bool | None = None
     qwen35_ane_prefill_gdn_fraction: float | None = None
     qwen35_ane_prefill_gdn_max_layers: int | None = None
+    qwen35_ane_prefill_cpu_enabled: bool | None = None
+    qwen35_ane_prefill_cpu_fraction: float | None = None
+    qwen35_ane_prefill_cpu_down_fraction: float | None = None
+    qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
+    qwen35_ane_prefill_cpu_threads: int | None = None
+    qwen35_ane_prefill_cpu_shared_resource: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2361,6 +2367,67 @@ async def update_model_settings(
                 detail="ANE GDN layer limit must be zero or greater.",
             )
         current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
+    if "qwen35_ane_prefill_cpu_enabled" in sent:
+        current_settings.qwen35_ane_prefill_cpu_enabled = bool(
+            request.qwen35_ane_prefill_cpu_enabled
+        )
+    if "qwen35_ane_prefill_cpu_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_fraction
+        if value is None or not 0.0 <= value <= 0.25:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU MLP fraction must be between 0.0 and 0.25.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_down_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_down_fraction
+        if value is None or not 0.0 <= value <= 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU MLP down fraction must be between 0.0 and 0.50.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_down_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_gdn_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_gdn_fraction
+        if value is None or not 0.0 <= value <= 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU GDN fraction must be between 0.0 and 0.50",
+            )
+        current_settings.qwen35_ane_prefill_cpu_gdn_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_threads" in sent:
+        value = request.qwen35_ane_prefill_cpu_threads
+        if value is None or not 0 <= value <= 64:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU worker count must be between 0 and 64.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_threads = int(value)
+    if "qwen35_ane_prefill_cpu_shared_resource" in sent:
+        current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
+            request.qwen35_ane_prefill_cpu_shared_resource
+        )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_fraction
+        + current_settings.qwen35_ane_prefill_cpu_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="MLP ANE and CPU fractions must total less than 1.0.",
+        )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_gdn
+        and current_settings.qwen35_ane_prefill_gdn_fraction
+        + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
