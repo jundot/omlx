@@ -88,6 +88,51 @@ class _OQ4eGDN(nn.Module):
         self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=4)
 
 
+class _OQ8MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=8)
+        self.up_proj = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=8)
+        self.down_proj = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=8)
+
+
+class _OQ8GDN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=8
+        )
+        self.in_proj_z = nn.QuantizedLinear(128, 128, bias=False, group_size=64, bits=8)
+        self.in_proj_b = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=8)
+        self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=8)
+
+
+def _affine_linear(input_dim, output_dim, bits, group_size):
+    linear = nn.QuantizedLinear(
+        input_dim, output_dim, bias=False, group_size=group_size, bits=bits
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+def _make_affine_mlp(bits, group_size):
+    return SimpleNamespace(
+        gate_proj=_affine_linear(128, 256, bits, group_size),
+        up_proj=_affine_linear(128, 256, bits, group_size),
+        down_proj=_affine_linear(256, 128, bits, group_size),
+    )
+
+
+def _make_affine_gdn(bits, group_size):
+    return SimpleNamespace(
+        in_proj_qkv=_affine_linear(128, 256, bits, group_size),
+        in_proj_z=_affine_linear(128, 128, bits, group_size),
+        in_proj_b=_affine_linear(128, 48, bits, group_size),
+        in_proj_a=_affine_linear(128, 48, bits, group_size),
+    )
+
+
 @pytest.mark.parametrize("sequence_length", [2048, 4096])
 def test_configure_scheduler_uses_the_compiled_ane_shape(sequence_length):
     scheduler = SimpleNamespace(
@@ -543,6 +588,372 @@ def test_prepare_pair_accepts_oq4e_group64_with_q5_down():
     assert state.scales.shape == (256, 2)
     assert dense0.shape == (128, 128)
     assert dense1.shape == (128, 128)
+
+
+def test_eligible_pair_preserves_q4_and_accepts_affine_q8():
+    mlp = _MLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    q8_mlp = _OQ8MLP()
+    for linear in (q8_mlp.gate_proj, q8_mlp.up_proj, q8_mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    assert ane_patch._eligible_pair(mlp)
+    assert ane_patch._eligible_pair(q8_mlp)
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
+    assert ane_patch._eligible_pair(_make_affine_mlp(6, 64))
+    generic_name = ane_patch._fused_swiglu_symbol(6, dual=dual)
+    assert generic_name == (
+        "qwen35_ane_dual_affine_swiglu_t"
+        if dual
+        else "qwen35_ane_affine_swiglu_t"
+    )
+    q4_name = "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
+    captured = {}
+    activation = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: name == generic_name)
+
+    def fused(*args):
+        captured["args"] = args
+        return activation
+
+    monkeypatch.setattr(fast, generic_name, fused, raising=False)
+    monkeypatch.setattr(
+        fast,
+        q4_name,
+        lambda *args: pytest.fail("Q6 must use the generic fused SwiGLU"),
+    )
+
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(q4_patch, "_linear_qmm", lambda linear, value, variant: value)
+    model0 = object()
+    model1 = object() if dual else None
+    state = ane_patch._CombinedMLPState(
+        model=model0,
+        model1=model1,
+        weight=mx.zeros((4, 3), dtype=mx.uint32),
+        scales=mx.zeros((4, 1), dtype=mx.bfloat16),
+        biases=mx.zeros((4, 1), dtype=mx.bfloat16),
+        ane_outputs=2,
+        gpu_outputs=2,
+        bits=6,
+        group_size=64,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            1, 0.5, 8, dual_ane=dual
+        ),
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    expected = (
+        x,
+        state.weight,
+        state.scales,
+        state.biases,
+        model0,
+        *(() if not dual else (model1,)),
+        6,
+        8,
+        64,
+    )
+    assert captured["args"] == expected
+
+
+def test_compile_pair_cache_identity_includes_bits_and_group_size(monkeypatch):
+    mlp = _make_affine_mlp(bits=6, group_size=64)
+    compiled = []
+
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_affine_swiglu_t",
+    )
+
+    def compile_linear(weight, sequence_length):
+        compiled.append((weight.shape, sequence_length))
+        return object()
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    config = ane_patch._AnePrefillConfig(2048, 0.5, 8)
+
+    first = ane_patch._compile_pair(mlp, config)
+    replacement = _make_affine_mlp(bits=8, group_size=128)
+    mlp.gate_proj = replacement.gate_proj
+    mlp.up_proj = replacement.up_proj
+    mlp.down_proj = replacement.down_proj
+    second = ane_patch._compile_pair(mlp, config)
+
+    assert first is not None and second is not None
+    assert (first.bits, first.group_size) == (6, 64)
+    assert (second.bits, second.group_size) == (8, 128)
+    assert first is not second
+    assert len(compiled) == 2
+    assert len(mlp._omlx_ane_prefill_cache) == 2
+
+
+def test_prepare_pair_tracks_q8_bits_and_packed_shape(monkeypatch):
+    mlp = _OQ8MLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_dual_affine_swiglu_t",
+    )
+
+    prepared = ane_patch._prepare_pair_for_bank(
+        mlp,
+        ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=True),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.bits == 8
+    assert state.weight.shape == (256, 32)
+    assert state.scales.shape == (256, 2)
+    assert dense0.shape == (128, 128)
+    assert dense1.shape == (128, 128)
+
+
+def test_compile_pair_skips_q8_without_generic_fused_swiglu(monkeypatch):
+    mlp = _OQ8MLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear",
+        lambda *args: pytest.fail("Q8 must not prepare an unfused ANE path"),
+    )
+
+    assert (
+        ane_patch._compile_pair(
+            mlp,
+            ane_patch._AnePrefillConfig(2048, 0.5, 8),
+        )
+        is None
+    )
+
+
+def test_compile_gdn_accepts_q8_and_propagates_bits(monkeypatch):
+    gdn = _OQ8GDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    compiled = []
+
+    def compile_linear(weight, sequence_length):
+        mx.eval(weight)
+        compiled.append((weight.shape, weight.dtype, sequence_length))
+        return object()
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_affine_qmm_t",
+    )
+
+    state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
+
+    assert state is not None
+    assert state.bits == 8
+    assert state.group_size == 64
+    assert state.weight.shape == (192, 32)
+    assert state.scales.shape == (192, 2)
+    assert compiled == [((192, 128), mx.float32, 2048)]
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
+    gdn = _make_affine_gdn(6, group_size)
+    compiled = []
+
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear",
+        lambda weight, sequence_length: compiled.append(weight.shape) or object(),
+    )
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_affine_qmm_t",
+    )
+
+    config = ane_patch._AneGDNConfig(1, 0.5, 8)
+    state = ane_patch._compile_gdn(gdn, config)
+
+    assert ane_patch._eligible_gdn(gdn)
+    assert state is not None
+    assert state.bits == 6
+    assert state.group_size == group_size
+    assert state.weight.shape == (384, 24)
+    assert state.scales.shape == (384, 128 // group_size)
+    assert state.biases.shape == state.scales.shape
+    assert state.b_outputs == 48
+    assert state.a_outputs == 48
+    total_outputs = (
+        state.z_outputs + state.qkv_outputs + state.b_outputs + state.a_outputs
+    )
+    combined = mx.arange(total_outputs).reshape(1, 1, total_outputs).astype(
+        mx.bfloat16
+    )
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_affine_qmm_t",
+        lambda *args: combined,
+    )
+
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(
+        q4_patch,
+        "_linear_qmm",
+        lambda *args: pytest.fail("packed Q6 GDN must not launch b/a qmm"),
+    )
+    gdn._omlx_ane_gdn_config = config
+    gdn._omlx_ane_gdn_state = state
+
+    x = mx.zeros((1, 1, 128), dtype=mx.bfloat16)
+    mixed_qkv, z, b, a = ane_patch._gdn_backend(gdn, x)
+    mx.eval(mixed_qkv, z, b, a)
+
+    assert compiled == [(192, 128)]
+    assert z.shape == (1, 1, state.z_outputs)
+    assert mixed_qkv.shape == (1, 1, state.qkv_outputs)
+    assert b.shape == (1, 1, state.b_outputs)
+    assert a.shape == (1, 1, state.a_outputs)
+    assert b[0, 0, 0].item() == state.z_outputs + state.qkv_outputs
+    assert a[0, 0, 0].item() == total_outputs - state.a_outputs
+
+
+def test_backend_dispatches_single_q8_swiglu_with_bits(monkeypatch):
+    activation = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
+    captured = {}
+
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_affine_swiglu_t",
+    )
+
+    def fused(*args):
+        captured["args"] = args
+        return activation
+
+    monkeypatch.setattr(fast, "qwen35_ane_affine_swiglu_t", fused, raising=False)
+
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(q4_patch, "_linear_qmm", lambda linear, value, variant: value)
+    state = ane_patch._CombinedMLPState(
+        model=object(),
+        weight=mx.zeros((4, 4), dtype=mx.uint32),
+        scales=mx.zeros((4, 2), dtype=mx.bfloat16),
+        biases=mx.zeros((4, 2), dtype=mx.bfloat16),
+        ane_outputs=2,
+        gpu_outputs=2,
+        bits=8,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(1, 0.5, 8),
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    assert captured["args"] == (
+        x,
+        state.weight,
+        state.scales,
+        state.biases,
+        state.model,
+        8,
+        8,
+        128,
+    )
+
+
+def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
+    activation = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
+    captured = {}
+
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_dual_affine_swiglu_t",
+    )
+
+    def fused(*args):
+        captured["args"] = args
+        return activation
+
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_dual_affine_swiglu_t",
+        fused,
+        raising=False,
+    )
+
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(q4_patch, "_linear_qmm", lambda linear, value, variant: value)
+    model0, model1 = object(), object()
+    state = ane_patch._CombinedMLPState(
+        model=model0,
+        model1=model1,
+        weight=mx.zeros((4, 4), dtype=mx.uint32),
+        scales=mx.zeros((4, 2), dtype=mx.bfloat16),
+        biases=mx.zeros((4, 2), dtype=mx.bfloat16),
+        ane_outputs=2,
+        gpu_outputs=2,
+        bits=8,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(1, 0.5, 8, dual_ane=True),
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    assert captured["args"] == (
+        x,
+        state.weight,
+        state.scales,
+        state.biases,
+        model0,
+        model1,
+        8,
+        8,
+        128,
+    )
 
 
 def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):

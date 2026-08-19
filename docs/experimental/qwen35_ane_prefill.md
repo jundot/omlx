@@ -19,16 +19,17 @@ logits remain on GPU.
 - The dual path is intended for M3 Ultra, where the two dies expose physical
   ANE instances 1 and 2.
 - The oMLX native custom kernels must be built (`OMLX_WITH_CUSTOM_KERNEL=1`).
-- Dense Qwen3.5/3.6/3.8 affine q4 gate/up linears with group size 64 or 128.
+- Dense Qwen3.5/3.6/3.8 affine q4, q6, or q8 gate/up linears with group size
+  64 or 128.
   The down projection may use compatible affine q2/q4/q5/q6/q8 weights and
   remains on the GPU.
-- Optional GDN acceleration accepts affine q4/q5 projections with group size
-  64 or 128. Mixed q4/q5 layouts are supported when the ANE prefix covers the
-  full z projection, leaving a homogeneous qkv suffix on the GPU.
+- Optional GDN acceleration accepts affine q4/q5/q6/q8 projections with group
+  size 64 or 128. Mixed q4/q5/q6/q8 layouts are supported when the ANE prefix
+  covers the full z projection, leaving a homogeneous qkv suffix on the GPU.
 - An MLP prefill call whose flattened token count exactly matches the fixed
   configured sequence length. Decode, target verification, short chunks, and
   unsupported layers automatically use the existing path.
-- Fixed-shape ANE programs and their combined q4 suffixes are prepared eagerly
+- Fixed-shape ANE programs and their combined affine suffixes are prepared eagerly
   on the MLX executor while the model starts. For the 64-layer 27B target this
   adds a substantial startup phase, but the first matching prompt no longer
   pays the compilation cost. Programs are cached for the model's lifetime.

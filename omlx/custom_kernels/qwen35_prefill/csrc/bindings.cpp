@@ -124,6 +124,18 @@ NB_MODULE(_ext, m) {
       "group_size"_a = 128,
       "stream"_a = nb::none());
   m.def(
+      "qwen35_ane_affine_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_affine_swiglu_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
       "qwen35_ane_dual_affine_qmm_t",
       &omlx::qwen35_prefill_kernels::qwen35_ane_dual_affine_qmm_t,
       "x"_a,
@@ -146,6 +158,19 @@ NB_MODULE(_ext, m) {
       "gpu_biases"_a,
       "ane_model0"_a,
       "ane_model1"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_affine_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_affine_swiglu_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
       "stream"_a = nb::none());

@@ -1739,7 +1739,7 @@ array qwen35_ane_affine_qmm_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
-      (bits != 4 && bits != 5) ||
+      (bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
       (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument("Unsupported ANE hybrid qmm configuration.");
   }
@@ -1771,10 +1771,10 @@ array qwen35_ane_q4_affine_qmm_t(
                                  profile_category, s);
 }
 
-array qwen35_ane_q4_swiglu_t(
+array qwen35_ane_affine_swiglu_t(
     const array &x, const array &gpu_weight, const array &gpu_scales,
     const array &gpu_biases, const std::shared_ptr<AneLinearModel> &ane_model,
-    int variant, int group_size, StreamOrDevice s) {
+    int bits, int variant, int group_size, StreamOrDevice s) {
   auto stream = to_stream(s);
   if (!ane_model || stream.device == Device::cpu ||
       (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
@@ -1783,9 +1783,10 @@ array qwen35_ane_q4_swiglu_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
+      (bits != 4 && bits != 6 && bits != 8) ||
       (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument(
-        "Unsupported ANE hybrid q4 SwiGLU configuration.");
+        "Unsupported ANE hybrid affine SwiGLU configuration.");
   }
   const int K = static_cast<int>(x.shape(-1));
   const int M = static_cast<int>(x.size() / K);
@@ -1793,17 +1794,25 @@ array qwen35_ane_q4_swiglu_t(
   const int ane_n = ane_model->output_dim();
   if (K != ane_model->input_dim() || M != ane_model->sequence_length() ||
       ane_n <= 0 || ane_n % 2 != 0 || gpu_n <= 0 || gpu_n % 128 != 0 ||
-      K % group_size != 0 || gpu_weight.shape(1) * 8 != K ||
+      K % group_size != 0 || gpu_weight.shape(1) * 32 != K * bits ||
       gpu_scales.shape(0) != gpu_n ||
       gpu_scales.shape(1) != K / group_size) {
-    throw std::invalid_argument("ANE hybrid q4 SwiGLU shape mismatch.");
+    throw std::invalid_argument("ANE hybrid affine SwiGLU shape mismatch.");
   }
   Shape shape = x.shape();
   shape.back() = (ane_n + gpu_n) / 2;
   return array(std::move(shape), x.dtype(),
                std::make_shared<AneHybridQ4Primitive>(
-                   stream, ane_model, 4, variant, group_size, true),
+                   stream, ane_model, bits, variant, group_size, true),
                std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
+}
+
+array qwen35_ane_q4_swiglu_t(
+    const array &x, const array &gpu_weight, const array &gpu_scales,
+    const array &gpu_biases, const std::shared_ptr<AneLinearModel> &ane_model,
+    int variant, int group_size, StreamOrDevice s) {
+  return qwen35_ane_affine_swiglu_t(x, gpu_weight, gpu_scales, gpu_biases,
+                                    ane_model, 4, variant, group_size, s);
 }
 
 array qwen35_ane_dual_affine_qmm_t(
@@ -1820,7 +1829,7 @@ array qwen35_ane_dual_affine_qmm_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
-      (bits != 4 && bits != 5) ||
+      (bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
       (group_size != 64 && group_size != 128) || variant != 8) {
     throw std::invalid_argument(
         "Unsupported dual ANE hybrid qmm configuration.");
@@ -1847,11 +1856,11 @@ array qwen35_ane_dual_affine_qmm_t(
       std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
 }
 
-array qwen35_ane_dual_q4_swiglu_t(
+array qwen35_ane_dual_affine_swiglu_t(
     const array &x, const array &gpu_weight, const array &gpu_scales,
     const array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model0,
-    const std::shared_ptr<AneLinearModel> &ane_model1, int variant,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int bits, int variant,
     int group_size, StreamOrDevice s) {
   auto stream = to_stream(s);
   if (!ane_model0 || !ane_model1 || stream.device == Device::cpu ||
@@ -1861,8 +1870,10 @@ array qwen35_ane_dual_q4_swiglu_t(
       gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
       gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
       !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
+      (bits != 4 && bits != 6 && bits != 8) ||
       (group_size != 64 && group_size != 128) || variant != 8) {
-    throw std::invalid_argument("Unsupported dual ANE q4 SwiGLU configuration.");
+    throw std::invalid_argument(
+        "Unsupported dual ANE affine SwiGLU configuration.");
   }
   const int K = static_cast<int>(x.shape(-1));
   const int M = static_cast<int>(x.size() / K);
@@ -1874,17 +1885,30 @@ array qwen35_ane_dual_q4_swiglu_t(
       M != ane_model1->sequence_length() || ane0_n <= 0 || ane1_n <= 0 ||
       ane0_n % 2 != 0 || ane1_n % 2 != 0 || gpu_n <= 0 ||
       gpu_n % 128 != 0 || K % group_size != 0 ||
-      gpu_weight.shape(1) * 8 != K || gpu_scales.shape(0) != gpu_n ||
+      gpu_weight.shape(1) * 32 != K * bits ||
+      gpu_scales.shape(0) != gpu_n ||
       gpu_scales.shape(1) != K / group_size) {
-    throw std::invalid_argument("Dual ANE hybrid q4 SwiGLU shape mismatch.");
+    throw std::invalid_argument(
+        "Dual ANE hybrid affine SwiGLU shape mismatch.");
   }
   Shape shape = x.shape();
   shape.back() = (ane0_n + ane1_n + gpu_n) / 2;
   return array(
       std::move(shape), x.dtype(),
       std::make_shared<DualAneHybridPrimitive>(
-          stream, ane_model0, ane_model1, 4, variant, group_size, true),
+          stream, ane_model0, ane_model1, bits, variant, group_size, true),
       std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
+}
+
+array qwen35_ane_dual_q4_swiglu_t(
+    const array &x, const array &gpu_weight, const array &gpu_scales,
+    const array &gpu_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int variant,
+    int group_size, StreamOrDevice s) {
+  return qwen35_ane_dual_affine_swiglu_t(
+      x, gpu_weight, gpu_scales, gpu_biases, ane_model0, ane_model1, 4,
+      variant, group_size, s);
 }
 
 array qwen35_ane_q4_swiglu_down_t(

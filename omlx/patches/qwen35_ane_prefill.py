@@ -65,6 +65,7 @@ class _CombinedMLPState:
     gpu_outputs: int
     model1: Any | None = None
     group_size: int = 128
+    bits: int = 4
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,8 @@ class _CombinedGDNState:
     bits: int
     group_size: int
     model1: Any | None = None
+    b_outputs: int = 0
+    a_outputs: int = 0
 
 
 def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
@@ -117,7 +120,7 @@ def _affine_spec(
     linear: Any,
     dtype: mx.Dtype,
     *,
-    allowed_bits: tuple[int, ...] = (4, 5),
+    allowed_bits: tuple[int, ...] = (4, 5, 6, 8),
 ) -> tuple[int, int] | None:
     """Return a supported affine ``(bits, group_size)`` pair for ``linear``."""
     bits = getattr(linear, "bits", None)
@@ -132,6 +135,18 @@ def _affine_spec(
     ):
         return None
     return int(bits), int(group_size)
+
+
+def _fused_swiglu_symbol(bits: int, *, dual: bool) -> str:
+    if bits == 4:
+        return "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
+    if bits in (6, 8):
+        return (
+            "qwen35_ane_dual_affine_swiglu_t"
+            if dual
+            else "qwen35_ane_affine_swiglu_t"
+        )
+    raise ValueError(f"Unsupported ANE SwiGLU bit width: {bits}")
 
 
 def _eligible_input(x: mx.array, config: _AnePrefillConfig) -> bool:
@@ -168,8 +183,8 @@ def _eligible_pair(mlp: Any) -> bool:
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate_dtype = getattr(getattr(gate, "scales", None), "dtype", None)
-    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4,))
-    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4,))
+    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4, 6, 8))
+    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4, 6, 8))
     down_spec = _affine_spec(
         down,
         getattr(getattr(down, "scales", None), "dtype", None),
@@ -202,12 +217,15 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
         mlp._omlx_ane_prefill_cache = cache
 
     output_dim = int(gate.weight.shape[0])
+    bits = int(gate.bits)
     group_size = int(gate.group_size)
     dual_ane = bool(
         config.dual_ane
-        and fast.has_symbol("qwen35_ane_dual_q4_swiglu_t")
         and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+        and fast.has_symbol(_fused_swiglu_symbol(bits, dual=True))
     )
+    if bits != 4 and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=dual_ane)):
+        return None
     alignment = 128 if dual_ane else 64
     ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
     gpu_outputs = output_dim - ane_outputs
@@ -217,6 +235,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
     key = (
         config.sequence_length,
         ane_outputs,
+        bits,
         group_size,
         "dual" if dual_ane else "linear",
     )
@@ -236,7 +255,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
                             linear.scales[start:end],
                             linear.biases[start:end],
                             group_size=group_size,
-                            bits=4,
+                            bits=bits,
                         ).astype(mx.float32)
                         for linear in (gate, up)
                     ],
@@ -281,6 +300,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
             biases=biases,
             ane_outputs=ane_outputs,
             gpu_outputs=gpu_outputs,
+            bits=bits,
             model1=model1,
             group_size=group_size,
         )
@@ -298,12 +318,17 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
 def _prepare_pair_for_bank(
     mlp: Any, config: _AnePrefillConfig
 ) -> tuple[_CombinedMLPState, mx.array, mx.array] | None:
+    from omlx.custom_kernels.qwen35_prefill import fast
+
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
     if not _eligible_pair(mlp):
         return None
     output_dim = int(gate.weight.shape[0])
+    bits = int(gate.bits)
     group_size = int(gate.group_size)
+    if bits != 4 and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=True)):
+        return None
     ane_outputs = (int(output_dim * config.fraction) // 128) * 128
     gpu_outputs = output_dim - ane_outputs
     if ane_outputs <= 0 or gpu_outputs <= 0 or gpu_outputs % 64:
@@ -318,7 +343,7 @@ def _prepare_pair_for_bank(
                         linear.scales[start:end],
                         linear.biases[start:end],
                         group_size=group_size,
-                        bits=4,
+                        bits=bits,
                     ).astype(mx.float32)
                     for linear in (gate, up)
                 ],
@@ -347,6 +372,7 @@ def _prepare_pair_for_bank(
             biases=biases,
             ane_outputs=ane_outputs,
             gpu_outputs=gpu_outputs,
+            bits=bits,
             model1=None,
             group_size=group_size,
         ),
@@ -386,12 +412,45 @@ def _eligible_gdn(gdn: Any) -> bool:
     )
 
 
+def _pack_affine_gdn_suffix(
+    qkv: Any,
+    b: Any,
+    a: Any,
+    qkv_offset: int,
+    qkv_spec: tuple[int, int],
+) -> tuple[mx.array, mx.array, mx.array, int, int] | None:
+    if qkv_spec[0] != 6:
+        return None
+    dtype = qkv.scales.dtype
+    if _affine_spec(b, dtype) != qkv_spec or _affine_spec(a, dtype) != qkv_spec:
+        return None
+
+    b_outputs = int(b.weight.shape[0])
+    a_outputs = int(a.weight.shape[0])
+    suffix_outputs = int(qkv.weight.shape[0]) - qkv_offset + b_outputs + a_outputs
+    padding = (-suffix_outputs) % 128
+    weights = [qkv.weight[qkv_offset:], b.weight, a.weight]
+    scales = [qkv.scales[qkv_offset:], b.scales, a.scales]
+    biases = [qkv.biases[qkv_offset:], b.biases, a.biases]
+    if padding:
+        weights.append(mx.zeros((padding, qkv.weight.shape[1]), dtype=mx.uint32))
+        scales.append(mx.zeros((padding, qkv.scales.shape[1]), dtype=dtype))
+        biases.append(mx.zeros((padding, qkv.biases.shape[1]), dtype=dtype))
+    return (
+        mx.contiguous(mx.concatenate(weights, axis=0)),
+        mx.contiguous(mx.concatenate(scales, axis=0)),
+        mx.contiguous(mx.concatenate(biases, axis=0)),
+        b_outputs,
+        a_outputs,
+    )
+
+
 def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     from omlx.custom_kernels.qwen35_prefill import fast
 
     if not _eligible_gdn(gdn) or not fast.has_symbol("qwen35_ane_affine_qmm_t"):
         return None
-    qkv, z, _, _ = _gdn_linears(gdn)
+    qkv, z, b, a = _gdn_linears(gdn)
     cache = getattr(gdn, "_omlx_ane_gdn_cache", None)
     if cache is None:
         cache = {}
@@ -415,14 +474,31 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     gpu_outputs = total_outputs - ane_outputs
     # The native GPU suffix accepts one quantization format. Put all of z on
     # ANE so an oQ4e-style q5-z/q4-qkv mix leaves a homogeneous qkv suffix.
-    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+    if ane_outputs < z_outputs:
         return None
+    qkv_offset = ane_outputs - z_outputs
+    packed_suffix = _pack_affine_gdn_suffix(qkv, b, a, qkv_offset, qkv_spec)
+    b_outputs = a_outputs = 0
+    if packed_suffix is None:
+        if gpu_outputs <= 0 or gpu_outputs % 64:
+            return None
+        weight = mx.contiguous(qkv.weight[qkv_offset:])
+        scales = mx.contiguous(qkv.scales[qkv_offset:])
+        biases = mx.contiguous(qkv.biases[qkv_offset:])
+    else:
+        weight, scales, biases, b_outputs, a_outputs = packed_suffix
     key = (
         config.sequence_length,
         ane_outputs,
         qkv_spec,
         z_spec,
-        "z_qkv_dual_row_int8" if dual_ane else "z_qkv_row_int8",
+        (
+            "z_qkv_b_a_pad_dual_affine"
+            if dual_ane
+            else "z_qkv_b_a_pad_affine"
+        )
+        if packed_suffix is not None
+        else ("z_qkv_dual_row_int8" if dual_ane else "z_qkv_row_int8"),
     )
     if key in cache:
         return cache[key]
@@ -462,10 +538,6 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         else:
             dense0 = dense_logical_slice(0, ane_outputs)
             dense1 = None
-        qkv_offset = ane_outputs - z_outputs
-        weight = mx.contiguous(qkv.weight[qkv_offset:])
-        scales = mx.contiguous(qkv.scales[qkv_offset:])
-        biases = mx.contiguous(qkv.biases[qkv_offset:])
         values = [dense0, weight, scales, biases]
         if dense1 is not None:
             values.append(dense1)
@@ -490,6 +562,8 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
             bits=qkv_bits,
             group_size=qkv_group_size,
             model1=model1,
+            b_outputs=b_outputs,
+            a_outputs=a_outputs,
         )
         cache[key] = state
         return state
@@ -500,7 +574,7 @@ def _prepare_gdn_for_bank(
 ) -> tuple[_CombinedGDNState, mx.array, mx.array] | None:
     if not _eligible_gdn(gdn):
         return None
-    qkv, z, _, _ = _gdn_linears(gdn)
+    qkv, z, b, a = _gdn_linears(gdn)
     logical = (z, qkv)
     z_outputs = int(z.weight.shape[0])
     qkv_outputs = int(qkv.weight.shape[0])
@@ -512,8 +586,19 @@ def _prepare_gdn_for_bank(
     qkv_bits, qkv_group_size = qkv_spec
     ane_outputs = (int(total_outputs * config.fraction) // 128) * 128
     gpu_outputs = total_outputs - ane_outputs
-    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+    if ane_outputs < z_outputs:
         return None
+    qkv_offset = ane_outputs - z_outputs
+    packed_suffix = _pack_affine_gdn_suffix(qkv, b, a, qkv_offset, qkv_spec)
+    b_outputs = a_outputs = 0
+    if packed_suffix is None:
+        if gpu_outputs <= 0 or gpu_outputs % 64:
+            return None
+        weight = mx.contiguous(qkv.weight[qkv_offset:])
+        scales = mx.contiguous(qkv.scales[qkv_offset:])
+        biases = mx.contiguous(qkv.biases[qkv_offset:])
+    else:
+        weight, scales, biases, b_outputs, a_outputs = packed_suffix
 
     def dense_logical_slice(start: int, end: int) -> mx.array:
         parts: list[mx.array] = []
@@ -542,10 +627,6 @@ def _prepare_gdn_for_bank(
     split = ane_outputs // 2
     dense0 = dense_logical_slice(0, split)
     dense1 = dense_logical_slice(split, ane_outputs)
-    qkv_offset = ane_outputs - z_outputs
-    weight = mx.contiguous(qkv.weight[qkv_offset:])
-    scales = mx.contiguous(qkv.scales[qkv_offset:])
-    biases = mx.contiguous(qkv.biases[qkv_offset:])
     mx.eval(dense0, dense1, weight, scales, biases)
     return (
         _CombinedGDNState(
@@ -558,6 +639,8 @@ def _prepare_gdn_for_bank(
             bits=qkv_bits,
             group_size=qkv_group_size,
             model1=None,
+            b_outputs=b_outputs,
+            a_outputs=a_outputs,
         ),
         dense0,
         dense1,
@@ -614,9 +697,23 @@ def _gdn_backend(
             )
         z = combined[..., : state.z_outputs]
         mixed_qkv = combined[..., state.z_outputs : state.z_outputs + state.qkv_outputs]
-        _, _, b_proj, a_proj = _gdn_linears(gdn)
-        b = _linear_qmm(b_proj, x, config.variant)
-        a = _linear_qmm(a_proj, x, config.variant)
+        if state.b_outputs:
+            suffix_start = state.z_outputs + state.qkv_outputs
+            b = combined[..., suffix_start : suffix_start + state.b_outputs]
+            a_start = suffix_start + state.b_outputs
+            a = combined[..., a_start : a_start + state.a_outputs]
+        else:
+            _, _, b_proj, a_proj = _gdn_linears(gdn)
+            b = (
+                b_proj(x)
+                if getattr(b_proj, "bits", None) == 8
+                else _linear_qmm(b_proj, x, config.variant)
+            )
+            a = (
+                a_proj(x)
+                if getattr(a_proj, "bits", None) == 8
+                else _linear_qmm(a_proj, x, config.variant)
+            )
         return mixed_qkv, z, b, a
     except Exception:
         gdn._omlx_ane_gdn_failed = True
@@ -651,9 +748,9 @@ def _backend(
             return None
     if state is None:
         return None
-    if state.scales.dtype != x.dtype or int(state.weight.shape[1]) * 8 != int(
+    if state.scales.dtype != x.dtype or int(state.weight.shape[1]) * 32 != int(
         x.shape[-1]
-    ):
+    ) * state.bits:
         return None
 
     try:
@@ -661,13 +758,42 @@ def _backend(
         from omlx.patches.qwen35_q4_mlp import _linear_qmm
 
         if state.model1 is not None:
-            activation = fast.qwen35_ane_dual_q4_swiglu_t(
+            if state.bits != 4:
+                if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
+                    return None
+                activation = fast.qwen35_ane_dual_affine_swiglu_t(
+                    x,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.model1,
+                    state.bits,
+                    config.variant,
+                    state.group_size,
+                )
+            else:
+                activation = fast.qwen35_ane_dual_q4_swiglu_t(
+                    x,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.model1,
+                    config.variant,
+                    state.group_size,
+                )
+            return _linear_qmm(mlp.down_proj, activation, config.variant)
+        if state.bits != 4:
+            if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=False)):
+                return None
+            activation = fast.qwen35_ane_affine_swiglu_t(
                 x,
                 state.weight,
                 state.scales,
                 state.biases,
                 state.model,
-                state.model1,
+                state.bits,
                 config.variant,
                 state.group_size,
             )
@@ -938,8 +1064,19 @@ def _enable_dual_procedure_banks(
     if not (
         config.dual_ane
         and fast.has_symbol("qwen35_ane_compile_linear_bank")
-        and fast.has_symbol("qwen35_ane_dual_q4_swiglu_t")
         and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+    ):
+        return None
+    candidate_bits = {
+        int(getattr(getattr(module, "gate_proj", None), "bits", 0))
+        for module in mlp_candidates
+    }
+    if 4 in candidate_bits and not fast.has_symbol("qwen35_ane_dual_q4_swiglu_t"):
+        return None
+    if any(
+        bits != 4
+        and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=True))
+        for bits in candidate_bits
     ):
         return None
 

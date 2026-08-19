@@ -537,6 +537,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
+                or os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") == "0"
             ):
                 if n_confirmed:
                     return orig_gdn(
@@ -550,7 +551,15 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 self.in_proj_b,
                 self.in_proj_a,
             )
-            if not any(should_route(linear, inputs) for linear in input_linears):
+            backend = _LM_GDN_PREFILL_BACKEND
+            projections = (
+                backend(self, inputs, bool(n_confirmed))
+                if backend is not None
+                else None
+            )
+            if projections is None and not any(
+                should_route(linear, inputs) for linear in input_linears
+            ):
                 if n_confirmed:
                     return orig_gdn(
                         self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
@@ -558,15 +567,19 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             B, S, _ = inputs.shape
-            projections = None
-            backend = _LM_GDN_PREFILL_BACKEND
-            if backend is not None:
-                projections = backend(self, inputs, bool(n_confirmed))
             if projections is None:
                 qkv = qmm_or_linear(self.in_proj_qkv, inputs)
                 z = qmm_or_linear(self.in_proj_z, inputs)
-                b = qmm_or_linear(self.in_proj_b, inputs)
-                a = qmm_or_linear(self.in_proj_a, inputs)
+                b = (
+                    self.in_proj_b(inputs)
+                    if getattr(self.in_proj_b, "bits", None) == 8
+                    else qmm_or_linear(self.in_proj_b, inputs)
+                )
+                a = (
+                    self.in_proj_a(inputs)
+                    if getattr(self.in_proj_a, "bits", None) == 8
+                    else qmm_or_linear(self.in_proj_a, inputs)
+                )
             else:
                 qkv, z, b, a = projections
             z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
