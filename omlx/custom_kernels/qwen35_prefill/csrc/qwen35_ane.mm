@@ -842,6 +842,27 @@ public:
     }
   }
 
+  void warmup() {
+    AneLinearModel::Ticket ticket{};
+    {
+      std::unique_lock<std::mutex> lock(state_mutex_);
+      completion_cv_.wait(lock, [this] { return submitted_ == completed_; });
+      if (!completion_error_.empty()) {
+        throw std::runtime_error("Prior ANE evaluation failed: " +
+                                 completion_error_);
+      }
+      ticket.ready = next_event_value_++;
+      ticket.done = next_event_value_++;
+      ++submitted_;
+    }
+    // Host-side ready signal: there is no producer command buffer, the
+    // input surface holds whatever it holds. evaluate_and_signal's readiness
+    // spin-wait passes immediately and the evaluation result is discarded.
+    [event_ setSignaledValue:ticket.ready];
+    evaluate_and_signal(ticket);
+    wait(ticket);
+  }
+
   int input_dim_;
   int output_dim_;
   int sequence_length_;
@@ -888,6 +909,11 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 }
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
+}
+void AneLinearModel::warmup() {
+  @autoreleasepool {
+    impl_->warmup();
+  }
 }
 void AneLinearModel::end(MTL::CommandBuffer *command_buffer,
                          AneLinearModel::Ticket ticket) {

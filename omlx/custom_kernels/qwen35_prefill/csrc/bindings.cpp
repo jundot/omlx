@@ -55,7 +55,11 @@ NB_MODULE(_ext, m) {
           &omlx::qwen35_prefill_kernels::AneLinearModel::output_dim)
       .def_prop_ro(
           "sequence_length",
-          &omlx::qwen35_prefill_kernels::AneLinearModel::sequence_length);
+          &omlx::qwen35_prefill_kernels::AneLinearModel::sequence_length)
+      .def(
+          "warmup",
+          &omlx::qwen35_prefill_kernels::AneLinearModel::warmup,
+          nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_linear",
       static_cast<std::shared_ptr<

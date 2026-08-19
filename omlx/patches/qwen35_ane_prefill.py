@@ -11,6 +11,7 @@ import importlib
 import logging
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -1357,6 +1358,18 @@ def _enable_dual_procedure_banks(
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
             procedure += 1
+
+        # Pay every procedure's first-evaluation cost now, while the model is
+        # still loading, so the first user request measures inference rather
+        # than ANE warmup.
+        warm_start = time.perf_counter()
+        for warm_model in (*models0, *models1):
+            warm_model.warmup()
+        logger.info(
+            "Warmed %d ANE procedures in %.1fs at load",
+            len(models0) + len(models1),
+            time.perf_counter() - warm_start,
+        )
 
     return (
         len(prepared_mlps),
