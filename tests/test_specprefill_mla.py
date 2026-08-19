@@ -172,3 +172,86 @@ class TestManualRopePreservesDtype:
         freqs = mx.exp(mx.arange(4, dtype=mx.float32))
         out = manual_rope_with_freqs(x, mx.array([3, 7, 11, 200]), dims=16, freqs=freqs)
         assert out.dtype == mx.bfloat16
+
+
+class TestScoreTokensWithCacheList:
+    """PR #2851 review: DSA draft scoring hands a ``CacheList`` (latent MLA at
+    slot 0, indexer at slot 1) to ``_mla_extract_queries`` and
+    ``_compute_importance``, which crashed on ``.offset`` and ``.keys``. This
+    drives the real ``score_tokens()`` end to end over a real mlx_lm
+    ``CacheList`` layout — extraction, importance, and the lookahead trim all
+    have to descend into the list instead of assuming a bare KVCache."""
+
+    def _model(self, glm, q_lora_rank=32, vocab=32):
+        from types import SimpleNamespace
+
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        args = glm.ModelArgs(
+            hidden_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            qk_nope_head_dim=16,
+            v_head_dim=16,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+        )
+
+        class _DsaAttention(glm.Glm4MoeLiteAttention):
+            """Receives the whole CacheList — like a real DSA layer — and
+            writes its KV into slot 0 (the latent MLA cache)."""
+
+            def __call__(self, x, mask=None, cache=None, **kwargs):
+                inner = cache
+                if inner is not None and hasattr(inner, "caches"):
+                    inner = inner.caches[0]
+                    # A real DSA indexer always writes its own slot too.
+                    L = x.shape[1]
+                    cache.caches[1].update_and_fetch(
+                        mx.zeros((1, 1, L, 4)), mx.zeros((1, 1, L, 4))
+                    )
+                return super().__call__(x, mask=mask, cache=inner)
+
+        attn = _DsaAttention(args)
+
+        class _Model:
+            def __init__(self):
+                self.layers = [SimpleNamespace(self_attn=attn)]
+                self._embed = mx.random.normal((vocab, args.hidden_size)) * 0.1
+                self._head = mx.random.normal((args.hidden_size, vocab)) * 0.1
+
+            def make_cache(self):
+                return [CacheList(KVCache(), KVCache())]
+
+            def __call__(self, tokens, cache=None):
+                x = self._embed[tokens]
+                h = self.layers[0].self_attn(x, mask=None, cache=cache[0])
+                return h @ self._head
+
+        return _Model()
+
+    def test_score_tokens_descends_into_cachelist(self):
+        glm = pytest.importorskip("mlx_lm.models.glm4_moe_lite")
+        from omlx.patches.specprefill import score_tokens
+
+        model = self._model(glm)
+        n_prompt = 24
+        tokens = [int(i % 32) for i in range(n_prompt)]
+
+        importance, cache = score_tokens(
+            model, tokens, n_lookahead=2, pool_kernel=0, prefill_step_size=8
+        )
+
+        assert importance.shape == (n_prompt,)
+        assert bool(mx.all(mx.isfinite(importance)))
+        # The lookahead trim must reach the CacheList children: without the
+        # descent, ``hasattr(entry, "offset")`` is False and the lookahead
+        # KV silently persists into the stored draft cache.
+        entry = cache[0]
+        assert not hasattr(entry, "offset")
+        assert entry.caches[0].offset == n_prompt
+        assert entry.caches[1].offset == n_prompt
