@@ -193,57 +193,6 @@ final class ModelSettingsScreenVM {
         ]
     }
 
-    static let qwen35AneSequenceLengthOptions: [(String, String)] = [
-        ("1024", "1,024 tokens"),
-        ("2048", "2,048 tokens — measured"),
-        ("4096", "4,096 tokens"),
-        ("8192", "8,192 tokens"),
-    ]
-
-    static let qwen35AneFractionOptions: [(String, String)] = [
-        ("0.15", "15%"),
-        ("0.25", "25%"),
-        ("0.35", "35%"),
-        ("0.4", "40%"),
-        ("0.45", "45%"),
-        ("0.465", "46.5%"),
-        ("0.5", "50%"),
-        ("0.53", "53%"),
-        ("0.55", "55%"),
-        ("0.6", "60%"),
-    ]
-
-    static let qwen35AneCpuFractionOptions: [(String, String)] = [
-        ("0", "Disabled"),
-        ("0.05", "5%"),
-        ("0.1", "10%"),
-        ("0.125", "12.5%"),
-        ("0.13", "13%"),
-        ("0.135", "13.5%"),
-        ("0.14", "14%"),
-        ("0.15", "15%"),
-        ("0.2", "20%"),
-        ("0.25", "25%"),
-    ]
-
-    static let qwen35AneCpuThreadOptions: [(String, String)] = [
-        ("0", "Automatic"),
-        ("8", "8"),
-        ("12", "12"),
-        ("16", "16"),
-        ("24", "24"),
-    ]
-
-    static let qwen35AneCpuDownFractionOptions: [(String, String)] = [
-        ("0", "Disabled"),
-        ("0.1", "10%"),
-        ("0.15", "15%"),
-        ("0.2", "20%"),
-        ("0.25", "25%"),
-        ("0.35", "35%"),
-        ("0.5", "50%"),
-    ]
-
     /// `config_model_type` values that surface IndexCache in the HTML
     /// admin. Mirrored from `dashboard.js:5-7` (`DSA_MODEL_TYPES`).
     static let dsaConfigModelTypes: Set<String> = [
@@ -708,25 +657,55 @@ final class ModelSettingsScreenVM {
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
-            patch.qwen35AnePrefillSequenceLength = Int(qwen35AnePrefillSequenceLength)
+            switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
+            case .success(let value): patch.qwen35AnePrefillSequenceLength = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillFraction:
-            patch.qwen35AnePrefillFraction = Double(qwen35AnePrefillFraction)
+            switch QwenAneSettingsValidator.mlpFraction(
+                qwen35AnePrefillFraction,
+                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
+            ) {
+            case .success(let value): patch.qwen35AnePrefillFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillMaxLayers:
-            patch.qwen35AnePrefillMaxLayers = Int(qwen35AnePrefillMaxLayers)
+            switch QwenAneSettingsValidator.mlpLayers(qwen35AnePrefillMaxLayers) {
+            case .success(let value): patch.qwen35AnePrefillMaxLayers = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillDualAne: patch.qwen35AnePrefillDualAne = qwen35AnePrefillDualAne
         case .qwen35AnePrefillGdn:     patch.qwen35AnePrefillGdn = qwen35AnePrefillGdn
         case .qwen35AnePrefillGdnFraction:
-            patch.qwen35AnePrefillGdnFraction = Double(qwen35AnePrefillGdnFraction)
+            switch QwenAneSettingsValidator.gdnFraction(qwen35AnePrefillGdnFraction) {
+            case .success(let value): patch.qwen35AnePrefillGdnFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillGdnMaxLayers:
-            patch.qwen35AnePrefillGdnMaxLayers = Int(qwen35AnePrefillGdnMaxLayers)
+            switch QwenAneSettingsValidator.gdnLayers(qwen35AnePrefillGdnMaxLayers) {
+            case .success(let value): patch.qwen35AnePrefillGdnMaxLayers = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillCpuEnabled:
             patch.qwen35AnePrefillCpuEnabled = qwen35AnePrefillCpuEnabled
         case .qwen35AnePrefillCpuFraction:
-            patch.qwen35AnePrefillCpuFraction = Double(qwen35AnePrefillCpuFraction)
+            switch QwenAneSettingsValidator.cpuFraction(
+                qwen35AnePrefillCpuFraction,
+                mlpFraction: qwen35AnePrefillFraction
+            ) {
+            case .success(let value): patch.qwen35AnePrefillCpuFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillCpuDownFraction:
-            patch.qwen35AnePrefillCpuDownFraction = Double(qwen35AnePrefillCpuDownFraction)
+            switch QwenAneSettingsValidator.cpuDownFraction(qwen35AnePrefillCpuDownFraction) {
+            case .success(let value): patch.qwen35AnePrefillCpuDownFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillCpuThreads:
-            patch.qwen35AnePrefillCpuThreads = Int(qwen35AnePrefillCpuThreads)
+            switch QwenAneSettingsValidator.cpuThreads(qwen35AnePrefillCpuThreads) {
+            case .success(let value): patch.qwen35AnePrefillCpuThreads = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillCpuSharedResource:
             patch.qwen35AnePrefillCpuSharedResource = qwen35AnePrefillCpuSharedResource
         case .indexCacheEnabled:
@@ -1500,18 +1479,109 @@ final class ModelSettingsScreenVM {
         v.rounded() == v ? String(Int(v)) : String(v)
     }
 
-    /// SpecPrefill keep-pct dropdown is declared with string options like
-    /// "0.2"; `String(0.2)` happens to print as `"0.2"` on Darwin but
-    /// `"0.20"` would not match. Format defensively so the dropdown shows
-    /// the saved value highlighted.
+    /// Keep persisted fractions concise and stable when moving between the
+    /// server DTO and editable text fields.
     static func formatPct(_ v: Double) -> String {
-        // Always 1-2 decimals to match the option values.
-        let rounded = (v * 100).rounded() / 100
-        // Picker selections are matched by exact string identity.  In
-        // particular, the 50% option is declared as "0.5", so returning
-        // "0.50" after a server reload leaves the Picker with no selected
-        // tag and makes the persisted value appear blank.
-        let formatted = String(format: "%.2f", rounded)
-        return formatted.hasSuffix("0") ? String(formatted.dropLast()) : formatted
+        var formatted = String(format: "%.6f", v)
+        while formatted.last == "0" { formatted.removeLast() }
+        if formatted.last == "." { formatted.removeLast() }
+        return formatted
+    }
+}
+
+enum QwenAneSettingsValidator {
+    static func promptBlock(_ raw: String) -> Result<Int, SamplingValidationError> {
+        integer(raw, label: "ANE prompt block") { value in
+            value >= 1024 && value.isMultiple(of: 64)
+                ? nil : "ANE prompt block must be a multiple of 64 and at least 1024."
+        }
+    }
+
+    static func mlpFraction(
+        _ raw: String, cpuFraction: String
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "MLP ANE fraction", range: 0.05...0.90) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            let cpu: Double
+            switch fraction(cpuFraction, label: "CPU MLP fraction", range: 0...0.25) {
+            case .failure(let error): return .failure(error)
+            case .success(let parsed): cpu = parsed
+            }
+            guard value + cpu < 1 else {
+                return .failure(.init(message: "MLP ANE and CPU fractions must total less than 1.0."))
+            }
+            return .success(value)
+        }
+    }
+
+    static func gdnFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
+        fraction(raw, label: "GDN ANE fraction", range: 0.05...0.90)
+    }
+
+    static func cpuFraction(
+        _ raw: String, mlpFraction: String
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "CPU MLP fraction", range: 0...0.25) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            let ane: Double
+            switch fraction(mlpFraction, label: "MLP ANE fraction", range: 0.05...0.90) {
+            case .failure(let error): return .failure(error)
+            case .success(let parsed): ane = parsed
+            }
+            guard value + ane < 1 else {
+                return .failure(.init(message: "MLP ANE and CPU fractions must total less than 1.0."))
+            }
+            return .success(value)
+        }
+    }
+
+    static func cpuDownFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
+        fraction(raw, label: "CPU MLP down fraction", range: 0...0.50)
+    }
+
+    static func cpuThreads(_ raw: String) -> Result<Int, SamplingValidationError> {
+        integer(raw, label: "CPU worker count") { (0...64).contains($0)
+            ? nil : "CPU worker count must be between 0 and 64."
+        }
+    }
+
+    static func mlpLayers(_ raw: String) -> Result<Int, SamplingValidationError> {
+        integer(raw, label: "ANE MLP layer limit") { $0 >= 1
+            ? nil : "ANE MLP layer limit must be positive."
+        }
+    }
+
+    static func gdnLayers(_ raw: String) -> Result<Int, SamplingValidationError> {
+        integer(raw, label: "ANE GDN layer limit") { $0 >= 0
+            ? nil : "ANE GDN layer limit must be zero or greater."
+        }
+    }
+
+    private static func fraction(
+        _ raw: String, label: String, range: ClosedRange<Double>
+    ) -> Result<Double, SamplingValidationError> {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard let value = Double(trimmed), value.isFinite else {
+            return .failure(.init(message: "\(label) must be a number."))
+        }
+        guard range.contains(value) else {
+            return .failure(.init(message: "\(label) must be between \(range.lowerBound) and \(range.upperBound)."))
+        }
+        return .success(value)
+    }
+
+    private static func integer(
+        _ raw: String, label: String, check: (Int) -> String?
+    ) -> Result<Int, SamplingValidationError> {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed) else {
+            return .failure(.init(message: "\(label) must be an integer."))
+        }
+        if let message = check(value) {
+            return .failure(.init(message: message))
+        }
+        return .success(value)
     }
 }

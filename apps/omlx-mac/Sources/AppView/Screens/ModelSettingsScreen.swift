@@ -1227,14 +1227,13 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.sequence.sub",
                                          defaultValue: "Only prompt chunks exactly matching this token count use the ANE path. 2,048 is the measured default.",
                                          comment: "Sublabel explaining the fixed Qwen ANE prompt block size")) {
-                        Popup(
-                            selection: saved(
-                                $vm.qwen35AnePrefillSequenceLength,
-                                field: .qwen35AnePrefillSequenceLength
-                            ),
-                            width: 190,
-                            options: ModelSettingsScreenVM.qwen35AneSequenceLengthOptions
-                        )
+                        TextInput(text: $vm.qwen35AnePrefillSequenceLength,
+                                  placeholder: "2048", mono: true,
+                                  isNumeric: true, range: 1024...262_144,
+                                  step: 64, width: 190)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillSequenceLength, client: client) }
+                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
@@ -1242,14 +1241,13 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_fraction.sub",
                                          defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
                                          comment: "Sublabel explaining the Qwen MLP ANE workload fraction")) {
-                        Popup(
-                            selection: saved(
-                                $vm.qwen35AnePrefillFraction,
-                                field: .qwen35AnePrefillFraction
-                            ),
-                            width: 190,
-                            options: ModelSettingsScreenVM.qwen35AneFractionOptions
-                        )
+                        TextInput(text: $vm.qwen35AnePrefillFraction,
+                                  placeholder: "0.53", mono: true,
+                                  isNumeric: true, range: 0.05...0.90,
+                                  step: 0.005, width: 190)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillFraction, client: client) }
+                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_layers.label",
                                       defaultValue: "MLP Layer Limit",
@@ -1258,7 +1256,9 @@ private struct ExperimentalSection: View {
                                          defaultValue: "Maximum eligible MLP layers prepared eagerly. The selected default covers the measured 64-layer model.",
                                          comment: "Sublabel explaining the maximum number of Qwen MLP ANE layers")) {
                         TextInput(text: $vm.qwen35AnePrefillMaxLayers,
-                                  placeholder: "64", mono: true, width: 90)
+                                  placeholder: "64", mono: true,
+                                  isNumeric: true, range: 1...256,
+                                  step: 1, width: 190)
                             .onSubmit {
                                 Task { await vm.save(.qwen35AnePrefillMaxLayers, client: client) }
                             }
@@ -1295,14 +1295,13 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.cpu_fraction.sub",
                                              defaultValue: "Gate/up output channels assigned to CPU FP16 matrix multiplication.",
                                              comment: "Sublabel explaining the Qwen MLP CPU workload fraction")) {
-                            Popup(
-                                selection: saved(
-                                    $vm.qwen35AnePrefillCpuFraction,
-                                    field: .qwen35AnePrefillCpuFraction
-                                ),
-                                width: 190,
-                                options: ModelSettingsScreenVM.qwen35AneCpuFractionOptions
-                            )
+                            TextInput(text: $vm.qwen35AnePrefillCpuFraction,
+                                      placeholder: "0.135", mono: true,
+                                      isNumeric: true, range: 0...0.25,
+                                      step: 0.005, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillCpuFraction, client: client) }
+                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_threads.label",
                                           defaultValue: "CPU Workers",
@@ -1310,14 +1309,13 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.cpu_threads.sub",
                                              defaultValue: "Eight is the measured starting point. Automatic delegates worker selection to Accelerate.",
                                              comment: "Sublabel explaining the Qwen CPU worker setting")) {
-                            Popup(
-                                selection: saved(
-                                    $vm.qwen35AnePrefillCpuThreads,
-                                    field: .qwen35AnePrefillCpuThreads
-                                ),
-                                width: 190,
-                                options: ModelSettingsScreenVM.qwen35AneCpuThreadOptions
-                            )
+                            TextInput(text: $vm.qwen35AnePrefillCpuThreads,
+                                      placeholder: "8", mono: true,
+                                      isNumeric: true, range: 0...64,
+                                      step: 1, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillCpuThreads, client: client) }
+                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.label",
                                           defaultValue: "Down Projection on CPU",
@@ -1325,14 +1323,13 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.sub",
                                              defaultValue: "Optional second-stage split. Disabled by default; 20% was the best isolated starting point.",
                                              comment: "Sublabel explaining the Qwen down-projection CPU workload fraction")) {
-                            Popup(
-                                selection: saved(
-                                    $vm.qwen35AnePrefillCpuDownFraction,
-                                    field: .qwen35AnePrefillCpuDownFraction
-                                ),
-                                width: 190,
-                                options: ModelSettingsScreenVM.qwen35AneCpuDownFractionOptions
-                            )
+                            TextInput(text: $vm.qwen35AnePrefillCpuDownFraction,
+                                      placeholder: "0", mono: true,
+                                      isNumeric: true, range: 0...0.50,
+                                      step: 0.005, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillCpuDownFraction, client: client) }
+                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.label",
                                           defaultValue: "Performance-Aware Scheduling",
@@ -1366,14 +1363,13 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_fraction.sub",
                                              defaultValue: "GDN projection channels assigned to both ANEs; the GPU handles the remainder.",
                                              comment: "Sublabel explaining the Qwen GDN ANE workload fraction")) {
-                            Popup(
-                                selection: saved(
-                                    $vm.qwen35AnePrefillGdnFraction,
-                                    field: .qwen35AnePrefillGdnFraction
-                                ),
-                                width: 190,
-                                options: ModelSettingsScreenVM.qwen35AneFractionOptions
-                            )
+                            TextInput(text: $vm.qwen35AnePrefillGdnFraction,
+                                      placeholder: "0.5", mono: true,
+                                      isNumeric: true, range: 0.05...0.90,
+                                      step: 0.005, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillGdnFraction, client: client) }
+                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_layers.label",
                                           defaultValue: "GDN Layer Limit",
@@ -1382,7 +1378,9 @@ private struct ExperimentalSection: View {
                                              defaultValue: "Maximum eligible GDN layers prepared eagerly. The selected default covers 48 layers.",
                                              comment: "Sublabel explaining the maximum number of Qwen GDN ANE layers")) {
                             TextInput(text: $vm.qwen35AnePrefillGdnMaxLayers,
-                                      placeholder: "48", mono: true, width: 90)
+                                      placeholder: "48", mono: true,
+                                      isNumeric: true, range: 0...256,
+                                      step: 1, width: 190)
                                 .onSubmit {
                                     Task { await vm.save(.qwen35AnePrefillGdnMaxLayers, client: client) }
                                 }

@@ -7838,8 +7838,74 @@
                 }
             },
 
+            validateQwenAneSettings() {
+                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
+
+                const integer = (value, label, minimum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
+                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    return null;
+                };
+                const fraction = (value, label, minimum, maximum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (number < minimum || number > maximum) {
+                        return `${label} must be between ${minimum} and ${maximum}.`;
+                    }
+                    return null;
+                };
+
+                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
+                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                if (!error && sequenceLength % 64 !== 0) {
+                    error = 'ANE prompt block must be a multiple of 64.';
+                }
+                if (error) return error;
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                if (error) return error;
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                if (error) return error;
+
+                if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
+                    if (error) return error;
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
+                    if (error) return error;
+                    if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
+                        return 'CPU worker count must be between 0 and 64.';
+                    }
+                    if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
+                        return 'MLP ANE and CPU fractions must total less than 1.0.';
+                    }
+                }
+
+                if (this.modelSettings.qwen35_ane_prefill_gdn) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    if (error) return error;
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    if (error) return error;
+                }
+                return null;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenAneValidationError = this.validateQwenAneSettings();
+                if (qwenAneValidationError) {
+                    alert(qwenAneValidationError);
+                    return;
+                }
 
                 this.savingModelSettings = true;
                 try {
@@ -7914,17 +7980,17 @@
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                qwen35_ane_prefill_sequence_length: parseInt(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
-                                qwen35_ane_prefill_max_layers: parseInt(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
+                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length),
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
+                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers),
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction),
                                 qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
                                     : 48,
                                 qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
-                                qwen35_ane_prefill_cpu_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_cpu_fraction) || 0.135,
+                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
                                 qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
                                     : 0,

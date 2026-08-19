@@ -2398,6 +2398,16 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_fraction
+        + current_settings.qwen35_ane_prefill_cpu_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="MLP ANE and CPU fractions must total less than 1.0.",
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

@@ -188,13 +188,13 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
 
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
-    assert '<option value="0.53" selected>53%</option>' in html
-    assert '<option value="0.5" selected>50%</option>' in html
+    assert 'min="0.05" max="0.90" step="0.005"' in html
+    assert 'placeholder="0.53"' in html
+    assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
 
 
-def test_qwen_ane_selects_have_static_values_and_configured_defaults():
-    """Alpine initializes the select before dynamic child bindings."""
+def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
     html = _model_settings_template()
     section = _section(
         html,
@@ -202,10 +202,21 @@ def test_qwen_ane_selects_have_static_values_and_configured_defaults():
         "<!-- TurboQuant KV Cache -->",
     )
 
-    assert '<option value="2048" selected>' in section
-    assert '<option value="0.53" selected>' in section
-    assert '<option value="0.5" selected>' in section
-    assert "<option :value=" not in section
+    for field in (
+        "qwen35_ane_prefill_sequence_length",
+        "qwen35_ane_prefill_fraction",
+        "qwen35_ane_prefill_cpu_fraction",
+        "qwen35_ane_prefill_cpu_down_fraction",
+        "qwen35_ane_prefill_cpu_threads",
+        "qwen35_ane_prefill_gdn_fraction",
+    ):
+        binding = f'x-model.number="modelSettings.{field}"'
+        before, after = section.split(binding, 1)
+        assert before.rsplit("<", 1)[-1].startswith("input ")
+        assert "</select>" not in after.split(">", 1)[0]
+
+    assert 'min="1024" step="64"' in section
+    assert 'min="0" max="64" step="1"' in section
 
 
 def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
@@ -232,22 +243,15 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "result?.latency_ms !== null" in script
 
 
-def test_qwen_ane_fraction_selects_cover_nax_tuner_results():
-    html = _model_settings_template()
-    section = _section(
-        html,
-        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
-        "<!-- TurboQuant KV Cache -->",
-    )
+def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
+    script = _dashboard_script()
 
-    for field in (
-        "qwen35_ane_prefill_fraction",
-        "qwen35_ane_prefill_gdn_fraction",
-    ):
-        select = section.split(f'x-model.number="modelSettings.{field}"', 1)[1]
-        select = select.split("</select>", 1)[0]
-        for value in ("0.15", "0.25", "0.35", "0.45", "0.53"):
-            assert f'<option value="{value}"' in select
+    assert "validateQwenAneSettings()" in script
+    assert "ANE prompt block must be a multiple of 64." in script
+    assert "MLP ANE and CPU fractions must total less than 1.0." in script
+    assert "CPU worker count must be between 0 and 64." in script
+    assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
+    assert "qwen35_ane_prefill_fraction: Number(" in script
 
 
 def test_qwen_ane_web_defaults_match_configured_profile():

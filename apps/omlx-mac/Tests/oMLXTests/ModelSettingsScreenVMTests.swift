@@ -78,14 +78,29 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.qwen35AnePrefillCpuSharedResource)
     }
 
-    func testQwenAneFractionFormatterMatchesPickerValues() {
+    func testQwenAneFractionFormatterPreservesSettingsValues() {
         XCTAssertEqual(ModelSettingsScreenVM.formatPct(0.5), "0.5")
         XCTAssertEqual(ModelSettingsScreenVM.formatPct(0.53), "0.53")
-        XCTAssertTrue(
-            ModelSettingsScreenVM.qwen35AneFractionOptions.contains {
-                $0.0 == ModelSettingsScreenVM.formatPct(0.50)
-            }
+        XCTAssertEqual(ModelSettingsScreenVM.formatPct(0.527), "0.527")
+    }
+
+    func testQwenAneArbitraryInputValidation() {
+        XCTAssertEqual(try? QwenAneSettingsValidator.promptBlock("2112").get(), 2112)
+        XCTAssertThrowsError(try QwenAneSettingsValidator.promptBlock("2100").get())
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.mlpFraction("0.467", cpuFraction: "0.137").get(),
+            0.467
         )
+        XCTAssertThrowsError(
+            try QwenAneSettingsValidator.mlpFraction("0.9", cpuFraction: "0.1").get()
+        )
+        XCTAssertEqual(
+            try? QwenAneSettingsValidator.cpuFraction("0.137", mlpFraction: "0.467").get(),
+            0.137
+        )
+        XCTAssertThrowsError(try QwenAneSettingsValidator.cpuThreads("8.5").get())
+        XCTAssertThrowsError(try QwenAneSettingsValidator.cpuThreads("65").get())
+        XCTAssertEqual(try? QwenAneSettingsValidator.gdnFraction("0.527").get(), 0.527)
     }
 
     func testQwenAneSettingsAreIncludedInWorkingProfile() {
