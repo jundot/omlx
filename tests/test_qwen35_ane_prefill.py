@@ -604,10 +604,13 @@ def test_eligible_pair_preserves_q4_and_accepts_affine_q8():
     assert ane_patch._eligible_pair(q8_mlp)
 
 
+@pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("dual", [False, True])
-def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
-    assert ane_patch._eligible_pair(_make_affine_mlp(6, 64))
-    generic_name = ane_patch._fused_swiglu_symbol(6, dual=dual)
+def test_q5_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(
+    monkeypatch, bits, dual
+):
+    assert ane_patch._eligible_pair(_make_affine_mlp(bits, 64))
+    generic_name = ane_patch._fused_swiglu_symbol(bits, dual=dual)
     assert generic_name == (
         "qwen35_ane_dual_affine_swiglu_t"
         if dual
@@ -627,7 +630,7 @@ def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
     monkeypatch.setattr(
         fast,
         q4_name,
-        lambda *args: pytest.fail("Q6 must use the generic fused SwiGLU"),
+        lambda *args: pytest.fail("Q5/Q6 must use the generic fused SwiGLU"),
     )
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
@@ -638,12 +641,12 @@ def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
     state = ane_patch._CombinedMLPState(
         model=model0,
         model1=model1,
-        weight=mx.zeros((4, 3), dtype=mx.uint32),
+        weight=mx.zeros((4, bits), dtype=mx.uint32),
         scales=mx.zeros((4, 1), dtype=mx.bfloat16),
         biases=mx.zeros((4, 1), dtype=mx.bfloat16),
         ane_outputs=2,
         gpu_outputs=2,
-        bits=6,
+        bits=bits,
         group_size=64,
     )
     mlp = SimpleNamespace(
@@ -653,7 +656,7 @@ def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
         ),
         _omlx_ane_prefill_state=state,
     )
-    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+    x = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
 
     result = ane_patch._backend(mlp, x)
     mx.eval(result)
@@ -665,7 +668,7 @@ def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
         state.biases,
         model0,
         *(() if not dual else (model1,)),
-        6,
+        bits,
         8,
         64,
     )

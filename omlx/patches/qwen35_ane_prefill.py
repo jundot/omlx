@@ -140,7 +140,7 @@ def _affine_spec(
 def _fused_swiglu_symbol(bits: int, *, dual: bool) -> str:
     if bits == 4:
         return "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
-    if bits in (6, 8):
+    if bits in (5, 6, 8):
         return (
             "qwen35_ane_dual_affine_swiglu_t"
             if dual
@@ -183,8 +183,8 @@ def _eligible_pair(mlp: Any) -> bool:
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate_dtype = getattr(getattr(gate, "scales", None), "dtype", None)
-    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4, 6, 8))
-    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4, 6, 8))
+    gate_spec = _affine_spec(gate, gate_dtype, allowed_bits=(4, 5, 6, 8))
+    up_spec = _affine_spec(up, gate_dtype, allowed_bits=(4, 5, 6, 8))
     down_spec = _affine_spec(
         down,
         getattr(getattr(down, "scales", None), "dtype", None),
