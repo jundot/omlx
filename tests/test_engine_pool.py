@@ -2978,6 +2978,75 @@ class TestMemorySettleBarrier:
         assert pool._current_model_memory == initial_memory - est_size
 
     @pytest.mark.asyncio
+    async def test_unload_finishes_after_caller_cancellation(
+        self, pool_with_loaded_model
+    ):
+        """Cancellation cannot strand tensors after the entry is detached."""
+        pool = pool_with_loaded_model
+        entry = pool._entries["model-a"]
+        stop_started = asyncio.Event()
+        allow_stop = asyncio.Event()
+
+        async def blocking_stop():
+            stop_started.set()
+            await allow_stop.wait()
+
+        entry.engine.stop.side_effect = blocking_stop
+        active_memory_values = iter([10 * 1024**3, 5 * 1024**3])
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+        ):
+            mock_mx.get_active_memory.side_effect = lambda: next(
+                active_memory_values, 5 * 1024**3
+            )
+            caller = asyncio.create_task(pool._unload_engine("model-a"))
+            await stop_started.wait()
+
+            caller.cancel()
+            await asyncio.sleep(0)
+            assert not caller.done()
+
+            caller.cancel()
+            await asyncio.sleep(0)
+            assert not caller.done()
+
+            allow_stop.set()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+        assert entry.engine is None
+        assert pool._current_model_memory == 0
+        assert pool._engine_unload_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_unload_failure_does_not_replace_caller_cancellation(
+        self, pool_with_loaded_model
+    ):
+        """A teardown failure is logged without masking caller cancellation."""
+        pool = pool_with_loaded_model
+        unload_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def failing_unload(_model_id):
+            unload_started.set()
+            await allow_failure.wait()
+            raise RuntimeError("teardown failed")
+
+        pool._unload_engine_impl = failing_unload
+        caller = asyncio.create_task(pool._unload_engine("model-a"))
+        await unload_started.wait()
+
+        caller.cancel()
+        allow_failure.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await asyncio.sleep(0)
+
+        assert pool._engine_unload_tasks == {}
+
+    @pytest.mark.asyncio
     async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
         """Test settle barrier succeeds after multiple rounds of GC."""
         pool = pool_with_loaded_model
