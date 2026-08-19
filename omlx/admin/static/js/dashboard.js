@@ -782,6 +782,10 @@
             accExternalEnabled: false,
             // Provider-specific JSON is intentionally session-only.
             accExternalExtraBody: '',
+            // Accuracy-only max_tokens floor; persisted like the shared
+            // endpoint settings because it is a simple number the user sets
+            // once per endpoint (thinking models need a larger budget).
+            accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -8834,10 +8838,28 @@
                 return value;
             },
 
+            saveAccExternalMaxTokens() {
+                localStorage.setItem('omlx_acc_external_max_tokens', this.accExternalMaxTokens.trim());
+            },
+
+            // Optional accuracy-only floor for per-question max_tokens.
+            // Returns null when unset; throws on invalid input.
+            parseAccuracyMaxTokens() {
+                const raw = this.accExternalMaxTokens.trim();
+                if (!raw) return null;
+                const value = Number(raw);
+                if (!Number.isInteger(value) || value < 1 || value > 1000000) {
+                    throw new Error(window.t('js.error.external_max_tokens_invalid'));
+                }
+                return value;
+            },
+
             accuracyExternalRequestBody() {
                 const body = this.externalRequestBody();
                 const extraBody = this.parseAccuracyExtraBody();
                 if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                const maxTokens = this.parseAccuracyMaxTokens();
+                if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
             },
 
