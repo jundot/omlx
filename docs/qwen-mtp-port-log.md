@@ -71,6 +71,34 @@ absent).
 | 34 | 2026-08-18 | `b0994092-554a-452c-8d4c-78fecda724b4` | `1cb1f43` — verify-concat JIT warm (host primary + device draft ids concat kernels) | — | ✅ | no port: warmup-only (timed-window JIT avoidance); omlx has no scored timed window |
 | 35 | 2026-08-19 | `59b321ee-eb5c-40ec-bb49-5218e4b8cd31` | `9e1ff9e` — later-window SDPA compile (throwaway FA K/V to kL>=1024, qL=1/5/4 shapes) | — | ✅ | no port: warmup-only (timed-window JIT avoidance) |
 
+## Submission registry — Accept-labeled merged submissions (chronological)
+
+Main also merges submissions under an "Accept submission <uuid>" label (the
+organizer's acceptance path; same editable-surface imports). Rows 36–54 close
+those out with the same port bar.
+
+| # | Date | Submission | Challenge commit | Port | Token-exact | Status |
+|---|---|---|---|---|---|---|
+| 36 | 2026-08-15 | `3e8b6f1a-0d16-490d-b233-14adac4527ca` | `fe88292` — persistent MTP-head KV cache + seed-hidden history fold | — | ✅ | covered: omlx `prompt_priming` folds the prompt into the persistent head cache during prefill (the same committed-history design) and `state.mtp_cache` persists across rounds |
+| 37 | 2026-08-15 | `45c257f1-f249-4fc0-945d-ee330bf9865c` | `1167008` — fused GDN in-proj (qkv+z+b+a) + fused SwiGLU gate/up matmuls; GDN mid-kernel; fused QK prep; head surface | `PORT-37` | ✅ token-exact (96-tok depth-2) | in-proj + gate/up fused, default ON (`OMLX_QWEN_FUSED_PROJ=0` ablation); 48/48 GDN + 64/64 MLP engage; −1% decode (89.5 vs 90.4 ms/tok). GDN mid-kernel + fused QK prep are Metal kernels (N); scale-const memo covered by constant folding |
+| 38 | 2026-08-15 | `55fa8d31-7a40-4390-ba4e-4e906ead1e3d` | `3e157ad` — per-boundary eager checkpoints at every width + warmup | — | ✅ | covered: this is the transient pre-fused state; the final design (and omlx) run the fused unsplit verify with lazy replay (`mtp_partial_rollback`) — see rows 4/10 |
+| 39 | 2026-08-16 | `12b1c699-febb-4ed6-9b24-c19018e5f006` | `033f622` — policy constants (headStepCostRatio 0.18, width-wall cap 5, streak gate 3) + fused gate/up & fused-QK dispatch thresholds | — | ✅ | covered: policy constants are `_DepthController` territory (machine-measured); no width wall in Python (row 12); dispatch thresholds are Metal-kernel selection |
+| 40 | 2026-08-17 | `d3caa5fe-9aa7-4203-bb96-249aaafb4801` | `6209702` — declares the dwsdubey 4-bit re-quantized MTP head | — | ✅ | no port: head-declaration only (proposal-side; the target decides every emitted token) |
+| 41 | 2026-08-17 | `ba493f74-c0fe-440a-a956-f77d26232e54` | `156b5b7` — cost-model schedule (as row 9) + quantized kernel tweak | — | ✅ | covered: cost-model depth selection is `_DepthController`; kernel tweak is C++ Metal |
+| 42 | 2026-08-17 | `14b53255-e585-44bd-84d9-37b7b29c0be9` | `79683c6` — affine-4 qdot nibble-extraction kernel change + head manifest | — | ✅ | no port: C++ Metal kernel; head declaration |
+| 43 | 2026-08-17 | `1d7876fd-d0e7-4e8a-a6dd-432a321084e9` | `be3361b` — warm `callWithHiddenAndNormed` shapes | — | ✅ | no port: warmup-only |
+| 44 | 2026-08-17 | `1235f4ba-0a48-4f9a-a0fa-8c9ed6880fd7` | `0824e0e` — quantized kernel 2-line | — | ✅ | no port: C++ Metal kernel |
+| 45 | 2026-08-17 | `f9ea43fd-e2b1-453a-b638-b58d2946115c` | `1abe636` — warmup + top-2 kernel compile + quantized tweak | — | ✅ | no port: warmup-only + C++ Metal kernel |
+| 46 | 2026-08-17 | `bd007bc7-e8ab-4919-baf4-d5e90068dd83` | `d1530a4` — quantized kernel 4-line | — | ✅ | no port: C++ Metal kernel |
+| 47 | 2026-08-17 | `caec88d4-c566-4d5c-ab80-5ce6e9c9e86d` | `0d800b2` — quantized kernel 6-line | — | ✅ | no port: C++ Metal kernel |
+| 48 | 2026-08-18 | `578535f7-95e6-4f95-a34c-281b9dbbbffc` | `12d3756` — crossrow QMV lane partitioning (4+4 vs 3+3+2) | — | ✅ | no port: C++ Metal kernel |
+| 49 | 2026-08-18 | `0792c757-e04b-4449-b9a5-e4ab9b64a396` | `868cde8` — memoized q/k norm scale constants + fused residual+rmsnorm kernel + quantized | — | ✅ | scale-const memo covered (Python constant folding); fused residual+rmsnorm is a Metal kernel (two-output compile is C1-risky in Python — see C1) |
+| 50 | 2026-08-18 | `12864bc1-9c9e-4e3b-8964-e8b9e4da8d31` | `369cc05` — proposal-side top-32 shortlist kernel (replaces argPartition sort) + invScale hoist | — | ✅ | no port: rerank shortlist is head-artifact + Metal kernel; invScale hoist covered by constant folding |
+| 51 | 2026-08-18 | `3a995c2b-3c42-48e8-b982-f36a8abda0e7` | `86fb1f0` — wired-limit residency-set resize + scale-const memo + fused residual+rmsnorm + quantized | — | ✅ | memory policy is Metal runtime (as row 33); rest as row 49 |
+| 52 | 2026-08-18 | `942e5ab2-1c46-4c50-b7c3-eaf948878ed0` | `474c750` — affine2/g64 32-values-per-lane QMV kernel + memory policy | — | ✅ | no port: C++ Metal kernel + Metal memory policy (as rows 31/32/33) |
+| 53 | 2026-08-18 | `11863aa9-0dc0-4703-b7a4-eacd473810cb` | `5068eb8` — empty commit (no editable-path diff) | — | ✅ | no-op: administrative accept, nothing to port |
+| 54 | 2026-08-19 | `0cd0a6b4-b539-4705-a1c7-cb271c1f9d3b` | `0c90733` — wired-limit overwrite (memory policy) + session cleanup | — | ✅ | no port: Metal runtime memory policy (as row 33); session cleanup mirrors covered machinery |
+
 ## Concern register
 
 ### C1 — Two-output compiled g+beta fusion not ported (ULP-divergence risk)
