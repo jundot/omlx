@@ -4,9 +4,10 @@
 The challenge's token-fidelity contract: every token an MTP decode emits must
 equal the token serial decode would have produced, token for token, from the
 same seed. This test loads the merged pinned checkpoint
-(/tmp/qwen38-mtp/merged — backbone + head under the mtp. prefix) through
-omlx's Lightning MTP machinery and compares the greedy MTP trajectory against
-the serial trajectory over the challenge's public long-copy gate prompt.
+(~/qwen38-mtp/merged — backbone + head under the mtp. prefix, built by
+tools/qwen38_mtp/merge_checkpoint.py) through omlx's Lightning MTP machinery
+and compares the greedy MTP trajectory against the serial trajectory over the
+challenge's public long-copy gate prompt.
 
 The test is skipped when the merged checkpoint is absent so the suite stays
 green in environments that have not staged the ~16 GB artifact. It is a real,
@@ -30,12 +31,14 @@ from omlx.patches.mlx_lm_mtp import (
 )
 
 MERGED = os.environ.get(
-    "Q38_MERGED", "/tmp/qwen38-mtp/merged"
+    "Q38_MERGED", os.path.expanduser("~/qwen38-mtp/merged")
 )
 PROMPT_FILE = os.environ.get(
     "Q38_PROMPT",
-    "/tmp/qwen-3.8-mtp-challenge/correctness_prompts/"
-    "public_longcopy_gate_english_512.txt",
+    os.path.expanduser(
+        "~/qwen38-mtp/challenge/correctness_prompts/"
+        "public_longcopy_gate_english_512.txt"
+    ),
 )
 
 pytestmark = pytest.mark.skipif(
