@@ -235,7 +235,7 @@ def qwen35_ane_dual_cpu_fp16_affine_qmm_t(
 
 
 def qwen35_cpu_shared_resource_available() -> bool:
-    """Whether the private shared-resource scheduler hint is accepted."""
+    """Whether dispatch_apply supports shared-resource scheduling attributes."""
     return bool(
         _ext is not None
         and hasattr(_ext, "qwen35_cpu_shared_resource_available")

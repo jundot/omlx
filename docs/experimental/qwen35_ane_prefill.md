@@ -32,6 +32,8 @@ remain on GPU.
   does not modify or dequantize the source checkpoint in place. The CPU GDN
   slice applies only to residual qkv outputs after the ANE prefix; z remains
   wholly on ANE so mixed-quantization checkpoints keep a valid GPU suffix.
+  The clone utility rejects non-finite tensors and BF16 values outside the
+  FP16 range before writing any checkpoint files.
 - An MLP prefill call whose flattened token count matches the fixed configured
   sequence length, or a single-prompt call that is wider: wide chunks are tiled
   internally into fixed-shape blocks plus a residual tail on the ordinary
@@ -175,6 +177,10 @@ The combined GPU suffix is retained alongside the original gate/up tensors so
 decode and every fallback remain unchanged. The dual path also owns two input
 and two output surfaces per accelerated layer. This deliberately spends memory
 to avoid per-request weight preparation and to keep both ANEs ready.
+When CPU sharing is enabled, model admission additionally reserves the eager
+FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
+materialization scratch. This projected size participates in the normal memory
+guard before the model begins loading.
 
 ## Qwen3.8-27B-oQ4e validation
 

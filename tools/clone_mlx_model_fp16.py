@@ -20,6 +20,8 @@ from pathlib import Path
 import mlx.core as mx
 from safetensors import safe_open
 
+_FP16_MAX = 65504.0
+
 
 def _clone_config(source: Path, destination: Path) -> None:
     config = json.loads(source.read_text())
@@ -30,6 +32,45 @@ def _clone_config(source: Path, destination: Path) -> None:
     destination.write_text(json.dumps(config, indent=2) + "\n")
 
 
+def _conversion_issues(shard: Path, tensors: dict[str, mx.array]) -> list[str]:
+    issues: list[str] = []
+    for name, value in tensors.items():
+        if not mx.issubdtype(value.dtype, mx.floating):
+            continue
+        finite = mx.isfinite(value)
+        non_finite = int(mx.sum(~finite).item())
+        if non_finite:
+            issues.append(f"{shard.name}:{name}: {non_finite} NaN or infinite value(s)")
+        if value.dtype == mx.bfloat16:
+            finite_abs = mx.where(
+                finite,
+                mx.abs(value).astype(mx.float32),
+                mx.array(0.0, dtype=mx.float32),
+            )
+            maximum = float(mx.max(finite_abs).item()) if value.size else 0.0
+            if maximum > _FP16_MAX:
+                issues.append(
+                    f"{shard.name}:{name}: maximum absolute value {maximum:g} "
+                    f"exceeds the FP16 limit {_FP16_MAX:g}"
+                )
+    return issues
+
+
+def _validate_conversion(shards: list[Path]) -> None:
+    issues: list[str] = []
+    for index, shard in enumerate(shards, start=1):
+        tensors = mx.load(str(shard))
+        issues.extend(_conversion_issues(shard, tensors))
+        del tensors
+        mx.clear_cache()
+        print(f"[{index}/{len(shards)}] validated {shard.name}", flush=True)
+    if issues:
+        report = "\n".join(f"- {issue}" for issue in issues)
+        raise ValueError(
+            "FP16 clone validation failed; no checkpoint files were written:\n" + report
+        )
+
+
 def clone_model(source: Path, destination: Path) -> None:
     source = source.resolve()
     destination = destination.resolve()
@@ -37,13 +78,17 @@ def clone_model(source: Path, destination: Path) -> None:
         raise ValueError("The destination must differ from the source model")
     if not source.is_dir():
         raise ValueError(f"Source model directory does not exist: {source}")
-    if destination.exists() and any(destination.iterdir()):
+    if destination.exists() and (
+        not destination.is_dir() or any(destination.iterdir())
+    ):
         raise ValueError(f"Destination already exists and is not empty: {destination}")
 
-    destination.mkdir(parents=True, exist_ok=True)
     shards = sorted(source.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"No safetensors shards found in {source}")
+    _validate_conversion(shards)
+
+    destination.mkdir(parents=True, exist_ok=True)
 
     for item in source.iterdir():
         if item.suffix == ".safetensors":
@@ -63,9 +108,7 @@ def clone_model(source: Path, destination: Path) -> None:
             metadata = handle.metadata() or {}
         tensors = mx.load(str(shard))
         converted = {
-            name: value.astype(mx.float16)
-            if value.dtype == mx.bfloat16
-            else value
+            name: value.astype(mx.float16) if value.dtype == mx.bfloat16 else value
             for name, value in tensors.items()
         }
         mx.save_safetensors(str(temporary), converted, metadata=metadata)

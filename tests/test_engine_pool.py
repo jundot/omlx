@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.engine_pool import (
+    EngineEntry,
+    EnginePool,
+    _qwen35_cpu_share_estimated_bytes,
+)
 from omlx.exceptions import (
     InsufficientMemoryError,
     ModelBusyError,
@@ -498,6 +502,135 @@ class TestEngineEntry:
         assert entry.model_type == "embedding"
         assert entry.engine_type == "embedding"
         assert entry.is_pinned is True
+
+
+class TestQwenCpuShareMemoryEstimate:
+    @staticmethod
+    def _write_config(path):
+        path.mkdir()
+        (path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5_text",
+                        "hidden_size": 256,
+                        "intermediate_size": 512,
+                        "num_hidden_layers": 4,
+                        "layer_types": [
+                            "linear_attention",
+                            "full_attention",
+                            "linear_attention",
+                            "linear_attention",
+                        ],
+                        "linear_num_key_heads": 1,
+                        "linear_key_head_dim": 64,
+                        "linear_num_value_heads": 2,
+                        "linear_value_head_dim": 64,
+                    },
+                }
+            )
+        )
+
+    def test_estimate_covers_gate_down_suffix_and_gdn_materialization(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_max_layers=3,
+            qwen35_ane_prefill_gdn=True,
+            qwen35_ane_prefill_gdn_max_layers=2,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_fraction=0.25,
+            qwen35_ane_prefill_cpu_down_fraction=0.25,
+            qwen35_ane_prefill_cpu_gdn_fraction=0.25,
+        )
+
+        estimated = _qwen35_cpu_share_estimated_bytes(str(model), settings)
+
+        gate = 3 * 2 * 128 * 256 * 2
+        down = int(3 * ((64 * 512 * 2) + (192 * 512 * 1.0625)))
+        gdn = 2 * 64 * 256 * 2
+        assert estimated == int((gate + down + gdn) * 1.5)
+
+    def test_runtime_estimate_feeds_resident_memory_accounting(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_fraction=0.25,
+        )
+        entry = EngineEntry(
+            model_id="qwen",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+
+        projected = pool._entry_runtime_resident_size(entry, settings)
+        extra = _qwen35_cpu_share_estimated_bytes(str(model), settings)
+
+        assert extra is not None and extra > 0
+        assert projected == entry.estimated_size + extra
+
+    @pytest.mark.asyncio
+    async def test_cpu_share_projection_participates_in_preload_admission(
+        self, tmp_path
+    ):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_down_fraction=0.25,
+        )
+        pool = _make_pool(ceiling=100_000)
+        pool._entries["qwen"] = EngineEntry(
+            model_id="qwen",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+
+        with (
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            pytest.raises(ModelTooLargeError) as exc_info,
+        ):
+            await pool.get_engine("qwen", runtime_settings=settings)
+
+        assert exc_info.value.model_size > 100_000
+
+    def test_enabled_cpu_share_fails_closed_when_geometry_is_unreadable(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+        )
+        entry = EngineEntry(
+            model_id="qwen",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+
+        assert pool._entry_runtime_resident_size(entry, settings) == 2000
 
 
 class TestApplySettingsOverrides:

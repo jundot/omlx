@@ -131,8 +131,8 @@ class ModelSettings:
             z+qkv projection outputs assigned to the CPU after the ANE prefix.
         qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
             (zero lets Accelerate choose).
-        qwen35_ane_prefill_cpu_shared_resource: Use Apple's private
-            shared-resource scheduler hint with manually sharded CPU work.
+        qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
+            shared-resource scheduling attributes for manually sharded CPU work.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).

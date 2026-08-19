@@ -54,6 +54,123 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+_FP16_BYTES = 2
+_MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
+_CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+
+
+def _positive_int(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _aligned_share_rows(outputs: int, fraction: float) -> int:
+    if outputs <= 0 or fraction <= 0:
+        return 0
+    return min(outputs, (int(outputs * fraction) // 64) * 64)
+
+
+def _qwen35_cpu_share_estimated_bytes(
+    model_path: str,
+    settings: object | None,
+) -> int | None:
+    """Estimate peak bytes added while materializing Qwen CPU-share rows.
+
+    The source checkpoint retains its packed weights. Gate/up and GDN add
+    eager FP16 row slices, while down sharing additionally retains a copied
+    quantized GPU suffix. The final multiplier covers the per-layer
+    dequantize/concatenate scratch observed during eager preparation. ``None``
+    means CPU sharing was requested for a Qwen checkpoint whose geometry could
+    not be established safely; callers must use a conservative fallback.
+    """
+
+    if (
+        settings is None
+        or not bool(getattr(settings, "qwen35_ane_prefill_enabled", False))
+        or not bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
+    ):
+        return 0
+
+    config_path = Path(model_path) / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        text = config
+    model_type = str(text.get("model_type") or config.get("model_type") or "")
+    if not any(token in model_type for token in ("qwen3_5", "qwen3_6", "qwen3_8")):
+        return 0
+
+    hidden = _positive_int(text.get("hidden_size"))
+    intermediate = _positive_int(text.get("intermediate_size"))
+    layer_count = _positive_int(text.get("num_hidden_layers"))
+    if not hidden or not intermediate or not layer_count:
+        return None
+    layer_count = min(
+        layer_count,
+        max(0, int(getattr(settings, "qwen35_ane_prefill_max_layers", 64) or 0)),
+    )
+
+    extra = 0.0
+    gate_fraction = float(
+        getattr(settings, "qwen35_ane_prefill_cpu_fraction", 0.0) or 0.0
+    )
+    gate_rows = _aligned_share_rows(intermediate, gate_fraction)
+    if gate_rows:
+        extra += layer_count * 2 * gate_rows * hidden * _FP16_BYTES
+
+    down_fraction = float(
+        getattr(settings, "qwen35_ane_prefill_cpu_down_fraction", 0.0) or 0.0
+    )
+    down_rows = _aligned_share_rows(hidden, down_fraction)
+    if down_rows and down_rows < hidden:
+        cpu_weight = down_rows * intermediate * _FP16_BYTES
+        gpu_suffix = (hidden - down_rows) * intermediate * _MAX_AFFINE_BYTES_PER_WEIGHT
+        extra += layer_count * (cpu_weight + gpu_suffix)
+
+    gdn_fraction = float(
+        getattr(settings, "qwen35_ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
+    )
+    if gdn_fraction > 0 and bool(getattr(settings, "qwen35_ane_prefill_gdn", True)):
+        key_heads = _positive_int(text.get("linear_num_key_heads"))
+        key_dim = _positive_int(text.get("linear_key_head_dim"))
+        value_heads = _positive_int(text.get("linear_num_value_heads"))
+        value_dim = _positive_int(text.get("linear_value_head_dim"))
+        qkv_outputs = 2 * key_heads * key_dim + value_heads * value_dim
+        z_outputs = value_heads * value_dim
+        if not qkv_outputs or not z_outputs:
+            return None
+        gdn_rows = min(
+            qkv_outputs,
+            _aligned_share_rows(qkv_outputs + z_outputs, gdn_fraction),
+        )
+        layer_types = text.get("layer_types")
+        if isinstance(layer_types, list):
+            gdn_layers = sum(
+                "linear" in str(layer_type).lower() for layer_type in layer_types
+            )
+        else:
+            # Qwen hybrid checkpoints use full attention periodically. Without
+            # the explicit map, charging every layer is the safe estimate.
+            gdn_layers = _positive_int(text.get("num_hidden_layers"))
+        gdn_layers = min(
+            gdn_layers,
+            max(
+                0,
+                int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0),
+            ),
+        )
+        extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
+
+    return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
 
 @dataclass
 class EngineEntry:
@@ -77,6 +194,7 @@ class EngineEntry:
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
+    runtime_estimated_size: int | None = None  # Includes active load-time variants
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -190,6 +308,9 @@ class EnginePool:
     def _entry_resident_size(self, entry: EngineEntry) -> int:
         """Return this process's planned weights, not the full cluster model."""
 
+        if entry.runtime_estimated_size is not None:
+            return entry.runtime_estimated_size
+
         deployment = self._distributed_deployment_for_entry(entry)
         if deployment is None:
             return entry.estimated_size
@@ -202,6 +323,37 @@ class EnginePool:
             if assignment is not None
             else entry.estimated_size
         )
+
+    def _entry_runtime_resident_size(
+        self,
+        entry: EngineEntry,
+        runtime_settings: object | None,
+        *,
+        base_size: int | None = None,
+    ) -> int:
+        """Include eager CPU-share storage in load and prefill accounting."""
+
+        base = self._entry_resident_size(entry) if base_size is None else base_size
+        if self._distributed_deployment_for_entry(entry) is not None:
+            return base
+        extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
+        if extra is None:
+            # An enabled CPU path with unreadable geometry must not silently
+            # retain the quantized estimate. One additional model-sized charge
+            # is conservative and lets normal admission produce useful errors.
+            extra = entry.estimated_size
+            logger.warning(
+                "Could not determine Qwen CPU-share geometry for %s; "
+                "reserving one additional model-sized memory allowance",
+                entry.model_id,
+            )
+        if extra > 0:
+            logger.info(
+                "Qwen CPU sharing adds %s to the projected memory for %s",
+                format_size(extra),
+                entry.model_id,
+            )
+        return base + extra
 
     @property
     def current_model_memory(self) -> int:
@@ -1325,10 +1477,22 @@ class EnginePool:
             # vision-inclusive file size (#2385).
             deployment = self._distributed_deployment_for_entry(entry)
             admission_size = self._entry_resident_size(entry)
-            if deployment is None and entry.text_only_size and (
-                force_lm or entry.engine_type == "batched"
+            if (
+                deployment is None
+                and entry.text_only_size
+                and (force_lm or entry.engine_type == "batched")
             ):
                 admission_size = entry.text_only_size
+            admission_settings = runtime_settings
+            if admission_settings is None and self._settings_manager is not None:
+                get_settings = getattr(self._settings_manager, "get_settings", None)
+                if callable(get_settings):
+                    admission_settings = get_settings(model_id)
+            admission_size = self._entry_runtime_resident_size(
+                entry,
+                admission_settings,
+                base_size=admission_size,
+            )
             admission_kind = "local shard" if deployment is not None else "model"
             ceiling = self._current_ceiling()
             best_effort = False
@@ -1919,6 +2083,7 @@ class EnginePool:
         entry.pending_unload_reason = None
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
+        entry.runtime_estimated_size = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2138,6 +2303,21 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
+            deployment = self._distributed_deployment_for_entry(entry)
+            base_resident_size = self._entry_resident_size(entry)
+            if (
+                deployment is None
+                and entry.text_only_size
+                and (force_lm or entry.engine_type == "batched")
+            ):
+                base_resident_size = entry.text_only_size
+            resident_size = self._entry_runtime_resident_size(
+                entry,
+                model_settings,
+                base_size=base_resident_size,
+            )
+            entry.runtime_estimated_size = resident_size
+
             # Wire the correct model_id / model_path into the shared scheduler
             # config so every engine (Batched/VLM/DFlash/Embedding) sees the
             # right values when it builds `SchedulerConfig` internally.
@@ -2158,11 +2338,7 @@ class EnginePool:
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
-            deployment = (
-                self._distributed_deployment_for_entry(entry)
-                if effective_type == "batched"
-                else None
-            )
+            deployment = deployment if effective_type == "batched" else None
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
@@ -2608,6 +2784,8 @@ class EnginePool:
             entry.is_loading = False
             entry.loading_started_at = None
             entry.abort_loading = False
+            if not load_completed:
+                entry.runtime_estimated_size = None
             self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:

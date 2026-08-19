@@ -1170,57 +1170,78 @@ BNNSNDArrayDescriptor cpu_matrix_descriptor(void *data, int rows, int cols,
   return descriptor;
 }
 
-using BsdThreadCtlFn = int (*)(uint64_t, uint64_t, uint64_t, uint64_t);
+// dispatch_apply_with_attr is present on the macOS versions that expose the
+// shared-resource scheduling policy, but older SDKs do not declare the family.
+// Resolve the public lifecycle dynamically so one extension binary remains
+// loadable on those SDKs without reaching into thread-control syscalls.
+using DispatchApplyAttrStorage = uint64_t[8];
+using DispatchApplyAttrInitFn = void (*)(DispatchApplyAttrStorage *);
+using DispatchApplyAttrDestroyFn = void (*)(DispatchApplyAttrStorage *);
+using DispatchApplyAttrSetParallelismFn = void (*)(DispatchApplyAttrStorage *,
+                                                   intptr_t, uint64_t);
+using DispatchApplyWithAttrFn = void (*)(size_t, DispatchApplyAttrStorage *,
+                                         void (^)(size_t));
 
-constexpr uint64_t kDispatchApplyAttrCommand = 0x2000;
-constexpr uint64_t kDispatchApplyAttrSet = 0x1;
-constexpr uint64_t kDispatchApplyAttrClear = 0x2;
-constexpr uint64_t kSharedResourceClusterConcurrency = 2;
+constexpr uint64_t kDispatchApplySharedResource = 1;
 
-BsdThreadCtlFn cpu_shared_resource_control() {
-  static const auto control = reinterpret_cast<BsdThreadCtlFn>(
-      dlsym(RTLD_DEFAULT, "__bsdthread_ctl"));
-  return control;
-}
+struct DispatchApplyAttrApi {
+  DispatchApplyAttrInitFn init;
+  DispatchApplyAttrDestroyFn destroy;
+  DispatchApplyAttrSetParallelismFn set_parallelism;
+  DispatchApplyWithAttrFn apply;
 
-bool set_cpu_shared_resource_policy(size_t worker_index, bool enabled) {
-  auto control = cpu_shared_resource_control();
-  return control &&
-         control(kDispatchApplyAttrCommand,
-                 enabled ? kDispatchApplyAttrSet : kDispatchApplyAttrClear,
-                 static_cast<uint64_t>(worker_index),
-                 kSharedResourceClusterConcurrency) == 0;
+  explicit operator bool() const {
+    return init && destroy && set_parallelism && apply;
+  }
+};
+
+const DispatchApplyAttrApi &dispatch_apply_attr_api() {
+  static const DispatchApplyAttrApi api{
+      reinterpret_cast<DispatchApplyAttrInitFn>(
+          dlsym(RTLD_DEFAULT, "dispatch_apply_attr_init")),
+      reinterpret_cast<DispatchApplyAttrDestroyFn>(
+          dlsym(RTLD_DEFAULT, "dispatch_apply_attr_destroy")),
+      reinterpret_cast<DispatchApplyAttrSetParallelismFn>(
+          dlsym(RTLD_DEFAULT, "dispatch_apply_attr_set_parallelism")),
+      reinterpret_cast<DispatchApplyWithAttrFn>(
+          dlsym(RTLD_DEFAULT, "dispatch_apply_with_attr")),
+  };
+  return api;
 }
 
 bool cpu_shared_resource_policy_available() {
-  static const bool available = [] {
-    if (!set_cpu_shared_resource_policy(0, true)) {
-      return false;
-    }
-    return set_cpu_shared_resource_policy(0, false);
-  }();
-  return available;
+  return static_cast<bool>(dispatch_apply_attr_api());
 }
 
-class ScopedCpuSharedResourcePolicy {
+class ScopedDispatchApplyAttributes {
 public:
-  ScopedCpuSharedResourcePolicy(size_t worker_index, bool enabled)
-      : worker_index_(worker_index), active_(enabled &&
-                set_cpu_shared_resource_policy(worker_index, true)) {}
+  explicit ScopedDispatchApplyAttributes(int parallelism) {
+    const auto &api = dispatch_apply_attr_api();
+    if (!api) {
+      return;
+    }
+    api.init(&attributes_);
+    active_ = true;
+    api.set_parallelism(&attributes_, static_cast<intptr_t>(parallelism),
+                        kDispatchApplySharedResource);
+  }
 
-  ~ScopedCpuSharedResourcePolicy() {
+  ~ScopedDispatchApplyAttributes() {
     if (active_) {
-      set_cpu_shared_resource_policy(worker_index_, false);
+      dispatch_apply_attr_api().destroy(&attributes_);
     }
   }
 
-  ScopedCpuSharedResourcePolicy(const ScopedCpuSharedResourcePolicy &) = delete;
-  ScopedCpuSharedResourcePolicy &
-  operator=(const ScopedCpuSharedResourcePolicy &) = delete;
+  ScopedDispatchApplyAttributes(const ScopedDispatchApplyAttributes &) = delete;
+  ScopedDispatchApplyAttributes &
+  operator=(const ScopedDispatchApplyAttributes &) = delete;
+
+  DispatchApplyAttrStorage *get() { return &attributes_; }
+  bool active() const { return active_; }
 
 private:
-  size_t worker_index_;
-  bool active_;
+  DispatchApplyAttrStorage attributes_{};
+  bool active_{false};
 };
 
 void cpu_fp16_matmul(const array &input, const array &weight, array &output,
@@ -1230,23 +1251,19 @@ void cpu_fp16_matmul(const array &input, const array &weight, array &output,
       std::getenv("OMLX_QWEN35_CPU_MANUAL_SHARDS");
   const int requested_threads =
       shared_resource && cpu_threads == 0 ? 8 : std::max(cpu_threads, 0);
-  const int manual_shards = shared_resource
-                                ? requested_threads
-                                : (manual_shards_value
-                                       ? (std::strcmp(manual_shards_value,
-                                                      "threads") == 0
-                                              ? requested_threads
-                                              : std::max(std::atoi(
-                                                             manual_shards_value),
-                                                         0))
-                                       : 0);
-  const char *manual_axis_value =
-      std::getenv("OMLX_QWEN35_CPU_MANUAL_AXIS");
+  const int manual_shards =
+      shared_resource
+          ? requested_threads
+          : (manual_shards_value
+                 ? (std::strcmp(manual_shards_value, "threads") == 0
+                        ? requested_threads
+                        : std::max(std::atoi(manual_shards_value), 0))
+                 : 0);
+  const char *manual_axis_value = std::getenv("OMLX_QWEN35_CPU_MANUAL_AXIS");
   const bool shard_columns =
       manual_axis_value && std::strcmp(manual_axis_value, "columns") == 0;
-  const bool use_shared_resource =
-      shared_resource && !shard_columns &&
-      cpu_shared_resource_policy_available();
+  const bool use_shared_resource = shared_resource && !shard_columns &&
+                                   cpu_shared_resource_policy_available();
   const int shard_extent = shard_columns ? N : M;
   if (manual_shards > 1 && shard_extent > 1) {
     const int shards = std::min(manual_shards, shard_extent);
@@ -1254,85 +1271,95 @@ void cpu_fp16_matmul(const array &input, const array &weight, array &output,
     auto *input_data = const_cast<_Float16 *>(input.data<_Float16>());
     auto *weight_data = const_cast<_Float16 *>(weight.data<_Float16>());
     auto *output_data = output.data<_Float16>();
-    dispatch_apply(
-        static_cast<size_t>(shards),
-        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-        ^(size_t index) {
-          const int row_blocks = M / 64;
-          const bool align_rows = use_shared_resource && M % 64 == 0 &&
-                                  row_blocks >= shards;
-          const int begin = align_rows
-                                ? static_cast<int>(
-                                      (static_cast<int64_t>(row_blocks) *
-                                       index) /
-                                      shards) *
-                                      64
-                                : static_cast<int>(
-                                      (static_cast<int64_t>(shard_extent) *
-                                       index) /
-                                      shards);
-          const int end = align_rows
-                              ? static_cast<int>(
-                                    (static_cast<int64_t>(row_blocks) *
-                                     (index + 1)) /
-                                    shards) *
-                                    64
-                              : static_cast<int>(
-                                    (static_cast<int64_t>(shard_extent) *
-                                     (index + 1)) /
-                                    shards);
-          const int row_begin = shard_columns ? 0 : begin;
-          const int row_end = shard_columns ? M : end;
-          const int column_begin = shard_columns ? begin : 0;
-          const int column_end = shard_columns ? end : N;
-          const int rows = row_end - row_begin;
-          const int columns = column_end - column_begin;
-          auto input_desc = cpu_matrix_descriptor(
-              input_data + static_cast<size_t>(row_begin) * K, rows, K,
-              BNNSDataTypeFloat16);
-          auto weight_desc = cpu_matrix_descriptor(
-              weight_data + static_cast<size_t>(column_begin) * K, columns, K,
-              BNNSDataTypeFloat16);
-          auto output_desc = cpu_matrix_descriptor(
-              output_data + static_cast<size_t>(row_begin) * N + column_begin,
-              rows, columns, BNNSDataTypeFloat16);
-          if (shard_columns) {
-            output_desc.stride[0] = 1;
-            output_desc.stride[1] = static_cast<size_t>(N);
-          }
-          BNNSFilterParameters filter_params{};
-          filter_params.n_threads = 1;
-          ScopedCpuSharedResourcePolicy scheduler_policy(
-              index, use_shared_resource);
-          const ssize_t workspace_size = BNNSMatMulWorkspaceSize(
-              false, true, 1.0f, &input_desc, &weight_desc, &output_desc,
-              &filter_params);
-          if (workspace_size < 0) {
-            failure->store(1, std::memory_order_relaxed);
-            return;
-          }
-          std::vector<uint8_t> workspace(static_cast<size_t>(workspace_size));
-          if (BNNSMatMul(false, true, 1.0f, &input_desc, &weight_desc,
-                         &output_desc,
-                         workspace.empty() ? nullptr : workspace.data(),
-                         &filter_params) != 0) {
-            failure->store(1, std::memory_order_relaxed);
-          }
-        });
-    if (failure->load(std::memory_order_relaxed) != 0) {
+    void (^work)(size_t) = ^(size_t index) {
+      try {
+        const int row_blocks = M / 64;
+        const bool align_rows =
+            use_shared_resource && M % 64 == 0 && row_blocks >= shards;
+        const int begin =
+            align_rows
+                ? static_cast<int>((static_cast<int64_t>(row_blocks) * index) /
+                                   shards) *
+                      64
+                : static_cast<int>(
+                      (static_cast<int64_t>(shard_extent) * index) / shards);
+        const int end =
+            align_rows ? static_cast<int>(
+                             (static_cast<int64_t>(row_blocks) * (index + 1)) /
+                             shards) *
+                             64
+                       : static_cast<int>((static_cast<int64_t>(shard_extent) *
+                                           (index + 1)) /
+                                          shards);
+        const int row_begin = shard_columns ? 0 : begin;
+        const int row_end = shard_columns ? M : end;
+        const int column_begin = shard_columns ? begin : 0;
+        const int column_end = shard_columns ? end : N;
+        const int rows = row_end - row_begin;
+        const int columns = column_end - column_begin;
+        auto input_desc = cpu_matrix_descriptor(
+            input_data + static_cast<size_t>(row_begin) * K, rows, K,
+            BNNSDataTypeFloat16);
+        auto weight_desc = cpu_matrix_descriptor(
+            weight_data + static_cast<size_t>(column_begin) * K, columns, K,
+            BNNSDataTypeFloat16);
+        auto output_desc = cpu_matrix_descriptor(
+            output_data + static_cast<size_t>(row_begin) * N + column_begin,
+            rows, columns, BNNSDataTypeFloat16);
+        if (shard_columns) {
+          output_desc.stride[0] = 1;
+          output_desc.stride[1] = static_cast<size_t>(N);
+        }
+        BNNSFilterParameters filter_params{};
+        filter_params.n_threads = 1;
+        const ssize_t workspace_size =
+            BNNSMatMulWorkspaceSize(false, true, 1.0f, &input_desc,
+                                    &weight_desc, &output_desc, &filter_params);
+        if (workspace_size < 0) {
+          failure->store(1, std::memory_order_relaxed);
+          return;
+        }
+        std::vector<uint8_t> workspace(static_cast<size_t>(workspace_size));
+        if (BNNSMatMul(false, true, 1.0f, &input_desc, &weight_desc,
+                       &output_desc,
+                       workspace.empty() ? nullptr : workspace.data(),
+                       &filter_params) != 0) {
+          failure->store(1, std::memory_order_relaxed);
+        }
+      } catch (const std::bad_alloc &) {
+        failure->store(2, std::memory_order_relaxed);
+      } catch (...) {
+        failure->store(3, std::memory_order_relaxed);
+      }
+    };
+    ScopedDispatchApplyAttributes attributes(shards);
+    if (use_shared_resource && attributes.active()) {
+      dispatch_apply_attr_api().apply(static_cast<size_t>(shards),
+                                      attributes.get(), work);
+    } else {
+      dispatch_apply(static_cast<size_t>(shards),
+                     dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                     work);
+    }
+    const int failure_code = failure->load(std::memory_order_relaxed);
+    if (failure_code == 2) {
+      throw std::runtime_error(
+          "Unable to allocate an Accelerate CPU fp16 matrix workspace.");
+    }
+    if (failure_code != 0) {
       throw std::runtime_error(
           "Accelerate rejected a manually sharded CPU fp16 matrix multiply.");
     }
     return;
   }
-  auto input_desc = cpu_matrix_descriptor(
-      const_cast<_Float16 *>(input.data<_Float16>()), M, K,
-      BNNSDataTypeFloat16);
-  auto weight_desc = cpu_matrix_descriptor(
-      const_cast<_Float16 *>(weight.data<_Float16>()), N, K,
-      BNNSDataTypeFloat16);
-  auto output_desc = cpu_matrix_descriptor(output.data<_Float16>(), M, N,
-                                            BNNSDataTypeFloat16);
+  auto input_desc =
+      cpu_matrix_descriptor(const_cast<_Float16 *>(input.data<_Float16>()), M,
+                            K, BNNSDataTypeFloat16);
+  auto weight_desc =
+      cpu_matrix_descriptor(const_cast<_Float16 *>(weight.data<_Float16>()), N,
+                            K, BNNSDataTypeFloat16);
+  auto output_desc =
+      cpu_matrix_descriptor(output.data<_Float16>(), M, N, BNNSDataTypeFloat16);
   BNNSFilterParameters filter_params{};
   filter_params.n_threads = static_cast<size_t>(std::max(cpu_threads, 0));
   const ssize_t workspace_size = BNNSMatMulWorkspaceSize(
