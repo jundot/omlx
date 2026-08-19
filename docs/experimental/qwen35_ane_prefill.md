@@ -37,13 +37,16 @@ The implementation uses undocumented APIs and can stop working after a macOS
 update. It also requantizes the selected weights to per-output-channel INT8,
 so it is an approximate acceleration path rather than bit-exact inference.
 
-On NAX GPUs (the M5 family) the tensor units run the quantized prefill
-matmuls faster than the ANE INT8 offload, so enabling the feature there
-regressed both prefill and decode in field testing. The patch therefore
-skips itself when NAX is available and logs the reason, mirroring the FA-256
-gate. `OMLX_QWEN35_ANE_PREFILL=1` forces the path on for benchmarking, and
-`OMLX_QWEN35_ANE_PREFILL=0` keeps it off everywhere regardless of the
-per-model setting.
+On NAX GPUs (the M5 family) the hybrid GPU suffix runs on dedicated NAX
+qmm kernels (group sizes 64 and 128), which resolves the prefill regression
+that early field testing saw when the suffix competed with tensor-unit
+prefill. The optimal ANE/GPU balance sits well below the classic ~50%
+optimum there, so use the Tune ANE Split utility in the model settings to
+measure the split for the specific machine before enabling. If the NAX
+metallib is missing at runtime, the suffix quietly falls back to the
+classic Metal kernels, and `OMLX_QWEN35_QMM_NAX=0` forces that fallback.
+`OMLX_QWEN35_ANE_PREFILL=0` keeps the whole feature off everywhere
+regardless of the per-model setting.
 
 ## Per-model settings
 

@@ -54,6 +54,18 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
 
 
+def test_apply_profile_surfaces_server_validation_error():
+    script = _dashboard_script()
+    method = script.split("async applyProfileToForm(profile) {", 1)[1].split(
+        "async applyTemplateToForm(template) {", 1
+    )[0]
+
+    assert "this.profileError = '';" in method
+    assert "const data = await r.json().catch(() => ({}));" in method
+    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
+    assert "this.profileError = String(e);" in method
+
+
 def test_reasoning_effort_has_presets_and_custom_input():
     """Common strings stay convenient while model-specific values remain usable."""
     html = _model_settings_template()
@@ -136,7 +148,14 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_gdn_hint",
         "modal.model_settings.qwen_ane_gdn_fraction",
         "modal.model_settings.qwen_ane_gdn_layers",
-        "modal.model_settings.qwen_ane_measured",
+        "modal.model_settings.qwen_ane_tune",
+        "modal.model_settings.qwen_ane_tune_hint",
+        "modal.model_settings.qwen_ane_tune_start",
+        "modal.model_settings.qwen_ane_tune_cancel",
+        "modal.model_settings.qwen_ane_tune_apply",
+        "modal.model_settings.qwen_ane_tune_applying",
+        "modal.model_settings.qwen_ane_tune_applied",
+        "modal.model_settings.qwen_ane_tune_preparing",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -167,11 +186,12 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
 
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
-    assert '<option value="0.53" selected>53% —' in html
-    assert '<option value="0.5" selected>50% —' in html
+    assert '<option value="0.53" selected>53%</option>' in html
+    assert '<option value="0.5" selected>50%</option>' in html
+    assert "measured optimum" not in html
 
 
-def test_qwen_ane_selects_have_static_values_and_measured_defaults():
+def test_qwen_ane_selects_have_static_values_and_configured_defaults():
     """Alpine initializes the select before dynamic child bindings."""
     html = _model_settings_template()
     section = _section(
@@ -186,7 +206,34 @@ def test_qwen_ane_selects_have_static_values_and_measured_defaults():
     assert "<option :value=" not in section
 
 
-def test_qwen_ane_web_defaults_match_measured_profile():
+def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
+    html = _model_settings_template()
+    script = _dashboard_script()
+
+    assert "startANETuning()" in html
+    assert "cancelANETuning()" in html
+    assert "applyANETuningRecommendation()" in html
+    assert "aneTuningRecommendationText()" in html
+    assert "'/admin/api/bench/ane-tune/start'" in script
+    assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results" in script
+    assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
+    assert "qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
+    assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
+
+
+def test_qwen_ane_fraction_selects_cover_nax_tuner_results():
+    html = _model_settings_template()
+    section = _section(
+        html,
+        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+        "<!-- TurboQuant KV Cache -->",
+    )
+
+    for value in ("0.15", "0.25", "0.35", "0.45", "0.53"):
+        assert section.count(f'<option value="{value}"') == 2
+
+
+def test_qwen_ane_web_defaults_match_configured_profile():
     script = _dashboard_script()
     state = script.split("buildModelSettingsState(model, settings) {", 1)[1].split(
         "_resetPresetApplicableFields()", 1
@@ -199,3 +246,16 @@ def test_qwen_ane_web_defaults_match_measured_profile():
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
     assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
     assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
+
+
+def test_js_embedded_translations_escape_apostrophes():
+    # A t() value dropped into a single-quoted Alpine JS string breaks the
+    # whole expression as soon as a translation contains an apostrophe (or a
+    # trailing backslash). Every quoted embed must run the JS-escape replace
+    # chain instead of interpolating the raw translation.
+    import re
+
+    unsafe = re.findall(
+        r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
+    )
+    assert unsafe == []

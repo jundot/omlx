@@ -1,4 +1,5 @@
 #include "qwen35_ane.h"
+#include "qwen35_prefill.h"
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
@@ -1122,6 +1123,35 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
 
 namespace {
 
+std::atomic<bool> g_hybrid_nax_runtime_ok{true};
+
+bool hybrid_nax_enabled() {
+  const char *override = std::getenv("OMLX_QWEN35_QMM_NAX");
+  if (override && (std::strcmp(override, "0") == 0 ||
+                   std::strcmp(override, "false") == 0 ||
+                   std::strcmp(override, "off") == 0)) {
+    return false;
+  }
+  return g_hybrid_nax_runtime_ok.load(std::memory_order_relaxed) &&
+         is_nax_available() && nax_qmm_kernels_built() &&
+         nax_qmm_runtime_active();
+}
+
+std::string hybrid_nax_qmm_name(int bits, int group_size,
+                                const std::string &type) {
+  return "qwen35_q" + std::to_string(bits) +
+         (group_size == 128 ? "_affine_qmm128_t_nax_"
+                            : "_affine_qmm_t_nax_") +
+         type + "_bm_64_bk_64_bn_64_wm_2_wn_2";
+}
+
+std::string hybrid_classic_qmm_name(int bits, int group_size,
+                                    const std::string &type) {
+  return "qwen35_q" + std::to_string(bits) +
+         (group_size == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_") +
+         type + "_bm_64_bk_32_bn_64";
+}
+
 class AneHybridQ4Primitive : public Primitive {
 public:
   AneHybridQ4Primitive(Stream stream, std::shared_ptr<AneLinearModel> model,
@@ -1199,12 +1229,24 @@ public:
                   profile_now_ns() - operation_start);
     }
 
-    std::string qmm_name = "qwen35_q" + std::to_string(bits_) +
-                           (group_size_ == 128 ? "_affine_qmm128_t_"
-                                               : "_affine_qmm_t_") +
-                           metal_type_name(x.dtype()) +
-                           "_bm_64_bk_32_bn_64";
-    auto qmm = device.get_kernel(qmm_name, library);
+    const std::string qmm_type = metal_type_name(x.dtype());
+    auto qmm = [&] {
+      if (hybrid_nax_enabled()) {
+        try {
+          auto nax_library = device.get_library(
+              "omlx_qwen35_prefill_kernels_nax", binary_dir());
+          return device.get_kernel(
+              hybrid_nax_qmm_name(bits_, group_size_, qmm_type), nax_library);
+        } catch (const std::exception &) {
+          // Older app bundles may carry an extension without the matching
+          // group-size-128 metallib. Keep the private ANE path usable by
+          // permanently demoting its suffix to the classic kernel.
+          g_hybrid_nax_runtime_ok.store(false, std::memory_order_relaxed);
+        }
+      }
+      return device.get_kernel(
+          hybrid_classic_qmm_name(bits_, group_size_, qmm_type), library);
+    }();
     encoder.set_compute_pipeline_state(qmm);
     encoder.set_input_array(weight, 0);
     encoder.set_input_array(scales, 1);
@@ -1398,12 +1440,21 @@ public:
                   profile_now_ns() - operation_start);
     }
 
-    std::string qmm_name = "qwen35_q" + std::to_string(bits_) +
-                           (group_size_ == 128 ? "_affine_qmm128_t_"
-                                               : "_affine_qmm_t_") +
-                           metal_type_name(x.dtype()) +
-                           "_bm_64_bk_32_bn_64";
-    auto qmm = device.get_kernel(qmm_name, library);
+    const std::string qmm_type = metal_type_name(x.dtype());
+    auto qmm = [&] {
+      if (hybrid_nax_enabled()) {
+        try {
+          auto nax_library = device.get_library(
+              "omlx_qwen35_prefill_kernels_nax", binary_dir());
+          return device.get_kernel(
+              hybrid_nax_qmm_name(bits_, group_size_, qmm_type), nax_library);
+        } catch (const std::exception &) {
+          g_hybrid_nax_runtime_ok.store(false, std::memory_order_relaxed);
+        }
+      }
+      return device.get_kernel(
+          hybrid_classic_qmm_name(bits_, group_size_, qmm_type), library);
+    }();
     encoder.set_compute_pipeline_state(qmm);
     encoder.set_input_array(weight, 0);
     encoder.set_input_array(scales, 1);

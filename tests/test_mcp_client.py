@@ -336,6 +336,42 @@ class TestMCPClientConnect:
         assert streamable_http_client.state == MCPServerState.CONNECTED
 
     @pytest.mark.asyncio
+    async def test_connect_streamable_http_uses_sdk_v2_stream_pair(
+        self, streamable_http_client: MCPClient
+    ):
+        """The MCP 2.x transport yields only the read/write stream pair."""
+        pytest.importorskip("mcp")
+        read_stream = MagicMock()
+        write_stream = MagicMock()
+        http_client = MagicMock()
+        transport = MagicMock()
+        session = MagicMock()
+        transport.__aenter__.return_value = (read_stream, write_stream)
+
+        with (
+            patch("httpx.AsyncClient", return_value=http_client),
+            patch(
+                "mcp.client.streamable_http.streamable_http_client",
+                return_value=transport,
+            ) as mock_transport,
+            patch("mcp.ClientSession", return_value=session) as mock_session,
+        ):
+            await streamable_http_client._connect_streamable_http()
+
+        http_client.__aenter__.assert_awaited_once_with()
+        mock_transport.assert_called_once_with(
+            url="http://localhost:3000/mcp", http_client=http_client
+        )
+        transport.__aenter__.assert_awaited_once_with()
+        mock_session.assert_called_once_with(read_stream, write_stream)
+        session.__aenter__.assert_awaited_once_with()
+
+        await streamable_http_client._cleanup_resources()
+        session.__aexit__.assert_awaited_once_with(None, None, None)
+        transport.__aexit__.assert_awaited_once_with(None, None, None)
+        http_client.__aexit__.assert_awaited_once_with(None, None, None)
+
+    @pytest.mark.asyncio
     async def test_connect_stdio_passes_cwd_to_sdk(self):
         """cwd from the server config reaches StdioServerParameters (#1111).
 

@@ -231,6 +231,60 @@ class TestProfileRoutes:
         assert r.status_code == 200
         assert r.json()["settings"]["active_profile_name"] == "coding"
 
+    def test_apply_profile_resolves_vlm_mtp_processor_conflict(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(
+                vlm_mtp_enabled=True,
+                vlm_mtp_draft_model="qwen-mtp-drafter",
+            ),
+        )
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "penalty",
+                "display_name": "Penalty",
+                "settings": {"presence_penalty": 1.5},
+            },
+        )
+
+        r = c.post("/admin/api/models/model-a/profiles/penalty/apply")
+
+        assert r.status_code == 200, r.text
+        settings = r.json()["settings"]
+        assert settings["presence_penalty"] == 1.5
+        assert settings["vlm_mtp_enabled"] is False
+        assert settings["active_profile_name"] == "penalty"
+        assert mgr.get_settings("model-a").vlm_mtp_enabled is False
+
+    def test_apply_profile_validation_error_is_400_without_partial_write(self, client):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(
+                vlm_mtp_enabled=True,
+                vlm_mtp_draft_model="qwen-mtp-drafter",
+            ),
+        )
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "dflash",
+                "display_name": "DFlash",
+                "settings": {"dflash_enabled": True},
+            },
+        )
+
+        r = c.post("/admin/api/models/model-a/profiles/dflash/apply")
+
+        assert r.status_code == 400
+        assert "vlm_mtp_enabled and dflash_enabled" in r.json()["detail"]
+        persisted = mgr.get_settings("model-a")
+        assert persisted.vlm_mtp_enabled is True
+        assert persisted.dflash_enabled is False
+        assert persisted.active_profile_name is None
+
     def test_apply_profile_sanitizes_diffusion_unsupported_settings(self, client):
         c, mgr = client
         pool = admin_routes._get_engine_pool()

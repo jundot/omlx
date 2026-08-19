@@ -143,7 +143,7 @@ grammar = [
     "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
 ]
 modelscope = [
     "modelscope>=1.10.0",
@@ -178,7 +178,7 @@ paroquant = [
 # git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
 # separately via --no-deps post-resolution.
 bundle = [
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
     "modelscope>=1.10.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
@@ -204,7 +204,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
     # The torch-stub smoke test (tests/test_torch_stub.py) gates
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
@@ -228,7 +228,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.3",
     "apache-tvm-ffi==0.1.11",

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -85,6 +86,203 @@ def _bind_generation_thread_stream(
         yield
     finally:
         response_generator_type._generate = original_generate
+
+
+def _encode_thinking_marker(tokenizer: Any, text: str) -> list[int] | None:
+    try:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        try:
+            ids = tokenizer.encode(text)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if not ids:
+        return None
+    encoded = [token_id for token_id in ids if isinstance(token_id, int)]
+    return encoded or None
+
+
+def _think_token_ids(tokenizer: Any) -> tuple[list[int], int | None]:
+    """Resolve the close-think token ID(s) and open-think token ID from mlx-lm.
+
+    The single-machine scheduler reads these off the tokenizer and feeds them
+    into ``ThinkingBudgetProcessor``. The rank has the same tokenizer, so it
+    can resolve them the same way (scheduler.py ``_get_think_token_id`` /
+    ``_resolve_think_end_token_ids`` / ``_encode_thinking_marker``).
+    """
+    think_end_ids: list[int] | None = None
+
+    try:
+        end_id = getattr(tokenizer, "think_end_id", None)
+        if end_id is not None:
+            think_end_ids = [end_id]
+    except (ValueError, TypeError):
+        pass
+    if think_end_ids is None:
+        think_end_str = getattr(tokenizer, "think_end", None) or "</think>"
+        think_end_ids = _encode_thinking_marker(tokenizer, think_end_str)
+    if think_end_ids is None:
+        try:
+            tid = tokenizer.convert_tokens_to_ids("</think>")
+            if isinstance(tid, int) and tid != getattr(tokenizer, "unk_token_id", None):
+                think_end_ids = [tid]
+        except (AttributeError, KeyError, TypeError):
+            pass
+    try:
+        think_start_id = getattr(tokenizer, "think_start_id", None)
+    except (ValueError, TypeError):
+        think_start_id = None
+    if not isinstance(think_start_id, int):
+        try:
+            start_text = getattr(tokenizer, "think_start", None) or "<think>"
+            candidate = tokenizer.convert_tokens_to_ids(start_text)
+            think_start_id = (
+                candidate
+                if isinstance(candidate, int)
+                and candidate != getattr(tokenizer, "unk_token_id", None)
+                else None
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            think_start_id = None
+    return think_end_ids or [], think_start_id
+
+
+def _thinking_close_pattern(
+    tokenizer: Any, think_end_text: str
+) -> tuple[list[int] | None, list[int] | None]:
+    """Resolve whitespace tokens surrounding a close-think marker."""
+    template = getattr(tokenizer, "_chat_template", None) or getattr(
+        tokenizer, "chat_template", None
+    )
+    if not template:
+        return None, None
+    template = template if isinstance(template, str) else str(template)
+    match = re.search(
+        r"(\\n|\\r|[\n\r])*" + re.escape(think_end_text) + r"((?:\\n|\\r|[\n\r])*)",
+        template,
+    )
+    if match is None:
+        return None, None
+    matched = match.group(0)
+    leading, trailing = matched.split(think_end_text, 1)
+    leading = leading.replace("\\n", "\n").replace("\\r", "\r")
+    trailing = trailing.replace("\\n", "\n").replace("\\r", "\r")
+    return (
+        _encode_thinking_marker(tokenizer, leading) if leading else None,
+        _encode_thinking_marker(tokenizer, trailing) if trailing else None,
+    )
+
+
+def _thinking_budget_token_to_piece(
+    tokenizer: Any, token_id: int
+) -> str | bytes | None:
+    """Best-effort token piece lookup for UTF-8-safe budget forcing."""
+    try:
+        token = tokenizer.convert_ids_to_tokens(token_id)
+        if isinstance(token, bytes):
+            return token
+        if isinstance(token, str):
+            byte_fallback = re.fullmatch(r"(?:<0x[0-9A-Fa-f]{2}>)+", token)
+            if byte_fallback is not None:
+                return bytes(
+                    int(match.group(1), 16)
+                    for match in re.finditer(r"<0x([0-9A-Fa-f]{2})>", token)
+                )
+            byte_decoder = getattr(tokenizer, "byte_decoder", None)
+            if isinstance(byte_decoder, dict) and token:
+                try:
+                    return bytes(byte_decoder[character] for character in token)
+                except (KeyError, TypeError, ValueError):
+                    pass
+            return token
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    try:
+        return tokenizer.decode([token_id], skip_special_tokens=False)
+    except TypeError:
+        try:
+            return tokenizer.decode([token_id])
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+@contextmanager
+def _install_thinking_budget_support(mlx_server: Any, tokenizer: Any):
+    """Make the rank honor a per-request ``thinking_budget``.
+
+    MLX-LM's server builds its logits processors once from CLI args
+    (``_make_logits_processors``) and never looks at the request body, so a
+    thinking budget forwarded by the coordinator is silently ignored. Wrap that
+    factory so a request carrying ``chat_template_kwargs.thinking_budget`` gets
+    an ``omlx`` ``ThinkingBudgetProcessor`` appended, enforcing the budget in
+    the rank's decode loop exactly like single-machine inference does.
+    """
+    from omlx.api.thinking import ThinkingBudgetProcessor, prompt_opens_thinking
+
+    think_end_ids, think_start_id = _think_token_ids(tokenizer)
+    if not think_end_ids:
+        yield
+        return
+
+    original = mlx_server._make_logits_processors
+    response_generator_type = mlx_server.ResponseGenerator
+    original_tokenize = response_generator_type._tokenize
+    think_end_text = getattr(tokenizer, "think_end", None) or "</think>"
+    leading_ids, trailing_ids = _thinking_close_pattern(tokenizer, think_end_text)
+
+    def token_to_piece(token_id: int) -> str | bytes | None:
+        return _thinking_budget_token_to_piece(tokenizer, token_id)
+
+    @wraps(original_tokenize)
+    def tokenize_with_thinking_state(
+        instance: Any, request_tokenizer: Any, request: Any, args: Any
+    ) -> Any:
+        result = original_tokenize(instance, request_tokenizer, request, args)
+        prompt, initial_state = result[0], result[3]
+        active = initial_state == "reasoning"
+        if getattr(request, "request_type", None) == "text":
+            active, _ = prompt_opens_thinking(
+                request_tokenizer,
+                getattr(request, "prompt", ""),
+                prompt,
+            )
+        args._omlx_thinking_active = active
+        return result
+
+    @wraps(original)
+    def with_thinking_budget(args: Any) -> list[Any]:
+        processors = original(args)
+        kwargs = getattr(args, "chat_template_kwargs", None) or {}
+        budget = kwargs.get("thinking_budget")
+        if (
+            budget is not None
+            and kwargs.get("enable_thinking") is not False
+            and getattr(args, "_omlx_thinking_active", False)
+        ):
+            processors = list(processors)
+            processors.append(
+                ThinkingBudgetProcessor(
+                    think_end_token_ids=think_end_ids,
+                    budget=budget,
+                    think_start_token_id=think_start_id,
+                    leading_token_ids=leading_ids,
+                    trailing_token_ids=trailing_ids,
+                    token_to_piece=token_to_piece,
+                )
+            )
+        return processors
+
+    response_generator_type._tokenize = tokenize_with_thinking_state
+    mlx_server._make_logits_processors = with_thinking_budget
+    try:
+        yield
+    finally:
+        mlx_server._make_logits_processors = original
+        response_generator_type._tokenize = original_tokenize
 
 
 class RuntimeMarker:
@@ -1028,6 +1226,10 @@ def run_worker(args: argparse.Namespace) -> int:
                         ResponseGenerator,
                         mx,
                         generation_stream,
+                    ),
+                    _install_thinking_budget_support(
+                        mlx_server,
+                        provider.tokenizer,
                     ),
                 ):
                     # install_server_telemetry also runs the idle heartbeat for

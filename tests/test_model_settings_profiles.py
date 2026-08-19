@@ -295,6 +295,35 @@ class TestApplyProfile:
         mgr.apply_profile("m", "p")
         assert mgr.get_settings("m").turboquant_kv_enabled is True
 
+    def test_apply_resolves_vlm_mtp_processor_conflict(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "m",
+            ModelSettings(
+                vlm_mtp_enabled=True,
+                vlm_mtp_draft_model="qwen-mtp-drafter",
+            ),
+        )
+        manager.save_profile(
+            "m",
+            "penalty",
+            "Penalty",
+            None,
+            {"presence_penalty": 1.5},
+        )
+
+        applied = manager.apply_profile("m", "penalty")
+
+        assert applied is not None
+        assert applied.presence_penalty == 1.5
+        assert applied.vlm_mtp_enabled is False
+        assert applied.active_profile_name == "penalty"
+
+        persisted = ModelSettingsManager(tmp_path).get_settings("m")
+        assert persisted.presence_penalty == 1.5
+        assert persisted.vlm_mtp_enabled is False
+        assert persisted.active_profile_name == "penalty"
+
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"
         profiles_file.write_text(

@@ -20,8 +20,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
-from omlx.custom_kernels.nax import is_nax_available
-
 logger = logging.getLogger(__name__)
 
 _COMPILE_LOCK = threading.RLock()
@@ -1057,18 +1055,6 @@ def enable_qwen35_ane_prefill(
     if env in ("0", "false", "off"):
         logger.info("Qwen ANE prefill disabled by OMLX_QWEN35_ANE_PREFILL")
         return 0
-    if env not in ("1", "true", "on") and is_nax_available():
-        # Auto: on NAX GPUs (M5 family) the tensor units run the quantized
-        # prefill matmuls faster than the ANE INT8 offload, so the hybrid
-        # split makes the ANE the bottleneck while the fixed-shape scheduler
-        # alignment also drops the wider Qwen prefill floor (M5 Pro report:
-        # 17.6k-token TTFT 54.7s -> 65-88s on 0.6.1, issue #2779).
-        # OMLX_QWEN35_ANE_PREFILL=1 forces the path on for benchmarking.
-        logger.info(
-            "Qwen ANE prefill skipped: NAX GPU, tensor-unit prefill is faster"
-        )
-        return 0
-
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 

@@ -444,11 +444,11 @@
                                     </button>
                                 </div>
                                 <p x-show="modelSettings.enable_thinking == null && modelSettings.thinking_default != null"
-                                   class="text-xs text-neutral-400" x-text="'{{ t('modal.model_settings.enable_thinking_default') }}'"></p>
+                                   class="text-xs text-neutral-400" x-text="'{{ t('modal.model_settings.enable_thinking_default')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></p>
                                 <p x-show="modelSettings.enable_thinking != null && modelSettings.thinking_default != null && modelSettings.enable_thinking !== modelSettings.thinking_default"
                                    class="text-xs text-amber-500 cursor-pointer hover:text-amber-600"
                                    @click="modelSettings.enable_thinking = null"
-                                   x-text="'{{ t('modal.model_settings.enable_thinking_reset') }}'"></p>
+                                   x-text="'{{ t('modal.model_settings.enable_thinking_reset')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></p>
                             </div>
 
                             <!-- Thinking Budget -->
@@ -688,7 +688,7 @@
                                                     :disabled="importingMtplx"
                                                     :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
                                                     class="mt-2 px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
-                                                    x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing') }}' : '{{ t('modal.model_settings.mtplx_import') }}'"></button>
+                                                    x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '{{ t('modal.model_settings.mtplx_import')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
                                             <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                         </div>
@@ -698,9 +698,9 @@
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
                                                             ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
                                                             : (modelSettings.dflash_enabled
-                                                                ? '{{ t('modal.model_settings.mtp_conflict_dflash') }}'
+                                                                ? '{{ t('modal.model_settings.mtp_conflict_dflash')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                 : (modelSettings.vlm_mtp_enabled
-                                                                    ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}'
+                                                                    ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))"
                                                 :class="[
                                                     modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
@@ -749,10 +749,13 @@
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_mlp_fraction') }}</label>
                                                     <select x-model.number="modelSettings.qwen35_ane_prefill_fraction"
                                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        <option value="0.15">15%</option>
+                                                        <option value="0.25">25%</option>
+                                                        <option value="0.35">35%</option>
                                                         <option value="0.4">40%</option>
                                                         <option value="0.45">45%</option>
                                                         <option value="0.5">50%</option>
-                                                        <option value="0.53" selected>53% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
+                                                        <option value="0.53" selected>53%</option>
                                                         <option value="0.55">55%</option>
                                                         <option value="0.6">60%</option>
                                                     </select>
@@ -798,9 +801,12 @@
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_gdn_fraction') }}</label>
                                                     <select x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"
                                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        <option value="0.15">15%</option>
+                                                        <option value="0.25">25%</option>
+                                                        <option value="0.35">35%</option>
                                                         <option value="0.4">40%</option>
                                                         <option value="0.45">45%</option>
-                                                        <option value="0.5" selected>50% — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
+                                                        <option value="0.5" selected>50%</option>
                                                         <option value="0.53">53%</option>
                                                         <option value="0.55">55%</option>
                                                         <option value="0.6">60%</option>
@@ -813,6 +819,60 @@
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                 </div>
                                             </div>
+                                        </div>
+
+                                        <div class="pt-4 border-t border-neutral-200 space-y-3">
+                                            <div class="flex items-start justify-between gap-4">
+                                                <div class="min-w-0">
+                                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_tune') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_tune_hint') }}</p>
+                                                </div>
+                                                <div class="flex flex-shrink-0 items-center gap-2">
+                                                    <button type="button"
+                                                            x-show="!aneTuningForSelectedModel() || (!aneTuning.running && !aneTuning.status?.recommendation)"
+                                                            @click="startANETuning()"
+                                                            :disabled="aneTuning.running"
+                                                            :class="aneTuning.running ? 'opacity-40 cursor-not-allowed' : ''"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
+                                                        {{ t('modal.model_settings.qwen_ane_tune_start') }}
+                                                    </button>
+                                                    <button type="button"
+                                                            x-show="aneTuningForSelectedModel() && aneTuning.running"
+                                                            @click="cancelANETuning()"
+                                                            :disabled="aneTuning.cancelling"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-red-200 bg-white text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40">
+                                                        {{ t('modal.model_settings.qwen_ane_tune_cancel') }}
+                                                    </button>
+                                                    <button type="button"
+                                                            x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
+                                                            @click="applyANETuningRecommendation()"
+                                                            :disabled="aneTuning.applying || aneTuning.applied"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors disabled:opacity-40"
+                                                            x-text="aneTuning.applied
+                                                                ? '{{ t('modal.model_settings.qwen_ane_tune_applied')|replace('\\', '\\\\')|replace("'", "\\'") }}'
+                                                                : (aneTuning.applying
+                                                                    ? '{{ t('modal.model_settings.qwen_ane_tune_applying')|replace('\\', '\\\\')|replace("'", "\\'") }}'
+                                                                    : '{{ t('modal.model_settings.qwen_ane_tune_apply')|replace('\\', '\\\\')|replace("'", "\\'") }}')"></button>
+                                                </div>
+                                            </div>
+
+                                            <div x-show="aneTuningForSelectedModel() && aneTuning.running" x-cloak class="space-y-1.5">
+                                                <div class="flex items-center justify-between gap-3 text-xs text-neutral-600">
+                                                    <span class="truncate" x-text="aneTuning.status?.message || '{{ t('modal.model_settings.qwen_ane_tune_preparing')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></span>
+                                                    <span class="tabular-nums"
+                                                          x-text="`${aneTuning.status?.current || 0}/${aneTuning.status?.total || aneTuning.total || 0}`"></span>
+                                                </div>
+                                                <div class="h-1.5 overflow-hidden rounded-full bg-neutral-200">
+                                                    <div class="h-full rounded-full bg-neutral-900 transition-all duration-300"
+                                                         :style="`width: ${aneTuningProgressPercent()}%`"></div>
+                                                </div>
+                                            </div>
+
+                                            <p x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
+                                               x-cloak class="text-xs text-neutral-600"
+                                               x-text="aneTuningRecommendationText()"></p>
+                                            <p x-show="aneTuningForSelectedModel() && aneTuning.error"
+                                               x-cloak class="text-xs text-red-600" x-text="aneTuning.error"></p>
                                         </div>
                                     </div>
                                 </template>
@@ -827,7 +887,7 @@
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}' : '')"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -891,7 +951,7 @@
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}' : '')"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
                                                 :class="[
                                                     modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -949,9 +1009,9 @@
                                                 :disabled="!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.dflash_compatible
                                                             ? (modelSettings.mtp_enabled
-                                                                ? '{{ t('modal.model_settings.mtp_conflict_dflash') }}'
+                                                                ? '{{ t('modal.model_settings.mtp_conflict_dflash')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                 : (modelSettings.vlm_mtp_enabled
-                                                                    ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}'
+                                                                    ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))
                                                             : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
                                                 :class="[

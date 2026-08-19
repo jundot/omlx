@@ -144,7 +144,7 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
     assert "clusterTopologySummary()" in cluster
     assert "Physical peer detected" not in cluster
     assert "Ports detected" not in cluster
-    assert "async initializeClusterSetup()" in javascript
+    assert "async initializeClusterSetup({ preview = true } = {})" in javascript
     assert "this.loadClusterKnownNodes();" in javascript
     assert "omlx.cluster.knownNodes" in javascript
     assert "Cached nodes are display hints only" in javascript

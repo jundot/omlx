@@ -219,6 +219,63 @@ struct BenchCancelResponse: Codable, Sendable {
 }
 
 // =============================================================================
+// MARK: - Qwen ANE/GPU split tuner
+// =============================================================================
+
+struct ANETuningStartRequest: Encodable, Sendable {
+    let modelId: String
+    let sequenceLength: Int
+    let repeats: Int
+}
+
+struct ANETuningStartResponse: Codable, Sendable {
+    let tuningId: String
+    let status: String
+    let total: Int
+}
+
+struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
+    let label: String
+    let enabled: Bool
+    let mlpFraction: Double?
+    let gdnEnabled: Bool
+    let gdnFraction: Double?
+    let processingTps: Double
+    let samples: [Double]
+    let speedupPercent: Double?
+
+    var id: String { label }
+}
+
+struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
+    let enabled: Bool
+    let mlpFraction: Double?
+    let gdnEnabled: Bool
+    let gdnFraction: Double?
+    let processingTps: Double
+    let speedupPercent: Double
+    let sequenceLength: Int
+}
+
+struct ANETuningStatusResponse: Codable, Sendable {
+    let tuningId: String
+    let modelId: String
+    let status: String
+    let phase: String
+    let message: String
+    let current: Int
+    let total: Int
+    let results: [ANETuningCandidateDTO]
+    let recommendation: ANETuningRecommendationDTO?
+    let error: String?
+}
+
+struct ANETuningCancelResponse: Codable, Sendable {
+    let status: String
+    let tuningId: String
+}
+
+// =============================================================================
 // MARK: - Accuracy bench
 // =============================================================================
 
