@@ -2250,6 +2250,10 @@ def _chain_next_drafts(
         return_hidden=True,
         logits_keep=1,
         draft_mode=compact,
+        # Committed-history flush (challenge a3104b04): leading rows only
+        # append K/V, the final row runs the full layer. Falls back inside
+        # mtp_forward when the head is multi-layer or the fold is 1 row.
+        kv_only_history=True,
     )
     state.hist_offset += int(n)
 

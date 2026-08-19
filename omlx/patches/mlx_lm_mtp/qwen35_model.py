@@ -76,6 +76,24 @@ def _compact_draft_enabled() -> bool:
         "off",
     )
 
+
+_KV_ONLY_HISTORY_ENV = "OMLX_QWEN_KV_ONLY_HISTORY"
+
+
+def _kv_only_history_enabled() -> bool:
+    """Opt-in (challenge a3104b04). Token-exact but measured neutral on
+    M4 Max (87.30 vs 87.43 ms/tok, 128-tok MTP) — per the port bar a
+    neutral optimization ships opt-in, not default-on. Set to 1 to enable the
+    K/V-only committed-history head flush."""
+    import os
+
+    return os.environ.get(_KV_ONLY_HISTORY_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     """True iff ``cls.<attr>`` is the function we previously installed.
 
@@ -244,6 +262,31 @@ def _patch_attention_packed_qkv(q35: Any) -> None:
     __call__._omlx_packed_qkv_marker = True
     cls.__call__ = __call__
 
+    def append_history_kv(self, x, cache=None):
+        """Append rows to the attention cache without producing a query
+        output (challenge a3104b04 — MTP-head committed-history flush).
+        The target never uses this proposal-head maintenance primitive."""
+        import mlx.core as mx
+
+        B, L, _ = x.shape
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+        if cache is not None:
+            keys = self.rope(keys, offset=cache.offset)
+        else:
+            keys = self.rope(keys)
+        if cache is not None:
+            cache.update_and_fetch(keys=keys, values=values)
+        return keys, values
+
+    cls.append_history_kv = append_history_kv
+
 
 # ---------------------------------------------------------------------------
 # TextModelArgs.from_dict — surface mtp_num_hidden_layers as instance attr.
@@ -320,6 +363,12 @@ def _register_mtp_classes(q35: Any) -> None:
             h = x + r
             return h + self.mlp(self.post_attention_layernorm(h))
 
+        def append_history_kv(self, x, cache=None):
+            """Populate this layer's K/V history without computing a dead
+            layer output (challenge a3104b04). Only valid when no later MTP
+            layer consumes that output — the single-layer head guarantees it."""
+            self.self_attn.append_history_kv(self.input_layernorm(x), cache)
+
     class MTPModule(nn.Module):
         """Multi-Token Prediction head from PR #990.
 
@@ -355,6 +404,40 @@ def _register_mtp_classes(q35: Any) -> None:
                 fused = layer(fused, mask, c)
 
             return self.norm(fused)
+
+        def mtp_last_hidden_kv_only(
+            self, hidden_states, next_token_ids, embed_tokens, cache=None
+        ):
+            """Run one proposal flush while omitting leading-row outputs that
+            have no consumer (challenge a3104b04). Every supplied row still
+            participates in the fusion stage and contributes K/V state; only
+            the final row needs a full decoder output. Multi-layer heads fail
+            closed (None) before mutating cache state."""
+            layers = self.layers
+            if (
+                len(layers) != 1
+                or cache is None
+                or len(cache) != 1
+                or hidden_states.shape[1] <= 1
+                or next_token_ids.shape[1] != hidden_states.shape[1]
+            ):
+                return None
+
+            embeds = embed_tokens(next_token_ids)
+            e = self.pre_fc_norm_embedding(embeds)
+            h = self.pre_fc_norm_hidden(hidden_states)
+            fused = self.fc(mx.concatenate([e, h], axis=-1))
+            history_count = fused.shape[1] - 1
+
+            layer = layers[0]
+            c = cache[0]
+            layer.append_history_kv(
+                fused[:, :history_count], cache=c
+            )
+
+            current = fused[:, history_count:]
+            mask = create_attention_mask(current, c)
+            return self.norm(layer(current, mask=mask, cache=c))
 
     q35.MTPDecoderLayer = MTPDecoderLayer
     q35.MTPModule = MTPModule
@@ -672,6 +755,7 @@ def _patch_text_model(q35: Any) -> None:
         return_hidden: bool = False,
         logits_keep: int = 0,
         draft_mode: bool = False,
+        kv_only_history: bool = False,
     ):
         """MTP-head forward.
 
@@ -690,7 +774,33 @@ def _patch_text_model(q35: Any) -> None:
         before they reach the verify block. Only the PROPOSAL side changes —
         the target decides every emitted token, so token fidelity is
         untouched.
+
+        ``kv_only_history`` (challenge a3104b04) runs a committed-history
+        flush so leading rows only append K/V state (their decoder outputs
+        are dead); the final row runs the full layer and its post-norm hidden
+        is returned. Falls back to the full forward when the head is
+        multi-layer or the flush is a single row.
         """
+        if kv_only_history and _kv_only_history_enabled():
+            mtp_out = self.mtp.mtp_last_hidden_kv_only(
+                hidden_states,
+                next_token_ids,
+                self.model.embed_tokens,
+                mtp_cache,
+            )
+            if mtp_out is not None:
+                logits_source = mtp_out
+                if logits_keep and logits_source.shape[1] > logits_keep:
+                    logits_source = logits_source[:, -logits_keep:, :]
+                if draft_mode and self._omlx_compact_draft_active():
+                    logits = self._compact_draft_logits(logits_source)
+                elif self.args.tie_word_embeddings:
+                    logits = self.model.embed_tokens.as_linear(logits_source)
+                else:
+                    logits = self.lm_head(logits_source)
+                if return_hidden:
+                    return logits, mtp_out
+                return logits
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -1021,6 +1131,7 @@ def _patch_outer_model(q35: Any) -> None:
         return_hidden: bool = False,
         logits_keep: int = 0,
         draft_mode: bool = False,
+        kv_only_history: bool = False,
     ):
         return self.language_model.mtp_forward(
             hidden_states,
@@ -1029,6 +1140,7 @@ def _patch_outer_model(q35: Any) -> None:
             return_hidden=return_hidden,
             logits_keep=logits_keep,
             draft_mode=draft_mode,
+            kv_only_history=kv_only_history,
         )
 
     def make_mtp_cache(self):
