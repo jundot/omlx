@@ -1408,21 +1408,39 @@ def enable_qwen35_ane_prefill(
         logger.warning("ANE native extension unavailable; Qwen ANE prefill skipped")
         return 0
     if not _install_dispatch():
+        logger.warning(
+            "Qwen ANE prefill: dispatch hook could not be installed "
+            "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
+            "running prefill on GPU"
+        )
         return 0
 
     config = _AnePrefillConfig(sequence_length, fraction, variant, dual_ane)
     candidates = []
-    modules = model.modules() if hasattr(model, "modules") else ()
-    for module in modules:
+    scanned_mlp = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
         if not all(
             hasattr(module, name) for name in ("gate_proj", "up_proj", "down_proj")
         ):
             continue
+        scanned_mlp += 1
         if not _eligible_pair(module):
             continue
         candidates.append(module)
         if len(candidates) >= max_layers:
             break
+
+    if not candidates:
+        # The most common silent no-op: ANE was requested but every dense MLP
+        # failed the eligibility gate (needs affine int4/5/6/8 quant with
+        # group_size 64 or 128). GDN may still be eligible below; the final
+        # summary warns if nothing at all is compiled.
+        logger.warning(
+            "Qwen ANE prefill requested but no eligible MLP layers found "
+            "(%d dense MLP module(s) scanned; ANE requires affine int4/5/6/8 "
+            "quantization with group_size 64 or 128)",
+            scanned_mlp,
+        )
 
     banked = _enable_dual_procedure_banks(
         model,
@@ -1439,7 +1457,7 @@ def enable_qwen35_ane_prefill(
         model._omlx_ane_dual_prefill_count = dual_count
         model._omlx_ane_resident_program_count = resident_programs
         model._omlx_ane_procedure_count = count + gdn_count
-        if count:
+        if count or gdn_count:
             logger.info(
                 "Eagerly compiled %d MLP and %d GDN procedures into %d "
                 "instance-pinned ANE programs (sequence_length=%d)",
@@ -1447,6 +1465,11 @@ def enable_qwen35_ane_prefill(
                 gdn_count,
                 resident_programs,
                 sequence_length,
+            )
+        else:
+            logger.warning(
+                "Qwen ANE prefill enabled but 0 procedures were compiled; "
+                "the whole model runs prefill on GPU"
             )
         return count
 
@@ -1544,4 +1567,33 @@ def enable_qwen35_ane_prefill(
             gdn_fraction,
             dual_ane,
         )
+    if not count and not gdn_count:
+        logger.warning(
+            "Qwen ANE prefill enabled but 0 procedures were compiled; "
+            "the whole model runs prefill on GPU"
+        )
     return count
+
+
+def qwen35_ane_prefill_status(model: Any) -> dict:
+    """Report the ANE prefill state that :func:`enable_qwen35_ane_prefill`
+    attached to ``model``.
+
+    Returns a JSON-serialisable dict, safe to call on any model (an untouched
+    model reports ``attempted=False``). ``configured`` is True only when at
+    least one MLP or GDN procedure was compiled onto the ANE, so callers can
+    tell an inactive ANE apart from a silent no-op.
+    """
+    attempted = hasattr(model, "_omlx_ane_mlp_prefill_count")
+    mlp = int(getattr(model, "_omlx_ane_mlp_prefill_count", 0) or 0)
+    gdn = int(getattr(model, "_omlx_ane_gdn_prefill_count", 0) or 0)
+    return {
+        "attempted": attempted,
+        "configured": bool(mlp or gdn),
+        "mlp_layers": mlp,
+        "gdn_layers": gdn,
+        "dual_ane_layers": int(getattr(model, "_omlx_ane_dual_prefill_count", 0) or 0),
+        "resident_programs": int(
+            getattr(model, "_omlx_ane_resident_program_count", 0) or 0
+        ),
+    }

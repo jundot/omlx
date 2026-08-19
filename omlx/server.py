@@ -2501,7 +2501,41 @@ async def server_status(_: bool = Depends(verify_api_key)):
             format_size(model_memory_max) if model_memory_max else "unlimited"
         ),
         "custom_kernels": native_kernel_status(),
+        "ane_prefill": _ane_prefill_status(pool),
     }
+
+
+def _ane_prefill_status(pool) -> dict:
+    """Aggregate the Qwen ANE prefill state across loaded models.
+
+    Best-effort and defensive: any model that never attempted ANE prefill is
+    omitted, so an empty ``models`` list means no loaded model uses it. Lets a
+    statusline distinguish "ANE active on N layers" from a silent no-op.
+    """
+    result = {"available": False, "configured_models": 0, "models": []}
+    if pool is None:
+        return result
+    try:
+        from .patches.qwen35_ane_prefill import qwen35_ane_prefill_status
+    except Exception:  # noqa: BLE001 - patch optional at runtime
+        return result
+    result["available"] = True
+    try:
+        for model_id, entry in pool._entries.items():
+            engine = getattr(entry, "engine", None)
+            mdl = getattr(engine, "_model", None) if engine is not None else None
+            if mdl is None:
+                continue
+            st = qwen35_ane_prefill_status(mdl)
+            if not st["attempted"]:
+                continue
+            st["model_id"] = model_id
+            result["models"].append(st)
+            if st["configured"]:
+                result["configured_models"] += 1
+    except Exception as exc:  # noqa: BLE001 - status must never fail the endpoint
+        logger.warning("ANE prefill status unavailable: %s", exc)
+    return result
 
 
 def _markitdown_virtual_model_status() -> dict:

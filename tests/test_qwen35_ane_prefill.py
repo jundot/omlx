@@ -1504,3 +1504,67 @@ def test_enable_env_kill_switch_wins(monkeypatch):
 
     assert count == 0
     assert installed == []
+
+
+# --- ANE prefill observability (feat/ane-prefill-observability) ---
+
+
+def test_prefill_status_reports_configured_layers():
+    """qwen35_ane_prefill_status surfaces the counters enable_ attaches."""
+    model = SimpleNamespace(
+        _omlx_ane_mlp_prefill_count=12,
+        _omlx_ane_gdn_prefill_count=4,
+        _omlx_ane_dual_prefill_count=8,
+        _omlx_ane_resident_program_count=24,
+    )
+    status = ane_patch.qwen35_ane_prefill_status(model)
+    assert status == {
+        "attempted": True,
+        "configured": True,
+        "mlp_layers": 12,
+        "gdn_layers": 4,
+        "dual_ane_layers": 8,
+        "resident_programs": 24,
+    }
+
+
+def test_prefill_status_flags_attempted_but_empty():
+    """A model that ran enable_ but compiled nothing reports the no-op, not silence."""
+    model = SimpleNamespace(
+        _omlx_ane_mlp_prefill_count=0,
+        _omlx_ane_gdn_prefill_count=0,
+        _omlx_ane_dual_prefill_count=0,
+        _omlx_ane_resident_program_count=0,
+    )
+    status = ane_patch.qwen35_ane_prefill_status(model)
+    assert status["attempted"] is True
+    assert status["configured"] is False
+
+
+def test_prefill_status_safe_on_untouched_model():
+    """Any model that never attempted ANE prefill is reported cleanly."""
+    status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
+    assert status["attempted"] is False
+    assert status["configured"] is False
+    assert status["mlp_layers"] == 0
+
+
+def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
+    """The dominant silent no-op (ANE requested, no eligible MLP) now warns."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    # force the banked path to decline so the plain loop reports the empty result
+    monkeypatch.setattr(ane_patch, "_enable_dual_procedure_banks", lambda *a, **k: None)
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+
+    model = SimpleNamespace(modules=lambda: [])  # no dense MLP modules at all
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(model)
+
+    assert count == 0
+    assert "no eligible MLP layers found" in caplog.text
+    # counters are attached even on the empty path, so status is never silent
+    assert ane_patch.qwen35_ane_prefill_status(model)["attempted"] is True
