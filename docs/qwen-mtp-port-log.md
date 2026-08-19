@@ -54,7 +54,7 @@ absent).
 | 17 | 2026-08-16 | `a3104b04-715a-4a7e-a58a-8445b68b54a8` | `cf35029` | ⏳ | ⏳ | pending (adds Qwen35MTP.swift model) |
 | 18 | 2026-08-16 | `9ef7b7f1-7373-43d0-9a60-3a4e885f1198` | `4eb5448` — fused full-attention Q/K RMSNorm+partial-RoPE Metal kernel | — | ✅ | no port: C++ Metal kernel in vendored mlx-swift (MLXFast.metalKernel); Python mlx ships prebuilt kernels. The equivalent q/rms-norm/rope math runs in mlx's graph with identical primitives |
 | 19 | 2026-08-16 | `22ce3162-41e8-4d8b-8199-bbbc555e00a6` | `e3b4531` — packed GDN prework mixer Metal kernel (conv+SiLU+split+norm+g in one launch; beta stays graph) | — | ✅ | no port: C++ Metal kernel. Python GDN prework runs the same primitives as graph ops; the one-input sigmoid ULP hazard (0xC0DB) is Metal-kernel-specific |
-| 20 | 2026-08-16 | `aa7c3e0c-20d1-4b27-a80c-e622e7880999` | `df404e0` | ⏳ | ⏳ | pending |
+| 20 | 2026-08-16 | `aa7c3e0c-20d1-4b27-a80c-e622e7880999` | `df404e0` — SIMD-shuffle draft top-1 reduction kernel | — | ✅ | no port: C++ Metal kernel; the draft proposal argmax is a graph `mx.argmax` in omlx with the same total order (value-desc, id-asc) |
 | 21 | 2026-08-16 | `e6c5ef35-0d86-4cec-a5d6-366e2e59cdcd` | `7351e62` | ⏳ | ⏳ | pending |
 | 22 | 2026-08-16 | `f03469a9-d889-4bca-8061-a4ad3178c7d2` | `c7468c5` — draftPolicy 1-line | ⏳ | ⏳ | policy-only submission |
 | 23 | 2026-08-16 | `776d7168-e968-40c4-808e-f643ec1953a7` | `4aacc53` — session +5 | ⏳ | ⏳ | pending |
