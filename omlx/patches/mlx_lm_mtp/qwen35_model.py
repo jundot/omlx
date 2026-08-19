@@ -140,6 +140,7 @@ def apply() -> bool:
     _patch_qwen3_5_moe()
 
     _patch_attention_packed_qkv(q35)
+    _patch_gdn_compiled_fusions(q35)
 
     if not hasattr(q35.TextModel, "_omlx_mtp_patched"):
         q35.TextModel._omlx_mtp_patched = "patch"
@@ -148,8 +149,60 @@ def apply() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Qwen3NextAttention — packed Q/K/V concat on N (challenge 088f763b).
+# GatedDeltaNet — compiled post-norm SiLU product (challenge 6cb6c963).
 # ---------------------------------------------------------------------------
+
+_COMPILED_FUSIONS_ENV = "OMLX_QWEN_COMPILED_FUSIONS"
+
+
+def _compiled_fusions_enabled() -> bool:
+    """Opt-in (challenge 6cb6c963). The Swift fuses the fp32 g+beta producer
+    and the post-norm SiLU product into compiled Metal passes. In Python,
+    mlx-lm's ``compute_g`` is already compiled (shapeless); the two-output
+    g+beta fusion is NOT ported — the laguna C1 finding shows two-output
+    compiled functions consuming a shared intermediate can diverge from eager
+    at ULP in MLX 0.32, and beta feeds the verify recurrence where fidelity is
+    absolute. The single-output post-norm SiLU product is safe (C1: single-
+    output compiled fusions are bit-exact) and is offered opt-in here; it
+    measured marginal on M4 Max."""
+    import os
+
+    return os.environ.get(_COMPILED_FUSIONS_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _patch_gdn_compiled_fusions(q35: Any) -> None:
+    """Optionally route the GDN post-norm SiLU product through a compiled
+    single-output function. Behavior is identical to eager unless
+    ``OMLX_QWEN_COMPILED_FUSIONS=1``."""
+    try:
+        from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated, _precise_swiglu
+    except ImportError:
+        return
+    if getattr(Qwen3NextRMSNormGated, "_omlx_compiled_swiglu_patched", False):
+        return
+
+    import mlx.core as mx
+
+    compiled_swiglu = mx.compile(
+        lambda h, gate, x: _precise_swiglu(h, gate, x)
+    )
+    original_call = Qwen3NextRMSNormGated.__call__
+
+    def __call__(self, hidden_states, gate=None):
+        x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
+        if gate is not None:
+            if _compiled_fusions_enabled():
+                return compiled_swiglu(hidden_states, gate, x)
+            return _precise_swiglu(hidden_states, gate, x)
+        return x.astype(hidden_states.dtype)
+
+    Qwen3NextRMSNormGated.__call__ = __call__
+    Qwen3NextRMSNormGated._omlx_compiled_swiglu_patched = True
 
 _PACKED_QKV_ENV = "OMLX_QWEN_PACKED_QKV"
 
