@@ -136,9 +136,9 @@ does not pay off.
 
 The tuner preserves the model's single- or dual-ANE execution setting. In
 single-ANE mode it compiles one unpinned calibration bank and tunes ANE/GPU
-MLP and GDN splits normally. CPU down-projection sharing remains available;
-CPU gate/up and CPU GDN sharing are omitted because those fused native paths
-currently require dual-ANE dispatch.
+MLP and GDN splits normally. CPU gate/up, down-projection, and GDN sharing are
+all calibrated in either mode when the checkpoint has the required eager FP16
+rows and the matching native symbols are available.
 
 The scheduler keeps its normal prompt chunk width; chunks wider than the
 compiled ANE shape are tiled internally. sequence_length must therefore not

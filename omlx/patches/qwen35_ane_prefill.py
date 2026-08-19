@@ -287,12 +287,28 @@ def _eligible_pair(mlp: Any) -> bool:
     )
 
 
-def _cpu_gate_kernel_symbol(bits: int) -> str | None:
+def _cpu_gate_kernel_symbol(bits: int, *, dual: bool = True) -> str | None:
     if bits == 4:
-        return "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+        return (
+            "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+            if dual
+            else "qwen35_ane_cpu_fp16_q4_swiglu_t"
+        )
     if bits in (5, 6, 8):
-        return "qwen35_ane_dual_cpu_fp16_swiglu_t"
+        return (
+            "qwen35_ane_dual_cpu_fp16_swiglu_t"
+            if dual
+            else "qwen35_ane_cpu_fp16_swiglu_t"
+        )
     return None
+
+
+def _cpu_gdn_kernel_symbol(*, dual: bool) -> str:
+    return (
+        "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
+        if dual
+        else "qwen35_ane_cpu_fp16_affine_qmm_t"
+    )
 
 
 def _prepare_cpu_linear(
@@ -360,10 +376,9 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
     ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and dual_ane
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
-        and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
+        and fast.has_symbol(_cpu_gate_kernel_symbol(bits, dual=dual_ane))
     )
     cpu_outputs = (
         (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
@@ -503,10 +518,9 @@ def _prepare_pair_for_bank(
     ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and dual_ane
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
-        and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
+        and fast.has_symbol(_cpu_gate_kernel_symbol(bits, dual=dual_ane))
     )
     cpu_outputs = (
         (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
@@ -622,10 +636,11 @@ def _prepare_pair_runtime_state(
     ane_outputs = (int(output_dim * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and config.dual_ane
         and gate.scales.dtype == mx.float16
         and up.scales.dtype == mx.float16
-        and fast.has_symbol(_cpu_gate_kernel_symbol(bits))
+        and fast.has_symbol(
+            _cpu_gate_kernel_symbol(bits, dual=bool(config.dual_ane))
+        )
     )
     cpu_outputs = (
         (int(output_dim * config.cpu_fraction) // 64) * 64 if cpu_enabled else 0
@@ -815,9 +830,8 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and dual_ane
         and qkv.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+        and fast.has_symbol(_cpu_gdn_kernel_symbol(dual=dual_ane))
     )
     cpu_outputs = (
         (int(total_outputs * config.cpu_fraction) // 64) * 64
@@ -967,9 +981,8 @@ def _prepare_gdn_for_bank(
 
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and dual_ane
         and qkv.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+        and fast.has_symbol(_cpu_gdn_kernel_symbol(dual=dual_ane))
     )
     cpu_outputs = (
         (int(total_outputs * config.cpu_fraction) // 64) * 64
@@ -1093,9 +1106,10 @@ def _prepare_gdn_runtime_state(
     ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
     cpu_enabled = bool(
         config.cpu_fraction > 0
-        and config.dual_ane
         and qkv.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+        and fast.has_symbol(
+            _cpu_gdn_kernel_symbol(dual=bool(config.dual_ane))
+        )
     )
     cpu_outputs = (
         (int(total_outputs * config.cpu_fraction) // 64) * 64
@@ -1165,22 +1179,38 @@ def _gdn_backend_exact(
         from omlx.custom_kernels.qwen35_prefill import fast
         from omlx.patches.qwen35_q4_mlp import _post_ane_qmm_or_linear
 
-        if state.model1 is not None and state.cpu_weight is not None:
-            combined = fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
-                x,
-                state.cpu_weight,
-                state.weight,
-                state.scales,
-                state.biases,
-                state.model,
-                state.model1,
-                state.bits,
-                config.variant,
-                state.group_size,
-                1,
-                config.cpu_threads,
-                config.cpu_shared_resource,
-            )
+        if state.cpu_weight is not None:
+            if state.model1 is not None:
+                combined = fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+                    x,
+                    state.cpu_weight,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.model1,
+                    state.bits,
+                    config.variant,
+                    state.group_size,
+                    1,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
+            else:
+                combined = fast.qwen35_ane_cpu_fp16_affine_qmm_t(
+                    x,
+                    state.cpu_weight,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    state.bits,
+                    config.variant,
+                    state.group_size,
+                    1,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
         elif state.model1 is not None:
             combined = fast.qwen35_ane_dual_affine_qmm_t(
                 x,
@@ -1311,8 +1341,8 @@ def _backend_exact(
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
-        if state.model1 is not None and state.cpu_weight is not None:
-            if state.bits == 4:
+        if state.cpu_weight is not None:
+            if state.model1 is not None and state.bits == 4:
                 activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
                     x,
                     state.cpu_weight,
@@ -1326,7 +1356,7 @@ def _backend_exact(
                     config.cpu_threads,
                     config.cpu_shared_resource,
                 )
-            else:
+            elif state.model1 is not None:
                 activation = fast.qwen35_ane_dual_cpu_fp16_swiglu_t(
                     x,
                     state.cpu_weight,
@@ -1335,6 +1365,33 @@ def _backend_exact(
                     state.biases,
                     state.model,
                     state.model1,
+                    state.bits,
+                    config.variant,
+                    state.group_size,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
+            elif state.bits == 4:
+                activation = fast.qwen35_ane_cpu_fp16_q4_swiglu_t(
+                    x,
+                    state.cpu_weight,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
+                    config.variant,
+                    state.group_size,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
+            else:
+                activation = fast.qwen35_ane_cpu_fp16_swiglu_t(
+                    x,
+                    state.cpu_weight,
+                    state.weight,
+                    state.scales,
+                    state.biases,
+                    state.model,
                     state.bits,
                     config.variant,
                     state.group_size,

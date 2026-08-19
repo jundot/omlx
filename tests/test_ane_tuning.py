@@ -59,6 +59,10 @@ def test_candidate_settings_preserve_single_ane_mode():
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
 
     assert tuned.qwen35_ane_prefill_dual_ane is False
+    assert tuned.qwen35_ane_prefill_cpu_enabled is True
+    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.14
+    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.20
+    assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.13
 
 
 def test_candidate_settings_apply_tuner_boolean_overrides():

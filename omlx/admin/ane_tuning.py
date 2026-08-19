@@ -769,11 +769,12 @@ def _calibrate_components_sync(
     bits = int(gate.bits)
     cpu_gate_supported = bool(
         run.request.allow_cpu
-        and dual_ane
         and bits in (4, 5, 6, 8)
         and gate.scales.dtype == mx.float16
         and mlp.up_proj.scales.dtype == mx.float16
-        and fast.has_symbol(patch._cpu_gate_kernel_symbol(bits))
+        and fast.has_symbol(
+            patch._cpu_gate_kernel_symbol(bits, dual=dual_ane)
+        )
     )
     down = mlp.down_proj
     cpu_down_supported = bool(
@@ -784,13 +785,12 @@ def _calibrate_components_sync(
     )
     gdn_cpu_supported = bool(
         run.request.allow_cpu
-        and dual_ane
         and run.request.allow_cpu_gdn
         and run.request.allow_ane_gdn
         and gdn is not None
         and gate.scales.dtype == mx.float16
         and gdn.in_proj_qkv.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_affine_qmm_t")
+        and fast.has_symbol(patch._cpu_gdn_kernel_symbol(dual=dual_ane))
     )
     cpu_shared = bool(
         (cpu_gate_supported or cpu_down_supported or gdn_cpu_supported)
