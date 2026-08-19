@@ -331,7 +331,11 @@ def main() -> None:
                 gdn=not args.disable_gdn,
                 gdn_fraction=args.single_gdn_fraction,
                 dual_ane=False,
-                cpu_fraction=0.0,
+                cpu_fraction=args.cpu_fraction,
+                cpu_down_fraction=args.cpu_down_fraction,
+                cpu_gdn_fraction=args.cpu_gdn_fraction,
+                cpu_threads=args.cpu_threads,
+                cpu_shared_resource=not args.disable_cpu_shared_resource,
             )
             compile_seconds = time.perf_counter() - started
         elif mode == "dual":
@@ -357,14 +361,14 @@ def main() -> None:
         variants: list[tuple[str, int | None, float | None]] = [
             (mode, None, None)
         ]
-        if mode == "dual" and args.cpu_threads_grid:
+        if mode in ("single", "dual") and args.cpu_threads_grid:
             variants = [
-                (f"dual_cpu_threads_{threads}", threads, None)
+                (f"{mode}_cpu_threads_{threads}", threads, None)
                 for threads in args.cpu_threads_grid
             ]
-        if mode == "dual" and args.cpu_gdn_fraction_grid:
+        if mode in ("single", "dual") and args.cpu_gdn_fraction_grid:
             variants = [
-                (f"dual_cpu_gdn_{fraction:.3f}", None, fraction)
+                (f"{mode}_cpu_gdn_{fraction:.3f}", None, fraction)
                 for fraction in args.cpu_gdn_fraction_grid
             ]
         for result_key, cpu_threads, cpu_gdn_fraction in variants:
