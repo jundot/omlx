@@ -1929,6 +1929,30 @@ class TestGlobalSettings:
         assert not any("http_proxy" in e.lower() for e in errors)
         assert not any("https_proxy" in e.lower() for e in errors)
 
+    def test_validate_valid_socks5_proxy(self):
+        """Test SOCKS5 proxy URLs pass validation."""
+        settings = GlobalSettings()
+        settings.network.http_proxy = "socks5h://127.0.0.1:1080"
+        settings.network.https_proxy = "socks5://127.0.0.1:1080"
+        errors = settings.validate()
+        assert not any("http_proxy" in e.lower() for e in errors)
+        assert not any("https_proxy" in e.lower() for e in errors)
+
+    def test_accepted_proxy_schemes_work_in_both_client_stacks(self):
+        """Every accepted scheme must be dialable by httpx and requests.
+
+        Guards the allowlist against drifting past what the installed
+        client stacks (socksio for httpx, PySocks for requests) support.
+        """
+        import httpx
+        import requests.adapters
+
+        for scheme in ("http://", "https://", "socks5://", "socks5h://"):
+            url = f"{scheme}127.0.0.1:1080"
+            httpx.Client(proxy=url).close()  # raises ValueError if unsupported
+            # requests resolves SOCKS support at adapter construction
+            requests.adapters.HTTPAdapter().proxy_manager_for(url)
+
     def test_priority_cli_over_env_over_file(self):
         """Test that CLI > env > file > defaults priority is respected."""
         with tempfile.TemporaryDirectory() as tmpdir:
