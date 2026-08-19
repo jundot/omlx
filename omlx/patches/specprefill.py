@@ -186,7 +186,9 @@ def _mla_extract_queries(attn, x, cache=None, **kwargs):
         q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(x)))
     q = q.reshape(B, L, n_heads, attn.q_head_dim).transpose(0, 2, 1, 3)
     q_nope, q_pe = mx.split(q, [attn.qk_nope_head_dim], axis=-1)
-    offset = cache.offset if cache is not None else 0
+    # DSA layers hand a CacheList here (latent MLA at 0, indexer at 1),
+    # which exposes no ``.offset`` of its own — descend instead of crashing.
+    offset = _cache_offset(cache)
     q_pe = attn.rope(q_pe, offset)
     if getattr(attn, "embed_q", None) is not None:
         q_nope = attn.embed_q(q_nope)
@@ -458,6 +460,12 @@ def _compute_importance(
         if not captures:
             continue
         cache = attn_caches[layer_i]
+        # DSA layers store a CacheList (latent MLA at 0, indexer at 1); the
+        # scoreable keys live in the attention slot. A bare ``.keys`` access
+        # crashes on exactly those models.
+        inner = getattr(cache, "caches", None)
+        if inner:
+            cache = inner[_ROPE_SLOT_ATTENTION]
         prompt_keys = cache.keys[..., :n_prompt, :]
         # Skip windowed/rotating caches that don't span the full prompt
         if prompt_keys.shape[-2] < n_prompt:
@@ -632,13 +640,15 @@ def score_tokens(
     # Trim lookahead tokens from cache before returning.
     # KVCache stores keys/values as contiguous tensors; slicing back
     # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    # DSA CacheList entries expose no ``.offset``: descend into their
+    # children, otherwise lookahead KV silently persists to stored caches.
+    for entry in cache:
+        for c in getattr(entry, "caches", None) or (entry,):
+            if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
+                if hasattr(c, "keys") and c.keys is not None:
+                    c.keys = c.keys[..., :pre_lookahead_offset, :]
+                    c.values = c.values[..., :pre_lookahead_offset, :]
+                c.offset = pre_lookahead_offset
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()
