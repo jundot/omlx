@@ -139,7 +139,9 @@ def test_i18n_key_present_in_all_locales():
     for loc in locales:
         data = json.loads((I18N / f"{loc}.json").read_text(encoding="utf-8"))
         assert "chat.enhanced_readability" in data, f"{loc} missing key"
-        assert (
-            data["chat.enhanced_readability"] == "Enhanced Readability"
-        ), f"{loc} not English fallback"
         assert "chat.enhanced_readability_desc" in data
+        label = data["chat.enhanced_readability"]
+        assert label.strip(), f"{loc} empty label"
+        # Only zh translates the label; all other locales keep the English fallback.
+        if loc != "zh":
+            assert label == "Enhanced Readability", f"{loc} not English fallback"

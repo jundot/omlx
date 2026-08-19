@@ -1302,7 +1302,7 @@
                                 <div class="flex items-end gap-4 flex-wrap">
                                     <!-- Model Selector -->
                                     <div class="flex-1">
-                                        <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.select_model') }} <span class="normal-case font-normal">(full precision only)</span></label>
+                                        <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.oq.select_model') }} <span class="normal-case font-normal">{{ t('models.oq.full_precision_only') }}</span></label>
                                         <select x-model="oqSelectedModelPath"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <option value="">{{ t('models.oq.select_placeholder') }}</option>
@@ -1314,19 +1314,19 @@
                                     <!-- Sensitivity Model (optional, all models) -->
                                     <div class="flex-1" x-show="oqSelectedModelPath && oqSensitivityModelCandidates().length > 0" x-cloak>
                                         <div class="flex items-center gap-1.5 mb-1.5">
-                                            <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider">Sensitivity Model</label>
+                                            <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider">{{ t('models.oq.sensitivity_model') }}</label>
                                             <span class="cursor-help" @mouseenter="$refs.sensTip.style.display='block'" @mouseleave="$refs.sensTip.style.display='none'">
                                                 <svg class="w-4 h-4 text-neutral-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                                                 </svg>
                                             </span>
                                             <div x-ref="sensTip" style="display:none" class="absolute mt-6 w-64 px-3 py-2 bg-neutral-800 text-white text-xs leading-relaxed rounded-lg z-50 shadow-lg pointer-events-none">
-                                                Use a quantized version of the source model to analyze layer sensitivity with ~4x less memory.
+                                                {{ t('models.oq.sensitivity_help') }}
                                             </div>
                                         </div>
                                         <select x-model="oqSensitivityModelPath"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <option value="">None (use source model)</option>
+                                            <option value="">{{ t('models.oq.sensitivity_none') }}</option>
                                             <template x-for="m in oqSensitivityModelCandidates()" :key="m.path">
                                                 <option :value="m.path" x-text="m.name + ' (' + m.size_formatted + ')'"></option>
                                             </template>
@@ -1426,7 +1426,7 @@
                                     <div x-show="oqAdvancedOpen" x-cloak class="mt-3 space-y-3 pl-1">
                                         <!-- Text Only (VLM only) -->
                                         <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
-                                            <span class="text-sm text-neutral-600">Text Only</span>
+                                            <span class="text-sm text-neutral-600">{{ t('models.oq.text_only') }}</span>
                                             <button type="button"
                                                     @click="oqTextOnly = !oqTextOnly"
                                                     :class="oqTextOnly ? 'bg-black' : 'bg-neutral-200'"
@@ -1436,7 +1436,7 @@
                                             </button>
                                         </div>
                                         <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">
-                                            Excludes vision encoder weights. Output is a text-only model (~2-3% smaller).
+                                            {{ t('models.oq.text_only_help') }}
                                         </p>
                                         <!-- Preserve MTP weights -->
                                         <div class="flex items-center justify-between">
@@ -1588,10 +1588,8 @@
                                     :aria-expanded="oqAboutOpen.toString()"
                                     aria-controls="oq-about-panel">
                                 <div>
-                                    <h4 class="text-sm font-semibold text-neutral-700">About oQ Quantization</h4>
-                                    <p class="mt-1 text-xs text-neutral-500">
-                                        Compare standard oQ with oQe imatrix and how enhanced quantization works.
-                                    </p>
+                                    <h4 class="text-sm font-semibold text-neutral-700">{{ t('models.oq.about_heading') }}</h4>
+                                    <p class="mt-1 text-xs text-neutral-500">{{ t('models.oq.about_subtitle') }}</p>
                                 </div>
                                 <i data-lucide="chevron-down"
                                    class="w-4 h-4 text-neutral-400 shrink-0 transition-transform"
@@ -1603,93 +1601,71 @@
                                  x-transition
                                  class="px-6 py-5 border-t border-neutral-200 text-sm text-neutral-500 leading-relaxed space-y-6">
                                 <div>
-                                    <h4 class="text-lg font-bold text-neutral-800">oQ: oMLX Universal Dynamic Quantization</h4>
+                                    <h4 class="text-lg font-bold text-neutral-800">{{ t('models.oq.about_title') }}</h4>
                                     <blockquote class="mt-3 border-l-2 border-neutral-300 pl-4 text-neutral-600 italic font-semibold">
-                                        <p>Quantization should not be exclusive to any particular inference server.</p>
-                                        <p class="mt-1">
-                                            oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm,
-                                            LM Studio, and any app that supports MLX safetensors format.
-                                        </p>
-                                        <p class="mt-1">No custom loader required.</p>
+                                        <p>{{ t('models.oq.about_quote1') }}</p>
+                                        <p class="mt-1">{{ t('models.oq.about_quote2') }}</p>
+                                        <p class="mt-1">{{ t('models.oq.about_quote3') }}</p>
                                     </blockquote>
                                 </div>
 
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">oQ and oQe: MLX-native mixed precision</h5>
-                                    <p class="mt-2">
-                                        The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a
-                                        byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity
-                                        and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted
-                                        affine quantization.
-                                    </p>
+                                    <h5 class="text-base font-bold text-neutral-700">{{ t('models.oq.about_mixed_heading') }}</h5>
+                                    <p class="mt-2">{{ t('models.oq.about_mixed_body') }}</p>
                                 </div>
 
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">What standard oQ does</h5>
+                                    <h5 class="text-base font-bold text-neutral-700">{{ t('models.oq.about_what_oq') }}</h5>
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
                                             <i data-lucide="activity" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
                                             <div>
-                                                <strong class="text-neutral-700">Layer sensitivity</strong>
-                                                <span class="text-neutral-500">
-                                                    is measured with calibration prompts by comparing quantized-layer output error
-                                                    against the float baseline.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_layer_sens') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_layer_sens_body') }}</span>
                                             </div>
                                         </div>
                                         <div class="flex gap-3">
                                             <i data-lucide="sliders-horizontal" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
                                             <div>
-                                                <strong class="text-neutral-700">Mixed precision</strong>
-                                                <span class="text-neutral-500">
-                                                    allocates higher bits to sensitive layers and protected tensors while keeping
-                                                    the target bits-per-weight budget under a hard cap.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_mixed') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_mixed_body2') }}</span>
                                             </div>
                                         </div>
                                         <div class="flex gap-3">
                                             <i data-lucide="route" class="w-4 h-4 text-neutral-400 shrink-0 mt-0.5"></i>
                                             <div>
-                                                <strong class="text-neutral-700">Architecture rules</strong>
-                                                <span class="text-neutral-500">
-                                                    keep MoE routers in fp16, protect shared experts and output-critical tensors,
-                                                    leave vision/audio encoders unquantized, and preserve SSM state tensors.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_arch') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_arch_body') }}</span>
                                             </div>
                                         </div>
                                     </div>
                                 </div>
 
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">What oQe adds</h5>
-                                    <p class="mt-2">
-                                        oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step.
-                                        This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from
-                                        representative prompts, then use that information so quantization spends less error on the
-                                        input channels that matter most.
-                                    </p>
+                                    <h5 class="text-base font-bold text-neutral-700">{{ t('models.oq.about_what_oqe') }}</h5>
+                                    <p class="mt-2">{{ t('models.oq.about_oqe_body') }}</p>
                                     <div class="mt-3 overflow-x-auto">
                                         <table class="w-full text-xs">
                                             <thead>
                                                 <tr class="border-b border-neutral-200">
-                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600">Path</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Bit allocation</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Affine quantization</th>
-                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">Best use</th>
+                                                    <th class="text-left py-2 pr-4 font-semibold text-neutral-600">{{ t('models.oq.about_th_path') }}</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">{{ t('models.oq.about_th_bit') }}</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">{{ t('models.oq.about_th_affine') }}</th>
+                                                    <th class="text-left py-2 px-3 font-semibold text-neutral-600">{{ t('models.oq.about_th_bestuse') }}</th>
                                                 </tr>
                                             </thead>
                                             <tbody class="text-neutral-500">
                                                 <tr class="border-b border-neutral-100">
                                                     <td class="py-2 pr-4 font-medium text-neutral-600">oQ</td>
-                                                    <td class="py-2 px-3">Layer-sensitivity mixed precision</td>
-                                                    <td class="py-2 px-3">Standard min/max affine per group</td>
-                                                    <td class="py-2 px-3">Fast, deterministic conversion with strong baseline quality</td>
+                                                    <td class="py-2 px-3">{{ t('models.oq.about_oq_bit') }}</td>
+                                                    <td class="py-2 px-3">{{ t('models.oq.about_oq_affine') }}</td>
+                                                    <td class="py-2 px-3">{{ t('models.oq.about_oq_bestuse') }}</td>
                                                 </tr>
                                                 <tr>
                                                     <td class="py-2 pr-4 font-medium text-neutral-600">oQe</td>
-                                                    <td class="py-2 px-3">Same oQ plan</td>
-                                                    <td class="py-2 px-3">imatrix-weighted clipping/search per group</td>
-                                                    <td class="py-2 px-3">Better low-bit retention, especially for MoE and activation-skewed layers</td>
+                                                    <td class="py-2 px-3">{{ t('models.oq.about_oqe_bit') }}</td>
+                                                    <td class="py-2 px-3">{{ t('models.oq.about_oqe_affine') }}</td>
+                                                    <td class="py-2 px-3">{{ t('models.oq.about_oqe_bestuse') }}</td>
                                                 </tr>
                                             </tbody>
                                         </table>
@@ -1697,54 +1673,38 @@
                                 </div>
 
                                 <div>
-                                    <h5 class="text-base font-bold text-neutral-700">How oQe imatrix works</h5>
+                                    <h5 class="text-base font-bold text-neutral-700">{{ t('models.oq.about_how_oqe') }}</h5>
                                     <div class="mt-3 space-y-3">
                                         <div class="flex gap-3">
                                             <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">1</span>
                                             <div>
-                                                <strong class="text-neutral-700">Collect activation energy.</strong>
-                                                <span class="text-neutral-500">
-                                                    oQe runs calibration samples through the model and records average input
-                                                    activation squared, E[x^2], for each quantized Linear input channel.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_step1') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_step1_body') }}</span>
                                             </div>
                                         </div>
                                         <div class="flex gap-3">
                                             <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">2</span>
                                             <div>
-                                                <strong class="text-neutral-700">Track experts separately.</strong>
-                                                <span class="text-neutral-500">
-                                                    For MoE SwitchLinear layers, oQe records one importance vector per expert using
-                                                    the router-selected expert indices, so inactive or rarely active experts are
-                                                    visible in the coverage report.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_step2') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_step2_body') }}</span>
                                             </div>
                                         </div>
                                         <div class="flex gap-3">
                                             <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">3</span>
                                             <div>
-                                                <strong class="text-neutral-700">Adapt sample count.</strong>
-                                                <span class="text-neutral-500">
-                                                    Calibration starts from the requested sample count and can continue up to the
-                                                    adaptive maximum when MoE expert coverage is not sufficient.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_step3') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_step3_body') }}</span>
                                             </div>
                                         </div>
                                         <div class="flex gap-3">
                                             <span class="w-5 h-5 rounded-full bg-neutral-200 text-neutral-700 text-xs font-semibold inline-flex items-center justify-center shrink-0">4</span>
                                             <div>
-                                                <strong class="text-neutral-700">Weight the quantization error.</strong>
-                                                <span class="text-neutral-500">
-                                                    During affine quantization, oQe chooses scale/bias candidates by minimizing
-                                                    sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE.
-                                                </span>
+                                                <strong class="text-neutral-700">{{ t('models.oq.about_step4') }}</strong>
+                                                <span class="text-neutral-500">{{ t('models.oq.about_step4_body') }}</span>
                                             </div>
                                         </div>
                                     </div>
-                                    <p class="mt-3 text-xs text-neutral-400">
-                                        If a tensor has no matching imatrix entry, the default behavior is to fall back to standard
-                                        oQ for that tensor. Enable strict coverage to fail instead.
-                                    </p>
+                                    <p class="mt-3 text-xs text-neutral-400">{{ t('models.oq.about_fallback_note') }}</p>
                                 </div>
                             </div>
                         </div>
@@ -1944,7 +1904,7 @@
                                     <div class="px-6 py-5 space-y-4">
                                         <!-- Model name (read-only) -->
                                         <div>
-                                            <label class="text-xs font-medium text-neutral-500 mb-1.5 block">Model</label>
+                                            <label class="text-xs font-medium text-neutral-500 mb-1.5 block">{{ t('models.uploader.modal_model_label') }}</label>
                                             <div class="text-sm font-medium text-neutral-900" x-text="uploadModalModelName"></div>
                                         </div>
                                         <!-- Repo name -->

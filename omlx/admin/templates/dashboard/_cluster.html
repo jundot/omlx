@@ -2,7 +2,7 @@
     <div class="animate-fade-in-up">
         <!-- The normal path describes the outcome, not the distributed system. -->
         <div class="mb-6">
-            <h2 class="text-2xl font-bold tracking-tight text-neutral-900">Use your accelerator pool together</h2>
+            <h2 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('cluster.hero_title') }}</h2>
             <p class="text-sm text-neutral-500 mt-2 max-w-2xl">
                 oMLX finds Metal and CUDA workers, checks their connections and
                 usable memory, and chooses how to shard each model.
@@ -57,7 +57,7 @@
                                         @click="copyClusterCommands('pairingRecovery', [clusterGuidance.command])"
                                         class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50">
                                     <i data-lucide="copy" class="w-3 h-3"></i>
-                                    <span x-text="clusterCommandsCopied.pairingRecovery ? 'Copied!' : 'Copy'"></span>
+                                    <span x-text="clusterCommandsCopied.pairingRecovery ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                 </button>
                             </div>
                             <pre class="text-[10px] font-mono text-neutral-700 whitespace-pre-wrap break-all" x-text="clusterGuidance.command"></pre>
@@ -75,7 +75,7 @@
                                     <button type="button"
                                             @click="copyClusterCommands('pairingKeygen', [clusterGuidance.keygen_command])"
                                             class="px-2 py-1 text-[10px] font-medium text-red-800 border border-red-200 rounded-md hover:bg-red-50"
-                                            x-text="clusterCommandsCopied.pairingKeygen ? 'Copied!' : 'Copy'"></button>
+                                            x-text="clusterCommandsCopied.pairingKeygen ? window.t('cluster.copied') : window.t('cluster.copy')"></button>
                                 </div>
                             </details>
                         </div>
@@ -171,7 +171,7 @@
         <template x-if="clusterLastGoodConfig && !clusterAutoconfigure && clusterShowSetupDetails">
             <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3">
                 <div class="min-w-0">
-                    <div class="text-xs font-semibold text-neutral-900">Resume your last cluster</div>
+                    <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.resume_last') }}</div>
                     <div class="text-[10px] text-neutral-500 mt-0.5">
                         The settings that worked last time are ready to reuse.
                     </div>
@@ -202,7 +202,7 @@
                     <div class="p-5 sm:p-6">
                         <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
                             <div>
-                                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Your compute pool</div>
+                                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.compute_pool') }}</div>
                                 <h4 class="text-lg font-semibold text-neutral-900 mt-1"
                                     x-text="clusterPairTitle()"></h4>
                                 <p class="text-xs text-neutral-500 mt-1"
@@ -252,7 +252,7 @@
                                         <span x-text="clusterLiveModelId()"></span>
                                     </div>
                                     <div class="cluster-fabric__api">
-                                        <span>OpenAI-compatible API</span>
+                                        <span>{{ t('cluster.openai_compat_api') }}</span>
                                         <code x-text="clusterPublicEndpoint()"></code>
                                     </div>
                                     <div class="cluster-fabric__actions">
@@ -265,7 +265,7 @@
                                                     ]
                                                 )"
                                                 class="cluster-fabric__copy"
-                                                :title="'Copy endpoint and model ID'">
+                                                :title="window.t('cluster.copy_endpoint_and_model_id')">
                                             <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                             <span x-text="clusterCommandsCopied.liveEndpoint
                                                 ? 'Copied'
@@ -385,9 +385,9 @@
                                      data-cluster-memory-allowances>
                                     <div class="cluster-fabric__memory-header">
                                         <div>
-                                            <span>Pooled accelerator memory</span>
+                                            <span>{{ t('cluster.pooled_mem') }}</span>
                                             <strong x-text="clusterCombinedMemoryLabel()"></strong>
-                                            <small>Installed memory is shown separately from the safe model budget. Splitting stays automatic unless you override shard balance.</small>
+                                            <small>{{ t('cluster.installed_mem_note') }}</small>
                                         </div>
                                         <button type="button"
                                                 x-show="clusterMemoryAllowanceCustomized()"
@@ -466,7 +466,7 @@
                                 </span>
                                 <div class="min-w-0 flex-1">
                                     <div class="flex items-center gap-2">
-                                        <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Model</span>
+                                        <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.context_model') }}</span>
                                         <template x-if="clusterSelectedModel() && clusterSelectedModelFitLabel()">
                                             <span class="px-2 py-0.5 rounded-full bg-blue-50 text-[9px] font-semibold text-blue-700"
                                                   x-text="clusterSelectedModelFitLabel()"></span>
@@ -502,7 +502,7 @@
                                         :aria-expanded="clusterShowModelPicker"
                                         class="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-neutral-700 bg-white border border-neutral-200 rounded-xl hover:bg-neutral-50">
                                     <i data-lucide="list-filter" class="w-4 h-4"></i>
-                                    <span x-text="clusterSelectedModel() ? 'Change model' : 'Choose model'"></span>
+                                    <span x-text="clusterSelectedModel() ? window.t('cluster.change_model') : window.t('cluster.choose_model')"></span>
                                 </button>
                                 <button type="button"
                                         @click="runClusterPrimaryAction()"
@@ -523,7 +523,7 @@
                                         class="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-red-700 bg-white border border-red-200 rounded-xl hover:bg-red-50 disabled:opacity-50"
                                         data-cluster-stop-deployment>
                                     <i data-lucide="square" class="w-4 h-4"></i>
-                                    <span x-text="clusterDeactivatingId ? 'Stopping…' : 'Stop cluster'"></span>
+                                    <span x-text="clusterDeactivatingId ? window.t('cluster.stopping') : window.t('cluster.stop_cluster')"></span>
                                 </button>
                             </div>
                         </div>
@@ -542,7 +542,7 @@
                                  data-cluster-context-planner>
                             <div class="cluster-context__header">
                                 <div>
-                                    <span class="cluster-context__eyebrow">Context window</span>
+                                    <span class="cluster-context__eyebrow">{{ t('cluster.context_window') }}</span>
                                     <strong x-text="clusterTokens(clusterTargetContextTokens) + ' tokens'"></strong>
                                 </div>
                                 <div class="cluster-context__presets"
@@ -557,7 +557,7 @@
                                                 ? 'cluster-context__preset--active'
                                                 : ''"
                                             :aria-pressed="clusterContextMode === 'auto'"
-                                            x-text="'Auto · ' + clusterTokens(
+                                            x-text="window.t('cluster.auto_prefix') + clusterTokens(
                                                 clusterContextMaximumTokens()
                                             )"></button>
                                     <template x-for="tokens in clusterContextOptions()"
@@ -593,8 +593,8 @@
                                 </div>
                                 <div class="cluster-context__legend"
                                      aria-label="Memory legend">
-                                    <span><i class="cluster-context__legend-weight"></i>Weights</span>
-                                    <span><i class="cluster-context__legend-kv"></i>KV cache</span>
+                                    <span><i class="cluster-context__legend-weight"></i>{{ t('cluster.context_weights') }}</span>
+                                    <span><i class="cluster-context__legend-kv"></i>{{ t('cluster.context_kv') }}</span>
                                 </div>
                             </div>
 
@@ -740,7 +740,7 @@
                                 </svg>
                             </span>
                             <div>
-                                <h3 class="text-sm font-semibold text-neutral-900">Add a CUDA worker</h3>
+                                <h3 class="text-sm font-semibold text-neutral-900">{{ t('cluster.add_cuda_worker') }}</h3>
                                 <p class="mt-1 max-w-2xl text-xs leading-relaxed text-neutral-600">
                                     Generate one secure command per CUDA box. It installs the minimal
                                     worker runtime, exchanges pinned SSH identities, and adds the box
@@ -751,7 +751,7 @@
                         <span x-show="clusterJoinedNodes.length" x-cloak
                               class="inline-flex shrink-0 items-center gap-2 rounded-full border border-green-200 bg-white px-3 py-1.5 text-xs font-semibold text-green-700">
                             <span class="h-2 w-2 rounded-full bg-green-500"></span>
-                            <span x-text="clusterJoinedNodes.length + ' CUDA worker' + (clusterJoinedNodes.length === 1 ? '' : 's') + ' joined'"></span>
+                            <span x-text="clusterJoinedNodes.length + ' ' + (clusterJoinedNodes.length === 1 ? window.t('cluster.cuda_worker_joined') : window.t('cluster.cuda_workers_joined'))"></span>
                         </span>
                     </div>
 
@@ -778,7 +778,7 @@
 
                         <div class="grid grid-cols-1 items-end gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
                             <label>
-                                <span class="mb-1.5 block text-xs font-medium text-neutral-700">Studio LAN IPv4 address</span>
+                                <span class="mb-1.5 block text-xs font-medium text-neutral-700">{{ t('cluster.studio_lan_ip') }}</span>
                                 <input type="text"
                                        inputmode="decimal"
                                        autocomplete="off"
@@ -794,7 +794,7 @@
                                     class="inline-flex items-center justify-center gap-2 rounded-xl bg-neutral-900 px-5 py-2.5 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
                                     data-cluster-generate-cuda-join>
                                 <i data-lucide="key-round" class="h-4 w-4"></i>
-                                <span x-text="clusterJoinLoading ? 'Generating…' : (clusterJoinCommand ? 'Generate another' : 'Generate join command')"></span>
+                                <span x-text="clusterJoinLoading ? window.t('cluster.generating') : (clusterJoinCommand ? window.t('cluster.generate_another') : window.t('cluster.generate_join_command'))"></span>
                             </button>
                         </div>
 
@@ -807,7 +807,7 @@
                              data-cluster-cuda-join-command>
                             <div class="flex flex-col gap-2 border-b border-neutral-800 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                                 <div>
-                                    <div class="text-xs font-semibold text-white">Paste into one Ubuntu/Debian CUDA box</div>
+                                    <div class="text-xs font-semibold text-white">{{ t('cluster.paste_cuda_box') }}</div>
                                     <div class="mt-0.5 text-[10px] text-neutral-400"
                                          x-text="clusterJoinCommandStatusLabel()"></div>
                                 </div>
@@ -816,7 +816,7 @@
                                             @click="copyClusterCommands('cudaJoin', [clusterJoinCommand])"
                                             :disabled="!clusterJoinCommandUsable()"
                                             class="rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-neutral-900 disabled:cursor-not-allowed disabled:opacity-40">
-                                        <span x-text="clusterCommandsCopied.cudaJoin ? 'Copied!' : 'Copy command'"></span>
+                                        <span x-text="clusterCommandsCopied.cudaJoin ? window.t('cluster.copied') : window.t('cluster.copy_command')"></span>
                                     </button>
                                     <button type="button"
                                             @click="revokeClusterJoinCommand()"
@@ -848,8 +848,8 @@
                         class="w-full mb-6 flex items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3 text-left hover:bg-neutral-50"
                         data-cluster-advanced-toggle>
                     <span>
-                        <span class="block text-sm font-medium text-neutral-700">Diagnostics</span>
-                        <span class="block text-xs text-neutral-400 mt-0.5">Connection, runtime, and recovery details</span>
+                        <span class="block text-sm font-medium text-neutral-700">{{ t('cluster.diagnostics') }}</span>
+                        <span class="block text-xs text-neutral-400 mt-0.5">{{ t('cluster.diagnostics_sub') }}</span>
                     </span>
                     <i data-lucide="chevron-down"
                        class="w-4 h-4 text-neutral-400 transition-transform"
@@ -869,7 +869,7 @@
                             :disabled="clusterDiagnosticsLoading"
                             class="inline-flex items-center justify-center gap-2 rounded-lg border border-neutral-300 bg-white px-3 py-2 text-xs font-medium text-neutral-700 hover:bg-neutral-100 disabled:opacity-50 shrink-0">
                         <i data-lucide="download" class="w-4 h-4"></i>
-                        <span x-text="clusterDiagnosticsLoading ? 'Building report…' : 'Download diagnostic report'"></span>
+                        <span x-text="clusterDiagnosticsLoading ? window.t('cluster.building_report') : window.t('cluster.download_diagnostic_report')"></span>
                     </button>
                 </div>
 
@@ -878,7 +878,7 @@
                      class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
                         <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">This Mac</span>
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.this_mac') }}</span>
                             <span class="w-8 h-8 rounded-xl bg-green-50 text-green-600 flex items-center justify-center">
                                 <i data-lucide="monitor" class="w-4 h-4"></i>
                             </span>
@@ -889,7 +889,7 @@
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
                         <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Memory budget</span>
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.memory_budget') }}</span>
                             <span class="w-8 h-8 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center">
                                 <i data-lucide="memory-stick" class="w-4 h-4"></i>
                             </span>
@@ -904,7 +904,7 @@
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
                         <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Transport</span>
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.transport') }}</span>
                             <span class="w-8 h-8 rounded-xl flex items-center justify-center"
                                   :class="clusterTransportIconTone(clusterEffectiveTransportState())">
                                 <i data-lucide="cable" class="w-4 h-4"></i>
@@ -920,7 +920,7 @@
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
                         <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Runtime</span>
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.runtime') }}</span>
                             <span class="w-8 h-8 rounded-xl bg-purple-50 text-purple-700 flex items-center justify-center">
                                 <i data-lucide="blocks" class="w-4 h-4"></i>
                             </span>
@@ -928,7 +928,7 @@
                         <div class="text-base font-semibold text-neutral-900"
                              x-text="'MLX ' + clusterStatus.runtime.mlx_version"></div>
                         <div class="text-sm text-neutral-500 mt-1"
-                             x-text="'oMLX ' + clusterStatus.runtime.omlx_version + ' · protocol ' + clusterStatus.protocol_version"></div>
+                             x-text="'oMLX ' + clusterStatus.runtime.omlx_version + ' · ' + window.t('cluster.protocol') + ' ' + clusterStatus.protocol_version"></div>
                     </div>
                 </div>
 
@@ -972,12 +972,12 @@
                                             @click="copyClusterCommands('endpoint', [clusterPublicEndpoint()])"
                                             class="px-2.5 py-1 rounded-full text-[10px] font-semibold border border-neutral-600 text-neutral-200 hover:bg-neutral-800"
                                             :title="clusterPublicEndpoint()"
-                                            x-text="clusterCommandsCopied.endpoint ? 'Endpoint copied' : 'Copy endpoint'"></button>
+                                            x-text="clusterCommandsCopied.endpoint ? window.t('cluster.endpoint_copied') : window.t('cluster.copy_endpoint')"></button>
                                     <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wider bg-blue-500 text-white"
-                                          x-text="'This Mac · R' + job.rank"></span>
+                                          x-text="window.t('cluster.this_mac') + ' · R' + job.rank"></span>
                                     <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wider"
                                           :class="job.live ? 'bg-green-50 text-green-700' : 'bg-amber-100 text-amber-700'"
-                                          x-text="job.live ? job.phase : 'stale'"></span>
+                                          x-text="job.live ? job.phase : window.t('cluster.stale')"></span>
                                 </div>
                             </div>
                         </div>
@@ -985,23 +985,23 @@
                         <div class="p-5">
                             <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Resident weights</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.resident_weights') }}</div>
                                     <div class="text-xl font-semibold mt-1 text-green-400"
                                          x-text="formatClusterGiB(clusterRuntimeResidentWeights(job))"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Weight allocation</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.weight_allocation') }}</div>
                                     <div class="text-xl font-semibold mt-1"
                                          x-text="formatClusterGiB(clusterRuntimeResidentWeights(job)) + ' / ' +
                                             formatClusterGiB(clusterRuntimeCapacity(job))"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Active requests</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.active_requests') }}</div>
                                     <div class="text-xl font-semibold mt-1"
                                          x-text="formatClusterCount(job.metrics?.active_requests || 0)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Time to first token</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.ttft') }}</div>
                                     <div class="text-xl font-semibold mt-1"
                                          x-text="job.metrics?.last_request?.ttft_seconds === null ||
                                             job.metrics?.last_request?.ttft_seconds === undefined
@@ -1009,32 +1009,32 @@
                                             : formatClusterSeconds(job.metrics.last_request.ttft_seconds)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Prefill</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.prefill') }}</div>
                                     <div class="text-xl font-semibold mt-1 text-blue-400"
                                          x-text="formatClusterRate(job.metrics?.last_request?.prefill_tps)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Decode</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.decode') }}</div>
                                     <div class="text-xl font-semibold mt-1 text-green-400"
                                          x-text="formatClusterRate(job.metrics?.last_request?.decode_tps)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Session average</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.session_avg') }}</div>
                                     <div class="text-xl font-semibold mt-1 text-cyan-400"
                                          x-text="formatClusterRate(job.metrics?.aggregate_decode_tps)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Pipeline busy</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.pipeline_busy') }}</div>
                                     <div class="text-xl font-semibold mt-1"
                                          x-text="formatClusterPercent(job.metrics?.pipeline?.utilization)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Prompt cache</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.prompt_cache') }}</div>
                                     <div class="text-xl font-semibold mt-1 text-purple-400"
                                          x-text="formatClusterPercent(job.metrics?.cache?.hit_rate)"></div>
                                 </div>
                                 <div class="rounded-xl bg-neutral-800 border border-neutral-700 px-4 py-3">
-                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">Collective link</div>
+                                    <div class="text-[10px] uppercase tracking-wider text-neutral-400">{{ t('cluster.collective_link') }}</div>
                                     <div class="text-sm font-semibold mt-2 text-blue-400"
                                          x-text="formatClusterBandwidth(clusterRuntimeProfile(job)?.collective_bandwidth_bytes_per_second)"></div>
                                 </div>
@@ -1054,14 +1054,14 @@
                                                 ? 'bg-green-500/10 border-green-500/30 text-green-300'
                                                 : 'bg-neutral-800 border-neutral-700 text-neutral-500'"
                                               :title="capability.reason"
-                                              x-text="name.replaceAll('_', ' ') + (capability.active ? ' · on' : ' · off')"></span>
+                                              x-text="name.replaceAll('_', ' ') + ' · ' + (capability.active ? window.t('cluster.on') : window.t('cluster.off'))"></span>
                                     </template>
                                 </div>
                             </template>
 
                             <div class="mt-5 rounded-xl border border-neutral-700 bg-neutral-800 px-4 py-3">
                                 <div class="flex items-center justify-between gap-3">
-                                    <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Live request path</span>
+                                    <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.live_request_path') }}</span>
                                     <span class="text-[10px] text-neutral-500"
                                           x-text="job.metrics?.active_requests
                                             ? job.metrics.active_requests + ' active'
@@ -1120,9 +1120,9 @@
                                                     <div class="min-w-0">
                                                         <div class="flex items-center gap-2">
                                                             <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
-                                                                  x-text="'Rank ' + assignment.rank"></span>
+                                                                  x-text="window.t('cluster.rank').replace('{rank}', assignment.rank)"></span>
                                                             <span x-show="assignment.rank === job.rank"
-                                                                  class="px-1.5 py-0.5 rounded bg-blue-500 text-[9px] font-semibold uppercase">This Mac</span>
+                                                                  class="px-1.5 py-0.5 rounded bg-blue-500 text-[9px] font-semibold uppercase">{{ t('cluster.this_mac') }}</span>
                                                         </div>
                                                         <div class="text-sm font-semibold mt-1 truncate"
                                                              x-text="assignment.node_id"></div>
@@ -1133,7 +1133,7 @@
                                                 <div class="grid grid-cols-3 gap-3 mt-4">
                                                     <div>
                                                         <div class="text-[9px] uppercase tracking-wider text-neutral-500"
-                                                             x-text="clusterRuntimeRankStatus(job, assignment) ? 'Resident weights' : 'Planned weights'"></div>
+                                                             x-text="clusterRuntimeRankStatus(job, assignment) ? window.t('cluster.resident_weights') : window.t('cluster.planned_weights')"></div>
                                                         <div class="text-xs font-medium mt-1"
                                                              x-text="formatClusterGiB(
                                                                 clusterRuntimeRankStatus(job, assignment)?.measured_weight_bytes
@@ -1141,13 +1141,13 @@
                                                              )"></div>
                                                     </div>
                                                     <div>
-                                                        <div class="text-[9px] uppercase tracking-wider text-neutral-500">Headroom</div>
+                                                        <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.headroom') }}</div>
                                                         <div class="text-xs font-medium text-green-400 mt-1"
                                                              x-text="formatClusterGiB(assignment.headroom_bytes)"></div>
                                                     </div>
                                                     <div>
-                                                        <div class="text-[9px] uppercase tracking-wider text-neutral-500">Cache</div>
-                                                        <div class="text-xs font-medium mt-1">KV local</div>
+                                                        <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.cache') }}</div>
+                                                        <div class="text-xs font-medium mt-1">{{ t('cluster.kv_local') }}</div>
                                                     </div>
                                                 </div>
                                                 <div class="mt-3 h-1.5 overflow-hidden rounded-full bg-neutral-700">
@@ -1164,33 +1164,33 @@
                                                 <template x-if="job.tensor_parallel_size > 1">
                                                     <div class="mt-3 pt-3 border-t border-neutral-700 grid grid-cols-3 gap-3">
                                                         <div>
-                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Tensor parallel</div>
+                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.tensor_parallel') }}</div>
                                                             <div class="text-xs font-medium text-cyan-400 mt-1" x-text="job.tensor_parallel_size + '× across nodes'"></div>
                                                         </div>
                                                         <div>
-                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Sharded weights</div>
+                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.sharded_weights') }}</div>
                                                             <div class="text-xs font-medium mt-1" x-text="formatClusterGiB(assignment.sharded_weight_bytes)"></div>
                                                         </div>
                                                         <div>
-                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">TP rank</div>
-                                                            <div class="text-xs font-medium text-neutral-300 mt-1" x-text="'R' + assignment.tensor_parallel_rank + ' of ' + assignment.tensor_parallel_size"></div>
+                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.tp_rank') }}</div>
+                                                            <div class="text-xs font-medium text-neutral-300 mt-1" x-text="window.t('cluster.rank_of').replace('{rank}', assignment.tensor_parallel_rank).replace('{size}', assignment.tensor_parallel_size)"></div>
                                                         </div>
                                                     </div>
                                                 </template>
                                                 <template x-if="assignment.predicted_stage_seconds !== undefined">
                                                     <div class="mt-3 pt-3 border-t border-neutral-700 grid grid-cols-3 gap-3">
                                                         <div>
-                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Predicted compute</div>
+                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.predicted_compute') }}</div>
                                                             <div class="text-xs font-medium mt-1"
                                                                  x-text="formatClusterSeconds(assignment.predicted_compute_seconds)"></div>
                                                         </div>
                                                         <div>
-                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Predicted send</div>
+                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.predicted_send') }}</div>
                                                             <div class="text-xs font-medium mt-1"
                                                                  x-text="formatClusterSeconds(assignment.predicted_send_seconds)"></div>
                                                         </div>
                                                         <div>
-                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Stage target</div>
+                                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.stage_target') }}</div>
                                                             <div class="text-xs font-medium text-cyan-400 mt-1"
                                                                  x-text="formatClusterSeconds(assignment.predicted_stage_seconds)"></div>
                                                         </div>
@@ -1231,9 +1231,9 @@
                         <div>
                             <div class="flex items-center gap-2">
                                 <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Nodes & direct link</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('cluster.nodes_direct_link') }}</span>
                             </div>
-                            <p class="text-xs text-neutral-400 mt-1">Live hardware state from this oMLX instance</p>
+                            <p class="text-xs text-neutral-400 mt-1">{{ t('cluster.live_hw_state') }}</p>
                         </div>
                         <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium"
                               :class="clusterTransportTone(clusterEffectiveTransportState())">
@@ -1264,19 +1264,19 @@
 
                                 <dl class="grid grid-cols-2 gap-x-4 gap-y-3 mt-5 text-sm">
                                     <div>
-                                        <dt class="text-xs text-neutral-400">Recommended</dt>
+                                        <dt class="text-xs text-neutral-400">{{ t('cluster.recommended') }}</dt>
                                         <dd class="font-medium text-neutral-700 mt-0.5"
                                             x-text="formatClusterGiB(clusterStatus.node.recommended_working_set_bytes)"></dd>
                                     </div>
                                     <div>
-                                        <dt class="text-xs text-neutral-400">RDMA control</dt>
+                                        <dt class="text-xs text-neutral-400">{{ t('cluster.rdma_control') }}</dt>
                                         <dd class="font-medium text-neutral-700 mt-0.5 capitalize"
                                             x-text="clusterStatus.transport.rdma.control_status"></dd>
                                     </div>
                                     <div class="col-span-2">
-                                        <dt class="text-xs text-neutral-400">Interfaces</dt>
+                                        <dt class="text-xs text-neutral-400">{{ t('cluster.interfaces') }}</dt>
                                         <dd class="font-mono text-xs text-neutral-600 mt-1 break-all"
-                                            x-text="clusterStatus.transport.rdma.devices.join(', ') || 'None reported'"></dd>
+                                            x-text="clusterStatus.transport.rdma.devices.join(', ') || window.t('cluster.none_reported')"></dd>
                                     </div>
                                 </dl>
                             </div>
@@ -1297,7 +1297,7 @@
                                             </div>
                                             <div class="min-w-0">
                                                 <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
-                                                     x-text="'Worker · rank ' + node.rank"></div>
+                                                     x-text="window.t('cluster.worker_rank').replace('{rank}', node.rank)"></div>
                                                 <div class="font-semibold text-neutral-900 truncate"
                                                      x-text="clusterNodeHardwareLabel(node)"></div>
                                             </div>
@@ -1305,7 +1305,7 @@
                                         <span class="inline-flex items-center gap-1.5 text-xs font-medium"
                                               :class="node.online ? 'text-green-600' : 'text-amber-600'">
                                             <span class="w-2 h-2 rounded-full bg-current"></span>
-                                            <span x-text="node.online ? 'Online' : 'Checking'"></span>
+                                            <span x-text="node.online ? window.t('cluster.online') : window.t('cluster.checking')"></span>
                                         </span>
                                     </div>
 
@@ -1315,12 +1315,12 @@
 
                                     <div class="mt-4 pt-4 border-t border-neutral-200 space-y-2 text-xs">
                                         <div class="flex items-center justify-between gap-3">
-                                            <span class="text-neutral-400">Host</span>
+                                            <span class="text-neutral-400">{{ t('cluster.host') }}</span>
                                             <span class="font-mono font-medium text-neutral-700 truncate"
                                                   x-text="node.ssh"></span>
                                         </div>
                                         <div class="flex items-center justify-between gap-3">
-                                            <span class="text-neutral-400">Memory</span>
+                                            <span class="text-neutral-400">{{ t('cluster.memory') }}</span>
                                             <span class="font-medium text-neutral-700"
                                                   x-text="node.memory
                                                     ? formatClusterGiB(node.memory)
@@ -1335,7 +1335,7 @@
                                 <div class="w-11 h-11 rounded-2xl bg-neutral-100 text-neutral-400 flex items-center justify-center">
                                     <i data-lucide="monitor-up" class="w-5 h-5"></i>
                                 </div>
-                                <div class="font-semibold text-neutral-900 mt-4">Waiting for another worker</div>
+                                <div class="font-semibold text-neutral-900 mt-4">{{ t('cluster.waiting_worker') }}</div>
                                 <p class="text-xs text-neutral-500 mt-2 leading-relaxed">
                                     Connect it and open oMLX. Bonjour discovery updates this view automatically.
                                 </p>
@@ -1346,7 +1346,7 @@
                         <div class="mt-5 pt-5 border-t border-neutral-100">
                             <div class="flex flex-col md:flex-row md:items-end gap-3">
                                 <div class="flex-1">
-                                    <label class="block text-xs font-medium text-neutral-600 mb-1.5">Peer IP route check</label>
+                                    <label class="block text-xs font-medium text-neutral-600 mb-1.5">{{ t('cluster.peer_ip_check') }}</label>
                                     <input type="text"
                                            x-model.trim="clusterRouteTo"
                                            @keydown.enter="loadClusterStatus()"
@@ -1385,7 +1385,7 @@
                             <div>
                                 <div class="flex items-center gap-2">
                                     <i data-lucide="terminal-square" class="w-4 h-4 text-neutral-500"></i>
-                                    <h4 class="text-sm font-semibold text-neutral-900">Worker process</h4>
+                                    <h4 class="text-sm font-semibold text-neutral-900">{{ t('cluster.worker_process') }}</h4>
                                 </div>
                                 <p class="text-xs text-neutral-500 mt-2 max-w-sm">
                                     Starts an isolated child, verifies ready/ping/shutdown, then cleans it up.
@@ -1395,7 +1395,7 @@
                                     :disabled="clusterWorkerRunning"
                                     class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all">
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                <span x-text="clusterWorkerRunning ? 'Running…' : 'Run check'"></span>
+                                <span x-text="clusterWorkerRunning ? window.t('cluster.running') : window.t('cluster.run_check')"></span>
                             </button>
                         </div>
                         <div class="mt-5 h-12 flex items-center">
@@ -1410,7 +1410,7 @@
                                 </div>
                             </template>
                             <span x-show="!clusterWorkerResult && !clusterWorkerRunning"
-                                  class="text-xs text-neutral-400">Not run in this browser session</span>
+                                  class="text-xs text-neutral-400">{{ t('cluster.not_run_session') }}</span>
                             <span x-show="clusterWorkerRunning"
                                   class="text-xs text-neutral-500 animate-pulse">Supervising child process…</span>
                         </div>
@@ -1421,7 +1421,7 @@
                             <div>
                                 <div class="flex items-center gap-2">
                                     <i data-lucide="orbit" class="w-4 h-4 text-neutral-500"></i>
-                                    <h4 class="text-sm font-semibold text-neutral-900">MLX collective</h4>
+                                    <h4 class="text-sm font-semibold text-neutral-900">{{ t('cluster.mlx_collective') }}</h4>
                                 </div>
                                 <p class="text-xs text-neutral-500 mt-2 max-w-sm">
                                     Runs two local MLX ranks and verifies a ring all-sum. Loopback only—not the remote link.
@@ -1431,7 +1431,7 @@
                                     :disabled="clusterCollectiveRunning"
                                     class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all">
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                <span x-text="clusterCollectiveRunning ? 'Running…' : 'Run check'"></span>
+                                <span x-text="clusterCollectiveRunning ? window.t('cluster.running') : window.t('cluster.run_check')"></span>
                             </button>
                         </div>
                         <div class="mt-5 h-12 flex items-center">
@@ -1446,7 +1446,7 @@
                                 </div>
                             </template>
                             <span x-show="!clusterCollectiveResult && !clusterCollectiveRunning"
-                                  class="text-xs text-neutral-400">Not run in this browser session</span>
+                                  class="text-xs text-neutral-400">{{ t('cluster.not_run_session') }}</span>
                             <span x-show="clusterCollectiveRunning"
                                   class="text-xs text-neutral-500 animate-pulse">Starting local ranks…</span>
                         </div>
@@ -1457,7 +1457,7 @@
                             <div>
                                 <div class="flex items-center gap-2">
                                     <i data-lucide="workflow" class="w-4 h-4 text-neutral-500"></i>
-                                    <h4 class="text-sm font-semibold text-neutral-900">Nemotron pipeline</h4>
+                                    <h4 class="text-sm font-semibold text-neutral-900">{{ t('cluster.nemotron_pipeline') }}</h4>
                                 </div>
                                 <p class="text-xs text-neutral-500 mt-2 max-w-sm">
                                     Runs an unequal two-rank hybrid Mamba/attention graph and verifies both ranks agree.
@@ -1467,7 +1467,7 @@
                                     :disabled="clusterPipelineRunning"
                                     class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 rounded-lg hover:bg-neutral-200 disabled:opacity-50 transition-all">
                                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                                <span x-text="clusterPipelineRunning ? 'Running…' : 'Run check'"></span>
+                                <span x-text="clusterPipelineRunning ? window.t('cluster.running') : window.t('cluster.run_check')"></span>
                             </button>
                         </div>
                         <div class="mt-5 h-12 flex items-center">
@@ -1482,7 +1482,7 @@
                                 </div>
                             </template>
                             <span x-show="!clusterPipelineResult && !clusterPipelineRunning"
-                                  class="text-xs text-neutral-400">Not run in this browser session</span>
+                                  class="text-xs text-neutral-400">{{ t('cluster.not_run_session') }}</span>
                             <span x-show="clusterPipelineRunning"
                                   class="text-xs text-neutral-500 animate-pulse">Executing hybrid graph…</span>
                         </div>
@@ -1544,7 +1544,7 @@
                         <div x-show="!clusterPeerProbe?.runtime_compatible || clusterShowPeerAdvanced"
                              x-cloak>
                         <div class="mb-5 flex flex-wrap items-center gap-2">
-                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Detected nearby</span>
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.detected_nearby') }}</span>
                             <span x-show="clusterDiscoveryLoading" class="text-xs text-neutral-400 animate-pulse">Looking for workers…</span>
                             <template x-for="peer in (clusterDiscoveredPeers || [])" :key="peer.ssh">
                                 <button @click="selectClusterDiscoveredPeer(peer)"
@@ -1556,7 +1556,7 @@
                                 </button>
                             </template>
                             <span x-show="clusterDiscoveredPeers !== null && !clusterDiscoveredPeers.length && !clusterDiscoveryLoading"
-                                  class="text-xs text-neutral-400">No advertised SSH peers found</span>
+                                  class="text-xs text-neutral-400">{{ t('cluster.no_ssh_peers') }}</span>
                             <button @click="discoverClusterPeers()"
                                     :disabled="clusterDiscoveryLoading"
                                     class="p-1.5 text-neutral-400 hover:text-neutral-700 disabled:opacity-50"
@@ -1572,16 +1572,16 @@
                         <div class="mb-5" data-cluster-ssh-setup>
                             <div class="flex items-center gap-2 mb-3">
                                 <i data-lucide="key" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">SSH Key Setup</span>
+                                <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.ssh_key_setup') }}</span>
                             </div>
                             <div class="rounded-xl border border-blue-200 bg-blue-50 p-4 mb-3">
-                                <div class="text-xs font-semibold text-blue-900">Terminal SSH can work while oMLX cannot</div>
+                                <div class="text-xs font-semibold text-blue-900">{{ t('cluster.ssh_works_note') }}</div>
                                 <p class="text-[10px] text-blue-700 mt-1">
                                     oMLX deliberately uses its own dedicated SSH key. A successful manual SSH login may be using a different key, so complete these steps on both Macs before checking the peer.
                                 </p>
                             </div>
                             <div class="rounded-xl border border-amber-200 bg-amber-50 p-4 mb-3">
-                                <div class="text-[10px] font-bold uppercase tracking-wider text-amber-800">Step 1 of 3</div>
+                                <div class="text-[10px] font-bold uppercase tracking-wider text-amber-800">{{ t('cluster.step_1_of_3') }}</div>
                                 <label class="block text-xs font-semibold text-amber-900 mt-1">{{ t('cluster.pairing.shared_secret') }}</label>
                                 <p class="text-[10px] text-amber-700 mt-1">
                                     {{ t('cluster.pairing.shared_secret_hint') }} The secret only authenticates this key exchange; it is not your SSH password.
@@ -1613,22 +1613,22 @@
                                 <div class="rounded-xl border border-neutral-200 bg-neutral-50 p-4">
                                     <div class="mb-3">
                                         <div class="text-xs font-semibold text-neutral-800">Step 2 of 3 · Confirm the oMLX key is active on both Macs</div>
-                                        <p class="text-[10px] text-neutral-500 mt-1">This key belongs only to oMLX cluster connections. If either Mac says no key was found, generate one there first.</p>
+                                        <p class="text-[10px] text-neutral-500 mt-1">{{ t('cluster.ssh_key_belongs') }}</p>
                                     </div>
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <div class="flex items-center gap-2">
-                                                <span class="px-2 py-0.5 rounded-full bg-green-100 text-green-700 text-[10px] font-semibold">This Mac: Active</span>
+                                                <span class="px-2 py-0.5 rounded-full bg-green-100 text-green-700 text-[10px] font-semibold">{{ t('cluster.this_mac_active') }}</span>
                                                 <span class="text-xs font-medium text-neutral-700" x-text="clusterSshKey.key_type"></span>
                                             </div>
                                             <div class="text-xs text-neutral-500 mt-1 font-mono break-all" x-text="clusterSshKey.fingerprint"></div>
-                                            <div class="text-[10px] text-neutral-400 mt-1" x-text="'Created: ' + new Date(clusterSshKey.created_at * 1000).toLocaleString()"></div>
+                                            <div class="text-[10px] text-neutral-400 mt-1" x-text="window.t('cluster.created') + new Date(clusterSshKey.created_at * 1000).toLocaleString()"></div>
                                         </div>
                                         <button @click="generateClusterSshKey()"
                                                 :disabled="clusterSshKeyGenerating"
                                                 class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                             <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
-                                            <span x-text="clusterSshKeyGenerating ? 'Regenerating…' : 'Regenerate'"></span>
+                                            <span x-text="clusterSshKeyGenerating ? window.t('cluster.regenerating') : window.t('cluster.regenerate')"></span>
                                         </button>
                                     </div>
                                     <div class="mt-3 pt-3 border-t border-neutral-200">
@@ -1642,7 +1642,7 @@
                                                     :disabled="clusterExchangeTokenLoading || clusterPairingSecret.length < 16"
                                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                                 <i data-lucide="key" class="w-3.5 h-3.5"></i>
-                                                <span x-text="clusterExchangeTokenLoading ? 'Generating…' : 'Generate exchange token'"></span>
+                                                <span x-text="clusterExchangeTokenLoading ? window.t('cluster.generating') : window.t('cluster.generate_exchange_token')"></span>
                                             </button>
                                         </div>
                                         <template x-if="clusterExchangeToken">
@@ -1655,11 +1655,11 @@
                                                 <button @click="copyClusterExchangeToken()"
                                                         class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 whitespace-nowrap">
                                                     <i data-lucide="copy" class="w-3.5 h-3.5"></i>
-                                                    <span x-text="clusterExchangeTokenCopied ? 'Copied!' : 'Copy'"></span>
+                                                    <span x-text="clusterExchangeTokenCopied ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                                 </button>
                                             </div>
                                         </template>
-                                        <p class="text-[10px] text-neutral-400 mt-2">Copy this token and paste it into section B on the other Mac.</p>
+                                        <p class="text-[10px] text-neutral-400 mt-2">{{ t('cluster.copy_token_b') }}</p>
                                     </div>
                                     <div class="mt-3 pt-3 border-t border-neutral-200">
                                         <div class="text-xs text-neutral-600 mb-2">B · Paste the other Mac's exchange token here</div>
@@ -1675,24 +1675,24 @@
                                                     :disabled="clusterKeyExchangeLoading || !clusterPeerExchangeToken || clusterPairingSecret.length < 16"
                                                     class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap">
                                                 <i data-lucide="link" class="w-3.5 h-3.5"></i>
-                                                <span x-text="clusterKeyExchangeLoading ? 'Pairing…' : 'Pair'"></span>
+                                                <span x-text="clusterKeyExchangeLoading ? window.t('cluster.pairing') : window.t('cluster.pair')"></span>
                                             </button>
                                         </div>
                                         <template x-if="clusterKeyExchangeResult">
-                                            <p class="text-[10px] text-green-600 mt-2">This direction is paired. Repeat these steps on the other Mac so both directions are trusted.</p>
+                                            <p class="text-[10px] text-green-600 mt-2">{{ t('cluster.direction_paired') }}</p>
                                         </template>
                                     </div>
                                     <div class="mt-3 pt-3 border-t border-neutral-200">
                                         <div class="flex items-center justify-between">
                                             <div>
                                                 <div class="text-xs text-neutral-500">macOS Keychain storage</div>
-                                                <div class="text-[10px] text-neutral-400 mt-1">Key fingerprint stored securely in system keychain</div>
+                                                <div class="text-[10px] text-neutral-400 mt-1">{{ t('cluster.fingerprint_stored') }}</div>
                                             </div>
                                             <button @click="storeClusterKeyInKeychain()"
                                                     :disabled="clusterKeychainStoring"
                                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                                 <i data-lucide="shield" class="w-3.5 h-3.5"></i>
-                                                <span x-text="clusterKeychainStoring ? 'Storing…' : 'Store in Keychain'"></span>
+                                                <span x-text="clusterKeychainStoring ? window.t('cluster.storing') : window.t('cluster.store_in_keychain')"></span>
                                             </button>
                                         </div>
                                     </div>
@@ -1703,13 +1703,13 @@
                                     <div class="flex items-center justify-between">
                                         <div>
                                             <div class="text-xs font-semibold text-neutral-800">Step 2 of 3 · Generate the oMLX key on this Mac</div>
-                                            <div class="text-[10px] text-neutral-500 mt-1">Do this on both Macs. oMLX uses this dedicated key instead of whichever key Terminal chose.</div>
+                                            <div class="text-[10px] text-neutral-500 mt-1">{{ t('cluster.both_macs_key') }}</div>
                                         </div>
                                         <button @click="generateClusterSshKey()"
                                                 :disabled="clusterSshKeyGenerating"
                                                 class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50">
                                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
-                                            <span x-text="clusterSshKeyGenerating ? 'Generating…' : 'Generate key'"></span>
+                                            <span x-text="clusterSshKeyGenerating ? window.t('cluster.generating') : window.t('cluster.generate_key')"></span>
                                         </button>
                                     </div>
                                 </div>
@@ -1718,7 +1718,7 @@
 
                         <div class="grid grid-cols-1 lg:grid-cols-5 gap-4 items-end">
                             <div class="lg:col-span-2">
-                                <label class="block text-xs font-medium text-neutral-600 mb-1.5">Peer SSH name</label>
+                                <label class="block text-xs font-medium text-neutral-600 mb-1.5">{{ t('cluster.peer_ssh_name') }}</label>
                                 <input type="text"
                                        x-model.trim="clusterPeerSsh"
                                        @input="invalidateClusterPeer(true)"
@@ -1735,7 +1735,7 @@
                                  once and kept is what took a launch down, so it
                                  is never where these start. -->
                             <div>
-                                <label class="block text-xs font-medium text-neutral-600 mb-1.5">This Mac · address</label>
+                                <label class="block text-xs font-medium text-neutral-600 mb-1.5">{{ t('cluster.this_mac_address') }}</label>
                                 <input type="text"
                                        x-model.trim="clusterLocalIp"
                                        @input="clusterIpsOverridden = true; invalidateClusterPeer(false)"
@@ -1756,7 +1756,7 @@
                                     :disabled="clusterPeerProbeLoading || !clusterPeerSsh.trim()"
                                     class="inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-xl hover:bg-neutral-800 disabled:opacity-50 transition-all">
                                 <i data-lucide="scan-search" class="w-4 h-4"></i>
-                                <span x-text="clusterPeerProbeLoading ? 'Checking…' : 'Check peer'"></span>
+                                <span x-text="clusterPeerProbeLoading ? window.t('cluster.checking_ellipsis') : window.t('cluster.check_peer')"></span>
                             </button>
                         </div>
 
@@ -1765,7 +1765,7 @@
                                     :disabled="clusterFabricLoading || !clusterPeerSsh.trim()"
                                     class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                 <i data-lucide="refresh-cw" class="w-3 h-3"></i>
-                                <span x-text="clusterFabricLoading ? 'Reading…' : 'Re-read addresses'"></span>
+                                <span x-text="clusterFabricLoading ? window.t('cluster.reading') : window.t('cluster.reread_addresses')"></span>
                             </button>
                             <button x-show="clusterIpsOverridden" x-cloak
                                     @click="useDiscoveredClusterAddresses()"
@@ -1858,8 +1858,7 @@
                                                   ? clusterPeerProbe.runtime_mismatches.join(' · ')
                                                   : ((clusterPeerProbe.runtime_warnings || []).length
                                                      ? clusterPeerProbe.runtime_warnings.join(' · ')
-                                                     : 'Runtime match')"></span>
-                                </div>
+                                                     : window.t('cluster.runtime_match'))"></span>                                </div>
                             </div>
                         </template>
                     </div>
@@ -1875,7 +1874,7 @@
                                 <i data-lucide="split-square-vertical" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">2 · Unequal-memory planner</span>
                             </div>
-                            <p class="text-xs text-neutral-400 mt-1">Contiguous pipeline stages in MLX rank order</p>
+                            <p class="text-xs text-neutral-400 mt-1">{{ t('cluster.contiguous_stages') }}</p>
                         </div>
                     </div>
                     <div class="p-6">
@@ -1886,7 +1885,7 @@
                         <div class="mb-5 rounded-2xl border border-neutral-200 bg-neutral-50 p-4">
                             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                                 <div class="min-w-0">
-                                    <div class="text-sm font-semibold text-neutral-900">Start automatically</div>
+                                    <div class="text-sm font-semibold text-neutral-900">{{ t('cluster.start_auto') }}</div>
                                     <div class="text-xs text-neutral-500 mt-1">
                                         Checks every worker, chooses the links and model split, then starts the cluster.
                                     </div>
@@ -1946,7 +1945,7 @@
                             <div class="mt-3 pt-3 border-t border-neutral-200">
                                 <div class="flex items-center justify-between gap-3">
                                     <div>
-                                        <div class="text-xs font-medium text-neutral-800">Choose a downloaded model</div>
+                                        <div class="text-xs font-medium text-neutral-800">{{ t('cluster.choose_downloaded_model') }}</div>
                                         <div class="text-[10px] text-neutral-500 mt-0.5">
                                             The selected model will run across the accelerator pool above.
                                         </div>
@@ -1955,7 +1954,7 @@
                                             :disabled="clusterCatalogueLoading"
                                             class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                         <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
-                                        <span x-text="clusterCatalogueLoading ? 'Checking fit…' : 'Check fit'"></span>
+                                        <span x-text="clusterCatalogueLoading ? window.t('cluster.checking_fit') : window.t('cluster.check_fit')"></span>
                                     </button>
                                 </div>
 
@@ -2028,12 +2027,12 @@
                             <!-- C4: the fabric on its own, without planning. -->
                             <div class="mt-3 pt-3 border-t border-neutral-200">
                                 <div class="flex items-center justify-between gap-3">
-                                    <div class="text-xs text-neutral-500">Link between Macs</div>
+                                    <div class="text-xs text-neutral-500">{{ t('cluster.link_between_macs') }}</div>
                                     <button @click="loadClusterTransports()"
                                             :disabled="clusterTransportsLoading"
                                             class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50">
                                         <i data-lucide="radio" class="w-3.5 h-3.5"></i>
-                                        <span x-text="clusterTransportsLoading ? 'Detecting…' : 'Detect link'"></span>
+                                        <span x-text="clusterTransportsLoading ? window.t('cluster.detecting') : window.t('cluster.detect_link')"></span>
                                     </button>
                                 </div>
 
@@ -2083,7 +2082,7 @@
                                                     <button @click="copyClusterCommands('link', clusterLinkStatus.commands)"
                                                             class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100">
                                                         <i data-lucide="copy" class="w-3 h-3"></i>
-                                                        <span x-text="clusterCommandsCopied.link ? 'Copied!' : 'Copy'"></span>
+                                                        <span x-text="clusterCommandsCopied.link ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                                     </button>
                                                 </div>
                                                 <pre class="text-[10px] font-mono text-neutral-700 bg-white border border-neutral-200 rounded-lg p-2 overflow-x-auto"><template x-for="line in clusterLinkStatus.commands" :key="line"><div x-text="line"></div></template></pre>
@@ -2110,7 +2109,7 @@
                                             <span class="font-medium text-neutral-700" x-text="clusterTransports.backend"></span>
                                         </div>
                                         <template x-if="!clusterTransports.transports.length">
-                                            <div class="text-[10px] text-neutral-400 mt-1">No links detected between these hosts.</div>
+                                            <div class="text-[10px] text-neutral-400 mt-1">{{ t('cluster.no_links_detected') }}</div>
                                         </template>
                                         <template x-for="(link, index) in clusterTransports.transports"
                                                   :key="'transport-' + index + ':' + (link.source_node_id || '') + '>' + link.peer_node_id + ':' + (link.kind || '')">
@@ -2134,15 +2133,15 @@
                                     <div class="text-xs font-medium text-neutral-800" x-text="clusterAutoconfigure.summary"></div>
                                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-3">
                                         <div>
-                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Link</div>
+                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.link') }}</div>
                                             <div class="text-xs font-medium text-neutral-700 mt-1" x-text="clusterAutoconfigure.link"></div>
                                         </div>
                                         <div>
-                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Backend</div>
+                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.backend') }}</div>
                                             <div class="text-xs font-medium text-neutral-700 mt-1" x-text="clusterAutoconfigure.backend"></div>
                                         </div>
                                         <div>
-                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">Split</div>
+                                            <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.split') }}</div>
                                             <div class="text-xs font-medium text-neutral-700 mt-1"
                                                  x-text="clusterAutoconfigure.tensor_parallel_size > 1
                                                     ? clusterAutoconfigure.pipeline_stages + (clusterAutoconfigure.pipeline_stages === 1 ? ' stage' : ' stages') + ' × ' + clusterAutoconfigure.tensor_parallel_size + '-way tensor'
@@ -2181,7 +2180,7 @@
                                                         <button @click="copyClusterCommands(clusterIssueKey(issue), [issue.remediation])"
                                                                 class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100">
                                                             <i data-lucide="copy" class="w-3 h-3"></i>
-                                                            <span x-text="clusterCommandsCopied[clusterIssueKey(issue)] ? 'Copied!' : 'Copy'"></span>
+                                                            <span x-text="clusterCommandsCopied[clusterIssueKey(issue)] ? window.t('cluster.copied') : window.t('cluster.copy')"></span>
                                                         </button>
                                                     </div>
                                                     <pre class="text-[10px] font-mono text-neutral-700 bg-white border border-neutral-200 rounded-lg p-2 overflow-x-auto" x-text="issue.remediation"></pre>
@@ -2200,7 +2199,7 @@
                                         <div class="mt-3 pt-3 border-t border-neutral-200">
                                             <div class="flex items-start justify-between gap-3">
                                                 <div class="min-w-0">
-                                                    <div class="text-xs font-semibold text-neutral-900">Preparing model on every Mac</div>
+                                                    <div class="text-xs font-semibold text-neutral-900">{{ t('cluster.preparing_every_mac') }}</div>
                                                     <template x-for="n in clusterAutoconfigure.staging.nodes.filter(n => n.missing_files > 0)" :key="n.node_id">
                                                         <div class="text-[10px] text-neutral-600 mt-1">
                                                             <span class="font-mono" x-text="n.node_id"></span>
@@ -2212,7 +2211,7 @@
                                                         :disabled="clusterStagingLoading"
                                                         class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 whitespace-nowrap shrink-0">
                                                     <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                                                    <span x-text="clusterStagingLoading ? 'Copying…' : 'Prepare now'"></span>
+                                                    <span x-text="clusterStagingLoading ? window.t('cluster.copying') : window.t('cluster.prepare_now')"></span>
                                                 </button>
                                             </div>
                                             <template x-if="clusterStagingResult">
@@ -2239,15 +2238,15 @@
                         </div>
 
                         <div class="flex items-center justify-between gap-3 mb-3">
-                            <h5 class="text-sm font-semibold text-neutral-900">Rank-ordered nodes</h5>
+                            <h5 class="text-sm font-semibold text-neutral-900">{{ t('cluster.rank_ordered_nodes') }}</h5>
                         </div>
                         <div class="flex items-center gap-4 mb-4">
-                            <label class="block text-xs font-medium text-neutral-600">Workload</label>
+                            <label class="block text-xs font-medium text-neutral-600">{{ t('cluster.workload') }}</label>
                             <select x-model="clusterExecutionProfile"
                                     @change="invalidateClusterPlan()"
                                     class="text-xs border border-neutral-200 rounded-lg px-2 py-1 focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                 <option value="interactive">Interactive — lowest latency for chat</option>
-                                <option value="balanced">Balanced</option>
+                                <option value="balanced">{{ t('cluster.workload_balanced') }}</option>
                                 <option value="throughput">Throughput — batch and long context</option>
                             </select>
                         </div>
@@ -2257,7 +2256,7 @@
                                     :aria-expanded="clusterShowAdvanced"
                                     class="w-full flex items-center justify-between gap-3 px-4 py-3 text-left">
                                 <div>
-                                    <div class="text-xs font-semibold text-neutral-800">Advanced activation settings</div>
+                                    <div class="text-xs font-semibold text-neutral-800">{{ t('cluster.advanced_activation') }}</div>
                                     <div class="text-[10px] text-neutral-500 mt-0.5">
                                         Runtime tuning, cache behaviour, and transport limits
                                     </div>
@@ -2270,7 +2269,7 @@
                                  class="border-t border-neutral-200 px-4 py-4 space-y-4">
                                 <div class="grid grid-cols-1 gap-4">
                                     <label class="block">
-                                        <span class="block text-xs font-medium text-neutral-600 mb-1.5">Automatic setup preference</span>
+                                        <span class="block text-xs font-medium text-neutral-600 mb-1.5">{{ t('cluster.auto_setup_pref') }}</span>
                                         <select x-model="clusterAutoconfigurePrefer"
                                                 class="w-full text-xs border border-neutral-200 rounded-lg px-2 py-1.5 focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                             <option value="speed">Speed — favour tensor parallelism</option>
@@ -2282,33 +2281,33 @@
                                     <label class="flex items-start gap-2 text-xs text-neutral-700">
                                         <input type="checkbox" x-model="clusterAutoTune"
                                                class="mt-0.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span><span class="font-medium">Auto tune</span><span class="block text-[10px] text-neutral-500 mt-0.5">Benchmark the accelerators and links before launch.</span></span>
+                                        <span><span class="font-medium">{{ t('cluster.auto_tune') }}</span><span class="block text-[10px] text-neutral-500 mt-0.5">{{ t('cluster.auto_tune_sub') }}</span></span>
                                     </label>
                                     <label class="flex items-start gap-2 text-xs text-neutral-700">
                                         <input type="checkbox" x-model="clusterAsyncOverlap"
                                                class="mt-0.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span><span class="font-medium">Async overlap</span><span class="block text-[10px] text-neutral-500 mt-0.5">Overlap pipeline communication and compute.</span></span>
+                                        <span><span class="font-medium">{{ t('cluster.async_overlap') }}</span><span class="block text-[10px] text-neutral-500 mt-0.5">{{ t('cluster.async_overlap_sub') }}</span></span>
                                     </label>
                                     <label class="flex items-start gap-2 text-xs text-neutral-700">
                                         <input type="checkbox" x-model="clusterCacheAffinity"
                                                class="mt-0.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span><span class="font-medium">Cache affinity</span><span class="block text-[10px] text-neutral-500 mt-0.5">Prefer ranks with reusable prompt cache state.</span></span>
+                                        <span><span class="font-medium">{{ t('cluster.cache_affinity') }}</span><span class="block text-[10px] text-neutral-500 mt-0.5">{{ t('cluster.cache_affinity_sub') }}</span></span>
                                     </label>
                                     <label class="flex items-start gap-2 text-xs text-neutral-700">
                                         <input type="checkbox" x-model="clusterSamplingRankOnly"
                                                class="mt-0.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                        <span><span class="font-medium">Token-only rank output</span><span class="block text-[10px] text-neutral-500 mt-0.5">Avoid full hidden-state transfers when the model supports the validated fast path; otherwise oMLX falls back automatically.</span></span>
+                                        <span><span class="font-medium">{{ t('cluster.token_only_rank') }}</span><span class="block text-[10px] text-neutral-500 mt-0.5">{{ t('cluster.token_only_rank_sub') }}</span></span>
                                     </label>
                                 </div>
                                 <label x-show="clusterBackend === 'ring'" x-cloak class="block">
-                                    <span class="block text-xs font-medium text-neutral-600 mb-1.5">Ring connections per IP</span>
+                                    <span class="block text-xs font-medium text-neutral-600 mb-1.5">{{ t('cluster.ring_conns_per_ip') }}</span>
                                     <input type="number"
                                            x-model.number="clusterRingConnectionsPerIp"
                                            min="1"
                                            max="32"
                                            step="1"
                                            class="w-full sm:w-40 text-xs border border-neutral-200 rounded-lg px-2 py-1.5 focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                    <span class="block text-[10px] text-neutral-500 mt-1">Used only by the Ring backend.</span>
+                                    <span class="block text-[10px] text-neutral-500 mt-1">{{ t('cluster.ring_backend_only') }}</span>
                                 </label>
                             </div>
                         </div>
@@ -2316,20 +2315,20 @@
                              whole model resident; under TP each holds a share. -->
                         <template x-if="clusterAutoconfigure && clusterAutoconfigure.plan">
                             <div class="mb-4 rounded-xl border border-neutral-200 bg-white p-3">
-                                <div class="text-[9px] uppercase tracking-wider text-neutral-500">Memory per accelerator</div>
+                                <div class="text-[9px] uppercase tracking-wider text-neutral-500">{{ t('cluster.mem_per_accel') }}</div>
                                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-2">
                                     <div>
-                                        <div class="text-[10px] text-neutral-500">On one accelerator alone</div>
+                                        <div class="text-[10px] text-neutral-500">{{ t('cluster.on_one_accel') }}</div>
                                         <div class="text-xs font-medium text-neutral-700 mt-1"
                                              x-text="formatClusterGiB(clusterAutoconfigure.plan.model.total_weight_bytes)"></div>
                                     </div>
                                     <div>
-                                        <div class="text-[10px] text-neutral-500">Largest share now</div>
+                                        <div class="text-[10px] text-neutral-500">{{ t('cluster.largest_share_now') }}</div>
                                         <div class="text-xs font-medium text-green-600 mt-1"
                                              x-text="formatClusterGiB(Math.max(...clusterAutoconfigure.plan.assignments.map(a => a.planned_weight_bytes)))"></div>
                                     </div>
                                     <div>
-                                        <div class="text-[10px] text-neutral-500">Saved per accelerator</div>
+                                        <div class="text-[10px] text-neutral-500">{{ t('cluster.saved_per_accel') }}</div>
                                         <div class="text-xs font-medium text-green-600 mt-1"
                                              x-text="formatClusterGiB(
                                                 clusterAutoconfigure.plan.model.total_weight_bytes
@@ -2339,7 +2338,7 @@
                             </div>
                         </template>
                         <div class="flex items-center gap-4 mb-4">
-                            <label class="block text-xs font-medium text-neutral-600">Tensor parallelism</label>
+                            <label class="block text-xs font-medium text-neutral-600">{{ t('cluster.tensor_parallelism') }}</label>
                             <div class="inline-flex items-center rounded-lg border border-neutral-200 bg-white p-0.5">
                                 <template x-for="size in clusterTensorParallelOptions()" :key="size">
                                     <button type="button"
@@ -2368,7 +2367,7 @@
                                     :disabled="clusterPlanLoading"
                                     class="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-neutral-900 rounded-xl hover:bg-neutral-800 disabled:opacity-50 transition-all flex-shrink-0">
                                 <i data-lucide="wand-sparkles" class="w-4 h-4"></i>
-                                <span x-text="clusterPlanLoading ? 'Planning…' : 'Build plan'"></span>
+                                <span x-text="clusterPlanLoading ? window.t('cluster.planning') : window.t('cluster.build_plan')"></span>
                             </button>
                         </div>
                     </div>
@@ -2383,7 +2382,7 @@
                      x-init="loadClusterNodeRoles()">
                     <div class="px-6 py-4 border-b border-neutral-200 flex items-center justify-between gap-3">
                         <div>
-                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Memory each accelerator gives</div>
+                            <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">{{ t('cluster.mem_each_accel') }}</div>
                             <p class="text-xs text-neutral-500 mt-1">
                                 Measured from the safe allocation cap, not installed memory.
                             </p>
@@ -2392,7 +2391,7 @@
                                 :disabled="clusterBudgetsLoading"
                                 class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 shrink-0">
                             <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
-                            <span x-text="clusterBudgetsLoading ? 'Measuring…' : 'Measure devices'"></span>
+                            <span x-text="clusterBudgetsLoading ? window.t('cluster.measuring') : window.t('cluster.measure_devices')"></span>
                         </button>
                     </div>
 
@@ -2460,7 +2459,7 @@
                         <div class="px-6 py-4 border-b border-neutral-200">
                             <div class="flex items-center justify-between gap-3">
                                 <div>
-                                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Model shard balance</div>
+                                    <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">{{ t('cluster.model_shard_balance') }}</div>
                                     <p class="text-xs text-neutral-500 mt-1">
                                         Automatic uses measured memory and speed. Move a device's target to put
                                         more layers there; every override is re-checked before launch.
@@ -2524,12 +2523,12 @@
                                         </div>
                                         <dl class="mt-2 space-y-1">
                                             <div class="flex justify-between text-[11px]">
-                                                <dt class="text-neutral-500">Model weights</dt>
+                                                <dt class="text-neutral-500">{{ t('cluster.model_weights') }}</dt>
                                                 <dd class="font-mono text-neutral-900"
                                                     x-text="clusterGiB(item.layer_weight_bytes + item.fixed_weight_bytes)"></dd>
                                             </div>
                                             <div class="flex justify-between text-[11px]">
-                                                <dt class="text-neutral-500">KV cache reserved</dt>
+                                                <dt class="text-neutral-500">{{ t('cluster.kv_reserved') }}</dt>
                                                 <dd class="font-mono text-neutral-900" x-text="clusterGiB(item.kv_cache_bytes)"></dd>
                                             </div>
                                             <!-- The role's only visible effect
@@ -2539,15 +2538,15 @@
                                                  will launch. -->
                                             <div class="flex justify-between text-[11px]">
                                                 <dt class="text-neutral-500"
-                                                    x-text="item.role === 'workstation' ? 'Held back for you' : 'Held back'"></dt>
+                                                    x-text="item.role === 'workstation' ? window.t('cluster.held_back_for_you') : window.t('cluster.held_back')"></dt>
                                                 <dd class="font-mono text-neutral-900" x-text="clusterGiB(item.reserve_bytes)"></dd>
                                             </div>
                                             <div class="flex justify-between text-[11px]">
-                                                <dt class="text-neutral-500">Free after that</dt>
+                                                <dt class="text-neutral-500">{{ t('cluster.free_after') }}</dt>
                                                 <dd class="font-mono text-neutral-900" x-text="clusterGiB(item.headroom_bytes)"></dd>
                                             </div>
                                             <div class="flex justify-between text-[11px] pt-1 border-t border-neutral-100">
-                                                <dt class="text-neutral-500">Holds up to</dt>
+                                                <dt class="text-neutral-500">{{ t('cluster.holds_up_to') }}</dt>
                                                 <dd class="font-mono font-semibold text-neutral-900"
                                                     x-text="`${clusterTokens(item.max_context_tokens)} tokens`"></dd>
                                             </div>
@@ -2561,7 +2560,7 @@
                                  one is the cluster's limit. -->
                             <div class="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
                                 <div class="flex items-center justify-between">
-                                    <span class="text-xs text-neutral-600">This cluster serves up to</span>
+                                    <span class="text-xs text-neutral-600">{{ t('cluster.serves_up_to') }}</span>
                                     <span class="text-sm font-semibold text-neutral-900"
                                           x-text="`${clusterTokens(clusterPlan.cluster?.max_context_tokens)} tokens`"></span>
                                 </div>
@@ -2582,7 +2581,7 @@
                             <i data-lucide="power" class="w-4 h-4 text-green-400"></i>
                             <span class="text-xs font-bold uppercase tracking-wider">3 · Manual activation</span>
                         </div>
-                        <p class="text-xs text-neutral-400 mt-1">Advanced fallback for reviewing and activating a hand-tuned plan separately.</p>
+                        <p class="text-xs text-neutral-400 mt-1">{{ t('cluster.advanced_fallback') }}</p>
                     </div>
                     <div class="p-6">
                         <div class="rounded-xl bg-amber-50 border border-amber-200 px-4 py-3 text-xs text-amber-800 mb-5">
@@ -2603,7 +2602,7 @@
                                       class="text-amber-700">Memory, role or split changed since this plan was built — build it again so you approve what launches.</span>
                                 <span x-show="clusterPreflightBlockers.length" x-cloak
                                       class="text-amber-700"
-                                      x-text="`Run the ${clusterPreflightBlockers.length === 1 ? 'command' : 'commands'} in step 2 first — a peer that cannot import what this model needs dies part-way through the load.`"></span>
+                                      x-text="clusterPreflightBlockers.length === 1 ? window.t('cluster.preflight_singular') : window.t('cluster.preflight_plural')"></span>
                                 <span x-show="clusterActivationReady()">Ready: activation re-runs planning and strict SSH preflight server-side.</span>
                             </div>
                             <button @click="activateClusterDeployment()"
@@ -2625,7 +2624,7 @@
                                  data-cluster-plan-changes>
                                 <div class="flex items-center gap-2">
                                     <i data-lucide="shield-check" class="w-4 h-4 text-blue-700"></i>
-                                    <span class="text-xs font-semibold text-blue-900">Signed placement kept</span>
+                                    <span class="text-xs font-semibold text-blue-900">{{ t('cluster.signed_placement_kept') }}</span>
                                 </div>
                                 <p class="text-[11px] text-blue-800 mt-1"
                                    x-text="clusterPlanChanges.reason"></p>

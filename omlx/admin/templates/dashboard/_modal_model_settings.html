@@ -309,18 +309,18 @@
                                         <option value="">{{ t('modal.model_settings.model_type_auto') }}</option>
                                         <option value="llm">LLM</option>
                                         <option value="vlm">VLM</option>
-                                        <option value="embedding">Embedding</option>
-                                        <option value="reranker">Reranker</option>
-                                        <option value="audio_stt">Audio STT</option>
-                                        <option value="audio_tts">Audio TTS</option>
-                                        <option value="audio_sts">Audio STS</option>
+                                        <option value="embedding">{{ t('modal.model_settings.type_embedding') }}</option>
+                                        <option value="reranker">{{ t('modal.model_settings.type_reranker') }}</option>
+                                        <option value="audio_stt">{{ t('modal.model_settings.type_audio_stt') }}</option>
+                                        <option value="audio_tts">{{ t('modal.model_settings.type_audio_tts') }}</option>
+                                        <option value="audio_sts">{{ t('modal.model_settings.type_audio_sts') }}</option>
                                     </select>
                                 </div>
                                 <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.reasoning_parser') }}</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                        <option value="">None</option>
+                                        <option value="">{{ t('modal.model_settings.none_option') }}</option>
                                         <template x-for="p in reasoningParsers" :key="p.value">
                                             <option :value="p.value" x-text="p.label + ' (' + p.models.join(', ') + ')'"></option>
                                         </template>
@@ -683,7 +683,7 @@
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.mtp_compatibility_reason"></p>
                                             <button type="button"
-                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
+                                                    x-show="!modelSettings.mtp_compatible && (modelSettings.mtp_compatibility_reason || '').includes('MTPLX side-car')"
                                                     @click="importMtplxSidecar()"
                                                     :disabled="importingMtplx"
                                                     :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
@@ -946,7 +946,7 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill.desc') | safe }}</p>
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
@@ -963,33 +963,33 @@
                                     </div>
                                     <div x-show="modelSettings.specprefill_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Model</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.specprefill.draft_model') }}</label>
                                             <select x-model="modelSettings.specprefill_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="">Select draft model...</option>
+                                                <option value="">{{ t('modal.model_settings.specprefill.draft_model_placeholder') }}</option>
                                                 <template x-for="m in specPrefillDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.specprefill_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
-                                            <p class="text-xs text-neutral-400 mt-1">Small model sharing tokenizer with target (e.g. Qwen3.5-0.8B for 35B)</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.specprefill.draft_model_hint') }}</p>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Keep Rate</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.specprefill.keep_rate') }}</label>
                                             <select x-model="modelSettings.specprefill_keep_pct"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="0.1">10% — Aggressive (~5-7x, some quality loss)</option>
-                                                <option value="0.2">20% — Balanced (~3x, recommended)</option>
-                                                <option value="0.25">25% — Conservative+ (~2.5x)</option>
-                                                <option value="0.3">30% — Conservative (~2.2x)</option>
-                                                <option value="0.4">40% — Mild (~1.8x)</option>
-                                                <option value="0.5">50% — Minimal (~1.5x)</option>
+                                                <option value="0.1">{{ t('modal.model_settings.specprefill.keep_rate_0.1') }}</option>
+                                                <option value="0.2">{{ t('modal.model_settings.specprefill.keep_rate_0.2') }}</option>
+                                                <option value="0.25">{{ t('modal.model_settings.specprefill.keep_rate_0.25') }}</option>
+                                                <option value="0.3">{{ t('modal.model_settings.specprefill.keep_rate_0.3') }}</option>
+                                                <option value="0.4">{{ t('modal.model_settings.specprefill.keep_rate_0.4') }}</option>
+                                                <option value="0.5">{{ t('modal.model_settings.specprefill.keep_rate_0.5') }}</option>
                                             </select>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Threshold (tokens)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.specprefill.threshold') }}</label>
                                             <input type="number" x-model.number="modelSettings.specprefill_threshold" min="1024" max="131072" step="1024" placeholder="8192"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Min tokens to trigger (shorter prompts use full prefill)</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.specprefill.threshold_hint') }}</p>
                                         </div>
                                     </div>
                                 </div>
@@ -999,7 +999,7 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding with compatible DFlash and DFlash2 checkpoints.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
+<p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash.desc') | safe }}</p>
                                             <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
@@ -1025,21 +1025,21 @@
                                     </div>
                                     <div x-show="modelSettings.dflash_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Model</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.draft_model') }}</label>
                                             <select x-model="modelSettings.dflash_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="">Select draft model...</option>
+                                                <option value="">{{ t('modal.model_settings.dflash.draft_model_placeholder') }}</option>
                                                 <template x-for="m in dflashDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
-                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16, z-lab/gemma-4-26B-A4B-it-DFlash, poolside/Laguna-S-2.1-DFlash-NVFP4). Note: -DFlash suffix only; -assistant variants are for MTP.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.draft_model_hint') }}</p>
                                         </div>
                                         <div class="bg-neutral-50 rounded-xl">
                                             <div class="flex items-start justify-between gap-3">
                                                 <div class="min-w-0">
-                                                    <span class="text-sm font-medium text-neutral-700">Quantization</span>
-                                                    <p class="text-xs text-neutral-500 mt-0.5">Enable quantization for the draft model (weight, activation bits &amp; group size).</p>
+                                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash.quantization') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash.quantization_hint') }}</p>
                                                 </div>
                                                 <button type="button" @click="modelSettings.dflash_draft_quant_enabled = !modelSettings.dflash_draft_quant_enabled"
                                                         :class="modelSettings.dflash_draft_quant_enabled ? 'bg-black' : 'bg-neutral-200'"
@@ -1051,7 +1051,7 @@
                                         </div>
                                         <div class="grid grid-cols-3 gap-3 pl-4" x-show="modelSettings.dflash_draft_quant_enabled" x-transition>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Weight Bits</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.weight_bits') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_weight_bits"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="2">2-bit</option>
@@ -1060,7 +1060,7 @@
                                                 </select>
                                             </div>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Activation Bits</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.activation_bits') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_activation_bits"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="16" selected>16-bit</option>
@@ -1068,7 +1068,7 @@
                                                 </select>
                                             </div>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Group Size</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.group_size') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_group_size"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="32">32</option>
@@ -1078,35 +1078,35 @@
                                             </div>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Context (fallback threshold)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.max_context') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_max_ctx" min="1" step="1024" placeholder="unlimited"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Prompts at or above this token count switch to BatchedEngine. Leave empty for unlimited.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.max_context_hint') }}</p>
                                         </div>
                                         <div class="pt-2 border-t border-neutral-200 space-y-3">
-                                            <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">Long-context tuning</p>
+                                            <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('modal.model_settings.dflash.long_context_tuning') }}</p>
                                             <div class="grid grid-cols-2 gap-3">
                                                 <div>
-                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft window size</label>
-                                                    <input type="number" x-model.number="modelSettings.dflash_draft_window_size" min="1" step="128" placeholder="2048"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                                    <p class="text-xs text-neutral-400 mt-1">Draft model sliding-attention window. Helps stabilise acceptance on long contexts. Leave empty for dflash default (2048).</p>
-                                                </div>
-                                                <div>
-                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft sink size</label>
-                                                    <input type="number" x-model.number="modelSettings.dflash_draft_sink_size" min="0" step="8" placeholder="0"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                                    <p class="text-xs text-neutral-400 mt-1">Attention-sink tokens always kept regardless of window. Leave empty for dflash default (0).</p>
-                                                </div>
-                                            </div>
-                                            <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Runtime block size</label>
-                                                <input type="number" x-model.number="modelSettings.dflash_block_size" min="1" step="1" placeholder="checkpoint default"
-                                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                                <p class="text-xs text-neutral-400 mt-1">Maximum draft and verify tokens per cycle. Leave empty to use the checkpoint block size.</p>
-                                            </div>
-                                            <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Verify mode</label>
+<label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.draft_window_size') }}</label>
+                                                     <input type="number" x-model.number="modelSettings.dflash_draft_window_size" min="1" step="128" placeholder="2048"
+                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                     <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.draft_window_size_hint') }}</p>
+                                                 </div>
+                                                 <div>
+                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.draft_sink_size') }}</label>
+                                                     <input type="number" x-model.number="modelSettings.dflash_draft_sink_size" min="0" step="8" placeholder="0"
+                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                     <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.draft_sink_size_hint') }}</p>
+                                                 </div>
+                                             </div>
+                                             <div>
+                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.runtime_block_size') }}</label>
+                                                 <input type="number" x-model.number="modelSettings.dflash_block_size" min="1" step="1" placeholder="checkpoint default"
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                 <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.runtime_block_size_hint') }}</p>
+                                             </div>
+                                             <div>
+                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.verify_mode') }}</label>
                                                 <select x-model="modelSettings.dflash_verify_mode"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="adaptive">adaptive (default)</option>
@@ -1114,13 +1114,13 @@
                                                     <option value="ddtree">ddtree</option>
                                                     <option value="off">off</option>
                                                 </select>
-                                                <p class="text-xs text-neutral-400 mt-1">Verifier algorithm. "adaptive" shrinks block size when acceptance drops; "off" disables speculative verify.</p>
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.verify_mode_hint') }}</p>
                                             </div>
                                         </div>
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
                                             <div class="min-w-0">
-                                                <span class="text-sm font-medium text-neutral-700">In-memory cache</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">DFlash L1 prefix snapshot cache in RAM. Speeds up multi-turn chats with shared prefixes.</p>
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash.in_memory_cache') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash.in_memory_cache_hint') }}</p>
                                             </div>
                                             <button type="button" @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
                                                     :class="modelSettings.dflash_in_memory_cache ? 'bg-black' : 'bg-neutral-200'"
@@ -1130,23 +1130,23 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache max entries</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.in_memory_max_entries') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Maximum number of prefix snapshots kept in L1 cache. Each entry stores KV + draft GDN state for one conversation prefix.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.in_memory_max_entries_hint') }}</p>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache size (GiB)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.in_memory_max_gib') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_gib" min="1" max="256" step="1" placeholder="8"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Byte budget for L1 snapshots; LRU evicts when exceeded.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.in_memory_max_gib_hint') }}</p>
                                         </div>
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
-                                                <span class="text-sm font-medium text-neutral-700">SSD cache</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">L2 spill of evicted L1 entries to disk. Uses the oMLX paged SSD cache directory (<code>dflash_l2/</code>).</p>
-                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">Enable oMLX paged SSD cache first (<code>--paged-ssd-cache-dir</code>).</p>
-                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">Requires in-memory cache to be enabled.</p>
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash.ssd_cache') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash.ssd_cache_hint') | safe }}</p>
+                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash.ssd_cache_enable_hint') | safe }}</p>
+                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash.ssd_cache_needs_mem') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="if (modelSettings.dflash_ssd_cache_available && modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = !modelSettings.dflash_ssd_cache"
@@ -1161,10 +1161,10 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_ssd_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">SSD cache size (GiB)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash.ssd_cache_max_gib') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_ssd_cache_max_gib" min="1" max="1024" step="1" placeholder="20"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Disk budget for L2 spill; oldest entries are evicted when exceeded.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash.ssd_cache_max_gib_hint') }}</p>
                                         </div>
                                     </div>
                                 </div>

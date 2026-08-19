@@ -614,7 +614,7 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
                             </div>
                             <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
-                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">Host</label>
+                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.server_alias.host') }}</label>
                                 <select id="server-alias-select"
                                         x-model="selectedAlias"
                                         class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
@@ -820,7 +820,7 @@
                                             </button>
                                         </div>
                                         <div class="flex items-center gap-2 min-w-0">
-                                            <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">App</span>
+                                            <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">{{ t('status.integrations.app_badge') }}</span>
                                             <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexAppCommand"></code>
                                             <button x-data="{ copied: false }"
                                                     @click="copyToClipboard(codexAppCommand); copied = true; setTimeout(() => copied = false, 2000)"
@@ -866,10 +866,10 @@
                                 <select x-model="globalSettings.integrations.openclaw_tools_profile"
                                         @change="saveIntegrationSettings()"
                                         class="text-xs border border-neutral-200 rounded-md px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
-                                    <option value="minimal">Minimal</option>
-                                    <option value="coding">Coding</option>
-                                    <option value="messaging">Messaging</option>
-                                    <option value="full">Full</option>
+                                    <option value="minimal">{{ t('status.integrations.profile_minimal') }}</option>
+                                    <option value="coding">{{ t('status.integrations.profile_coding') }}</option>
+                                    <option value="messaging">{{ t('status.integrations.profile_messaging') }}</option>
+                                    <option value="full">{{ t('status.integrations.profile_full') }}</option>
                                 </select>
                                 <button x-data="{ copied: false }"
                                         @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"

@@ -387,7 +387,7 @@
                                                             @click="copyWiredLimitCommand()"
                                                             :class="wiredLimitCopied ? 'text-green-500' : 'text-fg-tertiary hover:text-fg'"
                                                             class="transition-colors flex-shrink-0"
-                                                            :title="wiredLimitCopied ? 'Copied' : 'Copy'">
+                                                            :title="wiredLimitCopied ? window.t('bench.results.text_export.copied') : window.t('bench.results.text_export.copy')">
                                                         <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                                     </button>
                                                 </div>
@@ -630,8 +630,8 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.ssd_directory') }}</label>
                                     </div>
                                     <input type="text" x-model="globalSettings.cache.ssd_cache_dir"
-                                           class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
-                                </div>
+                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                 </div>
                             </div>
                         </div>
 
@@ -649,7 +649,7 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_policy_hint') }}</p>
                                     </div>
-                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
+                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="{{ t('common.none') }}"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -752,41 +752,39 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Network</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    Live
-                                </span>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">{{ t('settings.network.live_badge') }}</span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTP Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.http_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.proxy_example') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.http_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTPS Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.https_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.proxy_example') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.https_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">No Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Comma-separated hosts to bypass proxy</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.no_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.no_proxy_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.no_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">CA Bundle</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Path to PEM file for corporate TLS interception</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.ca_bundle') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.ca_bundle_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.ca_bundle"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
@@ -1151,7 +1149,7 @@
                                     <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.websearch.section_label') }}</span>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">DDGS · duckduckgo · brave · searxng</span>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">DDGS · DuckDuckGo · Brave · SearXNG</span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">

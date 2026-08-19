@@ -244,7 +244,12 @@
                 if (!def) return;
                 var svg = lucide.createElement(def);
                 Array.from(el.attributes).forEach(function(a) {
-                    if (a.name !== 'data-lucide') svg.setAttribute(a.name, a.value);
+                    // Copy only plain HTML attributes (class/style/etc.). Skip
+                    // Alpine directives (@click, x-show, :class, etc.) — they are
+                    // not valid SVG attribute names and would throw on setAttribute.
+                    var n = a.name;
+                    if (n === 'data-lucide' || n.charAt(0) === '@' || n.charAt(0) === ':' || n.indexOf('x-') === 0) return;
+                    svg.setAttribute(n, a.value);
                 });
                 svg.classList.add('lucide', 'lucide-' + name);
                 if (el.parentNode) el.parentNode.replaceChild(svg, el);
