@@ -42,7 +42,7 @@ absent).
 | 5 | 2026-08-15 | `e5051ba4-dde7-4829-90b4-7ff321fc0e25` | `ab62cea` — two-stage exact top-2 reduction kernel (replaces per-row argPartition+gather) | — | ✅ | no port: top-2 ledger is trusted-parent machinery absent in omlx; omlx uses in-graph argmax with identical ordering (value-desc, id-asc) |
 | 6 | 2026-08-15 | `b71bb354-4aa4-4ea5-b902-b67936205182` | `5c2441b` — top-2 reducer's first id IS the row argmax (drop separate argMax launch) | — | ✅ | already covered: omlx compute accepts in-graph from `mx.argmax` of the verify rows (single sync), same ordering contract |
 | 7 | 2026-08-15 | `84583d41-0417-437f-8482-5663cbddf51a` | `b6c7251` — `qmv_fast_crossrow_affine4_g64` multi-row (M=2..5) QMV kernel | ⏳ | ⏳ | N: C++ Metal kernel in vendored mlx-swift; Python mlx ships prebuilt kernels. Verify M=2..5 decode dispatch equivalence empirically |
-| 8 | 2026-08-15 | `7b33621c-1d1a-4540-834d-d89c7f402b0f` | `61936f2` | ⏳ | ⏳ | pending |
+| 8 | 2026-08-15 | `7b33621c-1d1a-4540-834d-d89c7f402b0f` | `61936f2` — compact proposal vocabulary: draft lm_head narrowed to 98,304 prefix + 26 control rows (~98k of 248k) with device-side id remap | `PORT-8` | ✅ token-exact (96-tok check) | compact draft lm_head, default ON (`OMLX_QWEN_COMPACT_DRAFT=0` ablation); −2.2% MTP decode (86.2 vs 88.2 ms/tok); acceptance preserved (50/44 cycles vs 49/45 full-vocab) |
 | 9 | 2026-08-15 | `aec00005-e85f-4a92-be34-822123d60b57` | `62174db` | ⏳ | ⏳ | pending |
 | 10 | 2026-08-15 | `06e8c9d4-add5-4052-8ccb-85decf2cb1f6` | `09eda55` | ⏳ | ⏳ | pending |
 | 11 | 2026-08-15 | `daf42d3e-df44-4117-a965-b34882dd999b` | `d819641` | ⏳ | ⏳ | pending (same shape as 10) |

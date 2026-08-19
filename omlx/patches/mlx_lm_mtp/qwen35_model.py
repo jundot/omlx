@@ -55,6 +55,27 @@ from . import prompt_priming
 
 logger = logging.getLogger(__name__)
 
+# Compact proposal vocabulary (challenge 7b33621). The draft lm_head readout
+# is narrowed from the full 248,320 rows to the 98,304 token-prefix rows plus
+# Qwen's text/control tokens 248,044…248,069 (98330 real rows; the Swift pads
+# to 98336 for its qmv N % 8 shape): ~60% less lm_head output work per draft
+# step. Draft-only — the target decides every emitted token.
+_COMPACT_PREFIX_ROWS = 98304
+_COMPACT_CTRL_START = 248044
+_COMPACT_CTRL_END = 248070
+_COMPACT_DRAFT_ENV = "OMLX_QWEN_COMPACT_DRAFT"
+
+
+def _compact_draft_enabled() -> bool:
+    import os
+
+    return os.environ.get(_COMPACT_DRAFT_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     """True iff ``cls.<attr>`` is the function we previously installed.
 
@@ -650,6 +671,7 @@ def _patch_text_model(q35: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        draft_mode: bool = False,
     ):
         """MTP-head forward.
 
@@ -659,6 +681,15 @@ def _patch_text_model(q35: Any) -> None:
         (0 = all): the depth-k history+draft fold only needs logits at the
         final position, and the vocab is large enough (~250k) that skipping
         the other rows matters.
+
+        ``draft_mode`` (challenge 7b33621) narrows the proposal lm_head to
+        the compact draft vocabulary — the 98,304 token-prefix rows plus
+        Qwen's control tokens 248,044…248,069 — instead of the full
+        248,320-row projection. Draft ids drawn from the compact readout are
+        mapped back to the tokenizer's id space by ``map_draft_token_ids``
+        before they reach the verify block. Only the PROPOSAL side changes —
+        the target decides every emitted token, so token fidelity is
+        untouched.
         """
         mtp_out = self.mtp(
             hidden_states,
@@ -669,13 +700,95 @@ def _patch_text_model(q35: Any) -> None:
         logits_source = mtp_out
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
+        if draft_mode and self._omlx_compact_draft_active():
+            logits = self._compact_draft_logits(logits_source)
+        elif self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
         else:
             logits = self.lm_head(logits_source)
         if return_hidden:
             return logits, mtp_out
         return logits
+
+    # -- compact draft vocabulary (challenge 7b33621) -----------------------
+
+    def _omlx_compact_draft_active(self) -> bool:
+        """Compact proposal vocabulary applies to the untied 248-320-vocab
+        backbone with no declared draft_lm_head (the pinned bf16 head ships
+        none)."""
+        return (
+            _compact_draft_enabled()
+            and not self.args.tie_word_embeddings
+            and int(getattr(self.args, "vocab_size", 0) or 0) == 248320
+            and not getattr(self, "_omlx_draft_head_declared", False)
+        )
+
+    def _compact_draft_head(self):
+        head = getattr(self, "_omlx_compact_draft_cache", None)
+        if head is not None:
+            return head
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        untied = self.lm_head
+
+        def compact_rows(arr):
+            return mx.concatenate(
+                [
+                    arr[0:_COMPACT_PREFIX_ROWS],
+                    arr[_COMPACT_CTRL_START:_COMPACT_CTRL_END],
+                ],
+                axis=0,
+            )
+
+        if isinstance(untied, nn.QuantizedLinear):
+            head = (
+                "quantized",
+                compact_rows(untied.weight),
+                compact_rows(untied.scales),
+                compact_rows(untied.biases),
+                untied.group_size,
+                untied.bits,
+            )
+        else:
+            bias = compact_rows(untied.bias) if untied.bias is not None else None
+            head = ("dense", compact_rows(untied.weight), bias, None)
+        self._omlx_compact_draft_cache = head
+        return head
+
+    def _compact_draft_logits(self, logits_source):
+        """Project through the compact draft lm_head (98330 real rows; the
+        Swift pads to 98336 for qmv_fast's N % 8 shape and slices the padding
+        off before argmax — Python's quantized_matmul needs no padding, and
+        the padding is unreachable either way)."""
+        import mlx.core as mx
+
+        head = self._compact_draft_head()
+        if head[0] == "quantized":
+            _, w, s, z, gs, bits = head
+            return mx.quantized_matmul(
+                logits_source, w, s, z, transpose=True, group_size=gs, bits=bits
+            )
+        _, weight, bias, _ = head
+        out = logits_source @ weight.T
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def map_draft_token_ids(self, ids):
+        """Map compact draft ids back to the tokenizer's full id space.
+        The low 98,304 rows keep their ids; the appended control rows are
+        248,044 … 248,069. Full-vocabulary proposals return the input
+        unchanged."""
+        if not self._omlx_compact_draft_active():
+            return ids
+        import mlx.core as mx
+
+        return mx.where(
+            ids < _COMPACT_PREFIX_ROWS,
+            ids,
+            ids + (_COMPACT_CTRL_START - _COMPACT_PREFIX_ROWS),
+        )
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -867,6 +980,10 @@ def _patch_text_model(q35: Any) -> None:
     cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
+    cls._omlx_compact_draft_active = _omlx_compact_draft_active
+    cls.map_draft_token_ids = map_draft_token_ids
+    cls._compact_draft_head = _compact_draft_head
+    cls._compact_draft_logits = _compact_draft_logits
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +1020,7 @@ def _patch_outer_model(q35: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        draft_mode: bool = False,
     ):
         return self.language_model.mtp_forward(
             hidden_states,
@@ -910,10 +1028,17 @@ def _patch_outer_model(q35: Any) -> None:
             mtp_cache,
             return_hidden=return_hidden,
             logits_keep=logits_keep,
+            draft_mode=draft_mode,
         )
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
+
+    def map_draft_token_ids(self, ids):
+        return self.language_model.map_draft_token_ids(ids)
+
+    def _omlx_compact_draft_active(self) -> bool:
+        return self.language_model._omlx_compact_draft_active()
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         return self.language_model.mtp_partial_rollback(cache, accepted, num_drafts)
@@ -923,6 +1048,8 @@ def _patch_outer_model(q35: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls.map_draft_token_ids = map_draft_token_ids
+    cls._omlx_compact_draft_active = _omlx_compact_draft_active
     # Informational marker for external code that just wants to know "is
     # this class touched by the MTP patch". Idempotency itself uses the
     # function-level _omlx_mtp_call_marker above.

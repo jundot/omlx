@@ -2233,12 +2233,23 @@ def _chain_next_drafts(
         begin(state.mtp_cache, depth)
 
     n = committed.shape[0]
+    # Compact proposal vocabulary (challenge 7b33621): greedy target + no
+    # grammar processors → draw drafts from the ~98330-row compact lm_head and
+    # map the ids back to the tokenizer space. The proposal side only — the
+    # verify forward stays on the full-vocabulary target lm_head.
+    compact = (
+        _is_greedy(gen_batch)
+        and procs is None
+        and callable(getattr(model, "map_draft_token_ids", None))
+        and bool(getattr(model, "_omlx_compact_draft_active", lambda: False)())
+    )
     logits, head_hidden = model.mtp_forward(
         hidden_rows,
         committed.reshape(1, n),
         state.mtp_cache,
         return_hidden=True,
         logits_keep=1,
+        draft_mode=compact,
     )
     state.hist_offset += int(n)
 
@@ -2257,14 +2268,20 @@ def _chain_next_drafts(
 
     for j in range(depth):
         logits_2d = logits[:, -1, :]
-        if procs is not None and prev_buf is not None:
-            prev = mx.concatenate(
-                [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
-                + [t.reshape(1).astype(mx.int32) for t in draft_toks]
+        if compact:
+            tok = _ensure_uint32(
+                model.map_draft_token_ids(mx.argmax(logits_2d, axis=-1))
             )
-            logits_2d = _apply_processors(procs, prev, logits_2d)
-        lp_2d = _logprobs(logits_2d)
-        tok = _ensure_uint32(sampler(lp_2d))
+            lp_2d = _logprobs(logits_2d)
+        else:
+            if procs is not None and prev_buf is not None:
+                prev = mx.concatenate(
+                    [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
+                    + [t.reshape(1).astype(mx.int32) for t in draft_toks]
+                )
+                logits_2d = _apply_processors(procs, prev, logits_2d)
+            lp_2d = _logprobs(logits_2d)
+            tok = _ensure_uint32(sampler(lp_2d))
         draft_toks.append(tok)
         draft_lps.append(lp_2d.squeeze(0))
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
@@ -2275,6 +2292,7 @@ def _chain_next_drafts(
             tok.reshape(1, 1),
             chain_cache,
             return_hidden=True,
+            draft_mode=compact,
         )
         h = head_hidden[:, -1:]
 
