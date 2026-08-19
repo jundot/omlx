@@ -73,7 +73,12 @@ absent).
 
 ## Concern register
 
-(to be filled as ports land)
+### C1 — Two-output compiled g+beta fusion not ported (ULP-divergence risk)
+
+- **Submission / challenge commit:** `6cb6c963-...` / `8f41fa6` (`qwen35CompiledGatedDeltaGBeta`).
+- **Optimization:** compile the fp32 `g` and `beta` producers of the GDN recurrence into one two-output compiled pass.
+- **Token-exactness issue:** the laguna port's C1 finding (MLX 0.32) shows two-output compiled functions that consume a shared intermediate can diverge from eager at ULP (5.96e-8–1.19e-7). `g`/`beta` feed the verify recurrence where the challenge requires absolute fidelity, so the fusion is not ported; mlx-lm's `compute_g` is already compiled (single output, shapeless) and `beta` stays a graph `sigmoid`. The single-output post-norm SiLU compile IS ported (opt-in, token-exact, measured 2.3× slower on M4 Max — see row 13).
+- **MLX-version dependence:** property of MLX 0.32.0 compiled kernels; re-verify after any MLX bump.
 
 ## How to update
 
