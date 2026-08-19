@@ -15,6 +15,7 @@ from omlx.api.responses_models import (
     TextFormatConfig,
 )
 from omlx.api.responses_utils import (
+    ResponseIdempotencyConflictError,
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
@@ -818,6 +819,49 @@ class TestResponseStore:
         reloaded = ResponseStore(max_size=10, state_dir=state_dir)
         assert reloaded.get("resp_1")["id"] == "resp_1"
         assert reloaded.get_record("resp_1")["input_messages"][0]["content"] == "Hi"
+
+    def test_idempotency_claim_is_durable_conflict_safe_and_not_evicted(
+        self, tmp_path
+    ):
+        state_dir = tmp_path / "response-state"
+        store = ResponseStore(max_size=1, state_dir=state_dir)
+        initial = {
+            "id": ResponseStore.response_id_for_idempotency_key("attempt-1"),
+            "object": "response",
+            "model": "test-model",
+            "status": "in_progress",
+            "output": [],
+        }
+
+        created, claimed = store.claim_idempotency("attempt-1", "fingerprint", initial)
+        assert created is True
+        assert claimed["status"] == "in_progress"
+        assert store.is_idempotent(initial["id"]) is True
+        assert store.claim_idempotency("attempt-1", "fingerprint", initial)[0] is False
+        with pytest.raises(ResponseIdempotencyConflictError):
+            store.claim_idempotency("attempt-1", "different", initial)
+
+        completed = dict(initial, status="completed")
+        store.put(initial["id"], completed)
+        store.put("resp_regular", {"id": "resp_regular", "status": "completed"})
+        assert store.get("resp_regular") is None
+
+        abandoned = {
+            "id": ResponseStore.response_id_for_idempotency_key("attempt-2"),
+            "object": "response",
+            "model": "test-model",
+            "status": "in_progress",
+            "output": [],
+        }
+        store.claim_idempotency("attempt-2", "fingerprint-2", abandoned)
+
+        reloaded = ResponseStore(max_size=1, state_dir=state_dir)
+        assert reloaded.get_by_idempotency_key("attempt-1")["status"] == "completed"
+        failed = reloaded.get_by_idempotency_key("attempt-2")
+        assert failed["status"] == "failed"
+        assert failed["error"]["code"] == "server_restarted"
+        persisted = "\n".join(path.read_text() for path in state_dir.glob("*.json"))
+        assert "attempt-1" not in persisted
 
     def test_resolve_chain_messages(self, tmp_path):
         state_dir = tmp_path / "response-state"

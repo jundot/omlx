@@ -2,6 +2,7 @@
 """Conversion utilities for the OpenAI Responses API."""
 
 import copy
+import hashlib
 import json
 import logging
 import uuid
@@ -32,6 +33,10 @@ class ResponseStateNotFoundError(ResponseStateError):
 
 class ResponseStateCorruptError(ResponseStateError):
     """Raised when a stored response chain is incomplete or invalid."""
+
+
+class ResponseIdempotencyConflictError(ResponseStateError):
+    """Raised when an idempotency key is reused for a different request."""
 
 
 def _try_parse_json(s: str):
@@ -524,7 +529,20 @@ class ResponseStore:
 
     def _evict_oldest(self) -> None:
         while len(self._store) > self._max_size:
-            response_id, _record = self._store.popitem(last=False)
+            # ponytail: claims are never evicted; add explicit retention with
+            # persisted tombstones if bounded idempotency history is needed.
+            candidate = next(
+                (
+                    response_id
+                    for response_id, record in self._store.items()
+                    if not record.get("idempotency_key_hash")
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            response_id = candidate
+            del self._store[response_id]
             self._remove_persisted_record(response_id)
 
     def _load_persisted_records(self) -> None:
@@ -547,6 +565,18 @@ class ResponseStore:
             key=lambda record: (record.get("created_at", 0), record["response_id"])
         )
         for record in loaded:
+            public_response = record.get("public_response", {})
+            if (
+                record.get("idempotency_key_hash")
+                and public_response.get("status") == "in_progress"
+            ):
+                public_response["status"] = "failed"
+                public_response["error"] = {
+                    "code": "server_restarted",
+                    "message": "The server restarted before the response completed.",
+                }
+                record["public_response"] = public_response
+                self._persist_record(record)
             self._store[record["response_id"]] = record
         self._evict_oldest()
 
@@ -554,10 +584,85 @@ class ResponseStore:
         """Store response state, evicting oldest records if needed."""
         record = self._normalize_record(response_id, response_data)
         if response_id in self._store:
+            existing = self._store[response_id]
+            for key in ("idempotency_key_hash", "request_fingerprint"):
+                if key in existing:
+                    record[key] = existing[key]
             self._store.move_to_end(response_id)
         self._store[response_id] = record
         self._persist_record(record)
         self._evict_oldest()
+
+    @staticmethod
+    def _idempotency_key_hash(idempotency_key: str) -> str:
+        return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def response_id_for_idempotency_key(cls, idempotency_key: str) -> str:
+        """Return the stable response ID associated with an idempotency key."""
+        return f"resp_{cls._idempotency_key_hash(idempotency_key)[:24]}"
+
+    def claim_idempotency(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+        public_response: Dict[str, Any],
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Persist a pre-generation claim or return the existing response."""
+        response_id = self.response_id_for_idempotency_key(idempotency_key)
+        existing = self._store.get(response_id)
+        if existing is not None:
+            if existing.get("request_fingerprint") != request_fingerprint:
+                raise ResponseIdempotencyConflictError(
+                    "Idempotency key was already used for a different request."
+                )
+            return False, copy.deepcopy(existing["public_response"])
+
+        claimed_response = copy.deepcopy(public_response)
+        claimed_response["id"] = response_id
+        record = self._normalize_record(response_id, claimed_response)
+        record["idempotency_key_hash"] = self._idempotency_key_hash(idempotency_key)
+        record["request_fingerprint"] = request_fingerprint
+        self._store[response_id] = record
+        self._persist_record(record)
+        self._evict_oldest()
+        return True, copy.deepcopy(claimed_response)
+
+    def get_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve a claimed response without persisting the raw key."""
+        response_id = self.response_id_for_idempotency_key(idempotency_key)
+        record = self._store.get(response_id)
+        if (
+            record is None
+            or record.get("idempotency_key_hash")
+            != self._idempotency_key_hash(idempotency_key)
+        ):
+            return None
+        self._store.move_to_end(response_id)
+        return copy.deepcopy(record["public_response"])
+
+    def is_idempotent(self, response_id: str) -> bool:
+        record = self._store.get(response_id)
+        return bool(record and record.get("idempotency_key_hash"))
+
+    def fail_idempotency(self, response_id: str, code: str) -> None:
+        """Make an existing in-progress claim terminal without allowing retry."""
+        record = self._store.get(response_id)
+        if record is None or not record.get("idempotency_key_hash"):
+            return
+        public_response = copy.deepcopy(record["public_response"])
+        if public_response.get("status") != "in_progress":
+            return
+        public_response["status"] = "failed"
+        public_response["error"] = {
+            "code": code,
+            "message": "The response failed after its idempotency claim was stored.",
+        }
+        record["public_response"] = public_response
+        self._persist_record(record)
 
     def get_record(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response-state record."""
