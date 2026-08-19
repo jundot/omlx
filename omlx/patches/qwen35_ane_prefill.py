@@ -522,6 +522,35 @@ def _eligible_gdn(gdn: Any) -> bool:
     )
 
 
+def min_viable_gdn_fraction(gdn: Any) -> float | None:
+    """Smallest ``gdn_fraction`` that engages the ANE on ``gdn``.
+
+    ``_prepare_gdn_for_bank`` keeps a 128-aligned ANE slice and rejects the
+    layer when that slice can't even cover the z projection
+    (``ane_outputs < z_outputs``). Below this fraction every GDN layer returns
+    ``None`` and 0 GDN procedures compile — the silent no-op of issue #2899.
+    Returns ``None`` when the layer is ineligible or can never engage.
+    """
+    if not _eligible_gdn(gdn):
+        return None
+    _, z, _, _ = _gdn_linears(gdn)
+    qkv = _gdn_linears(gdn)[0]
+    z_outputs = int(z.weight.shape[0])
+    total_outputs = z_outputs + int(qkv.weight.shape[0])
+    if total_outputs <= 0:
+        return None
+    # smallest 128-aligned ANE slice that covers z, matching the bank rejection
+    ane_min = ((z_outputs + 127) // 128) * 128
+    if ane_min > total_outputs:
+        return None
+    frac = ane_min / total_outputs
+    # _prepare_gdn_for_bank truncates via int(total * fraction); nudge up if the
+    # truncation would drop the aligned slice back below z.
+    if (int(total_outputs * frac) // 128) * 128 < ane_min:
+        frac = (ane_min + 1) / total_outputs
+    return frac
+
+
 def _pack_affine_gdn_suffix(
     qkv: Any,
     b: Any,
@@ -1366,6 +1395,42 @@ def _enable_dual_procedure_banks(
     )
 
 
+def _warn_gdn_below_floor(
+    model: Any,
+    gdn_requested: bool,
+    gdn_max_layers: int,
+    gdn_fraction: float,
+    gdn_count: int,
+) -> None:
+    """Explain a GDN no-op caused by a below-floor ``gdn_fraction`` (issue #2899).
+
+    When GDN prefill is requested and MLPs compiled but not one GDN layer did,
+    the usual cause is ``gdn_fraction`` below the model's structural minimum, so
+    the ANE slice can't cover the z projection. Say so, with the floor.
+    """
+    if not gdn_requested or gdn_max_layers <= 0 or gdn_count:
+        return
+    floor = None
+    for module in model.modules() if hasattr(model, "modules") else ():
+        if _eligible_gdn(module):
+            floor = min_viable_gdn_fraction(module)
+            break
+    if floor is not None and gdn_fraction < floor:
+        logger.warning(
+            "Qwen ANE GDN prefill requested at gdn_fraction=%.3f but 0 GDN "
+            "layers engaged: this model needs gdn_fraction >= %.3f for the "
+            "128-aligned ANE slice to cover the z projection. GDN runs on GPU.",
+            gdn_fraction,
+            floor,
+        )
+    else:
+        logger.warning(
+            "Qwen ANE GDN prefill requested but 0 GDN layers engaged "
+            "(gdn_fraction=%.3f); GDN runs on GPU",
+            gdn_fraction,
+        )
+
+
 def enable_qwen35_ane_prefill(
     model: Any,
     *,
@@ -1448,6 +1513,7 @@ def enable_qwen35_ane_prefill(
                 resident_programs,
                 sequence_length,
             )
+        _warn_gdn_below_floor(model, gdn, gdn_max_layers, gdn_fraction, gdn_count)
         return count
 
     count = 0
@@ -1544,4 +1610,6 @@ def enable_qwen35_ane_prefill(
             gdn_fraction,
             dual_ane,
         )
+    if not gdn_budget_exhausted:
+        _warn_gdn_below_floor(model, gdn, gdn_max_layers, gdn_fraction, gdn_count)
     return count

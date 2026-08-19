@@ -1504,3 +1504,70 @@ def test_enable_env_kill_switch_wins(monkeypatch):
 
     assert count == 0
     assert installed == []
+
+
+# --- GDN fraction floor (feat/ane-gdn-fraction-floor, issue #2899) ---
+
+
+class _FakeLinear:
+    """Minimal QuantizedLinear stand-in exposing weight.shape[0]."""
+
+    def __init__(self, out_features: int):
+        self.weight = SimpleNamespace(shape=(out_features, 128))
+
+
+def _fake_gdn(z_outputs: int, qkv_outputs: int):
+    return SimpleNamespace(
+        in_proj_z=_FakeLinear(z_outputs),
+        in_proj_qkv=_FakeLinear(qkv_outputs),
+    )
+
+
+def test_min_viable_gdn_fraction_matches_bank_rejection(monkeypatch):
+    """The floor is the smallest fraction whose 128-aligned slice covers z."""
+    # keep the eligibility gate out of the way; we test the arithmetic only
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda gdn: True)
+
+    # z=512, total=2048 -> ane_min=512 -> floor = 512/2048 = 0.25
+    gdn = _fake_gdn(z_outputs=512, qkv_outputs=1536)
+    floor = ane_patch.min_viable_gdn_fraction(gdn)
+    assert floor == 0.25
+
+    # the floor must actually clear the bank's own rejection rule
+    total = 2048
+    ane_outputs = (int(total * floor) // 128) * 128
+    assert ane_outputs >= 512
+    # one grid step below the floor must fail that same rule
+    below = 0.15
+    assert (int(total * below) // 128) * 128 < 512
+
+
+def test_min_viable_gdn_fraction_none_when_impossible(monkeypatch):
+    """A z projection larger than the whole layer can never engage."""
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda gdn: True)
+    # ceil(2050/128)*128 = 2176 > total 2060 -> the z slice can never fit
+    gdn = _fake_gdn(z_outputs=2050, qkv_outputs=10)
+    assert ane_patch.min_viable_gdn_fraction(gdn) is None
+
+
+def test_warn_gdn_below_floor_explains_the_no_op(monkeypatch, caplog):
+    """MLP compiled, 0 GDN, below-floor fraction -> a warning naming the floor."""
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda gdn: True)
+    gdn = _fake_gdn(z_outputs=512, qkv_outputs=1536)  # floor 0.25
+    model = SimpleNamespace(modules=lambda: [gdn])
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        ane_patch._warn_gdn_below_floor(
+            model, gdn_requested=True, gdn_max_layers=48,
+            gdn_fraction=0.15, gdn_count=0,
+        )
+    assert "gdn_fraction >= 0.250" in caplog.text
+
+    caplog.clear()
+    # gdn_count > 0 must stay silent
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        ane_patch._warn_gdn_below_floor(
+            model, gdn_requested=True, gdn_max_layers=48,
+            gdn_fraction=0.15, gdn_count=12,
+        )
+    assert caplog.text == ""

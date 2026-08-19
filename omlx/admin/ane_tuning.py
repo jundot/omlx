@@ -670,7 +670,22 @@ def _calibrate_components_sync(
             state, dense0, dense1 = value
             prepared.append(("mlp", fraction, state, dense0, dense1))
     if gdn is not None:
-        for fraction in fractions:
+        # Skip GDN fractions below the model's structural floor: they compile 0
+        # GDN procedures at apply time, so measuring them only compares
+        # identical pure-GPU-GDN configs and can get one recommended (#2899).
+        gdn_floor = patch.min_viable_gdn_fraction(gdn)
+        gdn_fractions = fractions
+        if gdn_floor is not None:
+            gdn_fractions = [f for f in fractions if f >= gdn_floor]
+            dropped = [f for f in fractions if f < gdn_floor]
+            if dropped:
+                logger.info(
+                    "Tuner: skipping GDN fractions below the structural floor "
+                    "%.3f for this model (dropped %s); they engage 0 GDN layers",
+                    gdn_floor,
+                    ", ".join(f"{f:.2f}" for f in dropped),
+                )
+        for fraction in gdn_fractions:
             config = patch._AneGDNConfig(
                 run.request.sequence_length, fraction, 8, True
             )
