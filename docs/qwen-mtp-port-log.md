@@ -65,7 +65,7 @@ absent).
 | 28 | 2026-08-17 | `316bd671-e06a-4aaf-a276-8d59f3fedc5d` | `111b757` — warm the `callWithHiddenAndNormed` shapes + top-2 kernels at every row count | — | ✅ | no port: warmup-only (timed-window JIT avoidance); omlx has no scored timed window |
 | 29 | 2026-08-17 | `39fdbf62-60e4-4ab7-bf09-0d1b5a0b618a` | `ed4dfd6` — warm additions + head precision islands re-declared | — | ✅ | no port: warmup-only + head declaration (as 27/28) |
 | 30 | 2026-08-18 | `b1e2591b-13f2-4b17-baf1-2956ca9242df` | `036fd9c` — draft rerank: coarse affine-2 compact readout picks 32 rows, affine-4 compact readout reranks them; head declaration | — | ✅ | no port: rerank Metal kernel + head artifact (draft-side). omlx keeps the pinned head; the proposal readout stays graph argmax |
-| 31 | 2026-08-18 | `824dc272-b560-4dc6-bf6c-42f58944f4cb` | `8dabcfb` — quantized kernels | ⏳ | ⏳ | pending |
+| 31 | 2026-08-18 | `824dc272-b560-4dc6-bf6c-42f58944f4cb` | `8dabcfb` — affine2/g64 single-row fast QMV for the coarse compact readout | — | ✅ | no port: C++ Metal kernel in vendored mlx-swift (2-bit qmv); Python mlx has no 2-bit quantized_matmul and the coarse readout is head-artifact-side |
 | 32 | 2026-08-18 | `72ce82dc-f751-485d-a7b3-94ab6471cf87` | `dccba74` — quantized kernels | ⏳ | ⏳ | pending |
 | 33 | 2026-08-18 | `4f76de6e-d9cf-4a52-8aa1-57dc4c0e2a16` | `c0e34af` — session + RuntimeStartupMemoryPolicy | ⏳ | ⏳ | pending |
 | 34 | 2026-08-18 | `b0994092-554a-452c-8d4c-78fecda724b4` | `1cb1f43` — session +19 | ⏳ | ⏳ | pending |
