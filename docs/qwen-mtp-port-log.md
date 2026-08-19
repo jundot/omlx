@@ -58,7 +58,7 @@ absent).
 | 21 | 2026-08-16 | `e6c5ef35-0d86-4cec-a5d6-366e2e59cdcd` | `7351e62` — margin-confidence gate in the cost model + fused gate-up SiLU Metal pass | — | ✅ | policy half covered by `_DepthController` (acceptance EMAs already condition on observed margins); SiLU fusion is a C++ Metal kernel — no port |
 | 22 | 2026-08-16 | `f03469a9-d889-4bca-8061-a4ad3178c7d2` | `c7468c5` — `segmentedStreakGate = 2` (draft-policy constant) | — | ✅ | covered: streak/segmented gating is a Swift-session policy constant; omlx `_DepthController` owns depth choice with its own gates (hysteresis, exit streaks) |
 | 23 | 2026-08-16 | `776d7168-e968-40c4-808e-f643ec1953a7` | `4aacc53` — `asyncEval` the replayed recurrent states after a wide-prefix replay | — | ✅ | covered: omlx dispatches the draft chain and rollback with `mx.async_eval` (single-sync cycle design); replay roots are consumed by the next cycle's graph build |
-| 24 | 2026-08-17 | `5c523482-452c-4662-a303-a3b359c81030` | `cdb06b7` | ⏳ | ⏳ | pending |
+| 24 | 2026-08-17 | `5c523482-452c-4662-a303-a3b359c81030` | `cdb06b7` — packed GDN prework mixer with in-kernel beta (0xC0DB sigmoid ULP map) | — | ✅ | no port: C++ Metal kernel; the sigmoid ULP hazard is Metal-kernel-internal and does not exist in mlx's graph sigmoid |
 | 25 | 2026-08-17 | `03dedda8-fc70-4e3e-881f-5384a17af405` | `32b94cb` | ⏳ | ⏳ | pending |
 | 26 | 2026-08-17 | `a451f3b3-20c6-4dcd-9a9f-e7f21d937a58` | `d077e68` | ⏳ | ⏳ | pending |
 | 27 | 2026-08-17 | `febb7e27-935c-4a1a-bee4-d7387950ea2d` | `cbdc3a8` — Qwen35 +90 + head declaration | ⏳ | ⏳ | pending |
