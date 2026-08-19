@@ -432,20 +432,63 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return self._model_type_str
 
     @staticmethod
+    def _draft_checkpoint_is_dflash2(draft_model_path: str | Path) -> bool:
+        """True when the draft checkpoint declares the DFlash2 architecture.
+
+        DFlash2's block-diffusion forward is numerically unstable in fp16
+        (NaN logits → every draft token is rejected), so the draft quant
+        spec must not fall back to fp16 activations for these checkpoints on
+        M1/M2 (see ``_build_quant_spec``).
+        """
+        config_path = Path(draft_model_path) / "config.json"
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                architectures = json.load(f).get("architectures") or []
+        except (OSError, json.JSONDecodeError):
+            return False
+        return any("DFlash2DraftModel" in str(arch) for arch in architectures)
+
+    @staticmethod
+    def _bf16_emulated_chip() -> bool:
+        """True on M1/M2 GPUs, where MLX emulates bf16 through fp32."""
+        try:
+            from dflash_mlx.runtime.chip_detect import detect_chip
+
+            return bool(detect_chip().bf16_emulated)
+        except Exception:
+            return False
+
+    @staticmethod
     def _build_quant_spec(
         weight_bits: int | None,
         activation_bits: int | None,
         group_size: int | None,
+        *,
+        draft_model_path: str | Path | None = None,
     ) -> str:
         """Convert draft quantization config into dflash 0.1.5's spec string format.
 
         None values fall back to dflash defaults (w4a16:gs64), so the spec stays
         valid when a profile or external API sets `enabled=True` without filling
         in every bit value.
+
+        On M1/M2 (bf16 emulated) dflash-mlx casts quantized drafts to fp16 to
+        dodge the emulation slowdown, but DFlash2 drafts produce NaN in fp16
+        and every draft token gets rejected (0% acceptance), making
+        speculative decoding strictly slower than plain decoding. Force fp32
+        activations for DFlash2 drafts on those chips: same int4 weights,
+        identical acceptance to bf16, and far faster than emulated bf16.
         """
         wb = weight_bits if weight_bits is not None else 4
         ab = activation_bits if activation_bits is not None else 16
         gs = group_size if group_size is not None else 64
+        if (
+            ab == 16
+            and draft_model_path is not None
+            and DFlashEngine._draft_checkpoint_is_dflash2(draft_model_path)
+            and DFlashEngine._bf16_emulated_chip()
+        ):
+            ab = 32
         return f"w{wb}a{ab}:gs{gs}"
 
     def _resolve_dflash_l2_dir(self, quiet: bool = False) -> Path | None:
@@ -600,6 +643,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         self._draft_quant_weight_bits,
                         self._draft_quant_activation_bits,
                         self._draft_quant_group_size,
+                        draft_model_path=self._draft_model_path,
                     )
                     if self._draft_quant_enabled
                     else None
