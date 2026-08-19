@@ -96,7 +96,7 @@ def _fused_proj_enabled() -> bool:
     )
 
 
-def _try_build_fused_in_proj(gdn: Any) -> Optional[tuple]:
+def _try_build_fused_in_proj(gdn: Any) -> tuple | None:
     """Concatenate the GDN input projections (qkv, z, b, a) on the output
     axis for one affine quantized matmul. Rows are independent, so this is
     bit-exact with four separate launches. Returns None when any projection
@@ -125,7 +125,7 @@ def _try_build_fused_in_proj(gdn: Any) -> Optional[tuple]:
     return (w, s, z, gs, bits, outs[0], outs[1], outs[2])
 
 
-def _try_build_fused_gate_up(mlp: Any) -> Optional[tuple]:
+def _try_build_fused_gate_up(mlp: Any) -> tuple | None:
     """Concatenate the SwiGLU gate/up projections on the output axis for one
     affine quantized matmul (challenge 45c257f1). Returns None when either
     projection is unquantized or the quantizations mismatch."""
@@ -297,7 +297,6 @@ def _patch_gdn_compiled_fusions(q35: Any) -> None:
     compiled_swiglu = mx.compile(
         lambda h, gate, x: _precise_swiglu(h, gate, x)
     )
-    original_call = Qwen3NextRMSNormGated.__call__
 
     def __call__(self, hidden_states, gate=None):
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
@@ -425,8 +424,6 @@ def _patch_attention_packed_qkv(q35: Any) -> None:
         """Append rows to the attention cache without producing a query
         output (challenge a3104b04 — MTP-head committed-history flush).
         The target never uses this proposal-head maintenance primitive."""
-        import mlx.core as mx
-
         B, L, _ = x.shape
         keys = self.k_proj(x)
         values = self.v_proj(x)
