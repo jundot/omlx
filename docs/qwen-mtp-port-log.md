@@ -49,7 +49,7 @@ absent).
 | 12 | 2026-08-15 | `5b656013-a2aa-44bb-bfa1-13471d966063` | `08897af` | ⏳ | ⏳ | pending |
 | 13 | 2026-08-15 | `6cb6c963-a793-4f34-987e-94c05182eeea` | `8f41fa6` | ⏳ | ⏳ | pending |
 | 14 | 2026-08-15 | `91743270-d5e2-4a8e-b61d-451bde3121e7` | `deb63ad` — declares a remote MTP head (amal-david q2-q4-rerank) in `mtp-head.manifest.json` | — | ✅ | no port: head-declaration only — the proposal head is swappable artifact, not model code; omlx keeps the organizer-pinned bf16 head. Draft-side only: the target decides every emitted token |
-| 15 | 2026-08-16 | `c08eb406-7383-4681-b12f-62e2fc35bf29` | `b6ce964` | ⏳ | ⏳ | pending |
+| 15 | 2026-08-16 | `c08eb406-7383-4681-b12f-62e2fc35bf29` | `b6ce964` — 512-prefix attention warm + optimistic-decaying policy priors | — | ✅ | no port: warmup-shape + policy-prior tuning. omlx has no timed decode window (JIT cost is not inside a scored region) and `_DepthController` learns priors from measurement, not hand-set constants |
 | 16 | 2026-08-16 | `be6b63f5-ab13-4fb1-bdee-cd49ffb5756a` | `1033e1a` | ⏳ | ⏳ | pending |
 | 17 | 2026-08-16 | `a3104b04-715a-4a7e-a58a-8445b68b54a8` | `cf35029` | ⏳ | ⏳ | pending (adds Qwen35MTP.swift model) |
 | 18 | 2026-08-16 | `9ef7b7f1-7373-43d0-9a60-3a4e885f1198` | `4eb5448` | ⏳ | ⏳ | pending |
