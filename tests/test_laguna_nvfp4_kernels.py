@@ -524,6 +524,126 @@ def test_dense_down_residual_matches_fallback():
 
 
 
+@pytest.mark.parametrize("h1", [False, True])
+def test_prefill_full_qk_norm_yarn_rows_bit_exact(seed, h1):
+    """Batched full-attention QK-norm+YaRN vs the per-row fallback: same
+    stepwise-bf16 agreement as the single-row kernel (few-ulp, majority
+    bit-exact), for both the 4-heads-per-group and h1 dispatches."""
+    rows = 3
+    mx.random.seed(seed)
+    rq = mx.random.normal((rows * 48 * 128,)).astype(mx.bfloat16)
+    rk = mx.random.normal((rows * 8 * 128,)).astype(mx.bfloat16)
+    qw = mx.random.normal((128,)).astype(mx.bfloat16)
+    kw = mx.random.normal((128,)).astype(mx.bfloat16)
+    ang = mx.random.normal(((rows + 2) * 64,)).astype(mx.float32)
+    offsets = mx.array([1], mx.int32)  # shift the angle atlas by one row
+    q, k = laguna_nvfp4.prefill_full_qk_norm_yarn(
+        rq, rk, qw, kw, ang, offsets, h1=h1)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        qf, kf = laguna_nvfp4.prefill_full_qk_norm_yarn(
+            rq, rk, qw, kw, ang, offsets, h1=h1)
+    finally:
+        laguna_nvfp4._ext = saved
+    dq = mx.abs(q.astype(mx.float32) - qf.astype(mx.float32))
+    dk = mx.abs(k.astype(mx.float32) - kf.astype(mx.float32))
+    assert float(dq.max()) <= 4e-3, (
+        f"seed {seed} h1={h1}: queries differ {float(dq.max()):.3g}")
+    assert float(dk.max()) <= 4e-3, (
+        f"seed {seed} h1={h1}: keys differ {float(dk.max()):.3g}")
+    assert int(mx.sum(dq == 0)) >= rows * 48 * 128 // 8
+
+
+@pytest.mark.parametrize("h1", [False, True])
+def test_prefill_sliding_qk_norm_rope_rows_bit_exact(h1):
+    """Batched sliding QK-norm+RoPE vs the per-row fallback, for both the
+    4-heads-per-group and h1 dispatches. The fallback is the documented
+    few-ulp approximation of the kernel's stepwise bf16 (same agreement as
+    the single-row kernel), so the assertion is a small bound + majority
+    bit-exact."""
+    rows = 3
+    mx.random.seed(4)
+    rq = mx.random.normal((rows * 64 * 128,)).astype(mx.bfloat16)
+    rk = mx.random.normal((rows * 8 * 128,)).astype(mx.bfloat16)
+    qw = mx.random.normal((128,)).astype(mx.bfloat16)
+    kw = mx.random.normal((128,)).astype(mx.bfloat16)
+    ang = mx.random.normal(((rows + 2) * 128,)).astype(mx.float32)
+    offsets = mx.array([1], mx.int32)
+    q, k = laguna_nvfp4.prefill_sliding_qk_norm_rope(
+        rq, rk, qw, kw, ang, offsets, h1=h1)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        qf, kf = laguna_nvfp4.prefill_sliding_qk_norm_rope(
+            rq, rk, qw, kw, ang, offsets, h1=h1)
+    finally:
+        laguna_nvfp4._ext = saved
+    dq = mx.abs(q.astype(mx.float32) - qf.astype(mx.float32))
+    dk = mx.abs(k.astype(mx.float32) - kf.astype(mx.float32))
+    assert float(dq.max()) <= 4e-3, f"h1={h1}: queries differ {float(dq.max()):.3g}"
+    assert float(dk.max()) <= 4e-3, f"h1={h1}: keys differ {float(dk.max()):.3g}"
+    assert int(mx.sum(dq == 0)) >= rows * 64 * 128 // 8
+
+
+def test_prefill_sorted_moe_tail_bit_exact():
+    """Prefill SORTED MoE tail: the kernel's inverse-order gather + bf16-
+    stepwise combine is bit-exact against the faithful reference (the
+    moe_tail arithmetic), and the pure-mlx fallback agrees within ULP."""
+    rows = 3
+    hidden = 2048
+    mx.random.seed(33)
+    ex = mx.random.normal((1, rows, 8, hidden), scale=0.02).astype(mx.bfloat16)
+    rw = mx.random.normal((1, rows, 8), scale=0.1).astype(mx.float32)
+    sh = mx.random.normal((1, rows, hidden), scale=0.05).astype(mx.bfloat16)
+    re = mx.random.normal((1, rows, hidden), scale=0.05).astype(mx.bfloat16)
+    # inverse_order: sorted position -> original flat row. Build the sorted
+    # plane so sorted[inv[p]*hidden + c] == ex[p*hidden + c] (the kernel's
+    # gather recovers the original exactly).
+    inv = mx.random.permutation(rows * 8).astype(mx.uint32)
+    perm = mx.argsort(inv)  # sorted position s holds logical row perm[s]
+    idx = (perm[:, None] * hidden + mx.arange(hidden)[None, :]).reshape(-1)
+    sorted_ex = mx.take(ex.reshape(-1), idx.astype(mx.int32)).reshape(
+        1, rows, 8, hidden)
+
+    y = laguna_nvfp4.prefill_sorted_moe_tail(sorted_ex, inv, rw, sh, re)
+
+    # faithful bf16-stepwise reference over the gathered (unsorted) plane
+    inv_flat = inv.reshape(-1).astype(mx.int32)
+    gidx = (inv_flat[:, None] * hidden + mx.arange(hidden)[None, :]).reshape(-1)
+    unsorted = mx.take(sorted_ex.reshape(-1), gidx).reshape(
+        1, rows, 8, hidden)
+    ex2 = unsorted.astype(mx.float32)
+    w2 = rw.astype(mx.bfloat16).astype(mx.float32)
+    tot = mx.zeros((1, rows, hidden), mx.float32)
+    for e in range(8):
+        p = (ex2[:, :, e, :] * w2[..., e : e + 1]).astype(mx.bfloat16)
+        tot = ((tot + p.astype(mx.float32)).astype(mx.bfloat16)).astype(
+            mx.float32)
+    scaled = (tot * mx.array(2.5, mx.float32)).astype(mx.bfloat16)
+    ref = (scaled.astype(mx.float32) + sh.astype(mx.float32)).astype(
+        mx.bfloat16)
+    ref = (ref.astype(mx.float32) + re.astype(mx.float32)).astype(
+        mx.bfloat16)
+    assert bool(mx.all(y == ref.reshape(-1))), (
+        f"sorted moe tail diverges at "
+        f"{int(mx.sum(y == ref.reshape(-1)))}/{rows*hidden}")
+
+    # the pure-mlx fallback (fp32 accumulate) agrees within ULP
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        yf = laguna_nvfp4.prefill_sorted_moe_tail(
+            sorted_ex, inv, rw, sh, re)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert float(mx.abs(y.astype(mx.float32) - yf.astype(mx.float32)).max())\
+        <= 2e-3
+
+
+@pytestmark_real
+
+
 @pytestmark_real
 def test_lm_head_prune_real_model():
     """The int5 prune pipeline on the REAL lm_head: the assembled argmax
