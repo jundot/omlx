@@ -816,6 +816,35 @@ METAL_FUNC bool laguna_router_key_before(
     return a_index < b_index;
 }
 
+// Ordinal-payload helpers: `laguna_router_key_ordinal` canonicalizes both
+// signed zeros and every NaN before applying the usual monotone IEEE-754 bit
+// transform; `laguna_router_ordinal_before` compares two ordinals unsigned
+// plus the original expert-index tie break — exactly
+// `laguna_router_key_before` on the source float key. (verbatim from
+// lagunaDecodeRouterOrdinalHeader.)
+METAL_FUNC uint laguna_router_key_ordinal(float key) {
+    uint bits = as_type<uint>(key);
+    uint magnitude = bits & 0x7FFFFFFFu;
+    if (magnitude > 0x7F800000u) {
+        return 0xFFFFFFFFu;
+    }
+    if (magnitude == 0u) {
+        return 0x80000000u;
+    }
+    return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+}
+
+METAL_FUNC bool laguna_router_ordinal_before(
+    uint a, uint a_index, uint b, uint b_index) {
+    if (a < b) {
+        return true;
+    }
+    if (b < a) {
+        return false;
+    }
+    return a_index < b_index;
+}
+
 #define LAGUNA_ROUTER_TOP8_KERNEL(name, normalizing)                          \
 kernel void name(                                                             \
     const device bfloat* logits [[buffer(0)]],                                \
@@ -896,6 +925,106 @@ kernel void name(                                                             \
 
 LAGUNA_ROUTER_TOP8_KERNEL(laguna_decode_router_top8_v3, 0)
 LAGUNA_ROUTER_TOP8_KERNEL(laguna_decode_router_top8_norm_v2, 1)
+
+// Decode router top-8, ordinal payload: same 256-lane bitonic network and
+// stage/stride/pair-role geometry as the accepted float-payload kernel
+// above, but the live payload is `(uint ordinal, uint index)` only, sorted
+// by `laguna_router_ordinal_before`. (verbatim from
+// lagunaDecodeRouterOrdinalKernelSource; the original per-lane sigmoid is
+// always materialized in the score table — the non-table arm recomputes the
+// winner sigmoid, byte-identical to the table read.)
+//   logits [256] bf16, correction_bias [256] fp32
+//   router_indices [8] uint32, router_scores [8] bf16
+// Grid: 1 threadgroup x 256 threads.
+#define LAGUNA_ROUTER_TOP8_ORDINAL_KERNEL(name, normalizing, table)          \
+kernel void name(                                                            \
+    const device bfloat* logits [[buffer(0)]],                               \
+    const device float* correction_bias [[buffer(1)]],                       \
+    device uint32_t* router_indices [[buffer(2)]],                           \
+    device bfloat* router_scores [[buffer(3)]],                              \
+    uint lane [[thread_position_in_threadgroup]])                            \
+{                                                                            \
+    threadgroup uint xchg_ordinals[256];                                     \
+    threadgroup uint xchg_indices[256];                                      \
+    threadgroup float original_scores[256];                                  \
+                                                                             \
+    float x = float(logits[lane]);                                           \
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));                     \
+    float score = x < 0.0f ? y : 1.0f - y;                                   \
+    original_scores[lane] = score;                                           \
+    float key = -(score + float(correction_bias[lane]));                     \
+    uint my_ordinal = laguna_router_key_ordinal(key);                        \
+    uint my_index = lane;                                                    \
+                                                                             \
+    for (uint sequence = 2; sequence <= 256; sequence <<= 1) {               \
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {        \
+            uint other_ordinal;                                              \
+            uint other_index;                                                \
+            if (stride < 32) {                                               \
+                other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride)); \
+                other_index = simd_shuffle_xor(my_index, ushort(stride));    \
+            } else {                                                         \
+                xchg_ordinals[lane] = my_ordinal;                            \
+                xchg_indices[lane] = my_index;                               \
+                threadgroup_barrier(mem_flags::mem_threadgroup);             \
+                uint partner = lane ^ stride;                                \
+                other_ordinal = xchg_ordinals[partner];                      \
+                other_index = xchg_indices[partner];                         \
+                threadgroup_barrier(mem_flags::mem_threadgroup);             \
+            }                                                                \
+                                                                             \
+            bool is_lower = (lane & stride) == 0;                            \
+            bool lower_wants_better = (lane & sequence) == 0;                \
+            bool want_better = lower_wants_better == is_lower;               \
+            bool other_before_my = laguna_router_ordinal_before(             \
+                other_ordinal, other_index, my_ordinal, my_index);           \
+            bool take_other = want_better ? other_before_my : !other_before_my; \
+            if (take_other) {                                                \
+                my_ordinal = other_ordinal;                                  \
+                my_index = other_index;                                      \
+            }                                                                \
+        }                                                                    \
+    }                                                                        \
+                                                                             \
+    if (normalizing) {                                                       \
+        float my_score = 0.0f;                                               \
+        if (lane < 8) {                                                      \
+            if (table) {                                                     \
+                my_score = original_scores[my_index];                        \
+            } else {                                                         \
+                float winner_x = float(logits[my_index]);                    \
+                float winner_y = 1.0f / (1.0f + metal::exp(metal::abs(winner_x))); \
+                my_score = winner_x < 0.0f ? winner_y : 1.0f - winner_y;     \
+            }                                                                \
+        }                                                                    \
+        float total = 0.0f;                                                  \
+        for (uint i = 0; i < 8; ++i) {                                       \
+            total = simd_shuffle(my_score, ushort(i)) + total;                \
+        }                                                                    \
+        if (lane < 8) {                                                      \
+            router_indices[lane] = my_index;                                 \
+            router_scores[lane] = bfloat(my_score / total);                  \
+        }                                                                    \
+    } else {                                                                 \
+        if (lane < 8) {                                                      \
+            float my_score = 0.0f;                                           \
+            if (table) {                                                     \
+                my_score = original_scores[my_index];                        \
+            } else {                                                         \
+                float winner_x = float(logits[my_index]);                    \
+                float winner_y = 1.0f / (1.0f + metal::exp(metal::abs(winner_x))); \
+                my_score = winner_x < 0.0f ? winner_y : 1.0f - winner_y;     \
+            }                                                                \
+            router_indices[lane] = my_index;                                 \
+            router_scores[lane] = bfloat(my_score);                          \
+        }                                                                    \
+    }                                                                        \
+}                                                                            \
+
+LAGUNA_ROUTER_TOP8_ORDINAL_KERNEL(laguna_decode_router_top8_ordinal_v1, 0, 0)
+LAGUNA_ROUTER_TOP8_ORDINAL_KERNEL(laguna_decode_router_top8_ordinal_norm_v1, 1, 0)
+LAGUNA_ROUTER_TOP8_ORDINAL_KERNEL(laguna_decode_router_top8_ordinal_table_v1, 0, 1)
+LAGUNA_ROUTER_TOP8_ORDINAL_KERNEL(laguna_decode_router_top8_ordinal_table_norm_v1, 1, 1)
 
 // Fused sliding-attention decode (steady ring regime).
 // (verbatim from lagunaSlidingFusedAttentionKernel; T_LOAD_K/T_LOAD_V/
@@ -1270,17 +1399,6 @@ kernel void laguna_sliding_fused_attn_ring_v1(
 //   router_weight [256][2048] bf16, correction_bias [256] fp32
 //   summed [2048], normalized [2048], router_logits [256], router_keys [256]
 // Grid: 32 tiles x 512 threads (16 simdgroups; 8 active).
-METAL_FUNC uint laguna_router_key_ordinal(float key) {
-    uint bits = as_type<uint>(key);
-    uint magnitude = bits & 0x7FFFFFFFu;
-    if (magnitude > 0x7F800000u) {
-        return 0xFFFFFFFFu;
-    }
-    if (magnitude == 0u) {
-        return 0x80000000u;
-    }
-    return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
-}
 
 kernel void laguna_residual_rms_router_bf16_2048_rpg8(
     const device bfloat* residual [[buffer(0)]],
@@ -1443,124 +1561,346 @@ kernel void laguna_prefill_moe_tail_bf16_v1(
 
 // Prefill router tournament: 8x 32-lane bitonic sorts then a 64-candidate
 // network over the top-8s, per row. (verbatim from
-// lagunaPrefillRouterTournamentKernelSource, non-normalizing epilogue)
+// lagunaPrefillRouterTournamentKernelSource; normalizing selects the
+// simd-folded normalization epilogue)
 //   logits [rows*256], correction_bias [256] fp32
 //   router_indices [rows*8] uint32, router_scores [rows*8] bf16
 // Grid: (256, rows) threads (one threadgroup per row).
-kernel void laguna_prefill_router_tournament_v1(
-    const device bfloat* logits [[buffer(0)]],
-    const device float* correction_bias [[buffer(1)]],
-    device uint32_t* router_indices [[buffer(2)]],
-    device bfloat* router_scores [[buffer(3)]],
-    uint2 tlane [[thread_position_in_threadgroup]],
-    uint2 tgrid [[threadgroup_position_in_grid]])
-{
-    uint lane = tlane.x;
-    uint row = tgrid.y;
-    threadgroup float xchg_keys[256];
-    threadgroup uint xchg_indices[256];
-    threadgroup float xchg_scores[256];
-    threadgroup float candidate_keys[64];
-    threadgroup uint candidate_indices[64];
-    threadgroup float candidate_scores[64];
+#define LAGUNA_PREFILL_ROUTER_TOURNAMENT_KERNEL(name, normalizing)            \
+kernel void name(                                                            \
+    const device bfloat* logits [[buffer(0)]],                               \
+    const device float* correction_bias [[buffer(1)]],                       \
+    device uint32_t* router_indices [[buffer(2)]],                           \
+    device bfloat* router_scores [[buffer(3)]],                              \
+    uint2 tlane [[thread_position_in_threadgroup]],                          \
+    uint2 tgrid [[threadgroup_position_in_grid]])                            \
+{                                                                            \
+    uint lane = tlane.x;                                                     \
+    uint row = tgrid.y;                                                      \
+    threadgroup float xchg_keys[256];                                        \
+    threadgroup uint xchg_indices[256];                                      \
+    threadgroup float xchg_scores[256];                                      \
+    threadgroup float candidate_keys[64];                                    \
+    threadgroup uint candidate_indices[64];                                  \
+    threadgroup float candidate_scores[64];                                  \
+                                                                             \
+    float x = float(logits[row * 256 + lane]);                               \
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));                     \
+    float my_score = x < 0.0f ? y : 1.0f - y;                                \
+    float my_key = -(my_score + float(correction_bias[lane]));               \
+    uint my_index = lane;                                                    \
+                                                                             \
+    for (uint sequence = 2; sequence <= 32; sequence <<= 1) {                \
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {        \
+            float other_key = simd_shuffle_xor(my_key, ushort(stride));      \
+            uint other_index = simd_shuffle_xor(my_index, ushort(stride));   \
+            float other_score = simd_shuffle_xor(my_score, ushort(stride));  \
+                                                                             \
+            bool is_lower = (lane & stride) == 0;                            \
+            float a_key = is_lower ? my_key : other_key;                     \
+            uint a_index = is_lower ? my_index : other_index;                \
+            float a_score = is_lower ? my_score : other_score;               \
+            float b_key = is_lower ? other_key : my_key;                     \
+            uint b_index = is_lower ? other_index : my_index;                \
+            float b_score = is_lower ? other_score : my_score;               \
+                                                                             \
+            bool lower_wants_better = (lane & sequence) == 0;                \
+            bool b_before_a = laguna_router_key_before(                      \
+                b_key, b_index, a_key, a_index);                             \
+            bool a_before_b = laguna_router_key_before(                      \
+                a_key, a_index, b_key, b_index);                             \
+            bool swap = lower_wants_better ? b_before_a : a_before_b;        \
+            if (swap) {                                                      \
+                my_key = is_lower ? b_key : a_key;                           \
+                my_index = is_lower ? b_index : a_index;                     \
+                my_score = is_lower ? b_score : a_score;                     \
+            }                                                                \
+        }                                                                    \
+    }                                                                        \
+                                                                             \
+    uint block = lane >> 5;                                                  \
+    uint within_block = lane & 31;                                           \
+    bool block_ascending = (block & 1) == 0;                                 \
+    uint rank_in_block = block_ascending ? within_block : (31 - within_block); \
+    bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24); \
+    if (is_local_top8) {                                                     \
+        candidate_keys[block * 8 + rank_in_block] = my_key;                  \
+        candidate_indices[block * 8 + rank_in_block] = my_index;             \
+        candidate_scores[block * 8 + rank_in_block] = my_score;              \
+    }                                                                        \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+                                                                             \
+    float my_key2 = candidate_keys[lane & 63];                               \
+    uint my_index2 = candidate_indices[lane & 63];                           \
+    float my_score2 = candidate_scores[lane & 63];                           \
+    for (uint sequence = 2; sequence <= 64; sequence <<= 1) {                \
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {        \
+            float other_key;                                                 \
+            uint other_index;                                                \
+            float other_score;                                               \
+            if (stride < 32) {                                               \
+                other_key = simd_shuffle_xor(my_key2, ushort(stride));       \
+                other_index = simd_shuffle_xor(my_index2, ushort(stride));   \
+                other_score = simd_shuffle_xor(my_score2, ushort(stride));   \
+            } else {                                                         \
+                xchg_keys[lane] = my_key2;                                   \
+                xchg_indices[lane] = my_index2;                              \
+                xchg_scores[lane] = my_score2;                               \
+                threadgroup_barrier(mem_flags::mem_threadgroup);             \
+                uint partner = lane ^ stride;                                \
+                other_key = xchg_keys[partner];                              \
+                other_index = xchg_indices[partner];                         \
+                other_score = xchg_scores[partner];                          \
+                threadgroup_barrier(mem_flags::mem_threadgroup);             \
+            }                                                                \
+                                                                             \
+            bool is_lower = (lane & stride) == 0;                            \
+            float a_key = is_lower ? my_key2 : other_key;                    \
+            uint a_index = is_lower ? my_index2 : other_index;               \
+            float a_score = is_lower ? my_score2 : other_score;              \
+            float b_key = is_lower ? other_key : my_key2;                    \
+            uint b_index = is_lower ? other_index : my_index2;               \
+            float b_score = is_lower ? other_score : my_score2;              \
+                                                                             \
+            bool lower_wants_better = (lane & sequence) == 0;                \
+            bool b_before_a = laguna_router_key_before(                      \
+                b_key, b_index, a_key, a_index);                             \
+            bool a_before_b = laguna_router_key_before(                      \
+                a_key, a_index, b_key, b_index);                             \
+            bool swap = lower_wants_better ? b_before_a : a_before_b;        \
+            if (swap) {                                                      \
+                my_key2 = is_lower ? b_key : a_key;                          \
+                my_index2 = is_lower ? b_index : a_index;                    \
+                my_score2 = is_lower ? b_score : a_score;                    \
+            }                                                                \
+        }                                                                    \
+    }                                                                        \
+                                                                             \
+    if (normalizing) {                                                       \
+        float total = 0.0f;                                                  \
+        for (uint i = 0; i < 8; ++i) {                                       \
+            total = simd_shuffle(my_score2, ushort(i)) + total;              \
+        }                                                                    \
+        if (lane < 8) {                                                      \
+            router_indices[row * 8 + lane] = my_index2;                      \
+            router_scores[row * 8 + lane] = bfloat(my_score2 / total);       \
+        }                                                                    \
+    } else {                                                                 \
+        if (lane < 8) {                                                      \
+            router_indices[row * 8 + lane] = my_index2;                      \
+            router_scores[row * 8 + lane] = bfloat(my_score2);               \
+        }                                                                    \
+    }                                                                        \
+}                                                                            \
 
-    float x = float(logits[row * 256 + lane]);
-    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-    float my_score = x < 0.0f ? y : 1.0f - y;
-    float my_key = -(my_score + float(correction_bias[lane]));
-    uint my_index = lane;
+LAGUNA_PREFILL_ROUTER_TOURNAMENT_KERNEL(laguna_prefill_router_tournament_v1, 0)
+LAGUNA_PREFILL_ROUTER_TOURNAMENT_KERNEL(laguna_prefill_router_tournament_norm_v1, 1)
 
-    for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
-        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-            float other_key = simd_shuffle_xor(my_key, ushort(stride));
-            uint other_index = simd_shuffle_xor(my_index, ushort(stride));
-            float other_score = simd_shuffle_xor(my_score, ushort(stride));
+// Prefill router top-8: per-row O(256) per-lane predecessor count over the
+// 256 choice keys (stable total order via laguna_router_key_before), the
+// rank-ordered emitters plus a per-row winner score table. (verbatim from
+// lagunaPrefillRouterTop8KernelSource; the normalizing epilogue folds the 8
+// selected sigmoids in index order)
+//   logits [rows*256], correction_bias [256] fp32
+//   router_indices [rows*8] uint32, router_scores [rows*8] bf16
+// Grid: (256, rows) threads (one threadgroup per row).
+#define LAGUNA_PREFILL_ROUTER_TOP8_KERNEL(name, normalizing)               \
+kernel void name(                                                          \
+    const device bfloat* logits [[buffer(0)]],                             \
+    const device float* correction_bias [[buffer(1)]],                     \
+    device uint32_t* router_indices [[buffer(2)]],                         \
+    device bfloat* router_scores [[buffer(3)]],                            \
+    uint2 tlane [[thread_position_in_threadgroup]],                        \
+    uint2 tgrid [[threadgroup_position_in_grid]])                          \
+{                                                                          \
+    uint lane = tlane.x;                                                   \
+    uint row = tgrid.y;                                                    \
+                                                                           \
+    threadgroup float choice_keys[256];                                    \
+    threadgroup float selected_scores[8];                                  \
+                                                                           \
+    float x = float(logits[row * 256 + lane]);                             \
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));                   \
+    float score = x < 0.0f ? y : 1.0f - y;                                 \
+    float corrected = score + float(correction_bias[lane]);                \
+    float my_key = -corrected;                                             \
+    choice_keys[lane] = my_key;                                            \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+                                                                           \
+    uint rank = 0;                                                         \
+    for (uint j = 0; j < 256; ++j) {                                       \
+        rank += laguna_router_key_before(                                  \
+            choice_keys[j], j, my_key, lane) ? 1 : 0;                      \
+    }                                                                      \
+    if (rank < 8) {                                                        \
+        router_indices[row * 8 + rank] = lane;                             \
+        selected_scores[rank] = score;                                     \
+    }                                                                      \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+                                                                           \
+    if (lane < 8) {                                                        \
+        if (normalizing) {                                                 \
+            float total = 0.0f;                                            \
+            for (uint i = 0; i < 8; ++i) {                                 \
+                total = selected_scores[i] + total;                        \
+            }                                                              \
+            router_scores[row * 8 + lane] =                                \
+                bfloat(selected_scores[lane] / total);                     \
+        } else {                                                           \
+            router_scores[row * 8 + lane] = bfloat(selected_scores[lane]); \
+        }                                                                  \
+    }                                                                      \
+}                                                                          \
 
-            bool is_lower = (lane & stride) == 0;
-            float a_key = is_lower ? my_key : other_key;
-            uint a_index = is_lower ? my_index : other_index;
-            float a_score = is_lower ? my_score : other_score;
-            float b_key = is_lower ? other_key : my_key;
-            uint b_index = is_lower ? other_index : my_index;
-            float b_score = is_lower ? other_score : my_score;
+LAGUNA_PREFILL_ROUTER_TOP8_KERNEL(laguna_prefill_router_top8_v1, 0)
+LAGUNA_PREFILL_ROUTER_TOP8_KERNEL(laguna_prefill_router_top8_norm_v1, 1)
 
-            bool lower_wants_better = (lane & sequence) == 0;
-            bool b_before_a = laguna_router_key_before(
-                b_key, b_index, a_key, a_index);
-            bool a_before_b = laguna_router_key_before(
-                a_key, a_index, b_key, b_index);
-            bool swap = lower_wants_better ? b_before_a : a_before_b;
-            if (swap) {
-                my_key = is_lower ? b_key : a_key;
-                my_index = is_lower ? b_index : a_index;
-                my_score = is_lower ? b_score : a_score;
-            }
-        }
-    }
+// Prefill router tournament, ordinal payload: same two-phase 32 -> 64
+// schedule and extraction geometry as the accepted float tournament above,
+// but the payload is (uint ordinal, uint index) sorted by
+// laguna_router_ordinal_before, with a per-row original-score table for the
+// final eight indexed loads. Phase 2 runs one 64-candidate set on lanes
+// 0..63 (the 32->64 cross-simdgroup merge handled explicitly). (verbatim
+// from lagunaPrefillRouterTournamentOrdinalKernelSource)
+//   logits [rows*256], correction_bias [256] fp32
+//   router_indices [rows*8] uint32, router_scores [rows*8] bf16
+// Grid: (256, rows) threads (one threadgroup per row).
+#define LAGUNA_PREFILL_ROUTER_TOURNAMENT_ORDINAL_KERNEL(name, normalizing)   \
+kernel void name(                                                            \
+    const device bfloat* logits [[buffer(0)]],                               \
+    const device float* correction_bias [[buffer(1)]],                       \
+    device uint32_t* router_indices [[buffer(2)]],                           \
+    device bfloat* router_scores [[buffer(3)]],                              \
+    uint2 tlane [[thread_position_in_threadgroup]],                          \
+    uint2 tgrid [[threadgroup_position_in_grid]])                            \
+{                                                                            \
+    uint lane = tlane.x;                                                     \
+    uint row = tgrid.y;                                                      \
+                                                                             \
+    threadgroup uint xchg_ordinals[64];                                      \
+    threadgroup uint xchg_indices[64];                                       \
+    threadgroup uint candidate_ordinals[64];                                 \
+    threadgroup uint candidate_indices[64];                                  \
+    threadgroup float original_scores[256];                                  \
+                                                                             \
+    float x = float(logits[row * 256 + lane]);                               \
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));                     \
+    float score = x < 0.0f ? y : 1.0f - y;                                   \
+    original_scores[lane] = score;                                           \
+    float key = -(score + float(correction_bias[lane]));                     \
+    uint my_ordinal = laguna_router_key_ordinal(key);                        \
+    uint my_index = lane;                                                    \
+                                                                             \
+    for (uint sequence = 2; sequence <= 32; sequence <<= 1) {                \
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {        \
+            uint other_ordinal = simd_shuffle_xor(my_ordinal, ushort(stride)); \
+            uint other_index = simd_shuffle_xor(my_index, ushort(stride));   \
+                                                                             \
+            bool is_lower = (lane & stride) == 0;                            \
+            bool lower_wants_better = (lane & sequence) == 0;                \
+            bool want_better = lower_wants_better == is_lower;               \
+            bool other_before_my = laguna_router_ordinal_before(             \
+                other_ordinal, other_index, my_ordinal, my_index);           \
+            bool take_other = want_better ? other_before_my : !other_before_my; \
+            if (take_other) {                                                \
+                my_ordinal = other_ordinal;                                  \
+                my_index = other_index;                                      \
+            }                                                                \
+        }                                                                    \
+    }                                                                        \
+                                                                             \
+    uint block = lane >> 5;                                                  \
+    uint within_block = lane & 31;                                           \
+    bool block_ascending = (block & 1) == 0;                                 \
+    uint rank_in_block = block_ascending ? within_block : (31 - within_block); \
+    bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24); \
+    if (is_local_top8) {                                                     \
+        candidate_ordinals[block * 8 + rank_in_block] = my_ordinal;          \
+        candidate_indices[block * 8 + rank_in_block] = my_index;             \
+    }                                                                        \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+                                                                             \
+    uint my_ordinal2 = 0u;                                                   \
+    uint my_index2 = 0u;                                                     \
+    if (lane < 64) {                                                         \
+        my_ordinal2 = candidate_ordinals[lane];                              \
+        my_index2 = candidate_indices[lane];                                 \
+    }                                                                        \
+                                                                             \
+    if (lane < 64) {                                                         \
+    for (uint sequence = 2; sequence <= 32; sequence <<= 1) {                \
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {        \
+            uint other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride)); \
+            uint other_index = simd_shuffle_xor(my_index2, ushort(stride));  \
+                                                                             \
+            bool is_lower = (lane & stride) == 0;                            \
+            bool lower_wants_better = (lane & sequence) == 0;                \
+            bool want_better = lower_wants_better == is_lower;               \
+            bool other_before_lane = laguna_router_ordinal_before(           \
+                other_ordinal, other_index, my_ordinal2, my_index2);         \
+            bool take_other = want_better ? other_before_lane : !other_before_lane; \
+            if (take_other) {                                                \
+                my_ordinal2 = other_ordinal;                                 \
+                my_index2 = other_index;                                     \
+            }                                                                \
+        }                                                                    \
+    }                                                                        \
+    }                                                                        \
+                                                                             \
+    if (lane < 64) {                                                         \
+        xchg_ordinals[lane] = my_ordinal2;                                   \
+        xchg_indices[lane] = my_index2;                                      \
+    }                                                                        \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+    if (lane < 64) {                                                         \
+        uint partner = lane ^ 32u;                                           \
+        uint other_ordinal = xchg_ordinals[partner];                         \
+        uint other_index = xchg_indices[partner];                            \
+        bool is_lower = (lane & 32u) == 0;                                   \
+        bool other_before_lane = laguna_router_ordinal_before(               \
+            other_ordinal, other_index, my_ordinal2, my_index2);             \
+        bool take_other = is_lower ? other_before_lane : !other_before_lane; \
+        if (take_other) {                                                    \
+            my_ordinal2 = other_ordinal;                                     \
+            my_index2 = other_index;                                         \
+        }                                                                    \
+        for (uint stride = 16; stride > 0; stride >>= 1) {                   \
+            other_ordinal = simd_shuffle_xor(my_ordinal2, ushort(stride));   \
+            other_index = simd_shuffle_xor(my_index2, ushort(stride));       \
+            is_lower = (lane & stride) == 0;                                 \
+            other_before_lane = laguna_router_ordinal_before(                \
+                other_ordinal, other_index, my_ordinal2, my_index2);          \
+            take_other = is_lower ? other_before_lane : !other_before_lane;  \
+            if (take_other) {                                                \
+                my_ordinal2 = other_ordinal;                                 \
+                my_index2 = other_index;                                     \
+            }                                                                \
+        }                                                                    \
+    }                                                                        \
+                                                                             \
+    if (normalizing) {                                                       \
+        float my_score2 = lane < 8 ? original_scores[my_index2] : 0.0f;      \
+        float total = 0.0f;                                                  \
+        for (uint i = 0; i < 8; ++i) {                                       \
+            total = simd_shuffle(my_score2, ushort(i)) + total;              \
+        }                                                                    \
+        if (lane < 8) {                                                      \
+            router_indices[row * 8 + lane] = my_index2;                      \
+            router_scores[row * 8 + lane] = bfloat(my_score2 / total);       \
+        }                                                                    \
+    } else {                                                                 \
+        if (lane < 8) {                                                      \
+            router_indices[row * 8 + lane] = my_index2;                      \
+            router_scores[row * 8 + lane] =                                 \
+                bfloat(original_scores[my_index2]);                          \
+        }                                                                    \
+    }                                                                        \
+}                                                                            \
 
-    uint block = lane >> 5;
-    uint within_block = lane & 31;
-    bool block_ascending = (block & 1) == 0;
-    uint rank_in_block = block_ascending ? within_block : (31 - within_block);
-    bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
-    if (is_local_top8) {
-        candidate_keys[block * 8 + rank_in_block] = my_key;
-        candidate_indices[block * 8 + rank_in_block] = my_index;
-        candidate_scores[block * 8 + rank_in_block] = my_score;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float my_key2 = candidate_keys[lane & 63];
-    uint my_index2 = candidate_indices[lane & 63];
-    float my_score2 = candidate_scores[lane & 63];
-    for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
-        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
-            float other_key;
-            uint other_index;
-            float other_score;
-            if (stride < 32) {
-                other_key = simd_shuffle_xor(my_key2, ushort(stride));
-                other_index = simd_shuffle_xor(my_index2, ushort(stride));
-                other_score = simd_shuffle_xor(my_score2, ushort(stride));
-            } else {
-                xchg_keys[lane] = my_key2;
-                xchg_indices[lane] = my_index2;
-                xchg_scores[lane] = my_score2;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                uint partner = lane ^ stride;
-                other_key = xchg_keys[partner];
-                other_index = xchg_indices[partner];
-                other_score = xchg_scores[partner];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            bool is_lower = (lane & stride) == 0;
-            float a_key = is_lower ? my_key2 : other_key;
-            uint a_index = is_lower ? my_index2 : other_index;
-            float a_score = is_lower ? my_score2 : other_score;
-            float b_key = is_lower ? other_key : my_key2;
-            uint b_index = is_lower ? other_index : my_index2;
-            float b_score = is_lower ? other_score : my_score2;
-
-            bool lower_wants_better = (lane & sequence) == 0;
-            bool b_before_a = laguna_router_key_before(
-                b_key, b_index, a_key, a_index);
-            bool a_before_b = laguna_router_key_before(
-                a_key, a_index, b_key, b_index);
-            bool swap = lower_wants_better ? b_before_a : a_before_b;
-            if (swap) {
-                my_key2 = is_lower ? b_key : a_key;
-                my_index2 = is_lower ? b_index : a_index;
-                my_score2 = is_lower ? b_score : a_score;
-            }
-        }
-    }
-
-    if (lane < 8) {
-        router_indices[row * 8 + lane] = my_index2;
-        router_scores[row * 8 + lane] = bfloat(my_score2);
-    }
-}
+LAGUNA_PREFILL_ROUTER_TOURNAMENT_ORDINAL_KERNEL(                             \
+    laguna_prefill_router_tournament_ordinal_active64_v2, 0)
+LAGUNA_PREFILL_ROUTER_TOURNAMENT_ORDINAL_KERNEL(                             \
+    laguna_prefill_router_tournament_ordinal_norm_active64_v2, 1)
 
 
 // Inline-mask exact pass: candidate rows get the stock-exact GEMV, others
