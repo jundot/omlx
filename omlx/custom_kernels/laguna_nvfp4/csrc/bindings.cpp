@@ -110,6 +110,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "lm_head_prune",
+        &omlx::laguna_nvfp4::lm_head_prune,
+        "x"_a, "codes_lo"_a, "codes_hi"_a, "scales"_a, "lm_head"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,

@@ -1105,6 +1105,150 @@ std::pair<array, array> prefill_router_tournament(
     return {outs[0], outs[1]};
 }
 
+// ── LM-head prune primitives ───────────────────────────────────────────
+
+class LmCoarsePrimitive : public Primitive {
+ public:
+    explicit LmCoarsePrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 LmCoarsePrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_int5_coarse_ratio_bound_delta_bf16_v6");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        for (auto& out : outputs) enc.set_output_array(out, c++);
+        int vocab = static_cast<int>(inputs[1].shape(0));
+        // The Swift launch is (vocab/16 * 512, 1, 1) with a 512-thread group
+        // = 16 simdgroups; each simdgroup computes ONE row (row = tg*16 + sg).
+        MTL::Size group_dims(512, 1, 1);
+        MTL::Size grid_dims(vocab / 16, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(LmCoarsePrimitive)
+};
+
+class LmArgmaxStage1Primitive : public Primitive {
+ public:
+    explicit LmArgmaxStage1Primitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 LmArgmaxStage1Primitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_coarse_argmax_stage1_v5");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        for (auto& out : outputs) enc.set_output_array(out, c++);
+        int vocab = static_cast<int>(inputs[0].shape(0));
+        int partials = vocab / 784;  // 128
+        MTL::Size group_dims(224, 1, 1);  // 224 threads per threadgroup
+        MTL::Size grid_dims(1, partials, 1);  // row = grid.y
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(LmArgmaxStage1Primitive)
+};
+
+class LmThresholdPrimitive : public Primitive {
+ public:
+    explicit LmThresholdPrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 LmThresholdPrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_exact_winner_bf16_midpoint_threshold_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        enc.set_output_array(out, c++);
+        MTL::Size group_dims(32, 1, 1);
+        MTL::Size grid_dims(1, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(LmThresholdPrimitive)
+};
+
+class LmInlineExactPrimitive : public Primitive {
+ public:
+    explicit LmInlineExactPrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 LmInlineExactPrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        enc.set_output_array(out, c++);
+        int vocab = static_cast<int>(inputs[0].shape(0));
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(vocab / 32, 1, 1);  // 4 rows per simdgroup x 8
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(LmInlineExactPrimitive)
+};
+
+array lm_head_prune(
+    const array& x,
+    const array& codes_lo,
+    const array& codes_hi,
+    const array& scales,
+    const array& lm_head,
+    StreamOrDevice s) {
+    int vocab = static_cast<int>(codes_lo.shape(0));
+    auto s_stream = to_stream(s);
+
+    // 1. coarse + delta
+    auto coarse_prim = std::make_shared<LmCoarsePrimitive>(s_stream);
+    Shape cv{vocab};
+    auto coarse_out = array::make_arrays(
+        {cv, cv}, {float32, bfloat16}, coarse_prim, {x, codes_lo, codes_hi, scales});
+    auto& coarse = coarse_out[0];
+    auto& delta = coarse_out[1];
+
+    // 2. argmax stage 1 -> 128 partials
+    int partials = vocab / 784;
+    auto arg_prim = std::make_shared<LmArgmaxStage1Primitive>(s_stream);
+    Shape pv{partials};
+    auto partials_out = array::make_arrays(
+        {pv, pv}, {float32, uint32}, arg_prim, {coarse});
+    auto& pmax = partials_out[0];
+    auto& pidx = partials_out[1];
+
+    // 3. winner threshold
+    auto thr_prim = std::make_shared<LmThresholdPrimitive>(s_stream);
+    Shape tv{1};
+    auto thr = array(tv, float32, thr_prim, {pmax, pidx, lm_head, x});
+
+    // 4. inline exact
+    auto inline_prim = std::make_shared<LmInlineExactPrimitive>(s_stream);
+    Shape av{vocab};
+    return array(av, bfloat16, inline_prim, {coarse, delta, thr, lm_head, x});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

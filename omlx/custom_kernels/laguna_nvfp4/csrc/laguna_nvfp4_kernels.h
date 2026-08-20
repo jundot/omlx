@@ -176,6 +176,17 @@ std::pair<array, array> prefill_router_tournament(
     const array& correction_bias,
     StreamOrDevice s = {});
 
+// LM-head int5 prune pipeline (verbatim from LagunaLmHeadPrune.swift):
+// coarse+delta -> argmax stage1 -> winner threshold -> inline exact. Returns
+// [vocab] bf16 assembled logits (winner exact, others certified-below).
+array lm_head_prune(
+    const array& x,
+    const array& codes_lo,
+    const array& codes_hi,
+    const array& scales,
+    const array& lm_head,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

@@ -484,6 +484,48 @@ def test_prefill_router_tournament_bit_exact():
 
 
 @pytestmark_real
+def test_lm_head_prune_real_model():
+    """The int5 prune pipeline on the REAL lm_head: the assembled argmax
+    must equal the stock argmax, the winner slot must be exact (bf16), and
+    no non-winner slot may exceed it (the certified-bound contract)."""
+    import json
+
+    from mlx_lm import load
+
+    from omlx.patches.laguna import apply_laguna_patch
+    from omlx.utils.model_loading import normalize_laguna_compressed_quant
+
+    apply_laguna_patch()
+    cfg = json.load(open(os.path.join(_LAGUNA_MODEL, "config.json")))
+    normalize_laguna_compressed_quant(cfg)
+    model, tok = load(_LAGUNA_MODEL, model_config=cfg)
+    lm = model.lm_head.weight
+    lo, hi, sc = laguna_nvfp4.build_int5_planes(lm)
+    assert lo is not None, "int5 plane certificate failed on the real lm_head"
+
+    ids = mx.array([tok.encode("The quick brown fox jumps over the lazy dog.")])
+    from mlx_lm.models.base import create_attention_mask
+
+    h = model.model.embed_tokens(ids)
+    mask = create_attention_mask(h, None)
+    for layer in model.model.layers:
+        h = layer(h, mask, None)
+    h = model.model.norm(h)
+    x = h[0, -1]
+
+    stock = lm.astype(mx.float32) @ x.astype(mx.float32)
+    stock_arg = int(mx.argmax(stock).item())
+    pruned = laguna_nvfp4.lm_head_prune(x, lo, hi, sc, lm)
+    pruned_arg = int(mx.argmax(pruned).item())
+    assert pruned_arg == stock_arg, (
+        f"prune argmax {pruned_arg} != stock {stock_arg}")
+    assert bool(pruned[stock_arg] == mx.array(stock[stock_arg], mx.bfloat16)), (
+        "winner slot not exact")
+    assert int(mx.sum(pruned.astype(mx.float32) > float(pruned[stock_arg]))) == 0, (
+        "non-winner slot above the winner")
+
+
+@pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel
     must match the stock nvfp4 path within ULP (accumulation-order only)."""

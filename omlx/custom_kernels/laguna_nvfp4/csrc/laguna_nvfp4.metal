@@ -1563,6 +1563,326 @@ kernel void laguna_prefill_router_tournament_v1(
 }
 
 
+// Inline-mask exact pass: candidate rows get the stock-exact GEMV, others
+// get bfloat(coarse). (verbatim from
+// laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1)
+//   coarse [V] f32, delta [V] bf16, thr [1] f32, lm_head [V*K] bf16, x [K]
+//   assembled [V] bf16
+// Grid: V/32 threadgroups (4 rows per simdgroup) x 256 threads (8 simdgroups).
+kernel void laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1(
+    const device float* coarse [[buffer(0)]],
+    const device bfloat* delta [[buffer(1)]],
+    const device float* thr [[buffer(2)]],
+    const device bfloat* lm_head [[buffer(3)]],
+    const device bfloat* x [[buffer(4)]],
+    device bfloat* assembled [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint VOCAB = 100352;
+    constexpr uint K = 2048;
+
+    uint base = tgid * 32 + sgid * 4;
+
+    uint candidate_mask = 0;
+    if (lane == 0) {
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            if (r < VOCAB && coarse[r] + float(delta[r]) >= thr[0]) {
+                candidate_mask |= 1u << tm;
+            }
+        }
+    }
+    candidate_mask = simd_broadcast(candidate_mask, 0);
+
+    if (candidate_mask == 0) {
+        if (lane < 4 && base + lane < VOCAB) {
+            assembled[base + lane] = bfloat(coarse[base + lane]);
+        }
+        return;
+    }
+
+    thread float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread bfloat inter[4];
+    thread float v_coeff[4];
+    uint bn = lane * 4;
+    for (uint i = 0; i < 16; ++i) {
+        vec<bfloat, 4> xv =
+            *((const device vec<bfloat, 4>*)(x + bn));
+        v_coeff[0] = float(xv.x);
+        v_coeff[1] = float(xv.y);
+        v_coeff[2] = float(xv.z);
+        v_coeff[3] = float(xv.w);
+        for (uint tm = 0; tm < 4; ++tm) {
+            const device bfloat* mrow = lm_head + size_t(base + tm) * K;
+            vec<bfloat, 4> mv =
+                *((const device vec<bfloat, 4>*)(mrow + bn));
+            inter[0] = mv.x;
+            inter[1] = mv.y;
+            inter[2] = mv.z;
+            inter[3] = mv.w;
+            result[tm] += inter[0] * v_coeff[0];
+            result[tm] += inter[1] * v_coeff[1];
+            result[tm] += inter[2] * v_coeff[2];
+            result[tm] += inter[3] * v_coeff[3];
+        }
+        bn += 128;
+    }
+    for (uint tm = 0; tm < 4; ++tm) {
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            result[tm] += simd_shuffle_down(result[tm], sn);
+        }
+    }
+    if (lane == 0) {
+        for (uint tm = 0; tm < 4; ++tm) {
+            uint r = base + tm;
+            if (r < VOCAB) {
+                assembled[r] = (candidate_mask & (1u << tm)) != 0
+                    ? bfloat(result[tm])
+                    : bfloat(coarse[r]);
+            }
+        }
+    }
+}
+
+// ── LM-head int5 prune family (LagunaLmHeadPrune.swift) ──────────────
+
+static inline float laguna_e8m0_decode(uint8_t b) {
+    if (b == 0u) {
+        return as_type<float>(0x00400000u);
+    }
+    return as_type<float>(uint(b) << 23);
+}
+
+// Int5 coarse pass: fused coarse (lower bound) + delta (certified bound,
+// bf16-up). (verbatim from lagunaLmHeadInt5CoarseRatioBoundDeltaBF16Kernel)
+//   x [2048] bf16, codes_lo [V][1024] uint8, codes_hi [V][256] uint8,
+//   scales [V][64] uint8
+//   coarse [V] f32, delta [V] bf16
+// Grid: V/16 threadgroups (16 rows) x 32 threads (1 simdgroup per row).
+kernel void laguna_lmhead_int5_coarse_ratio_bound_delta_bf16_v6(
+    const device bfloat* x [[buffer(0)]],
+    const device uint8_t* codes_lo [[buffer(1)]],
+    const device uint8_t* codes_hi [[buffer(2)]],
+    const device uint8_t* scales [[buffer(3)]],
+    device float* coarse [[buffer(4)]],
+    device bfloat* delta [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr float GAMMA = 0x1p-15f;
+    uint row = tg * 16 + sg;
+    const device uint8_t* lorow = codes_lo + size_t(row) * 1024;
+    const device uint8_t* hirow = codes_hi + size_t(row) * 256;
+    const device uint8_t* srow = scales + size_t(row) * 64;
+
+    float c_acc = 0.0f;
+    float d_acc = 0.0f;
+    for (uint gg = 0; gg < 2; ++gg) {
+        uint g = 2 * lane + gg;
+        float sd = laguna_e8m0_decode(srow[g]);
+        uint4 lo4 = ((const device uint4*)(lorow + g * 16))[0];
+        uint hb = ((const device uint*)(hirow + g * 4))[0];
+        const device ushort4* xrow = (const device ushort4*)(x + g * 32);
+        float cg = 0.0f;
+        float ag = 0.0f;
+        for (uint w = 0; w < 4; ++w) {
+            uint lw = lo4[w];
+            uint hw = hb >> (8u * w);
+            uint4 ne = (uint4(lw) >> uint4(0u, 8u, 16u, 24u)) & 15u;
+            uint4 no = (uint4(lw) >> uint4(4u, 12u, 20u, 28u)) & 15u;
+            uint4 he = (uint4(hw) >> uint4(0u, 2u, 4u, 6u)) & 1u;
+            uint4 ho = (uint4(hw) >> uint4(1u, 3u, 5u, 7u)) & 1u;
+            float4 ve = float4((ne << 1u) | he) - 16.0f;
+            float4 vo = float4((no << 1u) | ho) - 16.0f;
+            float4 xa = as_type<float4>(uint4(xrow[2 * w]) << 16);
+            float4 xb = as_type<float4>(uint4(xrow[2 * w + 1]) << 16);
+            float4 xe = float4(xa.x, xa.z, xb.x, xb.z);
+            float4 xo = float4(xa.y, xa.w, xb.y, xb.w);
+            float4 axe = metal::abs(xe);
+            float4 axo = metal::abs(xo);
+            for (uint k = 0; k < 4; ++k) {
+                cg += xe[k] * ve[k];
+                cg += xo[k] * vo[k];
+                ag += axe[k];
+                ag += axo[k];
+            }
+        }
+        c_acc += sd * cg;
+        d_acc += (0.5f * sd) * ag;
+    }
+    c_acc = simd_sum(c_acc);
+    d_acc = simd_sum(d_acc);
+    if (lane == 0) {
+        coarse[row] = c_acc;
+        float d_up = d_acc * (1.0f + 61.0f * GAMMA);
+        uint dbits = as_type<uint>(d_up);
+        uint dtrunc = dbits & 0xFFFF0000u;
+        if (dtrunc != dbits) {
+            dtrunc += 0x00010000u;
+        }
+        delta[row] = as_type<bfloat>(ushort(dtrunc >> 16));
+    }
+}
+
+// Argmax stage 1 over the coarse plane: 128 partial (max, idx) rows.
+// (verbatim from laguna_lmhead_coarse_argmax_stage1_v5)
+//   coarse [V] f32 -> partial_max [128] f32, partial_idx [128] uint32
+// Grid: 224 threadgroups x 128 threads (784 active, 7 simdgroups).
+kernel void laguna_lmhead_coarse_argmax_stage1_v5(
+    const device float* coarse [[buffer(0)]],
+    device float* partial_max [[buffer(1)]],
+    device uint32_t* partial_idx [[buffer(2)]],
+    uint2 tgrid [[threadgroup_position_in_grid]],
+    uint2 tlid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    uint row = tgrid.y;
+    uint lid = tlid.x;
+    constexpr uint ROW_SIZE = 784;
+    constexpr uint READS = 4;
+    constexpr uint ACTIVE_THREADS = ROW_SIZE / READS;
+    constexpr uint SIMD_GROUPS = 7;
+    threadgroup float shared_vals[32];
+    threadgroup uint shared_idxs[32];
+
+    float best = -metal::numeric_limits<float>::infinity();
+    uint best_idx = 0xFFFFFFFFu;
+    if (lid < ACTIVE_THREADS) {
+        uint base = row * ROW_SIZE + lid * READS;
+        for (uint i = 0; i < READS; ++i) {
+            float v = coarse[base + i];
+            if (v > best || (v == best && base + i < best_idx)) {
+                best = v;
+                best_idx = base + i;
+            }
+        }
+    }
+
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        float ov = simd_shuffle_down(best, sn);
+        uint oi = simd_shuffle_down(best_idx, sn);
+        if (ov > best || (ov == best && oi < best_idx)) {
+            best = ov;
+            best_idx = oi;
+        }
+    }
+    if (simd_lane == 0) {
+        shared_vals[simd_group] = best;
+        shared_idxs[simd_group] = best_idx;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    best = lid < SIMD_GROUPS
+        ? shared_vals[lid]
+        : -metal::numeric_limits<float>::infinity();
+    best_idx = lid < SIMD_GROUPS ? shared_idxs[lid] : 0xFFFFFFFFu;
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        float ov = simd_shuffle_down(best, sn);
+        uint oi = simd_shuffle_down(best_idx, sn);
+        if (ov > best || (ov == best && oi < best_idx)) {
+            best = ov;
+            best_idx = oi;
+        }
+    }
+    if (lid == 0) {
+        partial_max[row] = best;
+        partial_idx[row] = best_idx;
+    }
+}
+
+// Exact-winner threshold: argmax over the 128 partials, the winner row's
+// stock GEMV, and the bf16 predecessor midpoint. (verbatim)
+//   partial_max [128] f32, partial_idx [128] u32, lm_head [V*K] bf16,
+//   x [K] bf16 -> threshold [1] f32
+// Grid: 32 threads.
+kernel void laguna_lmhead_exact_winner_bf16_midpoint_threshold_v1(
+    const device float* partial_max [[buffer(0)]],
+    const device uint32_t* partial_idx [[buffer(1)]],
+    const device bfloat* lm_head [[buffer(2)]],
+    const device bfloat* x [[buffer(3)]],
+    device float* threshold [[buffer(4)]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    constexpr uint VOCAB = 100352;
+    constexpr uint K = 2048;
+    constexpr uint READS = 4;
+    threadgroup uint winner_row[1];
+
+    float best = -metal::numeric_limits<float>::infinity();
+    uint best_idx = 0xFFFFFFFFu;
+    uint base = lid * READS;
+    for (uint i = 0; i < READS; ++i) {
+        float v = partial_max[base + i];
+        uint idx = partial_idx[base + i];
+        if (v > best || (v == best && idx < best_idx)) {
+            best = v;
+            best_idx = idx;
+        }
+    }
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        float ov = simd_shuffle_down(best, sn);
+        uint oi = simd_shuffle_down(best_idx, sn);
+        if (ov > best || (ov == best && oi < best_idx)) {
+            best = ov;
+            best_idx = oi;
+        }
+    }
+    if (lid == 0) {
+        winner_row[0] = metal::min(best_idx, uint(VOCAB - 1));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r = winner_row[0];
+
+    float result = 0.0f;
+    thread bfloat inter[4];
+    thread float v_coeff[4];
+    uint bn = lid * 4;
+    const device bfloat* mrow = lm_head + size_t(r) * K;
+    for (uint i = 0; i < 16; ++i) {
+        vec<bfloat, 4> xv =
+            *((const device vec<bfloat, 4>*)(x + bn));
+        v_coeff[0] = float(xv.x);
+        v_coeff[1] = float(xv.y);
+        v_coeff[2] = float(xv.z);
+        v_coeff[3] = float(xv.w);
+        vec<bfloat, 4> mv =
+            *((const device vec<bfloat, 4>*)(mrow + bn));
+        inter[0] = mv.x;
+        inter[1] = mv.y;
+        inter[2] = mv.z;
+        inter[3] = mv.w;
+        result += inter[0] * v_coeff[0];
+        result += inter[1] * v_coeff[1];
+        result += inter[2] * v_coeff[2];
+        result += inter[3] * v_coeff[3];
+        bn += 128;
+    }
+    for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result += simd_shuffle_down(result, sn);
+    }
+    if (lid == 0) {
+        bfloat rounded = bfloat(result);
+        ushort bits = ushort(as_type<uint>(float(rounded)) >> 16);
+        ushort magnitude = bits & 0x7FFFu;
+        ushort predecessor_bits;
+        if (magnitude == 0u) {
+            predecessor_bits = 0x8001u;
+        } else if ((bits & 0x8000u) == 0u) {
+            predecessor_bits = bits - 1u;
+        } else {
+            predecessor_bits = bits + 1u;
+        }
+        float predecessor =
+            as_type<float>(uint(predecessor_bits) << 16);
+        float rounded_value = as_type<float>(uint(bits) << 16);
+        threshold[0] = predecessor + (rounded_value - predecessor) * 0.5f;
+    }
+}
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input

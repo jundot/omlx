@@ -535,6 +535,62 @@ def prefill_router_tournament(
     vals = mx.take_along_axis(score, ids.astype(mx.int32), axis=1)
     return ids.reshape(-1), vals.reshape(-1).astype(mx.bfloat16)
 
+
+# ---------------------------------------------------------------------------
+# LM-head int5 prune family (LagunaLmHeadPrune.swift)
+# ---------------------------------------------------------------------------
+
+def build_int5_planes(lm_head_weight):
+    """Port of the challenge's `buildInt5Planes` transform: given the bf16
+    lm_head [vocab, hidden], produce the (lo nibble plane, hi 1-bit plane,
+    e8m0 scales) int5 planes. Returns None when any code exceeds |15| (the
+    init certificate, declining to the stock head)."""
+    vocab, hidden = lm_head_weight.shape
+    w = lm_head_weight.astype(mx.float32).reshape(vocab, hidden // 32, 32)
+    gmax = mx.abs(w).max(axis=2)  # [V, 64]
+    gbits = gmax.view(mx.uint32)
+    biased_e = (gbits >> 23).astype(mx.int32)
+    mant = gbits & mx.array(0x007F_FFFF, mx.uint32)
+    bump = (mant >= mx.array(0x78_0000, mx.uint32)).astype(mx.int32)
+    sd_byte = mx.clip(biased_e - 3 + bump, 0, 255)
+    sd = mx.where(
+        sd_byte == 0,
+        mx.array(float.fromhex("0x1.0p-127"), mx.float32),
+        (sd_byte.astype(mx.uint32) << 23).view(mx.float32),
+    )
+    q = (w / sd[:, :, None]).round()
+    if float(mx.abs(q).max()) > 15.0:
+        return None
+    u = (q + 16).astype(mx.uint8).reshape(vocab, hidden)
+    base = u >> 1
+    u16 = base.view(mx.uint16)  # [V, 1024]
+    lo = ((u16 & mx.array(0x000F, mx.uint16))
+          | ((u16 >> 4) & mx.array(0x00F0, mx.uint16))).astype(mx.uint8)
+    u32 = u.view(mx.uint32)  # [V, 512]
+    nib = ((u32 & mx.array(0x01, mx.uint32))
+           | ((u32 >> 7) & mx.array(0x02, mx.uint32))
+           | ((u32 >> 14) & mx.array(0x04, mx.uint32))
+           | ((u32 >> 21) & mx.array(0x08, mx.uint32))).astype(mx.uint8)
+    nib16 = nib.view(mx.uint16)  # [V, 256]
+    hi = ((nib16 & mx.array(0x000F, mx.uint16))
+          | ((nib16 >> 4) & mx.array(0x00F0, mx.uint16))).astype(mx.uint8)
+    return lo, hi, sd_byte.astype(mx.uint8)
+
+
+def lm_head_prune(
+    x: mx.array, codes_lo, codes_hi, scales, lm_head, stream=None,
+):
+    """LM-head int5 prune pipeline (verbatim from LagunaLmHeadPrune.swift):
+    the coarse+delta pass over the int5 planes, the argmax stage 1, the
+    exact-winner threshold, and the inline exact pass. Returns [vocab] bf16
+    assembled logits whose argmax equals the stock lm_head argmax."""
+    if _ext is not None and has_symbol("lm_head_prune"):
+        return _ext.lm_head_prune(
+            x, codes_lo, codes_hi, scales, lm_head, stream=stream)
+    # Fallback: the stock full logits row (always correct).
+    return (lm_head.astype(mx.float32) @ x.astype(mx.float32)).astype(
+        mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,
