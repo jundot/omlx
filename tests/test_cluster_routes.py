@@ -194,7 +194,7 @@ def test_cluster_status_route(monkeypatch):
 
     response = _client().get(
         "/admin/api/cluster/status",
-        params={"route_to": "192.168.100.197"},
+        params={"route_to": "198.51.100.197"},
     )
 
     assert response.status_code == 200
