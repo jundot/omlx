@@ -463,6 +463,41 @@ def sliding_fused_attn_ring(
         "laguna_nvfp4 sliding_fused_attn_ring requires the native extension "
         "(the fused ring path has no pure-mlx equivalent).")
 
+
+def residual_rms_router(
+    residual, branch, weight, router_weight, correction_bias, stream=None,
+):
+    """Fused residual add + RMSNorm + MoE router GEMV (verbatim from
+    lagunaResidualRMSNormRouterSource, rowsPerGroup 8, precomputed ordinal
+    keys). Returns (summed, normalized, router_logits, router_keys)."""
+    if _ext is not None and has_symbol("residual_rms_router"):
+        return _ext.residual_rms_router(
+            residual, branch, weight, router_weight, correction_bias,
+            stream=stream,
+        )
+    summed = (residual + branch).astype(mx.bfloat16)
+    normalized = mx.fast.rms_norm(summed, weight, 1e-6)
+    logits = (normalized[None, :] @ router_weight.T).squeeze(0).astype(
+        mx.bfloat16)
+    x = logits.astype(mx.float32)
+    y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
+    score = mx.where(x < 0, y, 1.0 - y)
+    key = -(score + correction_bias.astype(mx.float32))
+    bits = key.view(mx.uint32)
+    magnitude = bits & 0x7FFFFFFF
+    keys = mx.where(
+        magnitude > 0x7F800000,
+        mx.full_like(bits, 0xFFFFFFFF),
+        mx.where(
+            magnitude == 0,
+            mx.full_like(bits, 0x80000000),
+            mx.where(
+                (bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000,
+            ),
+        ),
+    )
+    return summed, normalized, logits, keys
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

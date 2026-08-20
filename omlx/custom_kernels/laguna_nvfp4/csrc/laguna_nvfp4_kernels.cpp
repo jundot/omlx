@@ -895,6 +895,79 @@ array sliding_fused_attn_ring(
                   angles, k_cache, v_cache, params, scale_arr});
 }
 
+// ResidualRmsRouterPrimitive: fused residual add + RMSNorm + router GEMV.
+class ResidualRmsRouterPrimitive : public Primitive {
+ public:
+    explicit ResidualRmsRouterPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 ResidualRmsRouterPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        auto kernel = get_laguna_kernel(
+            d, "laguna_residual_rms_router_bf16_2048_rpg8");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        // 32 tiles x 512 threads; 2048 is distributed over 32 tiles (64 rows
+        // per tile x 8 = ... actually: 256 experts/8 = 32 tiles).
+        MTL::Size group_dims(512, 1, 1);
+        MTL::Size grid_dims(32, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(ResidualRmsRouterPrimitive)
+};
+
+std::vector<array> residual_rms_router(
+    const array& residual,
+    const array& branch,
+    const array& weight,
+    const array& router_weight,
+    const array& correction_bias,
+    StreamOrDevice s) {
+    if (residual.ndim() != 1 || residual.dtype() != bfloat16 ||
+        residual.shape(0) != 2048 || branch.shape(0) != 2048 ||
+        weight.shape(0) != 2048 || weight.ndim() != 1 ||
+        router_weight.ndim() != 2 || router_weight.dtype() != bfloat16 ||
+        router_weight.shape(0) != 256 || router_weight.shape(1) != 2048 ||
+        correction_bias.ndim() != 1 || correction_bias.dtype() != float32 ||
+        correction_bias.shape(0) != 256) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 residual_rms_router: shape mismatch — residual "
+            << residual.shape() << ", router_weight "
+            << router_weight.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<ResidualRmsRouterPrimitive>(s_stream);
+    Shape s2048{static_cast<ShapeElem>(2048)};
+    Shape s256{static_cast<ShapeElem>(256)};
+    auto outs = array::make_arrays(
+        {s2048, s2048, s256, s256},
+        {bfloat16, bfloat16, bfloat16, uint32}, prim,
+        {residual, branch, weight, router_weight, correction_bias});
+    return outs;
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

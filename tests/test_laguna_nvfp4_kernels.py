@@ -419,6 +419,28 @@ def test_sliding_fused_attn_ring_matches_reference():
     assert float(d.max()) <= 2e-3, f"ring diverges: max {float(d.max()):.4g}"
 
 
+def test_residual_rms_router_bit_exact():
+    """Fused residual + RMSNorm + router GEMV + ordinal keys vs the
+    fallback: all four outputs bit-exact."""
+    mx.random.seed(27)
+    res = mx.random.normal((2048,), scale=1.0).astype(mx.bfloat16)
+    br = mx.random.normal((2048,), scale=0.1).astype(mx.bfloat16)
+    w = mx.random.normal((2048,)).astype(mx.bfloat16)
+    rw = mx.random.normal((256, 2048), scale=0.02).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    s, n, lg, ky = laguna_nvfp4.residual_rms_router(res, br, w, rw, cb)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        sf, nf, lgf, kyf = laguna_nvfp4.residual_rms_router(res, br, w, rw, cb)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(s == sf))
+    assert bool(mx.all(n == nf))
+    assert bool(mx.all(lg == lgf))
+    assert bool(mx.all(ky == kyf))
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

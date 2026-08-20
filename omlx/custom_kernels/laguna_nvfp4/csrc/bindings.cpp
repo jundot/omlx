@@ -3,6 +3,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/vector.h>
 #include <nanobind/stl/variant.h>
 
 #include "laguna_nvfp4_kernels.h"
@@ -86,6 +87,13 @@ NB_MODULE(_ext, m) {
         "raw_queries"_a, "raw_keys"_a, "raw_values"_a,
         "query_weight"_a, "key_weight"_a, "angles"_a,
         "k_cache"_a, "v_cache"_a, "params"_a, "scale_arr"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "residual_rms_router",
+        &omlx::laguna_nvfp4::residual_rms_router,
+        "residual"_a, "branch"_a, "weight"_a, "router_weight"_a,
+        "correction_bias"_a,
         "stream"_a = nb::none());
 
     m.def(

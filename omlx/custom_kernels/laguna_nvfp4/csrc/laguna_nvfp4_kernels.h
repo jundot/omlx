@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "mlx/array.h"
 #include "mlx/stream.h"
@@ -147,6 +148,16 @@ array sliding_fused_attn_ring(
     const array& v_cache,
     const array& params,
     const array& scale_arr,
+    StreamOrDevice s = {});
+
+// Fused residual add + RMSNorm + MoE router GEMV (precomputed ordinal
+// keys). Returns {summed, normalized, router_logits, router_keys}.
+std::vector<array> residual_rms_router(
+    const array& residual,
+    const array& branch,
+    const array& weight,
+    const array& router_weight,
+    const array& correction_bias,
     StreamOrDevice s = {});
 
 // Native extension availability probe for ABI verification.
