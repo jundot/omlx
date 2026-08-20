@@ -37,6 +37,10 @@
         'qwen35_ane_prefill_gdn',
         'qwen35_ane_prefill_gdn_fraction',
         'qwen35_ane_prefill_gdn_max_layers',
+        'qwen35_ane_prefill_gdn_output',
+        'qwen35_ane_prefill_gdn_output_fraction',
+        'qwen35_ane_prefill_attention',
+        'qwen35_ane_prefill_attention_fraction',
         'qwen35_ane_prefill_cpu_enabled',
         'qwen35_ane_prefill_cpu_fraction',
         'qwen35_ane_prefill_cpu_down_fraction',
@@ -231,6 +235,10 @@
                 qwen35_ane_prefill_gdn: true,
                 qwen35_ane_prefill_gdn_fraction: 0.5,
                 qwen35_ane_prefill_gdn_max_layers: 48,
+                qwen35_ane_prefill_gdn_output: false,
+                qwen35_ane_prefill_gdn_output_fraction: 0.25,
+                qwen35_ane_prefill_attention: false,
+                qwen35_ane_prefill_attention_fraction: 0.43,
                 qwen35_ane_prefill_cpu_enabled: false,
                 qwen35_ane_prefill_cpu_fraction: 0.135,
                 qwen35_ane_prefill_cpu_down_fraction: 0,
@@ -259,6 +267,8 @@
                 allowCpuGate: true,
                 allowCpuDown: true,
                 allowAneGdn: true,
+                allowGdnOutput: false,
+                allowAttention: false,
                 allowCpuGdn: true,
                 allowCpuSharedResource: true,
             },
@@ -7352,6 +7362,10 @@
                     qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
                     qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
                     qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
+                    qwen35_ane_prefill_gdn_output: s.qwen35_ane_prefill_gdn_output || false,
+                    qwen35_ane_prefill_gdn_output_fraction: s.qwen35_ane_prefill_gdn_output_fraction ?? 0.25,
+                    qwen35_ane_prefill_attention: s.qwen35_ane_prefill_attention || false,
+                    qwen35_ane_prefill_attention_fraction: s.qwen35_ane_prefill_attention_fraction ?? 0.43,
                     qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
                     qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
                     qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
@@ -7796,6 +7810,12 @@
                 } else {
                     parts.push('GDN off');
                 }
+                if (recommendation.gdn_output_enabled) {
+                    parts.push(`GDN output ${Math.round(Number(recommendation.gdn_output_fraction) * 100)}%`);
+                }
+                if (recommendation.attention_enabled) {
+                    parts.push(`Attention gate ${Math.round(Number(recommendation.attention_fraction) * 100)}%`);
+                }
                 if (recommendation.cpu_enabled) {
                     parts.push(
                         `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
@@ -7871,6 +7891,8 @@
                             allow_cpu_down: this.aneTuningOverrides.allowCpu
                                 && this.aneTuningOverrides.allowCpuDown,
                             allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
+                            allow_gdn_output: this.aneTuningOverrides.allowGdnOutput,
+                            allow_attention: this.aneTuningOverrides.allowAttention,
                             allow_cpu_gdn: this.aneTuningOverrides.allowCpu
                                 && this.aneTuningOverrides.allowAneGdn
                                 && this.aneTuningOverrides.allowCpuGdn,
@@ -7970,6 +7992,18 @@
                     if (recommendation.gdn_enabled) {
                         patch.qwen35_ane_prefill_gdn_fraction = Number(
                             recommendation.gdn_fraction
+                        );
+                    }
+                    patch.qwen35_ane_prefill_gdn_output = !!recommendation.gdn_output_enabled;
+                    if (recommendation.gdn_output_enabled) {
+                        patch.qwen35_ane_prefill_gdn_output_fraction = Number(
+                            recommendation.gdn_output_fraction
+                        );
+                    }
+                    patch.qwen35_ane_prefill_attention = !!recommendation.attention_enabled;
+                    if (recommendation.attention_enabled) {
+                        patch.qwen35_ane_prefill_attention_fraction = Number(
+                            recommendation.attention_fraction
                         );
                     }
                     patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
@@ -8163,6 +8197,14 @@
                     error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
                     if (error) return error;
                 }
+                if (this.modelSettings.qwen35_ane_prefill_gdn_output) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_output_fraction, 'GDN output ANE fraction', 0.05, 0.90);
+                    if (error) return error;
+                }
+                if (this.modelSettings.qwen35_ane_prefill_attention) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_attention_fraction, 'Attention ANE fraction', 0.05, 0.90);
+                    if (error) return error;
+                }
                 return null;
             },
 
@@ -8260,6 +8302,10 @@
                                 qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
                                     : 48,
+                                qwen35_ane_prefill_gdn_output: !!this.modelSettings.qwen35_ane_prefill_gdn_output,
+                                qwen35_ane_prefill_gdn_output_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_output_fraction) || 0.25,
+                                qwen35_ane_prefill_attention: !!this.modelSettings.qwen35_ane_prefill_attention,
+                                qwen35_ane_prefill_attention_fraction: Number(this.modelSettings.qwen35_ane_prefill_attention_fraction) || 0.43,
                                 qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
                                 qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
                                 qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
@@ -8366,6 +8412,10 @@
                                     qwen35_ane_prefill_gdn: true,
                                     qwen35_ane_prefill_gdn_fraction: 0.5,
                                     qwen35_ane_prefill_gdn_max_layers: 48,
+                                    qwen35_ane_prefill_gdn_output: false,
+                                    qwen35_ane_prefill_gdn_output_fraction: 0.25,
+                                    qwen35_ane_prefill_attention: false,
+                                    qwen35_ane_prefill_attention_fraction: 0.43,
                                     qwen35_ane_prefill_cpu_enabled: false,
                                     qwen35_ane_prefill_cpu_fraction: 0.135,
                                     qwen35_ane_prefill_cpu_down_fraction: 0,
@@ -8469,6 +8519,10 @@
                         this.modelSettings.qwen35_ane_prefill_gdn = true;
                         this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
                         this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
+                        this.modelSettings.qwen35_ane_prefill_gdn_output = false;
+                        this.modelSettings.qwen35_ane_prefill_gdn_output_fraction = 0.25;
+                        this.modelSettings.qwen35_ane_prefill_attention = false;
+                        this.modelSettings.qwen35_ane_prefill_attention_fraction = 0.43;
                         this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
                         this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;

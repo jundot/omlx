@@ -435,6 +435,26 @@ class BatchedEngine(BaseEngine):
                             "qwen35_ane_prefill_gdn_max_layers",
                             48,
                         ),
+                        gdn_output=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_output",
+                            False,
+                        ),
+                        gdn_output_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_output_fraction",
+                            0.50,
+                        ),
+                        attention=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_attention",
+                            False,
+                        ),
+                        attention_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_attention_fraction",
+                            0.50,
+                        ),
                         dual_ane=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_dual_ane",

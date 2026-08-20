@@ -1135,6 +1135,8 @@ private struct ExperimentalSection: View {
                                 Toggle("Allow CPU down projection", isOn: $vm.aneTuningAllowCPUDown)
                                     .disabled(!vm.aneTuningAllowCPU)
                                 Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
+                                Toggle("Allow experimental GDN output on ANE", isOn: $vm.aneTuningAllowGDNOutput)
+                                Toggle("Allow experimental attention gate on ANE", isOn: $vm.aneTuningAllowAttention)
                                 Toggle("Allow GDN on CPU", isOn: $vm.aneTuningAllowCPUGDN)
                                     .disabled(!vm.aneTuningAllowCPU || !vm.aneTuningAllowANEGDN)
                                 Toggle(
@@ -1374,6 +1376,34 @@ private struct ExperimentalSection: View {
                                       placeholder: "48", mono: true,
                                       isNumeric: true, range: 0...256,
                                       step: 1, width: 190)
+                        }
+                    }
+                    Row(label: "Accelerate GDN Output",
+                        sublabel: "Split the GDN output projection across ANE and GPU.") {
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillGdnOutput))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    if vm.qwen35AnePrefillGdnOutput {
+                        Row(label: "GDN Output on ANE",
+                            sublabel: "Output rows assigned to both ANEs; the GPU handles the suffix.") {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnOutputFraction),
+                                      placeholder: "0.25", mono: true,
+                                      isNumeric: true, range: 0.05...0.90,
+                                      step: 0.005, width: 190)
+                        }
+                    }
+                    Row(label: "Accelerate Attention Gate",
+                        sublabel: "Preload query-gate rows as FP16 ANE programs while Q/K/V remain on GPU.") {
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillAttention))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    if vm.qwen35AnePrefillAttention {
+                        Row(label: "Attention Gate Combined-Width Share",
+                            sublabel: "Combined-width share used for gate rows; 43% covers the full gate on Qwen3.5 27B.") {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillAttentionFraction),
+                                      placeholder: "0.43", mono: true,
+                                      isNumeric: true, range: 0.05...0.90,
+                                      step: 0.005, width: 190)
                         }
                     }
                 }
@@ -1747,6 +1777,14 @@ private struct ExperimentalSection: View {
             parts.append("GDN ANE \(gdn)%")
         } else {
             parts.append("GDN off")
+        }
+        if recommendation.gdnOutputEnabled == true {
+            let fraction = Int(((recommendation.gdnOutputFraction ?? 0) * 100).rounded())
+            parts.append("GDN output \(fraction)%")
+        }
+        if recommendation.attentionEnabled == true {
+            let fraction = Int(((recommendation.attentionFraction ?? 0) * 100).rounded())
+            parts.append("Attention gate \(fraction)%")
         }
         if recommendation.cpuEnabled == true {
             let gate = Int(((recommendation.cpuFraction ?? 0) * 100).rounded())

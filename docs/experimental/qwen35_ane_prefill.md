@@ -12,8 +12,12 @@ SwiGLU without materializing the full gate/up result. The GDN z+qkv input
 projection is split 50/50 between the ANEs and GPU by default. Optional FP16
 CPU sharing can take independent gate/up, down-projection, and residual GDN
 qkv slices; all three branches run in parallel and are merged natively. GDN
-recurrence, b/a and output projections, normalization, embeddings, and logits
-remain on GPU.
+recurrence, b/a, normalization, embeddings, and logits remain on GPU. An
+experimental path can split the post-recurrence GDN output across ANE and GPU.
+A second path preloads only full-attention query-gate rows as FP16 ANE programs;
+query, key, and value remain on their checkpoint-quantized GPU route. Both are
+opt-in because their throughput and numerical trade-offs require validation on
+the target model and hardware.
 
 ## Requirements and limits
 
@@ -28,6 +32,12 @@ remain on GPU.
 - Optional GDN acceleration accepts affine q4/q5/q6/q8 projections with group
   size 64 or 128. Mixed q4/q5/q6/q8 layouts are supported when the ANE prefix
   covers the full z projection, leaving a homogeneous qkv suffix on the GPU.
+- Experimental GDN-output and attention-gate splitting accepts affine
+  q4/q5/q6/q8 projections with group size 64 or 128. The GPU suffix retains
+  the checkpoint's quantization. GDN-output ANE rows retain FP16 weights;
+  attention-gate rows use FP16 ANE weights while Q/K/V remain entirely on GPU.
+  Attention splitting only applies to full-attention layers; linear-attention
+  GDN layers use the separate GDN paths.
 - CPU sharing requires a separately preprocessed FP16 clone of the model. It
   does not modify or dequantize the source checkpoint in place. The CPU GDN
   slice applies only to residual qkv outputs after the ANE prefix; z remains
@@ -45,8 +55,10 @@ remain on GPU.
   pays the compilation cost. Programs are cached for the model's lifetime.
 
 The implementation uses undocumented APIs and can stop working after a macOS
-update. It also requantizes the selected weights to per-output-channel INT8,
-so it is an approximate acceleration path rather than bit-exact inference.
+update. The established MLP/GDN input path requantizes selected weights to
+per-output-channel INT8, so it is an approximate acceleration path rather than
+bit-exact inference. The experimental GDN output and attention-gate rows retain
+FP16 ANE weights. Attention Q/K/V remain on the original GPU representation.
 
 On NAX GPUs (the M5 family) the hybrid GPU suffix runs on dedicated NAX
 qmm kernels (group sizes 64 and 128), which resolves the prefill regression
@@ -78,6 +90,10 @@ where the native q8 tile is not profitable.
   "qwen35_ane_prefill_gdn": true,
   "qwen35_ane_prefill_gdn_fraction": 0.50,
   "qwen35_ane_prefill_gdn_max_layers": 48,
+  "qwen35_ane_prefill_gdn_output": false,
+  "qwen35_ane_prefill_gdn_output_fraction": 0.25,
+  "qwen35_ane_prefill_attention": false,
+  "qwen35_ane_prefill_attention_fraction": 0.43,
   "qwen35_ane_prefill_cpu_enabled": false,
   "qwen35_ane_prefill_cpu_fraction": 0.135,
   "qwen35_ane_prefill_cpu_down_fraction": 0.0,
@@ -121,7 +137,7 @@ working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
-The split tuner calibrates five workload controls: MLP gate/up work on ANE,
+The split tuner calibrates five default workload controls: MLP gate/up work on ANE,
 MLP gate/up work on CPU, MLP down-projection work on CPU, GDN work on ANE, and
 GDN qkv work on CPU. It packages several widths from one real MLP and GDN layer
 into a small temporary procedure bank, measures the production native paths,
@@ -133,6 +149,15 @@ criterion. CPU dimensions are skipped automatically when the checkpoint or
 native extension does not support FP16 CPU sharing. Zero is always a valid CPU
 GDN candidate, so the tuner can retain GPU-only residual qkv when CPU sharing
 does not pay off.
+
+GDN-output and attention-projection exploration can be enabled explicitly in
+the tuner's pre-run overrides. They are disabled by default. When requested,
+the tuner validates the proposed projection offload and a projection-disabled
+control as complete model runs, and recommends only the faster result. This
+full-model admission step is required because isolated projection latency does
+not capture contention with the existing ANE MLP/GDN schedule. Enable one
+experimental projection override at a time when characterising a new chip so
+the single ablation run isolates that stage.
 
 The tuner preserves the model's single- or dual-ANE execution setting. In
 single-ANE mode it compiles one unpinned calibration bank and tunes ANE/GPU
@@ -187,6 +212,49 @@ When CPU sharing is enabled, model admission additionally reserves the eager
 FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
 materialization scratch. This projected size participates in the normal memory
 guard before the model begins loading.
+
+The same admission estimate covers transient FP32 materialization, compiled
+FP16 GDN-output and attention-gate weights, per-procedure
+IOSurfaces, and the retained attention GPU suffix. Compiling both experimental
+stages can still create a large short-lived peak, so the defaults leave both
+disabled.
+
+## Remaining-projection experiment
+
+The production dispatch was validated with real
+`True2456/Qwen3.8-27B-AWQ-4.85bpw` weights (FP16-compatible clone), a 2,048-token
+block, and the tuned fused MLP/GDN/CPU workload. The original FP16 full-QKV
+attention experiment and FP16 GDN output were faster in isolation but reduced
+complete-model throughput:
+
+| Added stage | Projection-off control | Projection on | Full-model change |
+|---|---:|---:|---:|
+| GDN output, 25% ANE | 529.6 tok/s | 509.4 tok/s | -3.8% |
+| FP16 attention Q/gate/K/V, 35% ANE | 519.9 tok/s | 497.7 tok/s | -4.3% |
+
+The attention run dispatched 80 measured projection operations and the GPU
+finished last in all 80. Total ANE duty rose only from about 63.7% to 65.6%,
+showing that the additional work displaced or contended with useful MLP/GDN
+work instead of filling enough idle time to shorten the critical path. These
+results led to replacing the full-QKV path with gate-only FP16 offload.
+
+The gate-only path was then measured in a fresh five-run full-model comparison.
+At a 43% combined-width share, alignment assigns all 6,144 query-gate rows to
+the two ANEs while all Q/K/V rows stay on GPU:
+
+| Added stage | Projection-off control | Projection on | Full-model change |
+|---|---:|---:|---:|
+| FP16 attention gate, 43% combined width | 529.4 tok/s | 536.9 tok/s | +1.41% |
+
+All 16 full-attention layers dispatched. Relative to the same tuned path with
+the projection disabled, final hidden-state cosine changed from 0.99998248 to
+0.99998254 and final-logit cosine from 0.99999899 to 0.99999917 against the GPU
+baseline; top-1 remained unchanged. The FP16 rows therefore remove the
+measurable gate-only accuracy loss seen with per-row INT8. Eager compilation
+took 80.9 seconds for the complete tuned program set on the reference run and
+uses more resident memory, so the path remains disabled by default and is only
+considered when the tuner override explicitly allows experimental attention
+gate offload.
 
 ## Qwen3.8-27B-oQ4e validation
 

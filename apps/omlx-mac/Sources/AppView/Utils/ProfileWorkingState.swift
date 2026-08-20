@@ -77,6 +77,10 @@ struct ModelSettingsSnapshot: Equatable {
     var qwen35AnePrefillGdn: Bool
     var qwen35AnePrefillGdnFraction: String
     var qwen35AnePrefillGdnMaxLayers: String
+    var qwen35AnePrefillGdnOutput: Bool
+    var qwen35AnePrefillGdnOutputFraction: String
+    var qwen35AnePrefillAttention: Bool
+    var qwen35AnePrefillAttentionFraction: String
     var qwen35AnePrefillCpuEnabled: Bool
     var qwen35AnePrefillCpuFraction: String
     var qwen35AnePrefillCpuThreads: String
@@ -150,6 +154,10 @@ enum ProfileSettingsKey {
     static let qwen35AnePrefillGdn = "qwen35_ane_prefill_gdn"
     static let qwen35AnePrefillGdnFraction = "qwen35_ane_prefill_gdn_fraction"
     static let qwen35AnePrefillGdnMaxLayers = "qwen35_ane_prefill_gdn_max_layers"
+    static let qwen35AnePrefillGdnOutput = "qwen35_ane_prefill_gdn_output"
+    static let qwen35AnePrefillGdnOutputFraction = "qwen35_ane_prefill_gdn_output_fraction"
+    static let qwen35AnePrefillAttention = "qwen35_ane_prefill_attention"
+    static let qwen35AnePrefillAttentionFraction = "qwen35_ane_prefill_attention_fraction"
     static let qwen35AnePrefillCpuEnabled = "qwen35_ane_prefill_cpu_enabled"
     static let qwen35AnePrefillCpuFraction = "qwen35_ane_prefill_cpu_fraction"
     static let qwen35AnePrefillCpuDownFraction = "qwen35_ane_prefill_cpu_down_fraction"

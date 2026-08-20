@@ -75,7 +75,17 @@ NB_MODULE(_ext, m) {
       nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_linear_bank",
-      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_linear_bank,
+      static_cast<std::vector<std::shared_ptr<
+          omlx::qwen35_prefill_kernels::AneLinearModel>> (*)(
+          const std::vector<mlx::core::array> &, int, int)>(
+          &omlx::qwen35_prefill_kernels::qwen35_ane_compile_linear_bank),
+      "weights"_a,
+      "sequence_length"_a,
+      "ane_instance"_a,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_compile_fp16_linear_bank",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_fp16_linear_bank,
       "weights"_a,
       "sequence_length"_a,
       "ane_instance"_a,
@@ -85,6 +95,7 @@ NB_MODULE(_ext, m) {
       &omlx::qwen35_prefill_kernels::qwen35_ane_compile_fp16_linear,
       "weight"_a,
       "sequence_length"_a,
+      "ane_instance"_a = 0,
       nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_swiglu_down",

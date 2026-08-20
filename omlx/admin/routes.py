@@ -144,6 +144,10 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_gdn: bool | None = None
     qwen35_ane_prefill_gdn_fraction: float | None = None
     qwen35_ane_prefill_gdn_max_layers: int | None = None
+    qwen35_ane_prefill_gdn_output: bool | None = None
+    qwen35_ane_prefill_gdn_output_fraction: float | None = None
+    qwen35_ane_prefill_attention: bool | None = None
+    qwen35_ane_prefill_attention_fraction: float | None = None
     qwen35_ane_prefill_cpu_enabled: bool | None = None
     qwen35_ane_prefill_cpu_fraction: float | None = None
     qwen35_ane_prefill_cpu_down_fraction: float | None = None
@@ -2368,6 +2372,30 @@ async def update_model_settings(
                 detail="ANE GDN layer limit must be zero or greater.",
             )
         current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
+    if "qwen35_ane_prefill_gdn_output" in sent:
+        current_settings.qwen35_ane_prefill_gdn_output = bool(
+            request.qwen35_ane_prefill_gdn_output
+        )
+    if "qwen35_ane_prefill_gdn_output_fraction" in sent:
+        value = request.qwen35_ane_prefill_gdn_output_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="GDN output ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_gdn_output_fraction = float(value)
+    if "qwen35_ane_prefill_attention" in sent:
+        current_settings.qwen35_ane_prefill_attention = bool(
+            request.qwen35_ane_prefill_attention
+        )
+    if "qwen35_ane_prefill_attention_fraction" in sent:
+        value = request.qwen35_ane_prefill_attention_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="Attention ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_attention_fraction = float(value)
     if "qwen35_ane_prefill_cpu_enabled" in sent:
         current_settings.qwen35_ane_prefill_cpu_enabled = bool(
             request.qwen35_ane_prefill_cpu_enabled

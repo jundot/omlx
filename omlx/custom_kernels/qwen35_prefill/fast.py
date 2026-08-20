@@ -393,11 +393,16 @@ def qwen35_ane_profile_snapshot() -> dict[str, dict[str, float]]:
         return {}
     values = list(_ext.qwen35_ane_profile_snapshot())
     width = len(_ANE_PROFILE_KEYS)
-    if len(values) != 2 * width:
+    category_names = (
+        ("mlp", "gdn", "gdn_output", "attention")
+        if len(values) == 4 * width
+        else ("mlp", "gdn")
+    )
+    if len(values) != len(category_names) * width:
         return {}
     return {
         name: dict(zip(_ANE_PROFILE_KEYS, values[index * width : (index + 1) * width]))
-        for index, name in enumerate(("mlp", "gdn"))
+        for index, name in enumerate(category_names)
     }
 
 
@@ -454,12 +459,28 @@ def qwen35_ane_affine_qmm_t(
     )
 
 
-def qwen35_ane_compile_fp16_linear(weight: mx.array, sequence_length: int):
+def qwen35_ane_compile_fp16_linear(
+    weight: mx.array, sequence_length: int, ane_instance: int = 0
+):
     if not qwen35_ane_available() or not hasattr(
         _ext, "qwen35_ane_compile_fp16_linear"
     ):
         raise RuntimeError("Private ANE fp16 runtime is unavailable")
-    return _ext.qwen35_ane_compile_fp16_linear(weight, sequence_length)
+    return _ext.qwen35_ane_compile_fp16_linear(
+        weight, sequence_length, ane_instance
+    )
+
+
+def qwen35_ane_compile_fp16_linear_bank(
+    weights: list[mx.array], sequence_length: int, ane_instance: int
+):
+    if not qwen35_ane_available() or not hasattr(
+        _ext, "qwen35_ane_compile_fp16_linear_bank"
+    ):
+        raise RuntimeError("Private ANE fp16 procedure bank is unavailable")
+    return _ext.qwen35_ane_compile_fp16_linear_bank(
+        weights, sequence_length, ane_instance
+    )
 
 
 def qwen35_ane_swiglu_down_available() -> bool:

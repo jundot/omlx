@@ -38,6 +38,7 @@ _DOWN_SLOT = 2
 _GDN_SLOT = 3
 _VERIFY_SLOT = 4
 _REFINE_SLOT = 5
+_PROJECTION_ABLATION_SLOT = 6
 
 
 class ANETuningRequest(BaseModel):
@@ -48,6 +49,11 @@ class ANETuningRequest(BaseModel):
     allow_cpu_gate: bool = True
     allow_cpu_down: bool = True
     allow_ane_gdn: bool = True
+    # These stages can win in isolation but currently contend with useful
+    # MLP/GDN work in a complete prefill. Keep them explicitly opt-in so the
+    # default tuner does not spend compile time on a slower candidate.
+    allow_gdn_output: bool = False
+    allow_attention: bool = False
     allow_cpu_gdn: bool = True
     allow_cpu_shared_resource: bool = True
 
@@ -80,6 +86,14 @@ class _Candidate:
     fused_down: bool = False
     cpu_threads: int | None = None
     stage: str = "verification"
+    # Keep newly added dimensions after the original positional fields. A few
+    # internal callers (and third-party tuner probes) instantiate candidates
+    # positionally, so inserting these above the CPU fields silently changed
+    # the meaning of otherwise valid calls.
+    gdn_output_enabled: bool = False
+    gdn_output_fraction: float | None = None
+    attention_enabled: bool = False
+    attention_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -168,8 +182,13 @@ def _gdn_fraction_grid() -> list[float]:
     return [0.35, 0.40, 0.45, 0.50, 0.53, 0.56, 0.60]
 
 
-def _planned_rows() -> list[_Candidate]:
-    return [
+def _attention_fraction_grid() -> list[float]:
+    """Combined Q/gate/K/V widths worth testing after a profiled probe."""
+    return [0.25, 0.30, 0.35, 0.375, 0.40, 0.43]
+
+
+def _planned_rows(request: ANETuningRequest) -> list[_Candidate]:
+    rows = [
         _Candidate("GPU only", False),
         _Candidate("MLP topology calibration", True, stage="calibration"),
         _Candidate("CPU worker calibration", True, stage="calibration"),
@@ -177,11 +196,14 @@ def _planned_rows() -> list[_Candidate]:
         _Candidate("Predicted optimum", True),
         _Candidate("Full-model uncertainty runner-up", True),
     ]
+    if request.allow_gdn_output or request.allow_attention:
+        rows.append(_Candidate("Remaining projection ablation", True))
+    return rows
 
 
 def create_run(request: ANETuningRequest) -> ANETuningRun:
     fractions = _fraction_grid()
-    planned = _planned_rows()
+    planned = _planned_rows(request)
     run = ANETuningRun(
         tuning_id=str(uuid.uuid4()),
         request=request,
@@ -208,7 +230,14 @@ def create_run(request: ANETuningRequest) -> ANETuningRun:
             else 1
         )
         gdn_points = len(fractions) * cpu_gdn_points
-    run.total = 3 + len(fractions) * cpu_gate_points + cpu_down_points + gdn_points
+    projection_ablation = int(request.allow_gdn_output or request.allow_attention)
+    run.total = (
+        3
+        + projection_ablation
+        + len(fractions) * cpu_gate_points
+        + cpu_down_points
+        + gdn_points
+    )
     _runs[run.tuning_id] = run
     return run
 
@@ -260,6 +289,10 @@ def _empty_result(candidate: _Candidate) -> dict[str, Any]:
         "mlp_fraction": candidate.mlp_fraction,
         "gdn_enabled": candidate.gdn_enabled,
         "gdn_fraction": candidate.gdn_fraction,
+        "gdn_output_enabled": candidate.gdn_output_enabled,
+        "gdn_output_fraction": candidate.gdn_output_fraction,
+        "attention_enabled": candidate.attention_enabled,
+        "attention_fraction": candidate.attention_fraction,
         "cpu_enabled": candidate.cpu_enabled,
         "cpu_fraction": candidate.cpu_fraction,
         "cpu_down_fraction": candidate.cpu_down_fraction,
@@ -402,6 +435,20 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     )
     if candidate.gdn_fraction is not None and request.allow_ane_gdn:
         settings.qwen35_ane_prefill_gdn_fraction = candidate.gdn_fraction
+    settings.qwen35_ane_prefill_gdn_output = bool(
+        candidate.gdn_output_enabled and request.allow_gdn_output
+    )
+    if candidate.gdn_output_fraction is not None:
+        settings.qwen35_ane_prefill_gdn_output_fraction = (
+            candidate.gdn_output_fraction
+        )
+    settings.qwen35_ane_prefill_attention = bool(
+        candidate.attention_enabled and request.allow_attention
+    )
+    if candidate.attention_fraction is not None:
+        settings.qwen35_ane_prefill_attention_fraction = (
+            candidate.attention_fraction
+        )
     settings.qwen35_ane_prefill_cpu_enabled = bool(
         candidate.cpu_enabled and request.allow_cpu
     )
@@ -494,6 +541,8 @@ def _ane_is_active(engine: Any) -> bool:
     return bool(
         getattr(model, "_omlx_ane_mlp_prefill_count", 0)
         or getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+        or getattr(model, "_omlx_ane_gdn_output_prefill_count", 0)
+        or getattr(model, "_omlx_ane_attention_prefill_count", 0)
     )
 
 
@@ -633,6 +682,10 @@ async def _measure_candidate(
         "mlp_fraction": candidate.mlp_fraction,
         "gdn_enabled": candidate.gdn_enabled,
         "gdn_fraction": candidate.gdn_fraction,
+        "gdn_output_enabled": candidate.gdn_output_enabled,
+        "gdn_output_fraction": candidate.gdn_output_fraction,
+        "attention_enabled": candidate.attention_enabled,
+        "attention_fraction": candidate.attention_fraction,
         "cpu_enabled": candidate.cpu_enabled,
         "cpu_fraction": candidate.cpu_fraction,
         "cpu_down_fraction": candidate.cpu_down_fraction,
@@ -674,6 +727,7 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
     profile = result.get("_profile") or {}
     mlp = profile.get("mlp") or {}
     gdn = profile.get("gdn") or {}
+    attention = profile.get("attention") or {}
     ane_fraction = float(candidate.mlp_fraction or 0.0)
     cpu_fraction = float(candidate.cpu_fraction or 0.0)
     gpu_fraction = 1.0 - ane_fraction * (2 if candidate.fused_down else 1) - cpu_fraction
@@ -740,6 +794,30 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
             if cpu_gdn_fraction > 0:
                 cpu_gdn_fraction = balanced[1]
 
+    attention_fraction = candidate.attention_fraction
+    attention_ops = float(attention.get("operations", 0.0))
+    if (
+        candidate.attention_enabled
+        and attention_fraction is not None
+        and attention_ops > 0
+    ):
+        ane_time = max(
+            float(attention.get("ane0_eval_ns", 0.0)),
+            float(attention.get("ane1_eval_ns", 0.0)),
+        ) / attention_ops
+        gpu_time = (
+            float(attention.get("gpu_completion_ns", 0.0)) / attention_ops
+        )
+        ane_width = float(attention_fraction)
+        gpu_width = 1.0 - ane_width
+        balanced = _balanced_fractions(
+            [ane_width, gpu_width],
+            [ane_time, gpu_time],
+            [_attention_fraction_grid(), [gpu_width]],
+        )
+        if balanced is not None:
+            attention_fraction = balanced[0]
+
     return replace(
         candidate,
         label="Profile-refined optimum",
@@ -747,6 +825,7 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
         cpu_fraction=cpu_fraction,
         gdn_fraction=gdn_fraction,
         cpu_gdn_fraction=cpu_gdn_fraction,
+        attention_fraction=attention_fraction,
     )
 
 
@@ -1955,6 +2034,10 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             mlp_fraction=choice.mlp_fraction,
             gdn_enabled=choice.gdn_enabled,
             gdn_fraction=choice.gdn_fraction,
+            gdn_output_enabled=run.request.allow_gdn_output,
+            gdn_output_fraction=0.25,
+            attention_enabled=run.request.allow_attention,
+            attention_fraction=0.43,
             cpu_enabled=choice.cpu_enabled,
             cpu_fraction=choice.cpu_fraction,
             cpu_down_fraction=choice.cpu_down_fraction,
@@ -1968,11 +2051,39 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         )
 
         profiled = _profile_refinement(candidate, run.results[_VERIFY_SLOT])
+        remaining_projections = bool(
+            candidate.gdn_output_enabled or candidate.attention_enabled
+        )
+        refinement_fields = (
+            "mlp_fraction",
+            "cpu_fraction",
+            "gdn_fraction",
+            "cpu_gdn_fraction",
+            "attention_fraction",
+            "cpu_threads",
+        )
+        if remaining_projections:
+            # Keep the projection candidate enabled while validating the
+            # profile correction. Its projection-off control gets a separate
+            # row below, so attention no longer suppresses useful MLP/GDN
+            # rebalancing and both configurations remain directly comparable.
+            refined = replace(
+                profiled,
+                label="Profile-refined projection optimum",
+            )
+            refinement_changed = any(
+                getattr(refined, name) != getattr(candidate, name)
+                for name in refinement_fields
+            )
+        else:
+            refined = profiled
+            refinement_changed = False
+
         gdn_profile_changed = any(
             getattr(profiled, name) != getattr(candidate, name)
             for name in ("gdn_fraction", "cpu_gdn_fraction")
         )
-        if choice.fused_down and gdn_profile_changed:
+        if not remaining_projections and choice.fused_down and gdn_profile_changed:
             # The representative GDN call cannot reproduce contention with all
             # surrounding layers. Let the aggregate three-sample native profile
             # propose a stateless correction and spend the existing runner-up
@@ -1992,7 +2103,12 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 float(candidate.cpu_gdn_fraction or 0.0),
                 float(refined.cpu_gdn_fraction or 0.0),
             )
-        elif choice.fused_down and choice.alternate_cpu_threads is not None:
+        elif (
+            not remaining_projections
+            and not refinement_changed
+            and choice.fused_down
+            and choice.alternate_cpu_threads is not None
+        ):
             refined = replace(
                 candidate,
                 label=(
@@ -2015,17 +2131,11 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 ),
             )
             refinement_changed = True
-        else:
+        elif not remaining_projections and not refinement_changed:
             refined = profiled
             refinement_changed = any(
                 getattr(refined, name) != getattr(candidate, name)
-                for name in (
-                    "mlp_fraction",
-                    "cpu_fraction",
-                    "gdn_fraction",
-                    "cpu_gdn_fraction",
-                    "cpu_threads",
-                )
+                for name in refinement_fields
             )
         if refinement_changed:
             active_slot = _REFINE_SLOT
@@ -2050,10 +2160,33 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             )
             run.current += 1
 
+        result_slots = [_VERIFY_SLOT, _REFINE_SLOT]
+        if remaining_projections:
+            # Always retain a measured projection-off control. Apply the same
+            # profiled MLP/GDN correction first, otherwise the ablation would
+            # confound projection cost with a stale surrounding split.
+            projection_off = replace(
+                profiled,
+                label="Remaining projection ablation",
+                gdn_output_enabled=False,
+                gdn_output_fraction=None,
+                attention_enabled=False,
+                attention_fraction=None,
+            )
+            active_slot = _PROJECTION_ABLATION_SLOT
+            await _measure_result_slot(
+                run,
+                _PROJECTION_ABLATION_SLOT,
+                engine_pool,
+                base_settings,
+                projection_off,
+            )
+            result_slots.append(_PROJECTION_ABLATION_SLOT)
+
         baseline_result = run.results[_GPU_SLOT]
         completed = [
             run.results[index]
-            for index in (_VERIFY_SLOT, _REFINE_SLOT)
+            for index in result_slots
             if run.results[index]["processing_tps"] is not None
         ]
         best = max(completed, key=lambda result: result["processing_tps"])
@@ -2068,6 +2201,10 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             "mlp_fraction": best["mlp_fraction"],
             "gdn_enabled": bool(best["gdn_enabled"]),
             "gdn_fraction": best["gdn_fraction"],
+            "gdn_output_enabled": bool(best.get("gdn_output_enabled", False)),
+            "gdn_output_fraction": best.get("gdn_output_fraction"),
+            "attention_enabled": bool(best.get("attention_enabled", False)),
+            "attention_fraction": best.get("attention_fraction"),
             "cpu_enabled": bool(best.get("cpu_enabled", False)),
             "cpu_fraction": best.get("cpu_fraction"),
             "cpu_down_fraction": best.get("cpu_down_fraction"),
@@ -2135,6 +2272,10 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 "mlp_fraction": None,
                 "gdn_enabled": False,
                 "gdn_fraction": None,
+                "gdn_output_enabled": False,
+                "gdn_output_fraction": None,
+                "attention_enabled": False,
+                "attention_fraction": None,
                 "fused_down": False,
                 "processing_tps": baseline_result["processing_tps"],
                 "speedup_percent": baseline_result.get("speedup_percent"),

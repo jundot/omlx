@@ -54,8 +54,11 @@ private:
   friend std::vector<std::shared_ptr<AneLinearModel>>
   qwen35_ane_compile_linear_bank(const std::vector<mlx::core::array> &, int,
                                  int);
+  friend std::vector<std::shared_ptr<AneLinearModel>>
+  qwen35_ane_compile_linear_bank(const std::vector<mlx::core::array> &, int,
+                                 int, bool);
   friend std::shared_ptr<AneLinearModel>
-  qwen35_ane_compile_fp16_linear(const mlx::core::array &, int);
+  qwen35_ane_compile_fp16_linear(const mlx::core::array &, int, int);
   friend std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
       const mlx::core::array &, const mlx::core::array &,
       const mlx::core::array &, int, int);
@@ -84,6 +87,14 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     const std::vector<mlx::core::array> &weights, int sequence_length,
     int ane_instance);
 
+std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
+    const std::vector<mlx::core::array> &weights, int sequence_length,
+    int ane_instance, bool use_fp16);
+
+std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_fp16_linear_bank(
+    const std::vector<mlx::core::array> &weights, int sequence_length,
+    int ane_instance);
+
 mlx::core::array qwen35_cpu_fp16_affine_qmm_t(
     const mlx::core::array &x, const mlx::core::array &cpu_weight,
     const mlx::core::array &gpu_weight, const mlx::core::array &gpu_scales,
@@ -108,7 +119,8 @@ mlx::core::array qwen35_ane_cpu_fp16_affine_qmm_t(
     bool cpu_shared_resource = false, mlx::core::StreamOrDevice s = {});
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_fp16_linear(
-    const mlx::core::array &weight, int sequence_length);
+    const mlx::core::array &weight, int sequence_length,
+    int ane_instance = 0);
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const mlx::core::array &gate_weight,

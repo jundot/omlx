@@ -170,6 +170,10 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 mlpFraction: 0.467,
                 gdnEnabled: true,
                 gdnFraction: 0.527,
+                gdnOutputEnabled: true,
+                gdnOutputFraction: 0.5,
+                attentionEnabled: true,
+                attentionFraction: 0.5,
                 cpuEnabled: nil,
                 cpuFraction: nil,
                 cpuDownFraction: nil,
@@ -278,6 +282,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             allowCpuGate: false,
             allowCpuDown: true,
             allowAneGdn: false,
+            allowGdnOutput: true,
+            allowAttention: false,
             allowCpuGdn: false,
             allowCpuSharedResource: false
         )
@@ -291,6 +297,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["allow_cpu_gate"] as? Bool, false)
         XCTAssertEqual(object?["allow_cpu_down"] as? Bool, true)
         XCTAssertEqual(object?["allow_ane_gdn"] as? Bool, false)
+        XCTAssertEqual(object?["allow_gdn_output"] as? Bool, true)
+        XCTAssertEqual(object?["allow_attention"] as? Bool, false)
         XCTAssertEqual(object?["allow_cpu_gdn"] as? Bool, false)
         XCTAssertEqual(object?["allow_cpu_shared_resource"] as? Bool, false)
     }

@@ -77,7 +77,7 @@ def _qwen35_cpu_share_estimated_bytes(
     model_path: str,
     settings: object | None,
 ) -> int | None:
-    """Estimate peak bytes added while materializing Qwen CPU-share rows.
+    """Estimate peak bytes added by Qwen CPU and remaining-projection shares.
 
     The source checkpoint retains its packed weights. Gate/up and GDN add
     eager FP16 row slices, while down sharing additionally retains a copied
@@ -90,7 +90,11 @@ def _qwen35_cpu_share_estimated_bytes(
     if (
         settings is None
         or not bool(getattr(settings, "qwen35_ane_prefill_enabled", False))
-        or not bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
+        or not (
+            bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
+            or bool(getattr(settings, "qwen35_ane_prefill_gdn_output", False))
+            or bool(getattr(settings, "qwen35_ane_prefill_attention", False))
+        )
     ):
         return 0
 
@@ -119,9 +123,10 @@ def _qwen35_cpu_share_estimated_bytes(
     )
 
     extra = 0.0
+    cpu_enabled = bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
     gate_fraction = float(
         getattr(settings, "qwen35_ane_prefill_cpu_fraction", 0.0) or 0.0
-    )
+    ) if cpu_enabled else 0.0
     gate_rows = _aligned_share_rows(intermediate, gate_fraction)
     if gate_rows:
         extra += layer_count * 2 * gate_rows * hidden * _FP16_BYTES
@@ -132,7 +137,7 @@ def _qwen35_cpu_share_estimated_bytes(
 
     down_fraction = float(
         getattr(settings, "qwen35_ane_prefill_cpu_down_fraction", 0.0) or 0.0
-    )
+    ) if cpu_enabled else 0.0
     down_rows = _aligned_share_rows(hidden, down_fraction)
     if down_rows and down_rows < hidden:
         cpu_weight = down_rows * intermediate * _FP16_BYTES
@@ -141,7 +146,7 @@ def _qwen35_cpu_share_estimated_bytes(
 
     gdn_fraction = float(
         getattr(settings, "qwen35_ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
-    )
+    ) if cpu_enabled else 0.0
     if gdn_fraction > 0 and bool(getattr(settings, "qwen35_ane_prefill_gdn", True)):
         key_heads = _positive_int(text.get("linear_num_key_heads"))
         key_dim = _positive_int(text.get("linear_key_head_dim"))
@@ -172,6 +177,100 @@ def _qwen35_cpu_share_estimated_bytes(
             ),
         )
         extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
+
+    layer_types = text.get("layer_types")
+    if isinstance(layer_types, list):
+        gdn_layers = sum(
+            "linear" in str(layer_type).lower() for layer_type in layer_types
+        )
+        attention_layers = sum(
+            "full" in str(layer_type).lower() for layer_type in layer_types
+        )
+    else:
+        interval = _positive_int(text.get("full_attention_interval")) or 4
+        total_layers = _positive_int(text.get("num_hidden_layers"))
+        attention_layers = total_layers // interval
+        gdn_layers = total_layers - attention_layers
+    gdn_layers = min(
+        gdn_layers,
+        max(0, int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0)),
+    )
+    attention_layers = min(attention_layers, layer_count)
+    sequence_length = max(
+        1,
+        int(getattr(settings, "qwen35_ane_prefill_sequence_length", 2048) or 2048),
+    )
+    instances = 2 if bool(getattr(settings, "qwen35_ane_prefill_dual_ane", True)) else 1
+
+    def projection_peak(
+        inputs: int,
+        outputs: int,
+        layers: int,
+        fraction: float,
+        *,
+        copied_gpu_suffix: bool,
+        compiled_bytes_per_weight: int = 1,
+        maximum_ane_rows: int | None = None,
+    ) -> float:
+        ane_rows = _aligned_share_rows(outputs, fraction)
+        if maximum_ane_rows is not None:
+            ane_rows = min(ane_rows, maximum_ane_rows)
+        if not ane_rows or ane_rows >= outputs:
+            return 0.0
+        dense_compile = layers * ane_rows * inputs * 4
+        compiled_weight = layers * ane_rows * inputs * compiled_bytes_per_weight
+        io_surfaces = layers * (
+            instances * sequence_length * inputs * _FP16_BYTES
+            + sequence_length * ane_rows * _FP16_BYTES
+        )
+        gpu_suffix = (
+            layers
+            * (outputs - ane_rows)
+            * inputs
+            * _MAX_AFFINE_BYTES_PER_WEIGHT
+            if copied_gpu_suffix
+            else 0.0
+        )
+        return dense_compile + compiled_weight + io_surfaces + gpu_suffix
+
+    value_heads = _positive_int(text.get("linear_num_value_heads"))
+    value_dim = _positive_int(text.get("linear_value_head_dim"))
+    gdn_value_width = value_heads * value_dim
+    if bool(getattr(settings, "qwen35_ane_prefill_gdn_output", False)):
+        if not gdn_value_width:
+            return None
+        extra += projection_peak(
+            gdn_value_width,
+            hidden,
+            gdn_layers,
+            float(
+                getattr(settings, "qwen35_ane_prefill_gdn_output_fraction", 0.25)
+                or 0.25
+            ),
+            copied_gpu_suffix=False,
+            compiled_bytes_per_weight=_FP16_BYTES,
+        )
+    if bool(getattr(settings, "qwen35_ane_prefill_attention", False)):
+        heads = _positive_int(text.get("num_attention_heads"))
+        kv_heads = _positive_int(text.get("num_key_value_heads"))
+        head_dim = _positive_int(text.get("head_dim"))
+        # Qwen q_proj contains one query and one sigmoid-gate vector per
+        # attention head; only the gate rows are materialized for ANE.
+        attention_outputs = 2 * heads * head_dim + 2 * kv_heads * head_dim
+        if not attention_outputs:
+            return None
+        extra += projection_peak(
+            hidden,
+            attention_outputs,
+            attention_layers,
+            float(
+                getattr(settings, "qwen35_ane_prefill_attention_fraction", 0.43)
+                or 0.43
+            ),
+            copied_gpu_suffix=True,
+            compiled_bytes_per_weight=_FP16_BYTES,
+            maximum_ane_rows=heads * head_dim,
+        )
 
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
 
@@ -556,6 +655,24 @@ class EnginePool:
                 add(
                     "qwen35_ane_prefill_gdn_max_layers",
                     data.get("qwen35_ane_prefill_gdn_max_layers", 48),
+                )
+            add(
+                "qwen35_ane_prefill_gdn_output",
+                data.get("qwen35_ane_prefill_gdn_output", False),
+            )
+            if data.get("qwen35_ane_prefill_gdn_output", False):
+                add(
+                    "qwen35_ane_prefill_gdn_output_fraction",
+                    data.get("qwen35_ane_prefill_gdn_output_fraction", 0.25),
+                )
+            add(
+                "qwen35_ane_prefill_attention",
+                data.get("qwen35_ane_prefill_attention", False),
+            )
+            if data.get("qwen35_ane_prefill_attention", False):
+                add(
+                    "qwen35_ane_prefill_attention_fraction",
+                    data.get("qwen35_ane_prefill_attention_fraction", 0.43),
                 )
             cpu_active = bool(data.get("qwen35_ane_prefill_cpu_enabled", False))
             add("qwen35_ane_prefill_cpu_enabled", cpu_active)

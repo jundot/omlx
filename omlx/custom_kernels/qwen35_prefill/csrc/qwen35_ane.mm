@@ -58,7 +58,7 @@ enum ProfileMetric : size_t {
 
 using ProfileCategory =
     std::array<std::atomic<uint64_t>, kProfileMetricCount>;
-ProfileCategory g_ane_profile[2]{};
+ProfileCategory g_ane_profile[4]{};
 std::atomic<uint64_t> g_previous_ane_done_ns{0};
 std::atomic<int> g_ane_profile_override{-1};
 
@@ -266,6 +266,47 @@ NSString *fp16_linear_mil(int input_dim, int output_dim, int sequence_length) {
            "  } -> (y);\n}\n",
           input_dim, sequence_length, output_dim, input_dim, output_dim,
           input_dim, output_dim, sequence_length];
+}
+
+NSString *fp16_linear_bank_mil(
+    const std::vector<std::pair<int, int>> &shapes,
+    const std::vector<std::pair<uint64_t, uint64_t>> &weight_offsets,
+    int sequence_length) {
+  NSMutableString *mil = [NSMutableString
+      stringWithString:
+          @"program(1.3)\n"
+           "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", "
+           "\"3520.4.1\"}, {\"coremlc-version\", \"3520.5.1\"}})]\n{\n"];
+  for (size_t index = 0; index < shapes.size(); ++index) {
+    const int input_dim = shapes[index].first;
+    const int output_dim = shapes[index].second;
+    [mil appendFormat:
+             @"  func procedure%03zu<ios18>(tensor<fp16, [1, %d, 1, %d]> "
+              "x) {\n"
+              "    tensor<fp16, [%d, %d, 1, 1]> w = const()"
+              "[name=string(\"weight\"), val=tensor<fp16, [%d, %d, 1, 1]>("
+              "BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), "
+              "offset=uint64(%llu)))];\n"
+              "    string pt = const()[name=string(\"pt\"), "
+              "val=string(\"valid\")];\n"
+              "    tensor<int32, [2]> st = const()[name=string(\"st\"), "
+              "val=tensor<int32, [2]>([1,1])];\n"
+              "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), "
+              "val=tensor<int32, [4]>([0,0,0,0])];\n"
+              "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), "
+              "val=tensor<int32, [2]>([1,1])];\n"
+              "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+              "    tensor<fp16, [1, %d, 1, %d]> y = "
+              "conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, "
+              "strides=st, weight=w, x=x)[name=string(\"conv\")];\n"
+              "  } -> (y);\n",
+         index, input_dim, sequence_length, output_dim, input_dim, output_dim,
+         input_dim,
+         static_cast<unsigned long long>(weight_offsets[index].first),
+         output_dim, sequence_length];
+  }
+  [mil appendString:@"}\n"];
+  return mil;
 }
 
 NSString *fp16_swiglu_down_mil(int input_dim, int hidden_dim, int output_dim,
@@ -1024,7 +1065,7 @@ void qwen35_ane_profile_reset() {
 
 std::vector<double> qwen35_ane_profile_snapshot() {
   std::vector<double> result;
-  result.reserve(2 * kProfileMetricCount);
+  result.reserve(std::size(g_ane_profile) * kProfileMetricCount);
   for (const auto &category : g_ane_profile) {
     for (const auto &metric : category) {
       result.push_back(static_cast<double>(
@@ -1059,7 +1100,8 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_linear(
 }
 
 std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
-    const std::vector<array> &weights, int sequence_length, int ane_instance) {
+    const std::vector<array> &weights, int sequence_length, int ane_instance,
+    bool use_fp16) {
   if (!qwen35_ane_available()) {
     throw std::runtime_error("Private ANE runtime is unavailable.");
   }
@@ -1087,25 +1129,35 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     weight_offsets.reserve(weights.size());
     for (size_t index = 0; index < weights.size(); ++index) {
       const auto &weight = weights[index];
-      auto quantized = quantize_rows(
-          weight.data<float>(), static_cast<int>(weight.shape(0)),
-          static_cast<int>(weight.shape(1)));
-      uint64_t data_offset = append_blob_chunk(
-          weight_blob,
-          quantized.data.data(),
-          quantized.data.size() * sizeof(quantized.data.front()), 4);
-      uint64_t scale_offset = append_blob_chunk(
-          weight_blob,
-          quantized.scales.data(),
-          quantized.scales.size() * sizeof(quantized.scales.front()), 1);
-      weight_offsets.emplace_back(data_offset, scale_offset);
+      if (use_fp16) {
+        auto dense = fp16_rows(
+            weight.data<float>(), static_cast<int>(weight.shape(0)),
+            static_cast<int>(weight.shape(1)));
+        uint64_t data_offset = append_blob_chunk(
+            weight_blob, dense.data(), dense.size() * sizeof(dense.front()), 1);
+        weight_offsets.emplace_back(data_offset, 0);
+      } else {
+        auto quantized = quantize_rows(
+            weight.data<float>(), static_cast<int>(weight.shape(0)),
+            static_cast<int>(weight.shape(1)));
+        uint64_t data_offset = append_blob_chunk(
+            weight_blob, quantized.data.data(),
+            quantized.data.size() * sizeof(quantized.data.front()), 4);
+        uint64_t scale_offset = append_blob_chunk(
+            weight_blob, quantized.scales.data(),
+            quantized.scales.size() * sizeof(quantized.scales.front()), 1);
+        weight_offsets.emplace_back(data_offset, scale_offset);
+      }
     }
     auto *weight_header = static_cast<uint32_t *>(weight_blob.mutableBytes);
-    weight_header[0] = static_cast<uint32_t>(weights.size() * 2);
+    weight_header[0] = static_cast<uint32_t>(weights.size() * (use_fp16 ? 1 : 2));
     weight_header[1] = 2;
-    NSData *mil =
-        [int8_linear_bank_mil(shapes, weight_offsets, sequence_length)
-            dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *mil = [(use_fp16
+                        ? fp16_linear_bank_mil(
+                              shapes, weight_offsets, sequence_length)
+                        : int8_linear_bank_mil(
+                              shapes, weight_offsets, sequence_length))
+        dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *weight_map = @{
       @"@model_path/weights/weight.bin" :
           @{ @"offset" : @0, @"data" : weight_blob },
@@ -1117,6 +1169,10 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     id descriptor = ((id (*)(Class, SEL, id, id, id))objc_msgSend)(
         descriptor_class, @selector(modelWithMILText:weights:optionsPlist:),
         mil, weight_map, nil);
+    if (!descriptor) {
+      throw std::runtime_error(
+          "Private ANE procedure bank MIL descriptor creation failed.");
+    }
     id model = ((id (*)(Class, SEL, id))objc_msgSend)(
         model_class, @selector(inMemoryModelWithDescriptor:), descriptor);
     if (!model) {
@@ -1174,8 +1230,21 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
   }
 }
 
+std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
+    const std::vector<array> &weights, int sequence_length, int ane_instance) {
+  return qwen35_ane_compile_linear_bank(
+      weights, sequence_length, ane_instance, false);
+}
+
+std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_fp16_linear_bank(
+    const std::vector<array> &weights, int sequence_length, int ane_instance) {
+  return qwen35_ane_compile_linear_bank(
+      weights, sequence_length, ane_instance, true);
+}
+
 std::shared_ptr<AneLinearModel>
-qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length) {
+qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length,
+                               int ane_instance) {
   if (!qwen35_ane_available()) {
     throw std::runtime_error("Private ANE runtime is unavailable.");
   }
@@ -1186,7 +1255,7 @@ qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length) {
   }
   auto impl = std::make_unique<AneLinearModel::Impl>(
       weight.data<float>(), static_cast<int>(weight.shape(0)),
-      static_cast<int>(weight.shape(1)), sequence_length, true);
+      static_cast<int>(weight.shape(1)), sequence_length, true, ane_instance);
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
 }
 

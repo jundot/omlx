@@ -231,6 +231,8 @@ struct ANETuningStartRequest: Encodable, Sendable {
     let allowCpuGate: Bool
     let allowCpuDown: Bool
     let allowAneGdn: Bool
+    let allowGdnOutput: Bool
+    let allowAttention: Bool
     let allowCpuGdn: Bool
     let allowCpuSharedResource: Bool
 }
@@ -249,6 +251,10 @@ struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
     let mlpFraction: Double?
     let gdnEnabled: Bool
     let gdnFraction: Double?
+    let gdnOutputEnabled: Bool?
+    let gdnOutputFraction: Double?
+    let attentionEnabled: Bool?
+    let attentionFraction: Double?
     let cpuEnabled: Bool?
     let cpuFraction: Double?
     let cpuDownFraction: Double?
@@ -269,6 +275,10 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let mlpFraction: Double?
     let gdnEnabled: Bool
     let gdnFraction: Double?
+    let gdnOutputEnabled: Bool?
+    let gdnOutputFraction: Double?
+    let attentionEnabled: Bool?
+    let attentionFraction: Double?
     let cpuEnabled: Bool?
     let cpuFraction: Double?
     let cpuDownFraction: Double?

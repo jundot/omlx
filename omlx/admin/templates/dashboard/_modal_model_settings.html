@@ -859,6 +859,33 @@
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                 </div>
                                             </div>
+
+                                            <div class="pt-3 border-t border-neutral-200 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                                <div class="space-y-2">
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_gdn_output') }}</span>
+                                                        <input type="checkbox" x-model="modelSettings.qwen35_ane_prefill_gdn_output" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <p class="text-xs text-neutral-500">{{ t('modal.model_settings.qwen_ane_gdn_output_hint') }}</p>
+                                                    <input x-show="modelSettings.qwen35_ane_prefill_gdn_output"
+                                                           type="number" x-model.number="modelSettings.qwen35_ane_prefill_gdn_output_fraction"
+                                                           min="0.05" max="0.90" step="0.005" placeholder="0.25"
+                                                           :aria-label="t('modal.model_settings.qwen_ane_gdn_output_fraction')"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                </div>
+                                                <div class="space-y-2">
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_attention') }}</span>
+                                                        <input type="checkbox" x-model="modelSettings.qwen35_ane_prefill_attention" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <p class="text-xs text-neutral-500">{{ t('modal.model_settings.qwen_ane_attention_hint') }}</p>
+                                                    <input x-show="modelSettings.qwen35_ane_prefill_attention"
+                                                           type="number" x-model.number="modelSettings.qwen35_ane_prefill_attention_fraction"
+                                                           min="0.05" max="0.90" step="0.005" placeholder="0.43"
+                                                           :aria-label="t('modal.model_settings.qwen_ane_attention_fraction')"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                </div>
+                                            </div>
                                         </div>
 
                                         <div class="pt-4 border-t border-neutral-200 space-y-3">
@@ -927,6 +954,14 @@
                                                     <label class="flex items-center justify-between gap-3">
                                                         <span>{{ t('modal.model_settings.qwen_ane_tune_allow_ane_gdn') }}</span>
                                                         <input type="checkbox" x-model="aneTuningOverrides.allowAneGdn" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_gdn_output') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowGdnOutput" class="rounded border-neutral-300">
+                                                    </label>
+                                                    <label class="flex items-center justify-between gap-3">
+                                                        <span>{{ t('modal.model_settings.qwen_ane_tune_allow_attention') }}</span>
+                                                        <input type="checkbox" x-model="aneTuningOverrides.allowAttention" class="rounded border-neutral-300">
                                                     </label>
                                                     <label class="flex items-center justify-between gap-3"
                                                            :class="(!aneTuningOverrides.allowCpu || !aneTuningOverrides.allowAneGdn) ? 'opacity-40' : ''">

@@ -288,6 +288,18 @@ def main() -> None:
         action="store_true",
         help="benchmark MLP offload without compiling or dispatching GDN",
     )
+    parser.add_argument(
+        "--gdn-output",
+        action="store_true",
+        help="also split eligible GDN output projections across ANE and GPU",
+    )
+    parser.add_argument("--gdn-output-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--attention-projections",
+        action="store_true",
+        help="also split full-attention query-gate rows to FP16 ANE programs",
+    )
+    parser.add_argument("--attention-fraction", type=float, default=0.43)
     args = parser.parse_args()
     ane_sequence_length = args.ane_sequence_length or args.tokens
     if "single" in args.modes and "dual" in args.modes:
@@ -354,6 +366,10 @@ def main() -> None:
                 fraction=args.single_mlp_fraction,
                 gdn=not args.disable_gdn,
                 gdn_fraction=args.single_gdn_fraction,
+                gdn_output=args.gdn_output,
+                gdn_output_fraction=args.gdn_output_fraction,
+                attention=args.attention_projections,
+                attention_fraction=args.attention_fraction,
                 dual_ane=False,
                 cpu_fraction=args.cpu_fraction,
                 cpu_down_fraction=args.cpu_down_fraction,
@@ -372,6 +388,10 @@ def main() -> None:
                 fraction=args.dual_mlp_fraction,
                 gdn=not args.disable_gdn,
                 gdn_fraction=args.dual_gdn_fraction,
+                gdn_output=args.gdn_output,
+                gdn_output_fraction=args.gdn_output_fraction,
+                attention=args.attention_projections,
+                attention_fraction=args.attention_fraction,
                 dual_ane=True,
                 cpu_fraction=args.cpu_fraction,
                 cpu_down_fraction=args.cpu_down_fraction,
@@ -404,6 +424,40 @@ def main() -> None:
                 (f"{mode}_cpu_down_{fraction:.3f}", None, None, fraction)
                 for fraction in args.cpu_down_fraction_grid
             ]
+        if mode in ("single", "dual") and (
+            args.gdn_output or args.attention_projections
+        ):
+            projection_configs = [
+                (module, module._omlx_ane_projection_config)
+                for module in model.modules()
+                if hasattr(module, "_omlx_ane_projection_config")
+            ]
+            for module, _projection_config in projection_configs:
+                module._omlx_ane_projection_config = None
+            control, control_output = benchmark_mode(model, tokens, args.repeats)
+            for module, projection_config in projection_configs:
+                module._omlx_ane_projection_config = projection_config
+            control.update(
+                {
+                    "projection_layers_disabled": len(projection_configs),
+                    "resident_programs": int(
+                        getattr(model, "_omlx_ane_resident_program_count", 0)
+                    ),
+                }
+            )
+            if reference is not None:
+                control["accuracy_vs_gpu"] = accuracy(
+                    model, reference, control_output
+                )
+                control["speedup_vs_gpu"] = (
+                    results["gpu"]["median_seconds"] / control["median_seconds"]
+                )
+            results[f"{mode}_projection_off"] = control
+            print(
+                f"{mode.upper()}_PROJECTION_OFF "
+                f"{json.dumps(control, sort_keys=True)}",
+                flush=True,
+            )
         for result_key, cpu_threads, cpu_gdn_fraction, cpu_down_fraction in variants:
             if cpu_threads is not None:
                 for module in model.modules():
@@ -492,6 +546,16 @@ def main() -> None:
                     else 0,
                     "gdn_layers": int(
                         getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "gdn_output_layers": int(
+                        getattr(model, "_omlx_ane_gdn_output_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "attention_layers": int(
+                        getattr(model, "_omlx_ane_attention_prefill_count", 0)
                     )
                     if mode != "gpu"
                     else 0,

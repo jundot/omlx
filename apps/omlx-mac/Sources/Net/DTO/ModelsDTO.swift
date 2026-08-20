@@ -112,6 +112,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillGdn: Bool?
     let qwen35AnePrefillGdnFraction: Double?
     let qwen35AnePrefillGdnMaxLayers: Int?
+    let qwen35AnePrefillGdnOutput: Bool?
+    let qwen35AnePrefillGdnOutputFraction: Double?
+    let qwen35AnePrefillAttention: Bool?
+    let qwen35AnePrefillAttentionFraction: Double?
     let qwen35AnePrefillCpuEnabled: Bool?
     let qwen35AnePrefillCpuFraction: Double?
     let qwen35AnePrefillCpuDownFraction: Double?
@@ -193,6 +197,10 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillGdn: Bool? = nil
     var qwen35AnePrefillGdnFraction: Double? = nil
     var qwen35AnePrefillGdnMaxLayers: Int? = nil
+    var qwen35AnePrefillGdnOutput: Bool? = nil
+    var qwen35AnePrefillGdnOutputFraction: Double? = nil
+    var qwen35AnePrefillAttention: Bool? = nil
+    var qwen35AnePrefillAttentionFraction: Double? = nil
     var qwen35AnePrefillCpuEnabled: Bool? = nil
     var qwen35AnePrefillCpuFraction: Double? = nil
     var qwen35AnePrefillCpuDownFraction: Double? = nil

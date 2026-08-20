@@ -23,6 +23,7 @@ def test_ane_compile_bindings_release_the_python_gil():
         "qwen35_ane_compile_linear",
         "qwen35_ane_compile_linear_bank",
         "qwen35_ane_compile_fp16_linear",
+        "qwen35_ane_compile_fp16_linear_bank",
         "qwen35_ane_compile_swiglu_down",
     ):
         block = next(part for part in blocks if f'"{name}"' in part)
@@ -34,10 +35,15 @@ def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
     previous = q4_patch._LM_GDN_PREFILL_BACKEND
+    previous_attention = q4_patch._LM_ATTENTION_PREFILL_BACKEND
+    previous_output = q4_patch._LM_GDN_OUTPUT_PREFILL_BACKEND
     try:
         yield
     finally:
         q4_patch.register_qwen35_lm_gdn_prefill_backend(previous)
+        q4_patch.register_qwen35_lm_projection_prefill_backends(
+            previous_attention, previous_output
+        )
 
 
 class _MLP(nn.Module):
@@ -67,6 +73,131 @@ class _GDN(nn.Module):
         self.in_proj_z = nn.QuantizedLinear(128, 128, bias=False, group_size=64, bits=5)
         self.in_proj_b = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
         self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
+        self.out_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=4
+        )
+        self.out_proj.scales = self.out_proj.scales.astype(mx.float16)
+        self.out_proj.biases = self.out_proj.biases.astype(mx.float16)
+
+
+class _Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_attention_heads = 2
+        self.q_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=8
+        )
+        self.k_proj = nn.QuantizedLinear(
+            128, 64, bias=False, group_size=64, bits=8
+        )
+        self.v_proj = nn.QuantizedLinear(
+            128, 64, bias=False, group_size=64, bits=8
+        )
+        for linear in (self.q_proj, self.k_proj, self.v_proj):
+            linear.scales = linear.scales.astype(mx.float16)
+            linear.biases = linear.biases.astype(mx.float16)
+
+
+def test_prepare_remaining_projection_banks_keep_output_order():
+    config = ane_patch._AneProjectionConfig(2048, 0.5, 8, True)
+
+    gdn_prepared = ane_patch._prepare_projection_for_bank(
+        _GDN(), "gdn_output", config
+    )
+    assert gdn_prepared is not None
+    gdn_state, gdn0, gdn1 = gdn_prepared
+    assert gdn_state.output_dims == (256,)
+    assert gdn_state.bits == 4
+    assert gdn0.shape == (64, 128)
+    assert gdn1 is not None and gdn1.shape == (64, 128)
+    assert gdn_state.weight.shape[0] == 128
+
+    attention_prepared = ane_patch._prepare_projection_for_bank(
+        _Attention(), "attention", config
+    )
+    assert attention_prepared is not None
+    attention_state, attention0, attention1 = attention_prepared
+    assert attention_state.output_dims == (256, 64, 64)
+    assert attention_state.bits == 8
+    assert attention_state.attention_gate_only
+    assert attention_state.attention_heads == 2
+    assert attention_state.attention_head_dim == 64
+    assert attention_state.ane_gate_outputs == 128
+    assert attention0.shape == (64, 128)
+    assert attention1 is not None and attention1.shape == (64, 128)
+    assert attention_state.weight.shape[0] == 256
+
+
+def test_attention_projection_backend_restores_three_outputs(monkeypatch):
+    attention = _Attention()
+    config = ane_patch._AneProjectionConfig(1, 0.5, 8, True)
+    prepared = ane_patch._prepare_projection_for_bank(
+        attention, "attention", config
+    )
+    assert prepared is not None
+    state, _, _ = prepared
+    state = ane_patch.replace(state, model=object(), model1=object())
+    attention._omlx_ane_projection_config = config
+    attention._omlx_ane_projection_state = state
+    total = sum(state.output_dims)
+    combined = mx.arange(total).reshape(1, 1, total).astype(mx.float16)
+    captured = {}
+
+    def dispatch(*args):
+        captured["category"] = args[-1]
+        return combined
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", dispatch)
+    q, k, v = ane_patch._attention_backend(
+        attention, mx.zeros((1, 1, 128), dtype=mx.float16)
+    )
+    assert captured["category"] == 3
+    assert q.shape[-1] == 256
+    assert k.shape[-1] == 64
+    assert v.shape[-1] == 64
+    # Native order is ANE gate, GPU gate tail, GPU query, K, V. The backend
+    # restores Qwen's per-head [query, gate] q_proj layout.
+    assert mx.array_equal(q[..., :64], combined[..., 128:192]).item()
+    assert mx.array_equal(q[..., 64:128], combined[..., :64]).item()
+    assert mx.array_equal(q[..., 128:192], combined[..., 192:256]).item()
+    assert mx.array_equal(q[..., 192:256], combined[..., 64:128]).item()
+
+
+def test_projection_banks_compile_gdn_and_attention_gate_fp16(monkeypatch):
+    calls = []
+
+    def compiler(kind):
+        def compile_bank(weights, sequence_length, ane_instance):
+            calls.append((kind, len(weights), sequence_length, ane_instance))
+            return [object() for _ in weights]
+
+        return compile_bank
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_compile_fp16_linear_bank", compiler("fp16")
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+    model = SimpleNamespace(modules=lambda: (_GDN(), _Attention()))
+    config = ane_patch._AnePrefillConfig(2048, 0.5, 8, True)
+
+    gdn_count, attention_count, resident = ane_patch._enable_projection_banks(
+        model,
+        config,
+        gdn_output=True,
+        gdn_output_fraction=0.5,
+        gdn_max_layers=1,
+        attention=True,
+        attention_fraction=0.5,
+        attention_max_layers=1,
+    )
+
+    assert (gdn_count, attention_count, resident) == (1, 1, 4)
+    assert calls == [
+        ("fp16", 1, 2048, 1),
+        ("fp16", 1, 2048, 2),
+        ("fp16", 1, 2048, 1),
+        ("fp16", 1, 2048, 2),
+    ]
 
 
 class _Q6MLP(nn.Module):
@@ -2180,6 +2311,8 @@ def test_prefill_status_reports_configured_layers():
         "configured": True,
         "mlp_layers": 12,
         "gdn_layers": 4,
+        "gdn_output_layers": 0,
+        "attention_layers": 0,
         "dual_ane_layers": 8,
         "resident_programs": 24,
     }

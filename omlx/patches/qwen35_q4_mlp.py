@@ -33,6 +33,16 @@ _LM_GDN_PREFILL_BACKEND: (
     ]
     | None
 ) = None
+_LM_ATTENTION_PREFILL_BACKEND: (
+    Callable[
+        [Any, mx.array, bool],
+        tuple[mx.array, mx.array, mx.array] | None,
+    ]
+    | None
+) = None
+_LM_GDN_OUTPUT_PREFILL_BACKEND: (
+    Callable[[Any, mx.array, bool], mx.array | None] | None
+) = None
 _SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
 _Q8_MIN_TOKENS = 16384
 
@@ -55,6 +65,21 @@ def register_qwen35_lm_gdn_prefill_backend(
 
     global _LM_GDN_PREFILL_BACKEND
     _LM_GDN_PREFILL_BACKEND = backend
+
+
+def register_qwen35_lm_projection_prefill_backends(
+    attention_backend: Callable[
+        [Any, mx.array, bool],
+        tuple[mx.array, mx.array, mx.array] | None,
+    ]
+    | None,
+    gdn_output_backend: Callable[[Any, mx.array, bool], mx.array | None] | None,
+) -> None:
+    """Register first-refusal backends for remaining mlx-lm projections."""
+
+    global _LM_ATTENTION_PREFILL_BACKEND, _LM_GDN_OUTPUT_PREFILL_BACKEND
+    _LM_ATTENTION_PREFILL_BACKEND = attention_backend
+    _LM_GDN_OUTPUT_PREFILL_BACKEND = gdn_output_backend
 
 
 def _native_qmm_for_bits(bits: int) -> Callable[..., mx.array] | None:
@@ -463,10 +488,18 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 attn_module is None
                 or x.ndim != 3
                 or x.shape[-2] < min_tokens
-                or not all(
-                    should_route(linear, x)
-                    for linear in (self.q_proj, self.k_proj, self.v_proj)
-                )
+            ):
+                return orig_attn(self, x, mask=mask, cache=cache)
+
+            projection_backend = _LM_ATTENTION_PREFILL_BACKEND
+            projections = (
+                projection_backend(self, x, False)
+                if projection_backend is not None
+                else None
+            )
+            if projections is None and not all(
+                should_route(linear, x)
+                for linear in (self.q_proj, self.k_proj, self.v_proj)
             ):
                 return orig_attn(self, x, mask=mask, cache=cache)
 
@@ -481,16 +514,18 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 return orig_attn(self, x, mask=mask, cache=cache)
 
             B, L, _ = x.shape
-            q_proj_output = qmm_or_linear(self.q_proj, x)
+            if projections is None:
+                q_proj_output = qmm_or_linear(self.q_proj, x)
+                keys = qmm_or_linear(self.k_proj, x)
+                values = qmm_or_linear(self.v_proj, x)
+            else:
+                q_proj_output, keys, values = projections
             queries, gate = mx.split(
                 q_proj_output.reshape(B, L, self.num_attention_heads, -1),
                 2,
                 axis=-1,
             )
             gate = gate.reshape(B, L, -1)
-            keys = qmm_or_linear(self.k_proj, x)
-            values = qmm_or_linear(self.v_proj, x)
-
             queries = self.q_norm(queries).transpose(0, 2, 1, 3)
             keys = self.k_norm(
                 keys.reshape(B, L, self.num_key_value_heads, -1)
@@ -643,7 +678,18 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 cache.advance(S)
 
             out = self.norm(out, z)
-            return qmm_or_linear(self.out_proj, out.reshape(B, S, -1))
+            output_input = out.reshape(B, S, -1)
+            output_backend = _LM_GDN_OUTPUT_PREFILL_BACKEND
+            output = (
+                output_backend(self, output_input, bool(n_confirmed))
+                if output_backend is not None
+                else None
+            )
+            return (
+                output
+                if output is not None
+                else qmm_or_linear(self.out_proj, output_input)
+            )
 
         gdn_cls.__call__ = patched_gdn
         gdn_cls._omlx_q4_lm_gdn_patched = True

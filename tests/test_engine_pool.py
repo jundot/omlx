@@ -527,6 +527,9 @@ class TestQwenCpuShareMemoryEstimate:
                         "linear_key_head_dim": 64,
                         "linear_num_value_heads": 2,
                         "linear_value_head_dim": 64,
+                        "num_attention_heads": 4,
+                        "num_key_value_heads": 1,
+                        "head_dim": 64,
                     },
                 }
             )
@@ -579,6 +582,34 @@ class TestQwenCpuShareMemoryEstimate:
 
         assert extra is not None and extra > 0
         assert projected == entry.estimated_size + extra
+
+    def test_projection_banks_are_guarded_without_cpu_share(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=False,
+            qwen35_ane_prefill_gdn=True,
+            qwen35_ane_prefill_gdn_max_layers=2,
+            qwen35_ane_prefill_gdn_output=True,
+            qwen35_ane_prefill_gdn_output_fraction=0.25,
+            qwen35_ane_prefill_attention=True,
+            qwen35_ane_prefill_attention_fraction=0.35,
+        )
+
+        estimated = _qwen35_cpu_share_estimated_bytes(str(model), settings)
+
+        # Both procedure banks include their transient FP32 materialization and
+        # per-procedure IOSurfaces. GDN output compiles FP16; attention gate
+        # compiles FP16 and retains its packed GPU Q/K/V suffix.
+        gdn_output = (2 * 64 * 128 * 4) + (2 * 64 * 128 * 2)
+        gdn_output += 2 * ((2 * 2048 * 128 * 2) + (2048 * 64 * 2))
+        attention = (192 * 256 * 4) + (192 * 256 * 2)
+        attention += (2 * 2048 * 256 * 2) + (2048 * 192 * 2)
+        attention += 448 * 256 * 1.0625
+        assert estimated == int((gdn_output + attention) * 1.5)
 
     @pytest.mark.asyncio
     async def test_cpu_share_projection_participates_in_preload_admission(

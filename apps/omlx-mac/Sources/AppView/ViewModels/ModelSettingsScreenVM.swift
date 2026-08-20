@@ -39,6 +39,8 @@ final class ModelSettingsScreenVM {
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
         case qwen35AnePrefillDualAne, qwen35AnePrefillGdn
         case qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnMaxLayers
+        case qwen35AnePrefillGdnOutput, qwen35AnePrefillGdnOutputFraction
+        case qwen35AnePrefillAttention, qwen35AnePrefillAttentionFraction
         case qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuFraction
         case qwen35AnePrefillCpuDownFraction
         case qwen35AnePrefillCpuGdnFraction
@@ -273,6 +275,10 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillGdn: Bool = true
     var qwen35AnePrefillGdnFraction: String = "0.5"
     var qwen35AnePrefillGdnMaxLayers: String = "48"
+    var qwen35AnePrefillGdnOutput: Bool = false
+    var qwen35AnePrefillGdnOutputFraction: String = "0.25"
+    var qwen35AnePrefillAttention: Bool = false
+    var qwen35AnePrefillAttentionFraction: String = "0.43"
     var qwen35AnePrefillCpuEnabled: Bool = false
     var qwen35AnePrefillCpuFraction: String = "0.135"
     var qwen35AnePrefillCpuDownFraction: String = "0"
@@ -287,6 +293,8 @@ final class ModelSettingsScreenVM {
     var aneTuningAllowCPUGate: Bool = true
     var aneTuningAllowCPUDown: Bool = true
     var aneTuningAllowANEGDN: Bool = true
+    var aneTuningAllowGDNOutput: Bool = false
+    var aneTuningAllowAttention: Bool = false
     var aneTuningAllowCPUGDN: Bool = true
     var aneTuningAllowCPUSharedResource: Bool = true
 
@@ -385,6 +393,9 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillDualAne, .qwen35AnePrefillGdn:
             return true
         case .qwen35AnePrefillGdnFraction, .qwen35AnePrefillGdnMaxLayers:
+            return true
+        case .qwen35AnePrefillGdnOutput, .qwen35AnePrefillGdnOutputFraction,
+             .qwen35AnePrefillAttention, .qwen35AnePrefillAttentionFraction:
             return true
         case .qwen35AnePrefillCpuEnabled, .qwen35AnePrefillCpuFraction,
              .qwen35AnePrefillCpuDownFraction, .qwen35AnePrefillCpuGdnFraction:
@@ -525,6 +536,10 @@ final class ModelSettingsScreenVM {
                 self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
                 self.qwen35AnePrefillGdnFraction = s?.qwen35AnePrefillGdnFraction.map { Self.formatPct($0) } ?? "0.5"
                 self.qwen35AnePrefillGdnMaxLayers = s?.qwen35AnePrefillGdnMaxLayers.map(String.init) ?? "48"
+                self.qwen35AnePrefillGdnOutput = s?.qwen35AnePrefillGdnOutput ?? false
+                self.qwen35AnePrefillGdnOutputFraction = s?.qwen35AnePrefillGdnOutputFraction.map { Self.formatPct($0) } ?? "0.25"
+                self.qwen35AnePrefillAttention = s?.qwen35AnePrefillAttention ?? false
+                self.qwen35AnePrefillAttentionFraction = s?.qwen35AnePrefillAttentionFraction.map { Self.formatPct($0) } ?? "0.43"
                 self.qwen35AnePrefillCpuEnabled = s?.qwen35AnePrefillCpuEnabled ?? false
                 self.qwen35AnePrefillCpuFraction = s?.qwen35AnePrefillCpuFraction.map { Self.formatPct($0) } ?? "0.135"
                 self.qwen35AnePrefillCpuDownFraction = s?.qwen35AnePrefillCpuDownFraction.map { Self.formatPct($0) } ?? "0"
@@ -699,6 +714,24 @@ final class ModelSettingsScreenVM {
             case .success(let value): patch.qwen35AnePrefillGdnMaxLayers = value
             case .failure(let error): lastError = error.message; return
             }
+        case .qwen35AnePrefillGdnOutput:
+            patch.qwen35AnePrefillGdnOutput = qwen35AnePrefillGdnOutput
+        case .qwen35AnePrefillGdnOutputFraction:
+            switch QwenAneSettingsValidator.projectionFraction(
+                qwen35AnePrefillGdnOutputFraction, label: "GDN output ANE fraction"
+            ) {
+            case .success(let value): patch.qwen35AnePrefillGdnOutputFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillAttention:
+            patch.qwen35AnePrefillAttention = qwen35AnePrefillAttention
+        case .qwen35AnePrefillAttentionFraction:
+            switch QwenAneSettingsValidator.projectionFraction(
+                qwen35AnePrefillAttentionFraction, label: "Attention ANE fraction"
+            ) {
+            case .success(let value): patch.qwen35AnePrefillAttentionFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
         case .qwen35AnePrefillCpuEnabled:
             patch.qwen35AnePrefillCpuEnabled = qwen35AnePrefillCpuEnabled
         case .qwen35AnePrefillCpuFraction:
@@ -805,6 +838,8 @@ final class ModelSettingsScreenVM {
                     allowCpuGate: aneTuningAllowCPU && aneTuningAllowCPUGate,
                     allowCpuDown: aneTuningAllowCPU && aneTuningAllowCPUDown,
                     allowAneGdn: aneTuningAllowANEGDN,
+                    allowGdnOutput: aneTuningAllowGDNOutput,
+                    allowAttention: aneTuningAllowAttention,
                     allowCpuGdn: aneTuningAllowCPU
                         && aneTuningAllowANEGDN
                         && aneTuningAllowCPUGDN,
@@ -859,6 +894,14 @@ final class ModelSettingsScreenVM {
         qwen35AnePrefillGdn = recommendation.gdnEnabled
         if let fraction = recommendation.gdnFraction {
             qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
+        }
+        qwen35AnePrefillGdnOutput = recommendation.gdnOutputEnabled ?? false
+        if let fraction = recommendation.gdnOutputFraction {
+            qwen35AnePrefillGdnOutputFraction = Self.formatPct(fraction)
+        }
+        qwen35AnePrefillAttention = recommendation.attentionEnabled ?? false
+        if let fraction = recommendation.attentionFraction {
+            qwen35AnePrefillAttentionFraction = Self.formatPct(fraction)
         }
         qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
         if let fraction = recommendation.cpuFraction {
@@ -1134,6 +1177,14 @@ final class ModelSettingsScreenVM {
                 if qwen35AnePrefillGdn {
                     putDouble(ProfileSettingsKey.qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnFraction)
                     putInt(ProfileSettingsKey.qwen35AnePrefillGdnMaxLayers, qwen35AnePrefillGdnMaxLayers)
+                }
+                putBool(ProfileSettingsKey.qwen35AnePrefillGdnOutput, qwen35AnePrefillGdnOutput)
+                if qwen35AnePrefillGdnOutput {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillGdnOutputFraction, qwen35AnePrefillGdnOutputFraction)
+                }
+                putBool(ProfileSettingsKey.qwen35AnePrefillAttention, qwen35AnePrefillAttention)
+                if qwen35AnePrefillAttention {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillAttentionFraction, qwen35AnePrefillAttentionFraction)
                 }
                 putBool(ProfileSettingsKey.qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuEnabled)
                 putBool(ProfileSettingsKey.qwen35AnePrefillFusedDown, qwen35AnePrefillFusedDown)
@@ -1422,18 +1473,29 @@ final class ModelSettingsScreenVM {
         case .success: break
         case .failure(let error): lastError = error.message; return false
         }
-        guard qwen35AnePrefillGdn else { return true }
-        switch QwenAneSettingsValidator.gdnFraction(
-            qwen35AnePrefillGdnFraction,
-            cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
-        ) {
-        case .success: break
-        case .failure(let error): lastError = error.message; return false
+        if qwen35AnePrefillGdn {
+            switch QwenAneSettingsValidator.gdnFraction(
+                qwen35AnePrefillGdnFraction,
+                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
+            ) {
+            case .success: break
+            case .failure(let error): lastError = error.message; return false
+            }
+            switch QwenAneSettingsValidator.gdnLayers(qwen35AnePrefillGdnMaxLayers) {
+            case .success: break
+            case .failure(let error): lastError = error.message; return false
+            }
         }
-        switch QwenAneSettingsValidator.gdnLayers(qwen35AnePrefillGdnMaxLayers) {
-        case .success: return true
-        case .failure(let error): lastError = error.message; return false
+        for (enabled, value, label) in [
+            (qwen35AnePrefillGdnOutput, qwen35AnePrefillGdnOutputFraction, "GDN output ANE fraction"),
+            (qwen35AnePrefillAttention, qwen35AnePrefillAttentionFraction, "Attention ANE fraction"),
+        ] where enabled {
+            switch QwenAneSettingsValidator.projectionFraction(value, label: label) {
+            case .success: break
+            case .failure(let error): lastError = error.message; return false
+            }
         }
+        return true
     }
 
     /// Discard working changes by reloading the server's view.
@@ -1538,6 +1600,12 @@ final class ModelSettingsScreenVM {
 }
 
 enum QwenAneSettingsValidator {
+    static func projectionFraction(
+        _ raw: String, label: String
+    ) -> Result<Double, SamplingValidationError> {
+        fraction(raw, label: label, range: 0.05...0.90)
+    }
+
     static func promptBlock(_ raw: String) -> Result<Int, SamplingValidationError> {
         integer(raw, label: "ANE prompt block") { value in
             value >= 1024 && value.isMultiple(of: 64)

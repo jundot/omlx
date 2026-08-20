@@ -123,6 +123,14 @@ class ModelSettings:
         qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
             outputs assigned across the ANE instances.
         qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
+        qwen35_ane_prefill_gdn_output: Also accelerate the post-recurrence GDN
+            output projection.
+        qwen35_ane_prefill_gdn_output_fraction: Fraction of GDN output rows
+            assigned across the ANE instances.
+        qwen35_ane_prefill_attention: Accelerate full-attention query-gate rows
+            on ANE while retaining query/key/value projections on GPU.
+        qwen35_ane_prefill_attention_fraction: Gate rows assigned across the
+            ANEs, expressed as a fraction of combined Q/gate/K/V output width.
         qwen35_ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
             with the CPU. Requires a separately preprocessed FP16 checkpoint.
         qwen35_ane_prefill_cpu_fraction: Fraction of each eligible gate/up
@@ -239,6 +247,10 @@ class ModelSettings:
     qwen35_ane_prefill_gdn: bool = True
     qwen35_ane_prefill_gdn_fraction: float = 0.50
     qwen35_ane_prefill_gdn_max_layers: int = 48
+    qwen35_ane_prefill_gdn_output: bool = False
+    qwen35_ane_prefill_gdn_output_fraction: float = 0.25
+    qwen35_ane_prefill_attention: bool = False
+    qwen35_ane_prefill_attention_fraction: float = 0.43
     qwen35_ane_prefill_cpu_enabled: bool = False
     qwen35_ane_prefill_cpu_fraction: float = 0.135
     qwen35_ane_prefill_cpu_down_fraction: float = 0.0

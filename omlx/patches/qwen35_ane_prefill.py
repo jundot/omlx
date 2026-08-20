@@ -27,7 +27,14 @@ _COMPILE_LOCK = threading.RLock()
 _PATCHED_CLASSES: set[type] = set()
 _VLM_HOOK_INSTALLED = False
 _VLM_GDN_HOOK_INSTALLED = False
+_VLM_PROJECTION_HOOK_INSTALLED = False
 _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_GDN_OUTPUT_MODULES: weakref.WeakValueDictionary[int, Any] = (
+    weakref.WeakValueDictionary()
+)
+_ATTENTION_MODULES: weakref.WeakValueDictionary[int, Any] = (
+    weakref.WeakValueDictionary()
+)
 # Legacy extensions compile one program per slice, and the private runtime on
 # the reference M3 Ultra accepts 120 resident programs. Current extensions pack
 # all slices into one multi-procedure program per ANE instance and bypass this
@@ -61,6 +68,14 @@ class _AneGDNConfig:
     cpu_fraction: float = 0.0
     cpu_threads: int = 8
     cpu_shared_resource: bool = True
+
+
+@dataclass(frozen=True)
+class _AneProjectionConfig:
+    sequence_length: int
+    fraction: float
+    variant: int
+    dual_ane: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +151,23 @@ class _CombinedGDNState:
     a_outputs: int = 0
     cpu_weight: mx.array | None = None
     cpu_outputs: int = 0
+
+
+@dataclass(frozen=True)
+class _AneProjectionState:
+    model: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    output_dims: tuple[int, ...]
+    bits: int
+    group_size: int
+    model1: Any | None = None
+    attention_gate_only: bool = False
+    attention_heads: int = 0
+    attention_head_dim: int = 0
+    ane_gate_outputs: int = 0
+    gate_outputs: int = 0
 
 
 def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
@@ -943,6 +975,443 @@ def _register_gdn_module(gdn: Any) -> None:
     qkv, _, _, _ = _gdn_linears(gdn)
     if qkv is not None:
         _GDN_MODULES[id(qkv)] = gdn
+
+
+def _projection_linears(owner: Any, kind: str) -> tuple[Any, ...]:
+    if kind == "gdn_output":
+        return (getattr(owner, "out_proj", None),)
+    if kind == "attention":
+        return tuple(
+            getattr(owner, name, None) for name in ("q_proj", "k_proj", "v_proj")
+        )
+    raise ValueError(f"Unknown Qwen projection kind: {kind}")
+
+
+def _eligible_projection_bank(linears: tuple[Any, ...]) -> bool:
+    if not linears or any(linear is None for linear in linears):
+        return False
+    dtype = getattr(getattr(linears[0], "scales", None), "dtype", None)
+    specs = [_affine_spec(linear, dtype) for linear in linears]
+    if any(spec is None for spec in specs) or len(set(specs)) != 1:
+        return False
+    bits = int(linears[0].bits)
+    input_dim = int(linears[0].weight.shape[1]) * 32 // bits
+    return all(
+        int(linear.weight.shape[1]) * 32 // int(linear.bits) == input_dim
+        and int(linear.weight.shape[0]) % 64 == 0
+        for linear in linears
+    )
+
+
+def _prepare_projection_for_bank(
+    owner: Any,
+    kind: str,
+    config: _AneProjectionConfig,
+) -> tuple[_AneProjectionState, mx.array, mx.array | None] | None:
+    """Prepare an output-row projection bank and its quantized GPU suffix."""
+    linears = _projection_linears(owner, kind)
+    if not _eligible_projection_bank(linears):
+        return None
+    bits = int(linears[0].bits)
+    group_size = int(linears[0].group_size)
+    output_dims = tuple(int(linear.weight.shape[0]) for linear in linears)
+    total_outputs = sum(output_dims)
+    alignment = 128 if config.dual_ane else 64
+
+    if kind == "attention":
+        # Qwen3.5 packs [query, gate] inside every query head. Keep query,
+        # key, and value on their existing GPU route and offload only the
+        # lower-sensitivity gate rows. This avoids compounding the checkpoint's
+        # INT8 quantization error in the vectors consumed by softmax.
+        if linears[0].scales.dtype != mx.float16:
+            return None
+        heads = int(getattr(owner, "num_attention_heads", 0))
+        q_outputs = output_dims[0]
+        if heads <= 0 or q_outputs % (2 * heads):
+            return None
+        head_dim = q_outputs // (2 * heads)
+        gate_outputs = heads * head_dim
+        ane_outputs = min(
+            (int(total_outputs * config.fraction) // alignment) * alignment,
+            gate_outputs,
+        )
+        gpu_outputs = total_outputs - ane_outputs
+        if ane_outputs <= 0 or gpu_outputs <= 0:
+            return None
+        if config.dual_ane and (ane_outputs // 2) % 64:
+            return None
+
+        q_proj, k_proj, v_proj = linears
+
+        def head_parts(field: str, *, gate: bool) -> list[mx.array]:
+            value = getattr(q_proj, field)
+            offset = head_dim if gate else 0
+            return [
+                value[head * 2 * head_dim + offset : head * 2 * head_dim + offset + head_dim]
+                for head in range(heads)
+            ]
+
+        gate_weight = mx.contiguous(mx.concatenate(head_parts("weight", gate=True), axis=0))
+        gate_scales = mx.contiguous(mx.concatenate(head_parts("scales", gate=True), axis=0))
+        gate_biases = mx.contiguous(mx.concatenate(head_parts("biases", gate=True), axis=0))
+        query_weight = mx.contiguous(mx.concatenate(head_parts("weight", gate=False), axis=0))
+        query_scales = mx.contiguous(mx.concatenate(head_parts("scales", gate=False), axis=0))
+        query_biases = mx.contiguous(mx.concatenate(head_parts("biases", gate=False), axis=0))
+
+        dense_gate = mx.dequantize(
+            gate_weight[:ane_outputs],
+            gate_scales[:ane_outputs].astype(mx.float32),
+            gate_biases[:ane_outputs].astype(mx.float32),
+            group_size=group_size,
+            bits=bits,
+        )
+        if config.dual_ane:
+            split = ane_outputs // 2
+            dense0 = mx.contiguous(dense_gate[:split])
+            dense1 = mx.contiguous(dense_gate[split:])
+        else:
+            dense0 = mx.contiguous(dense_gate)
+            dense1 = None
+
+        # Native dispatch concatenates ANE results before the quantized GPU
+        # suffix. Put the remaining gate rows first so reconstruction is a
+        # pair of contiguous slices, followed by exact GPU Q/K/V results.
+        weight = mx.contiguous(
+            mx.concatenate(
+                [gate_weight[ane_outputs:], query_weight, k_proj.weight, v_proj.weight],
+                axis=0,
+            )
+        )
+        scales = mx.contiguous(
+            mx.concatenate(
+                [gate_scales[ane_outputs:], query_scales, k_proj.scales, v_proj.scales],
+                axis=0,
+            )
+        )
+        biases = mx.contiguous(
+            mx.concatenate(
+                [gate_biases[ane_outputs:], query_biases, k_proj.biases, v_proj.biases],
+                axis=0,
+            )
+        )
+        values = [dense0, weight, scales, biases]
+        if dense1 is not None:
+            values.append(dense1)
+        mx.eval(*values)
+        return (
+            _AneProjectionState(
+                model=None,
+                model1=None,
+                weight=weight,
+                scales=scales,
+                biases=biases,
+                output_dims=output_dims,
+                bits=bits,
+                group_size=group_size,
+                attention_gate_only=True,
+                attention_heads=heads,
+                attention_head_dim=head_dim,
+                ane_gate_outputs=ane_outputs,
+                gate_outputs=gate_outputs,
+            ),
+            dense0,
+            dense1,
+        )
+
+    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    gpu_outputs = total_outputs - ane_outputs
+    if ane_outputs <= 0 or gpu_outputs <= 0 or gpu_outputs % 64:
+        return None
+
+    def logical_parts(start: int, end: int, field: str) -> list[mx.array]:
+        parts: list[mx.array] = []
+        offset = 0
+        for linear, outputs in zip(linears, output_dims, strict=True):
+            lo = max(start - offset, 0)
+            hi = min(end - offset, outputs)
+            if lo < hi:
+                parts.append(getattr(linear, field)[lo:hi])
+            offset += outputs
+        return parts
+
+    def dense_rows(start: int, end: int) -> mx.array:
+        parts: list[mx.array] = []
+        offset = 0
+        for linear, outputs in zip(linears, output_dims, strict=True):
+            lo = max(start - offset, 0)
+            hi = min(end - offset, outputs)
+            if lo < hi:
+                parts.append(
+                    mx.dequantize(
+                        linear.weight[lo:hi],
+                        linear.scales[lo:hi],
+                        linear.biases[lo:hi],
+                        group_size=group_size,
+                        bits=bits,
+                    ).astype(mx.float32)
+                )
+            offset += outputs
+        return mx.contiguous(mx.concatenate(parts, axis=0))
+
+    if config.dual_ane:
+        split = ane_outputs // 2
+        if split % 64:
+            return None
+        dense0 = dense_rows(0, split)
+        dense1 = dense_rows(split, ane_outputs)
+    else:
+        dense0 = dense_rows(0, ane_outputs)
+        dense1 = None
+    weight = mx.contiguous(
+        mx.concatenate(logical_parts(ane_outputs, total_outputs, "weight"), axis=0)
+    )
+    scales = mx.contiguous(
+        mx.concatenate(logical_parts(ane_outputs, total_outputs, "scales"), axis=0)
+    )
+    biases = mx.contiguous(
+        mx.concatenate(logical_parts(ane_outputs, total_outputs, "biases"), axis=0)
+    )
+    values = [dense0, weight, scales, biases]
+    if dense1 is not None:
+        values.append(dense1)
+    mx.eval(*values)
+    return (
+        _AneProjectionState(
+            model=None,
+            model1=None,
+            weight=weight,
+            scales=scales,
+            biases=biases,
+            output_dims=output_dims,
+            bits=bits,
+            group_size=group_size,
+        ),
+        dense0,
+        dense1,
+    )
+
+
+def _compile_projection(
+    owner: Any,
+    kind: str,
+    config: _AneProjectionConfig,
+) -> _AneProjectionState | None:
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    prepared = _prepare_projection_for_bank(owner, kind, config)
+    if prepared is None:
+        return None
+    state, dense0, dense1 = prepared
+    if kind == "attention":
+        model = fast.qwen35_ane_compile_fp16_linear(
+            dense0, config.sequence_length, 1 if config.dual_ane else 0
+        )
+        model1 = (
+            fast.qwen35_ane_compile_fp16_linear(
+                dense1, config.sequence_length, 2
+            )
+            if dense1 is not None
+            else None
+        )
+    else:
+        model = fast.qwen35_ane_compile_fp16_linear(
+            dense0, config.sequence_length, 1 if config.dual_ane else 0
+        )
+        model1 = (
+            fast.qwen35_ane_compile_fp16_linear(
+                dense1, config.sequence_length, 2
+            )
+            if dense1 is not None
+            else None
+        )
+    return replace(state, model=model, model1=model1)
+
+
+def _projection_backend_exact(
+    owner: Any,
+    x: mx.array,
+    *,
+    kind: str,
+    profile_category: int,
+    target_verify: bool,
+) -> tuple[mx.array, ...] | None:
+    config = getattr(owner, "_omlx_ane_projection_config", None)
+    if config is None or target_verify or not _eligible_input(x, config):
+        return None
+    if getattr(owner, "_omlx_ane_projection_failed", False):
+        return None
+    state = getattr(owner, "_omlx_ane_projection_state", None)
+    if state is None:
+        try:
+            state = _compile_projection(owner, kind, config)
+            owner._omlx_ane_projection_state = state
+        except Exception:
+            owner._omlx_ane_projection_failed = True
+            logger.warning(
+                "Disabling Qwen %s ANE projection after compilation failed",
+                kind,
+                exc_info=True,
+            )
+            return None
+    if state is None or state.scales.dtype != x.dtype:
+        return None
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        if state.model1 is not None:
+            combined = fast.qwen35_ane_dual_affine_qmm_t(
+                x,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.model1,
+                state.bits,
+                config.variant,
+                state.group_size,
+                profile_category,
+            )
+        else:
+            combined = fast.qwen35_ane_affine_qmm_t(
+                x,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.bits,
+                config.variant,
+                state.group_size,
+                profile_category,
+            )
+        if state.attention_gate_only:
+            ane_gate = state.ane_gate_outputs
+            gate_tail = state.gate_outputs - ane_gate
+            query_outputs = state.attention_heads * state.attention_head_dim
+            offset = 0
+            gate = mx.concatenate(
+                [
+                    combined[..., offset : offset + ane_gate],
+                    combined[..., ane_gate : ane_gate + gate_tail],
+                ],
+                axis=-1,
+            )
+            offset = state.gate_outputs
+            query = combined[..., offset : offset + query_outputs]
+            offset += query_outputs
+            key_outputs, value_outputs = state.output_dims[1:]
+            key = combined[..., offset : offset + key_outputs]
+            offset += key_outputs
+            value = combined[..., offset : offset + value_outputs]
+            prefix = (*combined.shape[:-1], state.attention_heads, state.attention_head_dim)
+            q = mx.concatenate(
+                [query.reshape(prefix), gate.reshape(prefix)], axis=-1
+            ).reshape((*combined.shape[:-1], state.output_dims[0]))
+            return q, key, value
+        if len(state.output_dims) == 1:
+            return (combined,)
+        boundaries = []
+        offset = 0
+        for output_dim in state.output_dims[:-1]:
+            offset += output_dim
+            boundaries.append(offset)
+        return tuple(mx.split(combined, boundaries, axis=-1))
+    except Exception:
+        owner._omlx_ane_projection_failed = True
+        logger.warning(
+            "Disabling Qwen %s ANE projection after a runtime failure",
+            kind,
+            exc_info=True,
+        )
+        return None
+
+
+def _projection_backend(
+    owner: Any,
+    x: mx.array,
+    *,
+    kind: str,
+    profile_category: int,
+    target_verify: bool,
+) -> tuple[mx.array, ...] | None:
+    config = getattr(owner, "_omlx_ane_projection_config", None)
+    if config is None or target_verify:
+        return None
+    input_dim = int(x.shape[-1]) if x.ndim else 0
+    rows = int(x.size // input_dim) if input_dim else 0
+    if rows == config.sequence_length:
+        return _projection_backend_exact(
+            owner,
+            x,
+            kind=kind,
+            profile_category=profile_category,
+            target_verify=target_verify,
+        )
+    if rows < config.sequence_length:
+        return None
+    plan = _tiled_input_plan(x, config.sequence_length)
+    if plan is None:
+        return None
+    full_blocks, tail_rows = plan
+    blocks: list[tuple[mx.array, ...]] = []
+    for block in range(full_blocks):
+        start = block * config.sequence_length
+        block_x = mx.contiguous(x[:, start : start + config.sequence_length, :])
+        output = _projection_backend_exact(
+            owner,
+            block_x,
+            kind=kind,
+            profile_category=profile_category,
+            target_verify=False,
+        )
+        if output is None:
+            return None
+        blocks.append(output)
+    if tail_rows:
+        tail_x = x[:, full_blocks * config.sequence_length :, :]
+        blocks.append(
+            tuple(
+                _tail_qmm_or_linear(linear, tail_x, config.variant)
+                for linear in _projection_linears(owner, kind)
+            )
+        )
+    return tuple(
+        mx.concatenate([block[index] for block in blocks], axis=-2)
+        for index in range(len(blocks[0]))
+    )
+
+
+def _gdn_output_backend(
+    gdn: Any, x: mx.array, target_verify: bool = False
+) -> mx.array | None:
+    output = _projection_backend(
+        gdn,
+        x,
+        kind="gdn_output",
+        profile_category=2,
+        target_verify=target_verify,
+    )
+    return output[0] if output is not None else None
+
+
+def _attention_backend(
+    attention: Any, x: mx.array, target_verify: bool = False
+) -> tuple[mx.array, mx.array, mx.array] | None:
+    output = _projection_backend(
+        attention,
+        x,
+        kind="attention",
+        profile_category=3,
+        target_verify=target_verify,
+    )
+    return output if output is None else (output[0], output[1], output[2])
+
+
+def _register_projection_module(owner: Any, kind: str) -> None:
+    linears = _projection_linears(owner, kind)
+    if kind == "gdn_output":
+        _GDN_OUTPUT_MODULES[id(linears[0])] = owner
+    else:
+        _ATTENTION_MODULES[id(linears[0])] = owner
 
 
 def _eligible_gdn(gdn: Any) -> bool:
@@ -1824,6 +2293,7 @@ def _wrap_class(cls: type) -> None:
 
 def _install_dispatch() -> bool:
     global _VLM_GDN_HOOK_INSTALLED, _VLM_HOOK_INSTALLED
+    global _VLM_PROJECTION_HOOK_INSTALLED
     installed = False
     try:
         vlm = importlib.import_module("mlx_vlm.models.qwen3_5.language")
@@ -1848,11 +2318,20 @@ def _install_dispatch() -> bool:
         if callable(register_gdn) and not _VLM_GDN_HOOK_INSTALLED:
             register_gdn(_gdn_backend)
             _VLM_GDN_HOOK_INSTALLED = True
-        elif not _VLM_GDN_HOOK_INSTALLED:
-            target_linears = getattr(vlm, "_target_verify_linears", None)
-            if callable(target_linears):
-
+        target_linears = getattr(vlm, "_target_verify_linears", None)
+        target_linear = getattr(vlm, "_target_verify_linear", None)
+        wrapped_any_projection = False
+        if callable(target_linears) and not getattr(
+            target_linears, "_omlx_ane_projection_dispatch", False
+        ):
                 def ane_target_linears(linears, x, target_verify=False):
+                    attention = (
+                        _ATTENTION_MODULES.get(id(linears[0])) if linears else None
+                    )
+                    if attention is not None:
+                        output = _attention_backend(attention, x, target_verify)
+                        if output is not None:
+                            return output
                     gdn = _GDN_MODULES.get(id(linears[0])) if linears else None
                     if gdn is not None:
                         output = _gdn_backend(gdn, x, target_verify)
@@ -1860,7 +2339,26 @@ def _install_dispatch() -> bool:
                             return output
                     return target_linears(linears, x, target_verify)
 
+                ane_target_linears._omlx_ane_projection_dispatch = True
                 vlm._target_verify_linears = ane_target_linears
+                wrapped_any_projection = True
+        if callable(target_linear) and not getattr(
+            target_linear, "_omlx_ane_projection_dispatch", False
+        ):
+                def ane_target_linear(linear, x, target_verify=False):
+                    gdn = _GDN_OUTPUT_MODULES.get(id(linear))
+                    if gdn is not None:
+                        output = _gdn_output_backend(gdn, x, target_verify)
+                        if output is not None:
+                            return output
+                    return target_linear(linear, x, target_verify)
+
+                ane_target_linear._omlx_ane_projection_dispatch = True
+                vlm._target_verify_linear = ane_target_linear
+                wrapped_any_projection = True
+        if wrapped_any_projection:
+            _VLM_PROJECTION_HOOK_INSTALLED = True
+            if not callable(register_gdn):
                 _VLM_GDN_HOOK_INSTALLED = True
     except Exception:
         logger.debug("mlx-vlm Qwen ANE dispatch hook unavailable", exc_info=True)
@@ -1873,6 +2371,7 @@ def _install_dispatch() -> bool:
             installed = True
         from omlx.patches.qwen35_q4_mlp import (
             register_qwen35_lm_gdn_prefill_backend,
+            register_qwen35_lm_projection_prefill_backends,
         )
 
         # The mlx-lm GDN implementation does not use mlx-vlm's
@@ -1881,6 +2380,10 @@ def _install_dispatch() -> bool:
         # assignment is deliberately idempotent and avoids stale process-wide
         # hook state across VLM -> LLM fallback and model reloads.
         register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
+        register_qwen35_lm_projection_prefill_backends(
+            _attention_backend,
+            _gdn_output_backend,
+        )
         installed = True
     except Exception:
         logger.debug("mlx-lm Qwen ANE dispatch hook unavailable", exc_info=True)
@@ -2106,7 +2609,11 @@ def _enable_dual_procedure_banks(
     gdn_fraction: float,
     gdn_max_layers: int,
     cpu_gdn_fraction: float = 0.0,
-) -> tuple[int, int, int, int] | None:
+    gdn_output: bool = False,
+    gdn_output_fraction: float = 0.25,
+    attention: bool = False,
+    attention_fraction: float = 0.43,
+) -> tuple[int, int, int, int, int, int] | None:
     from omlx.custom_kernels.qwen35_prefill import fast
 
     if not (
@@ -2130,6 +2637,12 @@ def _enable_dual_procedure_banks(
 
     prepared_mlps: list[tuple[Any, _CombinedMLPState, mx.array, mx.array]] = []
     prepared_gdns: list[tuple[Any, _CombinedGDNState, mx.array, mx.array]] = []
+    prepared_gdn_outputs: list[
+        tuple[Any, _AneProjectionState, mx.array, mx.array]
+    ] = []
+    prepared_attentions: list[
+        tuple[Any, _AneProjectionState, mx.array, mx.array]
+    ] = []
     gdn_config = _AneGDNConfig(
         config.sequence_length,
         gdn_fraction,
@@ -2171,6 +2684,57 @@ def _enable_dual_procedure_banks(
                     state, dense0, dense1 = prepared
                     prepared_gdns.append((module, state, dense0, dense1))
 
+        projection_modules = model.modules() if hasattr(model, "modules") else ()
+        gdn_output_config = _AneProjectionConfig(
+            config.sequence_length,
+            gdn_output_fraction,
+            config.variant,
+            True,
+        )
+        attention_config = _AneProjectionConfig(
+            config.sequence_length,
+            attention_fraction,
+            config.variant,
+            True,
+        )
+        for module in projection_modules:
+            kind = None
+            projection_config = None
+            destination = None
+            if (
+                gdn_output
+                and len(prepared_gdn_outputs) < gdn_max_layers
+                and hasattr(module, "in_proj_qkv")
+                and hasattr(module, "out_proj")
+            ):
+                kind = "gdn_output"
+                projection_config = gdn_output_config
+                destination = prepared_gdn_outputs
+            elif (
+                attention
+                and len(prepared_attentions) < len(mlp_candidates)
+                and all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
+            ):
+                kind = "attention"
+                projection_config = attention_config
+                destination = prepared_attentions
+            if kind is None or projection_config is None or destination is None:
+                continue
+            try:
+                prepared = _prepare_projection_for_bank(
+                    module, kind, projection_config
+                )
+            except Exception:
+                logger.warning(
+                    "Skipping one Qwen %s ANE projection while preparing its procedure",
+                    kind,
+                    exc_info=True,
+                )
+                continue
+            if prepared is not None and prepared[2] is not None:
+                state, dense0, dense1 = prepared
+                destination.append((module, state, dense0, dense1))
+
         try:
             down_layer_stride = max(
                 1,
@@ -2206,6 +2770,14 @@ def _enable_dual_procedure_banks(
             procedure_entries.append(("gdn", index))
             weights0.append(dense0)
             weights1.append(dense1)
+        for index, (_, _, dense0, dense1) in enumerate(prepared_gdn_outputs):
+            procedure_entries.append(("gdn_output", index))
+            weights0.append(dense0)
+            weights1.append(dense1)
+        for index, (_, _, dense0, dense1) in enumerate(prepared_attentions):
+            procedure_entries.append(("attention", index))
+            weights0.append(dense0)
+            weights1.append(dense1)
         separate_down_entries = [] if combine_down else down_entries
         down_weights0 = [
             state.compile_weight0 for _, state in separate_down_entries
@@ -2215,7 +2787,7 @@ def _enable_dual_procedure_banks(
         ]
         procedure_count = len(procedure_entries) + len(separate_down_entries)
         if not procedure_count:
-            return (0, 0, 0, 0)
+            return (0, 0, 0, 0, 0, 0)
         if procedure_count > 256:
             logger.warning(
                 "ANE procedure bank exceeds the private 256-procedure limit; "
@@ -2262,6 +2834,8 @@ def _enable_dual_procedure_banks(
             for index, (_, state, _, _) in enumerate(prepared_mlps)
         ]
         assigned_gdn_states = [entry[1] for entry in prepared_gdns]
+        assigned_gdn_output_states = [entry[1] for entry in prepared_gdn_outputs]
+        assigned_attention_states = [entry[1] for entry in prepared_attentions]
         if config.ane_down_fraction > 0 and not down_entries:
             assigned_mlp_states = [
                 replace(state, down_ane=None) for state in assigned_mlp_states
@@ -2288,9 +2862,21 @@ def _enable_dual_procedure_banks(
                         compile_weight1=None,
                     ),
                 )
-            else:
+            elif kind == "gdn":
                 assigned_gdn_states[index] = replace(
                     assigned_gdn_states[index],
+                    model=models0[procedure],
+                    model1=models1[procedure],
+                )
+            elif kind == "gdn_output":
+                assigned_gdn_output_states[index] = replace(
+                    assigned_gdn_output_states[index],
+                    model=models0[procedure],
+                    model1=models1[procedure],
+                )
+            else:
+                assigned_attention_states[index] = replace(
+                    assigned_attention_states[index],
                     model=models0[procedure],
                     model1=models1[procedure],
                 )
@@ -2320,6 +2906,18 @@ def _enable_dual_procedure_banks(
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
+        for (module, _, _, _), state in zip(
+            prepared_gdn_outputs, assigned_gdn_output_states, strict=True
+        ):
+            module._omlx_ane_projection_config = gdn_output_config
+            module._omlx_ane_projection_state = state
+            _register_projection_module(module, "gdn_output")
+        for (module, _, _, _), state in zip(
+            prepared_attentions, assigned_attention_states, strict=True
+        ):
+            module._omlx_ane_projection_config = attention_config
+            module._omlx_ane_projection_state = state
+            _register_projection_module(module, "attention")
 
     model._omlx_ane_down_prefill_count = sum(
         state.down_ane is not None for state in assigned_mlp_states
@@ -2329,6 +2927,8 @@ def _enable_dual_procedure_banks(
         len(prepared_mlps),
         len(prepared_mlps),
         len(prepared_gdns),
+        len(prepared_gdn_outputs),
+        len(prepared_attentions),
         resident_program_count,
     )
 
@@ -2384,6 +2984,126 @@ def _enable_fused_down_banks(
         return None
     model._omlx_ane_down_prefill_count = count
     return count, resident_programs
+
+
+def _enable_projection_banks(
+    model: Any,
+    config: _AnePrefillConfig,
+    *,
+    gdn_output: bool,
+    gdn_output_fraction: float,
+    gdn_max_layers: int,
+    attention: bool,
+    attention_fraction: float,
+    attention_max_layers: int,
+) -> tuple[int, int, int]:
+    """Compile remaining projection procedures for fused or single-ANE modes."""
+    entries: list[tuple[Any, str, _AneProjectionConfig, _AneProjectionState, mx.array, mx.array | None]] = []
+    gdn_count = 0
+    attention_count = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
+        kind = None
+        fraction = 0.0
+        if (
+            gdn_output
+            and gdn_count < gdn_max_layers
+            and hasattr(module, "in_proj_qkv")
+            and hasattr(module, "out_proj")
+        ):
+            kind = "gdn_output"
+            fraction = gdn_output_fraction
+        elif (
+            attention
+            and attention_count < attention_max_layers
+            and all(hasattr(module, name) for name in ("q_proj", "k_proj", "v_proj"))
+        ):
+            kind = "attention"
+            fraction = attention_fraction
+        if kind is None:
+            continue
+        projection_config = _AneProjectionConfig(
+            config.sequence_length,
+            fraction,
+            config.variant,
+            config.dual_ane,
+        )
+        try:
+            prepared = _prepare_projection_for_bank(module, kind, projection_config)
+        except Exception:
+            logger.warning(
+                "Skipping one Qwen %s while preparing its ANE projection bank",
+                kind,
+                exc_info=True,
+            )
+            continue
+        if prepared is None:
+            continue
+        state, dense0, dense1 = prepared
+        entries.append((module, kind, projection_config, state, dense0, dense1))
+        if kind == "gdn_output":
+            gdn_count += 1
+        else:
+            attention_count += 1
+    if not entries:
+        return 0, 0, 0
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    weights0 = [entry[4] for entry in entries]
+    weights1 = [entry[5] for entry in entries]
+    mx.eval(*weights0, *(weight for weight in weights1 if weight is not None))
+    # GDN output remains FP16. Attention offloads only the query-gate rows and
+    # deliberately uses INT8: Q/K/V stay on the checkpoint-exact GPU suffix,
+    # while INT8 materially reduces both gate dispatch time and resident bytes.
+    models0: list[Any | None] = [None] * len(entries)
+    models1: list[Any | None] = [None] * len(entries)
+    resident_programs = 0
+    for compile_kind in ("gdn_output", "attention"):
+        indices = [index for index, entry in enumerate(entries) if entry[1] == compile_kind]
+        if not indices:
+            continue
+        kind_weights0 = [weights0[index] for index in indices]
+        states = [entries[index][3] for index in indices]
+        def compile_bank(
+            values: list[mx.array],
+            _selected_states: list[_AneProjectionState],
+            instance: int,
+            *,
+            second: bool,
+        ) -> list[Any]:
+            del second
+            return fast.qwen35_ane_compile_fp16_linear_bank(
+                values, config.sequence_length, instance
+            )
+
+        if config.dual_ane:
+            if any(weights1[index] is None for index in indices):
+                raise RuntimeError("Dual ANE projection split is incomplete")
+            kind_models0 = compile_bank(kind_weights0, states, 1, second=False)
+            kind_models1 = compile_bank(
+                [weights1[index] for index in indices if weights1[index] is not None],
+                states,
+                2,
+                second=True,
+            )
+            resident_programs += 2
+        else:
+            kind_models0 = compile_bank(kind_weights0, states, 0, second=False)
+            kind_models1 = [None] * len(kind_models0)
+            resident_programs += 1
+        for local_index, entry_index in enumerate(indices):
+            models0[entry_index] = kind_models0[local_index]
+            models1[entry_index] = kind_models1[local_index]
+    _warm_ane_models([*models0, *(model for model in models1 if model is not None)])
+    for index, (module, kind, projection_config, state, _, _) in enumerate(entries):
+        module._omlx_ane_projection_config = projection_config
+        module._omlx_ane_projection_state = replace(
+            state,
+            model=models0[index],
+            model1=models1[index],
+        )
+        _register_projection_module(module, kind)
+    return gdn_count, attention_count, resident_programs
 
 
 def _prepare_fused_down_for_bank(
@@ -2568,6 +3288,10 @@ def enable_qwen35_ane_prefill(
     gdn: bool = False,
     gdn_fraction: float = 0.50,
     gdn_max_layers: int = 48,
+    gdn_output: bool = False,
+    gdn_output_fraction: float = 0.25,
+    attention: bool = False,
+    attention_fraction: float = 0.43,
     dual_ane: bool = True,
     cpu_fraction: float = 0.0,
     cpu_down_fraction: float = 0.0,
@@ -2592,6 +3316,10 @@ def enable_qwen35_ane_prefill(
         raise ValueError("ANE GDN prefill fraction must be between 0.05 and 0.90")
     if gdn_max_layers < 0:
         raise ValueError("ANE GDN prefill max_layers must be non-negative")
+    if not 0.05 <= gdn_output_fraction <= 0.90:
+        raise ValueError("ANE GDN output fraction must be between 0.05 and 0.90")
+    if not 0.05 <= attention_fraction <= 0.90:
+        raise ValueError("ANE attention fraction must be between 0.05 and 0.90")
     if not 0.0 <= cpu_fraction <= 0.25:
         raise ValueError("ANE CPU fp16 fraction must be between 0.0 and 0.25")
     if not 0.0 <= cpu_down_fraction <= 0.50:
@@ -2723,18 +3451,38 @@ def enable_qwen35_ane_prefill(
                 else:
                     gdn_count, gdn_programs = fused_gdn
                     resident_programs += gdn_programs
+            gdn_output_count, attention_count, projection_programs = (
+                _enable_projection_banks(
+                    model,
+                    config,
+                    gdn_output=gdn_output,
+                    gdn_output_fraction=gdn_output_fraction,
+                    gdn_max_layers=gdn_max_layers,
+                    attention=attention,
+                    attention_fraction=attention_fraction,
+                    attention_max_layers=max_layers,
+                )
+            )
+            resident_programs += projection_programs
             model._omlx_ane_mlp_prefill_count = count
             model._omlx_ane_gdn_prefill_count = gdn_count
+            model._omlx_ane_gdn_output_prefill_count = gdn_output_count
+            model._omlx_ane_attention_prefill_count = attention_count
             model._omlx_ane_dual_prefill_count = count
             model._omlx_ane_resident_program_count = resident_programs
-            model._omlx_ane_procedure_count = count + gdn_count
+            model._omlx_ane_procedure_count = (
+                count + gdn_count + gdn_output_count + attention_count
+            )
             logger.info(
-                "Eagerly compiled %d fused MLP/down and %d GDN procedures "
+                "Eagerly compiled %d fused MLP/down, %d GDN input, %d GDN "
+                "output, and %d attention procedures "
                 "into %d "
                 "instance-pinned ANE programs (sequence_length=%d, "
                 "gpu_suffix=%s)",
                 count,
                 gdn_count,
+                gdn_output_count,
+                attention_count,
                 resident_programs,
                 sequence_length,
                 (
@@ -2753,21 +3501,66 @@ def enable_qwen35_ane_prefill(
         gdn_fraction=gdn_fraction,
         gdn_max_layers=gdn_max_layers,
         cpu_gdn_fraction=cpu_gdn_fraction,
+        # GDN output retains FP16 ANE weights and is compiled separately from
+        # this INT8 bank.
+        gdn_output=False,
+        gdn_output_fraction=gdn_output_fraction,
+        # Gate-only attention uses its own FP16 bank so its dense shape can be
+        # loaded independently of the MLP/GDN procedures.
+        attention=False,
+        attention_fraction=attention_fraction,
     )
     if banked is not None:
-        count, dual_count, gdn_count, resident_programs = banked
+        if len(banked) == 4:
+            # Compatibility with the original helper contract retained for
+            # local probes which replace the bank builder.
+            count, dual_count, gdn_count, resident_programs = banked
+            gdn_output_count = 0
+            attention_count = 0
+        else:
+            (
+                count,
+                dual_count,
+                gdn_count,
+                gdn_output_count,
+                attention_count,
+                resident_programs,
+            ) = banked
+        if gdn_output or attention:
+            (
+                gdn_output_count,
+                attention_count,
+                projection_programs,
+            ) = _enable_projection_banks(
+                model,
+                config,
+                gdn_output=gdn_output,
+                gdn_output_fraction=gdn_output_fraction,
+                gdn_max_layers=gdn_max_layers,
+                attention=attention,
+                attention_fraction=attention_fraction,
+                attention_max_layers=max_layers,
+            )
+            resident_programs += projection_programs
         model._omlx_ane_mlp_prefill_count = count
         model._omlx_ane_gdn_prefill_count = gdn_count
+        model._omlx_ane_gdn_output_prefill_count = gdn_output_count
+        model._omlx_ane_attention_prefill_count = attention_count
         model._omlx_ane_dual_prefill_count = dual_count
         model._omlx_ane_resident_program_count = resident_programs
         down_count = int(getattr(model, "_omlx_ane_down_prefill_count", 0))
-        model._omlx_ane_procedure_count = count + gdn_count + down_count
-        if count or gdn_count:
+        model._omlx_ane_procedure_count = (
+            count + gdn_count + gdn_output_count + attention_count + down_count
+        )
+        if count or gdn_count or gdn_output_count or attention_count:
             logger.info(
-                "Eagerly compiled %d MLP and %d GDN procedures into %d "
+                "Eagerly compiled %d MLP, %d GDN input, %d GDN output, and "
+                "%d attention procedures into %d "
                 "instance-pinned ANE programs (sequence_length=%d)",
                 count,
                 gdn_count,
+                gdn_output_count,
+                attention_count,
                 resident_programs,
                 sequence_length,
             )
@@ -2842,12 +3635,29 @@ def enable_qwen35_ane_prefill(
             _register_gdn_module(module)
             resident_programs += 2 if getattr(state, "model1", None) is not None else 1
             gdn_count += 1
+    gdn_output_count, attention_count, projection_programs = (
+        _enable_projection_banks(
+            model,
+            config,
+            gdn_output=gdn_output,
+            gdn_output_fraction=gdn_output_fraction,
+            gdn_max_layers=gdn_max_layers,
+            attention=attention,
+            attention_fraction=attention_fraction,
+            attention_max_layers=max_layers,
+        )
+    )
+    resident_programs += projection_programs
     model._omlx_ane_mlp_prefill_count = count
     model._omlx_ane_gdn_prefill_count = gdn_count
+    model._omlx_ane_gdn_output_prefill_count = gdn_output_count
+    model._omlx_ane_attention_prefill_count = attention_count
     model._omlx_ane_dual_prefill_count = dual_count
     model._omlx_ane_down_prefill_count = 0
     model._omlx_ane_resident_program_count = resident_programs
-    model._omlx_ane_procedure_count = count + gdn_count
+    model._omlx_ane_procedure_count = (
+        count + gdn_count + gdn_output_count + attention_count
+    )
 
     if count:
         logger.info(
@@ -2881,7 +3691,16 @@ def enable_qwen35_ane_prefill(
             gdn_fraction,
             dual_ane,
         )
-    if not count and not gdn_count:
+    if gdn_output_count or attention_count:
+        logger.info(
+            "Eagerly compiled and enabled ANE/GPU Qwen remaining projections "
+            "(%d GDN output, %d attention; output_fraction=%.3f/%.3f)",
+            gdn_output_count,
+            attention_count,
+            gdn_output_fraction,
+            attention_fraction,
+        )
+    if not count and not gdn_count and not gdn_output_count and not attention_count:
         logger.warning(
             "Qwen ANE prefill enabled but 0 procedures were compiled; "
             "the whole model runs prefill on GPU"
@@ -2894,11 +3713,19 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
     attempted = hasattr(model, "_omlx_ane_mlp_prefill_count")
     mlp = int(getattr(model, "_omlx_ane_mlp_prefill_count", 0) or 0)
     gdn = int(getattr(model, "_omlx_ane_gdn_prefill_count", 0) or 0)
+    gdn_output = int(
+        getattr(model, "_omlx_ane_gdn_output_prefill_count", 0) or 0
+    )
+    attention = int(
+        getattr(model, "_omlx_ane_attention_prefill_count", 0) or 0
+    )
     return {
         "attempted": attempted,
-        "configured": bool(mlp or gdn),
+        "configured": bool(mlp or gdn or gdn_output or attention),
         "mlp_layers": mlp,
         "gdn_layers": gdn,
+        "gdn_output_layers": gdn_output,
+        "attention_layers": attention,
         "dual_ane_layers": int(
             getattr(model, "_omlx_ane_dual_prefill_count", 0) or 0
         ),
