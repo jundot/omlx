@@ -38,6 +38,17 @@ case analysis).
 | `laguna_routed_nvfp4_swiglu_qmv_bf16_v2` | `lagunaRoutedSwiGLUQMVKernel` | ✅ within ~2 ulp |
 | `laguna_routed_nvfp4_down_reduce_bf16_v2` | `lagunaRoutedDownReduceKernel` | ✅ within ~2 ulp |
 | `laguna_full_qk_norm_yarn_bf16_128_v4` | `lagunaFullQKNormYaRNKernel` | ✅ ~1 bf16 step |
+| prefill QK-norm v2/h1 ×4, prefill sorted moe tail | batched prefill | ✅ |
+| decode router ordinal ×4, prefill router top8 ×2 / tournament-norm / tournament-ordinal ×2 | router variants | ✅ bit-exact |
+| shared/routed rows1 · halved · wide · packed · top8keys ×8 | r1/packed/scale-layout variants | ✅ ≤4 ulp |
+| `laguna_dense_gate_up_swiglu_bf16_v1`, `laguna_dense_down_residual_bf16_v1` | dense-MLP bf16 fusions | ✅ |
+| `laguna_decode_embedding_rope_atlas_bf16_2048_v2` | embedding + RoPE atlas | ✅ bit-exact |
+| `laguna_inject_empty_dispatch_v1`, `laguna_inject_dram_sweep_u4_v2` | harness timing probes | ✅ |
+| `laguna_full_fused_attn_grow_v1` | full-attn fused grow | ✅ fast-exp ULP |
+| `laguna_lmhead_int5_*` base/inline coarse + sparse refine | LM-head family | ✅ real-model validated |
+
+**All 46 challenge kernel names are present** (42 concrete kernel functions +
+4 macro-instantiated variants); 62 tests pass.
 | `laguna_sliding_qk_norm_rope_bf16_128_v1` | `lagunaSlidingQKNormRoPEKernel` | ✅ bit-exact |
 | `laguna_decode_nvfp4_qkv_h*_r1_v1_se1_sd1` | `lagunaDecodeNVFP4QKVR1Source` | ✅ bit-exact (h48/h64) |
 | `laguna_oproj_act_h*_v1_sc1_se1` | `lagunaGatedAffineOProjNVFP4Source` | ✅ bit-exact (h48/h64) |
@@ -62,11 +73,12 @@ pass. Real-model validation (Poolside 100k×2048 lm_head + a real hidden row):
 prune argmax == stock argmax, winner slot bf16-exact, zero non-winner slots
 above the winner — the prune's certified-bound contract.
 
-Not yet ported (documented follow-up): the prefill sorted moe_tail / qk_norm
-prefill variants, and the lane-major scale-bank variants of the QKV/o_proj
-kernels. These are prefill-adjacent or alternate scale-layout variants and do
-not change the decode hot path already covered. (The decode ordinal +
-prefill top8/tournament router variants ARE ported — see the table above.)
+Not ported (explicitly excluded): the NVFP4 attention re-quantization
+transform (`LagunaRuntimeWeights`), which converts the bf16 attention
+projections to NVFP4 — without it the decode QKV / o_proj / QK-norm kernels
+have no matching bank in omlx's stock bf16 attention path. Also not ported:
+the lane-major scale-bank variants of the QKV/o_proj kernels (alternate
+scale layout requiring the same transform).
 
 ## Correctness posture (important)
 
