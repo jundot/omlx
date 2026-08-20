@@ -158,6 +158,19 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "lm_head_int5_base_coarse",
+        &omlx::laguna_nvfp4::lm_head_int5_base_coarse,
+        "x"_a, "codes_base"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "lm_head_exact_sparse_refine",
+        &omlx::laguna_nvfp4::lm_head_exact_sparse_refine,
+        "coarse"_a, "delta"_a, "thr"_a, "lm_head"_a, "x"_a,
+        "codes_bit"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,

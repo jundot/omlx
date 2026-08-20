@@ -718,6 +718,32 @@ def test_full_fused_attn_grow_matches_reference():
     assert float(d.max()) <= 2e-3, f"full attn grow diverges: {float(d.max()):.4g}"
 
 
+def test_lm_head_base_coarse_runs():
+    """Nibble-only int5 base coarse pass dispatches and produces finite
+    coarse bounds."""
+    V, K = 2048, 2048
+    mx.random.seed(7)
+    w = mx.random.normal((V, K), scale=0.001).astype(mx.bfloat16)
+    wf = w.astype(mx.float32).reshape(V, K // 32, 32)
+    gmax = mx.abs(wf).max(axis=2)
+    gb = gmax.view(mx.uint32)
+    be = (gb >> 23).astype(mx.int32)
+    mant = gb & 0x7FFFFF
+    bump = (mant >= 0x780000).astype(mx.int32)
+    sd0 = mx.clip(be - 3 + bump, 0, 255)
+    sd = mx.where(sd0 == 0, mx.array(2.0**-127, mx.float32),
+                  (sd0.astype(mx.uint32) << 23).view(mx.float32))
+    q = (wf / sd[:, :, None]).round()
+    u = (q + 16).astype(mx.uint8).reshape(V, K)
+    base = u >> 1
+    u16 = base.view(mx.uint16)
+    lo = ((u16 & 0x000F) | ((u16 >> 4) & 0x00F0)).astype(mx.uint8)
+    x = mx.random.normal((K,), scale=0.1).astype(mx.bfloat16)
+    c, d = laguna_nvfp4.lm_head_int5_base_coarse(x, lo, sd0.astype(mx.uint8))
+    assert bool(mx.isfinite(c).all())
+    assert bool(mx.isfinite(d).all())
+
+
 @pytestmark_real
 def test_lm_head_prune_real_model():
     """The int5 prune pipeline on the REAL lm_head: the assembled argmax

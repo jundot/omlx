@@ -237,6 +237,17 @@ array full_fused_attn_grow(
     const array& k_cache, const array& v_cache, const array& params,
     const array& scale_arr, StreamOrDevice s = {});
 
+// Nibble-only int5 coarse pass. Returns {coarse, delta} [vocab].
+std::pair<array, array> lm_head_int5_base_coarse(
+    const array& x, const array& codes_base, const array& scales,
+    StreamOrDevice s = {});
+
+// Exact int5 sparse refine (verbatim). Returns [vocab] bf16 assembled.
+array lm_head_exact_sparse_refine(
+    const array& coarse, const array& delta, const array& thr,
+    const array& lm_head, const array& x, const array& codes_bit,
+    const array& scales, StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

@@ -709,6 +709,29 @@ def full_fused_attn_grow(
         "laguna_nvfp4 full_fused_attn_grow requires the native extension "
         "(the fused grow path has no pure-mlx equivalent).")
 
+
+def lm_head_int5_base_coarse(x, codes_base, scales, stream=None):
+    """Nibble-only int5 coarse pass (verbatim
+    laguna_lmhead_int5_base_coarse_delta_bf16_v1). Returns (coarse, delta)."""
+    if _ext is not None and has_symbol("lm_head_int5_base_coarse"):
+        return _ext.lm_head_int5_base_coarse(
+            x, codes_base, scales, stream=stream)
+    raise RuntimeError(
+        "laguna_nvfp4 lm_head_int5_base_coarse requires the native extension.")
+
+
+def lm_head_exact_sparse_refine(
+    coarse, delta, thr, lm_head, x, codes_bit, scales, stream=None,
+):
+    """Exact int5 sparse refine (verbatim
+    laguna_lmhead_exact_fused_int5_sparse_refine_v1). Returns [vocab] bf16."""
+    if _ext is not None and has_symbol("lm_head_exact_sparse_refine"):
+        return _ext.lm_head_exact_sparse_refine(
+            coarse, delta, thr, lm_head, x, codes_bit, scales, stream=stream)
+    raise RuntimeError(
+        "laguna_nvfp4 lm_head_exact_sparse_refine requires the native "
+        "extension.")
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

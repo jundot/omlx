@@ -1357,7 +1357,7 @@ class LmCoarsePrimitive : public Primitive {
         auto& s = stream();
         auto& d = metal::device(s.device);
         for (auto& out : outputs) out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-        auto kernel = get_laguna_kernel(d, "laguna_lmhead_int5_coarse_ratio_bound_delta_bf16_v6");
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_int5_inline_coarse_ratio_bound_delta_bf16_v6");
         auto& enc = metal::get_command_encoder(s);
         enc.set_compute_pipeline_state(kernel);
         int c = 0;
@@ -1646,6 +1646,83 @@ array full_fused_attn_grow(
     return array(o, bfloat16, prim,
                  {raw_queries, raw_keys, raw_values, query_weight, key_weight,
                   angles, k_cache, v_cache, params, scale_arr});
+}
+
+// LmBaseCoarsePrimitive: nibble-only int5 coarse pass.
+class LmBaseCoarsePrimitive : public Primitive {
+ public:
+    explicit LmBaseCoarsePrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 LmBaseCoarsePrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_int5_base_coarse_delta_bf16_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        for (auto& out : outputs) enc.set_output_array(out, c++);
+        int vocab = static_cast<int>(inputs[1].shape(0));
+        MTL::Size group_dims(512, 1, 1);
+        MTL::Size grid_dims(vocab / 16, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(LmBaseCoarsePrimitive)
+};
+
+std::pair<array, array> lm_head_int5_base_coarse(
+    const array& x, const array& codes_base, const array& scales,
+    StreamOrDevice s) {
+    int vocab = static_cast<int>(codes_base.shape(0));
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<LmBaseCoarsePrimitive>(s_stream);
+    Shape cv{vocab};
+    auto outs = array::make_arrays(
+        {cv, cv}, {float32, bfloat16}, prim, {x, codes_base, scales});
+    return {outs[0], outs[1]};
+}
+
+// LmSparseRefinePrimitive: exact int5 sparse refine.
+class LmSparseRefinePrimitive : public Primitive {
+ public:
+    explicit LmSparseRefinePrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 LmSparseRefinePrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_lmhead_exact_fused_int5_sparse_refine_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        enc.set_output_array(out, c++);
+        int vocab = static_cast<int>(inputs[5].shape(0));
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(vocab / 32, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(LmSparseRefinePrimitive)
+};
+
+array lm_head_exact_sparse_refine(
+    const array& coarse, const array& delta, const array& thr,
+    const array& lm_head, const array& x, const array& codes_bit,
+    const array& scales, StreamOrDevice s) {
+    int vocab = static_cast<int>(coarse.shape(0));
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<LmSparseRefinePrimitive>(s_stream);
+    Shape av{vocab};
+    return array(av, bfloat16, prim,
+                 {coarse, delta, thr, lm_head, x, codes_bit, scales});
 }
 
 int64_t abi_probe(const array& a) {
