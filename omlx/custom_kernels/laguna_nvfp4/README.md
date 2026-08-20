@@ -47,14 +47,23 @@ case analysis).
 | `laguna_residual_rms_router_bf16_2048_rpg8` | `lagunaResidualRMSNormRouterSource(8)` | ✅ bit-exact (4 outputs) |
 | `laguna_prefill_moe_tail_bf16_v1` | `lagunaPrefillMoETailKernel` | ✅ bit-exact |
 | `laguna_prefill_router_tournament_v1` | `lagunaPrefillRouterTournamentKernelSource` | ✅ bit-exact |
+| `laguna_lmhead_int5_coarse_*` + argmax stage1 + exact-winner + inline exact (`lm_head_prune`) | `LagunaLmHeadPrune.swift` family | ✅ real-model validated |
 
-Not yet ported (documented follow-up): the LM-head prune family
-(`LagunaLmHeadPrune.swift` — coarse int5 argmax + exact-winner threshold +
-sparse refine; requires the challenge's int5 checkpoint transform omlx does
-not produce), the prefill router top8 / sorted moe_tail / qk_norm prefill
-variants, the decode ordinal/tournament router variants, and the lane-major
-scale-bank variants of the QKV/o_proj kernels. These are draft-side or
-prefill-adjacent and do not change the decode hot path already covered.
+## LM-head int5 prune
+
+The `lm_head_prune` op fuses the challenge's 4-kernel pipeline over the int5
+planes built by `build_int5_planes` (the nibble/bit-plane + e8m0 scale
+transform with the `|q| <= 15` init certificate): coarse+delta pass, argmax
+stage-1, exact-winner bf16-predecessor-midpoint threshold, inline-mask exact
+pass. Real-model validation (Poolside 100k×2048 lm_head + a real hidden row):
+prune argmax == stock argmax, winner slot bf16-exact, zero non-winner slots
+above the winner — the prune's certified-bound contract.
+
+Not yet ported (documented follow-up): the prefill router top8 / sorted
+moe_tail / qk_norm prefill variants, the decode ordinal/tournament router
+variants, and the lane-major scale-bank variants of the QKV/o_proj kernels.
+These are prefill-adjacent or alternate scale-layout variants and do not
+change the decode hot path already covered.
 
 ## Correctness posture (important)
 
