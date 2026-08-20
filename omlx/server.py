@@ -62,6 +62,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
 
+from . import step_profile
 from .api.anthropic_models import (
     MessagesRequest as AnthropicMessagesRequest,
 )
@@ -4695,6 +4696,10 @@ async def stream_chat_completion(
             stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            # sse.emit: token arrival to the consumer taking the serialized
+            # chunks — parser feeds, pydantic construction, JSON encode, and
+            # the yield round-trip. The awaited engine gap stays out.
+            _sp_sse = step_profile.tick()
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -4742,6 +4747,7 @@ async def stream_chat_completion(
                             ],
                         )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            step_profile.add_since("sse.emit", _sp_sse)
     except Exception as e:
         logger.error(f"Error during chat streaming: {e}")
         error_data = {"error": {"message": str(e), "type": "server_error"}}
@@ -6689,6 +6695,10 @@ async def stream_responses_api(
 
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            # sse.emit: token arrival to the consumer taking the serialized
+            # chunks — parser feeds, pydantic construction, JSON encode, and
+            # the yield round-trip. The awaited engine gap stays out.
+            _sp_sse = step_profile.tick()
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -6725,6 +6735,7 @@ async def stream_responses_api(
                                 "sequence_number": seq,
                             },
                         )
+            step_profile.add_since("sse.emit", _sp_sse)
     except Exception as e:
         logger.error(f"Error during Responses API streaming: {e}")
         seq += 1

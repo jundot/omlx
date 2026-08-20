@@ -199,6 +199,12 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 
 Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
 
+### Diagnostics & Tuning Environment Variables
+
+- `OMLX_STEP_PROFILE=1` — log a periodic wall-time profile of the serving
+  hot path (decode, prefill, scheduling, cache bookkeeping, SSE emission)
+  as one summary line per window; `OMLX_STEP_PROFILE_EVERY=N` sets the
+  window length in scheduler steps (default 500). No overhead when unset.
 ### Claude Code Optimization
 
 Context scaling support for running smaller context models with Claude Code. Scales reported token counts so that auto-compact triggers at the right timing, and SSE keep-alive prevents read timeouts during long prefill.

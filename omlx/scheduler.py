@@ -47,6 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
+from . import step_profile
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -9689,7 +9690,9 @@ class Scheduler:
             self._clear_store_cache_admission_blocker(request.request_id)
 
             # Ensure we have a batch generator
+            _sp_gen = step_profile.tick()
             self._ensure_batch_generator(request.sampling_params)
+            step_profile.add_since("sched.ensure_generator", _sp_gen)
 
             if self.batch_generator is None:
                 # Put back and try again later
@@ -9705,8 +9708,10 @@ class Scheduler:
             # MLX_METAL_FAST_SYNCH=1 while the async store-cache worker keeps
             # gpu,0 busy — the #2330 twin-prefill hang. Same class as the
             # #2183/#2197 chunk-view and #2235 batch-KV-mutation fixes.
+            _sp_pfx = step_profile.tick()
             with mx.stream(self._stream):
                 self._prepare_prefix_cache_for_request(request)
+            step_profile.add_since("sched.prefix_cache", _sp_pfx)
 
             # Determine tokens to process and cache to use
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
@@ -10287,6 +10292,9 @@ class Scheduler:
             # lazy ops; keep them on the engine stream so the next decode
             # step's eval graph stays single-stream (#2235, see
             # _remove_uid_from_active_batch).
+            # This insert runs the whole prefill forward for non-chunked
+            # prompts — bucket it as prefill, not scheduler accounting.
+            _sp_insert = step_profile.tick()
             with mx.stream(self._stream):
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
@@ -10297,6 +10305,7 @@ class Scheduler:
                     logits_processors=[per_row_lps],
                     state_machines=[sm],
                 )
+            step_profile.add_since("step.prefill", _sp_insert)
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
@@ -11471,6 +11480,15 @@ class Scheduler:
                 self._decode_activity_key, len(self.running)
             )
 
+        _sp_pre = step_profile.tick()
+        if _sp_pre and self.running:
+            # Wall time between consecutive steps while decode is active:
+            # engine-loop sleeps, asyncio handoff, stream glue — everything
+            # the in-step buckets cannot see.
+            _sp_prev_end = getattr(self, "_sp_prev_step_end", None)
+            if _sp_prev_end is not None:
+                step_profile.add("step.gap", _sp_pre - _sp_prev_end)
+
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
 
@@ -11489,6 +11507,8 @@ class Scheduler:
         if self.memory_monitor is not None:
             self._check_memory_pressure()
 
+        step_profile.add_since("step.pre", _sp_pre)
+
         try:
             # Advance in-flight chunked prefills (one chunk per request).
             # Must run before _schedule_waiting() so that completing prefills
@@ -11499,12 +11519,16 @@ class Scheduler:
             if self.prefilling:
                 prefill_gate_open = self._prefill_gate_open()
                 if prefill_gate_open:
+                    _sp_prefill = step_profile.tick()
                     self._advance_chunked_prefills(
                         chunked_scheduled, chunked_rejected
                     )
+                    step_profile.add_since("step.prefill", _sp_prefill)
 
             # Schedule waiting requests
+            _sp_sched = step_profile.tick()
             scheduled, rejected = self._schedule_waiting()
+            step_profile.add_since("step.schedule", _sp_sched)
             # Merge chunked-prefill completions into the scheduled list.
             if chunked_scheduled:
                 scheduled = chunked_scheduled + scheduled
@@ -11547,12 +11571,15 @@ class Scheduler:
                 if self._vlm_mtp_active:
                     responses.extend(self._step_vlm_mtp())
                 _decode_dt = time.perf_counter() - _t_decode_start
+                step_profile.add("step.decode", _decode_dt)
                 self._repay_decode_debt(_decode_dt)
                 self._sample_decode_rate(len(responses), _decode_dt)
                 output.has_work = True
 
                 if responses:
+                    _sp_post = step_profile.tick()
                     outputs, finished_ids = self._process_batch_responses(responses)
+                    step_profile.add_since("step.postprocess", _sp_post)
                     output.outputs.extend(outputs)
                     output.finished_request_ids.update(finished_ids)
 
@@ -11579,7 +11606,9 @@ class Scheduler:
                         )
                         self._tokens_since_kv_cache_eval = 0
 
+                    _sp_cleanup = step_profile.tick()
                     self._cleanup_finished(finished_ids)
+                    step_profile.add_since("step.cache_cleanup", _sp_cleanup)
 
                     # Periodic Metal allocator cleanup during long decodes.
                     # mx.random.categorical inside the sampler allocates a
@@ -11695,6 +11724,9 @@ class Scheduler:
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
+        if step_profile.enabled():
+            self._sp_prev_step_end = time.perf_counter()
+        step_profile.maybe_log(self._step_counter)
         should_clear = self._should_periodic_clear_cache()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
