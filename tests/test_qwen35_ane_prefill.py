@@ -558,6 +558,7 @@ def test_cpu_shared_resource_scheduler_is_capability_guarded(
 
 
 def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     mlp = _MLP()
     linear = mlp.down_proj
     linear.scales = linear.scales.astype(mx.float16)
@@ -2165,3 +2166,121 @@ def test_enable_env_kill_switch_wins(monkeypatch):
 
     assert count == 0
     assert installed == []
+
+
+def test_prefill_status_reports_configured_layers():
+    model = SimpleNamespace(
+        _omlx_ane_mlp_prefill_count=12,
+        _omlx_ane_gdn_prefill_count=4,
+        _omlx_ane_dual_prefill_count=8,
+        _omlx_ane_resident_program_count=24,
+    )
+    assert ane_patch.qwen35_ane_prefill_status(model) == {
+        "attempted": True,
+        "configured": True,
+        "mlp_layers": 12,
+        "gdn_layers": 4,
+        "dual_ane_layers": 8,
+        "resident_programs": 24,
+    }
+
+
+def test_prefill_status_flags_attempted_but_empty():
+    model = SimpleNamespace(
+        _omlx_ane_mlp_prefill_count=0,
+        _omlx_ane_gdn_prefill_count=0,
+        _omlx_ane_dual_prefill_count=0,
+        _omlx_ane_resident_program_count=0,
+    )
+    status = ane_patch.qwen35_ane_prefill_status(model)
+    assert status["attempted"] is True
+    assert status["configured"] is False
+
+
+def test_prefill_status_safe_on_untouched_model():
+    status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
+    assert status["attempted"] is False
+    assert status["configured"] is False
+    assert status["mlp_layers"] == 0
+
+
+def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(
+        ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
+    )
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+
+    model = SimpleNamespace(modules=lambda: [])
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(model)
+
+    assert count == 0
+    assert "no eligible MLP layers found" in caplog.text
+    assert ane_patch.qwen35_ane_prefill_status(model)["attempted"] is True
+
+
+def test_bank_prepare_keeps_packed_q6_suffix():
+    gdn = _make_affine_gdn(6, 128)
+    config = ane_patch._AneGDNConfig(2048, 0.5, 8, True)
+    packed = ane_patch._pack_affine_gdn_suffix(
+        gdn.in_proj_qkv, gdn.in_proj_b, gdn.in_proj_a, 0, (6, 128)
+    )
+    assert packed is not None
+    expected_weight, expected_scales, expected_biases, b_outputs, a_outputs = packed
+
+    prepared = ane_patch._prepare_gdn_for_bank(gdn, config)
+    assert prepared is not None
+    state, _dense0, dense1 = prepared
+    assert (state.b_outputs, state.a_outputs) == (b_outputs, a_outputs)
+    assert state.weight.shape == expected_weight.shape
+    assert bool(mx.array_equal(state.weight, expected_weight))
+    assert bool(mx.array_equal(state.scales, expected_scales))
+    assert bool(mx.array_equal(state.biases, expected_biases))
+    assert dense1 is not None
+
+
+def test_enable_survives_warmup_failure(monkeypatch, caplog):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    class _FailingModel:
+        def warmup(self):
+            raise RuntimeError("ANE evaluation failed")
+
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda weights, sequence_length, ane_instance: [
+            _FailingModel() for _ in weights
+        ],
+    )
+    model = _Model(2)
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=2,
+            dual_ane=True,
+        )
+
+    assert count == 2
+    assert "ANE warmup failed" in caplog.text
+
+
+def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
+    linear = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.float16)
+    linear.biases = linear.biases.astype(mx.float16)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    assert ane_patch._prepare_cpu_linear(linear, 0.25) is None
+
+    monkeypatch.setattr(
+        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
+    )
+    assert ane_patch._prepare_cpu_linear(linear, 0.25) is not None

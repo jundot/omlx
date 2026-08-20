@@ -779,11 +779,7 @@
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
-                                                            :disabled="!modelSettings.qwen35_ane_prefill_dual_ane"
-                                                            :class="[
-                                                                modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                                !modelSettings.qwen35_ane_prefill_dual_ane ? 'opacity-40 cursor-not-allowed' : ''
-                                                            ]"
+                                                            :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                         <span :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1149,7 +1145,7 @@
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
-                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16, z-lab/gemma-4-26B-A4B-it-DFlash, poolside/Laguna-S-2.1-DFlash-NVFP4). Note: -DFlash suffix only; -assistant variants are for MTP.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16, z-lab/gemma-4-26B-A4B-it-DFlash, z-lab/Qwen3.8-27B-DFlash2, poolside/Laguna-S-2.1-DFlash-NVFP4). Note: -DFlash / -DFlash2 suffix; -assistant variants are for MTP.</p>
                                         </div>
                                         <div class="bg-neutral-50 rounded-xl">
                                             <div class="flex items-start justify-between gap-3">

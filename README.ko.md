@@ -90,7 +90,7 @@ pip install -e ".[mcp]"   # MCP (Model Context Protocol) 포함
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
+Python 3.10+와 Apple Silicon (M1/M2/M3/M4/M5)이 필요합니다.
 
 ## 빠른 시작
 

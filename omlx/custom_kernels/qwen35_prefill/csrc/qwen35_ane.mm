@@ -913,6 +913,27 @@ public:
     }
   }
 
+  void warmup() {
+    AneLinearModel::Ticket ticket{};
+    {
+      std::unique_lock<std::mutex> lock(state_mutex_);
+      completion_cv_.wait(lock, [this] { return submitted_ == completed_; });
+      if (!completion_error_.empty()) {
+        throw std::runtime_error("Prior ANE evaluation failed: " +
+                                 completion_error_);
+      }
+      ticket.ready = next_event_value_++;
+      ticket.done = next_event_value_++;
+      ++submitted_;
+    }
+    // Host-side ready signal: there is no producer command buffer, the
+    // input surface holds whatever it holds. evaluate_and_signal's readiness
+    // spin-wait passes immediately and the evaluation result is discarded.
+    [event_ setSignaledValue:ticket.ready];
+    evaluate_and_signal(ticket);
+    wait(ticket);
+  }
+
   int input_dim_;
   int output_dim_;
   int sequence_length_;
@@ -959,6 +980,11 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 }
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
+}
+void AneLinearModel::warmup() {
+  @autoreleasepool {
+    impl_->warmup();
+  }
 }
 void AneLinearModel::end(MTL::CommandBuffer *command_buffer,
                          AneLinearModel::Ticket ticket) {
@@ -1403,10 +1429,12 @@ using DispatchApplyAttrSetParallelismFn = void (*)(DispatchApplyAttrStorage *,
 using DispatchApplyWithAttrFn = void (*)(size_t, DispatchApplyAttrStorage *,
                                          void (^)(size_t));
 
-// Request one worker per CPU cluster. This is the public libdispatch
-// equivalent of the shared-cluster scheduling policy used by the former
-// __bsdthread_ctl implementation. The number of requested work shards is
-// still supplied as the iteration count to dispatch_apply_with_attr.
+// Request one worker per CPU cluster. dispatch_apply_attr is libdispatch SPI
+// (private/apply_private.h, not shipped in the public SDK), which is why it is
+// resolved through dlsym; DISPATCH_APPLY_ATTR_ENTITY_CLUSTER = 2 and the only
+// value libdispatch accepts for threads_per_entity is 1, anything else traps.
+// The number of requested work shards is still supplied as the iteration
+// count to dispatch_apply_with_attr.
 constexpr DispatchApplyAttrEntity kDispatchApplyAttrEntityCluster = 2;
 constexpr size_t kDispatchApplyThreadsPerCluster = 1;
 

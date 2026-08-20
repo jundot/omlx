@@ -11,6 +11,7 @@ The mixed-cache method follows the proposed upstream follow-up in
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +22,106 @@ from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU
+from mlx_lm.models.switch_layers import (
+    QuantizedSwitchLinear,
+    SwitchGLU,
+)
+
+# Compiled ``mx.compile(shapeless=True)`` fusions, ported from the Swift
+# challenge's ``lagunaCompiled*`` closures. Each body is the IDENTICAL
+# expression tree the eager code builds (same ops, same order, no
+# reassociation; compile only fuses elementwise ops, never reductions), so
+# every output is bit-exact against the uncompiled path, but the elementwise
+# tail is lowered once instead of rebuilt on every decode step. Set
+# OMLX_LAGUNA_COMPILED_FUSIONS=0 to disable.
+_COMPILED_FUSIONS = os.environ.get("OMLX_LAGUNA_COMPILED_FUSIONS", "1") != "0"
+
+
+def _compiled_softplus_gate(gate: mx.array) -> mx.array:
+    """Softplus output gate computed in float32, cast back to the input dtype."""
+    return nn.softplus(gate.astype(mx.float32)).astype(gate.dtype)
+
+
+def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
+    """SiLU(gate) * up (single-output, elementwise -> bit-exact when compiled)."""
+    return swiglu(gate, up)
+
+
+def _compiled_topk_normalize(weights: mx.array) -> mx.array:
+    """Top-k mixture-weight renormalization (``weights / sum(weights)``)."""
+    return weights / mx.sum(weights, axis=-1, keepdims=True)
+
+
+if _COMPILED_FUSIONS:
+    _compiled_softplus_gate = mx.compile(_compiled_softplus_gate, shapeless=True)
+    _compiled_topk_normalize = mx.compile(_compiled_topk_normalize, shapeless=True)
+    _swiglu = mx.compile(_swiglu, shapeless=True)
+
+
+def _make_compiled_expert_combine(scale: float):
+    """Weighted routed-expert reduction, routed scale, and shared-expert add."""
+
+    def _combine(y: mx.array, weights: mx.array, shared: mx.array) -> mx.array:
+        routed = mx.sum(y * weights[..., None], axis=-2)
+        return routed * scale + shared
+
+    return mx.compile(_combine, shapeless=True)
+
+
+def _make_compiled_expert_combine_residual(scale: float):
+    """Weighted reduction, scale, shared-expert add, and the decoder residual.
+
+    ``residual + (routed * scale + shared)`` is bit-exact against the eager
+    ``h + (routed*scale + shared)`` composed in the decoder layer, because IEEE
+    addition is commutative (the two adds have identical operands).
+    """
+
+    def _combine(
+        y: mx.array, weights: mx.array, shared: mx.array, residual: mx.array
+    ) -> mx.array:
+        routed = mx.sum(y * weights[..., None], axis=-2)
+        return residual + (routed * scale + shared)
+
+    return mx.compile(_combine, shapeless=True)
+
+
+# One compiled weighted-expert combine per routed-scaling value, shared across
+# every sparse block (the real checkpoint uses a single 2.5 factor).
+_COMPILED_COMBINES: dict[float, Any] = {}
+_COMPILED_COMBINES_RESIDUAL: dict[float, Any] = {}
+
+
+def _compiled_combine_for(scale: float):
+    combine = _COMPILED_COMBINES.get(scale)
+    if combine is None:
+        combine = _COMPILED_COMBINES[scale] = _make_compiled_expert_combine(scale)
+    return combine
+
+
+def _compiled_combine_residual_for(scale: float):
+    combine = _COMPILED_COMBINES_RESIDUAL.get(scale)
+    if combine is None:
+        combine = _COMPILED_COMBINES_RESIDUAL[scale] = (
+            _make_compiled_expert_combine_residual(scale)
+        )
+    return combine
+
+# DECODE-ONLY routed gate/up fusion (Swift ``DARKBLOOM_FUSED_ROUTED_GATE_UP``):
+# after load, retain a row-concatenated NVFP4 ``[gate; up]`` bank per sparse
+# layer and serve single-token decode's gate/up from ONE gather-QMM instead of
+# two. Bit-exact vs. the separate dispatches (each gathered output row keeps
+# its own K-loop), and correct (verified against the stock path on both a
+# synthetic model and the real 21.6 GB NVFP4 checkpoint), but it DEFAULTs OFF:
+# on the current MLX version two 512-wide gathers beat one 1024-wide gather, so
+# the fusion regresses single-token decode (~13% slower per sparse block) and
+# must stay opt-in until a wider gather-QMM kernel or layout makes it a win.
+_FUSED_ROUTED_GATE_UP = os.environ.get("OMLX_LAGUNA_FUSED_ROUTED_GATE_UP", "0") != "0"
+
+# Shared-expert gate/up fusion (Swift ``DARKBLOOM_FUSED_SHARED_GATE_UP``): one
+# NVFP4 quantized matmul over a row-concatenated ``[gate; up]`` bank instead of
+# two. Bit-exact but "unproven in ablation" in the Swift baseline, and measured
+# -2.3% decode here, so it also defaults OFF until a measured win exists.
+_FUSED_SHARED_GATE_UP = os.environ.get("OMLX_LAGUNA_FUSED_SHARED_GATE_UP", "0") != "0"
 
 
 @dataclass
@@ -175,14 +275,82 @@ def _rope_dims(args: ModelArgs, rope_config: dict[str, Any]) -> int:
 
 
 class MLP(nn.Module):
+    """Dense MLP, also used as the sparse block's shared expert.
+
+    When gate/up are NVFP4 group-16 4-bit ``QuantizedLinear`` banks and
+    ``OMLX_LAGUNA_FUSED_SHARED_GATE_UP=1``, the shared-expert projection serves
+    gate and up from ONE quantized matmul over a row-concatenated ``[gate; up]``
+    bank (mirrors the Swift challenge's ``DARKBLOOM_FUSED_SHARED_GATE_UP``,
+    opt-in there too). Bit-exact vs the separate dispatches; the dense BF16
+    layer-0 MLP never fuses.
+    """
+
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self._fused_gateup_weight: mx.array | None = None
+        self._fused_gateup_scales: mx.array | None = None
+        self._fused_gateup_split: int = 0
+        self._fusion_ready: bool | None = None
+
+    def _prepare_fused_gate_up(self) -> bool:
+        """Build the fused shared-expert NVFP4 ``[gate; up]`` bank."""
+        if self._fusion_ready is not None:
+            return self._fusion_ready
+        gate = self.gate_proj
+        up = self.up_proj
+
+        def _nvfp4_pair(module: Any) -> bool:
+            return (
+                isinstance(module, nn.QuantizedLinear)
+                and module.mode == "nvfp4"
+                and module.group_size == 16
+                and module.bits == 4
+                and module.get("bias") is None
+                and module.get("biases") is None
+                and module.weight.ndim == 2
+                and module.weight.dtype == mx.uint32
+                and module.scales.ndim == 2
+                and module.scales.dtype == mx.uint8
+            )
+
+        ready = (
+            _nvfp4_pair(gate)
+            and _nvfp4_pair(up)
+            and gate.weight.shape == up.weight.shape
+            and gate.scales.shape == up.scales.shape
+            and gate.scales.shape[0] == gate.weight.shape[0]
+            and gate.weight.shape[1] * 8 == gate.scales.shape[1] * 16
+        )
+        if ready:
+            self._fused_gateup_weight = mx.concatenate([gate.weight, up.weight], axis=0)
+            self._fused_gateup_scales = mx.concatenate([gate.scales, up.scales], axis=0)
+            self._fused_gateup_split = gate.weight.shape[0]
+        self._fusion_ready = ready
+        return ready
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        if (
+            _FUSED_SHARED_GATE_UP
+            and self._prepare_fused_gate_up()
+        ):
+            gate_up = mx.quantized_matmul(
+                x,
+                self._fused_gateup_weight,
+                self._fused_gateup_scales,
+                None,
+                transpose=True,
+                group_size=16,
+                bits=4,
+                mode="nvfp4",
+            )
+            split = self._fused_gateup_split
+            return self.down_proj(
+                _swiglu(gate_up[..., :split], gate_up[..., split:])
+            )
+        return self.down_proj(_swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class LagunaTopKRouter(nn.Module):
@@ -207,13 +375,24 @@ class LagunaTopKRouter(nn.Module):
         # weights selected expert outputs using the original router scores.
         corrected_scores = scores + self.e_score_correction_bias.astype(scores.dtype)
 
+        # NOTE (correctness, challenge commit f8848e0): the Swift challenge
+        # compiles this router tail (``lagunaCompiledRouterTail``: two outputs
+        # consuming the same sigmoid intermediate) into one kernel. In Python
+        # MLX 0.32 a two-output compiled function with a shared intermediate is
+        # bit-exact on some Apple GPUs and ULP-divergent on others. This feeds
+        # argpartition expert selection, so it stays eager for portable token
+        # exactness (see docs/laguna-mlxfast-port-correctness.md C1). Only the
+        # single-output top-k renormalization below is compiled.
         k = self.top_k
         inds = mx.stop_gradient(
             mx.argpartition(-corrected_scores, kth=k - 1, axis=-1)[..., :k]
         )
         weights = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob:
-            weights = weights / mx.sum(weights, axis=-1, keepdims=True)
+            if _COMPILED_FUSIONS:
+                weights = _compiled_topk_normalize(weights)
+            else:
+                weights = weights / mx.sum(weights, axis=-1, keepdims=True)
         return inds, weights.astype(dtype)
 
 
@@ -230,14 +409,115 @@ class LagunaSparseMoeBlock(nn.Module):
             args.hidden_size, args.moe_intermediate_size, args.num_experts
         )
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
+        # Fused [gate; up] NVFP4 decode bank (built lazily; see
+        # ``_prepare_fused_gate_up``). Leading-underscore plain attributes so
+        # Module reflection never treats them as checkpoint parameters.
+        self._fused_gateup_weight: mx.array | None = None
+        self._fused_gateup_scales: mx.array | None = None
+        self._fused_gateup_split: int = 0
+        self._routed_down_proj: Any | None = None
+        self._fusion_ready: bool | None = None
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def _prepare_fused_gate_up(self) -> bool:
+        """Build and retain the fused routed gate/up NVFP4 bank.
+
+        Fuses only the exact stock sparse-layer configuration: two bias-free
+        NVFP4 group-16 4-bit ``QuantizedSwitchLinear`` banks with identical
+        packed shapes. On any mismatch (unquantized modules, a non-NVFP4
+        mode, biases, unequal shapes) the block permanently falls back to the
+        stock separate-bank path.
+        """
+        if self._fusion_ready is not None:
+            return self._fusion_ready
+        gate = self.switch_mlp.gate_proj
+        up = self.switch_mlp.up_proj
+        down = self.switch_mlp.down_proj
+
+        def _nvfp4_pair(module: Any) -> bool:
+            return (
+                isinstance(module, QuantizedSwitchLinear)
+                and module.mode == "nvfp4"
+                and module.group_size == 16
+                and module.bits == 4
+                and module.get("bias") is None
+                and module.get("biases") is None
+                and module.weight.ndim == 3
+                and module.weight.dtype == mx.uint32
+                and module.scales.dtype == mx.uint8
+            )
+
+        ready = (
+            _nvfp4_pair(gate)
+            and _nvfp4_pair(up)
+            and gate.weight.shape == up.weight.shape
+            and gate.scales.shape == up.scales.shape
+            and gate.scales.shape[0] == gate.weight.shape[0]
+            and gate.scales.shape[1] == gate.weight.shape[1]
+            and gate.weight.shape[2] * 8 == gate.scales.shape[2] * 16
+        )
+        if ready:
+            self._fused_gateup_weight = mx.concatenate([gate.weight, up.weight], axis=1)
+            self._fused_gateup_scales = mx.concatenate([gate.scales, up.scales], axis=1)
+            self._fused_gateup_split = gate.weight.shape[1]
+            self._routed_down_proj = down
+        self._fusion_ready = ready
+        return ready
+
+    def _moe_fused_forward(self, x: mx.array, inds: mx.array) -> mx.array:
+        """Single-token gather-QMM over the fused [gate; up] NVFP4 bank.
+
+        Mirrors ``SwitchGLU``'s unsorted small-batch path exactly (no
+        gather-sort), but with one gather over the row-concatenated bank
+        instead of two. ``down_proj`` is the stock module invoked the same way
+        ``SwitchGLU`` does.
+        """
+        expanded = mx.expand_dims(x, (-2, -3))
+        gate_up = mx.gather_qmm(
+            expanded,
+            self._fused_gateup_weight,
+            self._fused_gateup_scales,
+            None,
+            rhs_indices=inds,
+            transpose=True,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+            sorted_indices=False,
+        )
+        split = self._fused_gateup_split
+        x_gate = gate_up[..., :split]
+        x_up = gate_up[..., split:]
+        return self._routed_down_proj(
+            _swiglu(x_gate, x_up), inds, sorted_indices=False
+        ).squeeze(-2)
+
+    def __call__(
+        self, x: mx.array, residual: mx.array | None = None
+    ) -> mx.array:
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
+        if (
+            _FUSED_ROUTED_GATE_UP
+            and x.shape[1] == 1
+            and inds.size < 64
+            and self._prepare_fused_gate_up()
+        ):
+            y = self._moe_fused_forward(x, inds)
+        else:
+            y = self.switch_mlp(x, inds)
+        if _COMPILED_FUSIONS:
+            shared = self.shared_expert(x)
+            if residual is not None:
+                return _compiled_combine_residual_for(self.routed_scaling_factor)(
+                    y, scores, shared, residual
+                )
+            return _compiled_combine_for(self.routed_scaling_factor)(
+                y, scores, shared
+            )
         y = mx.sum(y * scores[..., None], axis=-2)
         if self.routed_scaling_factor != 1.0:
             y = y * self.routed_scaling_factor
-        return y + self.shared_expert(x)
+        moe = y + self.shared_expert(x)
+        return residual + moe if residual is not None else moe
 
 
 class Attention(nn.Module):
@@ -352,7 +632,12 @@ class Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
 
         if self.gating:
-            gate = nn.softplus(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
+            if _COMPILED_FUSIONS:
+                gate = _compiled_softplus_gate(self.g_proj(x))
+            else:
+                gate = nn.softplus(self.g_proj(x).astype(mx.float32)).astype(
+                    output.dtype
+                )
             if self.gate_per_head:
                 shape = output.shape
                 output = (
@@ -403,8 +688,11 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        mlp_input = self.post_attention_layernorm(h)
+        if isinstance(self.mlp, LagunaSparseMoeBlock):
+            # Fold the decoder residual add into the (compiled) sparse combine.
+            return self.mlp(mlp_input, residual=h)
+        return h + self.mlp(mlp_input)
 
 
 class LagunaModel(nn.Module):

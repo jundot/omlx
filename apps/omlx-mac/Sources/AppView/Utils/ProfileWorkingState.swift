@@ -144,6 +144,7 @@ enum ProfileSettingsKey {
     static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"
     static let qwen35AnePrefillSequenceLength = "qwen35_ane_prefill_sequence_length"
     static let qwen35AnePrefillFraction = "qwen35_ane_prefill_fraction"
+    static let qwen35AnePrefillFusedDown = "qwen35_ane_prefill_fused_down"
     static let qwen35AnePrefillMaxLayers = "qwen35_ane_prefill_max_layers"
     static let qwen35AnePrefillDualAne = "qwen35_ane_prefill_dual_ane"
     static let qwen35AnePrefillGdn = "qwen35_ane_prefill_gdn"

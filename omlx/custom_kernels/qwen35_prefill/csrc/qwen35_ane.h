@@ -38,6 +38,10 @@ public:
   Ticket begin(MTL::CommandBuffer *command_buffer);
   void execute(Ticket ticket);
   void wait(Ticket ticket);
+  // Run one throwaway evaluation to pay the first-run compilation cost at
+  // load time instead of inside the first user request. Input contents are
+  // irrelevant; the output is discarded.
+  void warmup();
   void end(MTL::CommandBuffer *command_buffer, Ticket ticket);
 
 private:

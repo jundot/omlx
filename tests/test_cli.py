@@ -869,6 +869,45 @@ class TestLaunchCommandFunction:
 class TestLaunchArgvParsing:
     """Tests for top-level argv parsing of `omlx launch ...`."""
 
+    def test_launch_removes_forwarding_separator_after_known_option(self, monkeypatch):
+        """The oMLX separator must not reach the launched tool."""
+        from omlx import cli
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "omlx",
+                "launch",
+                "claude",
+                "--cross-session",
+                "--",
+                "--allow-dangerously-skip-permissions",
+            ],
+        )
+        with patch.object(cli, "launch_command") as launch:
+            cli.main()
+
+        args = launch.call_args.args[0]
+        assert args.cross_session is True
+        assert launch.call_args.kwargs["extra_args"] == [
+            "--allow-dangerously-skip-permissions"
+        ]
+
+    def test_launch_preserves_separator_intended_for_tool(self, monkeypatch):
+        """A second separator belongs to the launched tool's argv."""
+        from omlx import cli
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["omlx", "launch", "claude", "--", "--", "--literal-prompt"],
+        )
+        with patch.object(cli, "launch_command") as launch:
+            cli.main()
+
+        assert launch.call_args.kwargs["extra_args"] == ["--", "--literal-prompt"]
+
     def test_serve_still_rejects_unknown_args(self):
         """Non-launch commands must keep strict argparse rejection."""
         result = subprocess.run(

@@ -719,6 +719,26 @@ class TestResponseObject:
         assert len(resp.output) == 1
         assert resp.usage.total_tokens == 15
 
+    def test_incomplete_details_on_truncation(self):
+        # A max_output_tokens truncation must surface as status="incomplete"
+        # with incomplete_details.reason, so clients can distinguish an
+        # incomplete turn from a natural stop (the Responses API has no
+        # finish_reason field).
+        resp = ResponseObject(
+            model="test-model",
+            status="incomplete",
+            incomplete_details={"reason": "max_output_tokens"},
+        )
+        assert resp.status == "incomplete"
+        assert resp.incomplete_details == {"reason": "max_output_tokens"}
+        dumped = resp.model_dump(exclude_none=True)
+        assert dumped["incomplete_details"] == {"reason": "max_output_tokens"}
+
+    def test_completed_response_omits_incomplete_details(self):
+        resp = ResponseObject(model="test-model")
+        dumped = resp.model_dump(exclude_none=True)
+        assert "incomplete_details" not in dumped
+
 
 # =============================================================================
 # SSE Event Formatting Tests

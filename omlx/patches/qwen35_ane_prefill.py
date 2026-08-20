@@ -11,6 +11,7 @@ import importlib
 import logging
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -349,7 +350,13 @@ def _prepare_cpu_linear(
     linear: Any, fraction: float
 ) -> _CpuLinearState | None:
     """Eagerly split one affine projection into FP16 CPU and quantized GPU rows."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
     if fraction <= 0 or getattr(linear, "scales", None) is None:
+        return None
+    # Without the native symbol the dispatch wrapper would raise at first use
+    # and latch the whole layer off; stay a clean no-op like the other sites.
+    if not fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t"):
         return None
     spec = _affine_spec(linear, mx.float16)
     if spec is None:
@@ -1225,22 +1232,17 @@ def _prepare_gdn_for_bank(
     else:
         dense0 = dense_logical_slice(0, ane_outputs)
         dense1 = None
-    qkv_offset = ane_outputs - z_outputs
-    gpu_offset = qkv_offset + cpu_outputs
     cpu_weight = None
     if cpu_outputs:
         cpu_weight = mx.contiguous(
             mx.dequantize(
-                qkv.weight[qkv_offset:gpu_offset],
-                qkv.scales[qkv_offset:gpu_offset],
-                qkv.biases[qkv_offset:gpu_offset],
+                qkv.weight[qkv_offset : qkv_offset + cpu_outputs],
+                qkv.scales[qkv_offset : qkv_offset + cpu_outputs],
+                qkv.biases[qkv_offset : qkv_offset + cpu_outputs],
                 group_size=qkv_group_size,
                 bits=qkv_bits,
             ).astype(mx.float16)
         )
-    weight = mx.contiguous(qkv.weight[gpu_offset:])
-    scales = mx.contiguous(qkv.scales[gpu_offset:])
-    biases = mx.contiguous(qkv.biases[gpu_offset:])
     values = [dense0, weight, scales, biases]
     if dense1 is not None:
         values.append(dense1)
@@ -2069,6 +2071,32 @@ def _compile_single_banks(
     return None
 
 
+def _warm_ane_models(models: tuple[Any, ...] | list[Any]) -> None:
+    """Pay private-runtime first-evaluation cost without making load fatal."""
+    warm_start = time.perf_counter()
+    warmed = 0
+    try:
+        for model in models:
+            warmup = getattr(model, "warmup", None)
+            if warmup is None:
+                continue
+            warmup()
+            warmed += 1
+    except Exception:
+        logger.warning(
+            "ANE warmup failed after %d procedures; continuing, the runtime "
+            "failure latch handles broken procedures at first use",
+            warmed,
+            exc_info=True,
+        )
+    if warmed:
+        logger.info(
+            "Warmed %d ANE procedures in %.1fs at load",
+            warmed,
+            time.perf_counter() - warm_start,
+        )
+
+
 def _enable_dual_procedure_banks(
     model: Any,
     mlp_candidates: list[Any],
@@ -2224,6 +2252,7 @@ def _enable_dual_procedure_banks(
             procedure_entries
         ):
             raise RuntimeError("ANE procedure bank returned an incomplete model list")
+        _warm_ane_models([*models0, *models1, *down_models0, *down_models1])
 
         selected_down_layers = {index for index, _ in down_entries}
         assigned_mlp_states = [
@@ -2342,6 +2371,7 @@ def _enable_fused_down_banks(
             config.sequence_length,
             2,
         )
+        _warm_ane_models([*models0, *models1])
         for index, (module, state, *_weights) in enumerate(prepared):
             module._omlx_ane_prefill_config = config
             module._omlx_ane_fused_down_state = replace(
@@ -2515,6 +2545,7 @@ def _enable_fused_gdn_banks(
         models0, models1, resident_programs = banked
         if len(models0) != len(prepared) or len(models1) != len(prepared):
             raise RuntimeError("ANE GDN bank returned an incomplete model list")
+        _warm_ane_models([*models0, *models1])
         for index, (module, state, _, _) in enumerate(prepared):
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = replace(
@@ -2590,6 +2621,11 @@ def enable_qwen35_ane_prefill(
         logger.warning("ANE native extension unavailable; Qwen ANE prefill skipped")
         return 0
     if not _install_dispatch():
+        logger.warning(
+            "Qwen ANE prefill: dispatch hook could not be installed "
+            "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
+            "running prefill on GPU"
+        )
         return 0
 
     config = _AnePrefillConfig(
@@ -2610,17 +2646,27 @@ def enable_qwen35_ane_prefill(
             "continuing without ANE down offload"
         )
     candidates = []
+    scanned_mlp = 0
     modules = model.modules() if hasattr(model, "modules") else ()
     for module in modules:
         if not all(
             hasattr(module, name) for name in ("gate_proj", "up_proj", "down_proj")
         ):
             continue
+        scanned_mlp += 1
         if not _eligible_pair(module):
             continue
         candidates.append(module)
         if len(candidates) >= max_layers:
             break
+
+    if not candidates:
+        logger.warning(
+            "Qwen ANE prefill requested but no eligible MLP layers found "
+            "(%d dense MLP module(s) scanned; ANE requires affine int4/5/6/8 "
+            "quantization with group_size 64 or 128)",
+            scanned_mlp,
+        )
 
     if (
         cpu_fraction > 0 or cpu_down_fraction > 0 or cpu_gdn_fraction > 0
@@ -2716,7 +2762,7 @@ def enable_qwen35_ane_prefill(
         model._omlx_ane_resident_program_count = resident_programs
         down_count = int(getattr(model, "_omlx_ane_down_prefill_count", 0))
         model._omlx_ane_procedure_count = count + gdn_count + down_count
-        if count:
+        if count or gdn_count:
             logger.info(
                 "Eagerly compiled %d MLP and %d GDN procedures into %d "
                 "instance-pinned ANE programs (sequence_length=%d)",
@@ -2724,6 +2770,11 @@ def enable_qwen35_ane_prefill(
                 gdn_count,
                 resident_programs,
                 sequence_length,
+            )
+        else:
+            logger.warning(
+                "Qwen ANE prefill enabled but 0 procedures were compiled; "
+                "the whole model runs prefill on GPU"
             )
         return count
 
@@ -2830,4 +2881,28 @@ def enable_qwen35_ane_prefill(
             gdn_fraction,
             dual_ane,
         )
+    if not count and not gdn_count:
+        logger.warning(
+            "Qwen ANE prefill enabled but 0 procedures were compiled; "
+            "the whole model runs prefill on GPU"
+        )
     return count
+
+
+def qwen35_ane_prefill_status(model: Any) -> dict:
+    """Return JSON-serialisable ANE prefill configuration counters."""
+    attempted = hasattr(model, "_omlx_ane_mlp_prefill_count")
+    mlp = int(getattr(model, "_omlx_ane_mlp_prefill_count", 0) or 0)
+    gdn = int(getattr(model, "_omlx_ane_gdn_prefill_count", 0) or 0)
+    return {
+        "attempted": attempted,
+        "configured": bool(mlp or gdn),
+        "mlp_layers": mlp,
+        "gdn_layers": gdn,
+        "dual_ane_layers": int(
+            getattr(model, "_omlx_ane_dual_prefill_count", 0) or 0
+        ),
+        "resident_programs": int(
+            getattr(model, "_omlx_ane_resident_program_count", 0) or 0
+        ),
+    }

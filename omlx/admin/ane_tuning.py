@@ -678,36 +678,40 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
     cpu_fraction = float(candidate.cpu_fraction or 0.0)
     gpu_fraction = 1.0 - ane_fraction * (2 if candidate.fused_down else 1) - cpu_fraction
     mlp_ops = float(mlp.get("operations", 0.0))
-    if mlp_ops > 0 and cpu_fraction > 0:
+    if mlp_ops > 0 and ane_fraction > 0 and gpu_fraction > 0:
         ane_time = max(
             float(mlp.get("ane0_eval_ns", 0.0)),
             float(mlp.get("ane1_eval_ns", 0.0)),
         ) / mlp_ops
-        cpu_time = float(mlp.get("cpu_completion_ns", 0.0)) / mlp_ops
         gpu_time = float(mlp.get("gpu_completion_ns", 0.0)) / mlp_ops
         ane_width = ane_fraction * (2 if candidate.fused_down else 1)
-        balanced = _balanced_fractions(
-            [ane_width, cpu_fraction, gpu_fraction],
-            [ane_time, cpu_time, gpu_time],
-            [
-                (
-                    [2 * value for value in _fused_fraction_grid()]
-                    if candidate.fused_down
-                    else sorted(
-                        set([*_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.55])
-                    )
-                ),
-                (
-                    _fused_cpu_fraction_grid()
-                    if candidate.fused_down
-                    else _cpu_fraction_grid()
-                ),
-                [gpu_fraction],
-            ],
-        )
+        widths = [ane_width]
+        times = [ane_time]
+        choices = [
+            (
+                [2 * value for value in _fused_fraction_grid()]
+                if candidate.fused_down
+                else sorted(
+                    set([*_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.55])
+                )
+            )
+        ]
+        if cpu_fraction > 0:
+            widths.append(cpu_fraction)
+            times.append(float(mlp.get("cpu_completion_ns", 0.0)) / mlp_ops)
+            choices.append(
+                _fused_cpu_fraction_grid()
+                if candidate.fused_down
+                else _cpu_fraction_grid()
+            )
+        widths.append(gpu_fraction)
+        times.append(gpu_time)
+        choices.append([gpu_fraction])
+        balanced = _balanced_fractions(widths, times, choices)
         if balanced is not None:
             ane_fraction = balanced[0] / (2 if candidate.fused_down else 1)
-            cpu_fraction = balanced[1]
+            if cpu_fraction > 0:
+                cpu_fraction = balanced[1]
 
     gdn_fraction = candidate.gdn_fraction
     cpu_gdn_fraction = float(candidate.cpu_gdn_fraction or 0.0)
