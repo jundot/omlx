@@ -381,8 +381,45 @@ template <typename T>
   const uint n = gid.x;
   const uint m = gid.y;
   if (m < static_cast<uint>(M) && n < static_cast<uint>(N)) {
-    output[m * N + n] = static_cast<T>(ane_planar[n * M + m]) +
-                            gpu_rows[m * N + n];
+    const float total = static_cast<float>(ane_planar[n * M + m]) +
+                        static_cast<float>(gpu_rows[m * N + n]);
+    output[m * N + n] = static_cast<T>(total);
+  }
+}
+
+template <typename T>
+[[kernel]] void qwen35_ane_sum_dual_output(
+    const device float16_t *ane0_planar [[buffer(0)]],
+    const device float16_t *ane1_planar [[buffer(1)]],
+    const device T *gpu_rows [[buffer(2)]], device T *output [[buffer(3)]],
+    constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint n = gid.x;
+  const uint m = gid.y;
+  if (m < static_cast<uint>(M) && n < static_cast<uint>(N)) {
+    const float total = static_cast<float>(ane0_planar[n * M + m]) +
+                        static_cast<float>(ane1_planar[n * M + m]) +
+                        static_cast<float>(gpu_rows[m * N + n]);
+    output[m * N + n] = static_cast<T>(total);
+  }
+}
+
+template <typename T>
+[[kernel]] void qwen35_ane_sum_dual_cpu_output(
+    const device float16_t *ane0_planar [[buffer(0)]],
+    const device float16_t *ane1_planar [[buffer(1)]],
+    const device float16_t *cpu_rows [[buffer(2)]],
+    const device T *gpu_rows [[buffer(3)]], device T *output [[buffer(4)]],
+    constant int &M [[buffer(5)]], constant int &N [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint n = gid.x;
+  const uint m = gid.y;
+  if (m < static_cast<uint>(M) && n < static_cast<uint>(N)) {
+    const float total = static_cast<float>(ane0_planar[n * M + m]) +
+                        static_cast<float>(ane1_planar[n * M + m]) +
+                        cpu_rows[m * N + n] +
+                        static_cast<float>(gpu_rows[m * N + n]);
+    output[m * N + n] = static_cast<T>(total);
   }
 }
 
@@ -418,7 +455,11 @@ template <typename T>
   instantiate_kernel("qwen35_ane_swiglu_suffix_" #type,                        \
                      qwen35_ane_swiglu_suffix, type);                           \
   instantiate_kernel("qwen35_ane_sum_output_" #type,                           \
-                     qwen35_ane_sum_output, type)
+                     qwen35_ane_sum_output, type);                              \
+  instantiate_kernel("qwen35_ane_sum_dual_output_" #type,                      \
+                     qwen35_ane_sum_dual_output, type);                        \
+  instantiate_kernel("qwen35_ane_sum_dual_cpu_output_" #type,                 \
+                     qwen35_ane_sum_dual_cpu_output, type)
 
 instantiate_ane_io(float16_t);
 instantiate_ane_io(bfloat16_t);

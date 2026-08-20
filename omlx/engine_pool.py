@@ -125,6 +125,10 @@ def _qwen35_cpu_share_estimated_bytes(
     gate_rows = _aligned_share_rows(intermediate, gate_fraction)
     if gate_rows:
         extra += layer_count * 2 * gate_rows * hidden * _FP16_BYTES
+        if bool(getattr(settings, "qwen35_ane_prefill_fused_down", False)):
+            # The fused CPU branch keeps the matching hidden-channel columns
+            # of down_proj in FP16 as well as the gate/up rows above.
+            extra += layer_count * gate_rows * hidden * _FP16_BYTES
 
     down_fraction = float(
         getattr(settings, "qwen35_ane_prefill_cpu_down_fraction", 0.0) or 0.0
@@ -537,6 +541,10 @@ class EnginePool:
                 data.get("qwen35_ane_prefill_sequence_length", 2048),
             )
             add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
+            add(
+                "qwen35_ane_prefill_fused_down",
+                data.get("qwen35_ane_prefill_fused_down", False),
+            )
             add("qwen35_ane_prefill_max_layers", data.get("qwen35_ane_prefill_max_layers", 64))
             add("qwen35_ane_prefill_dual_ane", data.get("qwen35_ane_prefill_dual_ane", True))
             add("qwen35_ane_prefill_gdn", data.get("qwen35_ane_prefill_gdn", True))

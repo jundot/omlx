@@ -31,6 +31,7 @@
         'qwen35_ane_prefill_enabled',
         'qwen35_ane_prefill_sequence_length',
         'qwen35_ane_prefill_fraction',
+        'qwen35_ane_prefill_fused_down',
         'qwen35_ane_prefill_max_layers',
         'qwen35_ane_prefill_dual_ane',
         'qwen35_ane_prefill_gdn',
@@ -224,6 +225,7 @@
                 qwen35_ane_prefill_enabled: false,
                 qwen35_ane_prefill_sequence_length: 2048,
                 qwen35_ane_prefill_fraction: 0.53,
+                qwen35_ane_prefill_fused_down: false,
                 qwen35_ane_prefill_max_layers: 64,
                 qwen35_ane_prefill_dual_ane: true,
                 qwen35_ane_prefill_gdn: true,
@@ -7338,6 +7340,7 @@
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
                     qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
                     qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
                     qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
@@ -7778,7 +7781,7 @@
                     return `GPU only · ${speed} prompt tok/s · ${speedupText}`;
                 }
                 const parts = [
-                    `MLP ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
                 ];
                 if (recommendation.gdn_enabled) {
                     parts.push(
@@ -7956,6 +7959,7 @@
                 };
                 if (recommendation.enabled) {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
+                    patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
                     patch.qwen35_ane_prefill_dual_ane = true;
                     patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
                     if (recommendation.gdn_enabled) {

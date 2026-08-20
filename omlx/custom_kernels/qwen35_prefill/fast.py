@@ -88,6 +88,7 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_cpu_fp16_swiglu_t",
     "qwen35_ane_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_compile_linear_bank",
+    "qwen35_ane_compile_swiglu_down_bank",
     "qwen35_cpu_fp16_affine_qmm_t",
     "qwen35_ane_dual_affine_qmm_t",
     "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
@@ -96,6 +97,8 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_dual_affine_swiglu_t",
     "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_q4_swiglu_down_t",
+    "qwen35_ane_dual_q4_swiglu_down_t",
+    "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t",
 )
 
 
@@ -463,11 +466,30 @@ def qwen35_ane_compile_swiglu_down(
     up_weight: mx.array,
     down_weight: mx.array,
     sequence_length: int,
+    ane_instance: int = 0,
 ):
     if not qwen35_ane_swiglu_down_available():
         raise RuntimeError("Private ANE SwiGLU/down runtime is unavailable")
     return _ext.qwen35_ane_compile_swiglu_down(
-        gate_weight, up_weight, down_weight, sequence_length
+        gate_weight, up_weight, down_weight, sequence_length, ane_instance
+    )
+
+
+def qwen35_ane_compile_swiglu_down_bank(
+    gate_weights: list[mx.array],
+    up_weights: list[mx.array],
+    down_weights: list[mx.array],
+    sequence_length: int,
+    ane_instance: int,
+):
+    if _ext is None or not hasattr(_ext, "qwen35_ane_compile_swiglu_down_bank"):
+        raise RuntimeError("Private ANE SwiGLU/down bank compiler is unavailable")
+    return _ext.qwen35_ane_compile_swiglu_down_bank(
+        gate_weights,
+        up_weights,
+        down_weights,
+        sequence_length,
+        ane_instance,
     )
 
 
@@ -644,6 +666,78 @@ def qwen35_ane_q4_swiglu_down_t(
         ane_model,
         variant,
         group_size,
+    )
+
+
+def qwen35_ane_dual_q4_swiglu_down_t(
+    x: mx.array,
+    gpu_gate_up_weight: mx.array,
+    gpu_gate_up_scales: mx.array,
+    gpu_gate_up_biases: mx.array,
+    gpu_down_weight: mx.array,
+    gpu_down_scales: mx.array,
+    gpu_down_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_q4_swiglu_down_t"):
+        raise RuntimeError("Dual-ANE hybrid SwiGLU/down native kernel is unavailable")
+    return _ext.qwen35_ane_dual_q4_swiglu_down_t(
+        x,
+        gpu_gate_up_weight,
+        gpu_gate_up_scales,
+        gpu_gate_up_biases,
+        gpu_down_weight,
+        gpu_down_scales,
+        gpu_down_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+    )
+
+
+def qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+    x: mx.array,
+    cpu_gate_up_weight: mx.array,
+    cpu_down_weight: mx.array,
+    gpu_gate_up_weight: mx.array,
+    gpu_gate_up_scales: mx.array,
+    gpu_gate_up_biases: mx.array,
+    gpu_down_weight: mx.array,
+    gpu_down_scales: mx.array,
+    gpu_down_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    variant: int = 8,
+    group_size: int = 128,
+    cpu_threads: int = 0,
+    cpu_shared_resource: bool = False,
+) -> mx.array:
+    if _ext is None or not hasattr(
+        _ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t"
+    ):
+        raise RuntimeError(
+            "Dual-ANE/CPU fused SwiGLU/down native kernel is unavailable"
+        )
+    return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+        x,
+        cpu_gate_up_weight,
+        cpu_down_weight,
+        gpu_gate_up_weight,
+        gpu_gate_up_scales,
+        gpu_gate_up_biases,
+        gpu_down_weight,
+        gpu_down_scales,
+        gpu_down_biases,
+        ane_model0,
+        ane_model1,
+        variant,
+        group_size,
+        cpu_threads,
+        cpu_shared_resource,
     )
 
 

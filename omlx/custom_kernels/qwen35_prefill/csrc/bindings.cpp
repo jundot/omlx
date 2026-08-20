@@ -86,6 +86,16 @@ NB_MODULE(_ext, m) {
       "up_weight"_a,
       "down_weight"_a,
       "sequence_length"_a,
+      "ane_instance"_a = 0,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_compile_swiglu_down_bank",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_swiglu_down_bank,
+      "gate_weights"_a,
+      "up_weights"_a,
+      "down_weights"_a,
+      "sequence_length"_a,
+      "ane_instance"_a,
       nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_affine_qmm_t",
@@ -270,6 +280,41 @@ NB_MODULE(_ext, m) {
       "ane_model"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_q4_swiglu_down_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_q4_swiglu_down_t,
+      "x"_a,
+      "gpu_gate_up_weight"_a,
+      "gpu_gate_up_scales"_a,
+      "gpu_gate_up_biases"_a,
+      "gpu_down_weight"_a,
+      "gpu_down_scales"_a,
+      "gpu_down_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t",
+      &omlx::qwen35_prefill_kernels::
+          qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t,
+      "x"_a,
+      "cpu_gate_up_weight"_a,
+      "cpu_down_weight"_a,
+      "gpu_gate_up_weight"_a,
+      "gpu_gate_up_scales"_a,
+      "gpu_gate_up_biases"_a,
+      "gpu_down_weight"_a,
+      "gpu_down_scales"_a,
+      "gpu_down_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "cpu_threads"_a = 0,
+      "cpu_shared_resource"_a = false,
       "stream"_a = nb::none());
   m.def(
       "qwen35_fa256_attention",

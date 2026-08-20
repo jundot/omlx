@@ -1856,6 +1856,70 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
     )
 
 
+def test_fused_down_backend_runs_compatible_cpu_hidden_branch(monkeypatch):
+    output = mx.zeros((1, 1, 8), dtype=mx.float16)
+    captured = {}
+
+    def fused(*args):
+        captured["args"] = args
+        return output
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t", fused
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._FusedDownMLPState(
+        model=model0,
+        model1=model1,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+        cpu_gate_up_weight=mx.zeros((4, 8), dtype=mx.float16),
+        cpu_down_weight=mx.zeros((8, 2), dtype=mx.float16),
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.14,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+        ane_down_fraction=0.19,
+        fused_down=True,
+    )
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_fused_down_state=state,
+    )
+    x = mx.zeros((1, 1, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    assert result is output
+    assert captured["args"] == (
+        x,
+        state.cpu_gate_up_weight,
+        state.cpu_down_weight,
+        state.gate_up_weight,
+        state.gate_up_scales,
+        state.gate_up_biases,
+        state.down_weight,
+        state.down_scales,
+        state.down_biases,
+        model0,
+        model1,
+        8,
+        128,
+        12,
+        True,
+    )
+
+
 @pytest.mark.parametrize(
     ("bits", "expected_kernel"),
     [(4, "q4"), (5, "generic"), (6, "generic"), (8, "generic")],

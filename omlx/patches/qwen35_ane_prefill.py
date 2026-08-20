@@ -47,6 +47,8 @@ class _AnePrefillConfig:
     cpu_down_fraction: float = 0.0
     cpu_threads: int = 8
     cpu_shared_resource: bool = True
+    ane_down_fraction: float = 0.0
+    fused_down: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,23 @@ class _CpuLinearState:
 
 
 @dataclass(frozen=True)
+class _AneDownState:
+    model: Any
+    model1: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+    bits: int
+    group_size: int
+    cpu_weight: mx.array | None = None
+    cpu_outputs: int = 0
+    compile_weight0: mx.array | None = None
+    compile_weight1: mx.array | None = None
+
+
+@dataclass(frozen=True)
 class _CombinedMLPState:
     model: Any
     weight: mx.array
@@ -84,6 +103,21 @@ class _CombinedMLPState:
     cpu_weight: mx.array | None = None
     cpu_outputs: int = 0
     down_cpu: _CpuLinearState | None = None
+    down_ane: _AneDownState | None = None
+
+
+@dataclass(frozen=True)
+class _FusedDownMLPState:
+    model: Any
+    model1: Any
+    gate_up_weight: mx.array
+    gate_up_scales: mx.array
+    gate_up_biases: mx.array
+    down_weight: mx.array
+    down_scales: mx.array
+    down_biases: mx.array
+    cpu_gate_up_weight: mx.array | None = None
+    cpu_down_weight: mx.array | None = None
 
 
 @dataclass(frozen=True)
@@ -349,6 +383,95 @@ def _prepare_cpu_linear(
     )
 
 
+def _prepare_down_for_bank(
+    linear: Any,
+    config: _AnePrefillConfig,
+) -> _AneDownState | None:
+    """Split down-projection output rows across dual ANE, CPU, and GPU.
+
+    Unlike the abandoned hidden-channel split, every backend owns complete
+    output rows. The results can therefore be concatenated without summing
+    independently approximated partial dot products.
+    """
+    if config.ane_down_fraction <= 0 or not config.dual_ane:
+        return None
+    dtype = getattr(getattr(linear, "scales", None), "dtype", None)
+    spec = _affine_spec(linear, dtype, allowed_bits=(4, 5, 6, 8))
+    if spec is None:
+        return None
+    bits, group_size = spec
+    output_dim = int(linear.weight.shape[0])
+    ane_outputs = (
+        int(output_dim * config.ane_down_fraction) // 128
+    ) * 128
+    split = ane_outputs // 2
+    cpu_enabled = bool(
+        config.cpu_down_fraction > 0
+        and dtype == mx.float16
+    )
+    cpu_outputs = (
+        (int(output_dim * config.cpu_down_fraction) // 64) * 64
+        if cpu_enabled
+        else 0
+    )
+    gpu_start = ane_outputs + cpu_outputs
+    gpu_outputs = output_dim - gpu_start
+    if (
+        ane_outputs <= 0
+        or split % 64
+        or gpu_outputs <= 0
+        or gpu_outputs % 64
+    ):
+        return None
+
+    def dense_rows(start: int, stop: int) -> mx.array:
+        return mx.contiguous(
+            mx.dequantize(
+                linear.weight[start:stop],
+                linear.scales[start:stop],
+                linear.biases[start:stop],
+                group_size=group_size,
+                bits=bits,
+            ).astype(mx.float32)
+        )
+
+    dense0 = dense_rows(0, split)
+    dense1 = dense_rows(split, ane_outputs)
+    cpu_weight = None
+    if cpu_outputs:
+        cpu_weight = mx.contiguous(
+            mx.dequantize(
+                linear.weight[ane_outputs:gpu_start],
+                linear.scales[ane_outputs:gpu_start],
+                linear.biases[ane_outputs:gpu_start],
+                group_size=group_size,
+                bits=bits,
+            ).astype(mx.float16)
+        )
+    weight = mx.contiguous(linear.weight[gpu_start:])
+    scales = mx.contiguous(linear.scales[gpu_start:])
+    biases = mx.contiguous(linear.biases[gpu_start:])
+    values = [dense0, dense1, weight, scales, biases]
+    if cpu_weight is not None:
+        values.append(cpu_weight)
+    mx.eval(*values)
+    return _AneDownState(
+        model=None,
+        model1=None,
+        weight=weight,
+        scales=scales,
+        biases=biases,
+        ane_outputs=ane_outputs,
+        gpu_outputs=gpu_outputs,
+        bits=bits,
+        group_size=group_size,
+        cpu_weight=cpu_weight,
+        cpu_outputs=cpu_outputs,
+        compile_weight0=dense0,
+        compile_weight1=dense1,
+    )
+
+
 def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | None:
     from omlx.custom_kernels.qwen35_prefill import fast
 
@@ -586,6 +709,7 @@ def _prepare_pair_for_bank(
     if cpu_weight is not None:
         values.append(cpu_weight)
     mx.eval(*values)
+    down_ane = _prepare_down_for_bank(mlp.down_proj, config)
     return (
         _CombinedMLPState(
             model=None,
@@ -599,9 +723,14 @@ def _prepare_pair_for_bank(
             group_size=group_size,
             cpu_weight=cpu_weight,
             cpu_outputs=cpu_outputs,
-            down_cpu=_prepare_cpu_linear(
-                mlp.down_proj, config.cpu_down_fraction
+            down_cpu=(
+                None
+                if down_ane is not None
+                else _prepare_cpu_linear(
+                    mlp.down_proj, config.cpu_down_fraction
+                )
             ),
+            down_ane=down_ane,
         ),
         dense0,
         dense1,
@@ -745,6 +874,62 @@ def _post_ane_linear(
         if x.ndim >= 3 and int(x.shape[-2]) < q8_min_tokens:
             return linear(x)
     return _linear_qmm(linear, x, variant)
+
+
+def _post_ane_down(
+    linear: Any,
+    x: mx.array,
+    state: _AneDownState | None,
+    config: _AnePrefillConfig,
+    fallback: _CpuLinearState | None,
+) -> mx.array:
+    if state is None:
+        return _post_ane_linear(
+            linear,
+            x,
+            config.variant,
+            q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
+            cpu_state=fallback,
+            cpu_threads=config.cpu_threads,
+            cpu_shared_resource=config.cpu_shared_resource,
+        )
+    if (
+        state.model is None
+        or state.model1 is None
+        or state.scales.dtype != x.dtype
+    ):
+        raise RuntimeError("ANE down-projection state is incomplete")
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if state.cpu_weight is not None:
+        return fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+            x,
+            state.cpu_weight,
+            state.weight,
+            state.scales,
+            state.biases,
+            state.model,
+            state.model1,
+            state.bits,
+            config.variant,
+            state.group_size,
+            0,
+            config.cpu_threads,
+            config.cpu_shared_resource,
+        )
+    return fast.qwen35_ane_dual_affine_qmm_t(
+        x,
+        state.weight,
+        state.scales,
+        state.biases,
+        state.model,
+        state.model1,
+        state.bits,
+        config.variant,
+        state.group_size,
+        0,
+    )
 
 
 def _register_gdn_module(gdn: Any) -> None:
@@ -1319,6 +1504,53 @@ def _backend_exact(
     if getattr(mlp, "_omlx_ane_prefill_failed", False):
         return None
 
+    fused_down_state = getattr(mlp, "_omlx_ane_fused_down_state", None)
+    if fused_down_state is not None:
+        try:
+            from omlx.custom_kernels.qwen35_prefill import fast
+
+            if fused_down_state.cpu_gate_up_weight is not None:
+                if fused_down_state.cpu_down_weight is None:
+                    raise RuntimeError("Incomplete fused CPU MLP state")
+                return fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+                    x,
+                    fused_down_state.cpu_gate_up_weight,
+                    fused_down_state.cpu_down_weight,
+                    fused_down_state.gate_up_weight,
+                    fused_down_state.gate_up_scales,
+                    fused_down_state.gate_up_biases,
+                    fused_down_state.down_weight,
+                    fused_down_state.down_scales,
+                    fused_down_state.down_biases,
+                    fused_down_state.model,
+                    fused_down_state.model1,
+                    config.variant,
+                    128,
+                    config.cpu_threads,
+                    config.cpu_shared_resource,
+                )
+            return fast.qwen35_ane_dual_q4_swiglu_down_t(
+                x,
+                fused_down_state.gate_up_weight,
+                fused_down_state.gate_up_scales,
+                fused_down_state.gate_up_biases,
+                fused_down_state.down_weight,
+                fused_down_state.down_scales,
+                fused_down_state.down_biases,
+                fused_down_state.model,
+                fused_down_state.model1,
+                config.variant,
+                128,
+            )
+        except Exception:
+            mlp._omlx_ane_prefill_failed = True
+            logger.warning(
+                "Disabling fused ANE down prefill for one Qwen MLP after a "
+                "runtime failure",
+                exc_info=True,
+            )
+            return None
+
     state = getattr(mlp, "_omlx_ane_prefill_state", None)
     if state is None:
         try:
@@ -1398,14 +1630,12 @@ def _backend_exact(
                     config.cpu_threads,
                     config.cpu_shared_resource,
                 )
-            return _post_ane_linear(
+            return _post_ane_down(
                 mlp.down_proj,
                 activation,
-                config.variant,
-                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
-                cpu_state=state.down_cpu,
-                cpu_threads=config.cpu_threads,
-                cpu_shared_resource=config.cpu_shared_resource,
+                state.down_ane,
+                config,
+                state.down_cpu,
             )
 
         if state.model1 is not None:
@@ -1434,14 +1664,12 @@ def _backend_exact(
                     config.variant,
                     state.group_size,
                 )
-            return _post_ane_linear(
+            return _post_ane_down(
                 mlp.down_proj,
                 activation,
-                config.variant,
-                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
-                cpu_state=state.down_cpu,
-                cpu_threads=config.cpu_threads,
-                cpu_shared_resource=config.cpu_shared_resource,
+                state.down_ane,
+                config,
+                state.down_cpu,
             )
 
         if state.bits != 4:
@@ -1457,14 +1685,12 @@ def _backend_exact(
                 config.variant,
                 state.group_size,
             )
-            return _post_ane_linear(
+            return _post_ane_down(
                 mlp.down_proj,
                 activation,
-                config.variant,
-                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
-                cpu_state=state.down_cpu,
-                cpu_threads=config.cpu_threads,
-                cpu_shared_resource=config.cpu_shared_resource,
+                state.down_ane,
+                config,
+                state.down_cpu,
             )
 
         if fast.has_symbol("qwen35_ane_q4_swiglu_t"):
@@ -1477,14 +1703,12 @@ def _backend_exact(
                 config.variant,
                 state.group_size,
             )
-            return _post_ane_linear(
+            return _post_ane_down(
                 mlp.down_proj,
                 activation,
-                config.variant,
-                q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
-                cpu_state=state.down_cpu,
-                cpu_threads=config.cpu_threads,
-                cpu_shared_resource=config.cpu_shared_resource,
+                state.down_ane,
+                config,
+                state.down_cpu,
             )
 
         combined = fast.qwen35_ane_q4_affine_qmm_t(
@@ -1514,14 +1738,12 @@ def _backend_exact(
             axis=-1,
         )
 
-        return _post_ane_linear(
+        return _post_ane_down(
             mlp.down_proj,
             swiglu(gate, up),
-            config.variant,
-            q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
-            cpu_state=state.down_cpu,
-            cpu_threads=config.cpu_threads,
-            cpu_shared_resource=config.cpu_shared_resource,
+            state.down_ane,
+            config,
+            state.down_cpu,
         )
     except Exception:
         mlp._omlx_ane_prefill_failed = True
@@ -1921,17 +2143,57 @@ def _enable_dual_procedure_banks(
                     state, dense0, dense1 = prepared
                     prepared_gdns.append((module, state, dense0, dense1))
 
-        all_prepared = [*prepared_mlps, *prepared_gdns]
-        if not all_prepared:
+        try:
+            down_layer_stride = max(
+                1,
+                int(os.environ.get("OMLX_QWEN35_ANE_DOWN_LAYER_STRIDE", "1")),
+            )
+        except ValueError:
+            down_layer_stride = 1
+        down_entries = [
+            (index, state.down_ane)
+            for index, (_, state, _, _) in enumerate(prepared_mlps)
+            if state.down_ane is not None and index % down_layer_stride == 0
+        ]
+        combine_down = bool(
+            down_entries
+            and os.environ.get(
+                "OMLX_QWEN35_ANE_DOWN_COMBINED_BANK", ""
+            ).strip().lower()
+            in ("1", "true", "on")
+        )
+        down_by_mlp = dict(down_entries)
+        procedure_entries: list[tuple[str, int]] = []
+        weights0: list[mx.array] = []
+        weights1: list[mx.array] = []
+        for index, (_, _state, dense0, dense1) in enumerate(prepared_mlps):
+            procedure_entries.append(("mlp", index))
+            weights0.append(dense0)
+            weights1.append(dense1)
+            if combine_down and index in down_by_mlp:
+                procedure_entries.append(("down", index))
+                weights0.append(down_by_mlp[index].compile_weight0)
+                weights1.append(down_by_mlp[index].compile_weight1)
+        for index, (_, _, dense0, dense1) in enumerate(prepared_gdns):
+            procedure_entries.append(("gdn", index))
+            weights0.append(dense0)
+            weights1.append(dense1)
+        separate_down_entries = [] if combine_down else down_entries
+        down_weights0 = [
+            state.compile_weight0 for _, state in separate_down_entries
+        ]
+        down_weights1 = [
+            state.compile_weight1 for _, state in separate_down_entries
+        ]
+        procedure_count = len(procedure_entries) + len(separate_down_entries)
+        if not procedure_count:
             return (0, 0, 0, 0)
-        if len(all_prepared) > 256:
+        if procedure_count > 256:
             logger.warning(
                 "ANE procedure bank exceeds the private 256-procedure limit; "
                 "falling back to per-layer programs"
             )
             return None
-        weights0 = [entry[2] for entry in all_prepared]
-        weights1 = [entry[3] for entry in all_prepared]
         mx.eval(*weights0, *weights1)
         banked_models = _compile_dual_banks(
             weights0, weights1, config.sequence_length
@@ -1939,22 +2201,100 @@ def _enable_dual_procedure_banks(
         if banked_models is None:
             return None
         models0, models1, resident_program_count = banked_models
+        down_models0: list[Any] = []
+        down_models1: list[Any] = []
+        if separate_down_entries:
+            down_banks = _compile_dual_banks(
+                down_weights0,
+                down_weights1,
+                config.sequence_length,
+            )
+            if down_banks is None:
+                logger.warning(
+                    "ANE down-projection bank compilation failed; "
+                    "continuing with the established gate/GDN bank"
+                )
+                down_entries = []
+                separate_down_entries = []
+            else:
+                down_models0, down_models1, down_programs = down_banks
+                resident_program_count += down_programs
 
-        if len(models0) != len(all_prepared) or len(models1) != len(all_prepared):
+        if len(models0) != len(procedure_entries) or len(models1) != len(
+            procedure_entries
+        ):
             raise RuntimeError("ANE procedure bank returned an incomplete model list")
 
-        procedure = 0
-        for module, state, _, _ in prepared_mlps:
-            state = replace(state, model=models0[procedure], model1=models1[procedure])
+        selected_down_layers = {index for index, _ in down_entries}
+        assigned_mlp_states = [
+            state
+            if index in selected_down_layers
+            else replace(state, down_ane=None)
+            for index, (_, state, _, _) in enumerate(prepared_mlps)
+        ]
+        assigned_gdn_states = [entry[1] for entry in prepared_gdns]
+        if config.ane_down_fraction > 0 and not down_entries:
+            assigned_mlp_states = [
+                replace(state, down_ane=None) for state in assigned_mlp_states
+            ]
+        for procedure, (kind, index) in enumerate(procedure_entries):
+            if kind == "mlp":
+                assigned_mlp_states[index] = replace(
+                    assigned_mlp_states[index],
+                    model=models0[procedure],
+                    model1=models1[procedure],
+                )
+            elif kind == "down":
+                state = assigned_mlp_states[index]
+                down_state = state.down_ane
+                if down_state is None:
+                    raise RuntimeError("Missing prepared ANE down state")
+                assigned_mlp_states[index] = replace(
+                    state,
+                    down_ane=replace(
+                        down_state,
+                        model=models0[procedure],
+                        model1=models1[procedure],
+                        compile_weight0=None,
+                        compile_weight1=None,
+                    ),
+                )
+            else:
+                assigned_gdn_states[index] = replace(
+                    assigned_gdn_states[index],
+                    model=models0[procedure],
+                    model1=models1[procedure],
+                )
+
+        for procedure, (index, down_state) in enumerate(separate_down_entries):
+            state = assigned_mlp_states[index]
+            down_state = replace(
+                down_state,
+                model=down_models0[procedure],
+                model1=down_models1[procedure],
+                compile_weight0=None,
+                compile_weight1=None,
+            )
+            assigned_mlp_states[index] = replace(
+                state,
+                down_ane=down_state,
+            )
+
+        for (module, _, _, _), state in zip(
+            prepared_mlps, assigned_mlp_states, strict=True
+        ):
             module._omlx_ane_prefill_config = config
             module._omlx_ane_prefill_state = state
-            procedure += 1
-        for module, state, _, _ in prepared_gdns:
-            state = replace(state, model=models0[procedure], model1=models1[procedure])
+        for (module, _, _, _), state in zip(
+            prepared_gdns, assigned_gdn_states, strict=True
+        ):
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
-            procedure += 1
+
+    model._omlx_ane_down_prefill_count = sum(
+        state.down_ane is not None for state in assigned_mlp_states
+    )
 
     return (
         len(prepared_mlps),
@@ -1962,6 +2302,229 @@ def _enable_dual_procedure_banks(
         len(prepared_gdns),
         resident_program_count,
     )
+
+
+def _enable_fused_down_banks(
+    model: Any,
+    candidates: list[Any],
+    config: _AnePrefillConfig,
+) -> tuple[int, int] | None:
+    """Compile contiguous 32-layer dual-ANE fused SwiGLU/down banks."""
+    if not config.fused_down or not config.dual_ane or not candidates:
+        return None
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    count = 0
+    resident_programs = 0
+    for chunk_start in range(0, len(candidates), 32):
+        modules = candidates[chunk_start : chunk_start + 32]
+        prepared = []
+        for module in modules:
+            value = _prepare_fused_down_for_bank(module, config)
+            if value is not None:
+                state, weights = value
+                prepared.append((module, state, *weights))
+        if not prepared:
+            continue
+        compile_values = [value for entry in prepared for value in entry[2:]]
+        mx.eval(*compile_values)
+        models0 = fast.qwen35_ane_compile_swiglu_down_bank(
+            [entry[2] for entry in prepared],
+            [entry[3] for entry in prepared],
+            [entry[4] for entry in prepared],
+            config.sequence_length,
+            1,
+        )
+        models1 = fast.qwen35_ane_compile_swiglu_down_bank(
+            [entry[5] for entry in prepared],
+            [entry[6] for entry in prepared],
+            [entry[7] for entry in prepared],
+            config.sequence_length,
+            2,
+        )
+        for index, (module, state, *_weights) in enumerate(prepared):
+            module._omlx_ane_prefill_config = config
+            module._omlx_ane_fused_down_state = replace(
+                state, model=models0[index], model1=models1[index]
+            )
+        count += len(prepared)
+        resident_programs += 2
+        del prepared, compile_values
+    if not count:
+        return None
+    model._omlx_ane_down_prefill_count = count
+    return count, resident_programs
+
+
+def _prepare_fused_down_for_bank(
+    mlp: Any,
+    config: _AnePrefillConfig,
+) -> tuple[_FusedDownMLPState, tuple[mx.array, ...]] | None:
+    """Prepare one fused MLP using the same slices in serving and tuning."""
+    if not config.fused_down or not config.dual_ane:
+        return None
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    down = getattr(mlp, "down_proj", None)
+    if any(
+        int(getattr(linear, "bits", 0)) != 4
+        or int(getattr(linear, "group_size", 0)) != 128
+        for linear in (gate, up, down)
+    ):
+        return None
+    hidden = int(gate.weight.shape[0])
+    per_ane = (int(hidden * config.ane_down_fraction) // 128) * 128
+    total_ane = 2 * per_ane
+    cpu_hidden = (int(hidden * config.cpu_fraction) // 128) * 128
+    gpu_start = total_ane + cpu_hidden
+    if per_ane <= 0 or gpu_start >= hidden or (hidden - gpu_start) % 128:
+        return None
+
+    def dense_rows(linear: Any, start: int, stop: int) -> mx.array:
+        return mx.contiguous(
+            mx.dequantize(
+                linear.weight[start:stop],
+                linear.scales[start:stop],
+                linear.biases[start:stop],
+                group_size=128,
+                bits=4,
+            ).astype(mx.float32)
+        )
+
+    dense_down = mx.dequantize(
+        down.weight,
+        down.scales,
+        down.biases,
+        group_size=128,
+        bits=4,
+    ).astype(mx.float32)
+    gate0 = dense_rows(gate, 0, per_ane)
+    up0 = dense_rows(up, 0, per_ane)
+    down0 = mx.contiguous(dense_down[:, :per_ane])
+    gate1 = dense_rows(gate, per_ane, total_ane)
+    up1 = dense_rows(up, per_ane, total_ane)
+    down1 = mx.contiguous(dense_down[:, per_ane:total_ane])
+    cpu_gate_up_weight = None
+    cpu_down_weight = None
+    if cpu_hidden:
+        cpu_gate_up_weight = mx.contiguous(
+            mx.concatenate(
+                (
+                    dense_rows(gate, total_ane, gpu_start),
+                    dense_rows(up, total_ane, gpu_start),
+                ),
+                axis=0,
+            ).astype(mx.float16)
+        )
+        cpu_down_weight = mx.contiguous(
+            dense_down[:, total_ane:gpu_start].astype(mx.float16)
+        )
+    state = _FusedDownMLPState(
+        model=None,
+        model1=None,
+        gate_up_weight=mx.contiguous(
+            mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
+        ),
+        gate_up_scales=mx.contiguous(
+            mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
+        ),
+        gate_up_biases=mx.contiguous(
+            mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
+        ),
+        down_weight=mx.contiguous(down.weight[:, gpu_start // 8 :]),
+        down_scales=mx.contiguous(down.scales[:, gpu_start // 128 :]),
+        down_biases=mx.contiguous(down.biases[:, gpu_start // 128 :]),
+        cpu_gate_up_weight=cpu_gate_up_weight,
+        cpu_down_weight=cpu_down_weight,
+    )
+    values = [
+        state.gate_up_weight,
+        state.gate_up_scales,
+        state.gate_up_biases,
+        state.down_weight,
+        state.down_scales,
+        state.down_biases,
+        gate0,
+        up0,
+        down0,
+        gate1,
+        up1,
+        down1,
+    ]
+    if cpu_gate_up_weight is not None and cpu_down_weight is not None:
+        values.extend((cpu_gate_up_weight, cpu_down_weight))
+    mx.eval(*values)
+    return state, (gate0, up0, down0, gate1, up1, down1)
+
+
+def _enable_fused_gdn_banks(
+    model: Any,
+    config: _AnePrefillConfig,
+    *,
+    fraction: float,
+    max_layers: int,
+    cpu_fraction: float,
+) -> tuple[int, int] | None:
+    """Compile the established dual-ANE GDN path alongside fused MLP/down."""
+    if not config.dual_ane or max_layers <= 0:
+        return None
+
+    gdn_config = _AneGDNConfig(
+        config.sequence_length,
+        fraction,
+        config.variant,
+        True,
+        cpu_fraction=cpu_fraction,
+        cpu_threads=config.cpu_threads,
+        cpu_shared_resource=config.cpu_shared_resource,
+    )
+    prepared: list[tuple[Any, _CombinedGDNState, mx.array, mx.array]] = []
+    with _COMPILE_LOCK:
+        for module in model.modules() if hasattr(model, "modules") else ():
+            if len(prepared) >= max_layers:
+                break
+            if not _eligible_gdn(module):
+                continue
+            try:
+                entry = _prepare_gdn_for_bank(module, gdn_config)
+            except Exception:
+                logger.warning(
+                    "Skipping one Qwen GDN while preparing its fused-mode "
+                    "ANE procedure",
+                    exc_info=True,
+                )
+                continue
+            if entry is not None:
+                state, dense0, dense1 = entry
+                if dense1 is None:
+                    continue
+                prepared.append((module, state, dense0, dense1))
+
+        if not prepared:
+            return None
+        weights0 = [entry[2] for entry in prepared]
+        weights1 = [entry[3] for entry in prepared]
+        mx.eval(*weights0, *weights1)
+        banked = _compile_dual_banks(
+            weights0,
+            weights1,
+            config.sequence_length,
+        )
+        if banked is None:
+            return None
+        models0, models1, resident_programs = banked
+        if len(models0) != len(prepared) or len(models1) != len(prepared):
+            raise RuntimeError("ANE GDN bank returned an incomplete model list")
+        for index, (module, state, _, _) in enumerate(prepared):
+            module._omlx_ane_gdn_config = gdn_config
+            module._omlx_ane_gdn_state = replace(
+                state,
+                model=models0[index],
+                model1=models1[index],
+            )
+            _register_gdn_module(module)
+
+    return len(prepared), resident_programs
 
 
 def enable_qwen35_ane_prefill(
@@ -1977,6 +2540,8 @@ def enable_qwen35_ane_prefill(
     dual_ane: bool = True,
     cpu_fraction: float = 0.0,
     cpu_down_fraction: float = 0.0,
+    ane_down_fraction: float = 0.0,
+    fused_down: bool = False,
     cpu_gdn_fraction: float = 0.0,
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
@@ -2001,6 +2566,10 @@ def enable_qwen35_ane_prefill(
     if not 0.0 <= cpu_down_fraction <= 0.50:
         raise ValueError(
             "ANE CPU down-projection fraction must be between 0.0 and 0.50"
+        )
+    if not 0.0 <= ane_down_fraction <= 0.50:
+        raise ValueError(
+            "ANE down-projection fraction must be between 0.0 and 0.50"
         )
     if not 0.0 <= cpu_gdn_fraction <= 0.50:
         raise ValueError("ANE CPU GDN fraction must be between 0.0 and 0.50")
@@ -2032,7 +2601,14 @@ def enable_qwen35_ane_prefill(
         cpu_down_fraction=cpu_down_fraction,
         cpu_threads=cpu_threads,
         cpu_shared_resource=cpu_shared_resource,
+        ane_down_fraction=ane_down_fraction if dual_ane else 0.0,
+        fused_down=fused_down and dual_ane,
     )
+    if ane_down_fraction > 0 and not dual_ane:
+        logger.warning(
+            "Experimental ANE down projection currently requires dual ANE; "
+            "continuing without ANE down offload"
+        )
     candidates = []
     modules = model.modules() if hasattr(model, "modules") else ()
     for module in modules:
@@ -2073,6 +2649,50 @@ def enable_qwen35_ane_prefill(
                 )
                 config = replace(config, cpu_shared_resource=False)
 
+    if config.fused_down:
+        if config.cpu_down_fraction > 0:
+            logger.warning(
+                "Fused ANE MLP/down uses one CPU hidden-channel share for "
+                "gate/up and partial down; ignoring the output-row CPU down "
+                "fraction"
+            )
+            config = replace(config, cpu_down_fraction=0.0)
+        fused = _enable_fused_down_banks(model, candidates, config)
+        if fused is not None:
+            count, resident_programs = fused
+            gdn_count = 0
+            if gdn:
+                fused_gdn = _enable_fused_gdn_banks(
+                    model,
+                    config,
+                    fraction=gdn_fraction,
+                    max_layers=gdn_max_layers,
+                    cpu_fraction=cpu_gdn_fraction,
+                )
+                if fused_gdn is None:
+                    logger.warning(
+                        "Fused ANE down mode could not compile the requested "
+                        "GDN procedures; leaving GDN on GPU"
+                    )
+                else:
+                    gdn_count, gdn_programs = fused_gdn
+                    resident_programs += gdn_programs
+            model._omlx_ane_mlp_prefill_count = count
+            model._omlx_ane_gdn_prefill_count = gdn_count
+            model._omlx_ane_dual_prefill_count = count
+            model._omlx_ane_resident_program_count = resident_programs
+            model._omlx_ane_procedure_count = count + gdn_count
+            logger.info(
+                "Eagerly compiled %d fused MLP/down and %d GDN procedures "
+                "into %d "
+                "instance-pinned ANE programs (sequence_length=%d)",
+                count,
+                gdn_count,
+                resident_programs,
+                sequence_length,
+            )
+            return count
+
     banked = _enable_dual_procedure_banks(
         model,
         candidates,
@@ -2088,7 +2708,8 @@ def enable_qwen35_ane_prefill(
         model._omlx_ane_gdn_prefill_count = gdn_count
         model._omlx_ane_dual_prefill_count = dual_count
         model._omlx_ane_resident_program_count = resident_programs
-        model._omlx_ane_procedure_count = count + gdn_count
+        down_count = int(getattr(model, "_omlx_ane_down_prefill_count", 0))
+        model._omlx_ane_procedure_count = count + gdn_count + down_count
         if count:
             logger.info(
                 "Eagerly compiled %d MLP and %d GDN procedures into %d "
@@ -2167,6 +2788,7 @@ def enable_qwen35_ane_prefill(
     model._omlx_ane_mlp_prefill_count = count
     model._omlx_ane_gdn_prefill_count = gdn_count
     model._omlx_ane_dual_prefill_count = dual_count
+    model._omlx_ane_down_prefill_count = 0
     model._omlx_ane_resident_program_count = resident_programs
     model._omlx_ane_procedure_count = count + gdn_count
 

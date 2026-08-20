@@ -138,6 +138,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
     qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_fused_down: bool | None = None
     qwen35_ane_prefill_max_layers: int | None = None
     qwen35_ane_prefill_dual_ane: bool | None = None
     qwen35_ane_prefill_gdn: bool | None = None
@@ -2371,6 +2372,10 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_enabled = bool(
             request.qwen35_ane_prefill_cpu_enabled
         )
+    if "qwen35_ane_prefill_fused_down" in sent:
+        current_settings.qwen35_ane_prefill_fused_down = bool(
+            request.qwen35_ane_prefill_fused_down
+        )
     if "qwen35_ane_prefill_cpu_fraction" in sent:
         value = request.qwen35_ane_prefill_cpu_fraction
         if value is None or not 0.0 <= value <= 0.25:
@@ -2410,12 +2415,17 @@ async def update_model_settings(
     if (
         current_settings.qwen35_ane_prefill_cpu_enabled
         and current_settings.qwen35_ane_prefill_fraction
+        * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
         + current_settings.qwen35_ane_prefill_cpu_fraction
         >= 1.0
     ):
         raise HTTPException(
             status_code=400,
-            detail="MLP ANE and CPU fractions must total less than 1.0.",
+            detail=(
+                "Two per-ANE MLP shares and the CPU share must total less than 1.0."
+                if current_settings.qwen35_ane_prefill_fused_down
+                else "MLP ANE and CPU fractions must total less than 1.0."
+            ),
         )
     if (
         current_settings.qwen35_ane_prefill_cpu_enabled

@@ -106,6 +106,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillEnabled: Bool?
     let qwen35AnePrefillSequenceLength: Int?
     let qwen35AnePrefillFraction: Double?
+    let qwen35AnePrefillFusedDown: Bool?
     let qwen35AnePrefillMaxLayers: Int?
     let qwen35AnePrefillDualAne: Bool?
     let qwen35AnePrefillGdn: Bool?
@@ -186,6 +187,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillEnabled: Bool? = nil
     var qwen35AnePrefillSequenceLength: Int? = nil
     var qwen35AnePrefillFraction: Double? = nil
+    var qwen35AnePrefillFusedDown: Bool? = nil
     var qwen35AnePrefillMaxLayers: Int? = nil
     var qwen35AnePrefillDualAne: Bool? = nil
     var qwen35AnePrefillGdn: Bool? = nil

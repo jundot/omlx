@@ -253,6 +253,7 @@ struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
     let cpuFraction: Double?
     let cpuDownFraction: Double?
     let cpuGdnFraction: Double?
+    let fusedDown: Bool?
     let state: String?
     let processingTps: Double?
     let latencyMs: Double?
@@ -272,6 +273,7 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let cpuFraction: Double?
     let cpuDownFraction: Double?
     let cpuGdnFraction: Double?
+    let fusedDown: Bool?
     let cpuThreads: Int?
     let cpuSharedResource: Bool?
     let processingTps: Double

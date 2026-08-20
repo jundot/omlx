@@ -854,6 +854,7 @@ final class ModelSettingsScreenVM {
         patch.qwen35AnePrefillSequenceLength = recommendation.sequenceLength
         if recommendation.enabled {
             patch.qwen35AnePrefillFraction = recommendation.mlpFraction
+            patch.qwen35AnePrefillFusedDown = recommendation.fusedDown ?? false
             patch.qwen35AnePrefillDualAne = true
             patch.qwen35AnePrefillGdn = recommendation.gdnEnabled
             if recommendation.gdnEnabled {

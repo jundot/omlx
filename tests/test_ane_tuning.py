@@ -91,6 +91,58 @@ def test_candidate_settings_apply_tuner_boolean_overrides():
     assert tuned.qwen35_ane_prefill_cpu_shared_resource is False
 
 
+def test_fused_candidate_uses_per_ane_fraction_and_one_cpu_hidden_share():
+    base = ModelSettings(qwen35_ane_prefill_cpu_down_fraction=0.2)
+    request = ane_tuning.ANETuningRequest(model_id="qwen")
+    candidate = ane_tuning._Candidate(
+        label="fused",
+        enabled=True,
+        mlp_fraction=0.19,
+        cpu_enabled=True,
+        cpu_fraction=0.14,
+        cpu_down_fraction=0.2,
+        fused_down=True,
+        cpu_threads=12,
+    )
+
+    tuned = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert tuned.qwen35_ane_prefill_fused_down is True
+    assert tuned.qwen35_ane_prefill_fraction == 0.19
+    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.14
+    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.0
+    assert tuned.qwen35_ane_prefill_cpu_threads == 12
+
+
+def test_fused_profile_refinement_balances_aggregate_dual_ane_width():
+    candidate = ane_tuning._Candidate(
+        label="fused",
+        enabled=True,
+        mlp_fraction=0.19,
+        cpu_enabled=True,
+        cpu_fraction=0.14,
+        fused_down=True,
+    )
+    operations = 64
+    result = {
+        "_profile": {
+            "mlp": {
+                "operations": operations,
+                "ane0_eval_ns": 10e6 * operations,
+                "ane1_eval_ns": 10e6 * operations,
+                "cpu_completion_ns": 10e6 * operations,
+                "gpu_completion_ns": 10e6 * operations,
+            }
+        }
+    }
+
+    refined = ane_tuning._profile_refinement(candidate, result)
+
+    assert refined.mlp_fraction == 0.19
+    assert refined.cpu_fraction == 0.14
+    assert refined.fused_down is True
+
+
 def test_tuner_overrides_reduce_planned_search_matrix():
     full = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="full"))
     constrained = ane_tuning.create_run(
@@ -239,12 +291,67 @@ async def test_tuner_recommends_best_combined_split(monkeypatch):
         "cpu_fraction": 0.125,
         "cpu_down_fraction": 0.2,
         "cpu_gdn_fraction": None,
+        "fused_down": False,
         "cpu_threads": 8,
         "cpu_shared_resource": True,
         "processing_tps": 125.0,
         "speedup_percent": 25.0,
         "sequence_length": 2048,
     }
+
+
+@pytest.mark.asyncio
+async def test_fused_tuner_verifies_the_actual_calibrated_worker_counts(monkeypatch):
+    measured_threads = []
+
+    async def measure(run, pool, settings, candidate):
+        measured_threads.append(candidate.cpu_threads)
+        tps = {None: 100.0, 8: 120.0, 12: 130.0}[candidate.cpu_threads]
+        return {
+            **ane_tuning._empty_result(candidate),
+            "processing_tps": tps,
+            "samples": [tps],
+        }
+
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.19,
+            cpu_fraction=0.14,
+            cpu_down_fraction=0.0,
+            gdn_enabled=True,
+            gdn_fraction=0.45,
+            cpu_enabled=True,
+            cpu_threads=8,
+            cpu_shared_resource=True,
+            fused_down=True,
+            alternate_mlp_fraction=0.22,
+            alternate_cpu_fraction=0.11,
+            alternate_cpu_threads=12,
+        )
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+
+    async def get_engine(*args, **kwargs):
+        return object()
+
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings()
+        ),
+        get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+
+    assert measured_threads == [None, 8, 12]
+    assert run.recommendation["cpu_threads"] == 12
+    assert run.recommendation["mlp_fraction"] == 0.22
+    assert run.recommendation["cpu_fraction"] == 0.11
 
 
 @pytest.mark.asyncio
@@ -308,6 +415,18 @@ def test_ane_execution_observed_distinguishes_compiled_from_ran():
     assert ane_tuning._ane_execution_observed(_trace(mlp_ops=0, gdn_ops=0)) is False
     assert ane_tuning._ane_execution_observed(_trace(mlp_ops=126)) is True
     assert ane_tuning._ane_execution_observed(_trace(gdn_ops=48)) is True
+
+
+def test_required_mlp_execution_cannot_be_masked_by_gdn():
+    trace = _trace(mlp_ops=0, gdn_ops=48)
+
+    assert ane_tuning._ane_execution_observed(trace, require_mlp=True) is False
+    assert (
+        ane_tuning._ane_execution_observed(
+            trace, require_mlp=True, require_gdn=True
+        )
+        is False
+    )
 
 
 def test_ane_execution_is_unknown_without_the_profiler():
@@ -412,13 +531,8 @@ async def test_measure_accepts_candidate_whose_ane_executed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_measure_prompt_leaves_a_non_ane_tail_chunk(monkeypatch):
-    """sequence_length * 2 keeps a tail chunk in the measured prefill.
-
-    stream_generate prefills tokens[:-1]; the previous * 2 + 1 made that
-    exactly two full ANE-shaped blocks with no GPU tail, which overstated
-    the ANE gain in every v0.6.2 tuner result.
-    """
+async def test_measure_prompt_uses_four_exact_ane_tiles(monkeypatch):
+    """Account for stream_generate consuming the final input token."""
     pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126))
     lengths = []
     monkeypatch.setattr(
@@ -433,7 +547,7 @@ async def test_measure_prompt_leaves_a_non_ane_tail_chunk(monkeypatch):
 
     await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
 
-    assert lengths == [2048 + 1, 2048 * 2]
+    assert lengths == [2048 + 1, 2048 * 4 + 1]
 
 
 @pytest.mark.asyncio
@@ -535,6 +649,7 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "mlp_fraction": None,
         "gdn_enabled": False,
         "gdn_fraction": None,
+        "fused_down": False,
         "processing_tps": 100.0,
         "speedup_percent": 0.0,
         "sequence_length": run.request.sequence_length,

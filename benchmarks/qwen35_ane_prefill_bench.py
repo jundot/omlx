@@ -228,6 +228,12 @@ def main() -> None:
         type=float,
         help="Benchmark several CPU GDN shares after one ANE compilation",
     )
+    parser.add_argument(
+        "--cpu-down-fraction-grid",
+        nargs="+",
+        type=float,
+        help="Benchmark several CPU down shares after one ANE compilation",
+    )
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument(
         "--ane-sequence-length",
@@ -258,6 +264,20 @@ def main() -> None:
         help="Optional fp16 CPU share of each MLP down projection",
     )
     parser.add_argument(
+        "--ane-down-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Experimental output-row share, or per-ANE hidden share with "
+            "--ane-fused-down"
+        ),
+    )
+    parser.add_argument(
+        "--ane-fused-down",
+        action="store_true",
+        help="Fuse each ANE gate/up slice through its partial down projection",
+    )
+    parser.add_argument(
         "--cpu-gdn-fraction",
         type=float,
         default=0.0,
@@ -283,6 +303,10 @@ def main() -> None:
         value < 0 or value > 0.50 for value in args.cpu_gdn_fraction_grid
     ):
         parser.error("CPU GDN fractions must be between 0 and 0.50")
+    if args.cpu_down_fraction_grid and any(
+        value < 0 or value > 0.50 for value in args.cpu_down_fraction_grid
+    ):
+        parser.error("CPU down fractions must be between 0 and 0.50")
 
     native_ext = inject_extension(args.extension) if args.extension else None
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -333,6 +357,8 @@ def main() -> None:
                 dual_ane=False,
                 cpu_fraction=args.cpu_fraction,
                 cpu_down_fraction=args.cpu_down_fraction,
+                ane_down_fraction=args.ane_down_fraction,
+                fused_down=args.ane_fused_down,
                 cpu_gdn_fraction=args.cpu_gdn_fraction,
                 cpu_threads=args.cpu_threads,
                 cpu_shared_resource=not args.disable_cpu_shared_resource,
@@ -349,6 +375,8 @@ def main() -> None:
                 dual_ane=True,
                 cpu_fraction=args.cpu_fraction,
                 cpu_down_fraction=args.cpu_down_fraction,
+                ane_down_fraction=args.ane_down_fraction,
+                fused_down=args.ane_fused_down,
                 cpu_gdn_fraction=args.cpu_gdn_fraction,
                 cpu_threads=args.cpu_threads,
                 cpu_shared_resource=not args.disable_cpu_shared_resource,
@@ -358,20 +386,25 @@ def main() -> None:
             mlp_layers = 0
             compile_seconds = 0.0
 
-        variants: list[tuple[str, int | None, float | None]] = [
-            (mode, None, None)
+        variants: list[tuple[str, int | None, float | None, float | None]] = [
+            (mode, None, None, None)
         ]
         if mode in ("single", "dual") and args.cpu_threads_grid:
             variants = [
-                (f"{mode}_cpu_threads_{threads}", threads, None)
+                (f"{mode}_cpu_threads_{threads}", threads, None, None)
                 for threads in args.cpu_threads_grid
             ]
         if mode in ("single", "dual") and args.cpu_gdn_fraction_grid:
             variants = [
-                (f"{mode}_cpu_gdn_{fraction:.3f}", None, fraction)
+                (f"{mode}_cpu_gdn_{fraction:.3f}", None, fraction, None)
                 for fraction in args.cpu_gdn_fraction_grid
             ]
-        for result_key, cpu_threads, cpu_gdn_fraction in variants:
+        if mode in ("single", "dual") and args.cpu_down_fraction_grid:
+            variants = [
+                (f"{mode}_cpu_down_{fraction:.3f}", None, None, fraction)
+                for fraction in args.cpu_down_fraction_grid
+            ]
+        for result_key, cpu_threads, cpu_gdn_fraction, cpu_down_fraction in variants:
             if cpu_threads is not None:
                 for module in model.modules():
                     config = getattr(module, "_omlx_ane_prefill_config", None)
@@ -408,6 +441,20 @@ def main() -> None:
                     module._omlx_ane_gdn_config = updated_config
                     module._omlx_ane_gdn_state = updated_state
                 mx.clear_cache()
+            if cpu_down_fraction is not None:
+                from omlx.patches import qwen35_ane_prefill as ane_patch
+
+                for module in model.modules():
+                    state = getattr(module, "_omlx_ane_prefill_state", None)
+                    if state is None or not hasattr(module, "down_proj"):
+                        continue
+                    module._omlx_ane_prefill_state = replace(
+                        state,
+                        down_cpu=ane_patch._prepare_cpu_linear(
+                            module.down_proj, cpu_down_fraction
+                        ),
+                    )
+                mx.clear_cache()
             measured, output = benchmark_mode(model, tokens, args.repeats)
             measured.update(
                 {
@@ -417,7 +464,12 @@ def main() -> None:
                     if cpu_threads is not None
                     else args.cpu_threads,
                     "cpu_shared_resource": not args.disable_cpu_shared_resource,
-                    "cpu_down_fraction": args.cpu_down_fraction,
+                    "cpu_down_fraction": (
+                        cpu_down_fraction
+                        if cpu_down_fraction is not None
+                        else args.cpu_down_fraction
+                    ),
+                    "ane_down_fraction": args.ane_down_fraction,
                     "cpu_gdn_fraction": (
                         cpu_gdn_fraction
                         if cpu_gdn_fraction is not None
@@ -440,6 +492,11 @@ def main() -> None:
                     else 0,
                     "gdn_layers": int(
                         getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "down_layers": int(
+                        getattr(model, "_omlx_ane_down_prefill_count", 0)
                     )
                     if mode != "gpu"
                     else 0,
