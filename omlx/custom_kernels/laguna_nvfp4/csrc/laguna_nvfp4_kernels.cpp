@@ -1,0 +1,246 @@
+// Copyright © 2026 oMLX contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// NVFP4 (E4M3) Metal kernel dispatch, ported from
+// Layr-Labs/mlxfast-challenge (Sources/MLXFastModel/LagunaRuntimeModel.swift).
+//
+// Metal kernel sources live in laguna_nvfp4.metal, compiled into
+// omlx_laguna_nvfp4_kernels.metallib by CMake. The metallib is loaded lazily
+// on the first dispatch call and cached.
+//
+// MLX 0.32+ requires Metal dispatch to occur inside Primitive::eval_gpu.
+// All public API functions return an unevaluated array whose Primitive drives
+// the actual Metal dispatch at eval time.
+
+#include "laguna_nvfp4_kernels.h"
+
+#include <dlfcn.h>
+#include <algorithm>
+#include <filesystem>
+#include <sstream>
+#include <string>
+
+#include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/metal.h"
+#include "mlx/backend/metal/utils.h"
+#include "mlx/ops.h"
+#include "mlx/primitives.h"
+#include "mlx/utils.h"
+
+namespace omlx::laguna_nvfp4 {
+
+namespace {
+
+using namespace mlx::core;
+using namespace mlx::core::metal;
+
+// ---------------------------------------------------------------------------
+// Metallib loader
+// ---------------------------------------------------------------------------
+
+constexpr const char* kMetallibName = "omlx_laguna_nvfp4_kernels";
+
+std::string binary_dir() {
+    static std::string dir = []() {
+        Dl_info info;
+        if (!dladdr(reinterpret_cast<void*>(&binary_dir), &info)) {
+            throw std::runtime_error(
+                "laguna_nvfp4: unable to resolve binary dir.");
+        }
+        return std::filesystem::path(info.dli_fname).parent_path().string();
+    }();
+    return dir;
+}
+
+MTL::ComputePipelineState* get_laguna_kernel(
+    metal::Device& d,
+    const std::string& kernel_name) {
+    auto* lib = d.get_library(kMetallibName, binary_dir());
+    return d.get_kernel(kernel_name, lib);
+}
+
+// ---------------------------------------------------------------------------
+// Shared-expert fused gate/up NVFP4 QMV primitive
+// ---------------------------------------------------------------------------
+
+// SharedSwiGLUQmvPrimitive:
+//   inputs[0] = x      [K] bf16 activations
+//   inputs[1] = w      [2N, K*4/32] uint8 fused gate/up NVFP4 codes
+//   inputs[2] = scales [2N, K/16] uint8 E4M3 group scales
+//   output[0] = out    [N] bf16 silu(gate) * up
+class SharedSwiGLUQmvPrimitive : public Primitive {
+ public:
+    explicit SharedSwiGLUQmvPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 SharedSwiGLUQmvPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        const auto& x = inputs[0];
+        const auto& w = inputs[1];
+        const auto& scales = inputs[2];
+
+        auto kernel = get_laguna_kernel(
+            d, "laguna_shared_nvfp4_swiglu_qmv_bf16_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        enc.set_input_array(x, c++);
+        enc.set_input_array(w, c++);
+        enc.set_input_array(scales, c++);
+        enc.set_output_array(out, c++);
+
+        // 512 output rows; each threadgroup (2 simdgroups x 32 lanes) owns 4
+        // rows. 128 tiles x 4 rows = 512.
+        MTL::Size group_dims(64, 1, 1);
+        MTL::Size grid_dims(128, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(SharedSwiGLUQmvPrimitive)
+};
+
+// SharedDownResidualPrimitive:
+//   inputs[0] = activated [K2] bf16 swiglu output (K2 = 512)
+//   inputs[1] = down_weight [N, K2/2] uint8 NVFP4 codes (N = 2048)
+//   inputs[2] = down_scales [N, K2/16] uint8 E4M3 scales
+//   inputs[3] = routed [N] bf16
+//   inputs[4] = residual [N] bf16
+//   output[0] = out [N] bf16 = residual + (routed + shared)
+class SharedDownResidualPrimitive : public Primitive {
+ public:
+    explicit SharedDownResidualPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 SharedDownResidualPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        auto kernel = get_laguna_kernel(
+            d, "laguna_shared_nvfp4_down_residual_bf16_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        // 2048 output rows; each threadgroup (2 simdgroups x 32 lanes) owns
+        // 8 rows (2 simdgroups x 4 rows). 256 groups x 8 = 2048.
+        MTL::Size group_dims(64, 1, 1);
+        MTL::Size grid_dims(256, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(SharedDownResidualPrimitive)
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+array shared_nvfp4_swiglu_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s) {
+    if (x.ndim() != 1 || x.dtype() != bfloat16) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared_nvfp4_swiglu_qmv: expected 1-D bf16 input "
+               "of shape [2048], got shape ["
+            << x.shape() << "] dtype " << x.dtype();
+        throw std::invalid_argument(msg.str());
+    }
+    int64_t K = x.shape(0);
+    int64_t N = w.shape(0) / 2;
+    // The kernel reads each row as K/2 bytes of 4-bit nibbles. mlx-standard
+    // packing stores those in uint32 (8 nibbles per word) — K/8 uint32 per
+    // row — and the challenge's fused plane uses the same byte layout.
+    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
+    int64_t row_bytes = w.shape(1) * dtype_bytes;
+    if (w.ndim() != 2 || scales.ndim() != 2 ||
+        scales.shape(0) != 2 * N ||
+        scales.shape(1) * 16 != K ||
+        row_bytes * 2 != K) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared_nvfp4_swiglu_qmv: shape mismatch — "
+               "x " << x.shape() << ", w " << w.shape()
+            << " (row_bytes " << row_bytes << "), scales " << scales.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<SharedSwiGLUQmvPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(out_shape, bfloat16, prim, {x, w, scales});
+}
+
+array shared_nvfp4_down_residual(
+    const array& activated,
+    const array& down_weight,
+    const array& down_scales,
+    const array& routed,
+    const array& residual,
+    StreamOrDevice s) {
+    // activated [K2], down_weight [N, K2/2], down_scales [N, K2/16],
+    // routed/residual [N]; N = 2048, K2 = 512.
+    int64_t N = routed.shape(0);
+    int64_t K2 = activated.shape(0);
+    if (activated.ndim() != 1 || activated.dtype() != bfloat16 ||
+        routed.ndim() != 1 || residual.ndim() != 1 ||
+        routed.dtype() != bfloat16 || residual.dtype() != bfloat16 ||
+        down_weight.ndim() != 2 || down_scales.ndim() != 2 ||
+        down_weight.shape(0) != N || down_scales.shape(0) != N ||
+        down_scales.shape(1) * 16 != K2 ||
+        down_weight.shape(1) * 8 != K2 ||
+        residual.shape(0) != N) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared_nvfp4_down_residual: shape mismatch — "
+               "activated " << activated.shape() << ", down_weight "
+            << down_weight.shape() << ", down_scales " << down_scales.shape()
+            << ", routed " << routed.shape() << ", residual "
+            << residual.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<SharedDownResidualPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(
+        out_shape,
+        bfloat16,
+        prim,
+        {activated, down_weight, down_scales, routed, residual});
+}
+
+int64_t abi_probe(const array& a) {
+    return static_cast<int64_t>(a.size());
+}
+
+}  // namespace omlx::laguna_nvfp4

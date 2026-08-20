@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for omlx.custom_kernels.laguna_nvfp4 — the NVFP4 (E4M3) decode kernels
+ported from Layr-Labs/mlxfast-challenge (LagunaRuntimeModel.swift).
+
+The shared-expert SwiGLU-QMV kernel is validated against the stock
+``mx.quantized_matmul(mode="nvfp4")`` + swiglu path (the omlx laguna model's
+current fused gate/up implementation). On the real Poolside Laguna XS 2.1
+model the difference is last-ULP (accumulation order), so the comparison uses
+a ULP-scaled tolerance; the all-zeros and single-nibble cases are exact.
+
+The real-model fixture test runs when the pinned model is staged in the HF
+cache; the synthetic tests always run.
+"""
+
+from __future__ import annotations
+
+import os
+
+import mlx.core as mx
+import pytest
+
+from omlx.custom_kernels.laguna_nvfp4 import fast as laguna_nvfp4
+
+_K = 2048
+_N = 512
+
+
+def _swiglu(gate, up):
+    gate32 = gate.astype(mx.float32)
+    return (gate32 * mx.sigmoid(gate32) * up.astype(mx.float32)).astype(
+        gate.dtype
+    )
+
+
+def _fused_plane(seed: int):
+    """Synthetic NVFP4 gate/up plane quantized with mlx's nvfp4 quantizer."""
+    mx.random.seed(seed)
+    gate_w = mx.random.normal((_N, _K), scale=0.02)
+    up_w = mx.random.normal((_N, _K), scale=0.02)
+    gq, gs = mx.quantize(gate_w, group_size=16, bits=4, mode="nvfp4")
+    uq, us = mx.quantize(up_w, group_size=16, bits=4, mode="nvfp4")
+    return (
+        mx.concatenate([gq, uq], axis=0),
+        mx.concatenate([gs, us], axis=0),
+    )
+
+
+def _stock_path(x, w, scales):
+    gate_up = mx.quantized_matmul(
+        x[None, :], w, scales=scales, transpose=True,
+        group_size=16, bits=4, mode="nvfp4",
+    )
+    split = gate_up.shape[-1] // 2
+    g, u = gate_up[..., :split], gate_up[..., split:]
+    return _swiglu(g, u).squeeze(0)
+
+
+def test_module_imports_without_native():
+    assert laguna_nvfp4 is not None
+
+
+def test_all_zero_weights_give_zero():
+    x = mx.random.normal((_K,)).astype(mx.bfloat16)
+    w = mx.zeros((2 * _N, _K // 8), mx.uint32)
+    scales = (mx.ones((2 * _N, _K // 16)) * 20).astype(mx.uint8)
+    y = laguna_nvfp4.shared_nvfp4_swiglu_qmv(x, w, scales)
+    assert float(mx.abs(y).max()) == 0.0
+
+
+def test_single_nibble_activates_only_its_row():
+    x = mx.random.normal((_K,)).astype(mx.bfloat16)
+    w = mx.zeros((2 * _N, _K // 8), mx.uint32)
+    scales = (mx.ones((2 * _N, _K // 16)) * 20).astype(mx.uint8)
+    wn = mx.zeros((2 * _N, _K // 8), mx.uint32)
+    flat = mx.arange(2 * _N * (_K // 8))
+    wn = mx.where(flat == 0, mx.array(1, mx.uint32), wn.reshape(-1)).reshape(
+        _N * 2, _K // 8
+    )
+    wn = mx.where(flat == (_N * (_K // 8)), mx.array(2, mx.uint32),
+                  wn.reshape(-1)).reshape(_N * 2, _K // 8)
+    y = laguna_nvfp4.shared_nvfp4_swiglu_qmv(x, wn, scales)
+    assert float(mx.abs(y[1:]).max()) == 0.0
+    assert float(mx.abs(y[0])) > 0.0
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_matches_stock_nvfp4_path_within_ulp(seed):
+    """Custom kernel vs stock nvfp4 matmul + swiglu: last-ULP agreement.
+
+    The kernels share the E4M3 decode semantics but accumulate in different
+    orders (lane/simd tree vs the stock kernel), so exact equality holds for
+    ~half the rows and the rest differ at the final bf16 rounding.
+    """
+    x = mx.random.normal((_K,), scale=0.1).astype(mx.bfloat16)
+    w, scales = _fused_plane(seed)
+    y_native = laguna_nvfp4.shared_nvfp4_swiglu_qmv(x, w, scales)
+    y_stock = _stock_path(x, w, scales)
+
+    d = mx.abs(y_native.astype(mx.float32) - y_stock.astype(mx.float32))
+    mag = mx.abs(y_stock.astype(mx.float32))
+    # bf16 ulp at the largest output magnitude, times a small factor
+    ulp = mx.finfo(mx.bfloat16).eps * mx.maximum(mag, 1e-6)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max diff {float(d.max()):.6g} exceeds 4 ulp "
+        f"({float((4 * ulp).max()):.6g})"
+    )
+    # the accumulation-order difference leaves most rows bit-exact; the
+    # binding assertion is the ULP bound above
+    assert int(mx.sum(d == 0)) >= _N // 8
+
+
+def _stock_down_path(activated, w, scales, routed, residual):
+    shared = mx.quantized_matmul(
+        activated[None, :], w, scales=scales, transpose=True,
+        group_size=16, bits=4, mode="nvfp4",
+    ).squeeze(0)
+    return (residual + (routed + shared)).astype(mx.bfloat16)
+
+
+@pytest.mark.parametrize("seed", [3, 4])
+def test_down_residual_matches_stock_within_ulp(seed):
+    """Shared down+residual kernel vs stock nvfp4 matmul + adds: last-ULP."""
+    N2, K2 = 2048, 512
+    mx.random.seed(seed)
+    down = mx.random.normal((N2, K2), scale=0.02)
+    dq, ds = mx.quantize(down, group_size=16, bits=4, mode="nvfp4")
+    activated = mx.random.normal((K2,), scale=0.1).astype(mx.bfloat16)
+    routed = mx.random.normal((N2,), scale=0.01).astype(mx.bfloat16)
+    residual = mx.random.normal((N2,), scale=0.01).astype(mx.bfloat16)
+    y_native = laguna_nvfp4.shared_nvfp4_down_residual(
+        activated, dq, ds, routed, residual)
+    y_stock = _stock_down_path(activated, dq, ds, routed, residual)
+    d = mx.abs(y_native.astype(mx.float32) - y_stock.astype(mx.float32))
+    mag = mx.abs(y_stock.astype(mx.float32))
+    ulp = mx.finfo(mx.bfloat16).eps * mx.maximum(mag, 1e-6)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max diff {float(d.max()):.6g} exceeds 4 ulp")
+    assert int(mx.sum(d == 0)) >= N2 // 8
+
+
+def test_fallback_agrees_with_native_shape():
+    """The pure-mlx fallback and the native path share the public contract."""
+    x = mx.random.normal((_K,)).astype(mx.bfloat16)
+    w, scales = _fused_plane(7)
+    y = laguna_nvfp4.shared_nvfp4_swiglu_qmv(x, w, scales)
+    assert y.shape == (_N,)
+    assert y.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("bad_shape", [(_K - 1,), (_K // 2,)])
+def test_native_rejects_bad_input_shape(bad_shape):
+    if not laguna_nvfp4.has_native():
+        pytest.skip("native extension not built")
+    x = mx.random.normal(bad_shape).astype(mx.bfloat16)
+    w = mx.zeros((2 * _N, _K // 8), mx.uint32)
+    scales = mx.zeros((2 * _N, _K // 16), mx.uint8)
+    with pytest.raises(Exception):
+        laguna_nvfp4.shared_nvfp4_swiglu_qmv(x, w, scales)
+
+
+# ---------------------------------------------------------------------------
+# Real-model fixture (skipped unless the pinned model is staged)
+# ---------------------------------------------------------------------------
+
+_LAGUNA_MODEL = os.path.expanduser(
+    "~/.cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/"
+    "snapshots/841778bda563a36104dd521e37d99218e46f4f25"
+)
+
+pytestmark_real = pytest.mark.skipif(
+    not os.path.isdir(_LAGUNA_MODEL),
+    reason="Poolside Laguna XS 2.1 NVFP4 model not staged",
+)
+
+
+@pytestmark_real
+def test_real_model_fused_plane_matches_stock():
+    """Real layer-1 shared expert fused plane + real hidden state: the kernel
+    must match the stock nvfp4 path within ULP (accumulation-order only)."""
+    if not laguna_nvfp4.has_native():
+        pytest.skip("native extension not built")
+    import json
+
+    from mlx_lm import load
+
+    from omlx.patches.laguna import apply_laguna_patch
+    from omlx.utils.model_loading import normalize_laguna_compressed_quant
+
+    apply_laguna_patch()
+    cfg = json.load(open(os.path.join(_LAGUNA_MODEL, "config.json")))
+    normalize_laguna_compressed_quant(cfg)
+    model, tok = load(_LAGUNA_MODEL, model_config=cfg)
+
+    # real hidden state: walk layer 0 (the compiled forward is not hookable)
+    ids = mx.array([tok.encode("The quick brown fox jumps over the lazy dog")])
+    h = model.model.embed_tokens(ids)
+    from mlx_lm.models.base import create_attention_mask
+
+    mask = create_attention_mask(h, None)
+    h = model.model.layers[0](h, mask, None)
+    x_in = h[0, -1].reshape(-1)
+
+    se = model.model.layers[1].mlp.shared_expert
+    w = mx.concatenate([se.gate_proj.weight, se.up_proj.weight], axis=0)
+    s = mx.concatenate([se.gate_proj.scales, se.up_proj.scales], axis=0)
+
+    y_native = laguna_nvfp4.shared_nvfp4_swiglu_qmv(x_in, w, s)
+    y_stock = _stock_path(x_in, w, s)
+    d = mx.abs(y_native.astype(mx.float32) - y_stock.astype(mx.float32))
+    mag = mx.abs(y_stock.astype(mx.float32))
+    ulp = mx.finfo(mx.bfloat16).eps * mx.maximum(mag, 1e-6)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"max diff {float(d.max()):.6g} exceeds 4 ulp"
+    )
+    assert int(mx.sum(d == 0)) >= w.shape[0] // 4

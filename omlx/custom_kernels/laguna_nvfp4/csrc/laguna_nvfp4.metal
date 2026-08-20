@@ -1,0 +1,256 @@
+// Copyright © 2026 oMLX contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// NVFP4 (E4M3) decode kernels ported from Layr-Labs/mlxfast-challenge
+// (Sources/MLXFastModel/LagunaRuntimeModel.swift). Kernel bodies are kept
+// VERBATIM (included only the framework-injected buffer attributes and the
+// resolved default flag configuration: DARKBLOOM_NVFP4_SCALE_FOLD /
+// SCALE_DEFER / SCALE_CARRY / QDOT_SEED_ELIDE and E4M3_SIGN_DOMAIN on,
+// nibble split 1).
+//
+// NVFP4 contract: U32-packed weights [N, K*4/32], U8 E4M3 group scales
+// [N, K/16], group size 16, no biases. The fused gate/up plane concatenates
+// gate rows 0..N-1 over up rows N..2N-1 on the row axis.
+//
+// The row-scale suffix (2^22) is the deferred form of the fold: the scale
+// carries 2^14 of the weight magnitude, the kernel re-applies 2^22 once per
+// output row before the single bf16 rounding (bit-exact per the challenge's
+// closed case analysis).
+
+// clang-format off
+#include "mlx/backend/metal/kernels/utils.h"
+// clang-format on
+
+static inline float laguna_nvfp4_scale(uint8_t bits) {
+    if (bits < 16u) {
+        ushort fast_raw = ushort(bits) << 7;
+        return float(as_type<half>(fast_raw));
+    }
+    ushort raw = ushort(uint(bits) << 7);
+    half converted = as_type<half>(raw);
+    half signed_value = converted;
+    return float(signed_value);
+}
+
+static inline float laguna_nvfp4_qdot_codes_16(
+    uint2 codes,
+    const thread float* input,
+    float scale
+) {
+    float accum;
+    {
+        const uint c = codes.x;
+        const uint xe = c & 0x0F0F0F0Fu;
+        const uint ge = xe | (xe << 3);
+        const uint yo = c & 0xF0F0F0F0u;
+        const uint go = yo | (yo >> 3);
+        const uint p0 = (ge << 9) & 0x8E008E00u;
+        const uint p1 = (go << 8) & 0x8E008E00u;
+        const uint p2 = (ge << 1) & 0x8E008E00u;
+        const uint p3 = go & 0x8E008E00u;
+        const float2 v04 = float2(as_type<half2>(p0));
+        const float2 v15 = float2(as_type<half2>(p1));
+        const float2 v26 = float2(as_type<half2>(p2));
+        const float2 v37 = float2(as_type<half2>(p3));
+        accum =
+            (input[0] * v04.x +
+             input[1] * v15.x +
+             input[2] * v26.x +
+             input[3] * v37.x);
+        accum +=
+            (input[4] * v04.y +
+             input[5] * v15.y +
+             input[6] * v26.y +
+             input[7] * v37.y);
+    }
+    {
+        const uint c = codes.y;
+        const uint xe = c & 0x0F0F0F0Fu;
+        const uint ge = xe | (xe << 3);
+        const uint yo = c & 0xF0F0F0F0u;
+        const uint go = yo | (yo >> 3);
+        const uint p0 = (ge << 9) & 0x8E008E00u;
+        const uint p1 = (go << 8) & 0x8E008E00u;
+        const uint p2 = (ge << 1) & 0x8E008E00u;
+        const uint p3 = go & 0x8E008E00u;
+        const float2 v04 = float2(as_type<half2>(p0));
+        const float2 v15 = float2(as_type<half2>(p1));
+        const float2 v26 = float2(as_type<half2>(p2));
+        const float2 v37 = float2(as_type<half2>(p3));
+        accum +=
+            (input[8] * v04.x +
+             input[9] * v15.x +
+             input[10] * v26.x +
+             input[11] * v37.x);
+        accum +=
+            (input[12] * v04.y +
+             input[13] * v15.y +
+             input[14] * v26.y +
+             input[15] * v37.y);
+    }
+    return scale * accum;
+}
+
+static inline float laguna_nvfp4_qdot_16(
+    const device uint8_t* weight,
+    const thread float* input,
+    float scale
+) {
+    const device uint2* packed = (const device uint2*)weight;
+    return laguna_nvfp4_qdot_codes_16(packed[0], input, scale);
+}
+
+// Shared-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU activation.
+// (verbatim from lagunaSharedSwiGLUQMVKernel; buffer attributes injected)
+//   input        [2048] bf16            — shared-expert input
+//   fused_weight [1024][1024] uint8     — 512 gate rows then 512 up rows
+//   fused_scales [1024][128]  uint8     — E4M3 group-16 scales (2048/16)
+//   activated    [512] bf16             — silu(gate) * up
+kernel void laguna_shared_nvfp4_swiglu_qmv_bf16_v1(
+    const device bfloat* input [[buffer(0)]],
+    const device uint8_t* fused_weight [[buffer(1)]],
+    const device uint8_t* fused_scales [[buffer(2)]],
+    device bfloat* activated [[buffer(3)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint input_width = 2048;
+    constexpr uint output_width = 512;
+    constexpr uint fused_width = 1024;
+    constexpr uint packed_row_bytes = 1024;
+    constexpr uint scale_row_bytes = 128;
+    constexpr uint block_width = 512;
+    constexpr uint values_per_lane = 16;
+
+    uint first_row = tile * 4 + simd_group * 2;
+
+    thread float gate_result[2] = {0.0f, 0.0f};
+    thread float up_result[2] = {0.0f, 0.0f};
+    thread float input_values[values_per_lane];
+
+    for (uint block = 0; block < input_width; block += block_width) {
+        const device vec<bfloat, 4>* input_vectors =
+            (const device vec<bfloat, 4>*)(
+                input + block + lane * values_per_lane);
+        for (uint i = 0; i < values_per_lane / 4; ++i) {
+            const vec<bfloat, 4> values = input_vectors[i];
+            input_values[4 * i] = values[0];
+            input_values[4 * i + 1] = values[1];
+            input_values[4 * i + 2] = values[2];
+            input_values[4 * i + 3] = values[3];
+        }
+
+        for (uint row = 0; row < 2; ++row) {
+            uint gate_row = first_row + row;
+            uint up_row = gate_row + output_width;
+            const device uint8_t* gate_weight =
+                (const device uint8_t*)fused_weight +
+                gate_row * packed_row_bytes + block / 2 + lane * 8;
+            const device uint8_t* up_weight =
+                (const device uint8_t*)fused_weight +
+                up_row * packed_row_bytes + block / 2 + lane * 8;
+            const device uint8_t* gate_scale =
+                fused_scales + gate_row * scale_row_bytes +
+                block / 16 + lane;
+            const device uint8_t* up_scale =
+                fused_scales + up_row * scale_row_bytes +
+                block / 16 + lane;
+
+            gate_result[row] += laguna_nvfp4_qdot_16(
+                gate_weight,
+                input_values,
+                laguna_nvfp4_scale(gate_scale[0]));
+            up_result[row] += laguna_nvfp4_qdot_16(
+                up_weight,
+                input_values,
+                laguna_nvfp4_scale(up_scale[0]));
+        }
+    }
+
+    for (uint row = 0; row < 2; ++row) {
+        gate_result[row] = simd_sum(gate_result[row]);
+        up_result[row] = simd_sum(up_result[row]);
+        if (lane == 0) {
+            bfloat gate = bfloat(gate_result[row] * 4194304.0f);
+            bfloat up = bfloat(up_result[row] * 4194304.0f);
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            activated[first_row + row] = bfloat(silu * up);
+        }
+    }
+}
+
+// Shared-expert down_proj with routed + residual adds fused in one kernel.
+// (verbatim from lagunaSharedDownResidualSource(halved: false))
+//   activated   [512] bf16             — swiglu output (silu(gate)*up)
+//   down_weight [2048][256] uint8      — NVFP4 down_proj (K=512 nibbles)
+//   down_scales [2048][32]  uint8      — E4M3 group-16 scales
+//   routed      [2048] bf16            — routed-expert output to add
+//   residual    [2048] bf16            — decoder residual
+//   output      [2048] bf16            — residual + (routed + shared)
+// Grid: 256 groups x (2 simdgroups x 4 rows) = 2048 output rows.
+kernel void laguna_shared_nvfp4_down_residual_bf16_v1(
+    const device bfloat* activated [[buffer(0)]],
+    const device uint8_t* down_weight [[buffer(1)]],
+    const device uint8_t* down_scales [[buffer(2)]],
+    const device bfloat* routed [[buffer(3)]],
+    const device bfloat* residual [[buffer(4)]],
+    device bfloat* output [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint input_width = 512;
+    constexpr uint output_width = 2048;
+    constexpr uint outputs_per_simd = 4;
+    constexpr uint values_per_lane = 16;
+    constexpr uint packed_row_bytes = 256;
+    constexpr uint scale_row_bytes = 32;
+
+    uint first_row =
+        group * 2 * outputs_per_simd +
+        simd_group * outputs_per_simd;
+
+    thread float input_values[values_per_lane];
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*)(
+            activated + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0];
+        input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2];
+        input_values[4 * i + 3] = values[3];
+    }
+
+    thread float result[outputs_per_simd] = {
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+    for (uint row = 0; row < outputs_per_simd; ++row) {
+        uint output_row = first_row + row;
+        const device uint8_t* weight =
+            (const device uint8_t*)down_weight +
+            output_row * packed_row_bytes + lane * 8;
+        const device uint8_t* scale =
+            down_scales + output_row * scale_row_bytes + lane;
+        result[row] = laguna_nvfp4_qdot_16(
+            weight,
+            input_values,
+            laguna_nvfp4_scale(scale[0]));
+        result[row] = simd_sum(result[row]);
+    }
+
+    if (lane == 0) {
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            uint output_row = first_row + row;
+            bfloat shared = bfloat(result[row] * 4194304.0f);
+            bfloat r2 = bfloat(routed[output_row] + shared);
+            output[output_row] =
+                bfloat(residual[output_row] + r2);
+        }
+    }
+}
