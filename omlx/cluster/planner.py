@@ -616,6 +616,14 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     values = [heads, kv_heads]
     model_type = config.get("model_type")
+    if str(model_type or "").startswith("deepseek_v4") and kv_heads == 1:
+        # DeepSeek-V4 is MQA over one shared KV latent, and its shard()
+        # splits only the query heads — it never divides
+        # num_key_value_heads; every rank keeps the full latent. A single
+        # replicated KV head is therefore not a divisor constraint, and
+        # leaving it in rejects every tensor_parallel_size, because
+        # 1 % N != 0 for any N > 1.
+        values = [heads]
     if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe"}:
         values.extend(
             (
