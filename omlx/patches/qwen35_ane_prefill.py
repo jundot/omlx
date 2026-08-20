@@ -1366,6 +1366,53 @@ def _enable_dual_procedure_banks(
     )
 
 
+def _linear_input_dim(linear: Any) -> int:
+    """Logical input width of a QuantizedLinear (packed uint32 -> elements)."""
+    weight = getattr(linear, "weight", None)
+    bits = getattr(linear, "bits", None)
+    if weight is None or not bits:
+        return 0
+    return int(weight.shape[1]) * 32 // int(bits)
+
+
+def ane_prefill_transient_bytes(model: Any, sequence_length: int) -> int:
+    """Estimate the transient ANE-prefill I/O footprint of ``model``.
+
+    When ANE prefill is active the private runtime holds a fp16 input and
+    output IOSurface per compiled slice, sized ``dim * sequence_length * 2``.
+    Summed across the eagerly-compiled MLP and GDN slices this is the
+    deterministic dominant term of the first-request memory spike that trips
+    the hard watermark in issue #2841, and it is *not* covered by
+    ``MemoryMonitor.estimate_prefill_peak_bytes`` (KV + SDPA only).
+
+    Returns 0 when no ANE slice is attached, so it is safe on any model. This
+    is the I/O-surface term, not the full MLX merge scratch, so treat it as a
+    floor for the reservation rather than an exact peak.
+    """
+    if sequence_length <= 0:
+        return 0
+    total = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
+        mlp_state = getattr(module, "_omlx_ane_prefill_state", None)
+        if mlp_state is not None:
+            gate = getattr(module, "gate_proj", None)
+            input_dim = _linear_input_dim(gate) if gate is not None else 0
+            ane_outputs = int(getattr(mlp_state, "ane_outputs", 0) or 0)
+            programs = 2 if getattr(mlp_state, "model1", None) is not None else 1
+            total += (input_dim + ane_outputs) * sequence_length * 2 * programs
+            continue
+        gdn_state = getattr(module, "_omlx_ane_gdn_state", None)
+        if gdn_state is not None:
+            qkv = getattr(module, "in_proj_qkv", None)
+            input_dim = _linear_input_dim(qkv) if qkv is not None else 0
+            ane_outputs = int(getattr(gdn_state, "qkv_outputs", 0) or 0) + int(
+                getattr(gdn_state, "z_outputs", 0) or 0
+            )
+            programs = 2 if getattr(gdn_state, "model1", None) is not None else 1
+            total += (input_dim + ane_outputs) * sequence_length * 2 * programs
+    return int(total)
+
+
 def enable_qwen35_ane_prefill(
     model: Any,
     *,

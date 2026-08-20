@@ -224,6 +224,9 @@ class MemoryMonitor:
         # full-attention formula. Empty for non-hybrid models.
         self._rotating_layer_specs: tuple[tuple[int, int], ...] = ()
         self._prefill_memory_profile: PrefillMemoryProfile | None = None
+        # Transient ANE-prefill I/O surfaces (issue #2841); set via
+        # set_model_info, 0 unless the Qwen ANE prefill backend is attached.
+        self._ane_prefill_transient_bytes: int = 0
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
@@ -407,6 +410,7 @@ class MemoryMonitor:
         kv_bytes_per_token: Optional[float] = None,
         rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
         prefill_memory_profile: PrefillMemoryProfile | None = None,
+        ane_prefill_transient_bytes: int = 0,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -466,6 +470,11 @@ class MemoryMonitor:
             if count > 0 and window > 0
         )
         self._prefill_memory_profile = prefill_memory_profile
+        # Transient ANE-prefill I/O surfaces (issue #2841). 0 unless the Qwen
+        # ANE prefill backend is attached; charged on top of the KV+SDPA peak
+        # so a long first prompt reserves the private-runtime spike instead of
+        # tripping the hard watermark mid-prefill.
+        self._ane_prefill_transient_bytes = max(int(ane_prefill_transient_bytes), 0)
         # A new model's fixed state must be re-measured; a stale value from
         # the previous model would silently mis-charge admission.
         self._fixed_state_bytes = 0
@@ -780,7 +789,11 @@ class MemoryMonitor:
         # baseline. Resident math includes window-capped sliding-window
         # layers and measured fixed state, not just full-attention KVCache.
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
-        return attn + kv
+        # ANE prefill holds fixed-shape I/O surfaces per compiled slice for the
+        # whole prefill; reserve them so a long first prompt doesn't trip the
+        # hard watermark mid-request and get aborted (issue #2841). 0 when the
+        # ANE backend is not attached.
+        return attn + kv + self._ane_prefill_transient_bytes
 
     def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
@@ -1352,6 +1365,31 @@ def estimate_mla_kv_bytes_per_token(
     return float(elems_per_token) * float(dtype_size)
 
 
+def _ane_prefill_transient_bytes(model: Any) -> int:
+    """Transient ANE-prefill I/O bytes for ``model``, 0 when not attached.
+
+    Defensive: the ANE patch is optional at runtime, so any import or lookup
+    failure yields 0 and leaves the KV+SDPA estimate unchanged (issue #2841).
+    """
+    seq = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
+        cfg = getattr(module, "_omlx_ane_prefill_config", None) or getattr(
+            module, "_omlx_ane_gdn_config", None
+        )
+        if cfg is not None:
+            seq = int(getattr(cfg, "sequence_length", 0) or 0)
+            if seq > 0:
+                break
+    if seq <= 0:
+        return 0
+    try:
+        from omlx.patches.qwen35_ane_prefill import ane_prefill_transient_bytes
+
+        return int(ane_prefill_transient_bytes(model, seq))
+    except Exception:  # noqa: BLE001 - patch optional; never break estimation
+        return 0
+
+
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
@@ -1472,6 +1510,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(
                 f"Model info for memory estimation: "

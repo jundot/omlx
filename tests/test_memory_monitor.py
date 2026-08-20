@@ -329,6 +329,30 @@ class TestEstimatePrefillPeakBytes:
         # Total ≈ 4 GB
         assert 3 * 1024**3 < peak < 5 * 1024**3
 
+    def test_ane_prefill_transient_is_added(self):
+        # issue #2841: the ANE prefill I/O surfaces are reserved on top of the
+        # KV+SDPA peak so a long first prompt doesn't trip the hard watermark.
+        base = self._make_monitor()
+        peak_no_ane = base.estimate_prefill_peak_bytes(32768, 2048)
+
+        with_ane = self._make_monitor()
+        reserve = 4 * 1024**3
+        with_ane.set_model_info(
+            num_layers=62,
+            num_kv_heads=4,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=32,
+            ane_prefill_transient_bytes=reserve,
+        )
+        peak_with_ane = with_ane.estimate_prefill_peak_bytes(32768, 2048)
+        assert peak_with_ane == peak_no_ane + reserve
+
+    def test_ane_prefill_transient_defaults_to_zero(self):
+        # models without the ANE backend keep the original KV+SDPA estimate
+        m = self._make_monitor()
+        assert m._ane_prefill_transient_bytes == 0
+
     def test_prefill_head_dim_256_uses_full_score_fallback(self):
         # head_dim=256 is vector-kernel-supported, but not full-prefill-supported.
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)

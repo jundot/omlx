@@ -1504,3 +1504,43 @@ def test_enable_env_kill_switch_wins(monkeypatch):
 
     assert count == 0
     assert installed == []
+
+
+# --- ANE prefill transient memory estimate (issue #2841) ---
+
+
+class _FakeQLinear:
+    def __init__(self, out_features: int, packed_in: int, bits: int = 4):
+        # _linear_input_dim reads weight.shape[1] * 32 // bits
+        self.weight = SimpleNamespace(shape=(out_features, packed_in))
+        self.bits = bits
+
+
+def test_ane_prefill_transient_bytes_sums_slice_io():
+    """The estimate is (input_dim + ane_output) * seq * 2, per compiled slice."""
+    seq = 2048
+    # MLP: input_dim = 640 * 32 // 4 = 5120, ane_outputs = 9216, single program
+    mlp = SimpleNamespace(
+        gate_proj=_FakeQLinear(out_features=9216, packed_in=640, bits=4),
+        _omlx_ane_prefill_state=SimpleNamespace(ane_outputs=9216, model1=None),
+    )
+    model = SimpleNamespace(modules=lambda: [mlp])
+    expected = (5120 + 9216) * seq * 2
+    assert ane_patch.ane_prefill_transient_bytes(model, seq) == expected
+
+    # a dual-ANE slice (model1 present) doubles the I/O surfaces
+    mlp._omlx_ane_prefill_state = SimpleNamespace(ane_outputs=9216, model1=object())
+    assert ane_patch.ane_prefill_transient_bytes(model, seq) == expected * 2
+
+
+def test_ane_prefill_transient_bytes_zero_without_ane():
+    """A model with no ANE slice reserves nothing."""
+    model = SimpleNamespace(modules=lambda: [SimpleNamespace()])
+    assert ane_patch.ane_prefill_transient_bytes(model, 2048) == 0
+    # a non-positive sequence length is a no-op too
+    mlp = SimpleNamespace(
+        gate_proj=_FakeQLinear(9216, 640, 4),
+        _omlx_ane_prefill_state=SimpleNamespace(ane_outputs=9216, model1=None),
+    )
+    one = SimpleNamespace(modules=lambda: [mlp])
+    assert ane_patch.ane_prefill_transient_bytes(one, 0) == 0
