@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fuse Qwen3.5/3.6 MoE routed gate/up projections into one gather_qmm.
+"""Fuse supported MoE routed gate/up projections into one gather_qmm.
 
 At single-token decode the routed-expert path runs three tiny
 ``gather_qmm`` launches per MoE layer (gate, up, down). Affine
@@ -21,6 +21,11 @@ mlx-vlm's qwen3_5_moe target-verify helper calls ``gate_proj``/
 that module-level helper for a fused-aware version. Qwen3.5/3.6 MoE
 MTP checkpoints route through the VLM engine, which is why the VLM
 path matters even for text-only serving.
+
+Gemma 4 MoE uses the same stock ``SwitchGLU`` layout. Its transform is
+limited to the 26B architecture (128 experts, top-8 routing, one routed
+block per layer) and can be disabled independently with
+``OMLX_GEMMA4_MOE_GATE_UP=0``.
 """
 
 from __future__ import annotations
@@ -217,4 +222,57 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     return len(targets)
 
 
-__all__ = ["apply_qwen35_moe_gate_up_fusion"]
+def apply_gemma4_moe_gate_up_fusion(model: Any) -> int:
+    """Fuse gate/up expert projections on a Gemma 4 MoE model."""
+    if os.environ.get("OMLX_GEMMA4_MOE_GATE_UP", "1") == "0":
+        return 0
+
+    module = type(model).__module__ or ""
+    if "gemma4" not in module:
+        return 0
+
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None) or config
+    if text_config is None or not bool(getattr(text_config, "enable_moe_block", False)):
+        return 0
+    if int(getattr(text_config, "num_experts", 0) or 0) != 128:
+        return 0
+    if int(getattr(text_config, "top_k_experts", 0) or 0) != 8:
+        return 0
+    if int(getattr(text_config, "num_hidden_layers", 0) or 0) != 30:
+        return 0
+    if int(getattr(text_config, "hidden_size", 0) or 0) != 2816:
+        return 0
+    if int(getattr(text_config, "moe_intermediate_size", 0) or 0) != 704:
+        return 0
+
+    expected_layers = 30
+    targets = [
+        candidate
+        for _, candidate in model.named_modules()
+        if type(candidate) is SwitchGLU and _can_fuse(candidate)
+    ]
+    if expected_layers <= 0 or len(targets) != expected_layers:
+        return 0
+
+    _ensure_call_patch()
+    for switch_mlp in targets:
+        _fuse_one(switch_mlp)
+        _sync_and_clear_cache()
+    model._omlx_gemma4_gate_up_fused_count = len(targets)
+    logger.info("Gemma 4 MoE gate+up fusion applied: %d layers", len(targets))
+    return len(targets)
+
+
+def apply_moe_gate_up_fusions(model: Any) -> int:
+    """Apply every family-scoped gate/up transform supported by oMLX."""
+    return apply_qwen35_moe_gate_up_fusion(model) + apply_gemma4_moe_gate_up_fusion(
+        model
+    )
+
+
+__all__ = [
+    "apply_gemma4_moe_gate_up_fusion",
+    "apply_moe_gate_up_fusions",
+    "apply_qwen35_moe_gate_up_fusion",
+]

@@ -584,10 +584,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             ):
                 try:
                     from ..patches.qwen35_moe_gate_up import (
-                        apply_qwen35_moe_gate_up_fusion,
+                        apply_moe_gate_up_fusions,
                     )
 
-                    apply_qwen35_moe_gate_up_fusion(target_bundle.model)
+                    apply_moe_gate_up_fusions(target_bundle.model)
                 except Exception:
                     logger.debug(
                         "DFlash target MoE gate+up fusion not applied",

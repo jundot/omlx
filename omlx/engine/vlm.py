@@ -1648,7 +1648,7 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
-        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
@@ -1658,17 +1658,15 @@ class VLMBatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.qwen35_moe_gate_up import apply_moe_gate_up_fusions
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusions,
                     self._vlm_model,
                 )
             except Exception:
-                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
+                logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()

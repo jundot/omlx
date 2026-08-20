@@ -485,7 +485,7 @@ class TestDFlashEngineInit:
         )
         monkeypatch.setattr(
             qwen35_moe_gate_up,
-            "apply_qwen35_moe_gate_up_fusion",
+            "apply_moe_gate_up_fusions",
             lambda model: captured.setdefault("fused_target", model),
         )
         monkeypatch.setattr(
