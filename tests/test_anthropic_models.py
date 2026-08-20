@@ -6,7 +6,6 @@ Tests the request and response models for Anthropic Messages API,
 including content blocks, tools, and streaming events.
 """
 
-import json
 import pytest
 from pydantic import ValidationError
 
@@ -26,10 +25,10 @@ from omlx.api.anthropic_models import (
     ErrorEvent,
     InputJsonDelta,
     MessageDeltaEvent,
-    MessageStartEvent,
-    MessageStopEvent,
     MessagesRequest,
     MessagesResponse,
+    MessageStartEvent,
+    MessageStopEvent,
     PingEvent,
     SystemContent,
     TextDelta,
@@ -516,13 +515,14 @@ class TestMessagesRequest:
         assert req.top_k == 40
         assert req.metadata == {"user_id": "123"}
 
-    def test_request_max_tokens_required(self):
-        """Test that max_tokens is required."""
-        with pytest.raises(ValidationError):
-            MessagesRequest(
-                model="claude-3-sonnet",
-                messages=[AnthropicMessage(role="user", content="Hello")],
-            )
+    def test_request_max_tokens_optional(self):
+        """Test that max_tokens may be omitted for server-side defaults."""
+        req = MessagesRequest(
+            model="claude-3-sonnet",
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+
+        assert req.max_tokens is None
 
     def test_request_model_required(self):
         """Test that model is required."""

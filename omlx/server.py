@@ -44,6 +44,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -57,7 +58,7 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
@@ -195,6 +196,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .settings import DS4Settings, DS4_THINK_MAX_CONTEXT_TOKENS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -730,6 +732,16 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
+class _ModelNotFoundHTTPException(HTTPException):
+    """404 carrying stable API metadata for a failed model lookup."""
+
+    error_param = "model"
+    error_code = "model_not_found"
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=404, detail=detail)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -748,11 +760,28 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.status_code,
             exc.detail,
         )
-    if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+    if (
+        request.url.path == "/v1/messages"
+        and getattr(exc, "error_code", None) == "model_not_found"
+    ):
+        content = {
+            "type": "error",
+            "error": {"type": "not_found_error", "message": exc.detail},
+        }
+    elif _is_api_route(request):
+        content = _openai_error_body(
+            exc.detail,
+            exc.status_code,
+            param=getattr(exc, "error_param", None),
+            code=getattr(exc, "error_code", None),
+        )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -1168,7 +1197,7 @@ async def get_engine(
             f"Model '{model_id}' not found. "
             f"Available models: {', '.join(available) if available else '(none)'}"
         )
-        raise HTTPException(status_code=404, detail=detail)
+        raise _ModelNotFoundHTTPException(detail)
     except ModelTooLargeError as e:
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
@@ -1651,7 +1680,10 @@ def resolve_model_id(model_id: str | None) -> str | None:
     pool = _server_state.engine_pool
     if pool is None:
         return model_id
-    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+    resolver = getattr(pool, "resolve_model_id", None)
+    if not callable(resolver):
+        return model_id
+    return resolver(model_id, _server_state.settings_manager)
 
 
 async def _ensure_tokenizer_for_system_probe(
@@ -1775,15 +1807,28 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     requested_model_id = model_id
     model_settings = get_model_settings_for_request(requested_model_id)
     model_id = resolve_model_id(model_id)
+    pool = _server_state.engine_pool
 
     # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
 
     # Priority 2: model-native context, optionally clamped by policy
-    pool = _server_state.engine_pool
     if model_id and pool is not None:
-        entry = pool.get_entry(model_id)
+        get_entry = getattr(pool, "get_entry", None)
+        entry = get_entry(model_id) if callable(get_entry) else None
+        if entry is not None and getattr(entry, "engine_type", None) == "ds4":
+            engine = entry.engine
+            effective_context = getattr(engine, "effective_context_tokens", None)
+            if callable(effective_context):
+                return effective_context()
+            get_ds4_settings = getattr(pool, "_get_ds4_settings", None)
+            ds4_settings = get_ds4_settings() if callable(get_ds4_settings) else None
+            if not isinstance(ds4_settings, DS4Settings):
+                global_settings = _server_state.global_settings
+                ds4_settings = getattr(global_settings, "ds4", None)
+            if isinstance(ds4_settings, DS4Settings):
+                return ds4_settings.get_auto_context_tokens()
         if entry is not None and entry.model_context_length is not None:
             native = entry.model_context_length
             policy = getattr(_server_state.sampling, "max_context_window_policy", None)
@@ -1956,6 +2001,8 @@ def init_server(
     # is constructed.
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
+        global_settings=global_settings,
+        base_path=base_path,
     )
     from .cluster.enrollment import configure_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
@@ -2760,12 +2807,27 @@ async def _create_markitdown_chat_completion(
 @app.get("/v1/models")
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
-    models = []
+    models: list[ModelInfo] = []
+    seen_model_ids: set[str] = set()
+
+    def add_model_info(display_id: str, *, context_model_id: str) -> None:
+        if display_id in seen_model_ids:
+            return
+        seen_model_ids.add(display_id)
+        models.append(
+            ModelInfo(
+                id=display_id,
+                owned_by="omlx",
+                max_model_len=get_max_context_window(context_model_id),
+            )
+        )
     favorite_ids: set[str] = set()
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
+        display_ids_by_model: dict[str, str] = {}
+        settings_by_model: dict[str, object] = {}
 
         hide_helpers = bool(
             _server_state.global_settings is not None
@@ -2792,10 +2854,17 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             ms = None
             if settings_manager:
                 ms = settings_manager.get_settings(model_id)
+                settings_by_model[model_id] = ms
                 if ms.model_alias:
                     display_id = ms.model_alias
+            display_ids_by_model[model_id] = display_id
+
+        for m in status["models"]:
+            model_id = m["id"]
+            display_id = display_ids_by_model[model_id]
+            ms = settings_by_model.get(model_id)
             # Per-model hide: user-selected, always applied.
-            is_hidden = ms is not None and ms.is_hidden
+            is_hidden = bool(ms is not None and getattr(ms, "is_hidden", False))
             # Global helper hide: skip drafters when the toggle is on. A model
             # is a drafter if intrinsically flagged at discovery (config marker)
             # or referenced as another model's draft.
@@ -2808,40 +2877,25 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             if is_hidden or is_hidden_helper:
                 excluded_model_ids.add(model_id)
                 continue
-            if ms is not None and ms.is_favorite:
+            if ms is not None and getattr(ms, "is_favorite", False):
                 favorite_ids.add(display_id)
-            models.append(
-                ModelInfo(
-                    id=display_id,
-                    owned_by="omlx",
-                    max_model_len=get_max_context_window(model_id),
-                )
-            )
+            add_model_info(display_id, context_model_id=model_id)
+
         if settings_manager:
             physical_ids = {m["id"] for m in status["models"]}
-            existing_ids = {m.id for m in models}
             for profile in settings_manager.list_exposed_profile_models():
                 source_model_id = profile["source_model_id"]
                 profile_model_id = profile["model_id"]
                 if (
                     source_model_id not in physical_ids
+                    or profile_model_id in seen_model_ids
                     or source_model_id in excluded_model_ids
-                    or profile_model_id in existing_ids
                 ):
                     continue
-                models.append(
-                    ModelInfo(
-                        id=profile_model_id,
-                        owned_by="omlx",
-                        max_model_len=get_max_context_window(profile_model_id),
-                    )
-                )
-                existing_ids.add(profile_model_id)
+                add_model_info(profile_model_id, context_model_id=profile_model_id)
 
-    if _markitdown_is_visible() and not any(
-        m.id == MARKITDOWN_MODEL_ID for m in models
-    ):
-        models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
+    if _markitdown_is_visible() and MARKITDOWN_MODEL_ID not in seen_model_ids:
+        add_model_info(MARKITDOWN_MODEL_ID, context_model_id=MARKITDOWN_MODEL_ID)
 
     # Favorites first; stable sort keeps alphabetical order within groups.
     if favorite_ids:
@@ -2900,20 +2954,33 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     return status
 
 
+@app.get("/v1/models/{model_id}")
+async def retrieve_model(model_id: str, _: bool = Depends(verify_api_key)) -> ModelInfo:
+    """Return one API-visible model by its exact published identity."""
+    catalog = await list_models(True)
+    for model in catalog.data:
+        if model.id == model_id:
+            return model
+    raise _ModelNotFoundHTTPException(f"Model '{model_id}' not found")
+
+
 @app.post("/v1/models/{model_id}/unload")
 async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     """Manually unload a model from memory."""
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    entry = _server_state.engine_pool.get_entry(model_id)
+    resolved_model_id = resolve_model_id(model_id) or model_id
+    entry = _server_state.engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
-        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+        raise HTTPException(
+            status_code=400, detail=f"Model not loaded: {resolved_model_id}"
+        )
 
-    await _server_state.engine_pool._unload_engine(model_id)
-    return {"status": "ok", "model_id": model_id}
+    await _server_state.engine_pool._unload_engine(resolved_model_id)
+    return {"status": "ok", "model_id": resolved_model_id}
 
 
 @app.post("/v1/models/{model_id}/load")
@@ -2922,18 +2989,19 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    entry = _server_state.engine_pool.get_entry(model_id)
+    resolved_model_id = resolve_model_id(model_id) or model_id
+    entry = _server_state.engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is not None:
         return {
             "status": "ok",
-            "model_id": model_id,
-            "message": f"Already loaded: {model_id}",
+            "model_id": resolved_model_id,
+            "message": f"Already loaded: {resolved_model_id}",
         }
 
     try:
-        await _server_state.engine_pool.get_engine(model_id)
+        await _server_state.engine_pool.get_engine(resolved_model_id)
     except ModelNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ModelTooLargeError as e:
@@ -2951,7 +3019,11 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Loaded {resolved_model_id}",
+    }
 
 
 # =============================================================================
@@ -3212,6 +3284,11 @@ async def create_completion(
         model_load_duration = time.perf_counter() - load_start
         resolved_model = _serving_model_id(lease, request.model)
 
+        if _is_ds4_completion_proxy_engine(engine):
+            response = await _create_ds4_text_completion(engine, request, resolved_model)
+            await lease.release()
+            return response
+
         # Handle single prompt or list of prompts
         prompts = (
             request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -3389,6 +3466,621 @@ async def create_completion(
         raise
 
 
+def _is_ds4_chat_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy chat completions to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_chat_completion", None))
+        and callable(getattr(engine, "open_chat_completion_stream", None))
+    )
+
+
+def _is_ds4_completion_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy text completions to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_completion", None))
+        and callable(getattr(engine, "open_completion_stream", None))
+    )
+
+
+def _is_ds4_response_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy Responses API requests to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_response", None))
+        and callable(getattr(engine, "open_response_stream", None))
+    )
+
+
+def _is_ds4_anthropic_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy Anthropic Messages requests to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_anthropic_message", None))
+        and callable(getattr(engine, "open_anthropic_message_stream", None))
+    )
+
+
+def _choose_sampling_value(
+    request_value, setting_name: str, default, model_settings
+):
+    """Resolve a sampling parameter: request > per-model setting > global default."""
+    if request_value is not None:
+        return request_value
+    if model_settings is not None:
+        model_value = getattr(model_settings, setting_name, None)
+        if model_value is not None:
+            return model_value
+    return default
+
+
+def _ds4_sampling_params_without_force(
+    request: ChatCompletionRequest | CompletionRequest,
+) -> dict:
+    """Resolve DS4 sampling values without overriding client-supplied fields."""
+    global_sampling = _server_state.sampling
+    model_settings = None
+    model_id = resolve_model_id(request.model)
+    if model_id and _server_state.settings_manager:
+        model_settings = _server_state.settings_manager.get_settings(model_id)
+
+
+    return {
+        "temperature": _choose_sampling_value(
+            request.temperature, "temperature", global_sampling.temperature, model_settings
+        ),
+        "top_p": _choose_sampling_value(
+            request.top_p, "top_p", global_sampling.top_p, model_settings
+        ),
+        "top_k": _choose_sampling_value(
+            request.top_k, "top_k", global_sampling.top_k, model_settings
+        ),
+        "min_p": _choose_sampling_value(
+            request.min_p, "min_p", 0.0, model_settings
+        ),
+        "max_tokens": _choose_sampling_value(
+            request.max_tokens, "max_tokens", global_sampling.max_tokens, model_settings
+        ),
+    }
+
+
+def _ds4_explicit_reasoning_effort(request: object) -> str | None:
+    """Return the explicit reasoning effort from a supported API shape."""
+    direct = getattr(request, "reasoning_effort", None)
+    if isinstance(direct, str):
+        return direct
+
+    for field_name in ("reasoning", "output_config"):
+        config = getattr(request, field_name, None)
+        if isinstance(config, dict):
+            effort = config.get("effort")
+        else:
+            effort = getattr(config, "effort", None)
+        if isinstance(effort, str):
+            return effort
+    return None
+
+
+async def _ensure_ds4_max_reasoning_context(
+    engine: object,
+    request: object,
+) -> None:
+    """Raise DS4 context only for an explicit maximum-effort request."""
+    effort = _ds4_explicit_reasoning_effort(request)
+    if effort is None or effort.strip().lower() != "max":
+        return
+    ensure_min_context = getattr(engine, "ensure_min_context", None)
+    if callable(ensure_min_context):
+        await ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS)
+
+
+async def _reserve_ds4_proxy_request_window(engine: object):
+    """Mark DS4 active between context checks and endpoint proxy startup."""
+    begin = getattr(engine, "begin_proxy_request_window", None)
+    end = getattr(engine, "end_proxy_request_window", None)
+    if not callable(begin) or not callable(end):
+        return None
+    await begin()
+    return end
+
+
+def _build_ds4_chat_proxy_body(
+    request: ChatCompletionRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for OpenAI chat completions."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_sampling_params_without_force(request))
+    body["model"] = resolved_model
+    return body
+
+
+def _build_ds4_completion_proxy_body(
+    request: CompletionRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for OpenAI text completions."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_sampling_params_without_force(request))
+    body["model"] = resolved_model
+    return body
+
+
+def _ds4_responses_sampling_params_without_force(
+    request: ResponsesRequest,
+    body: dict,
+) -> dict:
+    """Resolve Responses API DS4 sampling defaults without forcing clients."""
+    global_sampling = _server_state.sampling
+    model_settings = None
+    model_id = resolve_model_id(request.model)
+    if model_id and _server_state.settings_manager:
+        model_settings = _server_state.settings_manager.get_settings(model_id)
+
+
+    params = {
+        "temperature": _choose_sampling_value(
+            request.temperature, "temperature", global_sampling.temperature, model_settings
+        ),
+        "top_p": _choose_sampling_value(
+            request.top_p, "top_p", global_sampling.top_p, model_settings
+        ),
+    }
+    if request.max_output_tokens is not None:
+        params["max_output_tokens"] = request.max_output_tokens
+    else:
+        params["max_output_tokens"] = _choose_sampling_value(
+            None, "max_tokens", global_sampling.max_tokens, model_settings
+        )
+    return params
+
+
+def _build_ds4_responses_proxy_body(
+    request: ResponsesRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for OpenAI Responses API requests."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_responses_sampling_params_without_force(request, body))
+    body["model"] = resolved_model
+    return body
+
+
+def _ds4_anthropic_sampling_params_without_force(
+    request: AnthropicMessagesRequest,
+) -> dict:
+    """Resolve Anthropic Messages DS4 sampling defaults without forcing clients."""
+    global_sampling = _server_state.sampling
+    model_settings = None
+    model_id = resolve_model_id(request.model)
+    if model_id and _server_state.settings_manager:
+        model_settings = _server_state.settings_manager.get_settings(model_id)
+
+
+    return {
+        "temperature": _choose_sampling_value(
+            request.temperature, "temperature", global_sampling.temperature, model_settings
+        ),
+        "top_p": _choose_sampling_value(
+            request.top_p, "top_p", global_sampling.top_p, model_settings
+        ),
+        "top_k": _choose_sampling_value(
+            request.top_k, "top_k", global_sampling.top_k, model_settings
+        ),
+        "max_tokens": _choose_sampling_value(
+            request.max_tokens, "max_tokens", global_sampling.max_tokens, model_settings
+        ),
+    }
+
+
+def _build_ds4_anthropic_proxy_body(
+    request: AnthropicMessagesRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for Anthropic Messages requests."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_anthropic_sampling_params_without_force(request))
+    body["model"] = resolved_model
+    return body
+
+
+def _proxy_response_media_type(headers: dict[str, str], fallback: str) -> str:
+    for key, value in headers.items():
+        if key.lower() == "content-type" and value:
+            return value
+    return fallback
+
+
+def _proxy_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    excluded = {"connection", "content-length", "content-type", "transfer-encoding"}
+    return {key: value for key, value in headers.items() if key.lower() not in excluded}
+
+
+def _proxy_streaming_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Return proxy headers appropriate for low-latency SSE forwarding."""
+    forwarded = _proxy_response_headers(headers)
+    forwarded.setdefault("Cache-Control", "no-cache")
+    forwarded.setdefault("X-Accel-Buffering", "no")
+    return forwarded
+
+
+def _ds4_int_usage_value(value: object) -> int:
+    """Return a non-negative integer usage value, ignoring malformed data."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    return 0
+
+
+def _ds4_usage_from_payload(payload: object) -> tuple[int, int, int]:
+    """Parse DS4 usage fields from a decoded response or SSE payload."""
+    if not isinstance(payload, dict):
+        return 0, 0, 0
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        for nested_key in ("response", "message"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict) and isinstance(nested.get("usage"), dict):
+                usage = nested["usage"]
+                break
+    if not isinstance(usage, dict):
+        return 0, 0, 0
+
+    prompt_tokens = _ds4_int_usage_value(
+        usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    )
+    completion_tokens = _ds4_int_usage_value(
+        usage.get("completion_tokens", usage.get("output_tokens", 0))
+    )
+    cached_candidates = [_ds4_int_usage_value(usage.get("cached_tokens", 0))]
+
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict):
+        cached_candidates.append(
+            _ds4_int_usage_value(prompt_details.get("cached_tokens", 0))
+        )
+
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict):
+        cached_candidates.append(
+            _ds4_int_usage_value(input_details.get("cached_tokens", 0))
+        )
+
+    cached_candidates.append(_ds4_int_usage_value(usage.get("cache_read_input_tokens", 0)))
+    cached_tokens = max(cached_candidates)
+    return prompt_tokens, completion_tokens, cached_tokens
+
+
+def _ds4_usage_from_body(body: bytes) -> tuple[int, int, int]:
+    """Parse DS4 non-streaming usage fields without changing response bytes."""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+        return 0, 0, 0
+    return _ds4_usage_from_payload(payload)
+
+
+def _record_ds4_proxy_metrics(
+    *,
+    body: bytes,
+    elapsed: float,
+    resolved_model: str,
+) -> None:
+    """Record best-effort server metrics for one non-streaming DS4 response."""
+    prompt_tokens, completion_tokens, cached_tokens = _ds4_usage_from_body(body)
+    get_server_metrics().record_request_complete(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
+        generation_duration=elapsed,
+        model_id=resolved_model,
+    )
+
+
+class _DS4StreamingMetricsTee:
+    """Byte-preserving DS4 SSE metrics tee for streaming proxy responses."""
+
+    def __init__(self, proxy: object, resolved_model: str):
+        self._proxy = proxy
+        self._resolved_model = resolved_model
+        self._started_at = time.perf_counter()
+        self._first_chunk_at: float | None = None
+        self._buffer = b""
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._cached_tokens = 0
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _observe_payload(self, payload: object) -> None:
+        prompt_tokens, completion_tokens, cached_tokens = _ds4_usage_from_payload(
+            payload
+        )
+        self._prompt_tokens = max(self._prompt_tokens, prompt_tokens)
+        self._completion_tokens = max(self._completion_tokens, completion_tokens)
+        self._cached_tokens = max(self._cached_tokens, cached_tokens)
+
+    def _observe_sse_data(self, data: bytes) -> None:
+        stripped = data.strip()
+        if not stripped or stripped == b"[DONE]":
+            return
+        try:
+            payload = json.loads(stripped)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            return
+        self._observe_payload(payload)
+
+    def _observe_chunk(self, chunk: bytes) -> None:
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            if line.startswith(b"data:"):
+                self._observe_sse_data(line[5:])
+
+    def _observe_remaining_buffer(self) -> None:
+        if not self._buffer:
+            return
+        line = self._buffer.rstrip(b"\r")
+        self._buffer = b""
+        if line.startswith(b"data:"):
+            self._observe_sse_data(line[5:])
+
+    def iter_bytes(self):
+        try:
+            for chunk in self._proxy.iter_bytes():
+                if chunk and self._first_chunk_at is None:
+                    self._first_chunk_at = time.perf_counter()
+                if chunk:
+                    self._observe_chunk(chunk)
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._observe_remaining_buffer()
+            finished_at = time.perf_counter()
+            first_chunk_at = self._first_chunk_at
+            prompt_tokens = self._prompt_tokens
+            completion_tokens = self._completion_tokens
+            cached_tokens = self._cached_tokens
+        close = getattr(self._proxy, "close", None)
+        if callable(close):
+            close()
+        if first_chunk_at is None:
+            prefill_duration = max(finished_at - self._started_at, 0.0)
+            generation_duration = 0.0
+        else:
+            prefill_duration = max(first_chunk_at - self._started_at, 0.0)
+            generation_duration = max(finished_at - first_chunk_at, 0.0)
+        get_server_metrics().record_request_complete(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            prefill_duration=prefill_duration,
+            generation_duration=generation_duration,
+            model_id=self._resolved_model,
+        )
+
+
+class _DS4StreamingResponse(StreamingResponse):
+    """StreamingResponse variant that always closes its DS4 upstream proxy."""
+
+    def __init__(self, proxy: object, *, resolved_model: str | None = None, **kwargs):
+        self._ds4_proxy = (
+            _DS4StreamingMetricsTee(proxy, resolved_model)
+            if resolved_model is not None
+            else proxy
+        )
+        super().__init__(self._ds4_proxy.iter_bytes(), **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close = getattr(self._ds4_proxy, "close", None)
+            if callable(close):
+                close()
+
+
+async def _create_ds4_text_completion(
+    engine: object,
+    request: CompletionRequest,
+    resolved_model: str,
+):
+    """Proxy an OpenAI text completion to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    release_ds4_request = None
+    try:
+        await _ensure_ds4_max_reasoning_context(engine, request)
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
+        body = _build_ds4_completion_proxy_body(request, resolved_model)
+        if request.stream:
+            proxy = await engine.open_completion_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
+            return _DS4StreamingResponse(
+                proxy,
+                resolved_model=resolved_model,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_streaming_response_headers(proxy.headers),
+            )
+
+        proxy_start = time.perf_counter()
+        proxy = await engine.proxy_completion(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
+
+
+async def _create_ds4_response(
+    engine: object,
+    request: ResponsesRequest,
+    resolved_model: str,
+):
+    """Proxy an OpenAI Responses API request to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    release_ds4_request = None
+    try:
+        await _ensure_ds4_max_reasoning_context(engine, request)
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
+        body = _build_ds4_responses_proxy_body(request, resolved_model)
+        if request.stream:
+            proxy = await engine.open_response_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
+            return _DS4StreamingResponse(
+                proxy,
+                resolved_model=resolved_model,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_streaming_response_headers(proxy.headers),
+            )
+
+        proxy_start = time.perf_counter()
+        proxy = await engine.proxy_response(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
+
+
+async def _create_ds4_anthropic_message(
+    engine: object,
+    request: AnthropicMessagesRequest,
+    resolved_model: str,
+):
+    """Proxy an Anthropic Messages API request to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    release_ds4_request = None
+    try:
+        await _ensure_ds4_max_reasoning_context(engine, request)
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
+        body = _build_ds4_anthropic_proxy_body(request, resolved_model)
+        if request.stream:
+            proxy = await engine.open_anthropic_message_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
+            return _DS4StreamingResponse(
+                proxy,
+                resolved_model=resolved_model,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_streaming_response_headers(proxy.headers),
+            )
+
+        proxy_start = time.perf_counter()
+        proxy = await engine.proxy_anthropic_message(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
+
+
+async def _create_ds4_chat_completion(
+    engine: object,
+    request: ChatCompletionRequest,
+    resolved_model: str,
+):
+    """Proxy an OpenAI chat completion to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    release_ds4_request = None
+    try:
+        await _ensure_ds4_max_reasoning_context(engine, request)
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
+        body = _build_ds4_chat_proxy_body(request, resolved_model)
+        if request.stream:
+            proxy = await engine.open_chat_completion_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
+            return _DS4StreamingResponse(
+                proxy,
+                resolved_model=resolved_model,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_streaming_response_headers(proxy.headers),
+            )
+
+        proxy_start = time.perf_counter()
+        proxy = await engine.proxy_chat_completion(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -3440,6 +4132,7 @@ async def create_chat_completion(
         )
 
     lease = _LLMEngineLease()
+
     try:
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
@@ -3447,6 +4140,11 @@ async def create_chat_completion(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+
+        if _is_ds4_chat_proxy_engine(engine):
+            response = await _create_ds4_chat_completion(engine, request, resolved_model)
+            await lease.release()
+            return response
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5453,11 +6151,19 @@ async def create_anthropic_message(
         )
 
     lease = _LLMEngineLease()
+
     try:
         engine = await get_engine_for_model(request.model, lease=lease)
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+
+        if _is_ds4_anthropic_proxy_engine(engine):
+            response = await _create_ds4_anthropic_message(
+                engine, request, resolved_model
+            )
+            await lease.release()
+            return response
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5950,6 +6656,11 @@ async def create_response(
         model_load_duration = time.perf_counter() - load_start
 
         resolved_model = _serving_model_id(lease, request.model)
+
+        if _is_ds4_response_proxy_engine(engine):
+            response = await _create_ds4_response(engine, request, resolved_model)
+            await lease.release()
+            return response
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,

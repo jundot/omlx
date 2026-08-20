@@ -444,11 +444,19 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.browse.section_label') }}</span>
                                     <span x-show="globalSettings.system.total_memory" x-cloak
                                           class="text-xs text-neutral-400" x-text="window.t('models.browse.system_suffix').replace('{memory}', globalSettings.system.total_memory)"></span>
-                                    <label class="flex items-center gap-1.5 ml-2 cursor-pointer select-none">
-                                        <input type="checkbox" x-model="hfMlxOnly"
-                                               class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 cursor-pointer">
-                                        <span class="text-xs text-neutral-500 font-medium">{{ t('models.browse.mlx_only') }}</span>
-                                    </label>
+                                    <div class="flex items-center gap-2 ml-2">
+                                        <span class="text-[10px] uppercase tracking-wider text-neutral-400 font-bold">{{ t('models.browse.show_only') }}</span>
+                                        <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                                            <input type="checkbox" x-model="hfShowMlx"
+                                                   class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 cursor-pointer">
+                                            <span class="text-xs text-neutral-500 font-medium">{{ t('models.browse.backend.mlx') }}</span>
+                                        </label>
+                                        <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                                            <input type="checkbox" x-model="hfShowDs4Gguf"
+                                                   class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 cursor-pointer">
+                                            <span class="text-xs text-neutral-500 font-medium">{{ t('models.browse.backend.ds4_gguf') }}</span>
+                                        </label>
+                                    </div>
                                 </div>
                                 <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                     <button @click="hfRecommendedTab = 'trending'; hfPage.trending = 1; hfTableSort = 'rank'; hfTableSortDir = 'asc'"
@@ -558,23 +566,30 @@
                                                         </td>
                                                     </tr>
                                                 </template>
-                                                <template x-for="model in getPagedModels(hfRecommendedTab)" :key="model.repo_id">
+                                                <template x-for="model in getPagedModels(hfRecommendedTab)" :key="model.download_ref || model.repo_id">
                                                     <tr class="hover:bg-neutral-50 transition-colors">
                                                         <td class="max-md:hidden px-4 py-3 text-xs text-neutral-400 tabular-nums" x-text="model.rank"></td>
                                                         <td class="px-4 py-3">
                                                             <!-- Mobile: name with #rank prefix -->
                                                             <div class="flex items-center gap-2 md:hidden">
                                                                 <span class="text-xs text-neutral-400 tabular-nums" x-text="'#' + model.rank"></span>
-                                                                <button @click="openModelDetail(model.repo_id)"
+                                                                <button @click="openModelDetail(model.download_ref || model.repo_id)"
                                                                         :title="model.name"
                                                                         class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer flex-1 min-w-0" x-text="model.name"></button>
                                                             </div>
                                                             <!-- Desktop: name -->
-                                                            <button @click="openModelDetail(model.repo_id)"
+                                                            <button @click="openModelDetail(model.download_ref || model.repo_id)"
                                                                     :title="model.name"
                                                                     class="max-md:hidden block text-sm font-medium text-neutral-900 hover:text-blue-600 truncate transition-colors text-left cursor-pointer max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.name"></button>
-                                                            <!-- Desktop: only params shown below name -->
-                                                            <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                            <!-- Desktop: params/backend badges shown below name -->
+                                                            <div class="max-md:hidden flex items-center gap-1.5 mt-0.5">
+                                                                <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                <span x-show="model.backend_label" x-cloak
+                                                                      :class="model.backend === 'ds4' ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-neutral-100 text-neutral-600 border-neutral-200'"
+                                                                      class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold rounded border" x-text="model.backend_label"></span>
+                                                                <span x-show="model.compatibility_status === 'unverified'" x-cloak
+                                                                      class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold rounded border bg-amber-50 text-amber-700 border-amber-200">{{ t('models.browse.unverified') }}</span>
+                                                            </div>
                                                             <!-- Mobile: inline params + size + downloads + likes -->
                                                             <div class="md:hidden flex items-center gap-2 flex-wrap mt-0.5 text-xs text-neutral-400">
                                                                 <span x-show="model.params" x-cloak x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
@@ -592,7 +607,7 @@
                                                                       class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
                                                                     {{ t('models.browse.high_oom_risk') }}
                                                                 </span>
-                                                                <button @click="downloadRecommended(model.repo_id)"
+                                                                <button @click="downloadRecommended(model.download_ref || model.repo_id)"
                                                                         :disabled="hfDownloading"
                                                                         class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                     <i data-lucide="download" class="w-3 h-3"></i>
@@ -613,7 +628,7 @@
                                                                       class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
                                                                     {{ t('models.browse.high_oom_risk') }}
                                                                 </span>
-                                                                <button @click="downloadRecommended(model.repo_id)"
+                                                                <button @click="downloadRecommended(model.download_ref || model.repo_id)"
                                                                         :disabled="hfDownloading"
                                                                         class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                     <i data-lucide="download" class="w-3 h-3"></i>
@@ -704,14 +719,21 @@
                                                     </tr>
                                                 </thead>
                                                 <tbody class="divide-y divide-neutral-100">
-                                                    <template x-for="model in getPagedModels('search')" :key="model.repo_id">
+                                                    <template x-for="model in getPagedModels('search')" :key="model.download_ref || model.repo_id">
                                                         <tr class="hover:bg-neutral-50 transition-colors">
                                                             <td class="px-4 py-3">
-                                                                <button @click="openModelDetail(model.repo_id)"
-                                                                        :title="model.repo_id"
-                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.repo_id"></button>
-                                                                <!-- Desktop: only params shown below name -->
-                                                                <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                <button @click="openModelDetail(model.download_ref || model.repo_id)"
+                                                                        :title="model.download_ref || model.repo_id"
+                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.name || model.repo_id"></button>
+                                                                <!-- Desktop: params/backend badges shown below name -->
+                                                                <div class="max-md:hidden flex items-center gap-1.5 mt-0.5">
+                                                                    <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                    <span x-show="model.backend_label" x-cloak
+                                                                          :class="model.backend === 'ds4' ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-neutral-100 text-neutral-600 border-neutral-200'"
+                                                                          class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold rounded border" x-text="model.backend_label"></span>
+                                                                    <span x-show="model.compatibility_status === 'unverified'" x-cloak
+                                                                          class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold rounded border bg-amber-50 text-amber-700 border-amber-200">{{ t('models.browse.unverified') }}</span>
+                                                                </div>
                                                                 <!-- Mobile: inline params + size + downloads + likes -->
                                                                 <div class="md:hidden flex items-center gap-2 flex-wrap mt-0.5 text-xs text-neutral-400">
                                                                     <span x-show="model.params" x-cloak x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
@@ -729,7 +751,7 @@
                                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
                                                                         {{ t('models.browse.high_oom_risk') }}
                                                                     </span>
-                                                                    <button @click="downloadRecommended(model.repo_id)"
+                                                                    <button @click="downloadRecommended(model.download_ref || model.repo_id)"
                                                                             :disabled="hfDownloading"
                                                                             class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                         <i data-lucide="download" class="w-3 h-3"></i>
@@ -750,7 +772,7 @@
                                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
                                                                         {{ t('models.browse.high_oom_risk') }}
                                                                     </span>
-                                                                    <button @click="downloadRecommended(model.repo_id)"
+                                                                    <button @click="downloadRecommended(model.download_ref || model.repo_id)"
                                                                             :disabled="hfDownloading"
                                                                             class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                         <i data-lucide="download" class="w-3 h-3"></i>
@@ -796,7 +818,7 @@
                                             <div class="flex items-center justify-between">
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2 flex-wrap">
-                                                        <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                        <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.display_name || task.repo_id"></span>
                                                         <span class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full shrink-0"
                                                               :class="{
                                                                   'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',
@@ -2042,7 +2064,7 @@
                                 <div class="px-6 py-5 border-b border-neutral-200 shrink-0">
                                     <div class="flex items-start justify-between gap-4">
                                         <div class="min-w-0 flex-1">
-                                            <h3 class="text-lg font-bold text-neutral-900 truncate" x-text="hfModelDetail.repo_id"></h3>
+                                            <h3 class="text-lg font-bold text-neutral-900 truncate" x-text="hfModelDetail.name || hfModelDetail.repo_id"></h3>
                                             <div class="flex items-center gap-3 mt-1.5 flex-wrap">
                                                 <span x-show="hfModelDetail.size > 0" class="text-xs text-neutral-500" x-text="hfModelDetail.size_formatted"></span>
                                                 <span class="text-xs text-neutral-500" x-text="'&#11015; ' + formatDownloads(hfModelDetail.downloads)"></span>
@@ -2130,7 +2152,7 @@
                                 </div>
                                 <!-- Footer -->
                                 <div class="px-6 py-4 border-t border-neutral-200 flex items-center justify-between shrink-0 bg-neutral-50">
-                                    <a :href="'https://huggingface.co/' + hfModelDetail.repo_id" target="_blank" rel="noopener noreferrer"
+                                    <a :href="hfModelDetail.hf_url || ('https://huggingface.co/' + hfModelDetail.repo_id)" target="_blank" rel="noopener noreferrer"
                                        class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1.5 transition-colors">
                                         <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
                                         {{ t('models.detail.view_on_hf') }}
@@ -2147,7 +2169,7 @@
                                             </span>
                                         </template>
                                         <template x-if="!hfModelDetail.is_adapter">
-                                            <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
+                                            <button @click="downloadRecommended(hfModelDetail.download_ref || hfModelDetail.repo_id); closeModelDetail();"
                                                     :disabled="hfDownloading"
                                                     class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all
                                                            disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">

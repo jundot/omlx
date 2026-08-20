@@ -32,6 +32,17 @@ def _write_fake_python(path: Path) -> None:
     path.chmod(0o755)
 
 
+def test_build_script_embeds_and_signs_ds4_support_files():
+    """The macOS bundle pipeline stages the managed DS4 runtime resources."""
+    build_script = Path("apps/omlx-mac/Scripts/build.sh").read_text()
+
+    assert "OMLX_DS4_BUNDLE_SOURCE" in build_script
+    assert "DS4Support" in build_script
+    assert "copy_ds4_support_files" in build_script
+    assert "${OMLX_REQUIRE_DS4_BUNDLE:-1}" in build_script
+    assert '_sign_embedded_mach_o_files "$RESOURCES_DIR/DS4Support"' in build_script
+
+
 def test_app_bundle_cli_wrapper_resolves_symlinked_invocation(tmp_path):
     """The bundle wrapper must resolve paths from the app, not the symlink."""
     script = _extract_cli_wrapper_script()

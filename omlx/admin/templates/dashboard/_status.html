@@ -959,6 +959,10 @@
                                                class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-all"
                                                x-text="engine.commit.substring(0, 7)"></a>
                                         </template>
+                                        <template x-if="engine.commit && !engine.url">
+                                            <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
+                                                  x-text="engine.commit.substring(0, 7)"></code>
+                                        </template>
                                         <template x-if="!engine.commit">
                                             <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
                                                   x-text="engine.version || 'unknown'"></code>

@@ -94,6 +94,12 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "model_type_override",
         "active_profile_name",
         "ttl_seconds",
+        # DS4 sidecars are physical, model-local launch configuration. Paths
+        # and verifier tuning must not leak into reusable profiles/templates.
+        "ds4_mtp_enabled",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

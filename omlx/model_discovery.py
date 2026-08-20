@@ -23,10 +23,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .ds4_gguf import (
+    DS4GGUFModelCandidate,
+    collect_ds4_gguf_model_candidates,
+    is_ds4_gguf_file,
+)
+
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal[
+    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+]
+EngineType = Literal[
+    "batched",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "ds4",
+]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -380,6 +397,8 @@ class DiscoveredModel:
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
+    # Optional UI display label preserving source casing.
+    display_name: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
 
 
@@ -1404,6 +1423,97 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
     return is_helper_model_config(config)
 
 
+def _unique_ds4_model_id(
+    models: dict[str, DiscoveredModel], candidate: str, *, force_suffix: bool = False
+) -> str:
+    """Return a DS4 model id that avoids case-insensitive collisions."""
+    existing_lower = {model_id.lower() for model_id in models}
+    if not force_suffix and candidate.lower() not in existing_lower:
+        return candidate
+
+    base = candidate.split(":ds4", 1)[0]
+    ds4_candidate = f"{base}:ds4"
+    if ds4_candidate.lower() not in existing_lower:
+        return ds4_candidate
+
+    index = 2
+    while True:
+        numbered = f"{base}:ds4-{index}"
+        if numbered.lower() not in existing_lower:
+            return numbered
+        index += 1
+
+
+def _relocate_ds4_collisions_for_model_id(
+    models: dict[str, DiscoveredModel], reserved_id: str
+) -> None:
+    """Move existing DS4 entries out of the way for a non-DS4 model id."""
+    reserved_lower = reserved_id.lower()
+    for existing_id, info in list(models.items()):
+        if existing_id.lower() != reserved_lower or info.engine_type != "ds4":
+            continue
+        del models[existing_id]
+        new_id = _unique_ds4_model_id(models, existing_id, force_suffix=True)
+        info.model_id = new_id
+        models[new_id] = info
+
+
+def _register_ds4_gguf_candidates(
+    models: dict[str, DiscoveredModel],
+    candidates: list[DS4GGUFModelCandidate],
+) -> bool:
+    """Register DS4 GGUF candidates as discovered models."""
+    registered = False
+    for candidate in candidates:
+        model_id = _unique_ds4_model_id(models, candidate.base_id)
+        models[model_id] = DiscoveredModel(
+            model_id=model_id,
+            model_path=str(candidate.model_path),
+            model_type="llm",
+            engine_type="ds4",
+            estimated_size=candidate.estimated_size,
+            config_model_type=candidate.config_model_type,
+            thinking_default=None,
+            preserve_thinking_default=None,
+            model_context_length=None,
+            source_type=candidate.source_type,
+            source_repo_id=candidate.source_repo_id,
+            display_name=candidate.display_name,
+        )
+
+        logger.info(
+            "Discovered DS4 GGUF model: %s (path: %s, size: %s)",
+            model_id,
+            candidate.model_path,
+            format_size(candidate.estimated_size),
+        )
+        registered = True
+    return registered
+
+
+def _register_ds4_gguf_models_in_dir(
+    models: dict[str, DiscoveredModel],
+    root_dir: Path,
+    gguf_dir: Path,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
+) -> bool:
+    """Register all direct DS4-supported primary GGUF files in ``gguf_dir``.
+
+    Returns True when at least one GGUF was registered.  Discovery is direct by
+    design so ordinary MLX model trees are not recursively walked for every
+    nested artifact; callers decide which known model/repo directories to scan.
+    """
+    candidates = collect_ds4_gguf_model_candidates(
+        root_dir,
+        _iter_readable_entries(gguf_dir, "DS4 GGUF directory"),
+        source_type=source_type,
+        source_repo_id=source_repo_id,
+    )
+    return _register_ds4_gguf_candidates(models, candidates)
+
+
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
@@ -1441,7 +1551,7 @@ def _register_model(
     source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
-    if model_id in models:
+    if model_id in models and models[model_id].engine_type != "ds4":
         logger.warning(
             f"Duplicate model_id '{model_id}' found in {model_dir}, "
             f"keeping version from {models[model_id].model_path}"
@@ -1501,6 +1611,7 @@ def _register_model(
         preserve_thinking_default = detect_preserve_thinking(model_dir)
         model_context_length = _read_model_context_length(model_dir)
 
+        _relocate_ds4_collisions_for_model_id(models, model_id)
         models[model_id] = DiscoveredModel(
             model_id=model_id,
             model_path=str(model_dir),
@@ -1615,9 +1726,28 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
         raise ValueError(access_error)
 
     models: dict[str, DiscoveredModel] = {}
+    entries = _iter_readable_entries(model_dir, "model directory")
+    root_is_model_dir = _is_model_dir(model_dir)
+    root_ds4_gguf_dir = model_dir.parent if root_is_model_dir else model_dir
+    root_ds4_gguf_candidates = {
+        candidate.model_path: candidate
+        for candidate in collect_ds4_gguf_model_candidates(
+            root_ds4_gguf_dir,
+            entries,
+        )
+    }
 
-    for subdir in _iter_readable_entries(model_dir, "model directory"):
-        if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
+    for subdir in entries:
+        if subdir.name.startswith("."):
+            continue
+
+        if is_ds4_gguf_file(subdir):
+            candidate = root_ds4_gguf_candidates.get(subdir)
+            if candidate is not None:
+                _register_ds4_gguf_candidates(models, [candidate])
+            continue
+
+        if not _is_readable_dir(subdir, "model entry"):
             continue
 
         if _is_adapter_dir(subdir):
@@ -1626,8 +1756,10 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                 "(oMLX does not support LoRA/PEFT adapters)"
             )
         elif _is_model_dir(subdir):
-            # Level 1: direct model folder
+            # Level 1: direct model folder.  Mixed MLX+GGUF directories expose
+            # separate MLX and DS4 entries.
             _register_model(models, subdir, subdir.name)
+            _register_ds4_gguf_models_in_dir(models, model_dir, subdir)
         else:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
@@ -1643,15 +1775,24 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                         source_type="hf_cache",
                         source_repo_id=hf_resolved.source_repo_id,
                     )
+                _register_ds4_gguf_models_in_dir(
+                    models,
+                    hf_resolved.snapshot_path,
+                    hf_resolved.snapshot_path,
+                    source_type="hf_cache",
+                    source_repo_id=hf_resolved.source_repo_id,
+                )
                 continue
 
-            # Level 2: organization folder — scan children
-            has_children = False
+            # Level 2: organization folder — scan children.  Direct GGUF files
+            # under the group are also accepted for downloaded GGUF repos.
+            has_children = _register_ds4_gguf_models_in_dir(models, model_dir, subdir)
             for child in _iter_readable_entries(subdir, "model group"):
-                if (
-                    not _is_readable_dir(child, "model group entry")
-                    or child.name.startswith(".")
-                ):
+                if child.name.startswith("."):
+                    continue
+                if is_ds4_gguf_file(child):
+                    continue
+                if not _is_readable_dir(child, "model group entry"):
                     continue
                 if _is_adapter_dir(child):
                     logger.info(
@@ -1661,6 +1802,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                 elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
+                    _register_ds4_gguf_models_in_dir(models, model_dir, child)
+                else:
+                    has_children = (
+                        _register_ds4_gguf_models_in_dir(models, model_dir, child)
+                        or has_children
+                    )
 
             if not has_children:
                 logger.debug(
@@ -1668,10 +1815,13 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                     f"(not a model or organization folder)"
                 )
 
-    # Fallback: if no models found and the directory itself is a model, register it.
-    # This supports pointing directly at a single model folder, e.g.:
-    #   /Models/Qwen3.5-9B-MLX-4bit/  (contains config.json and weight files)
-    if not models and _is_model_dir(model_dir):
+    # Fallback: if no directory models were found and the directory itself is a
+    # model, register it.  This supports pointing directly at a single model
+    # folder, including mixed MLX+GGUF folders where the GGUF file was already
+    # registered above.
+    if _is_model_dir(model_dir) and not any(
+        Path(info.model_path).is_dir() for info in models.values()
+    ):
         _register_model(models, model_dir, model_dir.name)
 
     return models
@@ -1707,13 +1857,34 @@ def discover_models_from_dirs(
             continue
 
         for model_id, info in discovered.items():
-            if model_id in merged:
-                logger.warning(
-                    f"Duplicate model_id '{model_id}' found in {model_dir}, "
-                    f"keeping version from {merged[model_id].model_path}"
-                )
+            existing_id = next(
+                (mid for mid in merged if mid.lower() == model_id.lower()), None
+            )
+            if existing_id is None:
+                merged[model_id] = info
                 continue
-            merged[model_id] = info
+
+            existing = merged[existing_id]
+            if info.engine_type == "ds4":
+                new_id = _unique_ds4_model_id(merged, model_id, force_suffix=True)
+                info.model_id = new_id
+                merged[new_id] = info
+                continue
+
+            if existing.engine_type == "ds4":
+                del merged[existing_id]
+                new_ds4_id = _unique_ds4_model_id(
+                    merged, existing_id, force_suffix=True
+                )
+                existing.model_id = new_ds4_id
+                merged[new_ds4_id] = existing
+                merged[model_id] = info
+                continue
+
+            logger.warning(
+                f"Duplicate model_id '{model_id}' found in {model_dir}, "
+                f"keeping version from {existing.model_path}"
+            )
 
     return merged
 

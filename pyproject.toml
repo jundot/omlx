@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    "setuptools>=61.0",
+    "setuptools>=70.1",
     "wheel",
     "cmake>=3.27",
     # Pin nanobind to match the ABI version MLX 0.32.0 was built with
@@ -252,7 +252,13 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
+"omlx" = [
+    "oq_calibration_data.json",
+    "oqe_calibration_data.json",
+    "vendor/ds4/darwin-arm64/LICENSE",
+    "vendor/ds4/darwin-arm64/README.md",
+    "vendor/ds4/darwin-arm64/manifest.json",
+]
 "omlx.admin" = [
     "templates/**/*.html",
     "static/**/*",

@@ -17,6 +17,9 @@ from omlx.settings import (
     AuthSettings,
     CacheSettings,
     ClaudeCodeSettings,
+    DS4_MAX_CONTEXT_TOKENS,
+    DS4_THINK_MAX_CONTEXT_TOKENS,
+    DS4Settings,
     GlobalSettings,
     HuggingFaceSettings,
     IntegrationSettings,
@@ -603,6 +606,96 @@ class TestCacheSettings:
         assert result["initial_cache_blocks"] == 8192
 
 
+class TestDS4Settings:
+    """Tests for DS4Settings dataclass."""
+
+    def test_defaults_and_default_paths(self):
+        """DS4 defaults match the managed-backend plan."""
+        settings = DS4Settings()
+        base_path = Path("/tmp/omlx")
+
+        assert settings.enabled is True
+        assert settings.auto_build is True
+        assert settings.source_repo is None
+        assert settings.source_commit is None
+        assert settings.get_support_dir(base_path) == Path("/tmp/omlx/support/ds4")
+        assert settings.get_binary_path(base_path) == Path(
+            "/tmp/omlx/support/ds4/ds4-server"
+        )
+        assert settings.get_kv_root(base_path) == Path("/tmp/omlx/ds4-kv")
+        assert settings.get_trace_dir(base_path) == Path("/tmp/omlx/logs/ds4-traces")
+        assert settings.get_debug_dir(base_path) == Path("/tmp/omlx/logs/ds4-debug")
+        assert settings.ready_timeout_ms == 600_000
+        assert settings.kv_cache_enabled is True
+        assert settings.kv_disk_space_mb == 65_536
+        assert settings.kv_cache_continued_interval_tokens == 2_048
+        assert settings.ssd_streaming == "auto"
+        assert settings.power == 100
+        assert settings.logs_to_disk is True
+        assert settings.trace_enabled is False
+
+    def test_custom_paths_expand(self):
+        """Advanced DS4 path settings expand to absolute paths."""
+        settings = DS4Settings(
+            support_dir="~/ds4-support",
+            binary_path="~/bin/ds4-server",
+            kv_root="~/ds4-kv",
+            trace_dir="~/ds4-traces",
+            debug_dir="~/ds4-debug",
+        )
+        base_path = Path("/tmp/omlx")
+
+        assert "~" not in str(settings.get_support_dir(base_path))
+        assert "~" not in str(settings.get_binary_path(base_path))
+        assert "~" not in str(settings.get_kv_root(base_path))
+        assert "~" not in str(settings.get_trace_dir(base_path))
+        assert "~" not in str(settings.get_debug_dir(base_path))
+
+    def test_auto_context_tokens_by_physical_ram(self):
+        """Adaptive DS4 context defaults are based on physical RAM only."""
+        settings = DS4Settings()
+        gib = 1024**3
+
+        assert settings.get_auto_context_tokens(64 * gib) == 32_768
+        assert settings.get_auto_context_tokens(96 * gib) == 100_000
+        assert settings.get_auto_context_tokens(256 * gib) == 250_000
+        assert (
+            settings.get_auto_context_tokens(512 * gib) == DS4_THINK_MAX_CONTEXT_TOKENS
+        )
+
+    def test_explicit_context_overrides_auto(self):
+        """An explicit DS4 context setting wins over adaptive RAM defaults."""
+        settings = DS4Settings(context_default_tokens=123_456)
+        assert settings.get_auto_context_tokens(512 * 1024**3) == 123_456
+
+    def test_to_dict_from_dict_roundtrip(self):
+        """DS4 settings round-trip through persisted dictionaries."""
+        settings = DS4Settings(
+            enabled=False,
+            support_dir="/support",
+            binary_path="/support/custom-ds4",
+            auto_build=False,
+            source_repo="https://example.com/ds4.git",
+            source_commit="abc123",
+            context_default_tokens=100_000,
+            ready_timeout_ms=123,
+            kv_cache_enabled=False,
+            kv_root="/kv",
+            kv_disk_space_mb=99,
+            kv_cache_continued_interval_tokens=512,
+            ssd_streaming="on",
+            power=50,
+            logs_to_disk=False,
+            trace_enabled=True,
+            trace_dir="/traces",
+            debug_dir="/debug",
+        )
+
+        restored = DS4Settings.from_dict(settings.to_dict())
+
+        assert restored == settings
+
+
 class TestAuthSettings:
     """Tests for AuthSettings dataclass."""
 
@@ -982,6 +1075,8 @@ class TestGlobalSettings:
             assert settings.scheduler.max_concurrent_requests == 8
             assert settings.scheduler.embedding_batch_size == 32
             assert settings.cache.enabled is True
+            assert settings.ds4.ready_timeout_ms == 600_000
+            assert settings.ds4.kv_cache_continued_interval_tokens == 2_048
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
 
@@ -1123,6 +1218,15 @@ class TestGlobalSettings:
                             "ssd_cache_dir": "/cache",
                             "ssd_cache_max_size": "50GB",
                         },
+                        "ds4": {
+                            "binary_path": "/opt/ds4/ds4-server",
+                            "auto_build": False,
+                            "source_repo": "https://example.com/ds4.git",
+                            "source_commit": "abc123",
+                            "kv_root": "/ds4-kv",
+                            "kv_disk_space_mb": 1234,
+                            "ssd_streaming": "on",
+                        },
                         "auth": {"api_key": "secret"},
                         "mcp": {"config_path": "/mcp.json"},
                     }
@@ -1140,6 +1244,13 @@ class TestGlobalSettings:
             assert settings.scheduler.embedding_batch_size == 24
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cache"
+            assert settings.ds4.binary_path == "/opt/ds4/ds4-server"
+            assert settings.ds4.auto_build is False
+            assert settings.ds4.source_repo == "https://example.com/ds4.git"
+            assert settings.ds4.source_commit == "abc123"
+            assert settings.ds4.kv_root == "/ds4-kv"
+            assert settings.ds4.kv_disk_space_mb == 1234
+            assert settings.ds4.ssd_streaming == "on"
             assert settings.auth.api_key == "secret"
             assert settings.mcp.config_path == "/mcp.json"
 
@@ -1203,6 +1314,7 @@ class TestGlobalSettings:
             assert data["version"] == "1.0"
             assert data["server"]["port"] == 9001
             assert data["auth"]["api_key"] == "saved-key"
+            assert data["ds4"]["ready_timeout_ms"] == 600_000
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions only")
     def test_save_restricts_settings_file_permissions(self):
@@ -1285,6 +1397,9 @@ class TestGlobalSettings:
             assert (base / "models").exists()
             assert (base / "cache").exists()
             assert (base / "logs").exists()
+            assert (base / "support" / "ds4").exists()
+            assert (base / "ds4-kv").exists()
+            assert (base / "logs" / "ds4-traces").exists()
 
     def test_ensure_directories_custom_paths(self):
         """Test directory creation with custom paths."""
@@ -1293,17 +1408,29 @@ class TestGlobalSettings:
             custom_models = Path(tmpdir) / "custom_models"
             custom_cache = Path(tmpdir) / "custom_cache"
             custom_logs = Path(tmpdir) / "custom_logs"
+            custom_support = Path(tmpdir) / "custom_ds4_support"
+            custom_kv = Path(tmpdir) / "custom_ds4_kv"
+            custom_traces = Path(tmpdir) / "custom_ds4_traces"
+            custom_debug = Path(tmpdir) / "custom_ds4_debug"
 
             settings = GlobalSettings(base_path=base)
             settings.model.model_dir = str(custom_models)
             settings.cache.ssd_cache_dir = str(custom_cache)
             settings.logging.log_dir = str(custom_logs)
+            settings.ds4.support_dir = str(custom_support)
+            settings.ds4.kv_root = str(custom_kv)
+            settings.ds4.trace_dir = str(custom_traces)
+            settings.ds4.debug_dir = str(custom_debug)
             settings.ensure_directories()
 
             assert base.exists()
             assert custom_models.exists()
             assert custom_cache.exists()
             assert custom_logs.exists()
+            assert custom_support.exists()
+            assert custom_kv.exists()
+            assert custom_traces.exists()
+            assert custom_debug.exists()
 
     def test_ensure_directories_unavailable_model_dir(self):
         """Test that unavailable model dirs are skipped instead of crashing."""
@@ -1569,6 +1696,31 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("initial_cache_blocks" in e.lower() for e in errors)
 
+    def test_validate_invalid_ds4_settings(self):
+        """Validation catches invalid DS4 backend settings."""
+        settings = GlobalSettings()
+        settings.ds4.context_default_tokens = DS4_MAX_CONTEXT_TOKENS + 1
+        settings.ds4.ready_timeout_ms = 0
+        settings.ds4.kv_disk_space_mb = 0
+        settings.ds4.kv_cache_continued_interval_tokens = 0
+        settings.ds4.ssd_streaming = "sometimes"  # type: ignore[assignment]
+        settings.ds4.power = 101
+
+        errors = settings.validate()
+
+        assert any("ds4.context_default_tokens" in e for e in errors)
+        assert any("ds4.ready_timeout_ms" in e for e in errors)
+        assert any("ds4.kv_disk_space_mb" in e for e in errors)
+        assert any("ds4.kv_cache_continued_interval_tokens" in e for e in errors)
+        assert any("ds4.ssd_streaming" in e for e in errors)
+        assert any("ds4.power" in e for e in errors)
+
+    def test_validate_valid_ds4_context_limit(self):
+        """Validation accepts DS4's documented maximum context selection."""
+        settings = GlobalSettings()
+        settings.ds4.context_default_tokens = DS4_MAX_CONTEXT_TOKENS
+        assert not any("ds4" in e for e in settings.validate())
+
     def test_validate_multiple_errors(self):
         """Test validation returns multiple errors."""
         settings = GlobalSettings()
@@ -1693,6 +1845,53 @@ class TestGlobalSettings:
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.cache.initial_cache_blocks == 16384
+
+    def test_env_override_ds4_settings(self):
+        """Hidden DS4 environment overrides feed global settings."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMLX_DS4_ENABLED": "false",
+                    "OMLX_DS4_SUPPORT_DIR": "/env/ds4-support",
+                    "OMLX_DS4_BINARY_PATH": "/env/ds4-server",
+                    "OMLX_DS4_AUTO_BUILD": "false",
+                    "OMLX_DS4_SOURCE_REPO": "https://example.com/env-ds4.git",
+                    "OMLX_DS4_SOURCE_COMMIT": "env123",
+                    "OMLX_DS4_KV_ROOT": "/env/ds4-kv",
+                    "OMLX_DS4_KV_CACHE_ENABLED": "false",
+                    "OMLX_DS4_KV_DISK_SPACE_MB": "1234",
+                    "OMLX_DS4_KV_CACHE_CONTINUED_INTERVAL_TOKENS": "4096",
+                    "OMLX_DS4_READY_TIMEOUT_MS": "42",
+                    "OMLX_DS4_CONTEXT_DEFAULT_TOKENS": "100000",
+                    "OMLX_DS4_SSD_STREAMING": "off",
+                    "OMLX_DS4_POWER": "55",
+                    "OMLX_DS4_LOGS_TO_DISK": "false",
+                    "OMLX_DS4_TRACE_ENABLED": "true",
+                    "OMLX_DS4_TRACE_DIR": "/env/ds4-traces",
+                    "OMLX_DS4_DEBUG_DIR": "/env/ds4-debug",
+                },
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.ds4.enabled is False
+                assert settings.ds4.support_dir == "/env/ds4-support"
+                assert settings.ds4.binary_path == "/env/ds4-server"
+                assert settings.ds4.auto_build is False
+                assert settings.ds4.source_repo == "https://example.com/env-ds4.git"
+                assert settings.ds4.source_commit == "env123"
+                assert settings.ds4.kv_root == "/env/ds4-kv"
+                assert settings.ds4.kv_cache_enabled is False
+                assert settings.ds4.kv_disk_space_mb == 1234
+                assert settings.ds4.kv_cache_continued_interval_tokens == 4096
+                assert settings.ds4.ready_timeout_ms == 42
+                assert settings.ds4.context_default_tokens == 100_000
+                assert settings.ds4.ssd_streaming == "off"
+                assert settings.ds4.power == 55
+                assert settings.ds4.logs_to_disk is False
+                assert settings.ds4.trace_enabled is True
+                assert settings.ds4.trace_dir == "/env/ds4-traces"
+                assert settings.ds4.debug_dir == "/env/ds4-debug"
 
     def test_env_override_cache_enabled_values(self):
         """Test various values for OMLX_CACHE_ENABLED."""

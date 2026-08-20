@@ -3,15 +3,15 @@
   "corpora": [
     {
       "file": "code_python.txt",
-      "bytes": 1500595,
-      "characters": 1499992,
-      "sha256": "59f6ec70e0b687ec49463dda575322348d7efe0d0770e69ff37b0e3ec6907aa1"
+      "bytes": 1500568,
+      "characters": 1499985,
+      "sha256": "fdd42bbac87bc3ceed98ff806ec5983b7f805e7b0dac9869417c21c535e02bba"
     },
     {
       "file": "code_mixed.txt",
-      "bytes": 1602480,
-      "characters": 1601487,
-      "sha256": "ac3fbc6b16bf18cbc76fd022c1d9ff1b1c4484587815ea6a882b9c7731b2277a"
+      "bytes": 1602483,
+      "characters": 1601494,
+      "sha256": "c1a670c50ddd603b635fa573804ad5cba9b543a6a744d68702dc904f1fffd596"
     },
     {
       "file": "novel_ko.txt",

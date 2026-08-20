@@ -1,12 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Setuptools hooks for platform wheels and optional custom kernels."""
+
 import os
 import sys
 
 from setuptools import setup
+from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
 DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
+
+
+class bdist_wheel(_bdist_wheel):
+    """Build a platform wheel while keeping the Python/ABI tags generic."""
+
+    def finalize_options(self):
+        super().finalize_options()
+        self.root_is_pure = False
+
+    def get_tag(self):
+        _python, _abi, plat = super().get_tag()
+        return "py3", "none", plat
 
 
 def _with_custom_kernel() -> bool:
@@ -71,5 +87,13 @@ def _custom_kernel_build_kwargs() -> dict:
     }
 
 
+def _setup_kwargs() -> dict:
+    kwargs = _custom_kernel_build_kwargs()
+    cmdclass = dict(kwargs.get("cmdclass", {}))
+    cmdclass["bdist_wheel"] = bdist_wheel
+    kwargs["cmdclass"] = cmdclass
+    return kwargs
+
+
 if __name__ == "__main__":
-    setup(**_custom_kernel_build_kwargs())
+    setup(**_setup_kwargs())

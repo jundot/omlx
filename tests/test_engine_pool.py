@@ -450,6 +450,19 @@ class TestEnginePoolStatus:
         assert model_a_status["pinned"] is True
         assert model_a_status["loaded"] is False
 
+    def test_get_status_includes_ds4_display_name(self, tmp_path):
+        """DS4 discovery display labels are exposed in pool status."""
+        (tmp_path / "DeepSeek V4 Flash Q2_K.gguf").write_bytes(b"0" * 1000)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(tmp_path))
+
+        status = pool.get_status()
+
+        model_status = status["models"][0]
+        assert model_status["id"] == "deepseek-v4-flash-q2-k"
+        assert model_status["engine_type"] == "ds4"
+        assert model_status["display_name"] == "DeepSeek V4 Flash Q2_K"
+
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -531,6 +544,38 @@ class TestApplySettingsOverrides:
         # model-b should remain unchanged (no override)
         assert pool.get_entry("model-b").model_type == "llm"
         assert pool.get_entry("model-b").engine_type == "batched"
+
+    def test_ds4_entry_ignores_model_type_override(self, tmp_path):
+        """Model type overrides must not route GGUF entries to MLX loaders."""
+        (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(tmp_path))
+
+        from omlx.model_settings import ModelSettings
+
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings(
+            model_type_override="vlm"
+        )
+
+        pool.apply_settings_overrides(settings_manager)
+
+        entry = pool.get_entry("foo")
+        assert entry.model_type == "llm"
+        assert entry.engine_type == "ds4"
+
+    def test_mlx_directory_named_gguf_is_not_treated_as_ds4(self, tmp_path):
+        """Only GGUF files, not directories ending in .gguf, are DS4 entries."""
+        model_dir = tmp_path / "Foo.gguf"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type": "llama"}')
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(tmp_path))
+
+        entry = pool.get_entry("Foo.gguf")
+        assert entry.engine_type == "batched"
+        assert pool._is_ds4_entry(entry) is False
 
     def test_no_override_leaves_entry_unchanged(self, small_mock_model_dir):
         """Test that None override doesn't change entry types."""
@@ -1629,6 +1674,27 @@ class TestEnginePoolEviction:
             # Try to load model-b - should fail (can't evict pinned model-a)
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
+
+    @pytest.mark.asyncio
+    async def test_ceiling_zero_after_refresh_disables_admission_guard(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """A refreshed 0 ceiling keeps its sentinel meaning: guard disabled."""
+        pool = EnginePool()
+        ceilings = iter([2500, 0])
+        pool._get_final_ceiling = lambda: next(ceilings)
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+
+        assert pool._entries["model-a"].engine is mock_engine
 
 
 class TestAdmissionSoftTargetEviction:

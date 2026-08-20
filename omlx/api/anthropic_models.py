@@ -185,8 +185,10 @@ class ThinkingConfig(BaseModel):
 class MessagesRequest(BaseModel):
     """Request for Anthropic Messages API."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str
-    max_tokens: int
+    max_tokens: int | None = None
     messages: list[AnthropicMessage]
     system: str | list[SystemContent] | None = None
     stop_sequences: list[str] | None = None

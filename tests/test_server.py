@@ -27,7 +27,11 @@ from omlx.server import (
     get_max_context_window,
     get_sampling_params,
 )
-from omlx.settings import GlobalSettings
+from omlx.settings import (
+    DS4Settings,
+    GlobalSettings,
+    ModelSettings as GlobalModelSettings,
+)
 
 
 class TestBoundarySnapshotLifecycle:
@@ -688,9 +692,10 @@ class TestGetMaxContextWindow:
 
     Resolution order:
         1. Explicit per-model setting (admin / settings.json).
-        2. Context length discovered from the model's config.json at
+        2. DS4 entries use their launch context or DS4 auto/global default.
+        3. Context length discovered from the model's config.json at
            startup (EngineEntry.model_context_length).
-        3. Global SamplingDefaults.max_context_window (32K).
+        4. Global SamplingDefaults.max_context_window (32K).
     """
 
     @pytest.fixture(autouse=True)
@@ -711,10 +716,21 @@ class TestGetMaxContextWindow:
             model_context_length=ctx_length,
         )
 
-    def _mount_pool(self, entries: dict):
+    @staticmethod
+    def _ds4_entry(model_id: str) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/fake/{model_id}.gguf",
+            model_type="llm",
+            engine_type="ds4",
+            estimated_size=0,
+        )
+
+    def _mount_pool(self, entries: dict, ds4_settings: DS4Settings | None = None):
         pool = MagicMock()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_entry.side_effect = lambda mid: entries.get(mid)
+        pool._get_ds4_settings.return_value = ds4_settings or DS4Settings()
         self._state.engine_pool = pool
 
     def _mount_settings(self, overrides: dict):
@@ -753,6 +769,29 @@ class TestGetMaxContextWindow:
         self._mount_pool({"llama-3": self._entry("llama-3", None)})
         self._mount_settings({"llama-3": ModelSettings(max_context_window=8192)})
         assert get_max_context_window("llama-3") == 8192
+
+    def test_ds4_uses_per_model_max_context_window(self):
+        """DS4 uses the shared max_context_window setting as launch context."""
+        self._mount_pool({"foo": self._ds4_entry("foo")})
+        self._mount_settings({"foo": ModelSettings(max_context_window=100_000)})
+        assert get_max_context_window("foo") == 100_000
+
+    def test_ds4_falls_back_to_ds4_auto_context(self):
+        """DS4 without per-model context reports DS4 auto/global context."""
+        self._mount_pool(
+            {"foo": self._ds4_entry("foo")},
+            ds4_settings=DS4Settings(context_default_tokens=250_000),
+        )
+        assert get_max_context_window("foo") == 250_000
+
+    def test_loaded_ds4_effective_context_wins_over_global_default(self):
+        """Loaded DS4 reports its effective launch context."""
+        entry = self._ds4_entry("foo")
+        engine = MagicMock()
+        engine.effective_context_tokens.return_value = 393_216
+        entry.engine = engine
+        self._mount_pool({"foo": entry}, ds4_settings=DS4Settings())
+        assert get_max_context_window("foo") == 393_216
 
     def test_no_model_id_returns_global_default(self):
         """A bare /v1/messages-style call with no model id falls to the default."""

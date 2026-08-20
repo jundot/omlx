@@ -110,6 +110,10 @@ omlx/_engine_commits.json
 # Generated build info (build-time artifact)
 omlx/_build_info.py
 
+# Generated DS4 runtime artifacts must stay out of source commits.
+omlx/vendor/ds4/darwin-arm64/ds4-server
+omlx/vendor/ds4/darwin-arm64/metal/
+
 # Tailwind CSS standalone CLI binary (download on demand via build_css.py)
 omlx/admin/tailwindcss-*
 

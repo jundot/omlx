@@ -6,6 +6,7 @@ Tests CLI argument parsing, command setup, and help text.
 Note: Configuration validation tests are in test_config.py.
 """
 
+import os
 import argparse
 import socket
 import subprocess
@@ -92,6 +93,20 @@ class TestCLIHelp:
         assert "start" in stdout_lower
         assert "stop" in stdout_lower
         assert "restart" in stdout_lower
+        assert "ds4" in stdout_lower
+
+    def test_ds4_install_help(self):
+        """Test DS4 support install help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "ds4", "install", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "--source" in result.stdout
+        assert "--commit" in result.stdout
+        assert "--support-dir" in result.stdout
 
 
 class TestLifecycleCommand:
@@ -577,6 +592,48 @@ class TestLaunchCommandFunction:
         ctx = integration.launch.call_args.args[0]
         assert ctx.extra_args == ("--resume", "abc123")
 
+    def test_launch_command_uses_first_host_from_multi_host_settings(
+        self, tmp_path, monkeypatch
+    ):
+        """launch_command should extract the first host from comma-separated server.host."""
+        from omlx.cli import launch_command
+
+        args = argparse.Namespace(
+            tool="opencode",
+            model="model-a",
+            host=None,
+            port=None,
+            api_key="test-key",
+        )
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+        integration.launch = MagicMock()
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [{"id": "model-a", "model_type": "lm"}]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1,0.0.0.0"
+        settings.server.port = 8000
+
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.host == "127.0.0.1"
+        assert ctx.port == 8000
+
     def test_launch_command_rejects_small_explicit_claude_model(self, capsys):
         """--model must not bypass Claude Code's minimum context check."""
         from omlx.cli import launch_command
@@ -1016,6 +1073,29 @@ class TestServeCommandFunctions:
 
         assert callable(serve_command)
 
+    def test_seed_ds4_support_does_not_build_from_source_on_startup(
+        self, tmp_path, monkeypatch
+    ):
+        """Plain server startup may copy bundled DS4 files, but must not build."""
+        from omlx import cli
+        import omlx.ds4_support as ds4_support
+        from omlx.settings import DS4Settings
+
+        calls = 0
+
+        def fake_build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("serve startup must not build DS4")
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+
+        cli.seed_ds4_support(
+            SimpleNamespace(base_path=tmp_path, ds4=DS4Settings(auto_build=True))
+        )
+
+        assert calls == 0
+
     def test_serve_model_dir_optional_with_default(self):
         """Test that serve --model-dir is optional with default ~/.omlx/models."""
         result = subprocess.run(
@@ -1200,6 +1280,193 @@ class TestServeCommandFunctions:
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0
+
+    def test_serve_binds_multiple_sockets_for_multi_host(self, tmp_path, monkeypatch):
+        """Comma-separated server.host should bind one socket per host."""
+        import uvicorn
+
+        from omlx.cli import serve_command
+
+        host = "127.0.0.1,0.0.0.0"
+        port = 0
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+        events = []
+
+        fake_server = ModuleType("omlx.server")
+
+        async def app(scope, receive, send):
+            return None
+
+        def fake_init_server(**kwargs):
+            events.append("init")
+
+        fake_server.app = app
+        fake_server.init_server = MagicMock(side_effect=fake_init_server)
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+
+        fake_mlx = ModuleType("mlx")
+        fake_mlx_core = ModuleType("mlx.core")
+        fake_mlx_core.device_info = lambda: {"memory_size": 0}
+        fake_mlx_core.set_cache_limit = MagicMock()
+        fake_mlx.core = fake_mlx_core
+        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+
+        original_bind_socket = uvicorn.Config.bind_socket
+
+        def tracking_bind_socket(config):
+            sock = original_bind_socket(config)
+            events.append("bind")
+            return sock
+
+        captured = {}
+
+        def fake_run(self, sockets=None):
+            self.config.load()
+            events.append("run")
+            captured["socket_count"] = len(sockets)
+
+        monkeypatch.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
+        monkeypatch.setattr("uvicorn.Server.run", fake_run)
+
+        serve_command(args)
+
+        assert events == ["bind", "bind", "init", "run"]
+        assert captured["socket_count"] == 2
+
+    def test_serve_exits_on_empty_bind_hosts(self, tmp_path, monkeypatch, capsys):
+        """Empty/whitespace-only host should exit cleanly with an error message."""
+        from omlx.cli import serve_command
+
+        host = " ,  "  # split + strip yields empty list
+        port = 8000
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            serve_command(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "no valid bind hosts" in captured.err
+
+    def test_serve_closes_sockets_on_partial_multi_host_bind_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """When first bind succeeds but second fails, all sockets are closed."""
+        import uvicorn
+
+        from omlx.cli import serve_command
+
+        host = "127.0.0.1,192.0.2.1"  # second host is TEST-NET, may fail
+        port = 0
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+
+        fake_server = ModuleType("omlx.server")
+        fake_server.app = ModuleType("app")
+        fake_server.init_server = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+
+        fake_mlx = ModuleType("mlx")
+        fake_mlx_core = ModuleType("mlx.core")
+        fake_mlx_core.device_info = lambda: {"memory_size": 0}
+        fake_mlx_core.set_cache_limit = MagicMock()
+        fake_mlx.core = fake_mlx_core
+        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+
+        closed_sockets = []
+        call_count = [0]
+
+        def fail_second_bind(config):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise OSError("EADDRNOTAVAIL")
+            # Use a mock socket — we only need to verify close() is called,
+            # and the code never reaches uvicorn.Server.run() on failure.
+            sock = MagicMock()
+            sock.close = MagicMock(side_effect=lambda: closed_sockets.append(sock))
+            return sock
+
+        monkeypatch.setattr("uvicorn.Config.bind_socket", fail_second_bind)
+
+        with pytest.raises(OSError, match="EADDRNOTAVAIL"):
+            serve_command(args)
+
+        assert len(closed_sockets) >= 1, "first socket should have been closed"
+
+    def test_serve_seeds_burst_decode_env_vars_before_engine_import(
+        self, tmp_path, monkeypatch
+    ):
+        """burst_decode_mode must seed OMLX_DECODE_BURST_* env vars before engines load."""
+        import uvicorn
+
+        from omlx.cli import serve_command
+        from omlx.settings import burst_decode_env
+
+        settings = self._make_settings(tmp_path, host="127.0.0.1", port=0)
+        settings.server.burst_decode_mode = "aggressive"
+        args = self._make_serve_args(tmp_path, host="127.0.0.1", port=0)
+
+        fake_server = ModuleType("omlx.server")
+        fake_server.app = ModuleType("app")
+        fake_server.init_server = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+
+        fake_mlx = ModuleType("mlx")
+        fake_mlx_core = ModuleType("mlx.core")
+        fake_mlx_core.device_info = lambda: {"memory_size": 0}
+        fake_mlx_core.set_cache_limit = MagicMock()
+        fake_mlx.core = fake_mlx_core
+        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging", lambda **kwargs: None
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+        monkeypatch.setattr("uvicorn.Config.bind_socket", MagicMock())
+        monkeypatch.setattr("uvicorn.Server.run", MagicMock())
+
+        # Clear env vars before the call so we can detect the seeding
+        for key in ("OMLX_DECODE_BURST_MAX_STEPS", "OMLX_DECODE_BURST_BUDGET_SINGLE_S"):
+            os.environ.pop(key, None)
+
+        serve_command(args)
+
+        expected = burst_decode_env("aggressive")
+        assert (
+            os.environ.get("OMLX_DECODE_BURST_MAX_STEPS")
+            == expected["OMLX_DECODE_BURST_MAX_STEPS"]
+        )
+        assert (
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S")
+            == expected["OMLX_DECODE_BURST_BUDGET_SINGLE_S"]
+        )
 
 
 class TestHasCliOverrides:

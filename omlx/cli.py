@@ -82,12 +82,13 @@ def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
     import os
+
     import uvicorn
 
     from ._version import __version__
     from . import process_title
-    from .settings import burst_decode_env, init_settings
-    from .logging_config import configure_file_logging, AdminStatsAccessFilter
+    from .logging_config import AdminStatsAccessFilter, configure_file_logging
+    from .settings import init_settings, burst_decode_env
 
     process_title.set_process_title()
 
@@ -97,8 +98,8 @@ def serve_command(args):
         build_number = None
 
     # Print version banner
-    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
-    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print("\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print("\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
         print(f"\033[33m├─ Version: {__version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
@@ -167,11 +168,10 @@ def serve_command(args):
     if settings.network.ca_bundle:
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
-
-    # Seed Burst Decode env vars so EngineConfig picks up the saved mode at
-    # engine construction (no restart needed when the mode changes later).
-    for _key, _value in burst_decode_env(settings.server.burst_decode_mode).items():
-        os.environ[_key] = _value
+    # Apply Burst Decode mode — seeds OMLX_DECODE_BURST_* env vars before
+    # engine_core.EngineConfig reads them at construction time.
+    burst_vars = burst_decode_env(settings.server.burst_decode_mode)
+    os.environ.update(burst_vars)
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
@@ -180,6 +180,12 @@ def serve_command(args):
         for error in errors:
             print(f"Configuration error: {error}")
         sys.exit(1)
+
+    # In app installs, seed from Contents/Resources/DS4Support.  Source-clone
+    # installs can build the same support tree from the pinned manifest commit.
+    # Failures are logged but do not block non-DS4 server usage; DS4 launch
+    # validation still reports a concrete missing-file/build-prerequisite error.
+    seed_ds4_support(settings)
 
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
@@ -210,8 +216,11 @@ def serve_command(args):
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
     bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
-    for h in bind_hosts:
-        print(f"Binding server at http://{h}:{settings.server.port}")
+    if not bind_hosts:
+        print("Error: no valid bind hosts configured", file=sys.stderr)
+        sys.exit(1)
+    display_urls = ", ".join(f"http://{h}:{settings.server.port}" for h in bind_hosts)
+    print(f"Binding server at {display_urls}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -225,23 +234,27 @@ def serve_command(args):
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
-    # Bind a socket per host so an occupied port fails fast before model preload.
-    # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
-    serve_sockets = [uvicorn_config.bind_socket()]
-    for h in bind_hosts[1:]:
-        extra_cfg = uvicorn.Config(
-            "omlx.server:app",
-            host=h,
-            port=settings.server.port,
-            log_level=uvicorn_level,
-            access_log=show_access_log,
-        )
-        serve_sockets.append(extra_cfg.bind_socket())
+    serve_sockets: list = []
+    try:
+        serve_sockets = [uvicorn_config.bind_socket()]
+        for host in bind_hosts[1:]:
+            extra_config = uvicorn.Config(
+                "omlx.server:app",
+                host=host,
+                port=settings.server.port,
+                log_level=uvicorn_level,
+                access_log=show_access_log,
+            )
+            serve_sockets.append(extra_config.bind_socket())
+    except Exception:
+        for sock in serve_sockets:
+            sock.close()
+        raise
 
     try:
         # Import server and config after the port is known to be available.
-        from .server import init_server
         from .config import parse_size
+        from .server import init_server
 
         model_dirs = settings.get_effective_model_dirs()
         print(f"Base path: {settings.base_path}")
@@ -345,8 +358,7 @@ def serve_command(args):
             global_settings=settings,
         )
 
-        for h in bind_hosts:
-            print(f"Starting server at http://{h}:{settings.server.port}")
+        print(f"Starting server at {display_urls}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
@@ -389,9 +401,16 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve host/port: CLI args > env vars > settings.json > defaults
     settings = GlobalSettings.load()
-    host = args.host or settings.server.host
+    raw_host = args.host or settings.server.host
+    # settings.server.host may be comma-separated for multi-host binding;
+    # for client connections use only the first host.
+    host = raw_host.split(",")[0].strip() if raw_host else raw_host
     port = args.port or settings.server.port
 
+    # 0.0.0.0 is a valid bind address but not a valid connect address.
+    # Fall back to localhost so launch can reach the server regardless
+    # of which interface it was bound to.
+    connect_host = host if host and host not in ("0.0.0.0", "::") else "127.0.0.1"
     # host may be a comma-separated list of bind addresses; pick the first one
     # for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind targets
     # but not connectable — fall back to localhost in that case.
@@ -713,7 +732,7 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      app.omlx")
+    print("Bundle ID:      app.omlx")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
@@ -797,6 +816,74 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def seed_ds4_support(settings) -> None:
+    """Seed default DS4 support files from bundled app resources."""
+    import logging
+
+    from .ds4_support import (
+        DS4SupportError,
+        inspect_ds4_support,
+        install_bundled_ds4_support_files,
+    )
+
+    logger = logging.getLogger("omlx.ds4_support")
+    ds4_settings = getattr(settings, "ds4", None)
+    if ds4_settings is None:
+        return
+
+    status = inspect_ds4_support(ds4_settings, base_path=settings.base_path)
+    if (
+        status.ready
+        or status.unsupported_platform
+        or ds4_settings.support_dir is not None
+    ):
+        return
+
+    try:
+        ds4_copy = install_bundled_ds4_support_files(
+            ds4_settings,
+            base_path=settings.base_path,
+        )
+        if ds4_copy is not None and ds4_copy.copied_files:
+            logger.info(
+                "Installed bundled DS4 support files from %s to %s",
+                ds4_copy.source_dir,
+                ds4_copy.destination_dir,
+            )
+    except (DS4SupportError, OSError) as exc:
+        logger.warning("Bundled DS4 support files are unavailable: %s", exc)
+
+
+def ds4_command(args) -> int:
+    """Dispatch 'omlx ds4 <target>' support-management commands."""
+    target = getattr(args, "target", None)
+    if target != "install":
+        print("Unknown ds4 target. Available: install", file=sys.stderr)
+        return 1
+
+    from .ds4_support import DS4SupportError, build_ds4_support_from_source
+    from .settings import init_settings
+
+    settings = init_settings(base_path=args.base_path)
+    if args.support_dir:
+        settings.ds4.support_dir = args.support_dir
+
+    try:
+        result = build_ds4_support_from_source(
+            settings.ds4,
+            base_path=settings.base_path,
+            source=args.source,
+            commit=args.commit,
+            skip_build=args.skip_build,
+            overwrite=True,
+        )
+    except DS4SupportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"DS4 support installed at {result.destination_dir}")
+    print(f"Source: {result.source_dir}")
+    return 0
 def cluster_command(args) -> int:
     """Run cluster diagnostics, collective checks, and shard planning."""
     import json
@@ -1003,6 +1090,53 @@ Examples:
                 action="store_true",
                 help="Return after sending the request without waiting for server health",
             )
+
+    ds4_parser = subparsers.add_parser(
+        "ds4",
+        help="Manage DS4/GGUF backend support files",
+        description="Build or inspect DS4/GGUF backend support files.",
+    )
+    ds4_subparsers = ds4_parser.add_subparsers(dest="target", help="DS4 commands")
+    ds4_install_parser = ds4_subparsers.add_parser(
+        "install",
+        help="Build ds4-server from the pinned source commit",
+        description=(
+            "Build ds4-server from the pinned manifest source commit and install "
+            "the validated support tree into the configured DS4 support directory."
+        ),
+    )
+    ds4_install_parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Custom ds4 source checkout or git URL (default: manifest source_repo)",
+    )
+    ds4_install_parser.add_argument(
+        "--commit",
+        type=str,
+        default=None,
+        help="Custom ds4 source commit (default: manifest source_commit)",
+    )
+    ds4_install_parser.add_argument(
+        "--support-dir",
+        type=str,
+        default=None,
+        help=(
+            "Destination support directory (default: configured ds4.support_dir "
+            "or ~/.omlx/support/ds4)"
+        ),
+    )
+    ds4_install_parser.add_argument(
+        "--base-path",
+        type=str,
+        default=None,
+        help="Base directory for oMLX data (default: ~/.omlx)",
+    )
+    ds4_install_parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Validate/copy an already-built ds4-server from --source",
+    )
 
     # Serve command (multi-model)
     serve_parser = subparsers.add_parser(
@@ -1438,6 +1572,8 @@ Example directory structure:
                     "--memory-guard-gb (a custom ceiling needs the guard on)"
                 )
             serve_command(args)
+        elif args.command == "ds4":
+            sys.exit(ds4_command(args))
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))
         elif args.command == "diagnose":

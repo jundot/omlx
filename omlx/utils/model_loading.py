@@ -518,6 +518,23 @@ def maybe_apply_pre_load_patches(
         if apply_llama4_attention_patch():
             logger.info("Llama 4 attention patch applied for %s", model_name)
 
+    qwen35_family_types = ("qwen3_5", "qwen3_6")
+    if (
+        isinstance(model_type, str)
+        and model_type.startswith(qwen35_family_types)
+        or isinstance(text_model_type, str)
+        and text_model_type.startswith(qwen35_family_types)
+    ):
+        try:
+            from ..patches.qwen35_ragged_sdpa_guard import (
+                apply_qwen35_ragged_sdpa_guard_patch,
+            )
+        except Exception as e:
+            logger.debug("Qwen3.5 ragged SDPA guard import failed: %s", e)
+        else:
+            if apply_qwen35_ragged_sdpa_guard_patch():
+                logger.info("Qwen3.5 ragged SDPA guard applied for %s", model_name)
+
     if model_type == "glm_moe_dsa":
         from ..patches.glm_moe_dsa import apply_glm_moe_dsa_patch
 

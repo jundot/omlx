@@ -35,8 +35,13 @@ from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..settings import (
+    BURST_DECODE_MODES,
+    DS4_MAX_CONTEXT_TOKENS,
+    SubKeyEntry,
+    burst_decode_env,
+)
 from ..model_settings import merge_chat_template_kwargs
-from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
     DDGS_TEXT_BACKENDS,
@@ -46,8 +51,8 @@ from ..websearch import (
 from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
 from .auth import (
     REMEMBER_ME_MAX_AGE,
-    SESSION_MAX_AGE,
     compare_keys,
+    SESSION_MAX_AGE,
     create_session_token,
     require_admin,
     validate_api_key,
@@ -171,6 +176,11 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
+    # DS4/GGUF MTP sidecar passed to ds4-server --mtp
+    ds4_mtp_enabled: bool | None = None
+    ds4_mtp_path: str | None = None
+    ds4_mtp_draft: int | None = None
+    ds4_mtp_margin: float | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -273,6 +283,23 @@ class GlobalSettingsRequest(BaseModel):
     gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
+
+    # DS4/GGUF backend settings
+    ds4_enabled: bool | None = None
+    ds4_support_dir: str | None = None
+    ds4_binary_path: str | None = None
+    ds4_auto_build: bool | None = None
+    ds4_source_repo: str | None = None
+    ds4_source_commit: str | None = None
+    ds4_context_default_tokens: int | None = None
+    ds4_ready_timeout_ms: int | None = None
+    ds4_kv_cache_enabled: bool | None = None
+    ds4_kv_root: str | None = None
+    ds4_kv_disk_space_mb: int | None = None
+    ds4_kv_cache_continued_interval_tokens: int | None = None
+    ds4_ssd_streaming: str | None = None
+    ds4_power: int | None = None
+    ds4_logs_to_disk: bool | None = None
 
     # MCP settings
     mcp_config: str | None = None
@@ -541,6 +568,9 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
     )
     for key in unsupported_none_fields:
         settings[key] = None
@@ -560,6 +590,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
+    settings["ds4_mtp_enabled"] = False
 
     unsupported_ct_kwargs = {
         "enable_thinking",
@@ -650,6 +681,10 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
+    settings.ds4_mtp_enabled = False
+    settings.ds4_mtp_path = None
+    settings.ds4_mtp_draft = None
+    settings.ds4_mtp_margin = None
 
 
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -1256,6 +1291,34 @@ def set_hf_uploader(uploader):
 # =============================================================================
 
 
+def _clean_optional_setting_path(value: str | None) -> str | None:
+    """Return a stripped optional path value, treating blanks as unset."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _clean_optional_ds4_support_dir(
+    value: str | None,
+    base_path: Path,
+) -> str | None:
+    """Keep the default DS4 support dir implicit so oMLX can manage it."""
+    cleaned = _clean_optional_setting_path(value)
+    if cleaned is None:
+        return None
+    default_support_dir = (base_path / "support" / "ds4").expanduser().resolve()
+    if Path(cleaned).expanduser().resolve() == default_support_dir:
+        return None
+    return cleaned
+
+
+def _restore_settings_values(target: Any, values: dict[str, Any]) -> None:
+    """Restore a settings dataclass/dict-like object from a value snapshot."""
+    for key, value in values.items():
+        setattr(target, key, value)
+
+
 def format_size(size_bytes: int) -> str:
     """
     Format a byte size as a human-readable string.
@@ -1839,6 +1902,163 @@ def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
         return []
 
 
+def _admin_ds4_status(ds4_status: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return DS4 status enriched for admin/API consumers."""
+    if not isinstance(ds4_status, dict):
+        return None
+    status = dict(ds4_status)
+    if status.get("crashed"):
+        status["status"] = "crashed"
+    elif status.get("running"):
+        status["status"] = "running"
+    else:
+        status["status"] = "stopped"
+
+    rss_bytes = status.get("rss_bytes")
+    status["rss_formatted"] = (
+        format_size(rss_bytes) if isinstance(rss_bytes, int) and rss_bytes > 0 else None
+    )
+    context_tokens = status.get("context_tokens")
+    status["context_tokens_formatted"] = (
+        f"{context_tokens:,}"
+        if isinstance(context_tokens, int) and context_tokens > 0
+        else None
+    )
+    recent_logs = status.get("recent_logs")
+    if isinstance(recent_logs, str):
+        status["recent_log_lines"] = recent_logs.splitlines()[-50:]
+    return status
+
+
+def _list_ds4_mtp_sidecars(global_settings: Any | None) -> list[dict[str, Any]]:
+    """Return selectable DS4 MTP sidecars from configured model directories."""
+    if global_settings is None:
+        return []
+    try:
+        model_dirs = global_settings.get_effective_model_dirs()
+    except Exception:
+        try:
+            model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+        except Exception:
+            return []
+
+    from ..ds4_gguf import collect_ds4_mtp_gguf_sidecar_candidates
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for model_dir in model_dirs:
+        root = Path(model_dir).expanduser().resolve()
+        if not root.is_dir():
+            continue
+        try:
+            first_level_dirs = [
+                path
+                for path in root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            ]
+        except OSError as e:
+            logger.debug("Could not list DS4 MTP sidecars in %s: %s", root, e)
+            continue
+
+        containers = [root, *first_level_dirs]
+        for group in first_level_dirs:
+            try:
+                containers.extend(
+                    path
+                    for path in group.iterdir()
+                    if path.is_dir() and not path.name.startswith(".")
+                )
+            except OSError as e:
+                logger.debug("Could not list DS4 MTP sidecars in %s: %s", group, e)
+
+        for container in containers:
+            try:
+                paths = list(container.iterdir())
+            except OSError as e:
+                logger.debug("Could not list DS4 MTP sidecars in %s: %s", container, e)
+                continue
+            for candidate in collect_ds4_mtp_gguf_sidecar_candidates(container, paths):
+                path = str(candidate.path)
+                if path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(
+                    {
+                        "display_name": candidate.display_name,
+                        "path": path,
+                        "size": candidate.size,
+                        "size_formatted": format_size(candidate.size),
+                        "kind": candidate.kind,
+                        "source_type": candidate.source_type,
+                        "source_repo_id": candidate.source_repo_id,
+                    }
+                )
+    candidates.sort(key=lambda item: item["display_name"].lower())
+    return candidates
+
+
+def _admin_ds4_global_status(engine_pool: Any, *, enabled: bool) -> dict[str, Any]:
+    """Summarize DS4 model lifecycle state for global settings UI."""
+    summary: dict[str, Any] = {
+        "status": "disabled" if not enabled else "no_models",
+        "available_models": 0,
+        "loaded_count": 0,
+        "running_count": 0,
+        "crashed_count": 0,
+        "loading_count": 0,
+        "loaded_models": [],
+    }
+    if engine_pool is None:
+        return summary
+    try:
+        pool_status = engine_pool.get_status()
+    except Exception as e:  # noqa: BLE001 - status UI must remain best-effort
+        logger.debug("Failed to collect DS4 global status: %s", e)
+        return summary
+
+    loaded_models: list[dict[str, Any]] = []
+    for model in pool_status.get("models", []):
+        if model.get("engine_type") != "ds4":
+            continue
+        summary["available_models"] += 1
+        if model.get("is_loading"):
+            summary["loading_count"] += 1
+        if not model.get("loaded"):
+            continue
+        summary["loaded_count"] += 1
+        ds4_status = _admin_ds4_status(model.get("ds4"))
+        lifecycle = ds4_status.get("status") if ds4_status else "loaded"
+        if ds4_status and ds4_status.get("running"):
+            summary["running_count"] += 1
+        if ds4_status and ds4_status.get("crashed"):
+            summary["crashed_count"] += 1
+        loaded_models.append(
+            {
+                "id": model.get("id"),
+                "status": lifecycle,
+                "context_tokens": (ds4_status or {}).get("context_tokens"),
+                "rss_formatted": (ds4_status or {}).get("rss_formatted"),
+                "log_path": (ds4_status or {}).get("log_path"),
+            }
+        )
+
+    if not enabled:
+        summary["status"] = "disabled"
+    elif summary["crashed_count"]:
+        summary["status"] = "crashed"
+    elif summary["running_count"]:
+        summary["status"] = "running"
+    elif summary["loading_count"]:
+        summary["status"] = "loading"
+    elif summary["loaded_count"]:
+        summary["status"] = "loaded"
+    elif summary["available_models"]:
+        summary["status"] = "idle"
+    summary["loaded_models"] = loaded_models[:10]
+    return summary
+
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -1900,10 +2120,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
+        ds4_status = _admin_ds4_status(model_info.get("ds4"))
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
-            "display_name": _model_display_name(
+            "display_name": model_info.get("display_name")
+            or _model_display_name(
                 model_id,
                 model_info.get("model_path", ""),
                 model_dirs,
@@ -1951,6 +2173,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatibility_reason": mtp_compat_reason,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "ds4": ds4_status,
         }
 
         # Add settings if available
@@ -2000,7 +2223,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             }
         )
 
-    return {"models": models}
+    return {
+        "models": models,
+        "ds4_mtp_sidecars": _list_ds4_mtp_sidecars(global_settings),
+    }
 
 
 @router.post("/api/models/{model_id}/unload")
@@ -2013,28 +2239,43 @@ async def unload_model(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    entry = engine_pool.get_entry(model_id)
+    settings_manager = _get_settings_manager()
+    resolved_model_id = engine_pool.resolve_model_id(model_id, settings_manager)
+    entry = engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
-        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+        raise HTTPException(
+            status_code=400, detail=f"Model not loaded: {resolved_model_id}"
+        )
     if entry.is_loading:
-        raise HTTPException(status_code=409, detail=f"Model still loading: {model_id}")
+        raise HTTPException(
+            status_code=409, detail=f"Model still loading: {resolved_model_id}"
+        )
 
-    unloaded = await engine_pool.request_unload(model_id, reason="manual admin unload")
+    unloaded = await engine_pool.request_unload(
+        resolved_model_id, reason="manual admin unload"
+    )
     if not unloaded:
-        logger.info("Queued manual unload for active model: %s", model_id)
+        logger.info("Queued manual unload for active model: %s", resolved_model_id)
         return JSONResponse(
             status_code=202,
             content={
                 "status": "unloading",
-                "model_id": model_id,
-                "message": f"Aborting active requests before unloading {model_id}",
+                "model_id": resolved_model_id,
+                "message": (
+                    "Aborting active requests before unloading "
+                    f"{resolved_model_id}"
+                ),
             },
         )
 
-    logger.info("Manually unloaded model: %s", model_id)
-    return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+    logger.info("Manually unloaded model: %s", resolved_model_id)
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Unloaded {resolved_model_id}",
+    }
 
 
 async def _require_admin_or_bearer(request: Request) -> bool:
@@ -2078,27 +2319,33 @@ async def load_model(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    entry = engine_pool.get_entry(model_id)
+    settings_manager = _get_settings_manager()
+    resolved_model_id = engine_pool.resolve_model_id(model_id, settings_manager)
+    entry = engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is not None:
         return {
             "status": "ok",
-            "model_id": model_id,
-            "message": f"Already loaded: {model_id}",
+            "model_id": resolved_model_id,
+            "message": f"Already loaded: {resolved_model_id}",
         }
     if entry.is_loading:
         raise HTTPException(
-            status_code=409, detail=f"Model is already loading: {model_id}"
+            status_code=409, detail=f"Model is already loading: {resolved_model_id}"
         )
 
     try:
-        await engine_pool.get_engine(model_id)
+        await engine_pool.get_engine(resolved_model_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info(f"Manually loaded model: {model_id}")
-    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+    logger.info(f"Manually loaded model: {resolved_model_id}")
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Loaded {resolved_model_id}",
+    }
 
 
 @router.post("/api/models/{model_id}/import-mtplx")
@@ -2172,6 +2419,13 @@ async def update_model_settings(
 
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
+    previous_max_context_window = current_settings.max_context_window
+    previous_ds4_mtp_settings = (
+        current_settings.ds4_mtp_enabled,
+        current_settings.ds4_mtp_path,
+        current_settings.ds4_mtp_draft,
+        current_settings.ds4_mtp_margin,
+    )
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -2223,31 +2477,54 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
-        current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
-        type_to_engine = {
-            "llm": "batched",
-            "vlm": "vlm",
-            "embedding": "embedding",
-            "reranker": "reranker",
-            "audio_stt": "audio_stt",
-            "audio_tts": "audio_tts",
-            "audio_sts": "audio_sts",
-        }
-        if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+        if engine_pool._is_ds4_entry(entry):
+            if override_value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="model_type_override is not supported for DS4 GGUF models",
+                )
+            current_settings.model_type_override = None
+            entry.model_type = "llm"
+            entry.engine_type = "ds4"
         else:
-            # Reset to auto-detected type
-            from pathlib import Path
+            current_settings.model_type_override = override_value
+            # Update engine pool entry type immediately
+            type_to_engine = {
+                "llm": "batched",
+                "vlm": "vlm",
+                "embedding": "embedding",
+                "reranker": "reranker",
+                "audio_stt": "audio_stt",
+                "audio_tts": "audio_tts",
+                "audio_sts": "audio_sts",
+            }
+            if override_value:
+                entry.model_type = override_value
+                entry.engine_type = type_to_engine.get(override_value, "batched")
+            else:
+                # Reset to auto-detected type
+                from ..model_discovery import detect_model_type
 
-            from ..model_discovery import detect_model_type
-
-            detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+                detected_type = detect_model_type(Path(entry.model_path))
+                entry.model_type = detected_type
+                entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
-        current_settings.max_context_window = request.max_context_window
+        max_context_window = request.max_context_window
+        if engine_pool._is_ds4_entry(entry):
+            if max_context_window is not None and max_context_window <= 0:
+                max_context_window = None
+            if (
+                max_context_window is not None
+                and max_context_window > DS4_MAX_CONTEXT_TOKENS
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "max_context_window must be <= "
+                        f"{DS4_MAX_CONTEXT_TOKENS} for DS4 GGUF models"
+                    ),
+                )
+        current_settings.max_context_window = max_context_window
     if "max_tokens" in sent:
         current_settings.max_tokens = request.max_tokens
     if "temperature" in sent:
@@ -2486,6 +2763,61 @@ async def update_model_settings(
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
 
+    # DS4/GGUF MTP sidecar passed through to ds4-server --mtp.
+    ds4_mtp_fields = {
+        "ds4_mtp_enabled",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
+    }
+    if sent & ds4_mtp_fields:
+        if not engine_pool._is_ds4_entry(entry):
+            requested_enable = (
+                bool(request.ds4_mtp_enabled)
+                if "ds4_mtp_enabled" in sent
+                else current_settings.ds4_mtp_enabled
+            )
+            requested_path = (
+                request.ds4_mtp_path
+                if "ds4_mtp_path" in sent
+                else current_settings.ds4_mtp_path
+            )
+            if requested_enable or requested_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DS4 MTP settings are only supported for DS4 GGUF models.",
+                )
+
+        if "ds4_mtp_path" in sent:
+            raw_path = request.ds4_mtp_path.strip() if request.ds4_mtp_path else None
+            current_settings.ds4_mtp_path = raw_path or None
+        if "ds4_mtp_draft" in sent:
+            value = request.ds4_mtp_draft
+            current_settings.ds4_mtp_draft = int(value) if value and value > 0 else None
+        if "ds4_mtp_margin" in sent:
+            value = request.ds4_mtp_margin
+            current_settings.ds4_mtp_margin = (
+                float(value) if value is not None and value >= 0 else None
+            )
+        if "ds4_mtp_enabled" in sent:
+            current_settings.ds4_mtp_enabled = bool(request.ds4_mtp_enabled)
+
+        if current_settings.ds4_mtp_enabled:
+            if not current_settings.ds4_mtp_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DS4 MTP requires a path to a Flash MTP sidecar GGUF.",
+                )
+            try:
+                from ..ds4_gguf import validate_ds4_mtp_compatibility
+
+                validate_ds4_mtp_compatibility(
+                    Path(entry.model_path),
+                    Path(current_settings.ds4_mtp_path),
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
@@ -2497,7 +2829,6 @@ async def update_model_settings(
             # mlx-community converted weights where the default sanitize
             # path stripped the MTP heads.
             import json
-            from pathlib import Path
 
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
@@ -2679,7 +3010,77 @@ async def update_model_settings(
                         settings=profile_settings,
                     )
 
-    # Persist settings
+    current_ds4_mtp_settings = (
+        current_settings.ds4_mtp_enabled,
+        current_settings.ds4_mtp_path,
+        current_settings.ds4_mtp_draft,
+        current_settings.ds4_mtp_margin,
+    )
+    ds4_context_changed = (
+        "max_context_window" in sent
+        and current_settings.max_context_window != previous_max_context_window
+    )
+    ds4_mtp_changed = bool(sent & ds4_mtp_fields) and (
+        current_ds4_mtp_settings != previous_ds4_mtp_settings
+    )
+    ds4_launch_requires_restart = (
+        entry.engine is not None
+        and engine_pool._is_ds4_entry(entry)
+        and (ds4_context_changed or ds4_mtp_changed)
+    )
+    if ds4_launch_requires_restart and entry.engine.has_active_requests():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "DS4 launch setting change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            ),
+        )
+
+    ds4_launch_restarted = False
+    if ds4_launch_requires_restart:
+        restart_with_launch_settings = getattr(
+            entry.engine, "restart_with_launch_settings", None
+        )
+        restart_with_context = getattr(entry.engine, "restart_with_context", None)
+        if callable(restart_with_launch_settings):
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_launch_restarted = bool(
+                    await restart_with_launch_settings(
+                        context_tokens=current_settings.max_context_window,
+                        model_settings=current_settings,
+                        reason="launch setting change",
+                        force=True,
+                    )
+                )
+                if ds4_launch_restarted:
+                    get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+                    if callable(get_rss):
+                        entry.actual_size = get_rss() or entry.actual_size
+            except DS4ProxyError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+        elif callable(restart_with_context) and ds4_context_changed:
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_launch_restarted = bool(
+                    await restart_with_context(current_settings.max_context_window)
+                )
+                if ds4_launch_restarted:
+                    get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+                    if callable(get_rss):
+                        entry.actual_size = get_rss() or entry.actual_size
+            except DS4ProxyError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+    # Persist settings only after DS4 restart admission has succeeded, so a
+    # racing active request cannot save a context that was not applied.
     settings_manager.set_settings(model_id, current_settings)
 
     # A failed load is cached to prevent clients from retrying the same broken
@@ -2750,9 +3151,11 @@ async def update_model_settings(
         "settings": current_settings.to_dict(),
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
-        "requires_reload": requires_reload,
+        "requires_reload": requires_reload or ds4_launch_requires_restart,
         "auto_unloaded": auto_unloaded,
-        "auto_reloaded": auto_reloaded,
+        "auto_reloaded": auto_reloaded or ds4_launch_restarted,
+        "ds4_context_restarted": ds4_launch_restarted and ds4_context_changed,
+        "ds4_launch_restarted": ds4_launch_restarted,
     }
 
 
@@ -2973,9 +3376,53 @@ async def apply_model_profile(
     is_admin: bool = Depends(require_admin),
 ):
     mgr = _require_settings_manager()
-    entry = _require_model(model_id)
-    is_diffusion_model = _entry_is_diffusion_model(entry)
+    pool_entry = _require_model(model_id)
+    is_diffusion_model = _entry_is_diffusion_model(pool_entry)
     sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+
+    previous_settings = mgr.get_settings(model_id)
+    profile = mgr.get_profile(model_id, name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    profile_settings = profile.get("settings", {}) or {}
+
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    is_ds4_entry = (
+        getattr(engine_pool, "_is_ds4_entry", None) if engine_pool is not None else None
+    )
+    is_ds4 = bool(entry is not None and callable(is_ds4_entry) and is_ds4_entry(entry))
+    target_max_context = previous_settings.max_context_window
+    if is_ds4 and "max_context_window" in profile_settings:
+        target_max_context = profile_settings.get("max_context_window")
+        if target_max_context is not None and target_max_context <= 0:
+            target_max_context = None
+        if (
+            target_max_context is not None
+            and target_max_context > DS4_MAX_CONTEXT_TOKENS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_context_window must be <= "
+                    f"{DS4_MAX_CONTEXT_TOKENS} for DS4 GGUF models"
+                ),
+            )
+    ds4_context_requires_restart = (
+        is_ds4
+        and entry is not None
+        and entry.engine is not None
+        and target_max_context != previous_settings.max_context_window
+    )
+    if ds4_context_requires_restart and entry.engine.has_active_requests():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "DS4 context change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            ),
+        )
+
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     except ValueError as e:
@@ -2985,7 +3432,31 @@ async def apply_model_profile(
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(applied)
         mgr.set_settings(model_id, applied)
-    return {"model_id": model_id, "settings": applied.to_dict()}
+    if is_ds4 and applied.max_context_window != target_max_context:
+        applied.max_context_window = target_max_context
+        mgr.set_settings(model_id, applied)
+
+    ds4_context_restarted = False
+    if ds4_context_requires_restart:
+        restart_with_context = getattr(entry.engine, "restart_with_context", None)
+        if callable(restart_with_context):
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_context_restarted = bool(
+                    await restart_with_context(applied.max_context_window)
+                )
+            except DS4ProxyError as e:
+                mgr.set_settings(model_id, previous_settings)
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                mgr.set_settings(model_id, previous_settings)
+                raise HTTPException(status_code=500, detail=str(e)) from e
+    return {
+        "model_id": model_id,
+        "settings": applied.to_dict(),
+        "ds4_context_restarted": ds4_context_restarted,
+    }
 
 
 @router.get("/api/profile-fields")
@@ -3327,6 +3798,18 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     disk_info = get_ssd_disk_info(cache_dir)
     server_state = _get_server_state() if _get_server_state is not None else None
 
+    ds4_auto_context = global_settings.ds4.get_auto_context_tokens(
+        memory_info["total_bytes"] or None
+    )
+    try:
+        engine_pool = _get_engine_pool() if callable(_get_engine_pool) else None
+    except HTTPException:
+        engine_pool = None
+    ds4_global_status = _admin_ds4_global_status(
+        engine_pool,
+        enabled=global_settings.ds4.enabled,
+    )
+
     return {
         "base_path": str(global_settings.base_path),
         "server": {
@@ -3398,6 +3881,40 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
+        },
+        "ds4": {
+            "enabled": global_settings.ds4.enabled,
+            "support_dir": str(
+                global_settings.ds4.get_support_dir(global_settings.base_path)
+            ),
+            "binary_path": global_settings.ds4.binary_path or "",
+            "auto_build": global_settings.ds4.auto_build,
+            "source_repo": global_settings.ds4.source_repo or "",
+            "source_commit": global_settings.ds4.source_commit or "",
+            "context_default_tokens": global_settings.ds4.context_default_tokens,
+            "auto_context_tokens": ds4_auto_context,
+            "auto_context_tokens_formatted": f"{ds4_auto_context:,}",
+            "ready_timeout_ms": global_settings.ds4.ready_timeout_ms,
+            "kv_cache_enabled": global_settings.ds4.kv_cache_enabled,
+            "kv_root": str(global_settings.ds4.get_kv_root(global_settings.base_path)),
+            "kv_disk_space_mb": global_settings.ds4.kv_disk_space_mb,
+            "kv_disk_space_formatted": format_size(
+                global_settings.ds4.kv_disk_space_mb * 1024 * 1024
+            ),
+            "kv_cache_continued_interval_tokens": (
+                global_settings.ds4.kv_cache_continued_interval_tokens
+            ),
+            "ssd_streaming": global_settings.ds4.ssd_streaming,
+            "power": global_settings.ds4.power,
+            "logs_to_disk": global_settings.ds4.logs_to_disk,
+            "trace_enabled": global_settings.ds4.trace_enabled,
+            "trace_dir": str(
+                global_settings.ds4.get_trace_dir(global_settings.base_path)
+            ),
+            "debug_dir": str(
+                global_settings.ds4.get_debug_dir(global_settings.base_path)
+            ),
+            **ds4_global_status,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -3518,19 +4035,24 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    previous_ds4_settings: dict[str, Any] | None = None
 
     # Apply server settings
     if request.host is not None:
         from ..utils.network import is_valid_bind_host
 
-        parts = [h.strip() for h in request.host.split(",") if h.strip()]
-        if not parts:
-            raise HTTPException(status_code=400, detail="Host cannot be empty")
-        for part in parts:
-            if not is_valid_bind_host(part):
+        _hosts = [h.strip() for h in request.host.split(",")]
+        _hosts = [h for h in _hosts if h]  # drop empty segments
+        if not _hosts:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid host: at least one non-empty host is required",
+            )
+        for h in _hosts:
+            if not is_valid_bind_host(h):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
+                    detail=f"Invalid host: {h!r} (must be a valid IP address or hostname)",
                 )
         global_settings.server.host = request.host
     if request.port is not None:
@@ -3562,9 +4084,10 @@ async def update_global_settings(
         # Seed env so models loaded later pick up the mode without a restart.
         for _key, _value in burst_decode_env(mode).items():
             os.environ[_key] = _value
-        # Hot-apply to every loaded engine. EngineConfig is a mutable dataclass
-        # and its burst fields are read fresh each decode burst
-        # (EngineCore._step_burst), so this takes effect on the next token.
+        # Hot-apply to every loaded engine.  EngineConfig is a mutable
+        # dataclass whose burst fields are read fresh each decode burst
+        # (EngineCore._step_burst), so the change takes effect on the
+        # next token without a restart.
         max_steps, single_s = BURST_DECODE_MODES[mode]
         from ..server import _server_state
 
@@ -3585,6 +4108,7 @@ async def update_global_settings(
                     cfg.decode_burst_budget_single_s = single_s
         runtime_applied.append("burst_decode_mode")
         logger.info(f"Burst Decode mode set to '{mode}'")
+
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
@@ -4340,6 +4864,75 @@ async def update_global_settings(
         )
         runtime_applied.append("skip_api_key_verification")
 
+    # Apply DS4/GGUF backend settings after earlier request-specific validation.
+    # Final global validation/save failures still roll this in-memory object back.
+    ds4_changed = False
+    if any(field.startswith("ds4_") for field in request.model_fields_set):
+        previous_ds4_settings = global_settings.ds4.to_dict()
+    if request.ds4_enabled is not None:
+        global_settings.ds4.enabled = request.ds4_enabled
+        ds4_changed = True
+    if "ds4_support_dir" in request.model_fields_set:
+        global_settings.ds4.support_dir = _clean_optional_ds4_support_dir(
+            request.ds4_support_dir,
+            global_settings.base_path,
+        )
+        ds4_changed = True
+    if "ds4_binary_path" in request.model_fields_set:
+        global_settings.ds4.binary_path = _clean_optional_setting_path(
+            request.ds4_binary_path
+        )
+        ds4_changed = True
+    if request.ds4_auto_build is not None:
+        global_settings.ds4.auto_build = request.ds4_auto_build
+        ds4_changed = True
+    if "ds4_source_repo" in request.model_fields_set:
+        global_settings.ds4.source_repo = _clean_optional_setting_path(
+            request.ds4_source_repo
+        )
+        ds4_changed = True
+    if "ds4_source_commit" in request.model_fields_set:
+        global_settings.ds4.source_commit = _clean_optional_setting_path(
+            request.ds4_source_commit
+        )
+        ds4_changed = True
+    if "ds4_context_default_tokens" in request.model_fields_set:
+        value = request.ds4_context_default_tokens
+        global_settings.ds4.context_default_tokens = (
+            None if value in (None, 0) else value
+        )
+        ds4_changed = True
+    if request.ds4_ready_timeout_ms is not None:
+        global_settings.ds4.ready_timeout_ms = request.ds4_ready_timeout_ms
+        ds4_changed = True
+    if request.ds4_kv_cache_enabled is not None:
+        global_settings.ds4.kv_cache_enabled = request.ds4_kv_cache_enabled
+        ds4_changed = True
+    if "ds4_kv_root" in request.model_fields_set:
+        global_settings.ds4.kv_root = _clean_optional_setting_path(request.ds4_kv_root)
+        ds4_changed = True
+    if request.ds4_kv_disk_space_mb is not None:
+        global_settings.ds4.kv_disk_space_mb = request.ds4_kv_disk_space_mb
+        ds4_changed = True
+    if request.ds4_kv_cache_continued_interval_tokens is not None:
+        global_settings.ds4.kv_cache_continued_interval_tokens = (
+            request.ds4_kv_cache_continued_interval_tokens
+        )
+        ds4_changed = True
+    if request.ds4_ssd_streaming is not None:
+        global_settings.ds4.ssd_streaming = request.ds4_ssd_streaming
+        ds4_changed = True
+    if request.ds4_power is not None:
+        global_settings.ds4.power = request.ds4_power
+        ds4_changed = True
+    if request.ds4_logs_to_disk is not None:
+        global_settings.ds4.logs_to_disk = request.ds4_logs_to_disk
+        ds4_changed = True
+
+    if ds4_changed:
+        runtime_applied.append("ds4")
+        logger.info("DS4 backend settings updated")
+
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
@@ -4351,6 +4944,8 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_ds4_settings is not None:
+            _restore_settings_values(global_settings.ds4, previous_ds4_settings)
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -4361,6 +4956,8 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_ds4_settings is not None:
+            _restore_settings_values(global_settings.ds4, previous_ds4_settings)
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
     if pending_embedding_batch_size is not None:
@@ -4581,7 +5178,53 @@ def _get_engine_info() -> dict:
             pass
         engines[pkg_name] = info
 
+    engines["ds4"] = _get_ds4_engine_info()
+
     return engines
+
+
+def _get_ds4_engine_info() -> dict:
+    """Get the DS4 support source commit shown in the engine versions panel."""
+    info = {"name": "ds4", "version": None, "commit": None, "url": None}
+    try:
+        from ..ds4_support import DS4_SUPPORT_MANIFEST, load_ds4_support_manifest
+
+        manifest_path = None
+        settings = _get_global_settings() if callable(_get_global_settings) else None
+        if settings is not None:
+            staged_manifest = (
+                settings.ds4.get_support_dir(settings.base_path) / DS4_SUPPORT_MANIFEST
+            )
+            if staged_manifest.is_file():
+                manifest_path = staged_manifest
+
+        manifest = load_ds4_support_manifest(manifest_path)
+        commit = manifest.source_commit.strip()
+        if commit:
+            info["commit"] = commit
+            info["url"] = _github_commit_url(manifest.source_repo, commit)
+    except Exception as exc:
+        logger.debug("Could not read DS4 support manifest for engine info: %s", exc)
+    return info
+
+
+def _github_commit_url(repo_url: str, commit: str) -> str | None:
+    """Build a GitHub commit URL for a repo URL when possible."""
+    repo = repo_url.strip().rstrip("/")
+    commit = commit.strip()
+    if not repo or not commit:
+        return None
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if repo.startswith("git@github.com:"):
+        repo = f"https://github.com/{repo.removeprefix('git@github.com:')}"
+    elif repo.startswith("ssh://git@github.com/"):
+        repo = f"https://github.com/{repo.removeprefix('ssh://git@github.com/')}"
+    elif repo.startswith("http://github.com/"):
+        repo = f"https://github.com/{repo.removeprefix('http://github.com/')}"
+    if not repo.startswith("https://github.com/"):
+        return None
+    return f"{repo}/commit/{commit}"
 
 
 def _get_commit_from_direct_url(dist, default_url: str) -> dict | None:
@@ -4595,10 +5238,11 @@ def _get_commit_from_direct_url(dist, default_url: str) -> dict | None:
             vcs_info = direct_url.get("vcs_info", {})
             commit = vcs_info.get("commit_id")
             if commit:
-                repo_url = direct_url.get("url", default_url).rstrip("/")
-                if repo_url.endswith(".git"):
-                    repo_url = repo_url[:-4]
-                return {"commit": commit, "url": f"{repo_url}/commit/{commit}"}
+                repo_url = direct_url.get("url", default_url)
+                return {
+                    "commit": commit,
+                    "url": _github_commit_url(repo_url, commit),
+                }
     except Exception:
         pass
     return None
@@ -5065,13 +5709,13 @@ def _build_active_models_data() -> dict:
         active_requests = 0
         waiting_requests = 0
         running_by_id = {}
-        has_scheduler_snapshot = False
         waiting_ids = set()
         waiting = []
         activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        has_scheduler_snapshot = False
         collector_request_ids: set = set()
         active_request_ids: set = set()
         activity_requests = 0
@@ -5841,9 +6485,11 @@ async def remove_hf_task(
 @router.get("/api/hf/recommended")
 async def get_recommended_models(
     mlx_only: bool = True,
+    show_mlx: bool | None = None,
+    show_ds4_gguf: bool | None = None,
     is_admin: bool = Depends(require_admin),
 ):
-    """Get recommended models filtered by system memory."""
+    """Get recommended models filtered by system memory/backend."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
@@ -5854,7 +6500,11 @@ async def get_recommended_models(
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
+            max_memory_bytes=max_memory,
+            result_limit=50,
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
         )
         return result
     except TimeoutError:
@@ -5872,6 +6522,8 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    show_mlx: bool | None = None,
+    show_ds4_gguf: bool | None = None,
     # Filtering
     min_params: Optional[int] = None,
     max_params: Optional[int] = None,
@@ -5888,7 +6540,9 @@ async def search_hf_models(
         q: Search query string (required)
         sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
         limit: Maximum results (max 100)
-        mlx_only: Restrict to MLX library models
+        mlx_only: Legacy MLX library restriction when OR filters are omitted
+        show_mlx: Include MLX catalog results
+        show_ds4_gguf: Include DeepSeek V4 DS4-GGUF catalog results
         min_params: Minimum parameter count
         max_params: Maximum parameter count
         min_size: Minimum model size in bytes
@@ -5913,6 +6567,8 @@ async def search_hf_models(
             max_size=max_size,
             sort_by_size=sort_by_size,
             sort_ascending=sort_ascending,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
         )
         return result
     except TimeoutError:
@@ -5955,9 +6611,42 @@ async def get_hf_model_info(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _engine_pool_status_models(engine_pool: Any) -> list[dict[str, Any]]:
+    """Return EnginePool status models when available."""
+    if engine_pool is None or not callable(getattr(engine_pool, "get_status", None)):
+        return []
+    try:
+        status = engine_pool.get_status()
+    except Exception as e:
+        logger.debug("Could not read EnginePool status for local models: %s", e)
+        return []
+    if not isinstance(status, dict):
+        return []
+    models = status.get("models", [])
+    if not isinstance(models, list):
+        return []
+    return [model for model in models if isinstance(model, dict)]
+
+
+def _containing_model_dir(path: Path, model_dirs: list[Path]) -> Path | None:
+    """Return the configured model dir containing *path*, if any."""
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        return None
+    for model_dir in model_dirs:
+        try:
+            resolved_dir = model_dir.resolve()
+        except OSError:
+            continue
+        if resolved_path == resolved_dir or resolved_path.is_relative_to(resolved_dir):
+            return model_dir
+    return None
+
+
 @router.get("/api/hf/models")
 async def list_hf_models(is_admin: bool = Depends(require_admin)):
-    """List models in all model directories with disk size info."""
+    """List local model artifacts in all model directories with disk size info."""
     global_settings = _get_global_settings()
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -5966,33 +6655,52 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
+    def _artifact_size(model_path: Path) -> int:
+        if model_path.is_file():
+            return model_path.stat().st_size
+        return sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+
+    models = []
+    seen_names: set[str] = set()
+
     def _add_model(
         model_path: Path,
         model_name: str,
         *,
         source_repo_id: str | None = None,
+        display_name: str | None = None,
+        engine_type: str | None = None,
+        model_type: str | None = None,
+        config_model_type: str | None = None,
+        backend_label: str | None = None,
     ) -> None:
         if model_name in seen_names:
             return
         seen_names.add(model_name)
-        total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
-        models.append(
-            {
-                "name": model_name,
-                "path": str(model_path),
-                "display_name": _model_display_name(
-                    model_name,
-                    model_path,
-                    model_dirs,
-                    source_repo_id=source_repo_id,
-                ),
-                "size": total_size,
-                "size_formatted": format_size(total_size),
-            }
-        )
+        total_size = _artifact_size(model_path)
+        model = {
+            "name": model_name,
+            "path": str(model_path),
+            "display_name": display_name
+            or _model_display_name(
+                model_name,
+                model_path,
+                model_dirs,
+                source_repo_id=source_repo_id,
+            ),
+            "size": total_size,
+            "size_formatted": format_size(total_size),
+        }
+        if engine_type:
+            model["engine_type"] = engine_type
+        if model_type:
+            model["model_type"] = model_type
+        if config_model_type:
+            model["config_model_type"] = config_model_type
+        if backend_label:
+            model["backend_label"] = backend_label
+        models.append(model)
 
-    models = []
-    seen_names: set[str] = set()
     for model_dir in model_dirs:
         if not model_dir.exists():
             continue
@@ -6022,8 +6730,44 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
+    engine_pool = None
+    if callable(_get_engine_pool):
+        try:
+            engine_pool = _get_engine_pool()
+        except HTTPException as e:
+            if e.status_code != 503:
+                raise
+        except Exception as e:
+            logger.debug("Could not get EnginePool for local models: %s", e)
+    for model_info in _engine_pool_status_models(engine_pool):
+        if model_info.get("engine_type") != "ds4":
+            continue
+        model_path = Path(str(model_info.get("model_path") or ""))
+        if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
+            continue
+        if _containing_model_dir(model_path, model_dirs) is None:
+            continue
+        model_id = str(model_info.get("id") or "")
+        if not model_id:
+            continue
+        _add_model(
+            model_path,
+            model_id,
+            display_name=model_info.get("display_name")
+            or _model_display_name(
+                model_id,
+                model_path,
+                model_dirs,
+                source_repo_id=model_info.get("source_repo_id"),
+            ),
+            engine_type="ds4",
+            model_type=model_info.get("model_type"),
+            config_model_type=model_info.get("config_model_type"),
+            backend_label="DS4-GGUF",
+        )
+
     # Sort by the UI display name so organization prefixes group together.
-    models.sort(key=lambda m: m["display_name"].lower())
+    models.sort(key=lambda m: (m.get("display_name") or m["name"]).lower())
     return {"models": models}
 
 
@@ -6040,6 +6784,20 @@ async def delete_hf_model(
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+
+    settings_manager = (
+        _get_settings_manager() if callable(_get_settings_manager) else None
+    )
+    resolved_model_name = model_name
+    if engine_pool is not None and callable(
+        getattr(engine_pool, "resolve_model_id", None)
+    ):
+        try:
+            resolved = engine_pool.resolve_model_id(model_name, settings_manager)
+            if isinstance(resolved, str):
+                resolved_model_name = resolved
+        except Exception as e:
+            logger.debug("Could not resolve local model name %s: %s", model_name, e)
 
     # Search for model across all directories in both flat and org-folder layouts
     model_path = None
@@ -6065,6 +6823,23 @@ async def delete_hf_model(
             break
 
     if model_path is None:
+        for model_info in _engine_pool_status_models(engine_pool):
+            if (
+                model_info.get("id") != resolved_model_name
+                or model_info.get("engine_type") != "ds4"
+            ):
+                continue
+            candidate = Path(str(model_info.get("model_path") or ""))
+            if candidate.suffix.lower() != ".gguf" or not candidate.is_file():
+                continue
+            parent = _containing_model_dir(candidate, model_dirs)
+            if parent is None:
+                continue
+            model_path = candidate
+            parent_model_dir = parent
+            break
+
+    if model_path is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
     # Validate path traversal against parent model directory
@@ -6074,18 +6849,20 @@ async def delete_hf_model(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
 
-    if not model_path.is_dir():
-        raise HTTPException(status_code=400, detail="Not a model directory")
+    if not model_path.is_dir() and not (
+        model_path.is_file() and model_path.suffix.lower() == ".gguf"
+    ):
+        raise HTTPException(status_code=400, detail="Not a supported model artifact")
 
     # Unload model if loaded
     if engine_pool is not None:
         loaded_ids = engine_pool.get_loaded_model_ids()
-        if model_name in loaded_ids:
+        if resolved_model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
-                logger.info(f"Unloaded model '{model_name}' before deletion")
+                await engine_pool._unload_engine(resolved_model_name)
+                logger.info(f"Unloaded model '{resolved_model_name}' before deletion")
             except Exception as e:
-                logger.warning(f"Failed to unload model '{model_name}': {e}")
+                logger.warning(f"Failed to unload model '{resolved_model_name}': {e}")
 
     # Delete from disk
     # Handle macOS resource fork files (._*) that may disappear on non-native
@@ -6104,13 +6881,17 @@ async def delete_hf_model(
         raise exc_info[1].with_traceback(exc_info[2])
 
     try:
-        if sys.version_info >= (3, 12):
+        if model_path.is_file():
+            model_path.unlink()
+            logger.info(f"Deleted model file: {model_path}")
+        elif sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
+            logger.info(f"Deleted model directory: {model_path}")
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
-        logger.info(f"Deleted model directory: {model_path}")
+            logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
-        logger.error(f"Failed to delete model directory {model_path}: {e}")
+        logger.error(f"Failed to delete model artifact {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
     # If the model was inside an org folder (organized layout) and that
@@ -6125,16 +6906,17 @@ async def delete_hf_model(
 
     # Re-discover models
     if engine_pool is not None:
-        settings_manager = _get_settings_manager()
         pinned_models = []
         if settings_manager:
             pinned_models = settings_manager.get_pinned_model_ids()
 
-        engine_pool._entries.pop(model_name, None)
+        if hasattr(engine_pool, "_entries"):
+            engine_pool._entries.pop(model_name, None)
+            engine_pool._entries.pop(resolved_model_name, None)
         # Release the deleted model's persisted settings (including its alias)
         # so they can be reused by another model.
         if settings_manager:
-            settings_manager.delete_settings(model_name)
+            settings_manager.delete_settings(resolved_model_name)
         engine_pool.discover_models(
             [str(d) for d in global_settings.get_effective_model_dirs()],
             pinned_models,

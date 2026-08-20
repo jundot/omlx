@@ -5,6 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 
+from omlx.model_settings import ModelSettings, ModelSettingsManager
 import pytest
 
 from omlx.model_settings import (

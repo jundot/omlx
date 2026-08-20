@@ -12,9 +12,9 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
@@ -28,6 +28,8 @@ from huggingface_hub.utils import tqdm as _hf_tqdm
 # Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
 # guarantees it exists. Re-verify the symbol when bumping the hub version.
 from huggingface_hub.utils._xet import abort_xet_session
+
+from . import ds4_downloader_catalog as _ds4_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,104 @@ _STALL_TIMEOUT = 300
 # so downloads fail. We resolve the redirect chain upfront and pin HfApi to
 # the final origin.
 _endpoint_resolution_cache: dict[str, str] = {}
+_HF_URL_HOSTS = {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}
+_HF_FILE_URL_KINDS = {"blob", "resolve"}
+
+
+@dataclass(frozen=True)
+class _HFDownloadTarget:
+    """Normalized HuggingFace repo or single-file download target."""
+
+    repo_id: str
+    revision: str | None = None
+    filename: str | None = None
+
+    @property
+    def is_file(self) -> bool:
+        return self.filename is not None
+
+    @property
+    def download_ref(self) -> str:
+        if not self.filename:
+            return self.repo_id
+        revision = quote(self.revision or "main", safe="")
+        filename = quote(self.filename, safe="/")
+        return f"https://huggingface.co/{self.repo_id}/resolve/{revision}/{filename}"
+
+    @property
+    def display_name(self) -> str:
+        if not self.filename:
+            return self.repo_id
+        return f"{self.repo_id}/{self.filename}"
+
+
+def _validate_repo_id(repo_id: str) -> str:
+    repo_id = repo_id.strip()
+    if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        raise ValueError(
+            f"Invalid repository ID: '{repo_id}'. "
+            "Expected format: 'owner/model' "
+            "(e.g., 'mlx-community/Llama-3-8B-4bit') or a HuggingFace file URL"
+        )
+    owner, name = repo_id.split("/", 1)
+    if not owner or not name:
+        raise ValueError(
+            f"Invalid repository ID: '{repo_id}'. " "Expected format: 'owner/model'"
+        )
+    return repo_id
+
+
+def _validate_hf_file_path(filename: str) -> str:
+    filename = filename.strip("/")
+    path = PurePosixPath(filename)
+    if (
+        not filename
+        or path.is_absolute()
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ValueError(
+            f"Invalid HuggingFace file path: '{filename}'. "
+            "Expected a file path inside the repository."
+        )
+    return filename
+
+
+def _parse_hf_file_url(value: str) -> _HFDownloadTarget | None:
+    parsed = urlparse(value.strip())
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.lower() not in _HF_URL_HOSTS
+    ):
+        return None
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2] not in _HF_FILE_URL_KINDS:
+        raise ValueError(
+            "Invalid HuggingFace file URL. Expected "
+            "https://huggingface.co/owner/model/resolve/<revision>/<file> "
+            "or /blob/<revision>/<file>."
+        )
+
+    repo_id = _validate_repo_id(f"{parts[0]}/{parts[1]}")
+    revision = parts[3].strip()
+    filename = _validate_hf_file_path("/".join(parts[4:]))
+    if not revision:
+        raise ValueError("Invalid HuggingFace file URL: missing revision.")
+    return _HFDownloadTarget(repo_id=repo_id, revision=revision, filename=filename)
+
+
+def _resolve_download_target(value: str) -> _HFDownloadTarget:
+    value = value.strip()
+    parsed = urlparse(value)
+    if parsed.scheme in ("http", "https"):
+        target = _parse_hf_file_url(value)
+        if target is not None:
+            return target
+        raise ValueError(
+            "Invalid HuggingFace URL. Expected a huggingface.co file URL "
+            "or repository ID in 'owner/model' format."
+        )
+    return _HFDownloadTarget(repo_id=_validate_repo_id(value))
 
 
 def _resolve_endpoint(endpoint: str) -> str:
@@ -202,6 +302,10 @@ class DownloadTask:
 
     task_id: str
     repo_id: str
+    revision: str = ""
+    filename: str = ""
+    download_ref: str = ""
+    display_name: str = ""
     status: DownloadStatus = DownloadStatus.PENDING
     progress: float = 0.0
     total_size: int = 0
@@ -217,6 +321,10 @@ class DownloadTask:
         return {
             "task_id": self.task_id,
             "repo_id": self.repo_id,
+            "revision": self.revision,
+            "filename": self.filename,
+            "download_ref": self.download_ref or self.repo_id,
+            "display_name": self.display_name or self.repo_id,
             "status": self.status.value,
             "progress": round(self.progress, 1),
             "total_size": self.total_size,
@@ -229,56 +337,71 @@ class DownloadTask:
         }
 
 
-_DTYPE_BYTES = {
-    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
-    "I64": 8, "I32": 4, "I16": 2, "I8": 1,
-    "U64": 8, "U32": 4, "U16": 2, "U8": 1,
-    "BOOL": 1,
-}
-
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
-
-def _calc_safetensors_disk_size(safetensors: dict) -> int:
-    """Calculate actual disk size in bytes from safetensors parameters.
-
-    safetensors.total is the parameter count, not bytes.
-    We need to multiply each dtype's parameter count by its byte width.
-    """
-    params = safetensors.get("parameters", {})
-    if not params:
-        return 0
-    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
-
-
-def _format_model_size(size_bytes: int) -> str:
-    """Format model size in bytes to a human-readable string."""
-    if size_bytes < 1024**2:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024**3:
-        return f"{size_bytes / 1024**2:.1f} MB"
-    else:
-        return f"{size_bytes / 1024**3:.1f} GB"
+# Backward-compatible helper aliases; tests and ModelScope downloader import
+# these from this module while the DS4/GGUF catalog logic lives separately.
+_DS4_GGUF_BASE_MODEL_FILTERS = _ds4_catalog.DS4_GGUF_BASE_MODEL_FILTERS
+_calc_safetensors_disk_size = _ds4_catalog.calc_safetensors_disk_size
+_format_model_size = _ds4_catalog.format_model_size
+_format_param_count = _ds4_catalog.format_param_count
+_get_param_count = _ds4_catalog.get_param_count
+_gguf_size_from_siblings = _ds4_catalog.gguf_size_from_siblings
+_has_gguf_files = _ds4_catalog.has_gguf_files
+_hf_catalog_item = _ds4_catalog.hf_catalog_item
+_hf_tags = _ds4_catalog.hf_tags
+_merge_catalog_results = _ds4_catalog.merge_catalog_results
+_resolve_hf_catalog_filters = _ds4_catalog.resolve_hf_catalog_filters
 
 
-def _format_param_count(total_params: int) -> str:
-    """Format parameter count to a human-readable string (e.g., 7.0B, 13.0B)."""
-    if total_params >= 1e12:
-        return f"{total_params / 1e12:.1f}T"
-    if total_params >= 1e9:
-        return f"{total_params / 1e9:.1f}B"
-    if total_params >= 1e6:
-        return f"{total_params / 1e6:.1f}M"
-    return str(total_params)
+def _hf_file_size(info, filename: str) -> int:
+    """Return file size for a selected HF sibling when metadata is available."""
+    for sibling in _ds4_catalog.hf_siblings(info):
+        if _ds4_catalog.hf_sibling_name(sibling) == filename:
+            return _ds4_catalog.hf_sibling_size(sibling)
+    return 0
 
 
-def _get_param_count(safetensors: dict) -> int:
-    """Get total parameter count from safetensors metadata."""
-    params = safetensors.get("parameters", {})
-    if not params:
-        return 0
-    return sum(params.values())
+def _hf_file_catalog_item(target: _HFDownloadTarget, info) -> dict:
+    """Build a DS4-GGUF catalog row for a direct HuggingFace file URL."""
+    size = _hf_file_size(info, target.filename or "")
+    downloads = getattr(info, "downloads", 0) or 0
+    likes = getattr(info, "likes", 0) or 0
+    trending_score = getattr(info, "trending_score", 0) or 0
+    filename = target.filename or target.repo_id
+    return {
+        "repo_id": target.repo_id,
+        "name": filename,
+        "download_ref": target.download_ref,
+        "hf_url": target.download_ref,
+        "selected_file": target.filename or "",
+        "revision": target.revision or "",
+        "downloads": downloads,
+        "likes": likes,
+        "trending_score": trending_score,
+        "created_at": _ds4_catalog.hf_timestamp(info, "created_at", "createdAt"),
+        "updated_at": _ds4_catalog.hf_timestamp(
+            info,
+            "last_modified",
+            "lastModified",
+            "updated_at",
+            "updatedAt",
+        ),
+        "size": size,
+        "size_formatted": _format_model_size(size) if size > 0 else "",
+        "params": None,
+        "params_formatted": None,
+        "backend": "ds4",
+        "backends": ["ds4"],
+        "backend_label": "DS4-GGUF",
+        "format": "gguf",
+        "compatibility_status": "unverified",
+        "compatibility_note": (
+            "DeepSeek V4 GGUF candidate; compatibility is unverified and DS4 "
+            "will validate the downloaded file at launch."
+        ),
+    }
 
 
 # HF API sort field mapping for search.
@@ -311,17 +434,19 @@ class HFDownloader:
         limit: int = 60,
         result_limit: int = 50,
         mlx_only: bool = True,
+        show_mlx: bool | None = None,
+        show_ds4_gguf: bool | None = None,
     ) -> dict:
-        """Fetch trending and popular models that fit in memory.
-
-        Queries HuggingFace Hub for models, optionally restricted to
-        mlx-community. Filtered by system memory capacity.
+        """Fetch trending/popular MLX and DS4-GGUF models that fit in memory.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
             result_limit: Maximum number of models to return per category.
-            mlx_only: If True, restrict to mlx-community author.
+            mlx_only: Legacy flag. When new OR flags are omitted, this keeps
+                the old MLX/safetensors query behavior.
+            show_mlx: Include MLX catalog results when set.
+            show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
             Dict with 'trending' and 'popular' lists, plus 'hf_token_invalid'
@@ -329,15 +454,28 @@ class HFDownloader:
             fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
+        legacy_filters = show_mlx is None and show_ds4_gguf is None
+        include_mlx, include_ds4 = _resolve_hf_catalog_filters(
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
+        )
+        if not include_mlx and not include_ds4:
+            return {"trending": [], "popular": []}
 
-        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+        async def _fetch_mlx(sort: str) -> tuple[list[dict], bool]:
+            if not include_mlx:
+                return [], False
             kwargs = {
                 "sort": sort,
                 "limit": limit,
                 "expand": ["safetensors", "downloads", "likes", "trendingScore"],
             }
-            if mlx_only:
-                kwargs["author"] = "mlx-community"
+            if legacy_filters:
+                if mlx_only:
+                    kwargs["author"] = "mlx-community"
+            else:
+                kwargs["filter"] = "mlx"
             # list_models returns a lazy generator; drain it inside the worker
             # thread so the paginated HTTP calls never block the event loop.
             models, token_rejected = await asyncio.wait_for(
@@ -354,23 +492,74 @@ class HFDownloader:
                 size = _calc_safetensors_disk_size(m.safetensors)
                 if size <= 0 or size > max_memory_bytes:
                     continue
-                params = _get_param_count(m.safetensors)
                 results.append(
-                    {
-                        "repo_id": m.id,
-                        "name": m.id.split("/")[-1],
-                        "downloads": downloads,
-                        "likes": m.likes or 0,
-                        "trending_score": m.trending_score or 0,
-                        "size": size,
-                        "size_formatted": _format_model_size(size),
-                        "params": params if params > 0 else None,
-                        "params_formatted": (
-                            _format_param_count(params) if params > 0 else None
-                        ),
-                    }
+                    _hf_catalog_item(m, backend="mlx", name=m.id.split("/")[-1])
                 )
             return results, token_rejected
+
+        async def _fetch_ds4(sort: str) -> tuple[list[dict], bool]:
+            if not include_ds4:
+                return [], False
+            results = []
+            token_rejected = False
+            for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
+                kwargs = {
+                    "sort": sort,
+                    "limit": limit,
+                    "filter": base_filter,
+                    "expand": [
+                        "siblings",
+                        "gguf",
+                        "tags",
+                        "downloads",
+                        "likes",
+                        "trendingScore",
+                    ],
+                }
+                models, rejected = await asyncio.wait_for(
+                    asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                token_rejected = token_rejected or rejected
+                for m in models:
+                    downloads = m.downloads or 0
+                    if downloads < _MIN_DOWNLOADS or not _has_gguf_files(m):
+                        continue
+                    size = _gguf_size_from_siblings(m)
+                    if size > 0 and size > max_memory_bytes:
+                        continue
+                    results.append(
+                        _hf_catalog_item(
+                            m,
+                            backend="ds4",
+                            name=m.id.split("/")[-1],
+                            base_model_filter=base_filter,
+                        )
+                    )
+            key = "downloads" if sort == "downloads" else "trending_score"
+            return (
+                sorted(
+                    _merge_catalog_results(results),
+                    key=lambda item: item.get(key, 0),
+                    reverse=True,
+                ),
+                token_rejected,
+            )
+
+        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+            (mlx_results, mlx_rejected), (ds4_results, ds4_rejected) = await asyncio.gather(
+                _fetch_mlx(sort),
+                _fetch_ds4(sort),
+            )
+            key = "downloads" if sort == "downloads" else "trending_score"
+            return (
+                sorted(
+                    _merge_catalog_results(mlx_results + ds4_results),
+                    key=lambda item: item.get(key, 0),
+                    reverse=True,
+                ),
+                mlx_rejected or ds4_rejected,
+            )
 
         (trending, trending_rejected), (popular, popular_rejected) = (
             await asyncio.gather(
@@ -399,23 +588,24 @@ class HFDownloader:
         # Sorting options
         sort_by_size: bool = False,
         sort_ascending: bool = False,
+        show_mlx: bool | None = None,
+        show_ds4_gguf: bool | None = None,
     ) -> dict:
-        """Search HuggingFace models by query string with filtering and sorting.
-
-        When mlx_only is True, results are restricted to the MLX library
-        (same as https://huggingface.co/models?library=mlx).
+        """Search HuggingFace models by query string with OR backend filters.
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
-            mlx_only: If True, restrict to MLX library models only.
+            mlx_only: Legacy MLX-library filter used when new OR flags are omitted.
             min_params: Minimum parameter count filter.
             max_params: Maximum parameter count filter.
             min_size: Minimum model size in bytes filter.
             max_size: Maximum model size in bytes filter.
             sort_by_size: Sort results by size instead of default sort.
             sort_ascending: Sort in ascending order (for size/params sorting).
+            show_mlx: Include MLX catalog results when set.
+            show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
             Dict with 'models' list and 'total' count, plus 'hf_token_invalid'
@@ -423,6 +613,44 @@ class HFDownloader:
             fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
+        legacy_filters = show_mlx is None and show_ds4_gguf is None
+        include_mlx, include_ds4 = _resolve_hf_catalog_filters(
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
+        )
+        if not include_mlx and not include_ds4:
+            return {"models": [], "total": 0}
+
+        try:
+            file_target = _parse_hf_file_url(query)
+        except ValueError:
+            file_target = None
+        if file_target is not None:
+            if (
+                not include_ds4
+                or not file_target.filename
+                or not file_target.filename.lower().endswith(".gguf")
+            ):
+                return {"models": [], "total": 0}
+            info = await asyncio.wait_for(
+                asyncio.to_thread(
+                    api.model_info,
+                    file_target.repo_id,
+                    revision=file_target.revision,
+                    files_metadata=True,
+                ),
+                timeout=_HF_API_TIMEOUT,
+            )
+            item = _hf_file_catalog_item(file_target, info)
+            size = item["size"] or 0
+            if min_size is not None and size < min_size:
+                return {"models": [], "total": 0}
+            if max_size is not None and (size <= 0 or size > max_size):
+                return {"models": [], "total": 0}
+            if min_params is not None or max_params is not None:
+                return {"models": [], "total": 0}
+            return {"models": [item], "total": 1}
 
         # Determine base sort - for Python-side sorting, we fetch by downloads
         # which tends to return more results, then sort in Python
@@ -431,36 +659,80 @@ class HFDownloader:
         else:
             base_sort = _SORT_MAP.get(sort, "trendingScore")
 
-        kwargs = {
-            "search": query,
-            "sort": base_sort,
-            "limit": limit,
-            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
-        }
-        if mlx_only:
-            kwargs["filter"] = "mlx"
+        async def _fetch_mlx() -> tuple[list[dict], bool]:
+            if not include_mlx:
+                return [], False
+            kwargs = {
+                "search": query,
+                "sort": base_sort,
+                "limit": limit,
+                "expand": [
+                    "safetensors",
+                    "downloads",
+                    "likes",
+                    "trendingScore",
+                    "createdAt",
+                    "lastModified",
+                ],
+            }
+            if (legacy_filters and mlx_only) or not legacy_filters:
+                kwargs["filter"] = "mlx"
+            models, token_rejected = await asyncio.wait_for(
+                asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
+                timeout=_HF_API_TIMEOUT,
+            )
+            return (
+                [_hf_catalog_item(m, backend="mlx", name=m.id) for m in models],
+                token_rejected,
+            )
 
-        # list_models returns a lazy generator; drain it inside the worker
-        # thread so the paginated HTTP calls never block the event loop.
-        models, token_rejected = await asyncio.wait_for(
-            asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
-            timeout=_HF_API_TIMEOUT,
+        async def _fetch_ds4() -> tuple[list[dict], bool]:
+            if not include_ds4:
+                return [], False
+            results = []
+            token_rejected = False
+            for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
+                kwargs = {
+                    "search": query,
+                    "sort": base_sort,
+                    "limit": limit,
+                    "filter": base_filter,
+                    "expand": [
+                        "siblings",
+                        "gguf",
+                        "tags",
+                        "downloads",
+                        "likes",
+                        "trendingScore",
+                        "createdAt",
+                        "lastModified",
+                    ],
+                }
+                models, rejected = await asyncio.wait_for(
+                    asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                token_rejected = token_rejected or rejected
+                for m in models:
+                    if _has_gguf_files(m):
+                        results.append(
+                            _hf_catalog_item(
+                                m,
+                                backend="ds4",
+                                name=m.id,
+                                base_model_filter=base_filter,
+                            )
+                        )
+            return _merge_catalog_results(results), token_rejected
+
+        (mlx_results, mlx_rejected), (ds4_results, ds4_rejected) = await asyncio.gather(
+            _fetch_mlx(), _fetch_ds4()
         )
-
+        token_rejected = mlx_rejected or ds4_rejected
         results = []
-        for m in models:
-            params = None
-            params_formatted = None
-            size = 0
-
-            if m.safetensors and m.safetensors.get("parameters"):
-                params = _get_param_count(m.safetensors)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(m.safetensors)
-                if params and params <= 0:
-                    params = None
-
-            # Apply filters
+        for item in _merge_catalog_results(mlx_results + ds4_results):
+            params = item.get("params")
+            size = item.get("size") or 0
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
@@ -469,20 +741,11 @@ class HFDownloader:
                 continue
             if max_size is not None and size > max_size:
                 continue
+            results.append(item)
 
-            results.append(
-                {
-                    "repo_id": m.id,
-                    "name": m.id,
-                    "downloads": m.downloads or 0,
-                    "likes": m.likes or 0,
-                    "trending_score": m.trending_score or 0,
-                    "size": size,
-                    "size_formatted": _format_model_size(size) if size > 0 else "",
-                    "params": params,
-                    "params_formatted": params_formatted,
-                }
-            )
+        def _ds4_or_tiebreaker(item: dict) -> int:
+            backends = item.get("backends") or []
+            return int(include_mlx and include_ds4 and "ds4" in backends)
 
         # Apply Python-side sorting
         if sort == "most_params":
@@ -495,7 +758,21 @@ class HFDownloader:
                 key=lambda x: x["size"] if x["size"] > 0 else -1,
                 reverse=(sort == "largest" or (sort_by_size and not sort_ascending)),
             )
-        # Otherwise, keep original HF API ordering (trending, downloads, created, updated)
+        elif sort == "downloads":
+            results.sort(key=lambda x: x.get("downloads", 0), reverse=True)
+        elif sort == "trending":
+            results.sort(key=lambda x: x.get("trending_score", 0), reverse=True)
+        elif sort == "created":
+            results.sort(
+                key=lambda x: (x.get("created_at", 0), _ds4_or_tiebreaker(x)),
+                reverse=True,
+            )
+        elif sort == "updated":
+            results.sort(
+                key=lambda x: (x.get("updated_at", 0), _ds4_or_tiebreaker(x)),
+                reverse=True,
+            )
+        # Otherwise, keep original HF API ordering from the single selected catalog.
 
         return {
             "models": results[:limit],
@@ -508,16 +785,18 @@ class HFDownloader:
         """Fetch detailed model information from HuggingFace.
 
         Args:
-            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            repo_id: HuggingFace repository ID or file URL.
 
         Returns:
             Dict with model details including description, files, tags, etc.
         """
+        target = _resolve_download_target(repo_id)
         api, endpoint = _get_hf_api()
         info = await asyncio.wait_for(
             asyncio.to_thread(
                 api.model_info,
-                repo_id,
+                target.repo_id,
+                revision=target.revision,
                 files_metadata=True,
             ),
             timeout=_HF_API_TIMEOUT,
@@ -536,21 +815,29 @@ class HFDownloader:
                         ),
                     }
                 )
+        if target.filename:
+            files = [f for f in files if f["name"] == target.filename]
 
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
+        gguf_size = sum(f["size"] for f in files if f["name"].lower().endswith(".gguf"))
+        has_gguf = gguf_size > 0 or any(tag.lower() == "gguf" for tag in _hf_tags(info))
 
         # Extract params and size from safetensors
         params = None
         params_formatted = None
         size = 0
         safetensors = getattr(info, "safetensors", None)
-        if safetensors:
-            st_dict = dict(safetensors) if not isinstance(safetensors, dict) else safetensors
+        if safetensors and not target.filename:
+            st_dict = (
+                dict(safetensors) if not isinstance(safetensors, dict) else safetensors
+            )
             if st_dict.get("parameters"):
                 params = _get_param_count(st_dict)
                 params_formatted = _format_param_count(params) if params > 0 else None
                 size = _calc_safetensors_disk_size(st_dict)
+        if target.filename and gguf_size > 0:
+            size = gguf_size
 
         # Fetch model card (README.md) content
         model_card = ""
@@ -558,8 +845,9 @@ class HFDownloader:
             card_path = await asyncio.wait_for(
                 asyncio.to_thread(
                     hf_hub_download,
-                    repo_id=repo_id,
+                    repo_id=target.repo_id,
                     filename="README.md",
+                    revision=target.revision,
                     endpoint=endpoint,
                 ),
                 timeout=_HF_API_TIMEOUT,
@@ -570,14 +858,32 @@ class HFDownloader:
                 if card_text.startswith("---"):
                     end = card_text.find("---", 3)
                     if end != -1:
-                        card_text = card_text[end + 3:].strip()
+                        card_text = card_text[end + 3 :].strip()
                 model_card = card_text
         except Exception:
             pass  # README not available
 
+        backends = []
+        has_safetensors_model = bool(
+            safetensors and getattr(safetensors, "get", lambda _key: None)("parameters")
+        )
+        if has_safetensors_model or not has_gguf:
+            backends.append("mlx")
+        if has_gguf:
+            backends.append("ds4")
+        backend = "mlx+ds4" if len(backends) > 1 else (backends[0] if backends else "")
+
         return {
             "repo_id": info.id,
-            "name": info.id,
+            "name": target.filename or info.id,
+            "download_ref": target.download_ref,
+            "hf_url": (
+                target.download_ref
+                if target.filename
+                else f"https://huggingface.co/{info.id}"
+            ),
+            "selected_file": target.filename or "",
+            "revision": target.revision or "",
             "model_card": model_card,
             "description": "",  # kept for backward compat
             "files": files,
@@ -594,6 +900,25 @@ class HFDownloader:
                 info.last_modified.isoformat() if info.last_modified else ""
             ),
             "is_adapter": is_adapter,
+            "has_gguf": has_gguf,
+            "gguf_size": gguf_size,
+            "gguf_size_formatted": (
+                _format_model_size(gguf_size) if gguf_size > 0 else ""
+            ),
+            "backend": backend,
+            "backends": backends,
+            "backend_label": (
+                "MLX + DS4-GGUF"
+                if backend == "mlx+ds4"
+                else ("DS4-GGUF" if backend == "ds4" else "MLX")
+            ),
+            "compatibility_status": "unverified" if has_gguf else "verified",
+            "compatibility_note": (
+                "DeepSeek V4 GGUF candidate; compatibility is unverified and DS4 "
+                f"will validate the downloaded {'file' if target.filename else 'repo'} at launch."
+                if has_gguf
+                else "MLX library model."
+            ),
         }
 
     def __init__(
@@ -617,13 +942,11 @@ class HFDownloader:
         """Update the model directory path."""
         self._model_dir = Path(new_dir)
 
-    async def start_download(
-        self, repo_id: str, hf_token: str = ""
-    ) -> DownloadTask:
+    async def start_download(self, repo_id: str, hf_token: str = "") -> DownloadTask:
         """Start downloading a model from HuggingFace.
 
         Args:
-            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            repo_id: HuggingFace repository ID or file URL.
             hf_token: Optional HuggingFace token for gated models.
 
         Returns:
@@ -632,25 +955,36 @@ class HFDownloader:
         Raises:
             ValueError: If repo_id format is invalid or download is already queued.
         """
-        repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
-            raise ValueError(
-                f"Invalid repository ID: '{repo_id}'. "
-                "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
-            )
+        target = _resolve_download_target(repo_id)
 
         # Check for duplicate active downloads
         for task in self._tasks.values():
-            if task.repo_id == repo_id and task.status in (
+            if task.status not in (
                 DownloadStatus.PENDING,
                 DownloadStatus.DOWNLOADING,
             ):
+                continue
+            if task.repo_id != target.repo_id:
+                continue
+            active_filename = task.filename or None
+            if (
+                active_filename is None
+                or target.filename is None
+                or active_filename == target.filename
+            ):
                 raise ValueError(
-                    f"Download for '{repo_id}' is already in progress"
+                    f"Download for '{target.display_name}' is already in progress"
                 )
 
         task_id = str(uuid.uuid4())
-        task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        task = DownloadTask(
+            task_id=task_id,
+            repo_id=target.repo_id,
+            revision=target.revision or "",
+            filename=target.filename or "",
+            download_ref=target.download_ref,
+            display_name=target.display_name,
+        )
         self._tasks[task_id] = task
 
         # Start download in background
@@ -658,7 +992,7 @@ class HFDownloader:
             self._run_download(task_id, hf_token)
         )
 
-        logger.info(f"Download queued: {repo_id} (task_id={task_id})")
+        logger.info(f"Download queued: {target.display_name} (task_id={task_id})")
         return task
 
     async def cancel_download(self, task_id: str) -> bool:
@@ -724,9 +1058,7 @@ class HFDownloader:
         self._cancelled.discard(task_id)
         return True
 
-    async def retry_download(
-        self, task_id: str, hf_token: str = ""
-    ) -> DownloadTask:
+    async def retry_download(self, task_id: str, hf_token: str = "") -> DownloadTask:
         """Retry a failed or cancelled download, resuming from existing files.
 
         Finalized shards are preserved on disk so snapshot_download will
@@ -751,7 +1083,7 @@ class HFDownloader:
                 f"Task {task_id} is not retryable (status: {old_task.status.value})"
             )
 
-        repo_id = old_task.repo_id
+        download_ref = old_task.download_ref or old_task.repo_id
         old_retry_count = old_task.retry_count
 
         # Remove old task entry
@@ -759,7 +1091,7 @@ class HFDownloader:
         self._cancelled.discard(task_id)
 
         # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(repo_id, hf_token)
+        new_task = await self.start_download(download_ref, hf_token)
         new_task.retry_count = old_retry_count + 1
         return new_task
 
@@ -830,12 +1162,16 @@ class HFDownloader:
                             api.model_info,
                             task.repo_id,
                             token=hf_token or None,
-                            expand=["safetensors"],
+                            revision=task.revision or None,
+                            expand=["safetensors", "siblings", "tags"],
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )
-                    if model_info.safetensors and model_info.safetensors.get(
-                        "parameters"
+                    if (
+                        not task.filename
+                        and model_info.safetensors
+                        and model_info.safetensors.get("parameters")
+                        and not _has_gguf_files(model_info)
                     ):
                         ignore_patterns = [
                             "*.bin",
@@ -849,9 +1185,7 @@ class HFDownloader:
                             model_info.safetensors
                         )
                 except Exception as e:
-                    logger.warning(
-                        f"Could not fetch repo info for {task.repo_id}: {e}"
-                    )
+                    logger.warning(f"Could not fetch repo info for {task.repo_id}: {e}")
 
                 dl_kwargs: dict = {
                     "repo_id": task.repo_id,
@@ -860,6 +1194,10 @@ class HFDownloader:
                     "endpoint": endpoint,
                     "etag_timeout": 30,
                 }
+                if task.revision:
+                    dl_kwargs["revision"] = task.revision
+                if task.filename:
+                    dl_kwargs["allow_patterns"] = [task.filename]
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
 
@@ -930,9 +1268,7 @@ class HFDownloader:
                     try:
                         await self._on_complete()
                     except Exception as e:
-                        logger.error(
-                            f"Error in download completion callback: {e}"
-                        )
+                        logger.error(f"Error in download completion callback: {e}")
 
         except (_DownloadCancelled, asyncio.CancelledError):
             if task.status not in (
@@ -1008,9 +1344,7 @@ class HFDownloader:
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
-                    task.progress = min(
-                        (current_size / task.total_size) * 100, 99.0
-                    )
+                    task.progress = min((current_size / task.total_size) * 100, 99.0)
 
                 # Activity detection: size change OR file mtime change
                 if current_size != last_size:
@@ -1032,8 +1366,7 @@ class HFDownloader:
                         "Try retrying the download."
                     )
                     logger.warning(
-                        f"Download stalled for {task.repo_id} "
-                        f"(task_id={task_id})"
+                        f"Download stalled for {task.repo_id} " f"(task_id={task_id})"
                     )
                     # Cancel the snapshot_download thread. The task cancel
                     # only unblocks the awaiting coroutine; aborting the xet

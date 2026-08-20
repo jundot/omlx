@@ -60,6 +60,10 @@
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
+        'ds4_mtp_enabled',
+        'ds4_mtp_path',
+        'ds4_mtp_draft',
+        'ds4_mtp_margin',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -92,6 +96,19 @@
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
+    /**
+     * Format a FastAPI error detail response into a human-readable message.
+     * Handles both string details and structured (list-of-object) details.
+     */
+    function formatErrorDetail(data, fallback) {
+        if (Array.isArray(data.detail)) {
+            return data.detail
+                .map(function (e) { return (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e); })
+                .join(', ');
+        }
+        return data.detail || fallback;
+    }
+
     function dashboard() {
         return {
             // Theme
@@ -118,6 +135,30 @@
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                ds4: {
+                    enabled: true,
+                    support_dir: '',
+                    binary_path: '',
+                    auto_build: true,
+                    source_repo: '',
+                    source_commit: '',
+                    context_default_tokens: null,
+                    auto_context_tokens: 32768,
+                    auto_context_tokens_formatted: '32,768',
+                    ready_timeout_ms: 600000,
+                    kv_cache_enabled: true,
+                    kv_root: '',
+                    kv_disk_space_mb: 65536,
+                    kv_cache_continued_interval_tokens: 2048,
+                    ssd_streaming: 'auto',
+                    power: 100,
+                    logs_to_disk: true,
+                    status: 'no_models',
+                    available_models: 0,
+                    loaded_count: 0,
+                    running_count: 0,
+                    crashed_count: 0,
+                },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
@@ -169,6 +210,7 @@
 
             // Models
             models: [],
+            ds4MtpSidecars: [],
             loadingModels: false,
             reloading: false,
             // Sort state persists across refreshes/restarts via localStorage.
@@ -565,7 +607,8 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
-            hfMlxOnly: true,
+            hfShowMlx: true,
+            hfShowDs4Gguf: true,
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -842,7 +885,7 @@
                     }
                 });
 
-                this.$watch('hfMlxOnly', () => {
+                const refreshHFBackendFilters = () => {
                     this.hfRecommended = { trending: [], popular: [] };
                     this.hfRecommendedLoaded = false;
                     this.hfSearchResults = [];
@@ -851,7 +894,9 @@
                     if (this.hfSearchQuery.trim()) {
                         this.searchHFModels();
                     }
-                });
+                };
+                this.$watch('hfShowMlx', refreshHFBackendFilters);
+                this.$watch('hfShowDs4Gguf', refreshHFBackendFilters);
 
                 this.$watch('msMlxOnly', () => {
                     this.msRecommended = { trending: [], popular: [] };
@@ -6545,6 +6590,7 @@
                             memory: { ...this.globalSettings.memory, ...data.memory },
                             scheduler: { ...this.globalSettings.scheduler, ...data.scheduler },
                             cache: { ...this.globalSettings.cache, ...data.cache },
+                            ds4: { ...this.globalSettings.ds4, ...data.ds4 },
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
@@ -6670,6 +6716,21 @@
                             ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
+                            ds4_enabled: this.globalSettings.ds4.enabled,
+                            ds4_support_dir: this.globalSettings.ds4.support_dir,
+                            ds4_binary_path: this.globalSettings.ds4.binary_path,
+                            ds4_auto_build: this.globalSettings.ds4.auto_build,
+                            ds4_source_repo: this.globalSettings.ds4.source_repo,
+                            ds4_source_commit: this.globalSettings.ds4.source_commit,
+                            ds4_context_default_tokens: this.globalSettings.ds4.context_default_tokens || null,
+                            ds4_ready_timeout_ms: this.globalSettings.ds4.ready_timeout_ms,
+                            ds4_kv_cache_enabled: this.globalSettings.ds4.kv_cache_enabled,
+                            ds4_kv_root: this.globalSettings.ds4.kv_root,
+                            ds4_kv_disk_space_mb: this.globalSettings.ds4.kv_disk_space_mb,
+                            ds4_kv_cache_continued_interval_tokens: this.globalSettings.ds4.kv_cache_continued_interval_tokens,
+                            ds4_ssd_streaming: this.globalSettings.ds4.ssd_streaming,
+                            ds4_power: this.globalSettings.ds4.power,
+                            ds4_logs_to_disk: this.globalSettings.ds4.logs_to_disk,
                             gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
                             gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
                             gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
@@ -6705,7 +6766,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = formatErrorDetail(data, window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -6786,6 +6847,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
+                        this.ds4MtpSidecars = data.ds4_mtp_sidecars || [];
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -7224,6 +7286,49 @@
                 );
             },
 
+            ds4MtpSidecarCandidates() {
+                const sidecars = this.ds4MtpSidecars || [];
+                const currentPath = this.modelSettings?.ds4_mtp_path || '';
+                if (!currentPath || sidecars.some((item) => item.path === currentPath)) {
+                    return sidecars;
+                }
+                return [
+                    {
+                        display_name: currentPath.split('/').pop() || currentPath,
+                        path: currentPath,
+                        size_formatted: '',
+                        kind: /dspark/i.test(currentPath) ? 'dspark' : 'legacy_mtp',
+                    },
+                    ...sidecars,
+                ];
+            },
+
+            ds4MtpSidecarKind() {
+                const currentPath = this.modelSettings?.ds4_mtp_path || '';
+                const candidate = (this.ds4MtpSidecars || []).find(
+                    (item) => item.path === currentPath,
+                );
+                return candidate?.kind || (/dspark/i.test(currentPath) ? 'dspark' : 'legacy_mtp');
+            },
+
+            ds4MtpSidecarLabel(sidecar) {
+                const label = sidecar.display_name || sidecar.path || '';
+                const kind = sidecar.kind === 'dspark' ? 'DSpark' : 'Legacy MTP';
+                const sized = sidecar.size_formatted ? `${label} (${sidecar.size_formatted})` : label;
+                return `[${kind}] ${sized}`;
+            },
+
+            applyDs4MtpPreset(preset) {
+                const presets = {
+                    conservative: { draft: 1, margin: 3 },
+                    balanced: { draft: 2, margin: 3 },
+                    aggressive: { draft: 4, margin: 1.5 },
+                };
+                const values = presets[preset] || presets.balanced;
+                this.modelSettings.ds4_mtp_draft = values.draft;
+                this.modelSettings.ds4_mtp_margin = values.margin;
+            },
+
             // Settings that materialize as per-request logits processors,
             // which the VLM MTP decode path cannot apply (#2399). Mirrors
             // vlm_mtp_processor_conflicts() in model_settings.py; neutral
@@ -7300,7 +7405,7 @@
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model?.config_model_type || '');
                 return {
                     model_alias: s.model_alias || '',
-                    model_type_override: s.model_type_override || '',
+                    model_type_override: model?.engine_type === 'ds4' ? '' : (s.model_type_override || ''),
                     max_context_window: s.max_context_window || null,
                     max_tokens: s.max_tokens || null,
                     temperature: isOcr ? 0.0 : (s.temperature ?? null),
@@ -7367,6 +7472,10 @@
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    ds4_mtp_enabled: s.ds4_mtp_enabled || false,
+                    ds4_mtp_path: s.ds4_mtp_path || '',
+                    ds4_mtp_draft: s.ds4_mtp_draft ?? 2,
+                    ds4_mtp_margin: s.ds4_mtp_margin ?? 3,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
@@ -8123,9 +8232,81 @@
                                     if (entry.force) forcedCtKwargs.push(key);
                                 }
                             }
-                            const payload = {
+                            const isDs4 = this.selectedModel?.engine_type === 'ds4';
+                            const commonPayload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
-                                model_type_override: this.modelSettings.model_type_override || null,
+                                model_type_override: isDs4
+                                    ? null
+                                    : (this.modelSettings.model_type_override || null),
+                                ttl_seconds: this.modelSettings.ttl_seconds || null,
+                            };
+                            if (isDs4) {
+                                const ds4MtpKind = this.ds4MtpSidecarKind();
+                                return {
+                                    ...commonPayload,
+                                    max_context_window: this.modelSettings.max_context_window || null,
+                                    max_tokens: this.modelSettings.max_tokens || null,
+                                    temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
+                                    top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
+                                    top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
+                                    min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
+                                    repetition_penalty: null,
+                                    presence_penalty: null,
+                                    force_sampling: false,
+                                    reasoning_parser: null,
+                                    index_cache_freq: 0,
+                                    enable_thinking: null,
+                                    thinking_budget_enabled: false,
+                                    thinking_budget_tokens: 0,
+                                    guided_grammar_enabled: false,
+                                    guided_grammar: null,
+                                    max_tool_result_tokens: 0,
+                                    chat_template_kwargs: null,
+                                    forced_ct_kwargs: null,
+                                    turboquant_kv_enabled: false,
+                                    turboquant_kv_bits: 4,
+                                    specprefill_enabled: false,
+                                    specprefill_draft_model: null,
+                                    specprefill_keep_pct: null,
+                                    specprefill_threshold: null,
+                                    dflash_enabled: false,
+                                    dflash_draft_model: null,
+                                    dflash_draft_quant_enabled: false,
+                                    dflash_draft_quant_weight_bits: null,
+                                    dflash_draft_quant_activation_bits: null,
+                                    dflash_draft_quant_group_size: null,
+                                    dflash_max_ctx: null,
+                                    dflash_in_memory_cache: true,
+                                    dflash_in_memory_cache_max_entries: 4,
+                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
+                                    dflash_ssd_cache: false,
+                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
+                                    dflash_draft_window_size: null,
+                                    dflash_draft_sink_size: null,
+                                    dflash_verify_mode: null,
+                                    mtp_enabled: false,
+                                    vlm_mtp_enabled: false,
+                                    vlm_mtp_draft_model: null,
+                                    vlm_mtp_draft_block_size: null,
+                                    ds4_mtp_enabled: !!this.modelSettings.ds4_mtp_enabled,
+                                    ds4_mtp_path: this.modelSettings.ds4_mtp_enabled
+                                        ? (this.modelSettings.ds4_mtp_path || null)
+                                        : null,
+                                    ds4_mtp_draft: this.modelSettings.ds4_mtp_enabled
+                                        && ds4MtpKind !== 'dspark'
+                                        ? (parseInt(this.modelSettings.ds4_mtp_draft) || 2)
+                                        : null,
+                                    ds4_mtp_margin: this.modelSettings.ds4_mtp_enabled
+                                        && ds4MtpKind !== 'dspark'
+                                        ? (Number.isFinite(parseFloat(this.modelSettings.ds4_mtp_margin))
+                                            ? parseFloat(this.modelSettings.ds4_mtp_margin)
+                                            : 3)
+                                        : null,
+                                    trust_remote_code: false,
+                                };
+                            }
+                            return {
+                                ...commonPayload,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 max_tokens: this.modelSettings.max_tokens || null,
                                 temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
@@ -8291,6 +8472,10 @@
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
+                                    ds4_mtp_enabled: false,
+                                    ds4_mtp_path: null,
+                                    ds4_mtp_draft: null,
+                                    ds4_mtp_margin: null,
                                 });
                             }
                             return payload;
@@ -8979,7 +9164,17 @@
                 const parts = [];
                 if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
                 if (activity.document_count != null) parts.push(activity.document_count + ' docs');
-                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.current_tokens != null && activity.total_tokens != null) {
+                    parts.push(this.formatTokenCount(activity.current_tokens) + ' / ' + this.formatTokenCount(activity.total_tokens) + ' tok');
+                } else if (activity.token_count != null) {
+                    parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                }
+                if (activity.tokens_per_second != null && Number.isFinite(activity.tokens_per_second)) {
+                    parts.push(activity.tokens_per_second.toFixed(1) + ' tok/s');
+                }
+                if (activity.chunk_tokens_per_second != null && Number.isFinite(activity.chunk_tokens_per_second)) {
+                    parts.push('chunk ' + activity.chunk_tokens_per_second.toFixed(1) + ' tok/s');
+                }
                 if (activity.text_length != null) parts.push(activity.text_length + ' chars');
                 if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
                 if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
@@ -10958,7 +11153,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || 'Failed to save'));
+                        alert(formatErrorDetail(data, 'Failed to save'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -11558,7 +11753,11 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
+                    const params = new URLSearchParams({
+                        show_mlx: this.hfShowMlx,
+                        show_ds4_gguf: this.hfShowDs4Gguf,
+                    });
+                    const response = await fetch(`/admin/api/hf/recommended?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.hfTokenInvalid = !!data.hf_token_invalid;
@@ -11617,6 +11816,7 @@
             // Table sort helpers for Browse Models
             sortModels(list) {
                 const sortBy = this.hfTableSort;
+                if (sortBy === 'server') return [...list];
                 const dir = this.hfTableSortDir === 'asc' ? 1 : -1;
                 return [...list].sort((a, b) => {
                     if (sortBy === 'rank') {
@@ -11653,9 +11853,9 @@
                     most_params:  { col: 'params',    dir: 'desc' },
                     least_params: { col: 'params',    dir: 'asc'  },
                     downloads:    { col: 'downloads', dir: 'desc' },
-                    trending:     { col: 'downloads', dir: 'desc' },
-                    created:      { col: 'downloads', dir: 'desc' },
-                    updated:      { col: 'downloads', dir: 'desc' },
+                    trending:     { col: 'server',    dir: 'desc' },
+                    created:      { col: 'server',    dir: 'desc' },
+                    updated:      { col: 'server',    dir: 'desc' },
                 };
                 const m = map[this.hfSearchSort];
                 if (m) {
@@ -11706,7 +11906,8 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
-                        mlx_only: this.hfMlxOnly,
+                        show_mlx: this.hfShowMlx,
+                        show_ds4_gguf: this.hfShowDs4Gguf,
                     });
                     // Add filter parameters if set. Sizes use binary GiB to match
                     // _format_model_size on the backend.

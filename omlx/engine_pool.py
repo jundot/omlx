@@ -48,11 +48,21 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
+from .ds4_gguf import normalize_ds4_gguf_model_id
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .scheduler import SchedulerConfig
+from .settings import DEFAULT_BASE_PATH, DS4Settings
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+
+_DS4_AUTO_ADMISSION_SETTLE_TIMEOUT_SECONDS = 8.0
+_DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS = 0.5
+# DS4 itself is a single-process backend. When a frontend switches models it
+# often cancels the old stream and immediately sends the new request; keep the
+# new request queued here until the old stream is officially inactive.
+_DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS = 10.0
+_DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS = 0.1
 
 
 @dataclass
@@ -73,6 +83,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "ds4",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -91,6 +102,7 @@ class EngineEntry:
     )
     source_type: str = "local"
     source_repo_id: str | None = None
+    display_name: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
     engine: (
         BaseEngine
@@ -114,6 +126,8 @@ class EngineEntry:
     # produced the engine, even when an optional accelerator fails soft and the
     # engine falls back, so identical requests keep reusing that fallback.
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
+    # Launch DS4 auto-mode with --ssd-streaming for the next load attempt.
+    ds4_auto_enable_ssd_streaming: bool = False
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
@@ -133,6 +147,9 @@ class EnginePool:
     def __init__(
         self,
         scheduler_config: SchedulerConfig | None = None,
+        global_settings: object | None = None,
+        base_path: str | Path | None = None,
+        ds4_settings: DS4Settings | None = None,
     ):
         """
         Initialize the engine pool.
@@ -162,6 +179,14 @@ class EnginePool:
         self._get_admission_ceiling: object | None = None  # Set by server
         self._get_admission_soft_target: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
+        self._global_settings: object | None = global_settings
+        self._base_path: Path = Path(
+            base_path
+            or getattr(global_settings, "base_path", None)
+            or DEFAULT_BASE_PATH
+        )
+        self._ds4_settings: DS4Settings | None = ds4_settings
+        self._ds4_consecutive_restart_failures: dict[str, int] = {}
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
@@ -170,6 +195,191 @@ class EnginePool:
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
         self._shutting_down = False
         self.configure_hot_cache_budget()
+
+    def configure_ds4_backend(
+        self,
+        *,
+        global_settings: object | None = None,
+        base_path: str | Path | None = None,
+        ds4_settings: DS4Settings | None = None,
+    ) -> None:
+        """Configure global DS4 lifecycle settings for future process loads."""
+        if global_settings is not None:
+            self._global_settings = global_settings
+        if base_path is not None:
+            self._base_path = Path(base_path)
+        elif global_settings is not None and getattr(global_settings, "base_path", None):
+            self._base_path = Path(global_settings.base_path)
+        if ds4_settings is not None:
+            self._ds4_settings = ds4_settings
+
+    def _get_ds4_settings(self) -> DS4Settings:
+        """Return the effective global DS4 settings for process launches."""
+        if self._ds4_settings is not None:
+            return self._ds4_settings
+        global_settings = self._global_settings
+        ds4_settings = getattr(global_settings, "ds4", None) if global_settings else None
+        if isinstance(ds4_settings, DS4Settings):
+            return ds4_settings
+        return DS4Settings()
+
+    @staticmethod
+    def _system_available_memory_bytes() -> int:
+        """Return best-effort system-available RAM for DS4 auto streaming."""
+        try:
+            import psutil
+
+            return max(0, int(psutil.virtual_memory().available))
+        except Exception:  # noqa: BLE001 - psutil may be absent or unavailable
+            return 0
+
+    def _prepare_ds4_auto_ssd_streaming(
+        self,
+        entry: EngineEntry,
+        *,
+        current: int,
+        ceiling: int,
+    ) -> int:
+        """Resolve DS4 SSD-streaming auto mode and return admission size."""
+        entry.ds4_auto_enable_ssd_streaming = False
+        if (
+            entry.engine_type != "ds4"
+            or self._get_ds4_settings().ssd_streaming != "auto"
+            or self._ds4_entry_uses_legacy_mtp(entry)
+        ):
+            return entry.estimated_size
+
+        if ceiling > 0:
+            available = max(0, ceiling - current)
+        else:
+            available = self._system_available_memory_bytes()
+        if available <= 0 or entry.estimated_size <= available:
+            return entry.estimated_size
+
+        entry.ds4_auto_enable_ssd_streaming = True
+        if ceiling <= 0:
+            logger.info(
+                "Auto-enabling DS4 SSD streaming for %s: estimated %s exceeds "
+                "available system memory %s",
+                entry.model_id,
+                format_size(entry.estimated_size),
+                format_size(available),
+            )
+            return entry.estimated_size
+
+        admission_size = max(1, min(entry.estimated_size, available))
+        logger.info(
+            "Auto-enabling DS4 SSD streaming for %s: estimated %s exceeds "
+            "available memory budget %s; using streaming admission estimate %s",
+            entry.model_id,
+            format_size(entry.estimated_size),
+            format_size(available),
+            format_size(admission_size),
+        )
+        return admission_size
+
+    def _ds4_entry_uses_legacy_mtp(self, entry: EngineEntry) -> bool:
+        """Return True when legacy MTP forbids DS4 SSD streaming.
+
+        DSpark also uses ``--mtp`` for its support GGUF, but the DS4 runtime
+        explicitly supports combining DSpark with main-model SSD streaming.
+        """
+        if entry.engine_type != "ds4" or self._settings_manager is None:
+            return False
+        try:
+            model_settings = self._settings_manager.get_settings(entry.model_id)
+        except Exception:  # noqa: BLE001 - settings should not block admission
+            return False
+        mtp_path = getattr(model_settings, "ds4_mtp_path", None)
+        if not getattr(model_settings, "ds4_mtp_enabled", False) or not mtp_path:
+            return False
+        try:
+            from .ds4_gguf import detect_ds4_mtp_sidecar_kind
+
+            return detect_ds4_mtp_sidecar_kind(Path(str(mtp_path))) != "dspark"
+        except Exception:  # noqa: BLE001 - unknown sidecars keep legacy safety
+            return True
+
+    async def _settle_ds4_auto_admission_after_eviction(
+        self,
+        entry: EngineEntry,
+        *,
+        current: int,
+        ceiling: int,
+    ) -> tuple[int, int]:
+        """Wait briefly for kernel memory ledgers before DS4 auto streaming.
+
+        DS4 teardown happens in a child process and can release Metal/wired
+        memory a little after the process exits. A single low dynamic ceiling
+        sampled immediately after eviction can otherwise force the next DS4
+        model into SSD streaming even though resident load would fit seconds
+        later.
+        """
+        if (
+            entry.engine_type != "ds4"
+            or self._get_ds4_settings().ssd_streaming != "auto"
+            or ceiling <= 0
+            or entry.estimated_size <= max(0, ceiling - current)
+        ):
+            return current, ceiling
+
+        best_current = current
+        best_ceiling = ceiling
+        best_available = max(0, ceiling - current)
+        deadline = time.monotonic() + _DS4_AUTO_ADMISSION_SETTLE_TIMEOUT_SECONDS
+        started = time.monotonic()
+        logged_wait = False
+
+        while time.monotonic() < deadline:
+            if not logged_wait:
+                logger.info(
+                    "Waiting for DS4 admission memory to settle for %s before "
+                    "auto-enabling SSD streaming: estimated %s exceeds "
+                    "available memory budget %s",
+                    entry.model_id,
+                    format_size(entry.estimated_size),
+                    format_size(best_available),
+                )
+                logged_wait = True
+
+            await asyncio.sleep(_DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS)
+            self._wake_process_memory_enforcer()
+
+            sampled_ceiling = self._current_ceiling()
+            sampled_current = self._current_admission_memory()
+            if sampled_ceiling <= 0:
+                logger.info(
+                    "DS4 admission memory guard disabled while settling %s "
+                    "after %.1fs; admitting without guarded ceiling",
+                    entry.model_id,
+                    time.monotonic() - started,
+                )
+                return sampled_current, 0
+            sampled_available = max(0, sampled_ceiling - sampled_current)
+            if sampled_available > best_available:
+                best_current = sampled_current
+                best_ceiling = sampled_ceiling
+                best_available = sampled_available
+
+            if sampled_ceiling > 0 and entry.estimated_size <= sampled_available:
+                logger.info(
+                    "DS4 admission memory settled for %s after %.1fs: "
+                    "available memory budget recovered to %s",
+                    entry.model_id,
+                    time.monotonic() - started,
+                    format_size(sampled_available),
+                )
+                return sampled_current, sampled_ceiling
+
+        if logged_wait:
+            logger.info(
+                "DS4 admission memory did not recover enough for resident "
+                "load of %s after %.1fs; best available memory budget was %s",
+                entry.model_id,
+                time.monotonic() - started,
+                format_size(best_available),
+            )
+        return best_current, best_ceiling
 
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
@@ -320,6 +530,35 @@ class EnginePool:
         if callable(wake):
             wake(active=active)
 
+    def _current_model_memory_by_backend(self, *, external: bool) -> int:
+        """Return loaded model memory estimates split by process boundary."""
+        total = 0
+        for entry in self._entries.values():
+            if entry.engine is None:
+                continue
+            is_external = entry.engine_type == "ds4"
+            if is_external != external:
+                continue
+            total += int(entry.actual_size or entry.estimated_size or 0)
+        return total
+
+    def _current_external_model_memory(self) -> int:
+        """Return loaded model memory not reflected in this process footprint."""
+        return self._current_model_memory_by_backend(external=True)
+
+    def _current_internal_model_memory(self) -> int:
+        """Return loaded model memory that should be reflected in parent footprint."""
+        return self._current_model_memory_by_backend(external=False)
+
+    def _current_admission_memory(self) -> int:
+        """Return parent/internal model memory plus external subprocess memory."""
+        parent_memory = max(
+            mx.get_active_memory(),
+            get_phys_footprint(),
+            self._current_internal_model_memory(),
+        )
+        return parent_memory + self._current_external_model_memory()
+
     @staticmethod
     def _canonical_signature_value(value: object) -> str:
         if isinstance(value, (dict, list, tuple)):
@@ -462,6 +701,7 @@ class EnginePool:
 
         return tuple(signature)
 
+
     @property
     def model_count(self) -> int:
         """Total number of discovered models."""
@@ -538,6 +778,7 @@ class EnginePool:
                     model_context_length=getattr(info, "model_context_length", None),
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
+                    display_name=getattr(info, "display_name", None),
                     is_helper=getattr(info, "is_helper", False),
                     is_pinned=model_id in pinned_set,
                 )
@@ -577,6 +818,14 @@ class EnginePool:
     }
 
     @staticmethod
+    def _is_ds4_entry(entry: EngineEntry) -> bool:
+        """Return True for discovered DS4 GGUF entries."""
+        if entry.engine_type == "ds4":
+            return True
+        path = Path(entry.model_path)
+        return path.suffix.lower() == ".gguf" and not path.is_dir()
+
+    @staticmethod
     def _entry_is_diffusion_model(entry: EngineEntry) -> bool:
         model_type = (entry.config_model_type or "").lower().replace("-", "_")
         return model_type == "diffusion_gemma"
@@ -587,15 +836,21 @@ class EnginePool:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
-            if settings.model_type_override:
-                entry.model_type = settings.model_type_override
-                entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
-                    settings.model_type_override, "batched"
-                )
+            if not settings.model_type_override:
+                continue
+            if self._is_ds4_entry(entry):
                 logger.info(
-                    f"Applied model_type override for {model_id}: "
-                    f"type={entry.model_type}, engine={entry.engine_type}"
+                    f"Ignoring model_type override for DS4 GGUF model {model_id}"
                 )
+                continue
+            entry.model_type = settings.model_type_override
+            entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
+                settings.model_type_override, "batched"
+            )
+            logger.info(
+                f"Applied model_type override for {model_id}: "
+                f"type={entry.model_type}, engine={entry.engine_type}"
+            )
 
     def get_model_ids(self) -> list[str]:
         """Get list of all discovered model IDs."""
@@ -799,9 +1054,12 @@ class EnginePool:
     def _raise_if_model_path_missing_locked(
         self, model_id: str, entry: EngineEntry
     ) -> None:
-        """Drop stale unloaded entries whose backing model directory vanished."""
+        """Drop stale unloaded entries whose backing model files vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        if self._is_ds4_entry(entry):
+            if model_path.is_file():
+                return
+        elif model_path.exists() and (model_path / "config.json").exists():
             return
 
         if entry.engine is None:
@@ -852,6 +1110,81 @@ class EnginePool:
                 return mid
         return None
 
+    def _resolve_ds4_source_name(
+        self, name: str, *, require_gguf_hint: bool = False
+    ) -> str | None:
+        """Resolve source GGUF filenames/paths to discovered DS4 model ids.
+
+        DS4 entries are exposed through normalized API ids, but users often
+        copy the original ``*.gguf`` filename or absolute path from the model
+        directory.  Accept those source names as aliases while still requiring
+        the file to have been discovered under ``self._entries``.
+        """
+        raw = name.strip()
+        if not raw:
+            return None
+
+        raw_path = Path(raw)
+        raw_name = raw_path.name or raw
+        has_gguf_hint = raw.lower().endswith(".gguf") or raw_name.lower().endswith(
+            ".gguf"
+        )
+        if require_gguf_hint and not has_gguf_hint:
+            return None
+
+        path_like = raw_path.is_absolute() or raw_name != raw
+
+        for model_id, entry in self._entries.items():
+            if not self._is_ds4_entry(entry):
+                continue
+
+            entry_path = Path(entry.model_path)
+            exact_terms = {entry.model_path, str(entry_path)}
+            if entry.display_name:
+                exact_terms.add(entry.display_name)
+                if not entry.display_name.lower().endswith(".gguf"):
+                    exact_terms.add(f"{entry.display_name}.gguf")
+            if raw.lower() in {term.lower() for term in exact_terms if term}:
+                return model_id
+
+            if path_like:
+                try:
+                    if raw_path.resolve(strict=False) == entry_path.resolve(strict=False):
+                        return model_id
+                except OSError:
+                    pass
+                continue
+
+            raw_terms = {raw, raw_name}
+            if has_gguf_hint:
+                if raw.lower().endswith(".gguf"):
+                    raw_terms.add(raw[:-5])
+                if raw_name.lower().endswith(".gguf"):
+                    raw_terms.add(raw_name[:-5])
+                raw_terms.add(raw_path.stem)
+
+            entry_terms = {model_id, entry_path.name, entry_path.stem}
+            if entry.display_name:
+                entry_terms.add(entry.display_name)
+
+            raw_terms_lower = {term.lower() for term in raw_terms if term}
+            entry_terms_lower = {term.lower() for term in entry_terms if term}
+            if raw_terms_lower & entry_terms_lower:
+                return model_id
+
+            normalized_terms = {
+                normalize_ds4_gguf_model_id(term) for term in raw_terms if term
+            }
+            entry_normalized_terms = {
+                normalize_ds4_gguf_model_id(term)
+                for term in {entry_path.name, entry_path.stem, entry.display_name or ""}
+                if term
+            }
+            if normalized_terms & entry_normalized_terms:
+                return model_id
+
+        return None
+
     def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
@@ -895,22 +1228,39 @@ class EnginePool:
                 )
                 if profile_source is not None:
                     return profile_source
-            all_settings = settings_manager.get_all_settings()
+            all_settings = settings_manager.get_all_settings() or {}
             for mid, ms in all_settings.items():
-                if ms.model_alias and ms.model_alias == model_id_or_alias:
+                if (
+                    mid in self._entries
+                    and getattr(ms, "model_alias", None) == model_id_or_alias
+                ):
                     return mid
 
-        # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
+        ds4_source_match = self._resolve_ds4_source_name(model_id_or_alias)
+        if ds4_source_match is not None:
+            return ds4_source_match
+
+        # Strip provider prefixes for the general MLX compatibility path. DS4
+        # entries deliberately require their exact published identity: a
+        # namespace must not become another name for the same GGUF engine.
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
-            if stripped in self._entries:
+            if stripped in self._entries and not self._is_ds4_entry(
+                self._entries[stripped]
+            ):
                 return stripped
             ci_match = self._case_insensitive_entry_match(stripped)
-            if ci_match is not None:
+            if ci_match is not None and not self._is_ds4_entry(
+                self._entries[ci_match]
+            ):
                 return ci_match
             if all_settings is not None:
                 for mid, ms in all_settings.items():
-                    if ms.model_alias and ms.model_alias == stripped:
+                    if (
+                        mid in self._entries
+                        and not self._is_ds4_entry(self._entries[mid])
+                        and getattr(ms, "model_alias", None) == stripped
+                    ):
                         return mid
 
         return model_id_or_alias
@@ -971,6 +1321,8 @@ class EnginePool:
                 model_id,
                 f"Model '{model_id}' did not return a loaded engine.",
             )
+        if getattr(engine, "model_type", None) == "ds4":
+            return
         llm_engine_types = [BaseEngine]
         if isinstance(VLMBatchedEngine, type):
             llm_engine_types.append(VLMBatchedEngine)
@@ -1228,6 +1580,13 @@ class EnginePool:
             )
             unloaded_for_admission = False
 
+            if (
+                entry.engine is None
+                and entry.engine_type == "ds4"
+                and not self._get_ds4_settings().enabled
+            ):
+                raise RuntimeError("DS4 backend is disabled in settings")
+
             # Already loaded - just update access time
             if entry.engine is not None:
                 if (
@@ -1274,6 +1633,18 @@ class EnginePool:
             self._raise_if_model_path_missing_locked(model_id, entry)
             self._raise_if_load_failed(model_id, entry)
 
+            ds4_evicted_for_singleton = await self._prepare_ds4_singleton_for_load(
+                entry
+            )
+
+            # If the engine was loaded by a concurrent get_engine() while we
+            # released the lock during the DS4 idle-wait, return it directly.
+            if entry.engine is not None:
+                entry.last_access = time.time()
+                if _lease:
+                    entry.in_use += 1
+                return entry.engine
+
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
             # evicting LRU non-pinned models first; if the model still
@@ -1314,8 +1685,10 @@ class EnginePool:
                 best_effort = ceiling > 0
             if ceiling > 0:
                 soft_target = self._admission_soft_target()
-                evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
-                evicted_any = unloaded_for_admission
+                evict_target = (
+                    min(soft_target, ceiling) if soft_target > 0 else ceiling
+                )
+                evicted_any = unloaded_for_admission or ds4_evicted_for_singleton
                 while True:
                     # Consult the tracked accumulator alongside live memory:
                     # after a model settles or idles, mx.get_active_memory() and
@@ -1324,13 +1697,19 @@ class EnginePool:
                     # the committed total. Using only live memory lets a second
                     # large model load without evicting the first, over-
                     # committing past the ceiling (#1623).
-                    current = max(
-                        mx.get_active_memory(),
-                        get_phys_footprint(),
-                        self._current_model_memory,
-                    )
+                    current = self._current_admission_memory()
+                    if entry.engine_type == "ds4":
+                        admission_size = self._prepare_ds4_auto_ssd_streaming(
+                            entry,
+                            current=current,
+                            ceiling=ceiling,
+                        )
                     projected = current + admission_size
-                    if projected <= evict_target:
+                    if projected <= evict_target and not (
+                        entry.engine_type == "ds4"
+                        and evicted_any
+                        and entry.ds4_auto_enable_ssd_streaming
+                    ):
                         break
                     victim = self._find_lru_victim()
                     if victim is not None:
@@ -1343,6 +1722,34 @@ class EnginePool:
                         await self._unload_engine(victim)
                         evicted_any = True
                         continue
+                    if evicted_any:
+                        (
+                            current,
+                            ceiling,
+                        ) = await self._settle_ds4_auto_admission_after_eviction(
+                            entry,
+                            current=current,
+                            ceiling=ceiling,
+                        )
+                        if ceiling <= 0:
+                            self._prepare_ds4_auto_ssd_streaming(
+                                entry,
+                                current=current,
+                                ceiling=0,
+                            )
+                            break
+                        evict_target = (
+                            min(soft_target, ceiling)
+                            if soft_target > 0
+                            else ceiling
+                        )
+                    if entry.engine_type == "ds4":
+                        admission_size = self._prepare_ds4_auto_ssd_streaming(
+                            entry,
+                            current=current,
+                            ceiling=ceiling,
+                        )
+                    projected = current + admission_size
                     if projected <= ceiling:
                         # Above the soft target with nothing left to
                         # evict, but still under the ceiling: admit. The
@@ -1375,8 +1782,10 @@ class EnginePool:
                         # #1623 undercount guard. Without a local eviction,
                         # keep trusting phys_footprint because it may be
                         # unrelated process pressure rather than model residue.
-                        committed = max(
-                            mx.get_active_memory(), self._current_model_memory
+                        committed = (
+                            self._current_admission_memory()
+                            if entry.engine_type == "ds4"
+                            else max(mx.get_active_memory(), self._current_model_memory)
                         )
                         committed_projected = committed + admission_size
                         if committed_projected <= ceiling:
@@ -1442,6 +1851,12 @@ class EnginePool:
                             f"{advice or DEFAULT_CEILING_ADVICE}."
                         ),
                     )
+            elif entry.engine_type == "ds4":
+                self._prepare_ds4_auto_ssd_streaming(
+                    entry,
+                    current=self._current_admission_memory(),
+                    ceiling=0,
+                )
 
             # Now load the model
             await self._load_engine(
@@ -1551,49 +1966,124 @@ class EnginePool:
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
 
-    async def _unload_other_dflash_engines(self, model_id: str) -> None:
-        """Unload other idle DFlash engines before starting a new one.
+    def _find_loaded_ds4_conflict(
+        self, model_id: str
+    ) -> tuple[str, EngineEntry] | None:
+        """Return another loaded DS4 entry, if any."""
+        for other_id, other in self._entries.items():
+            if other_id == model_id:
+                continue
+            if other.engine_type == "ds4" and other.engine is not None:
+                return other_id, other
+        return None
 
-        dflash-mlx installs target hooks on shared Python classes and owns a
-        process-global runtime cache manager, so multiple loaded DFlash engines
-        can leak state across model switches.
+    @staticmethod
+    def _ds4_entry_is_busy(entry: EngineEntry) -> bool:
+        if entry.in_use > 0:
+            return True
+        try:
+            return bool(
+                entry.engine is not None and entry.engine.has_active_requests()
+            )
+        except AttributeError:
+            return False
+
+    async def _wait_for_ds4_conflict_idle(
+        self, entry: EngineEntry, *, next_model_id: str
+    ) -> bool:
+        """Wait for a just-cancelled DS4 stream to close before switching.
+
+        Releases the pool lock during the idle-poll loop so other pool
+        operations (serving requests from already-loaded models, loading
+        non-DS4 models) are not blocked for the full wait duration.
         """
-        victims: list[str] = []
-        blocked: list[str] = []
-        for mid, e in self._entries.items():
-            if mid == model_id or e.engine is None:
-                continue
-            if type(e.engine).__name__ != "DFlashEngine":
-                continue
-            if e.is_loading or e.in_use > 0:
-                blocked.append(mid)
-                continue
-            try:
-                if e.engine.has_active_requests():
-                    blocked.append(mid)
-                    continue
-            except AttributeError:
-                pass
-            if e.is_pinned:
-                blocked.append(f"{mid} (pinned)")
-                continue
-            victims.append(mid)
+        if not self._ds4_entry_is_busy(entry):
+            return True
 
-        if blocked:
-            raise RuntimeError(
-                "Cannot load DFlash model "
-                f"'{model_id}' while another DFlash engine is active: "
-                f"{', '.join(blocked)}"
-            )
-
-        for victim in victims:
+        deadline = time.monotonic() + _DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS
+        started = time.monotonic()
+        logger.info(
+            "Queueing DS4 switch to '%s' while active model '%s' finishes "
+            "cancelling",
+            next_model_id,
+            entry.model_id,
+        )
+        # Release the pool lock that the caller holds so other operations
+        # can proceed during the idle wait.
+        self._lock.release()
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(_DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS)
+                if not self._ds4_entry_is_busy(entry):
+                    logger.info(
+                        "DS4 model '%s' became idle after %.1fs; continuing "
+                        "switch to '%s'",
+                        entry.model_id,
+                        time.monotonic() - started,
+                        next_model_id,
+                    )
+                    return True
             logger.info(
-                "Unloading DFlash model '%s' before loading '%s' because "
-                "dflash runtime hooks/cache are process-global",
-                victim,
-                model_id,
+                "Timed out after %.1fs waiting for DS4 model '%s' to become "
+                "idle before switching to '%s'",
+                time.monotonic() - started,
+                entry.model_id,
+                next_model_id,
             )
-            await self._unload_engine(victim)
+            return False
+        finally:
+            await self._lock.acquire()
+
+    async def _prepare_ds4_singleton_for_load(self, entry: EngineEntry) -> bool:
+        """Unload an idle DS4 conflict before loading another DS4 model.
+
+        The idle-wait in _wait_for_ds4_conflict_idle releases the pool lock
+        so other operations are not blocked during the poll loop.  To prevent
+        a TOCTOU race where two concurrent get_engine() calls for the same
+        model both pass the entry.engine-is-None guard, we mark the entry as
+        loading *before* releasing the lock.
+        """
+        if entry.engine_type != "ds4":
+            return False
+
+        conflict = self._find_loaded_ds4_conflict(entry.model_id)
+        if conflict is None:
+            return False
+
+        other_id, other = conflict
+        if other.is_pinned:
+            raise ModelLoadingError(
+                entry.model_id,
+                message=(
+                    f"Cannot load DS4 model '{entry.model_id}' while pinned "
+                    f"DS4 model '{other_id}' is loaded"
+                ),
+            )
+        # Mark loading *before* releasing the lock in the idle-wait to
+        # prevent a concurrent get_engine() for the same model from also
+        # entering _load_engine() and double-loading.
+        entry.is_loading = True
+        if not await self._wait_for_ds4_conflict_idle(
+            other, next_model_id=entry.model_id
+        ):
+            entry.is_loading = False
+            raise ModelLoadingError(
+                entry.model_id,
+                message=(
+                    f"Timed out waiting to switch DS4 model from '{other_id}' "
+                    f"to '{entry.model_id}' because the current request did "
+                    "not become idle"
+                ),
+            )
+
+        logger.info(
+            "Unloading DS4 process '%s' before switching to '%s'",
+            other_id,
+            entry.model_id,
+        )
+        await self._unload_engine(other_id)
+        entry.is_loading = False
+        return True
 
     @staticmethod
     def _resolve_scheduler_from_engine(engine: object) -> object | None:
@@ -1649,11 +2139,7 @@ class EnginePool:
         reclaim_attempted = False
         async with self._lock:
             while True:
-                current = max(
-                    mx.get_active_memory(),
-                    get_phys_footprint(),
-                    self._current_model_memory,
-                )
+                current = self._current_admission_memory()
                 if current + predicted <= target:
                     # A model eviction and/or the pooled-buffer reclaim below
                     # created enough headroom; signal the caller to re-admit.
@@ -1830,6 +2316,22 @@ class EnginePool:
         """
         entry = self._entries.get(model_id)
         if not entry or entry.engine is None:
+            return
+
+        if entry.engine_type == "ds4":
+            logger.info(f"Unloading DS4 process: {model_id}")
+            try:
+                await entry.engine.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping DS4 process for {model_id}: {e}")
+            entry.engine = None
+            entry.last_access = 0.0
+            entry.actual_size = None
+            entry.abort_requested = False
+            entry.pending_unload_reason = None
+            entry.runtime_settings_signature = None
+            self._current_model_memory -= entry.estimated_size
+            self._wake_process_memory_enforcer()
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
@@ -2024,6 +2526,49 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
+    async def _unload_other_dflash_engines(self, model_id: str) -> None:
+        """Unload other idle DFlash engines before starting a new one.
+
+        dflash-mlx installs target hooks on shared Python classes and owns a
+        process-global runtime cache manager, so multiple loaded DFlash engines
+        can leak state across model switches.
+        """
+        victims: list[str] = []
+        blocked: list[str] = []
+        for mid, e in self._entries.items():
+            if mid == model_id or e.engine is None:
+                continue
+            if type(e.engine).__name__ != "DFlashEngine":
+                continue
+            if e.is_loading or e.in_use > 0:
+                blocked.append(mid)
+                continue
+            try:
+                if e.engine.has_active_requests():
+                    blocked.append(mid)
+                    continue
+            except AttributeError:
+                pass
+            if e.is_pinned:
+                blocked.append(f"{mid} (pinned)")
+                continue
+            victims.append(mid)
+
+        if blocked:
+            raise RuntimeError(
+                "Cannot load DFlash model "
+                f"'{model_id}' while another DFlash engine is active: "
+                f"{', '.join(blocked)}"
+            )
+
+        for victim in victims:
+            logger.info(
+                "Unloading DFlash model '%s' before loading '%s' because "
+                "dflash runtime hooks/cache are process-global",
+                victim,
+                model_id,
+            )
+            await self._unload_engine(victim)
     def _schedule_failed_load_reclaim(
         self, model_id: str, pre_load_memory: int
     ) -> None:
@@ -2133,14 +2678,33 @@ class EnginePool:
             pass
 
             # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
+            # since DFlash has its own model loading pipeline.  DS4 is an
+            # external-process backend and intentionally bypasses MLX/DFlash
+            # loaders while still participating in the same lifecycle pool.
             engine = None
             deployment = (
                 self._distributed_deployment_for_entry(entry)
                 if effective_type == "batched"
                 else None
             )
-            if deployment is None and model_settings is not None:
+            if effective_type == "ds4":
+                ds4_settings = self._get_ds4_settings()
+                if not ds4_settings.enabled:
+                    raise RuntimeError("DS4 backend is disabled in settings")
+                from .engine.ds4 import DS4ProcessEngine
+
+                engine = DS4ProcessEngine(
+                    model_id=model_id,
+                    model_path=entry.model_path,
+                    settings=ds4_settings,
+                    base_path=self._base_path,
+                    context_tokens=getattr(
+                        model_settings, "max_context_window", None
+                    ),
+                    auto_enable_ssd_streaming=entry.ds4_auto_enable_ssd_streaming,
+                    model_settings=model_settings,
+                )
+            elif deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if (
@@ -2488,15 +3052,25 @@ class EnginePool:
             # because mx.set_cache_limit(total_mem) prevents automatic release.
             # Without this, memory stays at ~2x model size until the first
             # inference request triggers a clear. (#429)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
-            )
+            if entry.engine_type != "ds4":
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
 
+            ds4_rss = None
+            if entry.engine_type == "ds4":
+                get_rss = getattr(engine, "get_process_rss_bytes", None)
+                if callable(get_rss):
+                    ds4_rss = get_rss()
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
-            entry.actual_size = observed_delta or resident_size
+            entry.actual_size = (
+                ds4_rss or observed_delta or resident_size
+                if entry.engine_type == "ds4"
+                else observed_delta or resident_size
+            )
 
             # Registry consistency check: a lockless mutator (a
             # discover_models() rescan or the runtime model-directory
@@ -2604,6 +3178,69 @@ class EnginePool:
             except Exception as e:
                 logger.error(f"Failed to preload pinned model {model_id}: {e}")
 
+    async def restart_crashed_pinned_ds4(self, backoff_s: float = 5.0) -> list[str]:
+        """Restart pinned DS4 subprocesses that exited while loaded.
+
+        Snapshots crashed entries under the pool lock, then restarts each
+        one *outside* the lock so other pool operations are not blocked.
+        A configurable backoff delay is inserted before the first restart
+        to avoid rapid crash-restart loops.  After 3 consecutive failed
+        restart attempts the model is skipped until it recovers naturally
+        (e.g. via an explicit unload / reload).
+        """
+        # Snapshot candidates under the lock.
+        async with self._lock:
+            candidates: list[tuple[str, object, object]] = []
+            for model_id, entry in self._entries.items():
+                if (
+                    entry.engine_type != "ds4"
+                    or entry.engine is None
+                    or not entry.is_pinned
+                    or entry.is_loading
+                ):
+                    continue
+                has_crashed = getattr(entry.engine, "has_crashed", None)
+                if not callable(has_crashed) or not has_crashed():
+                    continue
+                restart = getattr(entry.engine, "restart_if_crashed", None)
+                if not callable(restart):
+                    continue
+                if entry.in_use > 0 or entry.engine.has_active_requests():
+                    entry.last_access = time.time()
+                    continue
+                candidates.append((model_id, entry, restart))
+
+        if not candidates:
+            return []
+
+        # Restart candidates outside the lock with backoff.
+        if backoff_s > 0:
+            await asyncio.sleep(backoff_s)
+
+        max_consecutive = 3
+        restarted: list[str] = []
+        for model_id, entry, restart in candidates:
+            fail_count = self._ds4_consecutive_restart_failures.get(model_id, 0)
+            if fail_count >= max_consecutive:
+                continue
+            try:
+                logger.warning("Restarting crashed pinned DS4 model: %s", model_id)
+                did_restart = await restart()
+            except Exception as e:  # noqa: BLE001 - keep health loop alive
+                logger.error("Failed to restart pinned DS4 model %s: %s", model_id, e)
+                self._ds4_consecutive_restart_failures[model_id] = fail_count + 1
+                continue
+            if not did_restart:
+                self._ds4_consecutive_restart_failures[model_id] = fail_count + 1
+                continue
+            self._ds4_consecutive_restart_failures.pop(model_id, None)
+            entry.last_access = time.time()
+            get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+            if callable(get_rss):
+                entry.actual_size = get_rss() or entry.actual_size
+            restarted.append(model_id)
+        return restarted
+
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
@@ -2621,6 +3258,21 @@ class EnginePool:
                         logger.error(f"Error unloading {model_id} during shutdown: {e}")
 
         logger.info("Engine pool shutdown complete")
+
+    @staticmethod
+    def _ds4_status_fields(entry: EngineEntry) -> dict:
+        """Return DS4-specific status fields for a loaded DS4 process."""
+        engine = entry.engine
+        if entry.engine_type != "ds4" or engine is None:
+            return {}
+        get_stats = getattr(engine, "get_stats", None)
+        if not callable(get_stats):
+            return {}
+        try:
+            return {"ds4": get_stats()}
+        except Exception as e:  # noqa: BLE001 - status must remain best-effort
+            logger.debug("Failed to collect DS4 status for %s: %s", entry.model_id, e)
+            return {}
 
     def get_status(self) -> dict:
         """
@@ -2664,6 +3316,8 @@ class EnginePool:
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
+                    "display_name": e.display_name,
+                    **self._ds4_status_fields(e),
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())
@@ -2693,6 +3347,10 @@ class EnginePool:
 
         now = time.time()
         expired: list[str] = []
+
+        # Restart crashed pinned DS4 processes *before* acquiring the
+        # TTL lock so crash recovery does not block normal TTL eviction.
+        await self.restart_crashed_pinned_ds4(backoff_s=5.0)
 
         async with self._lock:
             for model_id, entry in self._entries.items():

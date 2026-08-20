@@ -500,7 +500,7 @@ def warn_if_unexpected_versions() -> None:
 
 # ===== FILE: omlx/_version.py =====
 
-__version__ = "0.5.4rc2"
+__version__ = "0.5.5"
 
 
 # ===== FILE: omlx/adapter/__init__.py =====
@@ -6419,6 +6419,304 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
             await engine_pool._unload_engine(request.model_id)
 
 
+# ===== FILE: omlx/admin/ds4_downloader_catalog.py =====
+
+# SPDX-License-Identifier: Apache-2.0
+"""HuggingFace downloader catalog helpers for DS4-GGUF filters."""
+
+from datetime import datetime, timezone
+
+_DTYPE_BYTES = {
+    "F64": 8,
+    "F32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I64": 8,
+    "I32": 4,
+    "I16": 2,
+    "I8": 1,
+    "U64": 8,
+    "U32": 4,
+    "U16": 2,
+    "U8": 1,
+    "BOOL": 1,
+}
+
+# DS4 v1 targets DeepSeek V4 Flash/Pro GGUF repos. HuggingFace exposes these
+# as base-model tags (the same values used by the web UI's `other=` filter).
+DS4_GGUF_BASE_MODEL_FILTERS = (
+    "base_model:quantized:deepseek-ai/DeepSeek-V4-Flash",
+    "base_model:finetune:deepseek-ai/DeepSeek-V4-Flash",
+    "base_model:quantized:deepseek-ai/DeepSeek-V4-Pro",
+    "base_model:finetune:deepseek-ai/DeepSeek-V4-Pro",
+)
+
+
+def calc_safetensors_disk_size(safetensors: dict) -> int:
+    """Calculate actual disk size in bytes from safetensors parameters."""
+    params = safetensors.get("parameters", {})
+    if not params:
+        return 0
+    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
+
+
+def format_model_size(size_bytes: int) -> str:
+    """Format model size in bytes to a human-readable string."""
+    if size_bytes < 1024**2:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024**3:
+        return f"{size_bytes / 1024**2:.1f} MB"
+    return f"{size_bytes / 1024**3:.1f} GB"
+
+
+def format_param_count(total_params: int) -> str:
+    """Format parameter count to a human-readable string."""
+    if total_params >= 1e12:
+        return f"{total_params / 1e12:.1f}T"
+    if total_params >= 1e9:
+        return f"{total_params / 1e9:.1f}B"
+    if total_params >= 1e6:
+        return f"{total_params / 1e6:.1f}M"
+    return str(total_params)
+
+
+def get_param_count(safetensors: dict) -> int:
+    """Get total parameter count from safetensors metadata."""
+    params = safetensors.get("parameters", {})
+    if not params:
+        return 0
+    return sum(params.values())
+
+
+def hf_tags(model) -> list[str]:
+    """Return string tags from a HF model/info object or test dict."""
+    tags = model.get("tags") if isinstance(model, dict) else getattr(model, "tags", None)
+    if not isinstance(tags, (list, tuple, set)):
+        return []
+    return [tag for tag in tags if isinstance(tag, str)]
+
+
+def hf_siblings(model) -> list:
+    """Return HF sibling/file entries without triggering MagicMock iteration."""
+    siblings = (
+        model.get("siblings") if isinstance(model, dict) else getattr(model, "siblings", None)
+    )
+    return list(siblings) if isinstance(siblings, (list, tuple)) else []
+
+
+def hf_sibling_name(sibling) -> str:
+    """Return a normalized filename from a HF sibling/file entry."""
+    if isinstance(sibling, dict):
+        value = sibling.get("rfilename") or sibling.get("name") or sibling.get("Name")
+    else:
+        value = getattr(sibling, "rfilename", None) or getattr(sibling, "name", None)
+    return value if isinstance(value, str) else ""
+
+
+def hf_sibling_size(sibling) -> int:
+    """Return a normalized byte size from a HF sibling/file entry."""
+    if isinstance(sibling, dict):
+        value = sibling.get("size") or sibling.get("Size") or 0
+    else:
+        value = getattr(sibling, "size", 0) or 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def hf_gguf_metadata(model):
+    """Return HF GGUF metadata from a model object."""
+    gguf = model.get("gguf") if isinstance(model, dict) else getattr(model, "gguf", None)
+    if gguf is None or isinstance(gguf, (bool, int, float, str)):
+        return None
+    if not isinstance(gguf, dict):
+        return None
+    return gguf
+
+
+def has_gguf_metadata(model) -> bool:
+    """Return whether HF explicitly reports GGUF metadata for this repo."""
+    gguf = hf_gguf_metadata(model)
+    return isinstance(gguf, dict) and bool(gguf)
+
+
+def hf_gguf_total_size(model) -> int:
+    """Return total GGUF byte size from HF list metadata when available."""
+    gguf = hf_gguf_metadata(model)
+    if not isinstance(gguf, dict):
+        return 0
+    for key in ("totalFileSize", "total_file_size", "totalSize", "size"):
+        value = gguf.get(key) if isinstance(gguf, dict) else getattr(gguf, key, None)
+        if not isinstance(value, (int, float, str)):
+            continue
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            return size
+    return 0
+
+
+def gguf_size_from_siblings(model) -> int:
+    """Calculate total size of repo GGUF files from HF GGUF/file metadata."""
+    metadata_size = hf_gguf_total_size(model)
+    if metadata_size > 0:
+        return metadata_size
+    total = 0
+    for sibling in hf_siblings(model):
+        if hf_sibling_name(sibling).lower().endswith(".gguf"):
+            total += hf_sibling_size(sibling)
+    return total
+
+
+def has_gguf_files(model) -> bool:
+    """Best-effort GGUF repo detection from HF metadata, files, or tags."""
+    if has_gguf_metadata(model):
+        return True
+    if any(hf_sibling_name(s).lower().endswith(".gguf") for s in hf_siblings(model)):
+        return True
+    return any(tag.lower() == "gguf" for tag in hf_tags(model))
+
+
+def hf_timestamp(model, *names: str) -> float:
+    """Return a sortable POSIX timestamp from HF model datetime metadata."""
+    for name in names:
+        value = model.get(name) if isinstance(model, dict) else getattr(model, name, None)
+        if value is None:
+            continue
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            try:
+                return datetime.fromisoformat(text).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def resolve_hf_catalog_filters(
+    *,
+    mlx_only: bool,
+    show_mlx: bool | None,
+    show_ds4_gguf: bool | None,
+) -> tuple[bool, bool]:
+    """Resolve new OR-filter flags while preserving legacy mlx_only callers."""
+    if show_mlx is None and show_ds4_gguf is None:
+        # Legacy mode: `mlx_only` controls how narrowly the MLX/safetensors
+        # query is scoped; it never used to include GGUF candidates.
+        return True, False
+    return bool(show_mlx), bool(show_ds4_gguf)
+
+
+def merge_catalog_results(results: list[dict]) -> list[dict]:
+    """Merge duplicate repos returned by multiple backend/base-model filters."""
+    merged: dict[str, dict] = {}
+    for item in results:
+        repo_id = item.get("repo_id")
+        if not repo_id:
+            continue
+        existing = merged.get(repo_id)
+        if existing is None:
+            merged[repo_id] = item
+            continue
+        backends = set(existing.get("backends") or [existing.get("backend")])
+        backends.update(item.get("backends") or [item.get("backend")])
+        backends.discard(None)
+        existing["backends"] = sorted(backends)
+        if len(backends) > 1:
+            existing["backend"] = "mlx+ds4"
+            existing["backend_label"] = "MLX + DS4-GGUF"
+            existing["format"] = "mixed"
+        if not existing.get("size") and item.get("size"):
+            existing["size"] = item["size"]
+            existing["size_formatted"] = item.get("size_formatted", "")
+        for field in ("created_at", "updated_at"):
+            existing[field] = max(existing.get(field, 0) or 0, item.get(field, 0) or 0)
+        existing.setdefault("base_model_filters", [])
+        for filter_name in item.get("base_model_filters", []):
+            if filter_name not in existing["base_model_filters"]:
+                existing["base_model_filters"].append(filter_name)
+    return list(merged.values())
+
+
+def hf_catalog_item(
+    model,
+    *,
+    backend: str,
+    name: str,
+    base_model_filter: str | None = None,
+) -> dict:
+    """Normalize one HF model listing entry for admin downloader catalog APIs."""
+    params = None
+    params_formatted = None
+    size = 0
+    if backend == "ds4":
+        size = gguf_size_from_siblings(model)
+    else:
+        safetensors = getattr(model, "safetensors", None)
+        if safetensors and safetensors.get("parameters"):
+            params = get_param_count(safetensors)
+            params_formatted = format_param_count(params) if params > 0 else None
+            size = calc_safetensors_disk_size(safetensors)
+            if params and params <= 0:
+                params = None
+
+    if backend == "ds4":
+        backends = ["ds4"]
+        backend_label = "DS4-GGUF"
+        model_format = "gguf"
+        compatibility_status = "unverified"
+        compatibility_note = (
+            "DeepSeek V4 GGUF candidate; compatibility is unverified and DS4 "
+            "will validate the downloaded repo at launch."
+        )
+    else:
+        backends = ["mlx"]
+        backend_label = "MLX"
+        model_format = "safetensors"
+        compatibility_status = "verified"
+        compatibility_note = "MLX library model."
+
+    item = {
+        "repo_id": model.id,
+        "name": name,
+        "downloads": model.downloads or 0,
+        "likes": model.likes or 0,
+        "trending_score": model.trending_score or 0,
+        "created_at": hf_timestamp(model, "created_at", "createdAt"),
+        "updated_at": hf_timestamp(
+            model,
+            "last_modified",
+            "lastModified",
+            "updated_at",
+            "updatedAt",
+        ),
+        "size": size,
+        "size_formatted": format_model_size(size) if size > 0 else "",
+        "params": params,
+        "params_formatted": params_formatted,
+        "backend": backend,
+        "backends": backends,
+        "backend_label": backend_label,
+        "format": model_format,
+        "compatibility_status": compatibility_status,
+        "compatibility_note": compatibility_note,
+    }
+    if base_model_filter:
+        item["base_model_filters"] = [base_model_filter]
+    return item
+
+
 # ===== FILE: omlx/admin/external_api.py =====
 
 # SPDX-License-Identifier: Apache-2.0
@@ -6992,9 +7290,9 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
@@ -7008,6 +7306,8 @@ from huggingface_hub.utils import tqdm as _hf_tqdm
 # Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
 # guarantees it exists. Re-verify the symbol when bumping the hub version.
 from huggingface_hub.utils._xet import abort_xet_session
+
+from . import ds4_downloader_catalog as _ds4_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -7025,6 +7325,104 @@ _STALL_TIMEOUT = 300
 # so downloads fail. We resolve the redirect chain upfront and pin HfApi to
 # the final origin.
 _endpoint_resolution_cache: dict[str, str] = {}
+_HF_URL_HOSTS = {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}
+_HF_FILE_URL_KINDS = {"blob", "resolve"}
+
+
+@dataclass(frozen=True)
+class _HFDownloadTarget:
+    """Normalized HuggingFace repo or single-file download target."""
+
+    repo_id: str
+    revision: str | None = None
+    filename: str | None = None
+
+    @property
+    def is_file(self) -> bool:
+        return self.filename is not None
+
+    @property
+    def download_ref(self) -> str:
+        if not self.filename:
+            return self.repo_id
+        revision = quote(self.revision or "main", safe="")
+        filename = quote(self.filename, safe="/")
+        return f"https://huggingface.co/{self.repo_id}/resolve/{revision}/{filename}"
+
+    @property
+    def display_name(self) -> str:
+        if not self.filename:
+            return self.repo_id
+        return f"{self.repo_id}/{self.filename}"
+
+
+def _validate_repo_id(repo_id: str) -> str:
+    repo_id = repo_id.strip()
+    if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        raise ValueError(
+            f"Invalid repository ID: '{repo_id}'. "
+            "Expected format: 'owner/model' "
+            "(e.g., 'mlx-community/Llama-3-8B-4bit') or a HuggingFace file URL"
+        )
+    owner, name = repo_id.split("/", 1)
+    if not owner or not name:
+        raise ValueError(
+            f"Invalid repository ID: '{repo_id}'. " "Expected format: 'owner/model'"
+        )
+    return repo_id
+
+
+def _validate_hf_file_path(filename: str) -> str:
+    filename = filename.strip("/")
+    path = PurePosixPath(filename)
+    if (
+        not filename
+        or path.is_absolute()
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ValueError(
+            f"Invalid HuggingFace file path: '{filename}'. "
+            "Expected a file path inside the repository."
+        )
+    return filename
+
+
+def _parse_hf_file_url(value: str) -> _HFDownloadTarget | None:
+    parsed = urlparse(value.strip())
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.lower() not in _HF_URL_HOSTS
+    ):
+        return None
+
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2] not in _HF_FILE_URL_KINDS:
+        raise ValueError(
+            "Invalid HuggingFace file URL. Expected "
+            "https://huggingface.co/owner/model/resolve/<revision>/<file> "
+            "or /blob/<revision>/<file>."
+        )
+
+    repo_id = _validate_repo_id(f"{parts[0]}/{parts[1]}")
+    revision = parts[3].strip()
+    filename = _validate_hf_file_path("/".join(parts[4:]))
+    if not revision:
+        raise ValueError("Invalid HuggingFace file URL: missing revision.")
+    return _HFDownloadTarget(repo_id=repo_id, revision=revision, filename=filename)
+
+
+def _resolve_download_target(value: str) -> _HFDownloadTarget:
+    value = value.strip()
+    parsed = urlparse(value)
+    if parsed.scheme in ("http", "https"):
+        target = _parse_hf_file_url(value)
+        if target is not None:
+            return target
+        raise ValueError(
+            "Invalid HuggingFace URL. Expected a huggingface.co file URL "
+            "or repository ID in 'owner/model' format."
+        )
+    return _HFDownloadTarget(repo_id=_validate_repo_id(value))
 
 
 def _resolve_endpoint(endpoint: str) -> str:
@@ -7182,6 +7580,10 @@ class DownloadTask:
 
     task_id: str
     repo_id: str
+    revision: str = ""
+    filename: str = ""
+    download_ref: str = ""
+    display_name: str = ""
     status: DownloadStatus = DownloadStatus.PENDING
     progress: float = 0.0
     total_size: int = 0
@@ -7197,6 +7599,10 @@ class DownloadTask:
         return {
             "task_id": self.task_id,
             "repo_id": self.repo_id,
+            "revision": self.revision,
+            "filename": self.filename,
+            "download_ref": self.download_ref or self.repo_id,
+            "display_name": self.display_name or self.repo_id,
             "status": self.status.value,
             "progress": round(self.progress, 1),
             "total_size": self.total_size,
@@ -7209,56 +7615,71 @@ class DownloadTask:
         }
 
 
-_DTYPE_BYTES = {
-    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
-    "I64": 8, "I32": 4, "I16": 2, "I8": 1,
-    "U64": 8, "U32": 4, "U16": 2, "U8": 1,
-    "BOOL": 1,
-}
-
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
-
-def _calc_safetensors_disk_size(safetensors: dict) -> int:
-    """Calculate actual disk size in bytes from safetensors parameters.
-
-    safetensors.total is the parameter count, not bytes.
-    We need to multiply each dtype's parameter count by its byte width.
-    """
-    params = safetensors.get("parameters", {})
-    if not params:
-        return 0
-    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
-
-
-def _format_model_size(size_bytes: int) -> str:
-    """Format model size in bytes to a human-readable string."""
-    if size_bytes < 1024**2:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024**3:
-        return f"{size_bytes / 1024**2:.1f} MB"
-    else:
-        return f"{size_bytes / 1024**3:.1f} GB"
+# Backward-compatible helper aliases; tests and ModelScope downloader import
+# these from this module while the DS4/GGUF catalog logic lives separately.
+_DS4_GGUF_BASE_MODEL_FILTERS = _ds4_catalog.DS4_GGUF_BASE_MODEL_FILTERS
+_calc_safetensors_disk_size = _ds4_catalog.calc_safetensors_disk_size
+_format_model_size = _ds4_catalog.format_model_size
+_format_param_count = _ds4_catalog.format_param_count
+_get_param_count = _ds4_catalog.get_param_count
+_gguf_size_from_siblings = _ds4_catalog.gguf_size_from_siblings
+_has_gguf_files = _ds4_catalog.has_gguf_files
+_hf_catalog_item = _ds4_catalog.hf_catalog_item
+_hf_tags = _ds4_catalog.hf_tags
+_merge_catalog_results = _ds4_catalog.merge_catalog_results
+_resolve_hf_catalog_filters = _ds4_catalog.resolve_hf_catalog_filters
 
 
-def _format_param_count(total_params: int) -> str:
-    """Format parameter count to a human-readable string (e.g., 7.0B, 13.0B)."""
-    if total_params >= 1e12:
-        return f"{total_params / 1e12:.1f}T"
-    if total_params >= 1e9:
-        return f"{total_params / 1e9:.1f}B"
-    if total_params >= 1e6:
-        return f"{total_params / 1e6:.1f}M"
-    return str(total_params)
+def _hf_file_size(info, filename: str) -> int:
+    """Return file size for a selected HF sibling when metadata is available."""
+    for sibling in _ds4_catalog.hf_siblings(info):
+        if _ds4_catalog.hf_sibling_name(sibling) == filename:
+            return _ds4_catalog.hf_sibling_size(sibling)
+    return 0
 
 
-def _get_param_count(safetensors: dict) -> int:
-    """Get total parameter count from safetensors metadata."""
-    params = safetensors.get("parameters", {})
-    if not params:
-        return 0
-    return sum(params.values())
+def _hf_file_catalog_item(target: _HFDownloadTarget, info) -> dict:
+    """Build a DS4-GGUF catalog row for a direct HuggingFace file URL."""
+    size = _hf_file_size(info, target.filename or "")
+    downloads = getattr(info, "downloads", 0) or 0
+    likes = getattr(info, "likes", 0) or 0
+    trending_score = getattr(info, "trending_score", 0) or 0
+    filename = target.filename or target.repo_id
+    return {
+        "repo_id": target.repo_id,
+        "name": filename,
+        "download_ref": target.download_ref,
+        "hf_url": target.download_ref,
+        "selected_file": target.filename or "",
+        "revision": target.revision or "",
+        "downloads": downloads,
+        "likes": likes,
+        "trending_score": trending_score,
+        "created_at": _ds4_catalog.hf_timestamp(info, "created_at", "createdAt"),
+        "updated_at": _ds4_catalog.hf_timestamp(
+            info,
+            "last_modified",
+            "lastModified",
+            "updated_at",
+            "updatedAt",
+        ),
+        "size": size,
+        "size_formatted": _format_model_size(size) if size > 0 else "",
+        "params": None,
+        "params_formatted": None,
+        "backend": "ds4",
+        "backends": ["ds4"],
+        "backend_label": "DS4-GGUF",
+        "format": "gguf",
+        "compatibility_status": "unverified",
+        "compatibility_note": (
+            "DeepSeek V4 GGUF candidate; compatibility is unverified and DS4 "
+            "will validate the downloaded file at launch."
+        ),
+    }
 
 
 # HF API sort field mapping for search.
@@ -7291,17 +7712,19 @@ class HFDownloader:
         limit: int = 60,
         result_limit: int = 50,
         mlx_only: bool = True,
+        show_mlx: bool | None = None,
+        show_ds4_gguf: bool | None = None,
     ) -> dict:
-        """Fetch trending and popular models that fit in memory.
-
-        Queries HuggingFace Hub for models, optionally restricted to
-        mlx-community. Filtered by system memory capacity.
+        """Fetch trending/popular MLX and DS4-GGUF models that fit in memory.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
             result_limit: Maximum number of models to return per category.
-            mlx_only: If True, restrict to mlx-community author.
+            mlx_only: Legacy flag. When new OR flags are omitted, this keeps
+                the old MLX/safetensors query behavior.
+            show_mlx: Include MLX catalog results when set.
+            show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
             Dict with 'trending' and 'popular' lists, plus 'hf_token_invalid'
@@ -7309,15 +7732,28 @@ class HFDownloader:
             fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
+        legacy_filters = show_mlx is None and show_ds4_gguf is None
+        include_mlx, include_ds4 = _resolve_hf_catalog_filters(
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
+        )
+        if not include_mlx and not include_ds4:
+            return {"trending": [], "popular": []}
 
-        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+        async def _fetch_mlx(sort: str) -> tuple[list[dict], bool]:
+            if not include_mlx:
+                return [], False
             kwargs = {
                 "sort": sort,
                 "limit": limit,
                 "expand": ["safetensors", "downloads", "likes", "trendingScore"],
             }
-            if mlx_only:
-                kwargs["author"] = "mlx-community"
+            if legacy_filters:
+                if mlx_only:
+                    kwargs["author"] = "mlx-community"
+            else:
+                kwargs["filter"] = "mlx"
             # list_models returns a lazy generator; drain it inside the worker
             # thread so the paginated HTTP calls never block the event loop.
             models, token_rejected = await asyncio.wait_for(
@@ -7334,23 +7770,74 @@ class HFDownloader:
                 size = _calc_safetensors_disk_size(m.safetensors)
                 if size <= 0 or size > max_memory_bytes:
                     continue
-                params = _get_param_count(m.safetensors)
                 results.append(
-                    {
-                        "repo_id": m.id,
-                        "name": m.id.split("/")[-1],
-                        "downloads": downloads,
-                        "likes": m.likes or 0,
-                        "trending_score": m.trending_score or 0,
-                        "size": size,
-                        "size_formatted": _format_model_size(size),
-                        "params": params if params > 0 else None,
-                        "params_formatted": (
-                            _format_param_count(params) if params > 0 else None
-                        ),
-                    }
+                    _hf_catalog_item(m, backend="mlx", name=m.id.split("/")[-1])
                 )
             return results, token_rejected
+
+        async def _fetch_ds4(sort: str) -> tuple[list[dict], bool]:
+            if not include_ds4:
+                return [], False
+            results = []
+            token_rejected = False
+            for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
+                kwargs = {
+                    "sort": sort,
+                    "limit": limit,
+                    "filter": base_filter,
+                    "expand": [
+                        "siblings",
+                        "gguf",
+                        "tags",
+                        "downloads",
+                        "likes",
+                        "trendingScore",
+                    ],
+                }
+                models, rejected = await asyncio.wait_for(
+                    asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                token_rejected = token_rejected or rejected
+                for m in models:
+                    downloads = m.downloads or 0
+                    if downloads < _MIN_DOWNLOADS or not _has_gguf_files(m):
+                        continue
+                    size = _gguf_size_from_siblings(m)
+                    if size > 0 and size > max_memory_bytes:
+                        continue
+                    results.append(
+                        _hf_catalog_item(
+                            m,
+                            backend="ds4",
+                            name=m.id.split("/")[-1],
+                            base_model_filter=base_filter,
+                        )
+                    )
+            key = "downloads" if sort == "downloads" else "trending_score"
+            return (
+                sorted(
+                    _merge_catalog_results(results),
+                    key=lambda item: item.get(key, 0),
+                    reverse=True,
+                ),
+                token_rejected,
+            )
+
+        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+            (mlx_results, mlx_rejected), (ds4_results, ds4_rejected) = await asyncio.gather(
+                _fetch_mlx(sort),
+                _fetch_ds4(sort),
+            )
+            key = "downloads" if sort == "downloads" else "trending_score"
+            return (
+                sorted(
+                    _merge_catalog_results(mlx_results + ds4_results),
+                    key=lambda item: item.get(key, 0),
+                    reverse=True,
+                ),
+                mlx_rejected or ds4_rejected,
+            )
 
         (trending, trending_rejected), (popular, popular_rejected) = (
             await asyncio.gather(
@@ -7379,23 +7866,24 @@ class HFDownloader:
         # Sorting options
         sort_by_size: bool = False,
         sort_ascending: bool = False,
+        show_mlx: bool | None = None,
+        show_ds4_gguf: bool | None = None,
     ) -> dict:
-        """Search HuggingFace models by query string with filtering and sorting.
-
-        When mlx_only is True, results are restricted to the MLX library
-        (same as https://huggingface.co/models?library=mlx).
+        """Search HuggingFace models by query string with OR backend filters.
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
-            mlx_only: If True, restrict to MLX library models only.
+            mlx_only: Legacy MLX-library filter used when new OR flags are omitted.
             min_params: Minimum parameter count filter.
             max_params: Maximum parameter count filter.
             min_size: Minimum model size in bytes filter.
             max_size: Maximum model size in bytes filter.
             sort_by_size: Sort results by size instead of default sort.
             sort_ascending: Sort in ascending order (for size/params sorting).
+            show_mlx: Include MLX catalog results when set.
+            show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
             Dict with 'models' list and 'total' count, plus 'hf_token_invalid'
@@ -7403,6 +7891,44 @@ class HFDownloader:
             fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
+        legacy_filters = show_mlx is None and show_ds4_gguf is None
+        include_mlx, include_ds4 = _resolve_hf_catalog_filters(
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
+        )
+        if not include_mlx and not include_ds4:
+            return {"models": [], "total": 0}
+
+        try:
+            file_target = _parse_hf_file_url(query)
+        except ValueError:
+            file_target = None
+        if file_target is not None:
+            if (
+                not include_ds4
+                or not file_target.filename
+                or not file_target.filename.lower().endswith(".gguf")
+            ):
+                return {"models": [], "total": 0}
+            info = await asyncio.wait_for(
+                asyncio.to_thread(
+                    api.model_info,
+                    file_target.repo_id,
+                    revision=file_target.revision,
+                    files_metadata=True,
+                ),
+                timeout=_HF_API_TIMEOUT,
+            )
+            item = _hf_file_catalog_item(file_target, info)
+            size = item["size"] or 0
+            if min_size is not None and size < min_size:
+                return {"models": [], "total": 0}
+            if max_size is not None and (size <= 0 or size > max_size):
+                return {"models": [], "total": 0}
+            if min_params is not None or max_params is not None:
+                return {"models": [], "total": 0}
+            return {"models": [item], "total": 1}
 
         # Determine base sort - for Python-side sorting, we fetch by downloads
         # which tends to return more results, then sort in Python
@@ -7411,36 +7937,80 @@ class HFDownloader:
         else:
             base_sort = _SORT_MAP.get(sort, "trendingScore")
 
-        kwargs = {
-            "search": query,
-            "sort": base_sort,
-            "limit": limit,
-            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
-        }
-        if mlx_only:
-            kwargs["filter"] = "mlx"
+        async def _fetch_mlx() -> tuple[list[dict], bool]:
+            if not include_mlx:
+                return [], False
+            kwargs = {
+                "search": query,
+                "sort": base_sort,
+                "limit": limit,
+                "expand": [
+                    "safetensors",
+                    "downloads",
+                    "likes",
+                    "trendingScore",
+                    "createdAt",
+                    "lastModified",
+                ],
+            }
+            if (legacy_filters and mlx_only) or not legacy_filters:
+                kwargs["filter"] = "mlx"
+            models, token_rejected = await asyncio.wait_for(
+                asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
+                timeout=_HF_API_TIMEOUT,
+            )
+            return (
+                [_hf_catalog_item(m, backend="mlx", name=m.id) for m in models],
+                token_rejected,
+            )
 
-        # list_models returns a lazy generator; drain it inside the worker
-        # thread so the paginated HTTP calls never block the event loop.
-        models, token_rejected = await asyncio.wait_for(
-            asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
-            timeout=_HF_API_TIMEOUT,
+        async def _fetch_ds4() -> tuple[list[dict], bool]:
+            if not include_ds4:
+                return [], False
+            results = []
+            token_rejected = False
+            for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
+                kwargs = {
+                    "search": query,
+                    "sort": base_sort,
+                    "limit": limit,
+                    "filter": base_filter,
+                    "expand": [
+                        "siblings",
+                        "gguf",
+                        "tags",
+                        "downloads",
+                        "likes",
+                        "trendingScore",
+                        "createdAt",
+                        "lastModified",
+                    ],
+                }
+                models, rejected = await asyncio.wait_for(
+                    asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                token_rejected = token_rejected or rejected
+                for m in models:
+                    if _has_gguf_files(m):
+                        results.append(
+                            _hf_catalog_item(
+                                m,
+                                backend="ds4",
+                                name=m.id,
+                                base_model_filter=base_filter,
+                            )
+                        )
+            return _merge_catalog_results(results), token_rejected
+
+        (mlx_results, mlx_rejected), (ds4_results, ds4_rejected) = await asyncio.gather(
+            _fetch_mlx(), _fetch_ds4()
         )
-
+        token_rejected = mlx_rejected or ds4_rejected
         results = []
-        for m in models:
-            params = None
-            params_formatted = None
-            size = 0
-
-            if m.safetensors and m.safetensors.get("parameters"):
-                params = _get_param_count(m.safetensors)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(m.safetensors)
-                if params and params <= 0:
-                    params = None
-
-            # Apply filters
+        for item in _merge_catalog_results(mlx_results + ds4_results):
+            params = item.get("params")
+            size = item.get("size") or 0
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
@@ -7449,20 +8019,11 @@ class HFDownloader:
                 continue
             if max_size is not None and size > max_size:
                 continue
+            results.append(item)
 
-            results.append(
-                {
-                    "repo_id": m.id,
-                    "name": m.id,
-                    "downloads": m.downloads or 0,
-                    "likes": m.likes or 0,
-                    "trending_score": m.trending_score or 0,
-                    "size": size,
-                    "size_formatted": _format_model_size(size) if size > 0 else "",
-                    "params": params,
-                    "params_formatted": params_formatted,
-                }
-            )
+        def _ds4_or_tiebreaker(item: dict) -> int:
+            backends = item.get("backends") or []
+            return int(include_mlx and include_ds4 and "ds4" in backends)
 
         # Apply Python-side sorting
         if sort == "most_params":
@@ -7475,7 +8036,21 @@ class HFDownloader:
                 key=lambda x: x["size"] if x["size"] > 0 else -1,
                 reverse=(sort == "largest" or (sort_by_size and not sort_ascending)),
             )
-        # Otherwise, keep original HF API ordering (trending, downloads, created, updated)
+        elif sort == "downloads":
+            results.sort(key=lambda x: x.get("downloads", 0), reverse=True)
+        elif sort == "trending":
+            results.sort(key=lambda x: x.get("trending_score", 0), reverse=True)
+        elif sort == "created":
+            results.sort(
+                key=lambda x: (x.get("created_at", 0), _ds4_or_tiebreaker(x)),
+                reverse=True,
+            )
+        elif sort == "updated":
+            results.sort(
+                key=lambda x: (x.get("updated_at", 0), _ds4_or_tiebreaker(x)),
+                reverse=True,
+            )
+        # Otherwise, keep original HF API ordering from the single selected catalog.
 
         return {
             "models": results[:limit],
@@ -7488,16 +8063,18 @@ class HFDownloader:
         """Fetch detailed model information from HuggingFace.
 
         Args:
-            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            repo_id: HuggingFace repository ID or file URL.
 
         Returns:
             Dict with model details including description, files, tags, etc.
         """
+        target = _resolve_download_target(repo_id)
         api, endpoint = _get_hf_api()
         info = await asyncio.wait_for(
             asyncio.to_thread(
                 api.model_info,
-                repo_id,
+                target.repo_id,
+                revision=target.revision,
                 files_metadata=True,
             ),
             timeout=_HF_API_TIMEOUT,
@@ -7516,21 +8093,29 @@ class HFDownloader:
                         ),
                     }
                 )
+        if target.filename:
+            files = [f for f in files if f["name"] == target.filename]
 
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
+        gguf_size = sum(f["size"] for f in files if f["name"].lower().endswith(".gguf"))
+        has_gguf = gguf_size > 0 or any(tag.lower() == "gguf" for tag in _hf_tags(info))
 
         # Extract params and size from safetensors
         params = None
         params_formatted = None
         size = 0
         safetensors = getattr(info, "safetensors", None)
-        if safetensors:
-            st_dict = dict(safetensors) if not isinstance(safetensors, dict) else safetensors
+        if safetensors and not target.filename:
+            st_dict = (
+                dict(safetensors) if not isinstance(safetensors, dict) else safetensors
+            )
             if st_dict.get("parameters"):
                 params = _get_param_count(st_dict)
                 params_formatted = _format_param_count(params) if params > 0 else None
                 size = _calc_safetensors_disk_size(st_dict)
+        if target.filename and gguf_size > 0:
+            size = gguf_size
 
         # Fetch model card (README.md) content
         model_card = ""
@@ -7538,8 +8123,9 @@ class HFDownloader:
             card_path = await asyncio.wait_for(
                 asyncio.to_thread(
                     hf_hub_download,
-                    repo_id=repo_id,
+                    repo_id=target.repo_id,
                     filename="README.md",
+                    revision=target.revision,
                     endpoint=endpoint,
                 ),
                 timeout=_HF_API_TIMEOUT,
@@ -7550,14 +8136,32 @@ class HFDownloader:
                 if card_text.startswith("---"):
                     end = card_text.find("---", 3)
                     if end != -1:
-                        card_text = card_text[end + 3:].strip()
+                        card_text = card_text[end + 3 :].strip()
                 model_card = card_text
         except Exception:
             pass  # README not available
 
+        backends = []
+        has_safetensors_model = bool(
+            safetensors and getattr(safetensors, "get", lambda _key: None)("parameters")
+        )
+        if has_safetensors_model or not has_gguf:
+            backends.append("mlx")
+        if has_gguf:
+            backends.append("ds4")
+        backend = "mlx+ds4" if len(backends) > 1 else (backends[0] if backends else "")
+
         return {
             "repo_id": info.id,
-            "name": info.id,
+            "name": target.filename or info.id,
+            "download_ref": target.download_ref,
+            "hf_url": (
+                target.download_ref
+                if target.filename
+                else f"https://huggingface.co/{info.id}"
+            ),
+            "selected_file": target.filename or "",
+            "revision": target.revision or "",
             "model_card": model_card,
             "description": "",  # kept for backward compat
             "files": files,
@@ -7574,6 +8178,25 @@ class HFDownloader:
                 info.last_modified.isoformat() if info.last_modified else ""
             ),
             "is_adapter": is_adapter,
+            "has_gguf": has_gguf,
+            "gguf_size": gguf_size,
+            "gguf_size_formatted": (
+                _format_model_size(gguf_size) if gguf_size > 0 else ""
+            ),
+            "backend": backend,
+            "backends": backends,
+            "backend_label": (
+                "MLX + DS4-GGUF"
+                if backend == "mlx+ds4"
+                else ("DS4-GGUF" if backend == "ds4" else "MLX")
+            ),
+            "compatibility_status": "unverified" if has_gguf else "verified",
+            "compatibility_note": (
+                "DeepSeek V4 GGUF candidate; compatibility is unverified and DS4 "
+                f"will validate the downloaded {'file' if target.filename else 'repo'} at launch."
+                if has_gguf
+                else "MLX library model."
+            ),
         }
 
     def __init__(
@@ -7597,13 +8220,11 @@ class HFDownloader:
         """Update the model directory path."""
         self._model_dir = Path(new_dir)
 
-    async def start_download(
-        self, repo_id: str, hf_token: str = ""
-    ) -> DownloadTask:
+    async def start_download(self, repo_id: str, hf_token: str = "") -> DownloadTask:
         """Start downloading a model from HuggingFace.
 
         Args:
-            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            repo_id: HuggingFace repository ID or file URL.
             hf_token: Optional HuggingFace token for gated models.
 
         Returns:
@@ -7612,25 +8233,36 @@ class HFDownloader:
         Raises:
             ValueError: If repo_id format is invalid or download is already queued.
         """
-        repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
-            raise ValueError(
-                f"Invalid repository ID: '{repo_id}'. "
-                "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
-            )
+        target = _resolve_download_target(repo_id)
 
         # Check for duplicate active downloads
         for task in self._tasks.values():
-            if task.repo_id == repo_id and task.status in (
+            if task.status not in (
                 DownloadStatus.PENDING,
                 DownloadStatus.DOWNLOADING,
             ):
+                continue
+            if task.repo_id != target.repo_id:
+                continue
+            active_filename = task.filename or None
+            if (
+                active_filename is None
+                or target.filename is None
+                or active_filename == target.filename
+            ):
                 raise ValueError(
-                    f"Download for '{repo_id}' is already in progress"
+                    f"Download for '{target.display_name}' is already in progress"
                 )
 
         task_id = str(uuid.uuid4())
-        task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        task = DownloadTask(
+            task_id=task_id,
+            repo_id=target.repo_id,
+            revision=target.revision or "",
+            filename=target.filename or "",
+            download_ref=target.download_ref,
+            display_name=target.display_name,
+        )
         self._tasks[task_id] = task
 
         # Start download in background
@@ -7638,7 +8270,7 @@ class HFDownloader:
             self._run_download(task_id, hf_token)
         )
 
-        logger.info(f"Download queued: {repo_id} (task_id={task_id})")
+        logger.info(f"Download queued: {target.display_name} (task_id={task_id})")
         return task
 
     async def cancel_download(self, task_id: str) -> bool:
@@ -7704,9 +8336,7 @@ class HFDownloader:
         self._cancelled.discard(task_id)
         return True
 
-    async def retry_download(
-        self, task_id: str, hf_token: str = ""
-    ) -> DownloadTask:
+    async def retry_download(self, task_id: str, hf_token: str = "") -> DownloadTask:
         """Retry a failed or cancelled download, resuming from existing files.
 
         Finalized shards are preserved on disk so snapshot_download will
@@ -7731,7 +8361,7 @@ class HFDownloader:
                 f"Task {task_id} is not retryable (status: {old_task.status.value})"
             )
 
-        repo_id = old_task.repo_id
+        download_ref = old_task.download_ref or old_task.repo_id
         old_retry_count = old_task.retry_count
 
         # Remove old task entry
@@ -7739,7 +8369,7 @@ class HFDownloader:
         self._cancelled.discard(task_id)
 
         # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(repo_id, hf_token)
+        new_task = await self.start_download(download_ref, hf_token)
         new_task.retry_count = old_retry_count + 1
         return new_task
 
@@ -7810,12 +8440,16 @@ class HFDownloader:
                             api.model_info,
                             task.repo_id,
                             token=hf_token or None,
-                            expand=["safetensors"],
+                            revision=task.revision or None,
+                            expand=["safetensors", "siblings", "tags"],
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )
-                    if model_info.safetensors and model_info.safetensors.get(
-                        "parameters"
+                    if (
+                        not task.filename
+                        and model_info.safetensors
+                        and model_info.safetensors.get("parameters")
+                        and not _has_gguf_files(model_info)
                     ):
                         ignore_patterns = [
                             "*.bin",
@@ -7829,9 +8463,7 @@ class HFDownloader:
                             model_info.safetensors
                         )
                 except Exception as e:
-                    logger.warning(
-                        f"Could not fetch repo info for {task.repo_id}: {e}"
-                    )
+                    logger.warning(f"Could not fetch repo info for {task.repo_id}: {e}")
 
                 dl_kwargs: dict = {
                     "repo_id": task.repo_id,
@@ -7840,6 +8472,10 @@ class HFDownloader:
                     "endpoint": endpoint,
                     "etag_timeout": 30,
                 }
+                if task.revision:
+                    dl_kwargs["revision"] = task.revision
+                if task.filename:
+                    dl_kwargs["allow_patterns"] = [task.filename]
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
 
@@ -7910,9 +8546,7 @@ class HFDownloader:
                     try:
                         await self._on_complete()
                     except Exception as e:
-                        logger.error(
-                            f"Error in download completion callback: {e}"
-                        )
+                        logger.error(f"Error in download completion callback: {e}")
 
         except (_DownloadCancelled, asyncio.CancelledError):
             if task.status not in (
@@ -7988,9 +8622,7 @@ class HFDownloader:
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
-                    task.progress = min(
-                        (current_size / task.total_size) * 100, 99.0
-                    )
+                    task.progress = min((current_size / task.total_size) * 100, 99.0)
 
                 # Activity detection: size change OR file mtime change
                 if current_size != last_size:
@@ -8012,8 +8644,7 @@ class HFDownloader:
                         "Try retrying the download."
                     )
                     logger.warning(
-                        f"Download stalled for {task.repo_id} "
-                        f"(task_id={task_id})"
+                        f"Download stalled for {task.repo_id} " f"(task_id={task_id})"
                     )
                     # Cancel the snapshot_download thread. The task cancel
                     # only unblocks the awaiting coroutine; aborting the xet
@@ -10507,13 +11138,19 @@ from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..settings import (
+    BURST_DECODE_MODES,
+    DS4_MAX_CONTEXT_TOKENS,
+    SubKeyEntry,
+    burst_decode_env,
+)
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
-    SESSION_MAX_AGE,
     compare_keys,
+    SESSION_MAX_AGE,
     create_session_token,
     require_admin,
     validate_api_key,
@@ -10627,6 +11264,11 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
+    # DS4/GGUF MTP sidecar passed to ds4-server --mtp
+    ds4_mtp_enabled: bool | None = None
+    ds4_mtp_path: str | None = None
+    ds4_mtp_draft: int | None = None
+    ds4_mtp_margin: float | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -10723,6 +11365,23 @@ class GlobalSettingsRequest(BaseModel):
     hot_cache_only: bool | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
+
+    # DS4/GGUF backend settings
+    ds4_enabled: bool | None = None
+    ds4_support_dir: str | None = None
+    ds4_binary_path: str | None = None
+    ds4_auto_build: bool | None = None
+    ds4_source_repo: str | None = None
+    ds4_source_commit: str | None = None
+    ds4_context_default_tokens: int | None = None
+    ds4_ready_timeout_ms: int | None = None
+    ds4_kv_cache_enabled: bool | None = None
+    ds4_kv_root: str | None = None
+    ds4_kv_disk_space_mb: int | None = None
+    ds4_kv_cache_continued_interval_tokens: int | None = None
+    ds4_ssd_streaming: str | None = None
+    ds4_power: int | None = None
+    ds4_logs_to_disk: bool | None = None
 
     # MCP settings
     mcp_config: str | None = None
@@ -10972,6 +11631,9 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
     )
     for key in unsupported_none_fields:
         settings[key] = None
@@ -10991,6 +11653,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
+    settings["ds4_mtp_enabled"] = False
 
     unsupported_ct_kwargs = {
         "enable_thinking",
@@ -11080,6 +11743,10 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
+    settings.ds4_mtp_enabled = False
+    settings.ds4_mtp_path = None
+    settings.ds4_mtp_draft = None
+    settings.ds4_mtp_margin = None
 
 
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -11658,6 +12325,34 @@ def set_hf_uploader(uploader):
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+
+def _clean_optional_setting_path(value: str | None) -> str | None:
+    """Return a stripped optional path value, treating blanks as unset."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _clean_optional_ds4_support_dir(
+    value: str | None,
+    base_path: Path,
+) -> str | None:
+    """Keep the default DS4 support dir implicit so oMLX can manage it."""
+    cleaned = _clean_optional_setting_path(value)
+    if cleaned is None:
+        return None
+    default_support_dir = (base_path / "support" / "ds4").expanduser().resolve()
+    if Path(cleaned).expanduser().resolve() == default_support_dir:
+        return None
+    return cleaned
+
+
+def _restore_settings_values(target: Any, values: dict[str, Any]) -> None:
+    """Restore a settings dataclass/dict-like object from a value snapshot."""
+    for key, value in values.items():
+        setattr(target, key, value)
 
 
 def format_size(size_bytes: int) -> str:
@@ -12281,6 +12976,163 @@ def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
         return []
 
 
+def _admin_ds4_status(ds4_status: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return DS4 status enriched for admin/API consumers."""
+    if not isinstance(ds4_status, dict):
+        return None
+    status = dict(ds4_status)
+    if status.get("crashed"):
+        status["status"] = "crashed"
+    elif status.get("running"):
+        status["status"] = "running"
+    else:
+        status["status"] = "stopped"
+
+    rss_bytes = status.get("rss_bytes")
+    status["rss_formatted"] = (
+        format_size(rss_bytes) if isinstance(rss_bytes, int) and rss_bytes > 0 else None
+    )
+    context_tokens = status.get("context_tokens")
+    status["context_tokens_formatted"] = (
+        f"{context_tokens:,}"
+        if isinstance(context_tokens, int) and context_tokens > 0
+        else None
+    )
+    recent_logs = status.get("recent_logs")
+    if isinstance(recent_logs, str):
+        status["recent_log_lines"] = recent_logs.splitlines()[-50:]
+    return status
+
+
+def _list_ds4_mtp_sidecars(global_settings: Any | None) -> list[dict[str, Any]]:
+    """Return selectable DS4 MTP sidecars from configured model directories."""
+    if global_settings is None:
+        return []
+    try:
+        model_dirs = global_settings.get_effective_model_dirs()
+    except Exception:
+        try:
+            model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+        except Exception:
+            return []
+
+    from ..ds4_gguf import collect_ds4_mtp_gguf_sidecar_candidates
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for model_dir in model_dirs:
+        root = Path(model_dir).expanduser().resolve()
+        if not root.is_dir():
+            continue
+        try:
+            first_level_dirs = [
+                path
+                for path in root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            ]
+        except OSError as e:
+            logger.debug("Could not list DS4 MTP sidecars in %s: %s", root, e)
+            continue
+
+        containers = [root, *first_level_dirs]
+        for group in first_level_dirs:
+            try:
+                containers.extend(
+                    path
+                    for path in group.iterdir()
+                    if path.is_dir() and not path.name.startswith(".")
+                )
+            except OSError as e:
+                logger.debug("Could not list DS4 MTP sidecars in %s: %s", group, e)
+
+        for container in containers:
+            try:
+                paths = list(container.iterdir())
+            except OSError as e:
+                logger.debug("Could not list DS4 MTP sidecars in %s: %s", container, e)
+                continue
+            for candidate in collect_ds4_mtp_gguf_sidecar_candidates(container, paths):
+                path = str(candidate.path)
+                if path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(
+                    {
+                        "display_name": candidate.display_name,
+                        "path": path,
+                        "size": candidate.size,
+                        "size_formatted": format_size(candidate.size),
+                        "kind": candidate.kind,
+                        "source_type": candidate.source_type,
+                        "source_repo_id": candidate.source_repo_id,
+                    }
+                )
+    candidates.sort(key=lambda item: item["display_name"].lower())
+    return candidates
+
+
+def _admin_ds4_global_status(engine_pool: Any, *, enabled: bool) -> dict[str, Any]:
+    """Summarize DS4 model lifecycle state for global settings UI."""
+    summary: dict[str, Any] = {
+        "status": "disabled" if not enabled else "no_models",
+        "available_models": 0,
+        "loaded_count": 0,
+        "running_count": 0,
+        "crashed_count": 0,
+        "loading_count": 0,
+        "loaded_models": [],
+    }
+    if engine_pool is None:
+        return summary
+    try:
+        pool_status = engine_pool.get_status()
+    except Exception as e:  # noqa: BLE001 - status UI must remain best-effort
+        logger.debug("Failed to collect DS4 global status: %s", e)
+        return summary
+
+    loaded_models: list[dict[str, Any]] = []
+    for model in pool_status.get("models", []):
+        if model.get("engine_type") != "ds4":
+            continue
+        summary["available_models"] += 1
+        if model.get("is_loading"):
+            summary["loading_count"] += 1
+        if not model.get("loaded"):
+            continue
+        summary["loaded_count"] += 1
+        ds4_status = _admin_ds4_status(model.get("ds4"))
+        lifecycle = ds4_status.get("status") if ds4_status else "loaded"
+        if ds4_status and ds4_status.get("running"):
+            summary["running_count"] += 1
+        if ds4_status and ds4_status.get("crashed"):
+            summary["crashed_count"] += 1
+        loaded_models.append(
+            {
+                "id": model.get("id"),
+                "status": lifecycle,
+                "context_tokens": (ds4_status or {}).get("context_tokens"),
+                "rss_formatted": (ds4_status or {}).get("rss_formatted"),
+                "log_path": (ds4_status or {}).get("log_path"),
+            }
+        )
+
+    if not enabled:
+        summary["status"] = "disabled"
+    elif summary["crashed_count"]:
+        summary["status"] = "crashed"
+    elif summary["running_count"]:
+        summary["status"] = "running"
+    elif summary["loading_count"]:
+        summary["status"] = "loading"
+    elif summary["loaded_count"]:
+        summary["status"] = "loaded"
+    elif summary["available_models"]:
+        summary["status"] = "idle"
+    summary["loaded_models"] = loaded_models[:10]
+    return summary
+
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -12342,10 +13194,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
+        ds4_status = _admin_ds4_status(model_info.get("ds4"))
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
-            "display_name": _model_display_name(
+            "display_name": model_info.get("display_name")
+            or _model_display_name(
                 model_id,
                 model_info.get("model_path", ""),
                 model_dirs,
@@ -12393,6 +13247,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatibility_reason": mtp_compat_reason,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "ds4": ds4_status,
         }
 
         # Add settings if available
@@ -12442,7 +13297,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             }
         )
 
-    return {"models": models}
+    return {
+        "models": models,
+        "ds4_mtp_sidecars": _list_ds4_mtp_sidecars(global_settings),
+    }
 
 
 @router.post("/api/models/{model_id}/unload")
@@ -12455,15 +13313,23 @@ async def unload_model(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    entry = engine_pool.get_entry(model_id)
+    settings_manager = _get_settings_manager()
+    resolved_model_id = engine_pool.resolve_model_id(model_id, settings_manager)
+    entry = engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
-        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+        raise HTTPException(
+            status_code=400, detail=f"Model not loaded: {resolved_model_id}"
+        )
 
-    await engine_pool._unload_engine(model_id)
-    logger.info(f"Manually unloaded model: {model_id}")
-    return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+    await engine_pool._unload_engine(resolved_model_id)
+    logger.info(f"Manually unloaded model: {resolved_model_id}")
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Unloaded {resolved_model_id}",
+    }
 
 
 async def _require_admin_or_bearer(request: Request) -> bool:
@@ -12507,27 +13373,33 @@ async def load_model(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    entry = engine_pool.get_entry(model_id)
+    settings_manager = _get_settings_manager()
+    resolved_model_id = engine_pool.resolve_model_id(model_id, settings_manager)
+    entry = engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is not None:
         return {
             "status": "ok",
-            "model_id": model_id,
-            "message": f"Already loaded: {model_id}",
+            "model_id": resolved_model_id,
+            "message": f"Already loaded: {resolved_model_id}",
         }
     if entry.is_loading:
         raise HTTPException(
-            status_code=409, detail=f"Model is already loading: {model_id}"
+            status_code=409, detail=f"Model is already loading: {resolved_model_id}"
         )
 
     try:
-        await engine_pool.get_engine(model_id)
+        await engine_pool.get_engine(resolved_model_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info(f"Manually loaded model: {model_id}")
-    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+    logger.info(f"Manually loaded model: {resolved_model_id}")
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Loaded {resolved_model_id}",
+    }
 
 
 @router.post("/api/reload")
@@ -12575,6 +13447,13 @@ async def update_model_settings(
 
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
+    previous_max_context_window = current_settings.max_context_window
+    previous_ds4_mtp_settings = (
+        current_settings.ds4_mtp_enabled,
+        current_settings.ds4_mtp_path,
+        current_settings.ds4_mtp_draft,
+        current_settings.ds4_mtp_margin,
+    )
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -12623,31 +13502,54 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
-        current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
-        type_to_engine = {
-            "llm": "batched",
-            "vlm": "vlm",
-            "embedding": "embedding",
-            "reranker": "reranker",
-            "audio_stt": "audio_stt",
-            "audio_tts": "audio_tts",
-            "audio_sts": "audio_sts",
-        }
-        if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+        if engine_pool._is_ds4_entry(entry):
+            if override_value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="model_type_override is not supported for DS4 GGUF models",
+                )
+            current_settings.model_type_override = None
+            entry.model_type = "llm"
+            entry.engine_type = "ds4"
         else:
-            # Reset to auto-detected type
-            from pathlib import Path
+            current_settings.model_type_override = override_value
+            # Update engine pool entry type immediately
+            type_to_engine = {
+                "llm": "batched",
+                "vlm": "vlm",
+                "embedding": "embedding",
+                "reranker": "reranker",
+                "audio_stt": "audio_stt",
+                "audio_tts": "audio_tts",
+                "audio_sts": "audio_sts",
+            }
+            if override_value:
+                entry.model_type = override_value
+                entry.engine_type = type_to_engine.get(override_value, "batched")
+            else:
+                # Reset to auto-detected type
+                from ..model_discovery import detect_model_type
 
-            from ..model_discovery import detect_model_type
-
-            detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+                detected_type = detect_model_type(Path(entry.model_path))
+                entry.model_type = detected_type
+                entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
-        current_settings.max_context_window = request.max_context_window
+        max_context_window = request.max_context_window
+        if engine_pool._is_ds4_entry(entry):
+            if max_context_window is not None and max_context_window <= 0:
+                max_context_window = None
+            if (
+                max_context_window is not None
+                and max_context_window > DS4_MAX_CONTEXT_TOKENS
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "max_context_window must be <= "
+                        f"{DS4_MAX_CONTEXT_TOKENS} for DS4 GGUF models"
+                    ),
+                )
+        current_settings.max_context_window = max_context_window
     if "max_tokens" in sent:
         current_settings.max_tokens = request.max_tokens
     if "temperature" in sent:
@@ -12821,6 +13723,61 @@ async def update_model_settings(
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
 
+    # DS4/GGUF MTP sidecar passed through to ds4-server --mtp.
+    ds4_mtp_fields = {
+        "ds4_mtp_enabled",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
+    }
+    if sent & ds4_mtp_fields:
+        if not engine_pool._is_ds4_entry(entry):
+            requested_enable = (
+                bool(request.ds4_mtp_enabled)
+                if "ds4_mtp_enabled" in sent
+                else current_settings.ds4_mtp_enabled
+            )
+            requested_path = (
+                request.ds4_mtp_path
+                if "ds4_mtp_path" in sent
+                else current_settings.ds4_mtp_path
+            )
+            if requested_enable or requested_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DS4 MTP settings are only supported for DS4 GGUF models.",
+                )
+
+        if "ds4_mtp_path" in sent:
+            raw_path = request.ds4_mtp_path.strip() if request.ds4_mtp_path else None
+            current_settings.ds4_mtp_path = raw_path or None
+        if "ds4_mtp_draft" in sent:
+            value = request.ds4_mtp_draft
+            current_settings.ds4_mtp_draft = int(value) if value and value > 0 else None
+        if "ds4_mtp_margin" in sent:
+            value = request.ds4_mtp_margin
+            current_settings.ds4_mtp_margin = (
+                float(value) if value is not None and value >= 0 else None
+            )
+        if "ds4_mtp_enabled" in sent:
+            current_settings.ds4_mtp_enabled = bool(request.ds4_mtp_enabled)
+
+        if current_settings.ds4_mtp_enabled:
+            if not current_settings.ds4_mtp_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DS4 MTP requires a path to a Flash MTP sidecar GGUF.",
+                )
+            try:
+                from ..ds4_gguf import validate_ds4_mtp_compatibility
+
+                validate_ds4_mtp_compatibility(
+                    Path(entry.model_path),
+                    Path(current_settings.ds4_mtp_path),
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
@@ -12832,7 +13789,6 @@ async def update_model_settings(
             # mlx-community converted weights where the default sanitize
             # path stripped the MTP heads.
             import json
-            from pathlib import Path
 
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
@@ -13007,7 +13963,77 @@ async def update_model_settings(
                         settings=profile_settings,
                     )
 
-    # Persist settings
+    current_ds4_mtp_settings = (
+        current_settings.ds4_mtp_enabled,
+        current_settings.ds4_mtp_path,
+        current_settings.ds4_mtp_draft,
+        current_settings.ds4_mtp_margin,
+    )
+    ds4_context_changed = (
+        "max_context_window" in sent
+        and current_settings.max_context_window != previous_max_context_window
+    )
+    ds4_mtp_changed = bool(sent & ds4_mtp_fields) and (
+        current_ds4_mtp_settings != previous_ds4_mtp_settings
+    )
+    ds4_launch_requires_restart = (
+        entry.engine is not None
+        and engine_pool._is_ds4_entry(entry)
+        and (ds4_context_changed or ds4_mtp_changed)
+    )
+    if ds4_launch_requires_restart and entry.engine.has_active_requests():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "DS4 launch setting change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            ),
+        )
+
+    ds4_launch_restarted = False
+    if ds4_launch_requires_restart:
+        restart_with_launch_settings = getattr(
+            entry.engine, "restart_with_launch_settings", None
+        )
+        restart_with_context = getattr(entry.engine, "restart_with_context", None)
+        if callable(restart_with_launch_settings):
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_launch_restarted = bool(
+                    await restart_with_launch_settings(
+                        context_tokens=current_settings.max_context_window,
+                        model_settings=current_settings,
+                        reason="launch setting change",
+                        force=True,
+                    )
+                )
+                if ds4_launch_restarted:
+                    get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+                    if callable(get_rss):
+                        entry.actual_size = get_rss() or entry.actual_size
+            except DS4ProxyError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+        elif callable(restart_with_context) and ds4_context_changed:
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_launch_restarted = bool(
+                    await restart_with_context(current_settings.max_context_window)
+                )
+                if ds4_launch_restarted:
+                    get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+                    if callable(get_rss):
+                        entry.actual_size = get_rss() or entry.actual_size
+            except DS4ProxyError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+    # Persist settings only after DS4 restart admission has succeeded, so a
+    # racing active request cannot save a context that was not applied.
     settings_manager.set_settings(model_id, current_settings)
 
     # Auto-unload (and re-load if pinned) when a setting that only takes
@@ -13057,9 +14083,11 @@ async def update_model_settings(
         "settings": current_settings.to_dict(),
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
-        "requires_reload": requires_reload,
+        "requires_reload": requires_reload or ds4_launch_requires_restart,
         "auto_unloaded": auto_unloaded,
-        "auto_reloaded": auto_reloaded,
+        "auto_reloaded": auto_reloaded or ds4_launch_restarted,
+        "ds4_context_restarted": ds4_launch_restarted and ds4_context_changed,
+        "ds4_launch_restarted": ds4_launch_restarted,
     }
 
 
@@ -13280,16 +14308,84 @@ async def apply_model_profile(
     is_admin: bool = Depends(require_admin),
 ):
     mgr = _require_settings_manager()
-    entry = _require_model(model_id)
-    is_diffusion_model = _entry_is_diffusion_model(entry)
+    pool_entry = _require_model(model_id)
+    is_diffusion_model = _entry_is_diffusion_model(pool_entry)
     sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+
+    previous_settings = mgr.get_settings(model_id)
+    profile = mgr.get_profile(model_id, name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    profile_settings = profile.get("settings", {}) or {}
+
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    is_ds4_entry = (
+        getattr(engine_pool, "_is_ds4_entry", None) if engine_pool is not None else None
+    )
+    is_ds4 = bool(entry is not None and callable(is_ds4_entry) and is_ds4_entry(entry))
+    target_max_context = previous_settings.max_context_window
+    if is_ds4 and "max_context_window" in profile_settings:
+        target_max_context = profile_settings.get("max_context_window")
+        if target_max_context is not None and target_max_context <= 0:
+            target_max_context = None
+        if (
+            target_max_context is not None
+            and target_max_context > DS4_MAX_CONTEXT_TOKENS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_context_window must be <= "
+                    f"{DS4_MAX_CONTEXT_TOKENS} for DS4 GGUF models"
+                ),
+            )
+    ds4_context_requires_restart = (
+        is_ds4
+        and entry is not None
+        and entry.engine is not None
+        and target_max_context != previous_settings.max_context_window
+    )
+    if ds4_context_requires_restart and entry.engine.has_active_requests():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "DS4 context change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            ),
+        )
+
     applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(applied)
         mgr.set_settings(model_id, applied)
-    return {"model_id": model_id, "settings": applied.to_dict()}
+    if is_ds4 and applied.max_context_window != target_max_context:
+        applied.max_context_window = target_max_context
+        mgr.set_settings(model_id, applied)
+
+    ds4_context_restarted = False
+    if ds4_context_requires_restart:
+        restart_with_context = getattr(entry.engine, "restart_with_context", None)
+        if callable(restart_with_context):
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_context_restarted = bool(
+                    await restart_with_context(applied.max_context_window)
+                )
+            except DS4ProxyError as e:
+                mgr.set_settings(model_id, previous_settings)
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                mgr.set_settings(model_id, previous_settings)
+                raise HTTPException(status_code=500, detail=str(e)) from e
+    return {
+        "model_id": model_id,
+        "settings": applied.to_dict(),
+        "ds4_context_restarted": ds4_context_restarted,
+    }
 
 
 @router.get("/api/profile-fields")
@@ -13630,6 +14726,15 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     )
     disk_info = get_ssd_disk_info(cache_dir)
 
+    ds4_auto_context = global_settings.ds4.get_auto_context_tokens(
+        memory_info["total_bytes"] or None
+    )
+    engine_pool = _get_engine_pool() if callable(_get_engine_pool) else None
+    ds4_global_status = _admin_ds4_global_status(
+        engine_pool,
+        enabled=global_settings.ds4.enabled,
+    )
+
     return {
         "base_path": str(global_settings.base_path),
         "server": {
@@ -13683,6 +14788,40 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
+        },
+        "ds4": {
+            "enabled": global_settings.ds4.enabled,
+            "support_dir": str(
+                global_settings.ds4.get_support_dir(global_settings.base_path)
+            ),
+            "binary_path": global_settings.ds4.binary_path or "",
+            "auto_build": global_settings.ds4.auto_build,
+            "source_repo": global_settings.ds4.source_repo or "",
+            "source_commit": global_settings.ds4.source_commit or "",
+            "context_default_tokens": global_settings.ds4.context_default_tokens,
+            "auto_context_tokens": ds4_auto_context,
+            "auto_context_tokens_formatted": f"{ds4_auto_context:,}",
+            "ready_timeout_ms": global_settings.ds4.ready_timeout_ms,
+            "kv_cache_enabled": global_settings.ds4.kv_cache_enabled,
+            "kv_root": str(global_settings.ds4.get_kv_root(global_settings.base_path)),
+            "kv_disk_space_mb": global_settings.ds4.kv_disk_space_mb,
+            "kv_disk_space_formatted": format_size(
+                global_settings.ds4.kv_disk_space_mb * 1024 * 1024
+            ),
+            "kv_cache_continued_interval_tokens": (
+                global_settings.ds4.kv_cache_continued_interval_tokens
+            ),
+            "ssd_streaming": global_settings.ds4.ssd_streaming,
+            "power": global_settings.ds4.power,
+            "logs_to_disk": global_settings.ds4.logs_to_disk,
+            "trace_enabled": global_settings.ds4.trace_enabled,
+            "trace_dir": str(
+                global_settings.ds4.get_trace_dir(global_settings.base_path)
+            ),
+            "debug_dir": str(
+                global_settings.ds4.get_debug_dir(global_settings.base_path)
+            ),
+            **ds4_global_status,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -13794,19 +14933,24 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    previous_ds4_settings: dict[str, Any] | None = None
 
     # Apply server settings
     if request.host is not None:
         from ..utils.network import is_valid_bind_host
 
-        parts = [h.strip() for h in request.host.split(",") if h.strip()]
-        if not parts:
-            raise HTTPException(status_code=400, detail="Host cannot be empty")
-        for part in parts:
-            if not is_valid_bind_host(part):
+        _hosts = [h.strip() for h in request.host.split(",")]
+        _hosts = [h for h in _hosts if h]  # drop empty segments
+        if not _hosts:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid host: at least one non-empty host is required",
+            )
+        for h in _hosts:
+            if not is_valid_bind_host(h):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
+                    detail=f"Invalid host: {h!r} (must be a valid IP address or hostname)",
                 )
         global_settings.server.host = request.host
     if request.port is not None:
@@ -13838,9 +14982,10 @@ async def update_global_settings(
         # Seed env so models loaded later pick up the mode without a restart.
         for _key, _value in burst_decode_env(mode).items():
             os.environ[_key] = _value
-        # Hot-apply to every loaded engine. EngineConfig is a mutable dataclass
-        # and its burst fields are read fresh each decode burst
-        # (EngineCore._step_burst), so this takes effect on the next token.
+        # Hot-apply to every loaded engine.  EngineConfig is a mutable
+        # dataclass whose burst fields are read fresh each decode burst
+        # (EngineCore._step_burst), so the change takes effect on the
+        # next token without a restart.
         max_steps, single_s = BURST_DECODE_MODES[mode]
         from ..server import _server_state
 
@@ -13861,6 +15006,7 @@ async def update_global_settings(
                     cfg.decode_burst_budget_single_s = single_s
         runtime_applied.append("burst_decode_mode")
         logger.info(f"Burst Decode mode set to '{mode}'")
+
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
@@ -14378,6 +15524,75 @@ async def update_global_settings(
         )
         runtime_applied.append("skip_api_key_verification")
 
+    # Apply DS4/GGUF backend settings after earlier request-specific validation.
+    # Final global validation/save failures still roll this in-memory object back.
+    ds4_changed = False
+    if any(field.startswith("ds4_") for field in request.model_fields_set):
+        previous_ds4_settings = global_settings.ds4.to_dict()
+    if request.ds4_enabled is not None:
+        global_settings.ds4.enabled = request.ds4_enabled
+        ds4_changed = True
+    if "ds4_support_dir" in request.model_fields_set:
+        global_settings.ds4.support_dir = _clean_optional_ds4_support_dir(
+            request.ds4_support_dir,
+            global_settings.base_path,
+        )
+        ds4_changed = True
+    if "ds4_binary_path" in request.model_fields_set:
+        global_settings.ds4.binary_path = _clean_optional_setting_path(
+            request.ds4_binary_path
+        )
+        ds4_changed = True
+    if request.ds4_auto_build is not None:
+        global_settings.ds4.auto_build = request.ds4_auto_build
+        ds4_changed = True
+    if "ds4_source_repo" in request.model_fields_set:
+        global_settings.ds4.source_repo = _clean_optional_setting_path(
+            request.ds4_source_repo
+        )
+        ds4_changed = True
+    if "ds4_source_commit" in request.model_fields_set:
+        global_settings.ds4.source_commit = _clean_optional_setting_path(
+            request.ds4_source_commit
+        )
+        ds4_changed = True
+    if "ds4_context_default_tokens" in request.model_fields_set:
+        value = request.ds4_context_default_tokens
+        global_settings.ds4.context_default_tokens = (
+            None if value in (None, 0) else value
+        )
+        ds4_changed = True
+    if request.ds4_ready_timeout_ms is not None:
+        global_settings.ds4.ready_timeout_ms = request.ds4_ready_timeout_ms
+        ds4_changed = True
+    if request.ds4_kv_cache_enabled is not None:
+        global_settings.ds4.kv_cache_enabled = request.ds4_kv_cache_enabled
+        ds4_changed = True
+    if "ds4_kv_root" in request.model_fields_set:
+        global_settings.ds4.kv_root = _clean_optional_setting_path(request.ds4_kv_root)
+        ds4_changed = True
+    if request.ds4_kv_disk_space_mb is not None:
+        global_settings.ds4.kv_disk_space_mb = request.ds4_kv_disk_space_mb
+        ds4_changed = True
+    if request.ds4_kv_cache_continued_interval_tokens is not None:
+        global_settings.ds4.kv_cache_continued_interval_tokens = (
+            request.ds4_kv_cache_continued_interval_tokens
+        )
+        ds4_changed = True
+    if request.ds4_ssd_streaming is not None:
+        global_settings.ds4.ssd_streaming = request.ds4_ssd_streaming
+        ds4_changed = True
+    if request.ds4_power is not None:
+        global_settings.ds4.power = request.ds4_power
+        ds4_changed = True
+    if request.ds4_logs_to_disk is not None:
+        global_settings.ds4.logs_to_disk = request.ds4_logs_to_disk
+        ds4_changed = True
+
+    if ds4_changed:
+        runtime_applied.append("ds4")
+        logger.info("DS4 backend settings updated")
+
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
@@ -14389,6 +15604,8 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_ds4_settings is not None:
+            _restore_settings_values(global_settings.ds4, previous_ds4_settings)
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -14399,6 +15616,8 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_ds4_settings is not None:
+            _restore_settings_values(global_settings.ds4, previous_ds4_settings)
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
     if pending_embedding_batch_size is not None:
@@ -14588,7 +15807,53 @@ def _get_engine_info() -> dict:
             pass
         engines[pkg_name] = info
 
+    engines["ds4"] = _get_ds4_engine_info()
+
     return engines
+
+
+def _get_ds4_engine_info() -> dict:
+    """Get the DS4 support source commit shown in the engine versions panel."""
+    info = {"name": "ds4", "version": None, "commit": None, "url": None}
+    try:
+        from ..ds4_support import DS4_SUPPORT_MANIFEST, load_ds4_support_manifest
+
+        manifest_path = None
+        settings = _get_global_settings() if callable(_get_global_settings) else None
+        if settings is not None:
+            staged_manifest = (
+                settings.ds4.get_support_dir(settings.base_path) / DS4_SUPPORT_MANIFEST
+            )
+            if staged_manifest.is_file():
+                manifest_path = staged_manifest
+
+        manifest = load_ds4_support_manifest(manifest_path)
+        commit = manifest.source_commit.strip()
+        if commit:
+            info["commit"] = commit
+            info["url"] = _github_commit_url(manifest.source_repo, commit)
+    except Exception as exc:
+        logger.debug("Could not read DS4 support manifest for engine info: %s", exc)
+    return info
+
+
+def _github_commit_url(repo_url: str, commit: str) -> str | None:
+    """Build a GitHub commit URL for a repo URL when possible."""
+    repo = repo_url.strip().rstrip("/")
+    commit = commit.strip()
+    if not repo or not commit:
+        return None
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if repo.startswith("git@github.com:"):
+        repo = f"https://github.com/{repo.removeprefix('git@github.com:')}"
+    elif repo.startswith("ssh://git@github.com/"):
+        repo = f"https://github.com/{repo.removeprefix('ssh://git@github.com/')}"
+    elif repo.startswith("http://github.com/"):
+        repo = f"https://github.com/{repo.removeprefix('http://github.com/')}"
+    if not repo.startswith("https://github.com/"):
+        return None
+    return f"{repo}/commit/{commit}"
 
 
 def _get_commit_from_direct_url(dist, default_url: str) -> dict | None:
@@ -14602,10 +15867,11 @@ def _get_commit_from_direct_url(dist, default_url: str) -> dict | None:
             vcs_info = direct_url.get("vcs_info", {})
             commit = vcs_info.get("commit_id")
             if commit:
-                repo_url = direct_url.get("url", default_url).rstrip("/")
-                if repo_url.endswith(".git"):
-                    repo_url = repo_url[:-4]
-                return {"commit": commit, "url": f"{repo_url}/commit/{commit}"}
+                repo_url = direct_url.get("url", default_url)
+                return {
+                    "commit": commit,
+                    "url": _github_commit_url(repo_url, commit),
+                }
     except Exception:
         pass
     return None
@@ -15007,13 +16273,13 @@ def _build_active_models_data() -> dict:
         active_requests = 0
         waiting_requests = 0
         running_by_id = {}
-        has_scheduler_snapshot = False
         waiting_ids = set()
         waiting = []
         activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        has_scheduler_snapshot = False
         collector_request_ids: set = set()
         active_request_ids: set = set()
         activity_requests = 0
@@ -15783,9 +17049,11 @@ async def remove_hf_task(
 @router.get("/api/hf/recommended")
 async def get_recommended_models(
     mlx_only: bool = True,
+    show_mlx: bool | None = None,
+    show_ds4_gguf: bool | None = None,
     is_admin: bool = Depends(require_admin),
 ):
-    """Get recommended models filtered by system memory."""
+    """Get recommended models filtered by system memory/backend."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
@@ -15796,7 +17064,11 @@ async def get_recommended_models(
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
+            max_memory_bytes=max_memory,
+            result_limit=50,
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
         )
         return result
     except TimeoutError:
@@ -15814,6 +17086,8 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    show_mlx: bool | None = None,
+    show_ds4_gguf: bool | None = None,
     # Filtering
     min_params: Optional[int] = None,
     max_params: Optional[int] = None,
@@ -15830,7 +17104,9 @@ async def search_hf_models(
         q: Search query string (required)
         sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
         limit: Maximum results (max 100)
-        mlx_only: Restrict to MLX library models
+        mlx_only: Legacy MLX library restriction when OR filters are omitted
+        show_mlx: Include MLX catalog results
+        show_ds4_gguf: Include DeepSeek V4 DS4-GGUF catalog results
         min_params: Minimum parameter count
         max_params: Maximum parameter count
         min_size: Minimum model size in bytes
@@ -15855,6 +17131,8 @@ async def search_hf_models(
             max_size=max_size,
             sort_by_size=sort_by_size,
             sort_ascending=sort_ascending,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
         )
         return result
     except TimeoutError:
@@ -15897,9 +17175,42 @@ async def get_hf_model_info(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _engine_pool_status_models(engine_pool: Any) -> list[dict[str, Any]]:
+    """Return EnginePool status models when available."""
+    if engine_pool is None or not callable(getattr(engine_pool, "get_status", None)):
+        return []
+    try:
+        status = engine_pool.get_status()
+    except Exception as e:
+        logger.debug("Could not read EnginePool status for local models: %s", e)
+        return []
+    if not isinstance(status, dict):
+        return []
+    models = status.get("models", [])
+    if not isinstance(models, list):
+        return []
+    return [model for model in models if isinstance(model, dict)]
+
+
+def _containing_model_dir(path: Path, model_dirs: list[Path]) -> Path | None:
+    """Return the configured model dir containing *path*, if any."""
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        return None
+    for model_dir in model_dirs:
+        try:
+            resolved_dir = model_dir.resolve()
+        except OSError:
+            continue
+        if resolved_path == resolved_dir or resolved_path.is_relative_to(resolved_dir):
+            return model_dir
+    return None
+
+
 @router.get("/api/hf/models")
 async def list_hf_models(is_admin: bool = Depends(require_admin)):
-    """List models in all model directories with disk size info."""
+    """List local model artifacts in all model directories with disk size info."""
     global_settings = _get_global_settings()
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -15908,33 +17219,52 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
+    def _artifact_size(model_path: Path) -> int:
+        if model_path.is_file():
+            return model_path.stat().st_size
+        return sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+
+    models = []
+    seen_names: set[str] = set()
+
     def _add_model(
         model_path: Path,
         model_name: str,
         *,
         source_repo_id: str | None = None,
+        display_name: str | None = None,
+        engine_type: str | None = None,
+        model_type: str | None = None,
+        config_model_type: str | None = None,
+        backend_label: str | None = None,
     ) -> None:
         if model_name in seen_names:
             return
         seen_names.add(model_name)
-        total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
-        models.append(
-            {
-                "name": model_name,
-                "path": str(model_path),
-                "display_name": _model_display_name(
-                    model_name,
-                    model_path,
-                    model_dirs,
-                    source_repo_id=source_repo_id,
-                ),
-                "size": total_size,
-                "size_formatted": format_size(total_size),
-            }
-        )
+        total_size = _artifact_size(model_path)
+        model = {
+            "name": model_name,
+            "path": str(model_path),
+            "display_name": display_name
+            or _model_display_name(
+                model_name,
+                model_path,
+                model_dirs,
+                source_repo_id=source_repo_id,
+            ),
+            "size": total_size,
+            "size_formatted": format_size(total_size),
+        }
+        if engine_type:
+            model["engine_type"] = engine_type
+        if model_type:
+            model["model_type"] = model_type
+        if config_model_type:
+            model["config_model_type"] = config_model_type
+        if backend_label:
+            model["backend_label"] = backend_label
+        models.append(model)
 
-    models = []
-    seen_names: set[str] = set()
     for model_dir in model_dirs:
         if not model_dir.exists():
             continue
@@ -15964,8 +17294,44 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
+    engine_pool = None
+    if callable(_get_engine_pool):
+        try:
+            engine_pool = _get_engine_pool()
+        except HTTPException as e:
+            if e.status_code != 503:
+                raise
+        except Exception as e:
+            logger.debug("Could not get EnginePool for local models: %s", e)
+    for model_info in _engine_pool_status_models(engine_pool):
+        if model_info.get("engine_type") != "ds4":
+            continue
+        model_path = Path(str(model_info.get("model_path") or ""))
+        if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
+            continue
+        if _containing_model_dir(model_path, model_dirs) is None:
+            continue
+        model_id = str(model_info.get("id") or "")
+        if not model_id:
+            continue
+        _add_model(
+            model_path,
+            model_id,
+            display_name=model_info.get("display_name")
+            or _model_display_name(
+                model_id,
+                model_path,
+                model_dirs,
+                source_repo_id=model_info.get("source_repo_id"),
+            ),
+            engine_type="ds4",
+            model_type=model_info.get("model_type"),
+            config_model_type=model_info.get("config_model_type"),
+            backend_label="DS4-GGUF",
+        )
+
     # Sort by the UI display name so organization prefixes group together.
-    models.sort(key=lambda m: m["display_name"].lower())
+    models.sort(key=lambda m: (m.get("display_name") or m["name"]).lower())
     return {"models": models}
 
 
@@ -15982,6 +17348,20 @@ async def delete_hf_model(
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+
+    settings_manager = (
+        _get_settings_manager() if callable(_get_settings_manager) else None
+    )
+    resolved_model_name = model_name
+    if engine_pool is not None and callable(
+        getattr(engine_pool, "resolve_model_id", None)
+    ):
+        try:
+            resolved = engine_pool.resolve_model_id(model_name, settings_manager)
+            if isinstance(resolved, str):
+                resolved_model_name = resolved
+        except Exception as e:
+            logger.debug("Could not resolve local model name %s: %s", model_name, e)
 
     # Search for model across all directories in both flat and org-folder layouts
     model_path = None
@@ -16007,6 +17387,23 @@ async def delete_hf_model(
             break
 
     if model_path is None:
+        for model_info in _engine_pool_status_models(engine_pool):
+            if (
+                model_info.get("id") != resolved_model_name
+                or model_info.get("engine_type") != "ds4"
+            ):
+                continue
+            candidate = Path(str(model_info.get("model_path") or ""))
+            if candidate.suffix.lower() != ".gguf" or not candidate.is_file():
+                continue
+            parent = _containing_model_dir(candidate, model_dirs)
+            if parent is None:
+                continue
+            model_path = candidate
+            parent_model_dir = parent
+            break
+
+    if model_path is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
     # Validate path traversal against parent model directory
@@ -16016,18 +17413,20 @@ async def delete_hf_model(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
 
-    if not model_path.is_dir():
-        raise HTTPException(status_code=400, detail="Not a model directory")
+    if not model_path.is_dir() and not (
+        model_path.is_file() and model_path.suffix.lower() == ".gguf"
+    ):
+        raise HTTPException(status_code=400, detail="Not a supported model artifact")
 
     # Unload model if loaded
     if engine_pool is not None:
         loaded_ids = engine_pool.get_loaded_model_ids()
-        if model_name in loaded_ids:
+        if resolved_model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
-                logger.info(f"Unloaded model '{model_name}' before deletion")
+                await engine_pool._unload_engine(resolved_model_name)
+                logger.info(f"Unloaded model '{resolved_model_name}' before deletion")
             except Exception as e:
-                logger.warning(f"Failed to unload model '{model_name}': {e}")
+                logger.warning(f"Failed to unload model '{resolved_model_name}': {e}")
 
     # Delete from disk
     # Handle macOS resource fork files (._*) that may disappear on non-native
@@ -16046,13 +17445,17 @@ async def delete_hf_model(
         raise exc_info[1].with_traceback(exc_info[2])
 
     try:
-        if sys.version_info >= (3, 12):
+        if model_path.is_file():
+            model_path.unlink()
+            logger.info(f"Deleted model file: {model_path}")
+        elif sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
+            logger.info(f"Deleted model directory: {model_path}")
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
-        logger.info(f"Deleted model directory: {model_path}")
+            logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
-        logger.error(f"Failed to delete model directory {model_path}: {e}")
+        logger.error(f"Failed to delete model artifact {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
     # If the model was inside an org folder (organized layout) and that
@@ -16067,16 +17470,17 @@ async def delete_hf_model(
 
     # Re-discover models
     if engine_pool is not None:
-        settings_manager = _get_settings_manager()
         pinned_models = []
         if settings_manager:
             pinned_models = settings_manager.get_pinned_model_ids()
 
-        engine_pool._entries.pop(model_name, None)
+        if hasattr(engine_pool, "_entries"):
+            engine_pool._entries.pop(model_name, None)
+            engine_pool._entries.pop(resolved_model_name, None)
         # Release the deleted model's persisted settings (including its alias)
         # so they can be reused by another model.
         if settings_manager:
-            settings_manager.delete_settings(model_name)
+            settings_manager.delete_settings(resolved_model_name)
         engine_pool.discover_models(
             [str(d) for d in global_settings.get_effective_model_dirs()],
             pinned_models,
@@ -18757,8 +20161,10 @@ class ThinkingConfig(BaseModel):
 class MessagesRequest(BaseModel):
     """Request for Anthropic Messages API."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str
-    max_tokens: int
+    max_tokens: int | None = None
     messages: list[AnthropicMessage]
     system: str | list[SystemContent] | None = None
     stop_sequences: list[str] | None = None
@@ -23063,6 +24469,8 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Thinking effort for DS4/OpenAI reasoning-compatible backends
+    reasoning_effort: Optional[str] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)
@@ -23144,6 +24552,8 @@ class ChatCompletionResponse(BaseModel):
 class CompletionRequest(BaseModel):
     """Request for text completion."""
 
+    model_config = {"extra": "allow"}
+
     model: str
     prompt: Union[str, List[str]]
     temperature: float | None = None
@@ -23159,6 +24569,8 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Thinking effort for DS4/OpenAI reasoning-compatible backends
+    reasoning_effort: Optional[str] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
@@ -30892,6 +32304,10 @@ def _compute_window(
     d_ssd_disk = delta("ssd_disk_loads")
     d_tokens_matched = delta("prefix_tokens_matched")
     d_tokens_requested = delta("prefix_tokens_requested")
+    d_target_static_hits = delta("target_static_hits")
+    d_target_static_misses = delta("target_static_misses")
+    d_draft_prefix_hits = delta("draft_prefix_hits")
+    d_draft_prefix_misses = delta("draft_prefix_misses")
 
     minutes = elapsed / 60.0
 
@@ -30911,6 +32327,26 @@ def _compute_window(
         "ssd_hot_rate": round(
             _safe_ratio(d_ssd_hot, d_ssd_hot + d_ssd_disk), 4
         ),
+        "target_static_hits": d_target_static_hits,
+        "target_static_misses": d_target_static_misses,
+        "target_static_hit_rate": round(
+            _safe_ratio(
+                d_target_static_hits,
+                d_target_static_hits + d_target_static_misses,
+            ),
+            4,
+        ),
+        "target_static_tokens_restored": delta("target_static_tokens_restored"),
+        "draft_prefix_hits": d_draft_prefix_hits,
+        "draft_prefix_misses": d_draft_prefix_misses,
+        "draft_prefix_hit_rate": round(
+            _safe_ratio(
+                d_draft_prefix_hits,
+                d_draft_prefix_hits + d_draft_prefix_misses,
+            ),
+            4,
+        ),
+        "draft_prefix_tokens_saved": delta("draft_prefix_tokens_saved"),
     }
 
 
@@ -30921,6 +32357,10 @@ def _compute_cumulative(counters: dict[str, int]) -> dict[str, Any]:
     ssd_disk = counters.get("ssd_disk_loads", 0)
     tokens_matched = counters.get("prefix_tokens_matched", 0)
     tokens_requested = counters.get("prefix_tokens_requested", 0)
+    target_static_hits = counters.get("target_static_hits", 0)
+    target_static_misses = counters.get("target_static_misses", 0)
+    draft_prefix_hits = counters.get("draft_prefix_hits", 0)
+    draft_prefix_misses = counters.get("draft_prefix_misses", 0)
 
     return {
         "prefix_hits": prefix_hits,
@@ -30937,6 +32377,28 @@ def _compute_cumulative(counters: dict[str, int]) -> dict[str, Any]:
         "hot_cache_evictions": counters.get("hot_cache_evictions", 0),
         "hot_cache_promotions": counters.get("hot_cache_promotions", 0),
         "ssd_hot_rate": round(_safe_ratio(ssd_hot, ssd_hot + ssd_disk), 4),
+        "target_static_hits": target_static_hits,
+        "target_static_misses": target_static_misses,
+        "target_static_hit_rate": round(
+            _safe_ratio(
+                target_static_hits,
+                target_static_hits + target_static_misses,
+            ),
+            4,
+        ),
+        "target_static_tokens_restored": counters.get(
+            "target_static_tokens_restored", 0
+        ),
+        "draft_prefix_hits": draft_prefix_hits,
+        "draft_prefix_misses": draft_prefix_misses,
+        "draft_prefix_hit_rate": round(
+            _safe_ratio(
+                draft_prefix_hits,
+                draft_prefix_hits + draft_prefix_misses,
+            ),
+            4,
+        ),
+        "draft_prefix_tokens_saved": counters.get("draft_prefix_tokens_saved", 0),
     }
 
 
@@ -34642,15 +36104,47 @@ class PagedSSDCacheManager(CacheManager):
         ``_is_compatible_block``). Checks the expectation-gated signature
         fields: TurboQuant depth and CacheList sub composition.
         """
-        if not self._signature_bits_match(cache_signature or ""):
-            return False
-        if (
-            self._expected_cachelist_subtypes is not None
-            and _signature_cachelist_subtypes(cache_signature or "")
-            != self._expected_cachelist_subtypes
+        return self.signature_mismatch_reason(cache_signature) is None
+
+    def signature_mismatch_reason(self, cache_signature: str) -> str | None:
+        """Describe the first expectation-gated signature mismatch."""
+        cache_signature = cache_signature or ""
+        if not self._signature_bits_match(cache_signature):
+            actual_bits = _signature_turboquant_bits(cache_signature)
+            actual = "missing" if actual_bits is None else str(actual_bits)
+            return (
+                "TurboQuant depth: expected "
+                f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+
+        expected_subtypes = self._expected_cachelist_subtypes
+        if expected_subtypes is None:
+            return None
+
+        actual_subtypes = _signature_cachelist_subtypes(cache_signature)
+        if actual_subtypes == expected_subtypes:
+            return None
+
+        actual_layers = actual_subtypes or {}
+
+        def _layer_sort_key(layer: str) -> tuple[int, int | str]:
+            try:
+                return (0, int(layer))
+            except (TypeError, ValueError):
+                return (1, str(layer))
+
+        for layer in sorted(
+            set(expected_subtypes) | set(actual_layers), key=_layer_sort_key
         ):
-            return False
-        return True
+            expected = expected_subtypes.get(layer)
+            actual = actual_layers.get(layer)
+            if expected != actual:
+                return (
+                    f"CacheList sub composition at layer {layer}: "
+                    f"expected {expected}, got {actual}"
+                )
+
+        return "CacheList sub composition mismatch"
 
     def _expected_cache_signature(self) -> str:
         if (
@@ -34936,17 +36430,48 @@ class PagedSSDCacheManager(CacheManager):
             except Exception as e:
                 logger.warning("Stale-signature sweep failed: %s", e)
 
-        # Check if already exists in index (thread-safe)
-        if self._index.contains(block_hash):
+        # A matching content hash does not guarantee a matching serialized
+        # layout. Replace an indexed block written by an older cache schema
+        # instead of treating it as an unconditional hit (#2487).
+        indexed_metadata = self._index.get(block_hash)
+        if indexed_metadata is not None and self._is_compatible_block(indexed_metadata):
             self._index.touch(block_hash)
             self._stats["hits"] += 1
             return True
+        if indexed_metadata is not None:
+            reason = (
+                self.signature_mismatch_reason(indexed_metadata.cache_signature)
+                or "cache layout mismatch"
+            )
+            logger.info(
+                "Replacing incompatible indexed cache block %s: %s",
+                block_hash.hex()[:16],
+                reason,
+            )
+            self.forget_block(block_hash)
 
         # Also check hot cache / pending writes buffer
         hot_entry = None
         with self._hot_cache_lock:
             if block_hash in self._hot_cache:
                 hot_entry = self._hot_cache[block_hash]
+
+        if hot_entry is not None:
+            hot_metadata = hot_entry.get("block_metadata")
+            if isinstance(
+                hot_metadata, PagedSSDBlockMetadata
+            ) and not self._is_compatible_block(hot_metadata):
+                reason = (
+                    self.signature_mismatch_reason(hot_metadata.cache_signature)
+                    or "cache layout mismatch"
+                )
+                logger.info(
+                    "Replacing incompatible hot cache block %s: %s",
+                    block_hash.hex()[:16],
+                    reason,
+                )
+                self.forget_block(block_hash)
+                hot_entry = None
 
         if hot_entry is not None:
             if hot_cache_write_back or self._hot_cache_only:
@@ -36893,6 +38418,7 @@ from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
+    BlockHash,
     BlockTable,
     CacheBlock,
     PagedCacheManager,
@@ -36910,6 +38436,7 @@ logger = logging.getLogger(__name__)
 # Each entry is two 32-byte hashes; the cap only guards against unbounded
 # growth from many distinct conversation chains over a long-lived process.
 _TIP_LINEAGE_MAX_ENTRIES = 4096
+_EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 
 
 @dataclass
@@ -37011,6 +38538,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._exact_prefix_hits = 0
+        self._exact_prefix_misses = 0
+        self._exact_prefix_tokens_restored = 0
+        self._exact_prefix_stores = 0
+        self._exact_prefix_store_failures = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -37306,6 +38838,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
         hot_cache_write_back: bool = True,
+        _store_exact_terminal: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -37328,6 +38861,9 @@ class BlockAwarePrefixCache(CacheManager):
                 ArraysCache state instead of placeholders in hybrid models.
             hot_cache_write_back: When False, SSD-backed hot cache is bypassed
                 for newly stored dirty blocks.
+            _store_exact_terminal: Internal exact-prefix mode that persists the
+                trailing partial block and isolates the terminal hash from
+                ordinary prefix matching.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -37394,15 +38930,21 @@ class BlockAwarePrefixCache(CacheManager):
         # Skipping partial blocks also ensures is_last_block points to
         # the last full block, which is critical for non-sliceable caches
         # (ArraysCache/RotatingKVCache) that use last-block-only storage.
-        num_new_blocks = len(new_tokens) // self.block_size
+        num_new_blocks = (
+            math.ceil(len(new_tokens) / self.block_size)
+            if _store_exact_terminal
+            else len(new_tokens) // self.block_size
+        )
         trailing_partial_tokens = len(new_tokens) % self.block_size
-        self._last_partial_tokens_skipped = trailing_partial_tokens
+        self._last_partial_tokens_skipped = (
+            0 if _store_exact_terminal else trailing_partial_tokens
+        )
         self._last_tokens_to_next_block = (
             self.block_size - trailing_partial_tokens
-            if trailing_partial_tokens > 0
+            if trailing_partial_tokens > 0 and not _store_exact_terminal
             else 0
         )
-        if trailing_partial_tokens > 0:
+        if trailing_partial_tokens > 0 and not _store_exact_terminal:
             self._partial_block_skips += 1
             self._partial_tokens_skipped += trailing_partial_tokens
             logger.debug(
@@ -37436,15 +38978,20 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
-            block_extra_keys = resolve_block_extra_keys(
-                global_end,
-                extra_keys=extra_keys,
-                extra_key_token_start=extra_key_token_start,
-                extra_key_ranges=extra_key_ranges,
-            )
+            is_exact_terminal = _store_exact_terminal and i == num_new_blocks - 1
+            block_extra_keys: tuple[Any, ...] | None
+            if is_exact_terminal:
+                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+            else:
+                block_extra_keys = resolve_block_extra_keys(
+                    global_end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
 
             # Check if this block already exists (deduplication)
-            if len(block_tokens) == self.block_size:
+            if len(block_tokens) == self.block_size and not is_exact_terminal:
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -37483,10 +39030,17 @@ class BlockAwarePrefixCache(CacheManager):
                 model_name=self.paged_cache.model_name,
             )
 
-            # Register hash for full blocks (for deduplication)
-            if len(block_tokens) == self.block_size:
+            # Register ordinary full blocks for general prefix matching. The
+            # exact terminal uses a separate hash domain so it can carry the
+            # complete non-sliceable state without colliding with a normal
+            # block that may contain placeholders.
+            if len(block_tokens) == self.block_size and not is_exact_terminal:
                 self.paged_cache.register_block_hash(
                     block, block_tokens, parent_hash, extra_keys=block_extra_keys
+                )
+            elif is_exact_terminal and block.block_hash is not None:
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block.block_hash, block
                 )
 
             # Extract tensor slice and save to paged SSD
@@ -37671,8 +39225,12 @@ class BlockAwarePrefixCache(CacheManager):
                 if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._rotating_tip_lineage.clear()
 
-        # Update prefix index
-        self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
+        # Exact terminal blocks are discoverable only through
+        # fetch_exact_prefix(); never expose them to general prefix matching.
+        if not _store_exact_terminal:
+            self._update_prefix_index(
+                tokens, block_table.block_ids, extra_keys=extra_keys
+            )
 
         # Store entry for request tracking
         self._request_tables[request_id] = BlockCacheEntry(
@@ -37687,6 +39245,151 @@ class BlockAwarePrefixCache(CacheManager):
         )
 
         return block_table
+
+    def store_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        cache_data: list[Any],
+        model_cache_config: ModelCacheConfig | None = None,
+    ) -> BlockTable | None:
+        """Persist a complete prefix, including its exact terminal boundary.
+
+        Ordinary prefix matching remains full-block-only. This path stores one
+        domain-separated terminal block, excludes it from general matching,
+        and restores it only when the complete static-prefix token chain
+        matches. That captures an arbitrary system/tool boundary without
+        making the target model repeatedly prefill its uncached suffix.
+        SSD-backed configurations use write-through so the hot tier is never
+        the only durable copy.
+        """
+        if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        block_table = self.store_cache(
+            request_id,
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+            hot_cache_write_back=False,
+            _store_exact_terminal=True,
+        )
+        if block_table is None or block_table.num_tokens != len(tokens):
+            self.paged_cache.delete_block_table(request_id)
+            self._request_tables.pop(request_id, None)
+            self._exact_prefix_store_failures += 1
+            return None
+
+        stored_table = block_table.copy(request_id)
+        self._request_tables.pop(request_id, None)
+        self.paged_cache.request_tables.pop(request_id, None)
+        # Drop request ownership while retaining indexed, zero-reference block
+        # metadata so the exact chain remains discoverable and evictable.
+        self.paged_cache.release_for_eviction(block_table.block_ids)
+        self._exact_prefix_stores += 1
+        return stored_table
+
+    def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
+        """Return deterministic block hashes and token counts for an exact prefix."""
+        block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
+        parent_hash: BlockHash | None = None
+        terminal_start = ((len(tokens) - 1) // self.block_size) * self.block_size
+
+        for block_start in range(0, len(tokens), self.block_size):
+            block_tokens = tokens[block_start : block_start + self.block_size]
+            extra_keys = (
+                (_EXACT_PREFIX_TERMINAL_KEY,) if block_start == terminal_start else None
+            )
+            block_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+            block_hashes_and_token_counts.append((block_hash, len(block_tokens)))
+            parent_hash = block_hash
+
+        return block_hashes_and_token_counts
+
+    def fetch_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+    ) -> BlockTable | None:
+        """Acquire an all-or-nothing exact prefix chain from hot cache or SSD."""
+        if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        acquired_blocks: list[CacheBlock] = []
+        for block_hash, token_count in self._exact_prefix_hashes(tokens):
+            cached_block = self.paged_cache.cached_block_hash_to_block.get_block(
+                block_hash
+            )
+            if cached_block is None:
+                if not self.paged_ssd_cache.has_block(block_hash):
+                    for block_to_release in acquired_blocks:
+                        self.paged_cache.free_block(block_to_release.block_id)
+                    return None
+                # Recreate only the paged-manager metadata; reconstruction
+                # still loads the tensor payload from the existing cache tier.
+                cached_block = self.paged_cache.allocate_block()
+                if cached_block is None:
+                    for block_to_release in acquired_blocks:
+                        self.paged_cache.free_block(block_to_release.block_id)
+                    return None
+                cached_block.block_hash = block_hash
+                cached_block.token_count = token_count
+                cached_block.ref_count = 0
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block_hash, cached_block
+                )
+
+            acquired_block = self.paged_cache.acquire_cached_block(
+                cached_block.block_id, block_hash
+            )
+            if acquired_block is None:
+                for previous_block in acquired_blocks:
+                    self.paged_cache.free_block(previous_block.block_id)
+                return None
+            acquired_blocks.append(acquired_block)
+
+        block_table = self.paged_cache.create_block_table(request_id)
+        for acquired_block in acquired_blocks:
+            block_table.add_block(acquired_block.block_id, acquired_block.token_count)
+        self._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            last_access=time.time(),
+        )
+        return block_table
+
+    def restore_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        promote_to_hot_cache: bool,
+    ) -> list[Any] | None:
+        """Reconstruct a complete exact prefix and release temporary block refs."""
+        block_table = self.fetch_exact_prefix(request_id, tokens)
+        if block_table is None:
+            self._exact_prefix_misses += 1
+            return None
+
+        try:
+            if promote_to_hot_cache:
+                self.preload_blocks(block_table)
+            restored_cache = self.reconstruct_cache(
+                block_table,
+                promote_to_hot_cache=promote_to_hot_cache,
+            )
+            if restored_cache is None or block_table.num_tokens != len(tokens):
+                self._exact_prefix_misses += 1
+                return None
+            self._exact_prefix_hits += 1
+            self._exact_prefix_tokens_restored += len(tokens)
+            return restored_cache
+        finally:
+            self.release_cache(request_id)
 
     def _get_cache_seq_len(self, cache_data: list[dict[str, Any]]) -> int:
         """
@@ -38746,1393 +40449,3 @@ class BlockAwarePrefixCache(CacheManager):
                             logger.warning(
                                 f"Cache block size mismatch: block has block_size={block_size}, "
                                 f"expected {self.block_size}. Invalidating cache hit."
-                            )
-                            self._forget_incompatible_ssd_block(block.block_hash)
-                            break  # Stop here, don't use this block
-                        if not block_size and self.block_size:
-                            logger.warning(
-                                "Block has no block_size metadata (legacy cache), "
-                                f"current block_size is {self.block_size}. Invalidating cache hit."
-                            )
-                            self._forget_incompatible_ssd_block(block.block_hash)
-                            break  # Stop here, don't use this block
-
-                # Extract type info from block metadata
-                if block_metadata:
-                    block_layer_cache_types = block_metadata.get("layer_cache_types")
-                    if layer_cache_types is None:
-                        layer_cache_types = block_layer_cache_types
-                    elif (
-                        block_layer_cache_types is not None
-                        and self._canonical_layer_cache_types(block_layer_cache_types)
-                        != self._canonical_layer_cache_types(layer_cache_types)
-                    ):
-                        logger.warning(
-                            "Cache layer type mismatch at block %s: got %s, "
-                            "expected %s. Truncating cached prefix before this "
-                            "block.",
-                            block_id,
-                            block_layer_cache_types,
-                            layer_cache_types,
-                        )
-                        self._forget_incompatible_ssd_block(
-                            block.block_hash, block.block_id
-                        )
-                        break
-
-                    # Expectation-gated signature fields (TurboQuant depth,
-                    # CacheList sub composition). Hot-cache / pending-write
-                    # loads bypass the manager's index-scan compatibility
-                    # check, so the restore loop must gate them here.
-                    signature_gate = getattr(
-                        self.paged_ssd_cache, "is_signature_compatible", None
-                    )
-                    if callable(signature_gate) and not signature_gate(
-                        block_metadata.get("cache_signature", "")
-                    ):
-                        logger.warning(
-                            "Cache signature mismatch at block %s "
-                            "(TurboQuant depth or CacheList sub composition). "
-                            "Truncating cached prefix before this block.",
-                            block_id,
-                        )
-                        self._forget_incompatible_ssd_block(
-                            block.block_hash, block.block_id
-                        )
-                        break
-
-                    # Track meta_states from first and last blocks
-                    # Non-sliceable caches (RotatingKVCache) need last block's meta_state
-                    block_layer_meta_states = block_metadata.get("layer_meta_states")
-                    if first_block_meta_states is None:
-                        first_block_meta_states = block_layer_meta_states
-                    # Always update last to track the most recent
-                    last_block_meta_states = block_layer_meta_states
-                    all_block_meta_states.append(block_layer_meta_states)
-                else:
-                    # A block that loads with data but no metadata at all
-                    # cannot be trusted: it skipped every per-block validation
-                    # gate above (model_name, num_layers, block_size, layer
-                    # types), and continuing would leave the first/last
-                    # meta_state trackers stale (pairing this block's tensors
-                    # with an earlier block's meta). Truncate the chain here
-                    # and use the valid prefix, like the load-failure path.
-                    logger.warning(
-                        f"Block {block_id} loaded without metadata. "
-                        f"Truncating cached prefix before this block "
-                        f"({valid_block_count} valid blocks)."
-                    )
-                    self._forget_incompatible_ssd_block(
-                        block.block_hash, block.block_id
-                    )
-                    break
-
-                # Validate loaded data (pass cache types for hybrid models)
-                if not self._validate_block_cache_data(block_data, layer_cache_types):
-                    logger.debug(
-                        f"Block {block_id} has invalid layer data from tiered cache, "
-                        f"using {valid_block_count} valid blocks"
-                    )
-                    break  # Stop here, use valid prefix
-
-                all_block_data.append(block_data)
-                valid_block_count += 1
-                valid_token_count += block.token_count
-
-            # If we have fewer valid blocks than requested, update block_table
-            if valid_block_count < len(block_table.block_ids):
-                if valid_block_count == 0:
-                    # Free ref_counts for all blocks before returning
-                    for bid in block_table.block_ids:
-                        self.paged_cache.free_block(bid)
-                    block_table.block_ids.clear()
-                    block_table.num_tokens = 0
-                    return None  # No valid blocks at all
-
-                # Free ref_counts for blocks we are about to drop
-                for bid in block_table.block_ids[valid_block_count:]:
-                    self.paged_cache.free_block(bid)
-
-                # Truncate block_table to valid prefix
-                original_blocks = len(block_table.block_ids)
-                block_table.block_ids = block_table.block_ids[:valid_block_count]
-                block_table.num_tokens = valid_token_count
-                logger.info(
-                    f"Partial cache reconstruction: {valid_block_count}/{original_blocks} "
-                    f"blocks, {valid_token_count} tokens"
-                )
-
-            if not all_block_data:
-                return None
-
-            # Get number of layers from first block
-            num_layers = len(all_block_data[0])
-            if num_layers == 0:
-                return None
-
-            # --- Pre-scan: walk-back truncation for non-sliceable caches ---
-            # If the last loaded block has a placeholder for any non-sliceable
-            # layer (ArraysCache/RotatingKVCache/non-sliceable CacheList), walk
-            # backwards to find the latest block where ALL such layers carry
-            # real state. This recovers intermediate blocks from multi-turn
-            # conversations instead of rejecting the entire cache.
-            if all_block_data and layer_cache_types:
-                trunc_idx = self._find_walk_back_truncation_point(
-                    all_block_data, layer_cache_types
-                )
-                if trunc_idx is not None:
-                    new_count = trunc_idx + 1
-                    dropped_count = len(all_block_data) - new_count
-
-                    # Free ref_counts for dropped blocks
-                    for bid in block_table.block_ids[new_count:]:
-                        self.paged_cache.free_block(bid)
-
-                    # Truncate data structures
-                    all_block_data = all_block_data[:new_count]
-                    block_table.block_ids = block_table.block_ids[:new_count]
-                    valid_token_count = sum(
-                        self.paged_cache.allocated_blocks[bid].token_count
-                        for bid in block_table.block_ids
-                        if bid in self.paged_cache.allocated_blocks
-                    )
-                    block_table.num_tokens = valid_token_count
-
-                    # Update meta_states to the truncation-point block
-                    if trunc_idx < len(all_block_meta_states):
-                        last_block_meta_states = all_block_meta_states[trunc_idx]
-
-                    logger.info(
-                        f"Walk-back truncation: dropped {dropped_count} trailing "
-                        f"block(s) with placeholder non-sliceable state, keeping "
-                        f"{new_count} block(s) ({valid_token_count} tokens)"
-                    )
-
-            # Reconstruct caches for each layer
-            reconstructed_caches = []
-            healed_tq_layers = 0
-
-            for layer_idx in range(num_layers):
-                # Determine cache type for this layer
-                cache_type_name = "KVCache"
-                if layer_cache_types and layer_idx < len(layer_cache_types):
-                    cache_type_name = layer_cache_types[layer_idx]
-
-                handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
-
-                # === CacheList: dedicated branch (before standard 2-tuple unpack) ===
-                if cache_type_name == "CacheList":
-                    last_block_layer_data = all_block_data[-1][layer_idx]
-
-                    # Placeholder detection (partial match → reject for
-                    # non-sliceable CacheList, e.g. containing ArraysCache)
-                    if (
-                        isinstance(last_block_layer_data, tuple)
-                        and len(last_block_layer_data) == 2
-                        and hasattr(last_block_layer_data[0], "shape")
-                        and last_block_layer_data[0].shape == (1,)
-                    ):
-                        logger.info(
-                            f"CacheList layer {layer_idx}: partial prefix match "
-                            f"detected (placeholder). Rejecting cache."
-                        )
-                        return None
-
-                    # Each sub_state in block_data may be either:
-                    # - a legacy 2-tuple ``(keys, values)``, or
-                    # - an ``('__nstate__', class_name, [elements])`` marker
-                    #   emitted by the N-tuple-aware extract path (preserves
-                    #   PoolingCache's full 3-tuple state).
-                    # _sub_state_elements normalizes both to a raw element
-                    # list so downstream concat / unpack does not have to
-                    # branch on marker shape.
-                    def _sub_state_elements(sub_state):
-                        if (
-                            isinstance(sub_state, tuple)
-                            and len(sub_state) >= 3
-                            and isinstance(sub_state[0], str)
-                            and sub_state[0] == "__nstate__"
-                        ):
-                            return list(sub_state[2])
-                        if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 1:
-                            return list(sub_state)
-                        return None
-
-                    def _sub_state_class(sub_state):
-                        if (
-                            isinstance(sub_state, tuple)
-                            and len(sub_state) >= 3
-                            and sub_state[0] == "__nstate__"
-                        ):
-                            return sub_state[1]
-                        return None
-
-                    # Collect CacheList data from all blocks that have List[sub_state]
-                    cl_block_data = []
-                    for block_data in all_block_data:
-                        bd = block_data[layer_idx]
-                        if isinstance(bd, list) and all(
-                            _sub_state_elements(t) is not None for t in bd
-                        ):
-                            cl_block_data.append(bd)
-
-                    if not cl_block_data:
-                        logger.error(
-                            f"CacheList layer {layer_idx}: no valid block data found"
-                        )
-                        return None
-
-                    # Determine sub-cache count from first valid block
-                    num_sub_caches = len(cl_block_data[0])
-
-                    # Per-sub-cache class dispatch: sliceable sub-caches
-                    # (KVCache) concatenate per-block slices into the full
-                    # sequence; non-sliceable sub-caches (RotatingKVCache,
-                    # PoolingCache, ArraysCache, BatchPoolingCache) keep
-                    # the last block's full state, since each saved block
-                    # already snapshots the cache up to its boundary.
-                    sub_class_names_for_layer: list[str] = []
-                    if (
-                        last_block_meta_states
-                        and layer_idx < len(last_block_meta_states)
-                        and isinstance(last_block_meta_states[layer_idx], (list, tuple))
-                        and len(last_block_meta_states[layer_idx]) >= 1
-                        and isinstance(
-                            last_block_meta_states[layer_idx][0], (list, tuple)
-                        )
-                    ):
-                        sub_class_names_for_layer = list(
-                            last_block_meta_states[layer_idx][0]
-                        )
-
-                    non_sliceable_sub_classes = {
-                        "PoolingCache",
-                        "ArraysCache",
-                        "SizedArraysCache",
-                        "BatchPoolingCache",
-                    }
-
-                    def _is_non_sliceable_sub_class(class_name: str) -> bool:
-                        return (
-                            class_name in non_sliceable_sub_classes
-                            or CacheTypeRegistry.is_rotating_family(class_name)
-                        )
-
-                    # The store path (_extract_block_tensor_slice) picks ONE
-                    # storage mode for the whole layer: per-block slices only
-                    # when every sub-state is a >=2-element tuple of 4D
-                    # sequence tensors and no sub is a known non-sliceable
-                    # class; otherwise EVERY block stores the full cumulative
-                    # state of ALL subs at that block's boundary. Restore
-                    # mirrors that layer-level decision here. Dispatching per
-                    # sub (concat KVCache subs, last-block the rest) silently
-                    # concatenated a mixed CacheList's cumulative KV snapshots
-                    # into a duplicated sequence (e.g. inkling-style
-                    # CacheList(KVCache, ArraysCache): 4+8+12 tokens instead
-                    # of 12).
-                    any_non_sliceable_sub = any(
-                        _is_non_sliceable_sub_class(
-                            sub_class_names_for_layer[j]
-                            if j < len(sub_class_names_for_layer)
-                            else ""
-                        )
-                        for j in range(num_sub_caches)
-                    )
-                    last_block_elements = [
-                        _sub_state_elements(s) for s in cl_block_data[-1]
-                    ]
-                    stored_slice_mode = not any_non_sliceable_sub and all(
-                        elems is not None
-                        and len(elems) >= 2
-                        and hasattr(elems[0], "shape")
-                        and len(elems[0].shape) == 4
-                        for elems in last_block_elements
-                    )
-
-                    if len(cl_block_data) > 1 and stored_slice_mode:
-                        # Per-block slices: concatenate every sub along the
-                        # sequence axis into the full sequence.
-                        concatenated_sub_states = []
-                        for j in range(num_sub_caches):
-                            per_block_elements = [
-                                _sub_state_elements(bd[j]) for bd in cl_block_data
-                            ]
-                            num_elems = len(per_block_elements[-1])
-                            cat_elements = []
-                            for k in range(num_elems):
-                                # Concat sequence-axis tensors; non-sequence
-                                # elements (axis-2 mismatch or scalars) take
-                                # the last block's value.
-                                column = [pb[k] for pb in per_block_elements]
-                                first = column[0]
-                                if (
-                                    hasattr(first, "shape")
-                                    and len(first.shape) >= 3
-                                    and all(
-                                        hasattr(c, "shape")
-                                        and c.shape[:2] == first.shape[:2]
-                                        for c in column
-                                    )
-                                ):
-                                    if any(d == 0 for d in first.shape):
-                                        shape = list(first.shape)
-                                        shape[2] = sum(c.shape[2] for c in column)
-                                        cat_elements.append(mx.zeros(tuple(shape)))
-                                    else:
-                                        cat_elements.append(
-                                            mx.concatenate(column, axis=2)
-                                        )
-                                else:
-                                    cat_elements.append(column[-1])
-                            concatenated_sub_states.append(tuple(cat_elements))
-                    else:
-                        # Cumulative snapshots (or a single block): the last
-                        # matched block already holds the complete state of
-                        # every sub at its boundary. PoolingCache V4 markers
-                        # are the exception: their append-only pooled tensor
-                        # is stored as an absolute-range delta per block and
-                        # must be rebuilt in order. A legacy full snapshot may
-                        # appear before V4 deltas in an existing cache chain;
-                        # it becomes the reconstruction base.
-                        concatenated_sub_states = []
-                        for j, last_elements in enumerate(last_block_elements):
-                            has_pooling_deltas = any(
-                                _sub_state_class(bd[j]) == POOLING_CACHE_DELTA_CLASS
-                                for bd in cl_block_data
-                            )
-                            if not has_pooling_deltas:
-                                concatenated_sub_states.append(tuple(last_elements))
-                                continue
-
-                            pooled_parts = []
-                            pooled_length = 0
-                            last_pooling_state = None
-                            valid_pooling_chain = True
-                            for block_cache_list in cl_block_data:
-                                sub_state = block_cache_list[j]
-                                elements = _sub_state_elements(sub_state)
-                                marker_class = _sub_state_class(sub_state)
-                                if elements is None:
-                                    valid_pooling_chain = False
-                                    break
-
-                                if marker_class != POOLING_CACHE_DELTA_CLASS:
-                                    if len(elements) < 3:
-                                        valid_pooling_chain = False
-                                        break
-                                    if elements[2] is None:
-                                        pooled_parts = []
-                                        pooled_length = 0
-                                    elif (
-                                        hasattr(elements[2], "shape")
-                                        and len(elements[2].shape) >= 2
-                                    ):
-                                        pooled_parts = [elements[2]]
-                                        pooled_length = int(elements[2].shape[1])
-                                    else:
-                                        valid_pooling_chain = False
-                                        break
-                                    last_pooling_state = list(elements)
-                                    continue
-
-                                if (
-                                    len(elements) not in (4, 6)
-                                    or not hasattr(elements[2], "shape")
-                                    or len(elements[2].shape) < 2
-                                    or not hasattr(elements[-1], "tolist")
-                                ):
-                                    valid_pooling_chain = False
-                                    break
-                                try:
-                                    delta_range = elements[-1].tolist()
-                                    delta_start, delta_end = (
-                                        int(delta_range[0]),
-                                        int(delta_range[1]),
-                                    )
-                                except (IndexError, TypeError, ValueError):
-                                    valid_pooling_chain = False
-                                    break
-                                if (
-                                    delta_start != pooled_length
-                                    or delta_end < delta_start
-                                    or int(elements[2].shape[1])
-                                    != delta_end - delta_start
-                                ):
-                                    valid_pooling_chain = False
-                                    break
-                                pooled_parts.append(elements[2])
-                                pooled_length = delta_end
-                                last_pooling_state = list(elements[:-1])
-
-                            if (
-                                not valid_pooling_chain
-                                or not pooled_parts
-                                or last_pooling_state is None
-                            ):
-                                logger.info(
-                                    "CacheList layer %d sub-cache %d: invalid "
-                                    "PoolingCache delta chain. Rejecting cache.",
-                                    layer_idx,
-                                    j,
-                                )
-                                return None
-
-                            pooled = (
-                                pooled_parts[0]
-                                if len(pooled_parts) == 1
-                                else mx.concatenate(pooled_parts, axis=1)
-                            )
-                            last_pooling_state[2] = pooled
-                            concatenated_sub_states.append(tuple(last_pooling_state))
-
-                    # Build meta_state with correct offsets for reconstructed
-                    # sequence length (may differ from original if partial match)
-                    meta_state = None
-                    if last_block_meta_states and layer_idx < len(
-                        last_block_meta_states
-                    ):
-                        meta_state = last_block_meta_states[layer_idx]
-
-                    if (
-                        meta_state
-                        and isinstance(meta_state, (list, tuple))
-                        and len(meta_state) >= 2
-                    ):
-                        # Adjust sub-cache offsets to actual concatenated seq_len.
-                        # Sliceable sub-caches (KVCache) need offset replaced
-                        # with the post-concat seq_len. Non-sliceable
-                        # sub-caches (RotatingKVCache, PoolingCache, ...)
-                        # keep their last-block meta intact — the sliding
-                        # window offset / pool length already encode the
-                        # boundary state from the original snapshot.
-                        class_names = meta_state[0]
-                        adjusted_sub_metas = []
-                        for j in range(num_sub_caches):
-                            orig_sub_meta = (
-                                meta_state[1][j] if j < len(meta_state[1]) else ""
-                            )
-                            sub_class = (
-                                sub_class_names_for_layer[j]
-                                if j < len(sub_class_names_for_layer)
-                                else ""
-                            )
-                            if _is_non_sliceable_sub_class(sub_class):
-                                adjusted_sub_metas.append(
-                                    orig_sub_meta if orig_sub_meta else ""
-                                )
-                                continue
-                            sub_elements = concatenated_sub_states[j]
-                            actual_seq_len = None
-                            if (
-                                sub_elements
-                                and len(sub_elements) > 0
-                                and hasattr(sub_elements[0], "shape")
-                                and len(sub_elements[0].shape) >= 3
-                            ):
-                                actual_seq_len = sub_elements[0].shape[2]
-                            if (
-                                actual_seq_len is not None
-                                and isinstance(orig_sub_meta, (list, tuple))
-                                and len(orig_sub_meta) > 0
-                            ):
-                                adjusted_sub_metas.append(
-                                    (actual_seq_len,) + tuple(orig_sub_meta[1:])
-                                )
-                            else:
-                                adjusted_sub_metas.append(
-                                    orig_sub_meta if orig_sub_meta else ""
-                                )
-                        meta_state = (class_names, adjusted_sub_metas)
-
-                    cache = handler.reconstruct_cache(
-                        {"sub_states": concatenated_sub_states}, meta_state
-                    )
-                    if cache is None:
-                        logger.error(
-                            f"CacheList layer {layer_idx}: reconstruction failed"
-                        )
-                        return None
-                    reconstructed_caches.append(cache)
-                    continue
-
-                # === TurboQuant KV: payload-driven per-block handling ===
-                # One block chain can mix payload formats: blocks stored
-                # while TurboQuant KV conversion was active carry tagged
-                # ('__turboquant_v2__', (ks, vs)) NamedTuple states, while
-                # blocks stored without the conversion (chains written by
-                # versions that skipped it on chunked-prefill completion,
-                # or stored under a different TQ setting) carry plain dense
-                # (keys, values) tensors in the SAME chain via dedup.
-                # The per-block layer_cache_types mismatch check above
-                # truncates such chains when every block's type metadata is
-                # present and accurate, but block metadata is optional at
-                # load time (missing/corrupt metadata files, failed
-                # layer_cache_types round-trips, chains typed from a later
-                # block when the first block lacks types) — so the payload
-                # itself is the ground truth. Each block must be dispatched
-                # on its own payload format: typing the whole chain from
-                # the chain-level metadata feeds dense arrays into
-                # TurboQuant _concat_state (AttributeError: 'array' object
-                # has no attribute 'norms') and rejects the hit. The
-                # reverse mixing direction (dense-typed chain with
-                # TQ-tagged blocks appended later) is routed here by payload
-                # scan for the same reason.
-                if cache_type_name in (
-                    "TurboQuantKVCache",
-                    "BatchTurboQuantKVCache",
-                ) or (
-                    handler.supports_block_slicing
-                    and self._layer_has_turboquant_payload(all_block_data, layer_idx)
-                ):
-                    entries: list[tuple[int, str, Any, Any]] = []
-                    for block_idx, block_data in enumerate(all_block_data):
-                        if layer_idx >= len(block_data):
-                            continue
-                        bd = block_data[layer_idx]
-                        if not (isinstance(bd, tuple) and len(bd) == 2):
-                            logger.warning(
-                                f"TQ layer {layer_idx}: block {block_idx} has "
-                                f"unsupported payload type "
-                                f"{type(bd).__name__}. Rejecting cache hit."
-                            )
-                            return None
-                        if isinstance(bd[0], str) and bd[0] == "__turboquant_v2__":
-                            ks, vs = bd[1]
-                            entries.append((block_idx, "tq", ks, vs))
-                        elif self._is_placeholder_state(bd):
-                            # Empty-slice placeholder written by the TQ store
-                            # path: this block carries no KV for the layer,
-                            # so the chain cannot be reconstructed.
-                            logger.info(
-                                f"TQ layer {layer_idx}: block {block_idx} is "
-                                f"an empty-slice placeholder. Rejecting cache "
-                                f"hit; request will reprocess from scratch."
-                            )
-                            return None
-                        elif (
-                            hasattr(bd[0], "shape")
-                            and len(bd[0].shape) == 4
-                            and hasattr(bd[1], "shape")
-                        ):
-                            # Plain dense KV slice stored without TQ
-                            # conversion (e.g. chunked-prefill completion).
-                            entries.append((block_idx, "plain", bd[0], bd[1]))
-                        else:
-                            logger.warning(
-                                f"TQ layer {layer_idx}: block {block_idx} "
-                                f"payload is neither a tagged TurboQuant "
-                                f"state nor a dense KV slice. Rejecting "
-                                f"cache hit."
-                            )
-                            return None
-                    if not entries:
-                        logger.debug(f"TQ layer {layer_idx}: no block data")
-                        return None
-
-                    # Group consecutive TQ blocks that share (bits, seed) so
-                    # each run concatenates in quantized form and dequantizes
-                    # once. A homogeneous TQ chain stays a single run — one
-                    # concat + one codec rebuild, restored as a quantized
-                    # TurboQuantKVCache (upstream #1842: restored long-context
-                    # prefixes stay quantized, avoiding full-state
-                    # materialization). Mixed chains (plain dense blocks, or
-                    # runs with differing (bits, seed)) are dequantized per run
-                    # and merged into a dense KVCache, cast back to the dense
-                    # blocks' stored dtype: dequantize() emits float32, and an
-                    # uncast fp32 layer would silently promote the whole merged
-                    # batch cache (2x KV memory) on servers where the TurboQuant
-                    # requantize epilogue does not run (TQ disabled, skip_last).
-                    # The healed request trades TurboQuant's memory savings for
-                    # that one restored prefix.
-                    try:
-                        from mlx_lm.models.cache import KVCache
-
-                        groups: list[tuple[str, Any, Any]] = []
-                        for block_idx, kind, part_k, part_v in entries:
-                            if kind == "plain":
-                                groups.append(("plain", part_k, part_v))
-                                continue
-                            params = self._tq_block_params(
-                                all_block_meta_states,
-                                first_block_meta_states,
-                                block_idx,
-                                layer_idx,
-                            )
-                            if params is None:
-                                logger.warning(
-                                    f"TQ layer {layer_idx}: block {block_idx} "
-                                    f"has no TurboQuant (bits, seed) metadata "
-                                    f"and no server-configured KV bit depth "
-                                    f"is available. Rejecting cache hit "
-                                    f"instead of guessing the codec width."
-                                )
-                                return None
-                            if (
-                                groups
-                                and groups[-1][0] == "tq"
-                                and groups[-1][2] == params
-                            ):
-                                groups[-1][1].append((part_k, part_v))
-                            else:
-                                groups.append(("tq", [(part_k, part_v)], params))
-
-                        # Homogeneous TQ chain (single quantized run, no dense
-                        # blocks): keep it quantized end-to-end like the
-                        # pre-payload-driven path, so restored prefixes don't
-                        # materialize full state.
-                        if len(groups) == 1 and groups[0][0] == "tq":
-                            from mlx_vlm.turboquant import TurboQuantKVCache
-
-                            from ..turboquant_kv import (
-                                _concat_state_token_axis,
-                                _rebuild_codecs,
-                                _state_length,
-                            )
-
-                            tq_bits, tq_seed = groups[0][2]
-                            run_states = groups[0][1]
-                            cat_ks = _concat_state_token_axis(
-                                [ks for ks, _ in run_states]
-                            )
-                            cat_vs = _concat_state_token_axis(
-                                [vs for _, vs in run_states]
-                            )
-                            tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
-                            tq.keys = cat_ks
-                            tq.values = cat_vs
-                            tq.offset = _state_length(cat_ks)
-                            _rebuild_codecs(tq, cat_ks, cat_vs)
-                            reconstructed_caches.append(tq)
-                            continue
-
-                        key_parts = []
-                        value_parts = []
-                        dense_dtype = None
-                        for group in groups:
-                            if group[0] == "plain":
-                                key_parts.append(group[1])
-                                value_parts.append(group[2])
-                                if dense_dtype is None:
-                                    dense_dtype = group[1].dtype
-                                continue
-                            tq_bits, tq_seed = group[2]
-                            dq = self._dequantize_tq_run(
-                                group[1], tq_bits, tq_seed, layer_idx
-                            )
-                            if dq is None:
-                                return None
-                            key_parts.append(dq[0])
-                            value_parts.append(dq[1])
-
-                        keys = mx.concatenate(key_parts, axis=2)
-                        values = mx.concatenate(value_parts, axis=2)
-                        if dense_dtype is not None and keys.dtype != dense_dtype:
-                            keys = keys.astype(dense_dtype)
-                            values = values.astype(dense_dtype)
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
-                        healed_tq_layers += 1
-                        if healed_tq_layers == 1:
-                            n_tq = sum(1 for g in groups if g[0] == "tq")
-                            n_plain = len(groups) - n_tq
-                            logger.info(
-                                f"Healed mixed-format TQ chain: layer "
-                                f"{layer_idx} has {n_tq} quantized run(s) and "
-                                f"{n_plain} dense block group(s); restoring "
-                                f"affected layers as dense KVCache "
-                                f"(dtype={keys.dtype})"
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"TQ layer {layer_idx}: reconstruction failed: {e}"
-                        )
-                        return None
-                    continue
-
-                # === Generic N-tuple sliceable cache: concatenate block slices ===
-                last_block_layer_data = all_block_data[-1][layer_idx]
-                if (
-                    handler.supports_block_slicing
-                    and isinstance(last_block_layer_data, tuple)
-                    and len(last_block_layer_data) >= 3
-                    and last_block_layer_data[0] == "__nstate__"
-                ):
-                    marker_class = last_block_layer_data[1] or cache_type_name
-                    marker_handler = CacheTypeRegistry.get_handler_by_class_name(
-                        marker_class
-                    )
-                    axis_info = marker_handler.get_state_axis_info()
-                    layer_states = []
-                    for block_data in all_block_data:
-                        if layer_idx >= len(block_data):
-                            logger.debug(
-                                f"Layer {layer_idx}: missing block data for "
-                                f"{marker_class}"
-                            )
-                            return None
-                        block_layer_data = block_data[layer_idx]
-                        if (
-                            not isinstance(block_layer_data, tuple)
-                            or len(block_layer_data) < 3
-                            or block_layer_data[0] != "__nstate__"
-                        ):
-                            logger.debug(
-                                f"Layer {layer_idx}: expected N-tuple block data "
-                                f"for {marker_class}"
-                            )
-                            return None
-                        elements = tuple(block_layer_data[2])
-                        state_dict = {
-                            "states": elements,
-                            "cache_type": marker_class,
-                        }
-                        for info, elem in zip(axis_info, elements):
-                            state_dict[info.name] = elem
-                        layer_states.append(state_dict)
-
-                    concat_state = marker_handler.concatenate_states(layer_states)
-                    cache = marker_handler.reconstruct_cache(concat_state, None)
-                    if cache is None:
-                        logger.error(
-                            f"Layer {layer_idx}: failed to reconstruct {marker_class}"
-                        )
-                        return None
-                    reconstructed_caches.append(cache)
-                    continue
-
-                # === Generic N-tuple non-sliceable cache: use latest boundary ===
-                if (
-                    isinstance(last_block_layer_data, tuple)
-                    and len(last_block_layer_data) >= 3
-                    and last_block_layer_data[0] == "__nstate__"
-                ):
-                    marker_class = last_block_layer_data[1] or cache_type_name
-                    elements = last_block_layer_data[2]
-                    marker_handler = CacheTypeRegistry.get_handler_by_class_name(
-                        marker_class
-                    )
-                    meta_state = None
-                    if last_block_meta_states and layer_idx < len(
-                        last_block_meta_states
-                    ):
-                        meta_state = last_block_meta_states[layer_idx]
-                    cache = marker_handler.deserialize_state(
-                        tuple(elements), meta_state
-                    )
-                    if cache is None:
-                        logger.error(
-                            f"Layer {layer_idx}: failed to reconstruct {marker_class}"
-                        )
-                        return None
-                    reconstructed_caches.append(cache)
-                    continue
-
-                # Collect layer data from all blocks
-                layer_states = []
-                for block_data in all_block_data:
-                    if layer_idx < len(block_data):
-                        keys_slice, values_slice = block_data[layer_idx]
-                        if keys_slice is not None and values_slice is not None:
-                            layer_states.append(
-                                {
-                                    "keys": keys_slice,
-                                    "values": values_slice,
-                                }
-                            )
-
-                if not layer_states:
-                    logger.debug(
-                        f"Layer {layer_idx} has no data, cannot reconstruct cache"
-                    )
-                    return None
-
-                # Get meta_state for this layer based on cache type
-                meta_state = None
-                if not handler.supports_block_slicing:
-                    # Non-sliceable caches (RotatingKVCache, ArraysCache): use LAST block's meta_state
-                    # because we use the last block's data (layer_states[-1])
-                    if last_block_meta_states and layer_idx < len(
-                        last_block_meta_states
-                    ):
-                        meta_state = last_block_meta_states[layer_idx]
-                else:
-                    # Sliceable caches (KVCache): first block's meta_state is fine
-                    if first_block_meta_states and layer_idx < len(
-                        first_block_meta_states
-                    ):
-                        meta_state = first_block_meta_states[layer_idx]
-
-                # Reconstruct using appropriate handler
-                if handler.supports_block_slicing:
-                    # Standard concatenation for KVCache
-                    concat_state = handler.concatenate_states(layer_states)
-                    cache = handler.reconstruct_cache(concat_state, meta_state)
-                else:
-                    # Non-sliceable cache: use latest state
-                    # States were stored as full state, use last one
-                    latest_keys = layer_states[-1].get("keys")
-                    latest_values = layer_states[-1].get("values")
-
-                    if CacheTypeRegistry.is_rotating_family(cache_type_name):
-                        # RotatingKVCache: strict last-block restore.
-                        # If the last matched block is a placeholder, we only
-                        # had a partial prefix hit and must reject.
-                        if hasattr(latest_keys, "shape") and latest_keys.shape == (1,):
-                            logger.info(
-                                f"RotatingKVCache layer {layer_idx}: partial prefix "
-                                f"match detected (placeholder in last matched "
-                                f"block). Rejecting cache to prevent stale "
-                                f"sliding-window state."
-                            )
-                            return None
-
-                        latest_state = {
-                            "keys": latest_keys,
-                            "values": latest_values,
-                            "meta_state": meta_state,
-                        }
-                        cache = handler.reconstruct_cache(latest_state, meta_state)
-                    else:
-                        # ArraysCache/MambaCache: detect placeholder from
-                        # last-block-only storage. If the last matched block
-                        # has placeholder shape (1,), this is a partial prefix
-                        # match — the real state lives in a later block that
-                        # was not matched. We must reject the entire cache
-                        # because GDN recurrent state cannot be partially
-                        # reconstructed.
-                        if hasattr(latest_keys, "shape") and latest_keys.shape == (1,):
-                            logger.info(
-                                f"ArraysCache layer {layer_idx}: partial prefix "
-                                f"match detected (placeholder in last matched "
-                                f"block). Rejecting cache to prevent stale GDN "
-                                f"state. Request will reprocess from scratch."
-                            )
-                            return None
-
-                        # Exact match: last block has full state
-                        latest_state = {
-                            "states": [latest_keys, latest_values],
-                        }
-                        # Pass token_count for proper SizedArraysCache wrapping
-                        cache = handler.reconstruct_cache(
-                            latest_state,
-                            meta_state,
-                            token_count=valid_token_count,
-                        )
-
-                if cache is None:
-                    # Fallback to simple KVCache reconstruction
-                    cache = self._fallback_reconstruct_layer(
-                        layer_states, cache_type_name
-                    )
-
-                if cache is None:
-                    logger.debug(
-                        f"Layer {layer_idx}: failed to reconstruct {cache_type_name}"
-                    )
-                    return None
-
-                reconstructed_caches.append(cache)
-
-            if not reconstructed_caches:
-                return None
-
-            # Verify all layers were reconstructed
-            if len(reconstructed_caches) != num_layers:
-                logger.warning(
-                    f"Incomplete cache reconstruction: got {len(reconstructed_caches)} "
-                    f"layers, expected {num_layers}"
-                )
-                return None
-
-            # Verify KVCache offset consistency across KVCache-typed layers.
-            # All KVCache layers must have the same offset (they process
-            # the same tokens). A mismatch causes broadcast_shapes errors
-            # when the model creates a single attention mask from one layer
-            # and applies it to all attention layers.
-            # NOTE: only check layers explicitly typed as 'KVCache'.
-            # RotatingKVCache also has 'offset' but its meaning differs
-            # (total tokens ever processed, not buffer size), so mixing
-            # them would produce false positives.
-            if layer_cache_types:
-                kv_offsets = set()
-                for idx, c in enumerate(reconstructed_caches):
-                    if (
-                        idx < len(layer_cache_types)
-                        and layer_cache_types[idx] == "KVCache"
-                        and hasattr(c, "offset")
-                        and isinstance(getattr(c, "offset", None), int)
-                    ):
-                        kv_offsets.add(c.offset)
-                if len(kv_offsets) > 1:
-                    logger.warning(
-                        f"KVCache offset inconsistency after reconstruction: "
-                        f"{kv_offsets}. Rejecting cache to prevent "
-                        f"broadcast_shapes errors."
-                    )
-                    return None
-
-            logger.debug(
-                f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
-                f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"
-            )
-
-            return reconstructed_caches
-
-        except Exception as e:
-            logger.warning(f"Failed to reconstruct cache: {e}")
-            import traceback
-
-            logger.debug(traceback.format_exc())
-            return None
-
-    @staticmethod
-    def _layer_has_turboquant_payload(
-        all_block_data: list[list[Any]],
-        layer_idx: int,
-    ) -> bool:
-        """True if any block's payload for this layer is TurboQuant-tagged.
-
-        Used to route dense-typed (KVCache) layers whose chain later
-        accumulated TQ-converted blocks into the payload-driven TurboQuant
-        reconstruction path. layer_cache_types comes from the first block
-        only, so the chain-level type cannot detect this mixing.
-        """
-        for block_data in all_block_data:
-            if layer_idx >= len(block_data):
-                continue
-            bd = block_data[layer_idx]
-            if (
-                isinstance(bd, tuple)
-                and len(bd) == 2
-                and isinstance(bd[0], str)
-                and bd[0] == "__turboquant_v2__"
-            ):
-                return True
-        return False
-
-    def _tq_block_params(
-        self,
-        all_block_meta_states: list[Any],
-        first_block_meta_states: Any,
-        block_idx: int,
-        layer_idx: int,
-    ) -> tuple[float, int] | None:
-        """Resolve (bits, seed) for one block's TurboQuant payload.
-
-        Prefers the block's own per-block meta_state (TurboQuantKVCache
-        stores ``(offset, bits, seed)``; mixed chains can carry different
-        parameters per block), then the first block's chain-level meta, then
-        the server-configured TurboQuant KV bit depth (blocks admitted for
-        reconstruction already passed the bit-depth eligibility check, and
-        seed 0 is the universal codec default). Returns None when none of
-        these resolve: rebuilding a codec at a guessed width dequantizes to
-        plausible-but-wrong tensors — silent output corruption after a cache
-        hit — so the caller must reject the hit and re-prefill instead.
-        """
-        candidates = []
-        if block_idx < len(all_block_meta_states):
-            bms = all_block_meta_states[block_idx]
-            if bms and layer_idx < len(bms):
-                candidates.append(bms[layer_idx])
-        if first_block_meta_states and layer_idx < len(first_block_meta_states):
-            candidates.append(first_block_meta_states[layer_idx])
-        for ms in candidates:
-            if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                try:
-                    return float(ms[1]), int(ms[2])
-                except (TypeError, ValueError):
-                    continue
-        expected_bits = getattr(
-            self.paged_ssd_cache, "_expected_turboquant_kv_bits", None
-        )
-        if isinstance(expected_bits, (int, float)):
-            from mlx_vlm.turboquant import DEFAULT_TURBOQUANT_SEED
-
-            return float(expected_bits), int(DEFAULT_TURBOQUANT_SEED)
-        return None
-
-    def _dequantize_tq_run(
-        self,
-        run_states: list[tuple[Any, Any]],
-        bits: float,
-        seed: int,
-        layer_idx: int,
-    ) -> tuple[Any, Any] | None:
-        """Dequantize a run of consecutive TurboQuant block slices to dense KV.
-
-        Concatenates the quantized (ks, vs) states in block order and
-        dequantizes once, with codecs rebuilt deterministically from
-        (bits, seed). TurboQuant states are per-token (no cross-token
-        coupling), so dequantizing a run equals dequantizing its blocks
-        individually and concatenating — which makes payload-driven
-        per-block reconstruction valid.
-
-        Returns:
-            (keys, values) dense float32 arrays, or None when the run cannot
-            be decoded (caller rejects the cache hit).
-        """
-        from mlx_vlm.turboquant import TurboQuantKVCache
-
-        from ..turboquant_kv import _concat_state_token_axis, _rebuild_codecs
-
-        try:
-            cat_ks = _concat_state_token_axis([ks for ks, _ in run_states])
-            cat_vs = _concat_state_token_axis([vs for _, vs in run_states])
-            tq = TurboQuantKVCache(bits=bits, seed=seed)
-            _rebuild_codecs(tq, cat_ks, cat_vs)
-            return tq.dequantize(cat_ks, cat_vs)
-        except Exception as e:
-            logger.error(
-                f"TQ layer {layer_idx}: failed to dequantize "
-                f"{len(run_states)} block state(s) "
-                f"(bits={bits}, seed={seed}): {e}"
-            )
-            return None
-
-    def _fallback_reconstruct_layer(
-        self,
-        layer_states: list[dict[str, Any]],
-        cache_type_name: str,
-    ) -> Any | None:
-        """
-        Fallback layer reconstruction when handler fails.
-
-        Args:
-            layer_states: List of state dicts with 'keys' and 'values'
-            cache_type_name: Name of the cache type
-
-        Returns:
-            Reconstructed cache object or None
-        """
-        # The fallback rebuilds a plain KVCache, which is the wrong cache
-        # class for every other type: a rotating buffer or recurrent state
-        # restored as KVCache carries wrong positions and merge-unsafe
-        # state. When a non-KVCache handler declares failure, reject the
-        # cached prefix instead of papering over it with a guessed rebuild.
-        if cache_type_name != "KVCache":
-            logger.warning(
-                f"Handler reconstruction failed for {cache_type_name}; "
-                f"rejecting the cached prefix instead of rebuilding it as "
-                f"a plain KVCache."
-            )
-            return None
-        try:
-            # Collect keys and values
-            layer_keys = [s["keys"] for s in layer_states if s.get("keys") is not None]
-            layer_values = [
-                s["values"] for s in layer_states if s.get("values") is not None
-            ]
-
-            if not layer_keys or not layer_values:
-                return None
-
-            # Try to concatenate (works for 4D KV caches)
-            try:
-                concat_keys = mx.concatenate(layer_keys, axis=2)
-                concat_values = mx.concatenate(layer_values, axis=2)
-            except Exception:
-                # If concatenation fails, might be 3D tensors
-                try:
-                    concat_keys = mx.concatenate(layer_keys, axis=1)
-                    concat_values = mx.concatenate(layer_values, axis=1)
-                except Exception:
-                    # Last resort: use single state
-                    concat_keys = layer_keys[-1]
-                    concat_values = layer_values[-1]
-
-            # Create appropriate cache object
-            try:
-                from mlx_lm.models.cache import KVCache
-
-                cache = KVCache()
-                cache.keys = concat_keys
-                cache.values = concat_values
-                if len(concat_keys.shape) >= 3:
-                    cache.offset = (
-                        concat_keys.shape[2]
-                        if len(concat_keys.shape) == 4
-                        else concat_keys.shape[1]
-                    )
-                else:
-                    cache.offset = 0
-                return cache
-            except ImportError:
-                # Simple fallback
-                class SimpleKVCache:
-                    def __init__(self, keys, values):
-                        self.keys = keys
-                        self.values = values
-                        self.offset = keys.shape[2] if len(keys.shape) >= 3 else 0
-
-                    @property
-                    def state(self):
-                        return (self.keys, self.values)
-
-                return SimpleKVCache(concat_keys, concat_values)
-
-        except Exception as e:
-            logger.debug(f"Fallback reconstruction failed: {e}")
-            return None
-
-    def _find_kv_shape_ref(
-        self,
-        all_block_data: list[list[tuple[Any, Any]]],
-        layer_cache_types: list[str] | None = None,
-    ) -> tuple[int, int] | None:
-        """Find (kv_heads, head_dim) from a KVCache layer's stored data.
-
-        Used to create zero-length RotatingKVCache tensors with the correct shape.
-
-        Args:
-            all_block_data: All loaded block data
-            layer_cache_types: Per-layer cache type names
-
-        Returns:
-            (kv_heads, head_dim) tuple, or None if not found
-        """
-        if not all_block_data:
-            return None
-
-        for layer_idx, layer_data in enumerate(all_block_data[0]):
-            # Skip non-KVCache layers
-            if layer_cache_types and layer_idx < len(layer_cache_types):
-                if layer_cache_types[layer_idx] != "KVCache":
-                    continue
-            # Guard against non-tuple formats (CacheList stores List[Tuple])
-            if not isinstance(layer_data, tuple) or len(layer_data) != 2:
-                continue
-            keys, _ = layer_data
-            if hasattr(keys, "shape") and len(keys.shape) == 4:
-                return (keys.shape[1], keys.shape[3])
-
-        return None
-
-    def _create_empty_rotating_cache(
-        self,
-        meta_state: tuple | None = None,
-        kvcache_offset: int = 0,
-        kv_shape_ref: tuple[int, int] | None = None,
-    ) -> Any | None:
-        """
-        Create an empty RotatingKVCache for partial prefix restore.
-
-        Creates a RotatingKVCache with zero-length keys/values (not None) and
-        offset matching the KVCache layers. This ensures:
-        1. mlx-lm's empty() returns False → Continuation mode (not Fresh Start)
-        2. Position IDs (RoPE) are correct for all layers
-        3. The merge creates a zero-length buffer (not zero-filled) so that
-           no phantom attention positions exist during window padding reprocessing
-
-        Uses PrefillReadyRotatingKVCache (clamped size() by buffer length)
-        so BatchRotatingKVCache.merge() never reads beyond the actual buffer
-        and never sees zero-padded positions as valid attention keys.
-
-        Args:
-            meta_state: RotatingKVCache meta_state tuple (keep, max_size, offset, _idx).
-            kvcache_offset: Offset to match KVCache layers (= restored token count).
-            kv_shape_ref: (kv_heads, head_dim) from a KVCache layer for tensor shape.
-
-        Returns:
-            RotatingKVCache with zero-length keys/values, or None on failure.
-        """
-        if meta_state and len(meta_state) >= 2:
-            keep = int(meta_state[0])
-            max_size = int(meta_state[1])
-        else:
-            logger.warning(
-                "Cannot create empty RotatingKVCache: meta_state missing or incomplete"
-            )
-            return None
-
-        cache = PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
-        cache.offset = kvcache_offset
-
-        # Set zero-length keys/values so empty() returns False.
-        # This prevents mlx-lm from entering Fresh Start mode which
-        # would discard all cached KVCache data.
-        if kv_shape_ref and HAS_MLX:
-            kv_heads, head_dim = kv_shape_ref
-            cache.keys = mx.zeros((1, kv_heads, 0, head_dim))
-            cache.values = mx.zeros((1, kv_heads, 0, head_dim))
-            cache._idx = 0
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep}, "
-                f"offset={kvcache_offset}, kv_heads={kv_heads}, head_dim={head_dim}"
-            )
-        else:
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep} "
-                f"(no shape ref, keys=None)"
-            )
-
-        return cache
-
-    def _validate_block_cache_data(
-        self,
-        cache_data: list[tuple[Any, Any]],
-        layer_cache_types: list[str] | None = None,
-    ) -> bool:
-        """
-        Validate that block's cache_data has valid data for all layers.
-
-        A block's cache_data is a list of (keys, values) tuples, one per layer.
-        This validates that:
-        1. cache_data is not empty
-        2. Each layer has non-None keys and values
-        3. Each layer has consistent shapes (for sliceable cache types)
-
-        Args:
-            cache_data: List of (keys, values) tuples from a block
-            layer_cache_types: Optional list of cache type names per layer.
-                ArraysCache layers are excluded from seq_len consistency check.
-
-        Returns:
-            True if valid, False otherwise
-        """
-        if not cache_data:
-            return False
-
-        # Cache types that support per-block KV slicing. When cache type
-        # metadata is present, do not let non-KV hybrid states define the
-        # expected seq_len for KVCache layers.
-        sliceable_types = {
-            "KVCache",
-            "BatchKVCache",
-            "TurboQuantKVCache",
-            "BatchTurboQuantKVCache",
-            "MiniMaxM3KVCache",
-        }
-        non_sliceable_types = {
-            "ArraysCache",
-            "RotatingKVCache",
-            "BatchRotatingKVCache",
-            "CacheList",
-            "MiniMaxM3BatchKVCache",
-        }
-
-        expected_seq_len = None
-
-        for layer_idx, layer_data in enumerate(cache_data):
-            try:
-                # Determine cache type first to handle CacheList before tuple unpack
-                cache_type = None
-                if layer_cache_types and layer_idx < len(layer_cache_types):
-                    cache_type = layer_cache_types[layer_idx]
-
-                # CacheList: sub-cache list format, skip standard (keys, values) unpacking
-                if cache_type == "CacheList":
-                    # CacheList data is either List[Tuple] (last block) or Tuple (placeholder)
-                    if isinstance(layer_data, list):
-                        continue  # Sub-cache list — valid
-                    # Fall through to standard check for placeholder (zeros tuple)
-
-                if not isinstance(layer_data, (list, tuple)) or len(layer_data) < 2:
-                    logger.debug(
-                        f"Block validation failed: layer {layer_idx} has "
-                        f"unsupported data type {type(layer_data).__name__}"
-                    )
-                    return False
-
-                if (
-                    isinstance(layer_data, tuple)
-                    and len(layer_data) >= 3
-                    and layer_data[0] == "__nstate__"
-                ):
-                    elements = layer_data[2]
-                    if not isinstance(elements, (list, tuple)) or len(elements) < 2:
-                        logger.debug(
-                            f"Block validation failed: layer {layer_idx} has "
-                            "invalid N-tuple state"
-                        )
-                        return False
-                    keys, values = elements[0], elements[1]
-                else:
-                    keys, values = layer_data[0], layer_data[1]
-
-                # Skip seq_len check for non-sliceable types (e.g., ArraysCache, RotatingKVCache)
-                # This includes placeholder entries (1D tensors from non-last blocks)
-                # used by the last-block-only RotatingKVCache storage strategy
-                if cache_type in non_sliceable_types:
-                    continue
-                if layer_cache_types and cache_type not in sliceable_types:
-                    continue
-
-                # Check for None after non-sliceable N-tuple caches have been
-                # accepted. Pooling-style states can legitimately store None
-                # in their first elements.
-                if keys is None or values is None:
-                    logger.debug(
-                        f"Block validation failed: layer {layer_idx} has None keys/values"
-                    )
-                    return False
-
-                # Check shape consistency for sliceable types (KVCache, RotatingKVCache)
-                if hasattr(keys, "shape") and len(keys.shape) >= 3:
-                    seq_len = keys.shape[2]
-                    if expected_seq_len is None:
-                        expected_seq_len = seq_len
-                    elif seq_len != expected_seq_len:
-                        logger.debug(
-                            f"Block validation failed: layer {layer_idx} has "
-                            f"seq_len {seq_len}, expected {expected_seq_len}"
-                        )
-                        return False
-            except (TypeError, ValueError) as e:
-                logger.debug(f"Block validation failed: layer {layer_idx} error: {e}")
-                return False
-
-        return True
-
-    def _find_best_prefix_match(
-        self,
-        tokens: list[int],
-        extra_keys: tuple[Any, ...] | None = None,
-    ) -> tuple[int, tuple[int, ...], int, list[bytes]] | None:
-        """Find best matching prefix in the index.
-
-        Returns:
-            Tuple of (prefix_len, block_ids, num_blocks, chain_hashes) where
-            chain_hashes holds the per-block chain hash for each matched
-            block, or None when nothing matched. The hashes let the caller
-            re-validate that the indexed blocks still hold the content they
-            were indexed for before reusing them.
-        """
-        best_match = None
-        best_len = 0
-
-        parent_hash = b""
-        prefix_len = 0
-        num_blocks = 0
-        chain_hashes: list[bytes] = []
-
-        for start in range(0, len(tokens), self.block_size):
-            end = min(start + self.block_size, len(tokens))
-            block_tokens = tokens[start:end]
-            if not block_tokens:
-                break
-
-            parent_hash = compute_block_hash(
-                parent_hash,
-                block_tokens,
-                extra_keys=extra_keys,
-                model_name=self.paged_cache.model_name,
-            )
-            prefix_len += len(block_tokens)
-            num_blocks += 1
-            chain_hashes.append(parent_hash)
-
-            entry = self._prefix_index.get(parent_hash)
-            if entry and entry[0] == prefix_len and prefix_len > best_len:
-                best_match = entry
-                best_len = prefix_len
-
-        if best_match is None:
-            return None
-        return (*best_match, chain_hashes[: best_match[2]])
-
-    def _update_prefix_index(
-        self,

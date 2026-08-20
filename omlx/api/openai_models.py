@@ -313,10 +313,8 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
-    # OpenAI-compatible reasoning depth; forwarded to the chat template.
-    # Numbers stay numbers: models like Inkling take a numeric effort
-    # (0.1-0.99) while Qwen3.8 uses strings ("low".."xhigh") — each chat
-    # template validates its own vocabulary.
+    # OpenAI-compatible reasoning depth; forwarded to native and DS4 backends.
+    # Numbers stay numbers for models that accept a numeric effort.
     reasoning_effort: Optional[Union[str, int, float]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
@@ -399,6 +397,8 @@ class ChatCompletionResponse(BaseModel):
 class CompletionRequest(BaseModel):
     """Request for text completion."""
 
+    model_config = {"extra": "allow"}
+
     model: str
     prompt: Union[str, List[str]]
     temperature: float | None = None
@@ -414,6 +414,8 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Thinking effort for DS4/OpenAI reasoning-compatible backends
+    reasoning_effort: Optional[str] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)

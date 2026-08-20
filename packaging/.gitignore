@@ -3,6 +3,7 @@ _build/
 _export/
 dist/
 requirements/
+DS4Support/
 
 # Python
 __pycache__/

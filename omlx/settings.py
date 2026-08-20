@@ -42,6 +42,9 @@ SETTINGS_VERSION = "1.0"
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
 
+DS4_THINK_MAX_CONTEXT_TOKENS = 393_216
+DS4_MAX_CONTEXT_TOKENS = 1_000_000
+
 # One-line bootstrap file the macOS app writes when the user moves their data root
 BASE_PATH_BOOTSTRAP_FILE = (
     Path.home() / "Library" / "Application Support" / "oMLX" / "base-path"
@@ -464,6 +467,133 @@ class CacheSettings:
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+        )
+
+
+DS4SSDStreamingMode = Literal["auto", "on", "off"]
+
+
+@dataclass
+class DS4Settings:
+    """Global settings for the managed DS4/GGUF backend."""
+
+    enabled: bool = True
+    support_dir: str | None = None  # None means ~/.omlx/support/ds4
+    binary_path: str | None = None  # Hidden/advanced override for ds4-server
+    auto_build: bool = True  # Build pinned DS4 source on first DS4 launch if needed
+    source_repo: str | None = None  # None means manifest source_repo
+    source_commit: str | None = None  # None means manifest source_commit
+    context_default_tokens: int | None = None  # None means adaptive by physical RAM
+    ready_timeout_ms: int = 600_000
+    kv_cache_enabled: bool = True
+    kv_root: str | None = None  # None means ~/.omlx/ds4-kv
+    kv_disk_space_mb: int = 65_536
+    kv_cache_continued_interval_tokens: int = 2_048
+    kv_cache_reject_different_quant: bool = False
+    ssd_streaming: DS4SSDStreamingMode = "auto"
+    power: int = 100
+    trace_enabled: bool = False
+    trace_dir: str | None = None  # None means ~/.omlx/logs/ds4-traces
+    debug_dir: str | None = None  # None means ~/.omlx/logs/ds4-debug
+    logs_to_disk: bool = True  # Persist captured stdout/stderr to debug_dir/ds4.log
+
+    def get_support_dir(self, base_path: Path) -> Path:
+        """Return the DS4 support directory containing ds4-server and metal/."""
+        if self.support_dir:
+            return Path(self.support_dir).expanduser().resolve()
+        return base_path / "support" / "ds4"
+
+    def get_binary_path(self, base_path: Path) -> Path:
+        """Return the effective ds4-server binary path."""
+        if self.binary_path:
+            return Path(self.binary_path).expanduser().resolve()
+        return self.get_support_dir(base_path) / "ds4-server"
+
+    def get_kv_root(self, base_path: Path) -> Path:
+        """Return the shared DS4 KV cache root."""
+        if self.kv_root:
+            return Path(self.kv_root).expanduser().resolve()
+        return base_path / "ds4-kv"
+
+    def get_trace_dir(self, base_path: Path) -> Path:
+        """Return the default DS4 trace output directory."""
+        if self.trace_dir:
+            return Path(self.trace_dir).expanduser().resolve()
+        return base_path / "logs" / "ds4-traces"
+
+    def get_debug_dir(self, base_path: Path) -> Path:
+        """Return the DS4 debug artifact directory."""
+        if self.debug_dir:
+            return Path(self.debug_dir).expanduser().resolve()
+        return base_path / "logs" / "ds4-debug"
+
+    def get_auto_context_tokens(self, memory_bytes: int | None = None) -> int:
+        """Return the adaptive DS4 context default based on physical RAM."""
+        if self.context_default_tokens is not None:
+            return self.context_default_tokens
+        memory_gb = memory_bytes if memory_bytes is not None else get_system_memory()
+        memory_gb = memory_gb / 1024**3
+        if memory_gb <= 64:
+            return 32_768
+        if memory_gb < 192:
+            return 100_000
+        if memory_gb < 384:
+            return 250_000
+        return DS4_THINK_MAX_CONTEXT_TOKENS
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "support_dir": self.support_dir,
+            "binary_path": self.binary_path,
+            "auto_build": self.auto_build,
+            "source_repo": self.source_repo,
+            "source_commit": self.source_commit,
+            "context_default_tokens": self.context_default_tokens,
+            "ready_timeout_ms": self.ready_timeout_ms,
+            "kv_cache_enabled": self.kv_cache_enabled,
+            "kv_root": self.kv_root,
+            "kv_disk_space_mb": self.kv_disk_space_mb,
+            "kv_cache_continued_interval_tokens": (
+                self.kv_cache_continued_interval_tokens
+            ),
+            "kv_cache_reject_different_quant": self.kv_cache_reject_different_quant,
+            "ssd_streaming": self.ssd_streaming,
+            "power": self.power,
+            "trace_enabled": self.trace_enabled,
+            "trace_dir": self.trace_dir,
+            "debug_dir": self.debug_dir,
+            "logs_to_disk": self.logs_to_disk,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DS4Settings:
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", True),
+            support_dir=data.get("support_dir"),
+            binary_path=data.get("binary_path"),
+            auto_build=data.get("auto_build", True),
+            source_repo=data.get("source_repo"),
+            source_commit=data.get("source_commit"),
+            context_default_tokens=data.get("context_default_tokens"),
+            ready_timeout_ms=data.get("ready_timeout_ms", 600_000),
+            kv_cache_enabled=data.get("kv_cache_enabled", True),
+            kv_root=data.get("kv_root"),
+            kv_disk_space_mb=data.get("kv_disk_space_mb", 65_536),
+            kv_cache_continued_interval_tokens=data.get(
+                "kv_cache_continued_interval_tokens", 2_048
+            ),
+            kv_cache_reject_different_quant=data.get(
+                "kv_cache_reject_different_quant", False
+            ),
+            ssd_streaming=data.get("ssd_streaming", "auto"),
+            power=data.get("power", 100),
+            trace_enabled=data.get("trace_enabled", False),
+            trace_dir=data.get("trace_dir"),
+            debug_dir=data.get("debug_dir"),
+            logs_to_disk=data.get("logs_to_disk", True),
         )
 
 
@@ -923,6 +1053,7 @@ class GlobalSettings:
     memory: MemorySettings = field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     cache: CacheSettings = field(default_factory=CacheSettings)
+    ds4: DS4Settings = field(default_factory=DS4Settings)
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
@@ -1009,6 +1140,8 @@ class GlobalSettings:
                 self.scheduler = SchedulerSettings.from_dict(data["scheduler"])
             if "cache" in data:
                 self.cache = CacheSettings.from_dict(data["cache"])
+            if "ds4" in data:
+                self.ds4 = DS4Settings.from_dict(data["ds4"])
             if "auth" in data:
                 self.auth = AuthSettings.from_dict(data["auth"])
             if "mcp" in data:
@@ -1111,6 +1244,94 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_INITIAL_CACHE_BLOCKS value: {initial_blocks}"
                 )
+
+        # DS4 settings (hidden/advanced knobs)
+        if ds4_enabled := os.getenv("OMLX_DS4_ENABLED"):
+            self.ds4.enabled = ds4_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if ds4_support_dir := os.getenv("OMLX_DS4_SUPPORT_DIR"):
+            self.ds4.support_dir = ds4_support_dir
+        if ds4_binary_path := os.getenv("OMLX_DS4_BINARY_PATH"):
+            self.ds4.binary_path = ds4_binary_path
+        if ds4_auto_build := os.getenv("OMLX_DS4_AUTO_BUILD"):
+            self.ds4.auto_build = ds4_auto_build.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if ds4_source_repo := os.getenv("OMLX_DS4_SOURCE_REPO"):
+            self.ds4.source_repo = ds4_source_repo
+        if ds4_source_commit := os.getenv("OMLX_DS4_SOURCE_COMMIT"):
+            self.ds4.source_commit = ds4_source_commit
+        if ds4_kv_root := os.getenv("OMLX_DS4_KV_ROOT"):
+            self.ds4.kv_root = ds4_kv_root
+        if ds4_kv_cache_enabled := os.getenv("OMLX_DS4_KV_CACHE_ENABLED"):
+            self.ds4.kv_cache_enabled = ds4_kv_cache_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if ds4_kv_mb := os.getenv("OMLX_DS4_KV_DISK_SPACE_MB"):
+            try:
+                self.ds4.kv_disk_space_mb = int(ds4_kv_mb)
+            except ValueError:
+                logger.warning(f"Invalid OMLX_DS4_KV_DISK_SPACE_MB: {ds4_kv_mb}")
+        if ds4_ready_timeout := os.getenv("OMLX_DS4_READY_TIMEOUT_MS"):
+            try:
+                self.ds4.ready_timeout_ms = int(ds4_ready_timeout)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_DS4_READY_TIMEOUT_MS: {ds4_ready_timeout}"
+                )
+        if ds4_kv_interval := os.getenv("OMLX_DS4_KV_CACHE_CONTINUED_INTERVAL_TOKENS"):
+            try:
+                self.ds4.kv_cache_continued_interval_tokens = int(ds4_kv_interval)
+            except ValueError:
+                logger.warning(
+                    "Invalid OMLX_DS4_KV_CACHE_CONTINUED_INTERVAL_TOKENS: "
+                    f"{ds4_kv_interval}"
+                )
+        if ds4_context := os.getenv("OMLX_DS4_CONTEXT_DEFAULT_TOKENS"):
+            if ds4_context.strip().lower() == "auto":
+                self.ds4.context_default_tokens = None
+            else:
+                try:
+                    self.ds4.context_default_tokens = int(ds4_context)
+                except ValueError:
+                    logger.warning(
+                        f"Invalid OMLX_DS4_CONTEXT_DEFAULT_TOKENS: {ds4_context}"
+                    )
+        if ds4_ssd_streaming := os.getenv("OMLX_DS4_SSD_STREAMING"):
+            self.ds4.ssd_streaming = ds4_ssd_streaming.strip().lower()
+        if ds4_power := os.getenv("OMLX_DS4_POWER"):
+            try:
+                self.ds4.power = int(ds4_power)
+            except ValueError:
+                logger.warning(f"Invalid OMLX_DS4_POWER: {ds4_power}")
+        if ds4_logs_to_disk := os.getenv("OMLX_DS4_LOGS_TO_DISK"):
+            self.ds4.logs_to_disk = ds4_logs_to_disk.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if ds4_trace_enabled := os.getenv("OMLX_DS4_TRACE_ENABLED"):
+            self.ds4.trace_enabled = ds4_trace_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if ds4_trace_dir := os.getenv("OMLX_DS4_TRACE_DIR"):
+            self.ds4.trace_dir = ds4_trace_dir
+        if ds4_debug_dir := os.getenv("OMLX_DS4_DEBUG_DIR"):
+            self.ds4.debug_dir = ds4_debug_dir
 
         # Auth settings
         if api_key := os.getenv("OMLX_API_KEY"):
@@ -1329,6 +1550,7 @@ class GlobalSettings:
             "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
+            "ds4": self.ds4.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
@@ -1374,6 +1596,10 @@ class GlobalSettings:
             self.base_path,
             self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
+            self.ds4.get_support_dir(self.base_path),
+            self.ds4.get_kv_root(self.base_path),
+            self.ds4.get_trace_dir(self.base_path),
+            self.ds4.get_debug_dir(self.base_path),
         ]
 
         for directory in required:
@@ -1537,6 +1763,24 @@ class GlobalSettings:
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
             )
 
+        # DS4 validation
+        if self.ds4.context_default_tokens is not None:
+            if not 1 <= self.ds4.context_default_tokens <= DS4_MAX_CONTEXT_TOKENS:
+                errors.append(
+                    "ds4.context_default_tokens must be between 1 and "
+                    f"{DS4_MAX_CONTEXT_TOKENS}"
+                )
+        if self.ds4.ready_timeout_ms <= 0:
+            errors.append("ds4.ready_timeout_ms must be > 0")
+        if self.ds4.kv_disk_space_mb <= 0:
+            errors.append("ds4.kv_disk_space_mb must be > 0")
+        if self.ds4.kv_cache_continued_interval_tokens <= 0:
+            errors.append("ds4.kv_cache_continued_interval_tokens must be > 0")
+        if self.ds4.ssd_streaming not in {"auto", "on", "off"}:
+            errors.append("ds4.ssd_streaming must be one of: auto, on, off")
+        if not 1 <= self.ds4.power <= 100:
+            errors.append("ds4.power must be between 1 and 100")
+
         # Sampling validation
         if (
             self.sampling.max_context_window_policy is not None
@@ -1663,6 +1907,7 @@ class GlobalSettings:
             "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
+            "ds4": self.ds4.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),

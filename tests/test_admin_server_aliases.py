@@ -988,3 +988,301 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         assert gs.cache.gdn_ssd_pending_max_size == "512MB"
         assert gs.cache.gdn_sidecar_state_dtype == "fp32"
         gs.save.assert_not_called()
+
+
+
+class TestUpdateGlobalSettingsHostValidation:
+    """update_global_settings: host validation with is_valid_bind_host."""
+
+    def test_accepts_single_valid_host(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="0.0.0.0")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.server.host == "0.0.0.0"
+        gs.save.assert_called_once()
+
+    def test_accepts_localhost(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="localhost")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == "localhost"
+
+    def test_accepts_ipv6_loopback(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="::1")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == "::1"
+
+    def test_accepts_wildcard_ipv6(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="::")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == "::"
+
+    def test_accepts_multi_host_comma_separated(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="127.0.0.1,0.0.0.0")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == "127.0.0.1,0.0.0.0"
+
+    def test_accepts_multi_host_with_spaces(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host=" 127.0.0.1 , 0.0.0.0 ")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == " 127.0.0.1 , 0.0.0.0 "
+
+    def test_rejects_empty_host_string(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "at least one non-empty host" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_rejects_whitespace_only_host(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="   ")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "at least one non-empty host" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_rejects_commas_with_no_hosts(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host=" , , ")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        gs.save.assert_not_called()
+
+    def test_rejects_invalid_host_out_of_range_ip(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="999.999.999.999")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "999.999.999.999" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_rejects_invalid_host_with_spaces(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="not a host")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        gs.save.assert_not_called()
+
+    def test_rejects_multi_host_with_one_invalid(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="127.0.0.1,not valid!!!")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "not valid!!!" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_accepts_valid_host_with_surrounding_whitespace_in_multi(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host=" 127.0.0.1 , localhost ")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == " 127.0.0.1 , localhost "
+
+    def test_accepts_fqdn_hostname(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="my-server.local")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == "my-server.local"
+
+    def test_rejects_ip_shaped_invalid_octet(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="256.0.0.1")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        gs.save.assert_not_called()
+
+    def test_accepts_hostname_with_dashes(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="192-168-1-1")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.host == "192-168-1-1"
+
+    def test_rejects_host_with_leading_dash(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="-bad-host")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        gs.save.assert_not_called()
+
+    def test_does_not_mutate_host_on_invalid_input(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="invalid host!")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException):
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert gs.server.host == "127.0.0.1"
+        gs.save.assert_not_called()
+
+
+class TestUpdateGlobalSettingsBurstDecode:
+    """update_global_settings: save and hot-apply burst_decode_mode."""
+
+    def test_accepts_valid_mode_balanced(self):
+        gs = _make_global_settings()
+        gs.server.burst_decode_mode = "off"
+        request = GlobalSettingsRequest(burst_decode_mode="balanced")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "burst_decode_mode" in result["runtime_applied"]
+        assert gs.server.burst_decode_mode == "balanced"
+        gs.save.assert_called_once()
+
+    def test_accepts_off_mode(self):
+        gs = _make_global_settings()
+        gs.server.burst_decode_mode = "balanced"
+        request = GlobalSettingsRequest(burst_decode_mode="off")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.burst_decode_mode == "off"
+
+    def test_accepts_aggressive_mode(self):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(burst_decode_mode="aggressive")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.burst_decode_mode == "aggressive"
+
+    def test_rejects_invalid_mode_with_400(self):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(burst_decode_mode="invalid")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "invalid" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_sets_env_vars_on_apply(self):
+        """burst_decode_mode should seed OMLX_DECODE_BURST_* env vars."""
+        import os
+
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(burst_decode_mode="aggressive")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert os.environ.get("OMLX_DECODE_BURST_MAX_STEPS") == "64"
+        assert os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S") == "0.2"

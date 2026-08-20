@@ -15,12 +15,12 @@ Also re-exports core engine components for backwards compatibility.
 from ..engine_core import AsyncEngineCore, EngineConfig, EngineCore
 from .base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 from .batched import BatchedEngine
-from .embedding import EmbeddingEngine
-
 from .dflash import DFlashEngine
+from .ds4 import DS4ProcessEngine
+from .embedding import EmbeddingEngine
 from .reranker import RerankerEngine
-from .stt import STTEngine
 from .sts import STSEngine
+from .stt import STTEngine
 from .tts import TTSEngine
 from .vlm import VLMBatchedEngine
 
@@ -30,6 +30,7 @@ __all__ = [
     "GenerationOutput",
     "BatchedEngine",
     "DFlashEngine",
+    "DS4ProcessEngine",
     "VLMBatchedEngine",
     "EmbeddingEngine",
     "RerankerEngine",

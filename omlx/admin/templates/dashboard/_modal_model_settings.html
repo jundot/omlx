@@ -291,21 +291,23 @@
                 <!-- Two-column layout -->
                 <div class="flex flex-col lg:flex-row">
                     <!-- Left: Basic Settings -->
-                    <div class="w-full lg:w-3/5 lg:pr-6 lg:border-r border-neutral-200">
+                    <div class="w-full" :class="selectedModel?.engine_type === 'ds4' ? 'lg:w-full' : 'lg:w-3/5 lg:pr-6 lg:border-r border-neutral-200'">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.basic_label') }}</h3>
                         <div class="space-y-5">
                             <!-- Row 1: Model Alias / Model Type / Reasoning Parser -->
-                            <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
+                            <div class="grid grid-cols-1 gap-4" :class="selectedModel?.engine_type === 'ds4' ? 'sm:grid-cols-1' : (reasoningParsers.length > 0 && !modelSettings.is_diffusion_model ? 'sm:grid-cols-3' : 'sm:grid-cols-2')">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
                                     <input type="text" x-model="modelSettings.model_alias"
                                            :placeholder="selectedModel?.id"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
-                                <div>
+                                <div x-show="selectedModel?.engine_type !== 'ds4'">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_type') }}</label>
                                     <select x-model="modelSettings.model_type_override"
-                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            :disabled="selectedModel?.engine_type === 'ds4'"
+                                            :class="selectedModel?.engine_type === 'ds4' ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : 'bg-white'"
+                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         <option value="">{{ t('modal.model_settings.model_type_auto') }}</option>
                                         <option value="llm">LLM</option>
                                         <option value="vlm">VLM</option>
@@ -315,8 +317,10 @@
                                         <option value="audio_tts">Audio TTS</option>
                                         <option value="audio_sts">Audio STS</option>
                                     </select>
+                                    <p x-show="selectedModel?.engine_type === 'ds4'" x-cloak
+                                       class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.ds4_model_type_hint') }}</p>
                                 </div>
-                                <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
+                                <div x-show="selectedModel?.engine_type !== 'ds4' && reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.reasoning_parser') }}</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
@@ -325,6 +329,113 @@
                                             <option :value="p.value" x-text="p.label + ' (' + p.models.join(', ') + ')'"></option>
                                         </template>
                                     </select>
+                                </div>
+                            </div>
+
+                            <!-- DS4-GGUF launch settings -->
+                            <div x-show="selectedModel?.engine_type === 'ds4'" x-cloak
+                                 class="p-4 rounded-xl border border-purple-200 bg-purple-50 space-y-3">
+                                <div class="flex items-center justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <div class="text-xs font-bold uppercase tracking-wider text-purple-700">{{ t('modal.model_settings.ds4_section_label') }}</div>
+                                    </div>
+                                    <span x-show="selectedModel?.ds4?.status"
+                                          class="px-2 py-1 text-[10px] font-bold uppercase tracking-wide rounded-full border"
+                                          :class="selectedModel?.ds4?.status === 'running'
+                                              ? 'bg-green-50 text-green-700 border-green-200'
+                                              : (selectedModel?.ds4?.status === 'crashed'
+                                                  ? 'bg-red-50 text-red-700 border-red-200'
+                                                  : 'bg-neutral-100 text-neutral-600 border-neutral-200')"
+                                          x-text="selectedModel?.ds4?.status"></span>
+                                </div>
+                                <div x-show="selectedModel?.ds4" x-cloak class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-purple-800/80">
+                                    <div x-show="selectedModel?.ds4?.context_tokens_formatted">
+                                        <span class="font-semibold">{{ t('modal.model_settings.ds4_status_context') }}:</span>
+                                        <span x-text="selectedModel?.ds4?.context_tokens_formatted"></span>
+                                    </div>
+                                    <div x-show="selectedModel?.ds4?.rss_formatted">
+                                        <span class="font-semibold">{{ t('modal.model_settings.ds4_status_rss') }}:</span>
+                                        <span x-text="selectedModel?.ds4?.rss_formatted"></span>
+                                    </div>
+                                    <div x-show="selectedModel?.ds4?.log_path" class="truncate" :title="selectedModel?.ds4?.log_path">
+                                        <span class="font-semibold">{{ t('modal.model_settings.ds4_status_log') }}:</span>
+                                        <span x-text="selectedModel?.ds4?.log_path"></span>
+                                    </div>
+                                </div>
+                                <div class="pt-2 border-t border-purple-100 space-y-3">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-purple-950">{{ t('modal.model_settings.ds4_mtp') }}</span>
+                                            <p class="text-xs text-purple-800/70 mt-0.5">{{ t('modal.model_settings.ds4_mtp_hint') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="modelSettings.ds4_mtp_enabled = !modelSettings.ds4_mtp_enabled"
+                                                :class="modelSettings.ds4_mtp_enabled ? 'bg-purple-950' : 'bg-purple-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-950">
+                                            <span :class="modelSettings.ds4_mtp_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="modelSettings.ds4_mtp_enabled" x-transition class="space-y-3">
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-purple-800 mb-2">{{ t('modal.model_settings.ds4_mtp_sidecar_select') }}</label>
+                                            <select x-model="modelSettings.ds4_mtp_path"
+                                                    :disabled="ds4MtpSidecarCandidates().length === 0"
+                                                    :class="ds4MtpSidecarCandidates().length === 0 ? 'bg-purple-50 text-purple-500 cursor-not-allowed' : 'bg-white'"
+                                                    class="w-full px-3 py-2 border border-purple-200 rounded-xl text-sm focus:ring-2 focus:ring-purple-950 focus:border-transparent transition-all">
+                                                <option value="" x-text="ds4MtpSidecarCandidates().length === 0 ? '{{ t('modal.model_settings.ds4_mtp_no_sidecars') }}' : '{{ t('modal.model_settings.ds4_mtp_select_placeholder') }}'"></option>
+                                                <template x-for="sidecar in ds4MtpSidecarCandidates()" :key="sidecar.path">
+                                                    <option :value="sidecar.path" x-text="ds4MtpSidecarLabel(sidecar)"></option>
+                                                </template>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-purple-800 mb-2">{{ t('modal.model_settings.ds4_mtp_path') }}</label>
+                                            <input type="text"
+                                                   x-model="modelSettings.ds4_mtp_path"
+                                                   placeholder="/path/to/DeepSeek-V4-Flash-MTP.gguf"
+                                                   class="w-full px-3 py-2 border border-purple-200 rounded-xl text-sm focus:ring-2 focus:ring-purple-950 focus:border-transparent transition-all bg-white">
+                                        </div>
+                                        <div x-show="modelSettings.ds4_mtp_path" x-cloak
+                                             class="text-xs font-semibold text-purple-900"
+                                             x-text="ds4MtpSidecarKind() === 'dspark' ? 'DSpark runtime (--dspark)' : 'Legacy MTP runtime'"></div>
+                                        <div x-show="ds4MtpSidecarKind() === 'dspark'" x-cloak
+                                             class="rounded-lg border border-purple-200 bg-purple-50 px-3 py-2 text-xs text-purple-800">
+                                            DSpark uses adaptive speculative decoding and can run with main-model SSD streaming. Legacy draft-token and margin tuning do not apply.
+                                        </div>
+                                        <div x-show="ds4MtpSidecarKind() !== 'dspark'"
+                                             class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-purple-800 mb-2">{{ t('modal.model_settings.ds4_mtp_tuning') }}</label>
+                                                <select @change="applyDs4MtpPreset($event.target.value); $event.target.value = ''"
+                                                        class="w-full px-3 py-2 border border-purple-200 rounded-xl text-sm focus:ring-2 focus:ring-purple-950 focus:border-transparent transition-all bg-white">
+                                                    <option value="">{{ t('modal.model_settings.ds4_mtp_tuning_custom') }}</option>
+                                                    <option value="conservative">{{ t('modal.model_settings.ds4_mtp_tuning_conservative') }}</option>
+                                                    <option value="balanced">{{ t('modal.model_settings.ds4_mtp_tuning_balanced') }}</option>
+                                                    <option value="aggressive">{{ t('modal.model_settings.ds4_mtp_tuning_aggressive') }}</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-purple-800 mb-2">{{ t('modal.model_settings.ds4_mtp_draft') }}</label>
+                                                <input type="number"
+                                                       x-model.number="modelSettings.ds4_mtp_draft"
+                                                       min="1"
+                                                       max="8"
+                                                       step="1"
+                                                       placeholder="2"
+                                                       class="w-full px-3 py-2 border border-purple-200 rounded-xl text-sm focus:ring-2 focus:ring-purple-950 focus:border-transparent transition-all bg-white">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-purple-800 mb-2">{{ t('modal.model_settings.ds4_mtp_margin') }}</label>
+                                                <input type="number"
+                                                       x-model.number="modelSettings.ds4_mtp_margin"
+                                                       min="0"
+                                                       step="0.1"
+                                                       placeholder="3"
+                                                       class="w-full px-3 py-2 border border-purple-200 rounded-xl text-sm focus:ring-2 focus:ring-purple-950 focus:border-transparent transition-all bg-white">
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
 
@@ -337,7 +448,9 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
+                                                   :max="selectedModel?.engine_type === 'ds4' ? 1000000 : null"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p x-show="selectedModel?.engine_type === 'ds4'" x-cloak class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.ds4_context_hint') }}</p>
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>
@@ -372,7 +485,7 @@
 
                                     <!-- Row 4: Repetition Penalty / Presence Penalty -->
                                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4"
-                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
+                                         x-show="selectedModel?.engine_type !== 'ds4' && !modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
                                             <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -405,7 +518,7 @@
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex items-end"
-                                     x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
+                                     x-show="selectedModel?.engine_type !== 'ds4' && (!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm')">
                                     <button type="button" @click="loadGenerationDefaults"
                                             :disabled="loadingGenDefaults"
                                             class="w-full px-4 py-2.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-xl border border-neutral-200 transition-all disabled:opacity-50">
@@ -421,10 +534,10 @@
                     </div>
 
                     <!-- Right: Advanced Settings -->
-                    <div class="w-full lg:w-2/5 lg:pl-6 mt-6 lg:mt-0 pt-6 lg:pt-0 border-t lg:border-t-0 border-neutral-200">
+                    <div x-show="selectedModel?.engine_type !== 'ds4'" class="w-full lg:w-2/5 lg:pl-6 mt-6 lg:mt-0 pt-6 lg:pt-0 border-t lg:border-t-0 border-neutral-200">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.advanced_label') }}</h3>
                         <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1"
-                             x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
+                             x-show="selectedModel?.engine_type !== 'ds4' && (!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm')">
                             <!-- Enable Thinking -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>
