@@ -92,7 +92,9 @@ int affine_bytes_per_pack(int bits) {
 }
 
 bool supported_deepseek_affine(int group_size, int bits) {
-  return group_size == 64 && (bits == 2 || bits == 3);
+  // 4/8-bit joined 2/3-bit once the generic dequant template grew their
+  // instantiations — they are the most common community affine exports.
+  return group_size == 64 && (bits == 2 || bits == 3 || bits == 4 || bits == 8);
 }
 
 int affine_packed_row_bytes(int K, int bits) {
@@ -157,7 +159,7 @@ class GlmDsaQ8VupFlatPrimitive : public Primitive {
     if (weight.shape(0) != H || scales.shape(0) != H ||
         biases.shape(0) != H || scales.shape(1) != N ||
         biases.shape(1) != N || weight.shape(2) * pack_factor != K ||
-        scales.shape(2) != K / group_size ||
+        (K % group_size) != 0 || scales.shape(2) != K / group_size ||
         biases.shape(2) != K / group_size) {
       return true;
     }
@@ -394,7 +396,7 @@ class DeepseekMxfp4GatherBlocksPrimitive : public Primitive {
       return true;
     }
     if (weight.shape(2) * values_per_uint32 != K || scales.shape(0) != E ||
-        scales.shape(1) != N || scales.shape(2) != K / group_size) {
+        scales.shape(1) != N || (K % group_size) != 0 || scales.shape(2) != K / group_size) {
       return true;
     }
     return false;
@@ -692,7 +694,7 @@ class DeepseekAffineGatherBlocksPrimitive : public Primitive {
     }
     if (weight.shape(2) * static_cast<int>(sizeof(uint32_t)) != packed_bytes ||
         scales.shape(0) != E || scales.shape(1) != N ||
-        scales.shape(2) != K / group_size || biases.shape() != scales.shape()) {
+        (K % group_size) != 0 || scales.shape(2) != K / group_size || biases.shape() != scales.shape()) {
       return true;
     }
     return false;
@@ -1001,7 +1003,7 @@ class DeepseekMxfp4GatherExpertPrimitive : public Primitive {
       return true;
     }
     if (weight.shape(2) * values_per_uint32 != K || scales.shape(0) != E ||
-        scales.shape(1) != N || scales.shape(2) != K / group_size) {
+        scales.shape(1) != N || (K % group_size) != 0 || scales.shape(2) != K / group_size) {
       return true;
     }
     return false;
@@ -1113,7 +1115,7 @@ array glm_dsa_q8_vup_flat(
   if (H != weight.shape(0) || H != scales.shape(0) ||
       H != biases.shape(0) || V != scales.shape(1) ||
       V != biases.shape(1) || x.shape(3) != K ||
-      scales.shape(2) != K / group_size ||
+      (K % group_size) != 0 || scales.shape(2) != K / group_size ||
       biases.shape(2) != K / group_size) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.glm_dsa_q8_vup_flat] incompatible shapes: "
@@ -1244,7 +1246,7 @@ array deepseek_mxfp4_gather_qmm_blocks(
   const int E = weight.shape(0);
   const int N = weight.shape(1);
   if (weight.shape(2) * values_per_uint32 != K || scales.shape(0) != E ||
-      scales.shape(1) != N || scales.shape(2) != K / group_size) {
+      scales.shape(1) != N || (K % group_size) != 0 || scales.shape(2) != K / group_size) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_blocks] "
         << "incompatible shapes: " << x.shape() << ", " << weight.shape()
@@ -1435,7 +1437,7 @@ array deepseek_affine_gather_qmm_blocks(
   if (packed_bytes <= 0 ||
       weight.shape(2) * static_cast<int>(sizeof(uint32_t)) != packed_bytes ||
       scales.shape(0) != E || scales.shape(1) != N ||
-      scales.shape(2) != K / group_size || biases.shape() != scales.shape()) {
+      (K % group_size) != 0 || scales.shape(2) != K / group_size || biases.shape() != scales.shape()) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.deepseek_affine_gather_qmm_blocks] "
         << "incompatible shapes: " << x.shape() << ", " << weight.shape()
@@ -1570,7 +1572,7 @@ array deepseek_mxfp4_gather_qmm_expert(
   const int E = weight.shape(0);
   const int N = weight.shape(1);
   if (weight.shape(2) * values_per_uint32 != K || scales.shape(0) != E ||
-      scales.shape(1) != N || scales.shape(2) != K / group_size) {
+      scales.shape(1) != N || (K % group_size) != 0 || scales.shape(2) != K / group_size) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_expert] "
         << "incompatible shapes: " << x.shape() << ", " << weight.shape()

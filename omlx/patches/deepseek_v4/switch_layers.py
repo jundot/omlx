@@ -245,7 +245,7 @@ class QuantizedSwitchLinear(nn.Module):
             and x.shape[-2] == 1
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
-            and self.bits in (2, 3)
+            and self.bits in (2, 3, 4, 8)
             and self.mode == "affine"
             and biases is not None
             and "bias" not in self

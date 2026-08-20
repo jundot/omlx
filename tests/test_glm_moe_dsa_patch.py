@@ -667,7 +667,7 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
 
     for dtype in (mx.bfloat16, mx.float16):
         x = mx.random.normal((routes, 1, input_dims), dtype=dtype)
-        for bits in (2, 3):
+        for bits in (2, 3, 4, 8):
             w0 = mx.random.normal(
                 (experts, output_dims, input_dims),
                 dtype=dtype,
