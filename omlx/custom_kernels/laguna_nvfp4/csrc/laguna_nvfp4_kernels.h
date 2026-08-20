@@ -135,6 +135,20 @@ std::pair<array, array> decode_router_top8(
     bool normalizing,
     StreamOrDevice s = {});
 
+// Fused sliding-attention decode (steady ring regime). Returns [64*128] bf16.
+array sliding_fused_attn_ring(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& raw_values,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    const array& k_cache,
+    const array& v_cache,
+    const array& params,
+    const array& scale_arr,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

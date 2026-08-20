@@ -367,6 +367,58 @@ def test_decode_router_top8_bit_exact(normalizing):
     assert bool(mx.all(sc == scf))
 
 
+def _ring_reference(rq, rk, rv, qw, kw, angles, kc, vc, widx, scale):
+    """Python reference of the fused ring attention (norm+rope+flash attn)."""
+    def norm_rope(x, w, angles):
+        n = mx.fast.rms_norm(x.reshape(-1, 128), w, 1e-6).reshape(-1, 128)
+        c = angles[:64].astype(mx.float32)
+        s_ = angles[64:128].astype(mx.float32)
+        f = n[..., :64].astype(mx.float32)
+        sec = n[..., 64:].astype(mx.float32)
+        o1 = (f * c - sec * s_).astype(mx.bfloat16)
+        o2 = (f * s_ + sec * c).astype(mx.bfloat16)
+        return mx.concatenate([o1, o2], axis=-1)
+    q = norm_rope(rq, qw, angles).reshape(64, 128)
+    k = norm_rope(rk, kw, angles).reshape(8, 128)
+    K = mx.concatenate(
+        [kc[:, :widx], k[:, None], kc[:, widx + 1 :]], axis=1)
+    V = mx.concatenate(
+        [vc[:, :widx], rv.reshape(8, 128)[:, None], vc[:, widx + 1 :]],
+        axis=1)
+    refs = []
+    for h in range(64):
+        kvh = h // 8
+        sc = (q[h].astype(mx.float32) * scale) @ K[kvh].astype(mx.float32).T
+        m = sc.max()
+        e = mx.exp(sc - m)
+        refs.append(((e[:, None] * V[kvh].astype(mx.float32)).sum(0) / e.sum())
+                    .astype(mx.bfloat16))
+    return mx.concatenate(refs)
+
+
+def test_sliding_fused_attn_ring_matches_reference():
+    """Fused sliding-attention ring vs a Python reference of the same
+    norm+rope+online-softmax arithmetic: matches within fast-exp ULP."""
+    mx.random.seed(24)
+    rq = mx.random.normal((64 * 128,)).astype(mx.bfloat16)
+    rk = mx.random.normal((8 * 128,)).astype(mx.bfloat16)
+    rv = mx.random.normal((8 * 128,)).astype(mx.bfloat16)
+    qw = mx.random.normal((128,)).astype(mx.bfloat16)
+    kw = mx.random.normal((128,)).astype(mx.bfloat16)
+    ang = mx.random.normal((128,)).astype(mx.float32)
+    kc = mx.random.normal((8, 512, 128)).astype(mx.bfloat16)
+    vc = mx.random.normal((8, 512, 128)).astype(mx.bfloat16)
+    widx = 17
+    scale = 0.0883
+    y = laguna_nvfp4.sliding_fused_attn_ring(
+        rq, rk, rv, qw, kw, ang, kc, vc, mx.array([widx], mx.uint32),
+        mx.array([scale], mx.float32))
+    ref = _ring_reference(rq, rk, rv, qw, kw, ang, kc, vc, widx, scale)
+    d = mx.abs(y.astype(mx.float32) - ref.astype(mx.float32))
+    # fast-exp ULP differences only; at these magnitudes well below 1e-3
+    assert float(d.max()) <= 2e-3, f"ring diverges: max {float(d.max()):.4g}"
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

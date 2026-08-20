@@ -447,6 +447,22 @@ def decode_router_top8(
         vals = vals / mx.maximum(mx.sum(vals), 1e-6)
     return ids, vals.astype(mx.bfloat16)
 
+
+def sliding_fused_attn_ring(
+    raw_queries, raw_keys, raw_values, query_weight, key_weight, angles,
+    k_cache, v_cache, params, scale_arr, stream=None,
+):
+    """Fused sliding-attention decode (steady ring regime; verbatim from
+    lagunaSlidingFusedAttentionKernel). Returns attended [64*128] bf16.
+    """
+    if _ext is not None and has_symbol("sliding_fused_attn_ring"):
+        return _ext.sliding_fused_attn_ring(
+            raw_queries, raw_keys, raw_values, query_weight, key_weight,
+            angles, k_cache, v_cache, params, scale_arr, stream=stream)
+    raise RuntimeError(
+        "laguna_nvfp4 sliding_fused_attn_ring requires the native extension "
+        "(the fused ring path has no pure-mlx equivalent).")
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

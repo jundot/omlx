@@ -897,6 +897,372 @@ kernel void name(                                                             \
 LAGUNA_ROUTER_TOP8_KERNEL(laguna_decode_router_top8_v3, 0)
 LAGUNA_ROUTER_TOP8_KERNEL(laguna_decode_router_top8_norm_v2, 1)
 
+// Fused sliding-attention decode (steady ring regime).
+// (verbatim from lagunaSlidingFusedAttentionKernel; T_LOAD_K/T_LOAD_V/
+// LAGUNA_RESCALE macros inline)
+//   raw_queries [64*128] bf16, raw_keys [8*128] bf16, raw_values [8*128] bf16
+//   query_weight [128] bf16, key_weight [128] bf16, angles [128] fp32
+//   k_cache [8][512][128] bf16, v_cache [8][512][128] bf16
+//   params [1] uint32 (write idx), scale_arr [1] fp32
+//   attended [64*128] bf16
+// Grid: 32 threadgroups (2 heads each) x 1024 threads.
+kernel void laguna_sliding_fused_attn_ring_v1(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* raw_values [[buffer(2)]],
+    const device bfloat* query_weight [[buffer(3)]],
+    const device bfloat* key_weight [[buffer(4)]],
+    const device float* angles [[buffer(5)]],
+    const device bfloat* k_cache [[buffer(6)]],
+    const device bfloat* v_cache [[buffer(7)]],
+    const device uint32_t* params [[buffer(8)]],
+    const device float* scale_arr [[buffer(9)]],
+    device bfloat* attended [[buffer(10)]],
+    uint pair_tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint head_dim = 128;
+    constexpr uint window = 512;
+    constexpr uint gqa = 8;
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int BDP = BD + 1;
+    constexpr int qk_per_thread = 4;
+    constexpr int v_per_thread = 4;
+    constexpr uint rotary_pairs = 64;
+    constexpr int N = 512;
+
+    typedef float U;
+
+    uint head0 = pair_tg * 2;
+    uint head1 = head0 + 1;
+    uint kv_head = head0 / gqa;
+    uint widx = params[0];
+    float scale = scale_arr[0];
+
+    threadgroup bfloat tg_q0[head_dim];
+    threadgroup bfloat tg_q1[head_dim];
+    threadgroup bfloat tg_k[head_dim];
+    threadgroup bfloat tg_v[head_dim];
+
+    if (sg < 3) {
+        const device bfloat* input =
+            sg == 0 ? raw_queries + head0 * head_dim
+            : sg == 1 ? raw_queries + head1 * head_dim
+                      : raw_keys + kv_head * head_dim;
+        const device bfloat* weight =
+            sg == 2 ? key_weight : query_weight;
+        threadgroup bfloat* outrow =
+            sg == 0 ? tg_q0 : sg == 1 ? tg_q1 : tg_k;
+
+        uint base = lane * 4;
+        thread bfloat normalized[4];
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            float value = float(input[base + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+        float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+        for (uint i = 0; i < 4; ++i) {
+            normalized[i] =
+                weight[base + i] *
+                bfloat(float(input[base + i]) * inverse_rms);
+        }
+        thread float paired[4];
+        for (uint i = 0; i < 4; ++i) {
+            paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+        }
+        if (lane < 16) {
+            for (uint i = 0; i < 4; ++i) {
+                uint pair = base + i;
+                float first = float(normalized[i]);
+                float second = paired[i];
+                float cosine = angles[pair];
+                float sine = angles[pair + rotary_pairs];
+                outrow[pair] = bfloat(first * cosine - second * sine);
+                outrow[pair + rotary_pairs] =
+                    bfloat(first * sine + second * cosine);
+            }
+        }
+    } else if (sg == 3) {
+        const device bfloat* vin = raw_values + kv_head * head_dim;
+        for (uint i = lane; i < head_dim; i += 32) {
+            tg_v[i] = vin[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((head0 % gqa) == 0 && sg == 0) {
+        device bfloat* kc = (device bfloat*)k_cache +
+            (size_t)kv_head * (window * head_dim) +
+            (size_t)widx * head_dim;
+        device bfloat* vc = (device bfloat*)v_cache +
+            (size_t)kv_head * (window * head_dim) +
+            (size_t)widx * head_dim;
+        for (uint i = lane; i < head_dim; i += 32) {
+            kc[i] = tg_k[i];
+            vc[i] = tg_v[i];
+        }
+    }
+
+    threadgroup U outputs[4 * BN * BDP];
+    threadgroup U max_scores[2 * BN];
+    threadgroup U sum_exp_scores[2 * BN];
+
+    const device bfloat* pair_keys = k_cache +
+        (size_t)kv_head * (window * head_dim) +
+        (size_t)sg * head_dim + lane * qk_per_thread;
+    const device bfloat* pair_values = v_cache +
+        (size_t)kv_head * (window * head_dim) +
+        (size_t)sg * head_dim + lane * v_per_thread;
+    const int inner_k_stride = BN * int(head_dim);
+    const int inner_v_stride = BN * int(head_dim);
+
+    thread U pair_q0[qk_per_thread];
+    thread U pair_q1[qk_per_thread];
+    thread U pair_o0[v_per_thread];
+    thread U pair_o1[v_per_thread];
+
+    for (int j = 0; j < qk_per_thread; ++j) {
+        pair_q0[j] =
+            static_cast<U>(scale) * tg_q0[lane * qk_per_thread + j];
+        pair_q1[j] =
+            static_cast<U>(scale) * tg_q1[lane * qk_per_thread + j];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+        pair_o0[j] = 0;
+        pair_o1[j] = 0;
+    }
+
+    U pair_max0 = metal::numeric_limits<U>::lowest();
+    U pair_max1 = metal::numeric_limits<U>::lowest();
+    U pair_sum0 = 0;
+    U pair_sum1 = 0;
+
+    int i = sg;
+    for (; i + BN < N; i += 2 * BN) {
+        const device bfloat* pipe_keys_b = pair_keys + inner_k_stride;
+        const device bfloat* pipe_values_b = pair_values + inner_v_stride;
+        const bool sub_a = uint(i) == widx;
+        const bool sub_b = uint(i + BN) == widx;
+        U pipe_ka[4];
+        U pipe_kb[4];
+        // T_LOAD_K
+        if (sub_a) {
+            pipe_ka[0] = tg_k[lane * qk_per_thread + 0];
+            pipe_ka[1] = tg_k[lane * qk_per_thread + 1];
+            pipe_ka[2] = tg_k[lane * qk_per_thread + 2];
+            pipe_ka[3] = tg_k[lane * qk_per_thread + 3];
+        } else {
+            const vec<bfloat, 4> v_ =
+                *reinterpret_cast<const device vec<bfloat, 4>*>(pair_keys);
+            pipe_ka[0] = v_.x; pipe_ka[1] = v_.y;
+            pipe_ka[2] = v_.z; pipe_ka[3] = v_.w;
+        }
+        if (sub_b) {
+            pipe_kb[0] = tg_k[lane * qk_per_thread + 0];
+            pipe_kb[1] = tg_k[lane * qk_per_thread + 1];
+            pipe_kb[2] = tg_k[lane * qk_per_thread + 2];
+            pipe_kb[3] = tg_k[lane * qk_per_thread + 3];
+        } else {
+            const vec<bfloat, 4> v_ =
+                *reinterpret_cast<const device vec<bfloat, 4>*>(pipe_keys_b);
+            pipe_kb[0] = v_.x; pipe_kb[1] = v_.y;
+            pipe_kb[2] = v_.z; pipe_kb[3] = v_.w;
+        }
+        bfloat pipe_va0, pipe_va1, pipe_va2, pipe_va3;
+        bfloat pipe_vb0, pipe_vb1, pipe_vb2, pipe_vb3;
+        // T_LOAD_V
+        if (sub_a) {
+            pipe_va0 = tg_v[lane * v_per_thread + 0];
+            pipe_va1 = tg_v[lane * v_per_thread + 1];
+            pipe_va2 = tg_v[lane * v_per_thread + 2];
+            pipe_va3 = tg_v[lane * v_per_thread + 3];
+        } else {
+            const vec<bfloat, 4> v_ =
+                *reinterpret_cast<const device vec<bfloat, 4>*>(pair_values);
+            pipe_va0 = v_.x; pipe_va1 = v_.y;
+            pipe_va2 = v_.z; pipe_va3 = v_.w;
+        }
+        if (sub_b) {
+            pipe_vb0 = tg_v[lane * v_per_thread + 0];
+            pipe_vb1 = tg_v[lane * v_per_thread + 1];
+            pipe_vb2 = tg_v[lane * v_per_thread + 2];
+            pipe_vb3 = tg_v[lane * v_per_thread + 3];
+        } else {
+            const vec<bfloat, 4> v_ =
+                *reinterpret_cast<const device vec<bfloat, 4>*>(pipe_values_b);
+            pipe_vb0 = v_.x; pipe_vb1 = v_.y;
+            pipe_vb2 = v_.z; pipe_vb3 = v_.w;
+        }
+
+        U pair_score0 = 0;
+        U pair_score1 = 0;
+        pair_score0 += pair_q0[0] * pipe_ka[0];
+        pair_score1 += pair_q1[0] * pipe_ka[0];
+        pair_score0 += pair_q0[1] * pipe_ka[1];
+        pair_score1 += pair_q1[1] * pipe_ka[1];
+        pair_score0 += pair_q0[2] * pipe_ka[2];
+        pair_score1 += pair_q1[2] * pipe_ka[2];
+        pair_score0 += pair_q0[3] * pipe_ka[3];
+        pair_score1 += pair_q1[3] * pipe_ka[3];
+        pair_score0 = simd_sum(pair_score0);
+        pair_score1 = simd_sum(pair_score1);
+
+        U pair_new_max0 = metal::max(pair_max0, pair_score0);
+        U pair_new_max1 = metal::max(pair_max1, pair_score1);
+        U pair_factor0;
+        U pair_factor1;
+        // LAGUNA_RESCALE
+        {
+            const float db_delta_ = (pair_max0 - pair_new_max0);
+            pair_factor0 = (as_type<uint>(db_delta_) == 0u)
+                ? float(1.0f) : metal::fast::exp(db_delta_);
+        }
+        {
+            const float db_delta_ = (pair_max1 - pair_new_max1);
+            pair_factor1 = (as_type<uint>(db_delta_) == 0u)
+                ? float(1.0f) : metal::fast::exp(db_delta_);
+        }
+        U pair_exp0 = metal::fast::exp(pair_score0 - pair_new_max0);
+        U pair_exp1 = metal::fast::exp(pair_score1 - pair_new_max1);
+
+        pair_max0 = pair_new_max0;
+        pair_max1 = pair_new_max1;
+        pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
+        pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
+
+        pair_o0[0] = pair_o0[0] * pair_factor0 + pair_exp0 * pipe_va0;
+        pair_o1[0] = pair_o1[0] * pair_factor1 + pair_exp1 * pipe_va0;
+        pair_o0[1] = pair_o0[1] * pair_factor0 + pair_exp0 * pipe_va1;
+        pair_o1[1] = pair_o1[1] * pair_factor1 + pair_exp1 * pipe_va1;
+        pair_o0[2] = pair_o0[2] * pair_factor0 + pair_exp0 * pipe_va2;
+        pair_o1[2] = pair_o1[2] * pair_factor1 + pair_exp1 * pipe_va2;
+        pair_o0[3] = pair_o0[3] * pair_factor0 + pair_exp0 * pipe_va3;
+        pair_o1[3] = pair_o1[3] * pair_factor1 + pair_exp1 * pipe_va3;
+
+        U pipeb_score0 = 0;
+        U pipeb_score1 = 0;
+        pipeb_score0 += pair_q0[0] * pipe_kb[0];
+        pipeb_score1 += pair_q1[0] * pipe_kb[0];
+        pipeb_score0 += pair_q0[1] * pipe_kb[1];
+        pipeb_score1 += pair_q1[1] * pipe_kb[1];
+        pipeb_score0 += pair_q0[2] * pipe_kb[2];
+        pipeb_score1 += pair_q1[2] * pipe_kb[2];
+        pipeb_score0 += pair_q0[3] * pipe_kb[3];
+        pipeb_score1 += pair_q1[3] * pipe_kb[3];
+        pipeb_score0 = simd_sum(pipeb_score0);
+        pipeb_score1 = simd_sum(pipeb_score1);
+
+        U pipeb_new_max0 = metal::max(pair_max0, pipeb_score0);
+        U pipeb_new_max1 = metal::max(pair_max1, pipeb_score1);
+        U pipeb_factor0;
+        U pipeb_factor1;
+        {
+            const float db_delta_ = (pair_max0 - pipeb_new_max0);
+            pipeb_factor0 = (as_type<uint>(db_delta_) == 0u)
+                ? float(1.0f) : metal::fast::exp(db_delta_);
+        }
+        {
+            const float db_delta_ = (pair_max1 - pipeb_new_max1);
+            pipeb_factor1 = (as_type<uint>(db_delta_) == 0u)
+                ? float(1.0f) : metal::fast::exp(db_delta_);
+        }
+        U pipeb_exp0 = metal::fast::exp(pipeb_score0 - pipeb_new_max0);
+        U pipeb_exp1 = metal::fast::exp(pipeb_score1 - pipeb_new_max1);
+
+        pair_max0 = pipeb_new_max0;
+        pair_max1 = pipeb_new_max1;
+        pair_sum0 = pair_sum0 * pipeb_factor0 + pipeb_exp0;
+        pair_sum1 = pair_sum1 * pipeb_factor1 + pipeb_exp1;
+
+        pair_o0[0] = pair_o0[0] * pipeb_factor0 + pipeb_exp0 * pipe_vb0;
+        pair_o1[0] = pair_o1[0] * pipeb_factor1 + pipeb_exp1 * pipe_vb0;
+        pair_o0[1] = pair_o0[1] * pipeb_factor0 + pipeb_exp0 * pipe_vb1;
+        pair_o1[1] = pair_o1[1] * pipeb_factor1 + pipeb_exp1 * pipe_vb1;
+        pair_o0[2] = pair_o0[2] * pipeb_factor0 + pipeb_exp0 * pipe_vb2;
+        pair_o1[2] = pair_o1[2] * pipeb_factor1 + pipeb_exp1 * pipe_vb2;
+        pair_o0[3] = pair_o0[3] * pipeb_factor0 + pipeb_exp0 * pipe_vb3;
+        pair_o1[3] = pair_o1[3] * pipeb_factor1 + pipeb_exp1 * pipe_vb3;
+
+        pair_keys += 2 * inner_k_stride;
+        pair_values += 2 * inner_v_stride;
+    }
+
+    constexpr int pair_planes = 2;
+    constexpr int pair_plane_size = BN * BDP;
+    if (lane == 0) {
+        max_scores[sg] = pair_max0;
+        max_scores[BN + sg] = pair_max1;
+        sum_exp_scores[sg] = pair_sum0;
+        sum_exp_scores[BN + sg] = pair_sum1;
+    }
+    for (int p = 0; p < pair_planes; ++p) {
+        outputs[p * pair_plane_size + lane * BDP + sg] = pair_o0[p];
+        outputs[
+            (pair_planes + p) * pair_plane_size + lane * BDP + sg] =
+            pair_o1[p];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    pair_max0 = max_scores[lane];
+    pair_max1 = max_scores[BN + lane];
+    U pair_global_max0 = simd_max(pair_max0);
+    U pair_global_max1 = simd_max(pair_max1);
+    U pair_global_factor0 = metal::fast::exp(pair_max0 - pair_global_max0);
+    U pair_global_factor1 = metal::fast::exp(pair_max1 - pair_global_max1);
+    pair_sum0 = simd_sum(sum_exp_scores[lane] * pair_global_factor0);
+    pair_sum1 = simd_sum(sum_exp_scores[BN + lane] * pair_global_factor1);
+
+    for (int p = 0; p < pair_planes; ++p) {
+        U acc0 = simd_sum(
+            outputs[p * pair_plane_size + sg * BDP + lane] *
+            pair_global_factor0);
+        U acc1 = simd_sum(
+            outputs[
+                (pair_planes + p) * pair_plane_size + sg * BDP + lane] *
+            pair_global_factor1);
+        pair_o0[p] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+        pair_o1[p] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int p = 0; p < pair_planes; ++p) {
+        outputs[p * pair_plane_size + lane * BDP + sg] =
+            pair_o0[pair_planes + p];
+        outputs[
+            (pair_planes + p) * pair_plane_size + lane * BDP + sg] =
+            pair_o1[pair_planes + p];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int p = 0; p < pair_planes; ++p) {
+        U acc0 = simd_sum(
+            outputs[p * pair_plane_size + sg * BDP + lane] *
+            pair_global_factor0);
+        U acc1 = simd_sum(
+            outputs[
+                (pair_planes + p) * pair_plane_size + sg * BDP + lane] *
+            pair_global_factor1);
+        pair_o0[pair_planes + p] =
+            pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+        pair_o1[pair_planes + p] =
+            pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+    }
+
+    if (lane == 0) {
+        device bfloat* pair_out0 =
+            attended + head0 * head_dim + sg * v_per_thread;
+        device bfloat* pair_out1 =
+            attended + head1 * head_dim + sg * v_per_thread;
+        for (int p = 0; p < v_per_thread; ++p) {
+            pair_out0[p] = static_cast<bfloat>(pair_o0[p]);
+            pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
+        }
+    }
+}
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input

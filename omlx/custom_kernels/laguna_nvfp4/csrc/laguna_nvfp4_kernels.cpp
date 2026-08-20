@@ -813,6 +813,88 @@ std::pair<array, array> decode_router_top8(
     return {outs[0], outs[1]};
 }
 
+// SlidingFusedAttnRingPrimitive: fused sliding-attention decode (ring).
+//   inputs[0] raw_queries [64*128], [1] raw_keys [8*128], [2] raw_values
+//   [3] query_weight [128], [4] key_weight [128], [5] angles [128] fp32
+//   [6] k_cache [8][512][128], [7] v_cache [8][512][128]
+//   [8] params [1] uint32, [9] scale_arr [1] fp32
+//   output[0] attended [64*128] bf16
+class SlidingFusedAttnRingPrimitive : public Primitive {
+ public:
+    explicit SlidingFusedAttnRingPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 SlidingFusedAttnRingPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        auto kernel = get_laguna_kernel(
+            d, "laguna_sliding_fused_attn_ring_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        MTL::Size group_dims(1024, 1, 1);
+        MTL::Size grid_dims(64 / 2, 1, 1);  // 64 sliding heads, 2 per group
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(SlidingFusedAttnRingPrimitive)
+};
+
+array sliding_fused_attn_ring(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& raw_values,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    const array& k_cache,
+    const array& v_cache,
+    const array& params,
+    const array& scale_arr,
+    StreamOrDevice s) {
+    if (raw_queries.ndim() != 1 || raw_queries.dtype() != bfloat16 ||
+        raw_queries.shape(0) != 64 * 128 ||
+        raw_keys.shape(0) != 8 * 128 || raw_values.shape(0) != 8 * 128 ||
+        query_weight.shape(0) != 128 || key_weight.shape(0) != 128 ||
+        angles.dtype() != float32 || angles.shape(0) != 128 ||
+        k_cache.ndim() != 3 || k_cache.dtype() != bfloat16 ||
+        k_cache.shape(0) != 8 || k_cache.shape(1) != 512 ||
+        k_cache.shape(2) != 128 ||
+        v_cache.ndim() != 3 || v_cache.shape(0) != 8 ||
+        v_cache.shape(1) != 512 || v_cache.shape(2) != 128 ||
+        params.ndim() != 1 || params.dtype() != uint32 ||
+        scale_arr.ndim() != 1 || scale_arr.dtype() != float32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 sliding_fused_attn_ring: shape mismatch — "
+               "raw_queries " << raw_queries.shape() << ", k_cache "
+            << k_cache.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<SlidingFusedAttnRingPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(64 * 128)};
+    return array(out_shape, bfloat16, prim,
+                 {raw_queries, raw_keys, raw_values, query_weight, key_weight,
+                  angles, k_cache, v_cache, params, scale_arr});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }
