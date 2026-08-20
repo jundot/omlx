@@ -692,8 +692,10 @@
                                             <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                         </div>
+                                        <!-- Tri-state: null = Auto (embedded-DSpark checkpoints enable
+                                             themselves), true = On, false = Off. Click cycles the three. -->
                                         <button type="button"
-                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
+                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.mtp_enabled = (modelSettings.mtp_enabled === null ? true : (modelSettings.mtp_enabled ? false : null))"
                                                 :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
                                                             ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
@@ -703,13 +705,15 @@
                                                                     ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))"
                                                 :class="[
-                                                    modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                    modelSettings.mtp_enabled ? 'bg-black' : (modelSettings.mtp_enabled === null ? 'bg-neutral-400' : 'bg-neutral-200'),
                                                     ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                            <span :class="modelSettings.mtp_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                            <span :class="modelSettings.mtp_enabled ? 'translate-x-5' : (modelSettings.mtp_enabled === null ? 'translate-x-2.5' : 'translate-x-0')"
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
+                                        <span class="text-[10px] uppercase tracking-wide text-neutral-400 mt-1.5 ml-1 flex-shrink-0"
+                                              x-text="modelSettings.mtp_enabled === null ? 'Auto' : (modelSettings.mtp_enabled ? 'On' : 'Off')"></span>
                                     </div>
                                 </div>
 

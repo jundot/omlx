@@ -192,3 +192,31 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_mtp_tri_state_survives_the_settings_route():
+    """None means auto and must round-trip: the route used to bool() it,
+    so any unrelated settings save silently pinned MTP to explicit off."""
+    pool, _entry = _failed_pool()
+
+    # An explicit None (auto) request must not collapse to False.
+    settings = ModelSettings(mtp_enabled=False)
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mtp_enabled=None)
+    )
+    assert settings.mtp_enabled is None
+
+    # A save that does not mention mtp_enabled must leave auto untouched.
+    settings = ModelSettings()
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(temperature=0.5)
+    )
+    assert settings.mtp_enabled is None
+
+    # An explicit off stays an explicit off.
+    settings = ModelSettings()
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mtp_enabled=False)
+    )
+    assert settings.mtp_enabled is False

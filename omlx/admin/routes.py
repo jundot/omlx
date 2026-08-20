@@ -2553,9 +2553,17 @@ async def update_model_settings(
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
 
-    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). Tri-state: None
+    # means auto (on for checkpoints shipping an embedded DSpark drafter)
+    # and must survive the round-trip — bool() here silently turned every
+    # settings save into an explicit off.
     if "mtp_enabled" in sent:
-        new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
+        if is_diffusion_model:
+            new_mtp_enabled = False
+        elif request.mtp_enabled is None:
+            new_mtp_enabled = None
+        else:
+            new_mtp_enabled = bool(request.mtp_enabled)
         if new_mtp_enabled:
             # Compatibility check: the model needs MTP heads in config.json AND
             # the model_type must be one PR 990 / PR 15 covers AND the weight

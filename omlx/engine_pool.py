@@ -520,8 +520,11 @@ class EnginePool:
         # Load-time model variants. Dependent fields only matter when their
         # feature is active; stale draft paths or tuning defaults must not
         # force a reload when the corresponding feature is disabled.
-        mtp_active = bool(data.get("mtp_enabled", False))
-        add("mtp_enabled", mtp_active)
+        # Tri-state (None = auto: on when the checkpoint ships an embedded
+        # drafter). Hash the raw value — collapsing None to False would skip
+        # the reload when a user explicitly disables MTP on an auto-enabled
+        # checkpoint.
+        add("mtp_enabled", data.get("mtp_enabled", None))
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)

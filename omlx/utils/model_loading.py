@@ -608,9 +608,24 @@ def maybe_apply_pre_load_patches(
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
     if _is_mtp_compatible(config, model_type):
-        mtp_enabled = bool(
-            model_settings is not None and getattr(model_settings, "mtp_enabled", False)
+        mtp_setting = (
+            getattr(model_settings, "mtp_enabled", None)
+            if model_settings is not None
+            else None
         )
+        if mtp_setting is None:
+            # Auto: a checkpoint that ships embedded DSpark drafting stages
+            # is built to be served with them. Plain MTP heads stay opt-in
+            # (acceptance varies by family and quant), and auto yields to
+            # any explicitly chosen speculative path — the exclusivity
+            # validator only sees explicit True, not a resolved auto.
+            mtp_enabled = (
+                _has_dspark_heads(config)
+                and not getattr(model_settings, "dflash_enabled", False)
+                and not getattr(model_settings, "vlm_mtp_enabled", False)
+            )
+        else:
+            mtp_enabled = bool(mtp_setting)
         from ..patches.mlx_lm_mtp import (
             apply_mlx_lm_mtp_patch,
             set_mtp_active,

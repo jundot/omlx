@@ -159,12 +159,16 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
-        mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
-            When True, BatchGenerator uses MTP draft+verify for singleton decode and
-            for multi-row decode batches whose cache positions are aligned. Unaligned
-            continuous batches fall back to standard decoding automatically. Compatible
-            model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
-            dflash_enabled.
+        mtp_enabled: Native multi-token prediction (mlx-lm PR 990 / PR 15
+            monkey-patch), tri-state. None (default) = auto: enabled only for
+            checkpoints that ship an embedded DSpark drafter, and yielding to
+            any explicitly chosen speculative path. True forces it on (plain
+            MTP heads included), False forces it off. When active,
+            BatchGenerator uses MTP draft+verify for singleton decode and for
+            multi-row decode batches whose cache positions are aligned;
+            unaligned continuous batches fall back to standard decoding.
+            Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*.
+            Mutually exclusive with dflash_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model. Mutually exclusive with processor-backed
@@ -285,8 +289,10 @@ class ModelSettings:
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash.
-    mtp_enabled: bool = False
+    # with dflash. None = auto: on for checkpoints that ship an embedded
+    # DSpark drafter (they are built to be served with it and draft/verify
+    # is token-identical), off otherwise.
+    mtp_enabled: Optional[bool] = None
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
     # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
     # An adaptive controller picks 1..max per sequence from rolling

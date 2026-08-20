@@ -1852,18 +1852,24 @@ class TestBatchGeneratorDispatch:
 
 
 class TestModelSettingsMtp:
-    def test_default_mtp_disabled(self):
+    def test_default_mtp_is_auto(self):
+        # Tri-state: None = auto (model_loading enables MTP only for
+        # checkpoints that ship an embedded DSpark drafter; everything else
+        # resolves to off). See tests/test_mtp_auto_default.py.
         s = ModelSettings()
-        assert s.mtp_enabled is False
+        assert s.mtp_enabled is None
 
     def test_mtp_enabled_roundtrip(self):
         original = ModelSettings(mtp_enabled=True)
         restored = ModelSettings.from_dict(original.to_dict())
         assert restored.mtp_enabled is True
 
-    def test_legacy_settings_dict_defaults_mtp_off(self):
+    def test_legacy_settings_dict_defaults_mtp_auto(self):
+        # A legacy dict without the key means the user never chose — that is
+        # auto (None), not an explicit off. Only checkpoints shipping an
+        # embedded DSpark drafter resolve auto to on at load.
         s = ModelSettings.from_dict({"display_name": "qwen3.6"})
-        assert s.mtp_enabled is False
+        assert s.mtp_enabled is None
 
     def test_mutual_exclusion_with_dflash(self):
         with pytest.raises(ValueError, match="speculative-decoding"):

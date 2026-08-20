@@ -7417,7 +7417,7 @@
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
-                    mtp_enabled: s.mtp_enabled || false,
+                    mtp_enabled: s.mtp_enabled === undefined ? null : s.mtp_enabled,
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -8360,7 +8360,7 @@
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
-                                mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_enabled: this.modelSettings.mtp_enabled,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -8423,7 +8423,7 @@
                                     dflash_draft_sink_size: null,
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
-                                    mtp_enabled: false,
+                                    mtp_enabled: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
@@ -8526,7 +8526,7 @@
                         this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
-                        this.modelSettings.mtp_enabled = false;
+                        this.modelSettings.mtp_enabled = null;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
