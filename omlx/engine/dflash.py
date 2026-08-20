@@ -397,6 +397,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 20 * 1024**3
         )
+        # Prefix-snapshot insert threshold. dflash-mlx skips inserting a snapshot whose prompt is
+        # longer than `max_snapshot_tokens` (default 32_000, dflash_mlx/runtime/config.py), and oMLX
+        # never passed the field, so on this path the default was unreachable. An agent workload
+        # carries a large fixed prefix — system prompt plus tool schemas — and a ~50k-token prompt
+        # therefore never entered the cache at all: every turn re-prefilled the whole thing (measured
+        # 80-93s per turn on an M5 Pro with a 35B MoE). 0 disables the cap; the cache stays bounded by
+        # `prefix_cache_max_bytes` and `prefix_cache_max_entries` either way. Defaults to None so the
+        # dflash-mlx default still applies when the setting is absent.
+        raw_max_snapshot = getattr(model_settings, "dflash_max_snapshot_tokens", None) if model_settings else None
+        self._max_snapshot_tokens = int(raw_max_snapshot) if raw_max_snapshot is not None else None
         self._draft_window_size = (
             getattr(model_settings, "dflash_draft_window_size", None)
             if model_settings
@@ -488,6 +498,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # stays bounded instead of filling the disk (issue #1326).
             prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
             # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
+            max_snapshot_tokens=self._max_snapshot_tokens,
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
