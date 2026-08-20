@@ -73,12 +73,27 @@ pass. Real-model validation (Poolside 100k×2048 lm_head + a real hidden row):
 prune argmax == stock argmax, winner slot bf16-exact, zero non-winner slots
 above the winner — the prune's certified-bound contract.
 
-Not ported (explicitly excluded): the NVFP4 attention re-quantization
-transform (`LagunaRuntimeWeights`), which converts the bf16 attention
-projections to NVFP4 — without it the decode QKV / o_proj / QK-norm kernels
-have no matching bank in omlx's stock bf16 attention path. Also not ported:
-the lane-major scale-bank variants of the QKV/o_proj kernels (alternate
-scale layout requiring the same transform).
+## NVFP4 attention re-quantization (ported, opt-in)
+
+`lagunaNativeAffineWeight` is ported: with `OMLX_LAGUNA_NVFP4_ATTN=1` (plus
+`OMLX_LAGUNA_NVFP4_KERNELS=1`), each bf16 attention projection is quantized
+to NVFP4 group-16 at load and the fused QKV bank is built, so the decode QKV
+kernel dispatches against it (decode-only; prefill keeps the bf16 params).
+
+**Measured: +22% decode** (10.40 vs 12.67 ms/tok, 96-token real decode on the
+Poolside pin) — the largest integrated win of the port.
+
+**Important — token divergence:** the NVFP4 requant is lossy vs the bf16
+serial path, so with it on the emitted tokens diverge from omlx's bf16
+baseline at near ties (94/96 positions differed on the probe). The
+challenge's ranked runtime is self-consistent because its serial reference
+ALSO uses NVFP4 attention; omlx's default serial path is bf16, so this must
+stay **default-OFF and opt-in**, documented as non-token-identical. The
+challenge's own correctness contract (hidden serial replay) is what makes
+this acceptable there.
+
+Not ported: the lane-major scale-bank variants of the QKV/o_proj kernels
+(alternate scale layout).
 
 ## Correctness posture (important)
 

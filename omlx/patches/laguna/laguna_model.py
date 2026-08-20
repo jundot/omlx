@@ -130,6 +130,14 @@ _FUSED_SHARED_GATE_UP = os.environ.get("OMLX_LAGUNA_FUSED_SHARED_GATE_UP", "0") 
 # fp32 in the Python path), so the shared-expert outputs differ at bf16 ulp.
 _LAGUNA_NVFP4_KERNELS = os.environ.get("OMLX_LAGUNA_NVFP4_KERNELS", "0") != "0"
 
+# NVFP4 attention re-quantization (challenge lagunaNativeAffineWeight): at
+# load, each bf16 attention projection is quantized to NVFP4 group-16 and a
+# fused [q;k;v] bank is built so the decoder QKV + o_proj kernels can
+# dispatch against it (decode-only; prefill keeps the stock bf16 params).
+# Default OFF (opt-in) - changes attention numerics to the NVFP4
+# approximation the challenge's ranked runtime uses.
+_LAGUNA_NVFP4_ATTN = os.environ.get("OMLX_LAGUNA_NVFP4_ATTN", "0") != "0"
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -639,6 +647,10 @@ class Attention(nn.Module):
         else:
             self.sink = None
 
+        # NVFP4 requantized attention bank (lazy; built on first decode call
+        # with the kernels enabled). mirrors lagunaNativeAffineWeight.
+        self._nvfp4_bank = None
+
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
@@ -659,6 +671,43 @@ class Attention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
         )
 
+    def _prepare_nvfp4_bank(self) -> bool:
+        """Quantize q/k/v/o to NVFP4 group-16 and build the fused QKV bank."""
+        if self._nvfp4_bank is not None:
+            return self._nvfp4_bank is not False
+        if not _LAGUNA_NVFP4_ATTN or not _LAGUNA_NVFP4_KERNELS:
+            self._nvfp4_bank = False
+            return False
+        try:
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _laguna_nvfp4
+
+            if not _laguna_nvfp4.has_native():
+                self._nvfp4_bank = False
+                return False
+            q = self.q_proj.weight.astype(mx.float32)
+            k = self.k_proj.weight.astype(mx.float32)
+            v = self.v_proj.weight.astype(mx.float32)
+            o = self.o_proj.weight.astype(mx.float32)
+            qc, qs = mx.quantize(q, group_size=16, bits=4, mode="nvfp4")
+            kc, ks = mx.quantize(k, group_size=16, bits=4, mode="nvfp4")
+            vc, vs = mx.quantize(v, group_size=16, bits=4, mode="nvfp4")
+            oc, os_ = mx.quantize(o, group_size=16, bits=4, mode="nvfp4")
+            # fused QKV bank: [rows=(heads+2kv)*128, hidden/8] codes, scales
+            codes = mx.concatenate(
+                [qc.view(mx.uint8).reshape(qc.shape[0], -1),
+                 kc.view(mx.uint8).reshape(kc.shape[0], -1),
+                 vc.view(mx.uint8).reshape(vc.shape[0], -1)], axis=0)
+            scales = mx.concatenate([qs, ks, vs], axis=0)
+            self._nvfp4_bank = {
+                "qkv_codes": codes, "qkv_scales": scales,
+                "o_codes": oc.view(mx.uint8).reshape(oc.shape[0], -1),
+                "o_scales": os_,
+            }
+            return True
+        except Exception:
+            self._nvfp4_bank = False
+            return False
+
     def __call__(
         self,
         x: mx.array,
@@ -667,19 +716,50 @@ class Attention(nn.Module):
     ) -> mx.array:
         bsz, seq_len, _ = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        queries = self.q_norm(
-            queries.reshape(bsz, seq_len, self.n_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        keys = self.k_norm(
-            keys.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        values = values.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(
-            0, 2, 1, 3
+        # NVFP4-decode QKV path (opt-in): single-token decode dispatches the
+        # fused q/k/v NVFP4 kernel against the requantized bank.
+        from omlx.custom_kernels.laguna_nvfp4 import fast as _laguna_nvfp4
+
+        use_nvfp4_qkv = (
+            bsz == 1
+            and seq_len == 1
+            and self._prepare_nvfp4_bank()
+            and _laguna_nvfp4.has_symbol("decode_nvfp4_qkv_r1")
         )
+        if use_nvfp4_qkv:
+            hidden = x.reshape(-1)
+            heads4 = self.n_heads if self.n_heads in (48, 64) else 64
+            projected = _laguna_nvfp4.decode_nvfp4_qkv_r1(
+                hidden, self._nvfp4_bank["qkv_codes"],
+                self._nvfp4_bank["qkv_scales"], heads4,
+            )
+            q_split = self.n_heads * self.head_dim
+            k_end = q_split + self.n_kv_heads * self.head_dim
+            queries = projected[:q_split].reshape(
+                bsz, seq_len, self.n_heads, self.head_dim)
+            keys = projected[q_split:k_end].reshape(
+                bsz, seq_len, self.n_kv_heads, self.head_dim)
+            values = projected[k_end:].reshape(
+                bsz, seq_len, self.n_kv_heads, self.head_dim)
+            queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+            keys = self.k_norm(keys).transpose(0, 2, 1, 3)
+            values = values.transpose(0, 2, 1, 3)
+        else:
+            queries, keys, values = (
+                self.q_proj(x), self.k_proj(x), self.v_proj(x))
+            queries = self.q_norm(
+                queries.reshape(bsz, seq_len, self.n_heads, self.head_dim)
+            ).transpose(0, 2, 1, 3)
+            keys = self.k_norm(
+                keys.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim)
+            ).transpose(0, 2, 1, 3)
+            values = values.reshape(
+                bsz, seq_len, self.n_kv_heads, self.head_dim
+            ).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
+
             keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
