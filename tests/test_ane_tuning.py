@@ -28,6 +28,12 @@ def test_nax_fraction_grid_covers_faster_gpu_balance(monkeypatch):
     assert ane_tuning._fraction_grid() == [0.15, 0.25, 0.35, 0.45, 0.53]
 
 
+def test_cpu_worker_search_space_is_independent_of_saved_settings():
+    assert ane_tuning._cpu_thread_grid() == [6, 8, 10, 12, 14, 16]
+    assert ane_tuning._COARSE_SAMPLES == 7
+    assert ane_tuning._FINALIST_SAMPLES == 9
+
+
 def test_candidate_settings_are_transient_copy():
     base = ModelSettings()
     request = ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048)
@@ -355,6 +361,150 @@ async def test_fused_tuner_verifies_the_actual_calibrated_worker_counts(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_fused_tuner_can_spend_runner_up_slot_on_gdn(monkeypatch):
+    measured = []
+
+    async def measure(run, pool, settings, candidate):
+        measured.append(
+            (candidate.cpu_threads, candidate.gdn_fraction, candidate.cpu_gdn_fraction)
+        )
+        if not candidate.enabled:
+            tps = 100.0
+        elif candidate.gdn_fraction == 0.53:
+            tps = 130.0
+        else:
+            tps = 120.0
+        return {
+            **ane_tuning._empty_result(candidate),
+            "processing_tps": tps,
+            "samples": [tps],
+        }
+
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.19,
+            cpu_fraction=0.14,
+            cpu_down_fraction=0.0,
+            gdn_enabled=True,
+            gdn_fraction=0.45,
+            cpu_enabled=True,
+            cpu_threads=8,
+            cpu_shared_resource=True,
+            cpu_gdn_fraction=0.125,
+            fused_down=True,
+            alternate_mlp_fraction=0.19,
+            alternate_cpu_fraction=0.14,
+            alternate_cpu_threads=8,
+            alternate_gdn_fraction=0.53,
+            alternate_cpu_gdn_fraction=0.0,
+            alternate_reason="GDN topology",
+        )
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+
+    async def get_engine(*args, **kwargs):
+        return object()
+
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings()
+        ),
+        get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+
+    assert measured == [
+        (None, None, None),
+        (8, 0.45, 0.125),
+        (8, 0.53, 0.0),
+    ]
+    assert run.recommendation["gdn_fraction"] == 0.53
+    assert run.recommendation["cpu_gdn_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_full_model_gdn_correction_precedes_worker_runner_up(monkeypatch):
+    measured = []
+
+    async def measure(run, pool, settings, candidate):
+        measured.append(
+            (candidate.cpu_threads, candidate.gdn_fraction, candidate.cpu_gdn_fraction)
+        )
+        tps = 100.0 if not candidate.enabled else 120.0
+        if candidate.gdn_fraction == 0.45:
+            tps = 130.0
+        return {
+            **ane_tuning._empty_result(candidate),
+            "processing_tps": tps,
+            "samples": [tps],
+        }
+
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.19,
+            cpu_fraction=0.14,
+            cpu_down_fraction=0.0,
+            gdn_enabled=True,
+            gdn_fraction=0.50,
+            cpu_enabled=True,
+            cpu_threads=8,
+            cpu_shared_resource=True,
+            cpu_gdn_fraction=0.10,
+            fused_down=True,
+            alternate_mlp_fraction=0.19,
+            alternate_cpu_fraction=0.14,
+            alternate_cpu_threads=12,
+            alternate_gdn_fraction=0.50,
+            alternate_cpu_gdn_fraction=0.10,
+            alternate_reason="CPU worker count",
+        )
+
+    def profile_refinement(candidate, result):
+        return ane_tuning.replace(
+            candidate,
+            gdn_fraction=0.45,
+            cpu_gdn_fraction=0.125,
+        )
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+    monkeypatch.setattr(ane_tuning, "_profile_refinement", profile_refinement)
+
+    async def get_engine(*args, **kwargs):
+        return object()
+
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings(
+                qwen35_ane_prefill_cpu_threads=14,
+                qwen35_ane_prefill_gdn_fraction=0.60,
+            )
+        ),
+        get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+
+    assert measured == [
+        (None, None, None),
+        (8, 0.50, 0.10),
+        (8, 0.45, 0.125),
+    ]
+    assert run.recommendation["gdn_fraction"] == 0.45
+    assert run.recommendation["cpu_gdn_fraction"] == 0.125
+
+
+@pytest.mark.asyncio
 async def test_tuner_keeps_gpu_for_sub_noise_gain(monkeypatch):
     async def measure(run, pool, settings, candidate):
         tps = 100.5 if candidate.enabled else 100.0
@@ -528,6 +678,7 @@ async def test_measure_accepts_candidate_whose_ane_executed(monkeypatch):
     result = await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
 
     assert result["processing_tps"] == 400.0
+    assert result["samples"] == [400.0, 400.0, 400.0]
 
 
 @pytest.mark.asyncio

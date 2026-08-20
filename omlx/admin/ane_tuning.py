@@ -97,6 +97,9 @@ class _CalibrationChoice:
     alternate_mlp_fraction: float | None = None
     alternate_cpu_fraction: float | None = None
     alternate_cpu_threads: int | None = None
+    alternate_gdn_fraction: float | None = None
+    alternate_cpu_gdn_fraction: float | None = None
+    alternate_reason: str | None = None
 
 
 @dataclass
@@ -150,8 +153,15 @@ def _fused_cpu_fraction_grid() -> list[float]:
     return [0.0, 0.08, 0.11, 0.14, 0.17, 0.20]
 
 
-def _cpu_thread_grid(current: int) -> list[int]:
-    return sorted({6, 8, 10, 12, 14, 16, max(1, min(64, current))})
+_CALIBRATION_CPU_THREADS = 8
+_COARSE_SAMPLES = 7
+_FINALIST_SAMPLES = 9
+
+
+def _cpu_thread_grid() -> list[int]:
+    # Deliberately independent of saved model settings: identical hardware and
+    # tuner overrides must produce the same search space on every run.
+    return [6, 8, 10, 12, 14, 16]
 
 
 def _gdn_fraction_grid() -> list[float]:
@@ -165,7 +175,7 @@ def _planned_rows() -> list[_Candidate]:
         _Candidate("CPU worker calibration", True, stage="calibration"),
         _Candidate("GDN calibration", True, stage="calibration"),
         _Candidate("Predicted optimum", True),
-        _Candidate("Profile-refined optimum", True),
+        _Candidate("Full-model uncertainty runner-up", True),
     ]
 
 
@@ -288,6 +298,25 @@ def _set_phase_running(run: ANETuningRun, slot: int, message: str) -> None:
     run.phase = "calibrating"
     run.message = message
     run.results[slot]["state"] = "running"
+
+
+def _preview_phase(
+    run: ANETuningRun,
+    slot: int,
+    *,
+    detail: str,
+    latency_ms: float,
+    **values: Any,
+) -> None:
+    """Publish a provisional calibration leader without completing its row."""
+    run.results[slot].update(
+        {
+            "detail": detail,
+            "latency_ms": round(latency_ms, 3),
+            "state": "running",
+            **values,
+        }
+    )
 
 
 def _complete_phase(
@@ -499,6 +528,7 @@ async def _measure_candidate(
         tokenizer, measure_length, BenchmarkContextProfile.CODE_PYTHON
     )
 
+    run.message = f"Warming {candidate.label}…"
     async for _ in engine.stream_generate(
         prompt=warmup,
         max_tokens=2,
@@ -525,7 +555,15 @@ async def _measure_candidate(
     traces: list[dict[str, Any] | None] = []
     profile: dict[str, dict[str, float]] = {}
     try:
-        for _ in range(run.request.repeats):
+        # Accelerated finalists are expensive to reload but relatively cheap
+        # to sample once loaded. Three observations provide a real median and
+        # avoid the average-of-two instability seen in repeated tuner runs.
+        measurement_repeats = (
+            max(3, run.request.repeats)
+            if candidate.enabled
+            else run.request.repeats
+        )
+        for sample_index in range(measurement_repeats):
             metrics = await _run_single_test(
                 engine=engine,
                 prompt=prompt,
@@ -546,6 +584,10 @@ async def _measure_candidate(
                 ),
             )
             samples.append(float(metrics["processing_tps"]))
+            run.message = (
+                f"Testing {candidate.label}: sample {sample_index + 1}/"
+                f"{measurement_repeats} complete · {samples[-1]:.1f} tok/s"
+            )
             if candidate.enabled:
                 traces.append(metrics.get("ane_trace"))
         if profile_enabled and fast is not None:
@@ -605,6 +647,11 @@ async def _measure_candidate(
 
 def _nearest(value: float, choices: list[float]) -> float:
     return min(choices, key=lambda choice: abs(choice - value))
+
+
+def _median_absolute_deviation(samples: list[float]) -> float:
+    median = statistics.median(samples)
+    return statistics.median(abs(sample - median) for sample in samples)
 
 
 def _balanced_fractions(
@@ -847,6 +894,40 @@ def _time_gdn_state(
             _restore_attr(gdn, name, previous[name], missing)
 
 
+def _time_gdn_state_once(
+    patch: Any,
+    gdn: Any,
+    x: Any,
+    config: Any,
+    state: Any,
+) -> float:
+    """Time one already-warmed representative GDN dispatch."""
+    import mlx.core as mx
+
+    missing = object()
+    names = (
+        "_omlx_ane_gdn_config",
+        "_omlx_ane_gdn_state",
+        "_omlx_ane_gdn_failed",
+    )
+    previous = {name: getattr(gdn, name, missing) for name in names}
+    gdn._omlx_ane_gdn_config = config
+    gdn._omlx_ane_gdn_state = state
+    gdn._omlx_ane_gdn_failed = False
+    try:
+        started = time.perf_counter()
+        output = patch._gdn_backend(gdn, x)
+        if output is None:
+            raise RuntimeError("Representative Qwen GDN dispatch failed")
+        values = output if isinstance(output, (tuple, list)) else (output,)
+        mx.eval(*values)
+        mx.synchronize()
+        return (time.perf_counter() - started) * 1000.0
+    finally:
+        for name in names:
+            _restore_attr(gdn, name, previous[name], missing)
+
+
 def _calibrate_fused_components_sync(
     run: ANETuningRun,
     base_settings: Any,
@@ -878,9 +959,7 @@ def _calibrate_fused_components_sync(
         and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
         and fast.qwen35_cpu_shared_resource_available()
     )
-    starting_threads = int(
-        getattr(base_settings, "qwen35_ane_prefill_cpu_threads", 8) or 8
-    )
+    calibration_threads = _CALIBRATION_CPU_THREADS
     fractions = _fused_fraction_grid()
     cpu_fractions = _fused_cpu_fraction_grid() if cpu_supported else [0.0]
     gdn_fractions = _gdn_fraction_grid() if gdn is not None else []
@@ -897,7 +976,7 @@ def _calibrate_fused_components_sync(
             True,
             ane_down_fraction=fraction,
             fused_down=True,
-            cpu_threads=starting_threads,
+            cpu_threads=calibration_threads,
             cpu_shared_resource=cpu_shared,
         )
         value = patch._prepare_fused_down_for_bank(mlp, config)
@@ -967,7 +1046,7 @@ def _calibrate_fused_components_sync(
         if 2 * fraction + cpu_fraction < 1.0
     ]
     thread_points = (
-        3 * len(_cpu_thread_grid(starting_threads)) if cpu_supported else 1
+        3 * len(_cpu_thread_grid()) if cpu_supported else 1
     )
     run.total = (
         3
@@ -981,7 +1060,7 @@ def _calibrate_fused_components_sync(
         (1, run.request.sequence_length, input_dim), dtype=gate.scales.dtype
     )
     mx.eval(x)
-    repeats = max(1, min(run.request.repeats, 2))
+    coarse_repeats = _COARSE_SAMPLES
 
     _set_phase_running(
         run,
@@ -996,7 +1075,7 @@ def _calibrate_fused_components_sync(
             8,
             True,
             cpu_fraction=cpu_fraction,
-            cpu_threads=starting_threads,
+            cpu_threads=calibration_threads,
             cpu_shared_resource=cpu_shared,
             ane_down_fraction=fraction,
             fused_down=True,
@@ -1007,8 +1086,26 @@ def _calibrate_fused_components_sync(
         state, _weights = value
         model0, model1 = fused_models[fraction]
         state = replace(state, model=model0, model1=model1)
-        latency = _time_fused_mlp_state(patch, mlp, x, config, state, repeats)
+        latency = _time_fused_mlp_state(
+            patch, mlp, x, config, state, coarse_repeats
+        )
         mlp_results.append((latency, fraction, cpu_fraction))
+        preview_ms, preview_ane, preview_cpu = min(mlp_results)
+        _preview_phase(
+            run,
+            _GATE_SLOT,
+            detail=(
+                f"Current best · ANE {preview_ane:.1%} each · "
+                f"CPU {preview_cpu:.1%} · "
+                f"GPU {1.0 - 2 * preview_ane - preview_cpu:.1%}"
+            ),
+            latency_ms=preview_ms,
+            mlp_fraction=preview_ane,
+            cpu_enabled=preview_cpu > 0,
+            cpu_fraction=preview_cpu,
+            cpu_down_fraction=0.0,
+            fused_down=True,
+        )
         run.current += 1
         run.message = (
             f"Fused MLP: ANE {fraction:.1%} each, CPU {cpu_fraction:.1%}…"
@@ -1035,10 +1132,11 @@ def _calibrate_fused_components_sync(
         fused_down=True,
     )
 
-    best_threads = starting_threads
-    alternate_mlp: float | None = None
-    alternate_cpu: float | None = None
-    alternate_threads: int | None = None
+    best_threads = calibration_threads
+    worker_alternate_mlp: float | None = None
+    worker_alternate_cpu: float | None = None
+    worker_alternate_threads: int | None = None
+    worker_uncertainty = float("inf")
     _set_phase_running(run, _DOWN_SLOT, "Tuning fused CPU branch worker count…")
     if best_cpu > 0:
         thread_results: list[tuple[float, float, float, int, list[float]]] = []
@@ -1050,7 +1148,7 @@ def _calibrate_fused_components_sync(
         for _coarse_ms, fraction, cpu_fraction in finalists:
             model0, model1 = fused_models[fraction]
             contender_states: list[tuple[int, Any, Any]] = []
-            for threads in _cpu_thread_grid(starting_threads):
+            for threads in _cpu_thread_grid():
                 config = patch._AnePrefillConfig(
                     run.request.sequence_length,
                     fraction,
@@ -1078,7 +1176,7 @@ def _calibrate_fused_components_sync(
             # cache/kernel state before the interleaved samples.
             for _threads, config, state in contender_states:
                 _time_fused_mlp_state_once(patch, mlp, x, config, state)
-            for sample_index in range(5):
+            for sample_index in range(_FINALIST_SAMPLES):
                 offset = sample_index % len(contender_states)
                 ordered = contender_states[offset:] + contender_states[:offset]
                 for threads, config, state in ordered:
@@ -1090,6 +1188,22 @@ def _calibrate_fused_components_sync(
                 latency = statistics.median(samples_ms)
                 thread_results.append(
                     (latency, fraction, cpu_fraction, threads, samples_ms)
+                )
+                preview = min(thread_results)
+                _preview_phase(
+                    run,
+                    _DOWN_SLOT,
+                    detail=(
+                        f"Current best · {preview[3]} workers · "
+                        f"ANE {preview[1]:.1%} each · CPU {preview[2]:.1%}"
+                    ),
+                    latency_ms=preview[0],
+                    mlp_fraction=preview[1],
+                    cpu_enabled=preview[2] > 0,
+                    cpu_fraction=preview[2],
+                    cpu_down_fraction=0.0,
+                    fused_down=True,
+                    cpu_threads=preview[3],
                 )
                 logger.info(
                     "[ane-tuner-fused-worker] ane_each=%.3f cpu=%.3f "
@@ -1110,13 +1224,47 @@ def _calibrate_fused_components_sync(
                 mx.clear_cache()
         if thread_results:
             ranked_threads = sorted(thread_results)
-            worker_ms, best_mlp, best_cpu, best_threads, _samples = ranked_threads[0]
+            fastest_ms = ranked_threads[0][0]
+            tied_threads = [
+                result
+                for result in ranked_threads
+                if result[0] <= fastest_ms * 1.005
+            ]
+            # Resolve a sub-0.5% tie without consulting saved settings: prefer
+            # the least dispersed result, then the lower resource count.
+            selected = min(
+                tied_threads,
+                key=lambda result: (
+                    _median_absolute_deviation(result[4]),
+                    result[3],
+                    result[2],
+                    result[0],
+                ),
+            )
+            worker_ms, best_mlp, best_cpu, best_threads, _samples = selected
             alternate = next(
-                (result for result in ranked_threads[1:] if result[3] != best_threads),
+                (result for result in ranked_threads if result[3] != best_threads),
                 None,
             )
             if alternate is not None:
-                _, alternate_mlp, alternate_cpu, alternate_threads, _ = alternate
+                (
+                    alternate_ms,
+                    worker_alternate_mlp,
+                    worker_alternate_cpu,
+                    worker_alternate_threads,
+                    _,
+                ) = alternate
+                worker_uncertainty = (
+                    abs(alternate_ms - worker_ms) / min(alternate_ms, worker_ms)
+                )
+            logger.info(
+                "[ane-tuner-fused-worker-choice] threads=%d latency_ms=%.3f "
+                "alternate_threads=%s uncertainty=%.4f",
+                best_threads,
+                worker_ms,
+                worker_alternate_threads,
+                worker_uncertainty,
+            )
         else:
             worker_ms = None
     else:
@@ -1140,6 +1288,9 @@ def _calibrate_fused_components_sync(
 
     best_gdn: float | None = None
     best_gdn_cpu = 0.0
+    gdn_alternate: float | None = None
+    gdn_cpu_alternate: float | None = None
+    gdn_uncertainty = float("inf")
     if gdn_models:
         _set_phase_running(run, _GDN_SLOT, "Balancing GDN across ANE, CPU and GPU…")
         qkv = patch._gdn_linears(gdn)[0]
@@ -1166,13 +1317,139 @@ def _calibrate_fused_components_sync(
                 state = patch._prepare_gdn_runtime_state(gdn, config, model0, model1)
                 if state is None:
                     continue
-                latency = _time_gdn_state(patch, gdn, gdn_x, config, state, repeats)
+                latency = _time_gdn_state(
+                    patch, gdn, gdn_x, config, state, coarse_repeats
+                )
                 gdn_results.append((latency, fraction, cpu_fraction))
+                preview_ms, preview_ane, preview_cpu = min(gdn_results)
+                _preview_phase(
+                    run,
+                    _GDN_SLOT,
+                    detail=(
+                        f"Coarse best · ANE {preview_ane:.1%} · "
+                        f"CPU {preview_cpu:.1%} · "
+                        f"GPU {1.0 - preview_ane - preview_cpu:.1%}"
+                    ),
+                    latency_ms=preview_ms,
+                    gdn_enabled=True,
+                    gdn_fraction=preview_ane,
+                    cpu_enabled=preview_cpu > 0,
+                    cpu_gdn_fraction=preview_cpu,
+                    fused_down=True,
+                )
                 run.current += 1
                 run.message = f"GDN: ANE {fraction:.1%}, CPU {cpu_fraction:.1%}…"
         if not gdn_results:
             raise RuntimeError("Every representative GDN candidate failed")
-        gdn_ms, best_gdn, best_gdn_cpu = min(gdn_results)
+
+        # Coarse timings identify a shortlist cheaply. Retest that shortlist
+        # interleaved so a warm ANE, host load, or traversal order cannot flip
+        # the chosen GDN topology between otherwise identical tuner runs.
+        gdn_contenders: list[tuple[float, float, Any, Any]] = []
+        for _coarse_ms, fraction, cpu_fraction in sorted(gdn_results)[:3]:
+            model0, model1 = gdn_models[fraction]
+            config = patch._AneGDNConfig(
+                run.request.sequence_length,
+                fraction,
+                8,
+                True,
+                cpu_fraction=cpu_fraction,
+                cpu_threads=best_threads,
+                cpu_shared_resource=cpu_shared,
+            )
+            state = patch._prepare_gdn_runtime_state(
+                gdn, config, model0, model1
+            )
+            if state is not None:
+                gdn_contenders.append((fraction, cpu_fraction, config, state))
+        if not gdn_contenders:
+            raise RuntimeError("No shortlisted GDN candidate could be prepared")
+
+        gdn_samples = {
+            (fraction, cpu_fraction): []
+            for fraction, cpu_fraction, _config, _state in gdn_contenders
+        }
+        for _fraction, _cpu_fraction, config, state in gdn_contenders:
+            _time_gdn_state_once(patch, gdn, gdn_x, config, state)
+        for sample_index in range(_FINALIST_SAMPLES):
+            offset = sample_index % len(gdn_contenders)
+            ordered = gdn_contenders[offset:] + gdn_contenders[:offset]
+            for fraction, cpu_fraction, config, state in ordered:
+                gdn_samples[(fraction, cpu_fraction)].append(
+                    _time_gdn_state_once(patch, gdn, gdn_x, config, state)
+                )
+
+        ranked_gdn: list[tuple[float, float, float, list[float]]] = []
+        for fraction, cpu_fraction, _config, _state in gdn_contenders:
+            samples_ms = gdn_samples[(fraction, cpu_fraction)]
+            latency = statistics.median(samples_ms)
+            ranked_gdn.append((latency, fraction, cpu_fraction, samples_ms))
+            preview = min(ranked_gdn)
+            _preview_phase(
+                run,
+                _GDN_SLOT,
+                detail=(
+                    f"Finalist best · ANE {preview[1]:.1%} · "
+                    f"CPU {preview[2]:.1%} · "
+                    f"GPU {1.0 - preview[1] - preview[2]:.1%}"
+                ),
+                latency_ms=preview[0],
+                gdn_enabled=True,
+                gdn_fraction=preview[1],
+                cpu_enabled=preview[2] > 0,
+                cpu_gdn_fraction=preview[2],
+                fused_down=True,
+            )
+            logger.info(
+                "[ane-tuner-gdn-finalist] ane=%.3f cpu=%.3f "
+                "latency_ms=%.3f samples_ms=%s",
+                fraction,
+                cpu_fraction,
+                latency,
+                ",".join(f"{sample:.3f}" for sample in samples_ms),
+            )
+        ranked_gdn.sort()
+        fastest_gdn_ms = ranked_gdn[0][0]
+        tied_gdn = [
+            result
+            for result in ranked_gdn
+            if result[0] <= fastest_gdn_ms * 1.005
+        ]
+        selected_gdn = min(
+            tied_gdn,
+            key=lambda result: (
+                _median_absolute_deviation(result[3]),
+                result[2],
+                result[1],
+                result[0],
+            ),
+        )
+        gdn_ms, best_gdn, best_gdn_cpu, _samples = selected_gdn
+        alternate = next(
+            (
+                result
+                for result in ranked_gdn
+                if (result[1], result[2]) != (best_gdn, best_gdn_cpu)
+            ),
+            None,
+        )
+        if alternate is not None:
+            alternate_ms, gdn_alternate, gdn_cpu_alternate, _ = alternate
+            gdn_uncertainty = (
+                abs(alternate_ms - gdn_ms) / min(alternate_ms, gdn_ms)
+            )
+        logger.info(
+            "[ane-tuner-gdn-choice] ane=%.3f cpu=%.3f latency_ms=%.3f "
+            "alternate_ane=%s alternate_cpu=%s uncertainty=%.4f",
+            best_gdn,
+            best_gdn_cpu,
+            gdn_ms,
+            gdn_alternate,
+            gdn_cpu_alternate,
+            gdn_uncertainty,
+        )
+        del gdn_contenders
+        mx.clear_cache()
         _complete_phase(
             run,
             _GDN_SLOT,
@@ -1200,6 +1477,37 @@ def _calibrate_fused_components_sync(
             fused_down=True,
         )
 
+    # Spend the one existing runner-up model load on the least certain
+    # calibration decision. This improves stability without adding another
+    # expensive full-model compile/reload cycle.
+    alternate_mlp: float | None = None
+    alternate_cpu: float | None = None
+    alternate_threads: int | None = None
+    alternate_gdn: float | None = None
+    alternate_gdn_cpu: float | None = None
+    alternate_reason: str | None = None
+    if gdn_alternate is not None and gdn_uncertainty <= worker_uncertainty:
+        alternate_mlp = best_mlp
+        alternate_cpu = best_cpu
+        alternate_threads = best_threads
+        alternate_gdn = gdn_alternate
+        alternate_gdn_cpu = gdn_cpu_alternate
+        alternate_reason = "GDN topology"
+    elif worker_alternate_threads is not None:
+        alternate_mlp = worker_alternate_mlp
+        alternate_cpu = worker_alternate_cpu
+        alternate_threads = worker_alternate_threads
+        alternate_gdn = best_gdn
+        alternate_gdn_cpu = best_gdn_cpu
+        alternate_reason = "CPU worker count"
+    logger.info(
+        "[ane-tuner-runner-up-choice] reason=%s worker_uncertainty=%.4f "
+        "gdn_uncertainty=%.4f",
+        alternate_reason,
+        worker_uncertainty,
+        gdn_uncertainty,
+    )
+
     return _CalibrationChoice(
         mlp_fraction=best_mlp,
         cpu_fraction=best_cpu,
@@ -1214,6 +1522,9 @@ def _calibrate_fused_components_sync(
         alternate_mlp_fraction=alternate_mlp,
         alternate_cpu_fraction=alternate_cpu,
         alternate_cpu_threads=alternate_threads,
+        alternate_gdn_fraction=alternate_gdn,
+        alternate_cpu_gdn_fraction=alternate_gdn_cpu,
+        alternate_reason=alternate_reason,
     )
 
 
@@ -1313,9 +1624,7 @@ def _calibrate_components_sync(
         and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
         and fast.qwen35_cpu_shared_resource_available()
     )
-    cpu_threads = int(
-        getattr(base_settings, "qwen35_ane_prefill_cpu_threads", 8) or 8
-    )
+    cpu_threads = _CALIBRATION_CPU_THREADS
     fractions = run.fractions
     cpu_fractions = (
         _cpu_fraction_grid()
@@ -1408,7 +1717,7 @@ def _calibrate_components_sync(
         (1, run.request.sequence_length, input_dim), dtype=gate.scales.dtype
     )
     mx.eval(x)
-    calibration_repeats = max(1, min(run.request.repeats, 2))
+    calibration_repeats = _COARSE_SAMPLES
 
     _set_phase_running(run, _GATE_SLOT, "Balancing MLP gate/up across ANE, CPU and GPU…")
     gate_results: list[tuple[float, float, float]] = []
@@ -1433,6 +1742,19 @@ def _calibrate_components_sync(
                 patch, mlp, x, config, state, calibration_repeats
             )
             gate_results.append((latency, fraction, cpu_fraction))
+            preview = min(gate_results)
+            _preview_phase(
+                run,
+                _GATE_SLOT,
+                detail=(
+                    f"Current best · ANE {preview[1]:.1%} · "
+                    f"CPU {preview[2]:.1%}"
+                ),
+                latency_ms=preview[0],
+                mlp_fraction=preview[1],
+                cpu_enabled=preview[2] > 0,
+                cpu_fraction=preview[2],
+            )
             run.current += 1
             run.message = (
                 f"MLP gate/up: ANE {fraction:.1%}, CPU {cpu_fraction:.1%}…"
@@ -1471,6 +1793,20 @@ def _calibrate_components_sync(
             patch, mlp, x, config, state, calibration_repeats
         )
         down_results.append((latency, down_fraction))
+        preview = min(down_results)
+        _preview_phase(
+            run,
+            _DOWN_SLOT,
+            detail=(
+                f"Current best · CPU {preview[1]:.1%} · "
+                f"GPU {1.0 - preview[1]:.1%}"
+            ),
+            latency_ms=preview[0],
+            mlp_fraction=best_mlp,
+            cpu_enabled=best_cpu > 0 or preview[1] > 0,
+            cpu_fraction=best_cpu,
+            cpu_down_fraction=preview[1],
+        )
         run.current += 1
         run.message = f"MLP down projection: CPU {down_fraction:.1%}…"
     if not down_results:
@@ -1520,6 +1856,21 @@ def _calibrate_components_sync(
                     patch, gdn, gdn_x, config, state, calibration_repeats
                 )
                 gdn_results.append((latency, fraction, cpu_fraction))
+                preview = min(gdn_results)
+                _preview_phase(
+                    run,
+                    _GDN_SLOT,
+                    detail=(
+                        f"Current best · ANE {preview[1]:.1%} · "
+                        f"CPU {preview[2]:.1%} · "
+                        f"GPU {1.0 - preview[1] - preview[2]:.1%}"
+                    ),
+                    latency_ms=preview[0],
+                    gdn_enabled=True,
+                    gdn_fraction=preview[1],
+                    cpu_enabled=preview[2] > 0,
+                    cpu_gdn_fraction=preview[2],
+                )
                 run.current += 1
                 run.message = (
                     f"GDN: ANE {fraction:.1%}, CPU {cpu_fraction:.1%}…"
@@ -1612,17 +1963,56 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             run, _VERIFY_SLOT, engine_pool, base_settings, candidate
         )
 
-        if choice.fused_down and choice.alternate_cpu_threads is not None:
+        profiled = _profile_refinement(candidate, run.results[_VERIFY_SLOT])
+        gdn_profile_changed = any(
+            getattr(profiled, name) != getattr(candidate, name)
+            for name in ("gdn_fraction", "cpu_gdn_fraction")
+        )
+        if choice.fused_down and gdn_profile_changed:
+            # The representative GDN call cannot reproduce contention with all
+            # surrounding layers. Let the aggregate three-sample native profile
+            # propose a stateless correction and spend the existing runner-up
+            # load validating it end to end.
             refined = replace(
                 candidate,
-                label="Full-model calibration runner-up",
+                label="Full-model profile-refined GDN",
+                gdn_fraction=profiled.gdn_fraction,
+                cpu_gdn_fraction=profiled.cpu_gdn_fraction,
+            )
+            refinement_changed = True
+            logger.info(
+                "[ane-tuner-full-model-correction] gdn=%.3f->%.3f "
+                "cpu_gdn=%.3f->%.3f",
+                float(candidate.gdn_fraction or 0.0),
+                float(refined.gdn_fraction or 0.0),
+                float(candidate.cpu_gdn_fraction or 0.0),
+                float(refined.cpu_gdn_fraction or 0.0),
+            )
+        elif choice.fused_down and choice.alternate_cpu_threads is not None:
+            refined = replace(
+                candidate,
+                label=(
+                    f"Full-model {choice.alternate_reason} runner-up"
+                    if choice.alternate_reason
+                    else "Full-model calibration runner-up"
+                ),
                 mlp_fraction=choice.alternate_mlp_fraction,
                 cpu_fraction=choice.alternate_cpu_fraction,
                 cpu_threads=choice.alternate_cpu_threads,
+                gdn_fraction=(
+                    choice.alternate_gdn_fraction
+                    if choice.alternate_gdn_fraction is not None
+                    else candidate.gdn_fraction
+                ),
+                cpu_gdn_fraction=(
+                    choice.alternate_cpu_gdn_fraction
+                    if choice.alternate_cpu_gdn_fraction is not None
+                    else candidate.cpu_gdn_fraction
+                ),
             )
             refinement_changed = True
         else:
-            refined = _profile_refinement(candidate, run.results[_VERIFY_SLOT])
+            refined = profiled
             refinement_changed = any(
                 getattr(refined, name) != getattr(candidate, name)
                 for name in (
