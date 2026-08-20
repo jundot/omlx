@@ -338,77 +338,6 @@ def sliding_qk_norm_rope(
     )
 
 
-def _qk_norm_rope_fallback_rows(
-    raw_queries, raw_keys, query_weight, key_weight, angles, offsets,
-    q_heads, k_heads, rotary_pairs, mscale=None,
-):
-    """Batched (multi-row) stock-op fallback for the prefill QK-norm+RoPE
-    kernels: applies ``_qk_norm_rope_fallback`` per row with the row's angle
-    row (atlas offset + row), then transposes to the kernel's head-major,
-    row-inner output layout."""
-    dim = 128
-    rows = raw_queries.shape[0] // (q_heads * dim)
-    off = int(offsets[0])
-    angle_rows = angles[
-        off * 2 * rotary_pairs : (off + rows) * 2 * rotary_pairs
-    ].reshape(rows, 2 * rotary_pairs)
-    q_parts, k_parts = [], []
-    for t in range(rows):
-        rq = raw_queries[t * q_heads * dim : (t + 1) * q_heads * dim]
-        rk = raw_keys[t * k_heads * dim : (t + 1) * k_heads * dim]
-        q, k = _qk_norm_rope_fallback(
-            rq, rk, query_weight, key_weight, angle_rows[t],
-            q_heads, k_heads, rotary_pairs, mscale,
-        )
-        q_parts.append(q)
-        k_parts.append(k)
-    qr = mx.stack(q_parts).reshape(rows, q_heads, dim)
-    kr = mx.stack(k_parts).reshape(rows, k_heads, dim)
-    return (
-        mx.transpose(qr, (1, 0, 2)).reshape(-1),
-        mx.transpose(kr, (1, 0, 2)).reshape(-1),
-    )
-
-
-def prefill_full_qk_norm_yarn(
-    raw_queries, raw_keys, query_weight, key_weight, angles, offsets,
-    h1=False, stream=None,
-):
-    """Batched full-attention Q/K RMSNorm + partial-RoPE with the YaRN
-    mscale (48 q + 8 k heads, rotary 64; per-row angle row from the atlas at
-    offsets[0] + row). Returns (queries [48*rows*128], keys [8*rows*128])
-    bf16, head-major with the row axis inner. h1 selects one head per
-    threadgroup (32-thread groups) vs 4 heads (128-thread groups)."""
-    if _ext is not None and has_symbol("prefill_full_qk_norm_yarn"):
-        return _ext.prefill_full_qk_norm_yarn(
-            raw_queries, raw_keys, query_weight, key_weight, angles,
-            offsets, h1, stream=stream,
-        )
-    return _qk_norm_rope_fallback_rows(
-        raw_queries, raw_keys, query_weight, key_weight, angles, offsets,
-        48, 8, 32, mscale=1.3465735912322998,
-    )
-
-
-def prefill_sliding_qk_norm_rope(
-    raw_queries, raw_keys, query_weight, key_weight, angles, offsets,
-    h1=False, stream=None,
-):
-    """Batched sliding-attention Q/K RMSNorm + full RoPE (64 q + 8 k heads,
-    rotary 128; per-row angle row from the atlas at offsets[0] + row).
-    Returns (queries [64*rows*128], keys [8*rows*128]) bf16, head-major
-    with the row axis inner. h1 selects one head per threadgroup."""
-    if _ext is not None and has_symbol("prefill_sliding_qk_norm_rope"):
-        return _ext.prefill_sliding_qk_norm_rope(
-            raw_queries, raw_keys, query_weight, key_weight, angles,
-            offsets, h1, stream=stream,
-        )
-    return _qk_norm_rope_fallback_rows(
-        raw_queries, raw_keys, query_weight, key_weight, angles, offsets,
-        64, 8, 64, mscale=None,
-    )
-
-
 def decode_nvfp4_qkv_r1(
     normalized: mx.array,
     weight_codes: mx.array,
@@ -519,6 +448,37 @@ def decode_router_top8(
     return ids, vals.astype(mx.bfloat16)
 
 
+def decode_router_top8_ordinal(
+    logits: mx.array,
+    correction_bias: mx.array,
+    normalizing: bool = False,
+    score_table: bool = False,
+    stream=None,
+):
+    """Decode router top-8, ordinal payload (same 256-lane bitonic network,
+    uint ordinal + index sorted via laguna_router_key_ordinal; verbatim from
+    lagunaDecodeRouterOrdinalKernelSource). Returns (indices, scores) [8].
+    The score-table arm reads the winner's original sigmoid from TG memory;
+    the recompute arm re-derives it — both byte-identical.
+    """
+    if _ext is not None and has_symbol("decode_router_top8_ordinal"):
+        return _ext.decode_router_top8_ordinal(
+            logits, correction_bias, normalizing, score_table, stream=stream)
+    # Fallback: identical math to decode_router_top8 (the ordinal transform
+    # is order-preserving on the float keys, so the top-8 set and order match
+    # the float-payload network exactly).
+    x = logits.astype(mx.float32)
+    y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
+    score = mx.where(x < 0, y, 1.0 - y)
+    key = score + correction_bias.astype(mx.float32)
+    ids = mx.argsort(-key, axis=0)[:8].astype(mx.uint32)
+    vals = mx.take(score, ids)
+    if normalizing:
+        vals = vals / mx.maximum(mx.sum(vals), 1e-6)
+    return ids, vals.astype(mx.bfloat16)
+
+
+
 def sliding_fused_attn_ring(
     raw_queries, raw_keys, raw_values, query_weight, key_weight, angles,
     k_cache, v_cache, params, scale_arr, stream=None,
@@ -588,44 +548,24 @@ def prefill_moe_tail(
     return y.reshape(-1)
 
 
-def prefill_sorted_moe_tail(
-    sorted_expert_outputs, inverse_order, router_weights, shared_output,
-    residual, stream=None,
+def prefill_router_top8(
+    logits: mx.array, correction_bias: mx.array, normalizing: bool = False,
+    stream=None,
 ):
-    """Prefill SORTED MoE tail (verbatim from
-    lagunaPrefillSortedMoETailKernel): the inverse-order permutation gather
-    over the sorted expert plane, then the weighted 8-expert combine (x2.5)
-    + shared + residual. Returns [rows*2048] bf16."""
-    if _ext is not None and has_symbol("prefill_sorted_moe_tail"):
-        return _ext.prefill_sorted_moe_tail(
-            sorted_expert_outputs, inverse_order, router_weights,
-            shared_output, residual, stream=stream,
-        )
-    # Fallback: unsort the sorted plane with the inverse-order gather (full
-    # element indices, row*2048 + col — same as the kernel), then the
-    # moe_tail fallback combine.
-    rows = sorted_expert_outputs.shape[1]
-    ex = sorted_expert_outputs.reshape(-1)
-    hidden = 2048
-    inv = inverse_order.reshape(-1).astype(mx.int32)  # [rows*8]
-    idx = (inv[:, None] * hidden + mx.arange(hidden)[None, :]).reshape(-1)
-    unsorted = mx.take(ex, idx).reshape(1, rows, 8, hidden)
-    w = router_weights.astype(mx.bfloat16)  # [1, rows, 8]
-    y = mx.sum(unsorted * w[..., None], axis=2) * mx.array(
-        2.5, mx.float32)  # [1, rows, 2048]
-    y = (y + shared_output + residual).astype(mx.bfloat16)
-    return y.reshape(-1)
+    """Prefill router top-8 (per-row O(256) predecessor count over the 256
+    choice keys, stable total order; verbatim from
+    lagunaPrefillRouterTop8KernelSource). Returns (indices, scores)[rows*8].
+    """
+    if _ext is not None and has_symbol("prefill_router_top8"):
+        return _ext.prefill_router_top8(
+            logits, correction_bias, normalizing, stream=stream)
+    return _prefill_stock_fallback(logits, correction_bias, normalizing, stream)
 
 
-def prefill_router_tournament(
-    logits: mx.array, correction_bias: mx.array, stream=None,
-):
-    """Prefill router tournament (batched 2-phase bitonic; verbatim from
-    lagunaPrefillRouterTournamentKernelSource). Returns (indices, scores)
-    [rows*8] each (scores are the raw sigmoids, the bias orders the sort)."""
-    if _ext is not None and has_symbol("prefill_router_tournament"):
-        return _ext.prefill_router_tournament(
-            logits, correction_bias, stream=stream)
+def _prefill_stock_fallback(logits, correction_bias, normalizing, stream):
+    """Shared stock fallback: batched argsort by the bias-ordered key, then
+    the raw sigmoid scores (the index tie break matches the kernels' stable
+    total order on exact ties)."""
     rows = logits.shape[0] // 256
     x = logits.astype(mx.float32).reshape(rows, 256)
     y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
@@ -633,7 +573,40 @@ def prefill_router_tournament(
     key = score + correction_bias.astype(mx.float32)[None, :]
     ids = mx.argsort(-key, axis=1)[:, :8].astype(mx.uint32)
     vals = mx.take_along_axis(score, ids.astype(mx.int32), axis=1)
+    if normalizing:
+        vals = vals / mx.maximum(mx.sum(vals, axis=1, keepdims=True), 1e-6)
     return ids.reshape(-1), vals.reshape(-1).astype(mx.bfloat16)
+
+
+def prefill_router_tournament(
+    logits: mx.array, correction_bias: mx.array, normalizing: bool = False,
+    stream=None,
+):
+    """Prefill router tournament (batched 2-phase bitonic; verbatim from
+    lagunaPrefillRouterTournamentKernelSource; the normalizing epilogue
+    simd-folds the 8 winner sigmoids). Returns (indices, scores) [rows*8]
+    each (scores are the raw sigmoids, the bias orders the sort)."""
+    if _ext is not None and has_symbol("prefill_router_tournament"):
+        return _ext.prefill_router_tournament(
+            logits, correction_bias, normalizing, stream=stream)
+    return _prefill_stock_fallback(logits, correction_bias, normalizing, stream)
+
+
+def prefill_router_tournament_ordinal(
+    logits: mx.array, correction_bias: mx.array, normalizing: bool = False,
+    stream=None,
+):
+    """Prefill router tournament, ordinal: same two-phase schedule with the
+    (uint ordinal, uint index) payload and one 64-candidate phase-2 set on
+    lanes 0..63 (verbatim from
+    lagunaPrefillRouterTournamentOrdinalKernelSource). Returns (indices,
+    scores) [rows*8] (scores are the raw sigmoids, the bias orders the
+    sort)."""
+    if _ext is not None and has_symbol("prefill_router_tournament_ordinal"):
+        return _ext.prefill_router_tournament_ordinal(
+            logits, correction_bias, normalizing, stream=stream)
+    return _prefill_stock_fallback(logits, correction_bias, normalizing, stream)
+
 
 
 # ---------------------------------------------------------------------------
@@ -692,32 +665,34 @@ def lm_head_prune(
         mx.bfloat16)
 
 
-def dense_gate_up_swiglu(
-    input_x: mx.array, fused_weight: mx.array, stream=None,
-) -> mx.array:
-    """Dense bf16 gate/up fused + SwiGLU (verbatim from
-    lagunaDenseGateUpSwiGLUKernel). Returns [8192] bf16."""
-    if _ext is not None and has_symbol("dense_gate_up_swiglu"):
-        return _ext.dense_gate_up_swiglu(input_x, fused_weight, stream=stream)
-    gate = (input_x @ fused_weight[:8192].T).astype(mx.bfloat16)
-    up = (input_x @ fused_weight[8192:].T).astype(mx.bfloat16)
-    g32 = gate.astype(mx.float32)
-    u32 = up.astype(mx.float32)
-    sig = mx.sigmoid(g32)
-    return (g32 * sig * u32).astype(mx.bfloat16)
+def inject_empty_dispatch(control, prev, stream=None):
+    """Harness timing probe (verbatim laguna_inject_empty_dispatch_v1)."""
+    if _ext is not None and has_symbol("inject_empty_dispatch"):
+        return _ext.inject_empty_dispatch(control, prev, stream=stream)
+    return mx.zeros((256,), mx.uint32)
 
 
-def dense_down_residual(
-    activated: mx.array, down_weight: mx.array, residual: mx.array,
+def inject_dram_sweep(pool, control, stream=None):
+    """Harness timing probe (verbatim laguna_inject_dram_sweep_u4_v2)."""
+    if _ext is not None and has_symbol("inject_dram_sweep"):
+        return _ext.inject_dram_sweep(pool, control, stream=stream)
+    return mx.zeros((256,), mx.uint32)
+
+
+def decode_embedding_rope_atlas(
+    tokens, embedding_weight, full_atlas, sliding_atlas, atlas_position,
     stream=None,
-) -> mx.array:
-    """Dense bf16 down_proj + residual (verbatim from
-    lagunaDenseDownResidualKernel). Returns [2048] bf16."""
-    if _ext is not None and has_symbol("dense_down_residual"):
-        return _ext.dense_down_residual(
-            activated, down_weight, residual, stream=stream)
-    down = (activated @ down_weight.T).astype(mx.bfloat16)
-    return (residual + down).astype(mx.bfloat16)
+):
+    """Fused decode embedding + RoPE angle atlas (verbatim
+    laguna_decode_embedding_rope_atlas_bf16_2048_v2). Returns
+    (hidden [2048] bf16, full_angles [64] f32, sliding_angles [128] f32)."""
+    if _ext is not None and has_symbol("decode_embedding_rope_atlas"):
+        return _ext.decode_embedding_rope_atlas(
+            tokens, embedding_weight, full_atlas, sliding_atlas,
+            atlas_position, stream=stream)
+    pos = int(atlas_position[0])
+    hidden = embedding_weight[int(tokens[0])]
+    return hidden, full_atlas[pos], sliding_atlas[pos]
 
 def shared_nvfp4_down_residual(
     activated: mx.array,
@@ -752,3 +727,223 @@ def shared_nvfp4_down_residual(
         stream=stream,
     ).squeeze(0)  # [N]
     return (residual + (routed + shared)).astype(mx.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Launch-schedule / scale-layout variants (rows1, halved, packed, top-8)
+# ---------------------------------------------------------------------------
+
+def _depack_shared_halved_fused(plane: mx.array) -> mx.array:
+    """Inverse of halved_group32_scale_plane for the shared fused gate/up
+    plane (allowed flat pairs [0, 32768]): [128 + 1024*64] uint8 → the stock
+    [1024, 128] group-16 plane by repeating the even bytes and patching the
+    two header-preserved odd bytes (gate row 0 and up row 0 pair 0)."""
+    header = plane[:128].astype(mx.uint8)
+    halved = plane[128:].reshape(1024, 64)
+    full = mx.repeat(halved, 2, axis=-1)  # [1024, 128]
+    flat = full.reshape(-1)
+    flat = mx.where(mx.arange(flat.size) == 1, header[0], flat)
+    flat = mx.where(mx.arange(flat.size) == 512 * 128 + 1, header[1], flat)
+    return flat.reshape(1024, 128)
+
+
+def shared_nvfp4_swiglu_qmv_rows1(
+    x: mx.array, w: mx.array, scales: mx.array, stream=None,
+) -> mx.array:
+    """R1 scheduling twin of shared_nvfp4_swiglu_qmv (one output row per
+    simdgroup; 256 tiles). Same layouts, same fallback."""
+    if _ext is not None and has_symbol("shared_nvfp4_swiglu_qmv_rows1"):
+        return _ext.shared_nvfp4_swiglu_qmv_rows1(x, w, scales, stream=stream)
+    return shared_nvfp4_swiglu_qmv(x, w, scales, stream=stream)
+
+
+def shared_nvfp4_swiglu_qmv_rows1_halved(
+    x: mx.array, w: mx.array, scales: mx.array, stream=None,
+) -> mx.array:
+    """Halved group-32 twin of shared_nvfp4_swiglu_qmv_rows1 (scales are the
+    1-D [128 + 1024*64] halved plane)."""
+    if _ext is not None and has_symbol("shared_nvfp4_swiglu_qmv_rows1_halved"):
+        return _ext.shared_nvfp4_swiglu_qmv_rows1_halved(
+            x, w, scales, stream=stream)
+    full = _depack_shared_halved_fused(scales)
+    return shared_nvfp4_swiglu_qmv(x, w, full, stream=stream)
+
+
+def shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+    x: mx.array, w: mx.array, scales: mx.array, stream=None,
+) -> mx.array:
+    """Wide-codes twin (two groups per lane) over the same halved plane."""
+    if _ext is not None and has_symbol("shared_nvfp4_swiglu_qmv_rows1_halved_wide"):
+        return _ext.shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+            x, w, scales, stream=stream)
+    full = _depack_shared_halved_fused(scales)
+    return shared_nvfp4_swiglu_qmv(x, w, full, stream=stream)
+
+
+def _depack_shared_halved_down(plane: mx.array) -> mx.array:
+    """[128 + 2048*16] halved group-32 shared down plane -> [2048, 32] stock
+    group-16 scales (flat pair 0 patched from the header)."""
+    header = plane[:128].astype(mx.uint8)
+    halved = plane[128:].reshape(2048, 16)
+    full = mx.repeat(halved, 2, axis=-1)  # [2048, 32]
+    flat = full.reshape(-1)
+    flat = mx.where(mx.arange(flat.size) == 1, header[0], flat)
+    return flat.reshape(2048, 32)
+
+
+def shared_nvfp4_down_residual_halved(
+    activated, down_weight, down_scales, routed, residual, stream=None,
+):
+    """Shared-expert down_proj + routed/residual adds over the halved
+    group-32 down scale plane (128-byte header + [2048*16] bytes)."""
+    if _ext is not None and has_symbol("shared_nvfp4_down_residual_halved"):
+        return _ext.shared_nvfp4_down_residual_halved(
+            activated, down_weight, down_scales, routed, residual,
+            stream=stream,
+        )
+    full = _depack_shared_halved_down(down_scales)
+    return shared_nvfp4_down_residual(
+        activated, down_weight, full, routed, residual, stream=stream)
+
+
+def routed_nvfp4_swiglu_qmv_rows1(
+    input_x, fused_weight, fused_scales, indices, stream=None,
+):
+    """R1 scheduling twin of routed_nvfp4_swiglu_qmv (one output row per
+    simdgroup, 256 tiles per expert). Same layouts, same fallback."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_rows1"):
+        return _ext.routed_nvfp4_swiglu_qmv_rows1(
+            input_x, fused_weight, fused_scales, indices, stream=stream)
+    return routed_nvfp4_swiglu_qmv(
+        input_x, fused_weight, fused_scales, indices, stream=stream)
+
+
+def _packed_routed_gateup_order():
+    """Walk-order row-block gather index of preparePackedRoutedGateUpBank:
+    packed position p = tile*32 + kblock*4 + sub reads the fused plane's
+    row-block (fusedRow*4 + kblock); fusedRow = gate/up pair-interleaved
+    mapping of logical_row = tile*4 + sub//2."""
+    rows = 1024
+    order = []
+    for tile in range(rows // 8):
+        for kb in range(4):
+            for sub in range(8):
+                logical = tile * 4 + sub // 2
+                gate_row = (logical // 32) * 64 + logical % 32
+                fused_row = gate_row if sub % 2 == 0 else gate_row + 32
+                order.append(fused_row * 4 + kb)
+    return mx.array(order, mx.int32)
+
+
+def packed_routed_gateup_scales(
+    fused_scales: mx.array,
+) -> mx.array:
+    """Build the packed routed gate/up scale bank (challenge
+    preparePackedRoutedGateUpBank): [E, 1024, 128] uint8 -> the 1-D
+    [128 + E*65536] halved walk-order bank, or None when the group-32
+    halving certificate fails (only flat pairs 0 and 16 may differ)."""
+    E, rows, _ = fused_scales.shape
+    row_blocks = fused_scales.reshape(E, rows * 4, 32)
+    packed = mx.take(row_blocks, _packed_routed_gateup_order(), axis=1)
+    return halved_group32_scale_plane(packed, [0, 16])
+
+
+def _depack_routed_gateup_scales(packed: mx.array) -> mx.array:
+    """Inverse of packed_routed_gateup_scales: the 1-D packed halved bank ->
+    the stock [E, 1024, 128] group-16 uint8 plane (even bytes repeated, the
+    two header odd bytes patched back into packed flat bytes 1 and 33)."""
+    header = packed[:128].astype(mx.uint8)
+    E = (packed.size - 128) // 65536
+    body = packed[128:].reshape(E, 4096, 16)
+    blocks = mx.repeat(body, 2, axis=-1)  # [E, 4096, 32]
+    flat = blocks.reshape(-1)  # expert e occupies [e*131072, (e+1)*131072)
+    ar = mx.arange(flat.size)
+    flat = mx.where(ar == 1, header[0], flat)
+    flat = mx.where(ar == 33, header[1], flat)
+    blocks = flat.reshape(E, 4096, 32)
+    order = _packed_routed_gateup_order()
+    inv = mx.argsort(order)  # inverse permutation
+    orig = mx.take(blocks, inv, axis=1)
+    return orig.reshape(E, 1024, 128)
+
+
+def _routed_packed_fallback(
+    input_x, fused_weight, packed_scales, experts, stream=None,
+):
+    """Shared per-slot fallback for the packed routed gate/up QMV variants:
+    de-pack the scale bank to the stock [E, 1024, 128] plane, un-interleave
+    the fused code plane, and run the stock nvfp4 matmul + swiglu per slot."""
+    N = fused_weight.shape[1] // 2
+    full_scales = _depack_routed_gateup_scales(packed_scales)
+    fw = fused_weight.reshape(
+        fused_weight.shape[0], N // 32, 2, 32, fused_weight.shape[-1])
+    fs = full_scales.reshape(
+        full_scales.shape[0], N // 32, 2, 32, full_scales.shape[-1])
+    gate_w = mx.concatenate([fw[:, p, 0] for p in range(N // 32)], axis=1)
+    up_w = mx.concatenate([fw[:, p, 1] for p in range(N // 32)], axis=1)
+    gate_s = mx.concatenate([fs[:, p, 0] for p in range(N // 32)], axis=1)
+    up_s = mx.concatenate([fs[:, p, 1] for p in range(N // 32)], axis=1)
+    outs = []
+    for e in experts:
+        e = int(e)
+        g = mx.quantized_matmul(
+            input_x[None, :], gate_w[e], scales=gate_s[e], transpose=True,
+            group_size=16, bits=4, mode="nvfp4", stream=stream)
+        u = mx.quantized_matmul(
+            input_x[None, :], up_w[e], scales=up_s[e], transpose=True,
+            group_size=16, bits=4, mode="nvfp4", stream=stream)
+        outs.append(_swiglu(g, u)[0])
+    return mx.concatenate(outs)
+
+
+def routed_nvfp4_swiglu_qmv_packed(
+    input_x, fused_weight, packed_scales, indices, stream=None,
+):
+    """Routed fused gate/up QMV over the packed walk-order scale bank
+    (per-expert [tile 128][kblock 4][sub 8][16 B] behind the 128-byte
+    header)."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_packed"):
+        return _ext.routed_nvfp4_swiglu_qmv_packed(
+            input_x, fused_weight, packed_scales, indices, stream=stream)
+    return _routed_packed_fallback(
+        input_x, fused_weight, packed_scales,
+        [int(indices[s]) for s in range(indices.size)], stream=stream)
+
+
+def _top8_slots_from_keys(router_keys):
+    """Per-slot top-8 experts of the ordinal router keys: slot r owns the
+    (r+1)-th smallest (ordinal, index) — the exact order of the kernel's
+    per-slot extraction rounds."""
+    keys = router_keys.astype(mx.int64)
+    comb = (keys << 32) | mx.arange(256, dtype=mx.int64)
+    return mx.argsort(comb)[:8].astype(mx.uint32)
+
+
+def routed_nvfp4_swiglu_qmv_packed_top8keys(
+    input_x, fused_weight, packed_scales, router_keys, stream=None,
+):
+    """Packed routed QMV with the simd-shuffle top-8 ordinal expert
+    selection: router_keys [256] uint32 ordinal keys, slot r picks the
+    (r+1)-th smallest key (expert slot output placement, winner is the
+    route)."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_packed_top8keys"):
+        return _ext.routed_nvfp4_swiglu_qmv_packed_top8keys(
+            input_x, fused_weight, packed_scales, router_keys, stream=stream)
+    experts = _top8_slots_from_keys(router_keys)
+    return _routed_packed_fallback(
+        input_x, fused_weight, packed_scales,
+        [int(e) for e in experts], stream=stream)
+
+
+def routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+    input_x, fused_weight, packed_scales, router_keys, stream=None,
+):
+    """R1 scheduling twin of routed_nvfp4_swiglu_qmv_packed_top8keys (one
+    output row per simdgroup, twice the threadgroups)."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_packed_top8keys_r1"):
+        return _ext.routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+            input_x, fused_weight, packed_scales, router_keys, stream=stream)
+    experts = _top8_slots_from_keys(router_keys)
+    return _routed_packed_fallback(
+        input_x, fused_weight, packed_scales,
+        [int(e) for e in experts], stream=stream)

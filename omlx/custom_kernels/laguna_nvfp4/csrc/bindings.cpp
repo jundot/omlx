@@ -57,20 +57,6 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
-        "prefill_full_qk_norm_yarn",
-        &omlx::laguna_nvfp4::prefill_full_qk_norm_yarn,
-        "raw_queries"_a, "raw_keys"_a, "query_weight"_a, "key_weight"_a,
-        "angles"_a, "offsets"_a, "h1"_a = false,
-        "stream"_a = nb::none());
-
-    m.def(
-        "prefill_sliding_qk_norm_rope",
-        &omlx::laguna_nvfp4::prefill_sliding_qk_norm_rope,
-        "raw_queries"_a, "raw_keys"_a, "query_weight"_a, "key_weight"_a,
-        "angles"_a, "offsets"_a, "h1"_a = false,
-        "stream"_a = nb::none());
-
-    m.def(
         "decode_nvfp4_qkv_r1",
         &omlx::laguna_nvfp4::decode_nvfp4_qkv_r1,
         "normalized"_a, "weight_codes"_a, "weight_scales"_a, "heads"_a,
@@ -96,6 +82,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "decode_router_top8_ordinal",
+        &omlx::laguna_nvfp4::decode_router_top8_ordinal,
+        "logits"_a, "correction_bias"_a, "normalizing"_a, "score_table"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "sliding_fused_attn_ring",
         &omlx::laguna_nvfp4::sliding_fused_attn_ring,
         "raw_queries"_a, "raw_keys"_a, "raw_values"_a,
@@ -118,16 +110,21 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
-        "prefill_sorted_moe_tail",
-        &omlx::laguna_nvfp4::prefill_sorted_moe_tail,
-        "sorted_expert_outputs"_a, "inverse_order"_a, "router_weights"_a,
-        "shared_output"_a, "residual"_a,
+        "prefill_router_top8",
+        &omlx::laguna_nvfp4::prefill_router_top8,
+        "logits"_a, "correction_bias"_a, "normalizing"_a,
         "stream"_a = nb::none());
 
     m.def(
         "prefill_router_tournament",
         &omlx::laguna_nvfp4::prefill_router_tournament,
-        "logits"_a, "correction_bias"_a,
+        "logits"_a, "correction_bias"_a, "normalizing"_a = false,
+        "stream"_a = nb::none());
+
+    m.def(
+        "prefill_router_tournament_ordinal",
+        &omlx::laguna_nvfp4::prefill_router_tournament_ordinal,
+        "logits"_a, "correction_bias"_a, "normalizing"_a,
         "stream"_a = nb::none());
 
     m.def(
@@ -137,21 +134,74 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
-        "dense_gate_up_swiglu",
-        &omlx::laguna_nvfp4::dense_gate_up_swiglu,
-        "input"_a, "fused_weight"_a,
-        "stream"_a = nb::none());
+        "inject_empty_dispatch",
+        &omlx::laguna_nvfp4::inject_empty_dispatch,
+        "control"_a, "prev"_a, "stream"_a = nb::none());
 
     m.def(
-        "dense_down_residual",
-        &omlx::laguna_nvfp4::dense_down_residual,
-        "activated"_a, "down_weight"_a, "residual"_a,
-        "stream"_a = nb::none());
+        "inject_dram_sweep",
+        &omlx::laguna_nvfp4::inject_dram_sweep,
+        "pool"_a, "control"_a, "stream"_a = nb::none());
+
+    m.def(
+        "decode_embedding_rope_atlas",
+        &omlx::laguna_nvfp4::decode_embedding_rope_atlas,
+        "tokens"_a, "embedding_weight"_a, "full_atlas"_a, "sliding_atlas"_a,
+        "atlas_position"_a, "stream"_a = nb::none());
 
     m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,
         "routed"_a, "residual"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_swiglu_qmv_rows1",
+        &omlx::laguna_nvfp4::shared_nvfp4_swiglu_qmv_rows1,
+        "x"_a, "w"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_swiglu_qmv_rows1_halved",
+        &omlx::laguna_nvfp4::shared_nvfp4_swiglu_qmv_rows1_halved,
+        "x"_a, "w"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_swiglu_qmv_rows1_halved_wide",
+        &omlx::laguna_nvfp4::shared_nvfp4_swiglu_qmv_rows1_halved_wide,
+        "x"_a, "w"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_down_residual_halved",
+        &omlx::laguna_nvfp4::shared_nvfp4_down_residual_halved,
+        "activated"_a, "down_weight"_a, "down_scales"_a,
+        "routed"_a, "residual"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_rows1",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_rows1,
+        "input"_a, "fused_weight"_a, "fused_scales"_a, "indices"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_packed",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_packed,
+        "input"_a, "fused_weight"_a, "packed_scales"_a, "indices"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_packed_top8keys",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_packed_top8keys,
+        "input"_a, "fused_weight"_a, "packed_scales"_a, "router_keys"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_packed_top8keys_r1",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_packed_top8keys_r1,
+        "input"_a, "fused_weight"_a, "packed_scales"_a, "router_keys"_a,
         "stream"_a = nb::none());
 }

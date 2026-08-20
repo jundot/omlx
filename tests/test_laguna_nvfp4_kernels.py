@@ -644,6 +644,31 @@ def test_prefill_sorted_moe_tail_bit_exact():
 @pytestmark_real
 
 
+def test_decode_embedding_rope_atlas_exact():
+    """Fused embedding + RoPE atlas vs the stock gathers: bit-exact."""
+    mx.random.seed(5)
+    tok = mx.array([123], mx.int32)
+    ew = mx.random.normal((100352, 2048)).astype(mx.bfloat16)
+    fa = mx.random.normal((4096, 64)).astype(mx.float32)
+    sa = mx.random.normal((4096, 128)).astype(mx.float32)
+    pos = mx.array([777], mx.int32)
+    h, f, s2 = laguna_nvfp4.decode_embedding_rope_atlas(tok, ew, fa, sa, pos)
+    assert bool(mx.all(h == ew[123]))
+    assert bool(mx.all(f == fa[777]))
+    assert bool(mx.all(s2 == sa[777]))
+
+
+def test_inject_probes_run():
+    """The harness-timing inject probes dispatch without error."""
+    c = mx.array([0xFFFFFFFF], mx.uint32)
+    pv = mx.array([5], mx.uint32)
+    y = laguna_nvfp4.inject_empty_dispatch(c, pv)
+    assert y.shape == (256,)
+    pool = mx.zeros((1 << 22,), mx.uint32)
+    y2 = laguna_nvfp4.inject_dram_sweep(pool, mx.array([1, 1], mx.uint32))
+    assert y2.shape == (256,)
+
+
 @pytestmark_real
 def test_lm_head_prune_real_model():
     """The int5 prune pipeline on the REAL lm_head: the assembled argmax

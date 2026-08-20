@@ -2449,6 +2449,98 @@ kernel void laguna_dense_down_residual_bf16_v1(
     }
 }
 
+// ── Inject probes (harness timing; verbatim) ────────────────────────────
+
+// Empty dispatch (chaining probe).
+//   control [1] u32, prev [1] u32 -> sink [256] u32
+kernel void laguna_inject_empty_dispatch_v1(
+    const device uint32_t* control [[buffer(0)]],
+    const device uint32_t* prev [[buffer(1)]],
+    device uint32_t* sink [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (control[0] == 0xFFFFFFFFu) {
+        sink[gid & 255u] = gid + prev[0];
+    }
+}
+
+// DRAM sweep probe.
+//   pool [pool*4] u32, control [2] u32 -> sink [256] u32
+kernel void laguna_inject_dram_sweep_u4_v2(
+    const device uint32_t* pool [[buffer(0)]],
+    const device uint32_t* control [[buffer(1)]],
+    device uint32_t* sink [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    constexpr uint kThreads = 1024;
+    constexpr uint kPerThread = 8;
+    constexpr uint kMask = (1u << 22) - 1u;
+    const device uint4* quads = (const device uint4*)pool;
+    uint idx = (gid + control[0]) & kMask;
+    uint passes = control[1];
+    uint4 acc = uint4(0u);
+    for (uint p = 0; p < passes; ++p) {
+        for (uint i = 0; i < kPerThread; ++i) {
+            acc ^= quads[idx];
+            idx = (idx + kThreads) & kMask;
+        }
+    }
+    uint folded = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    if (folded == 0xFFFFFFFFu) {
+        sink[gid & 255u] = folded;
+    }
+}
+
+// Decode embedding + RoPE angle atlas, fused.
+// (verbatim from lagunaDecodeEmbeddingRoPEAtlasKernel)
+//   tokens [1] i32, embedding_weight [V][2048] bf16
+//   full_atlas [L][64] f32, sliding_atlas [L][128] f32, atlas_position i32
+//   hidden [2048] bf16, full_angles [64] f32, sliding_angles [128] f32
+// Grid: 512 threads.
+kernel void laguna_decode_embedding_rope_atlas_bf16_2048_v2(
+    const device int32_t* tokens [[buffer(0)]],
+    const device bfloat* embedding_weight [[buffer(1)]],
+    const device float* full_atlas [[buffer(2)]],
+    const device float* sliding_atlas [[buffer(3)]],
+    const device int32_t* atlas_position [[buffer(4)]],
+    device bfloat* hidden [[buffer(5)]],
+    device float* full_angles [[buffer(6)]],
+    device float* sliding_angles [[buffer(7)]],
+    uint lane [[thread_position_in_grid]])
+{
+    constexpr uint hidden_size = 2048;
+    constexpr uint hidden_vectors = hidden_size / 4;
+    constexpr uint full_width = 64;
+    constexpr uint sliding_width = 128;
+
+    uint token = uint(tokens[0]);
+    uint position = uint(atlas_position[0]);
+
+    const device vec<bfloat, 4>* embedding_vectors =
+        (const device vec<bfloat, 4>*)(
+            embedding_weight + token * hidden_size);
+    device vec<bfloat, 4>* hidden_vectors_out =
+        (device vec<bfloat, 4>*)(hidden);
+    if (lane < hidden_vectors) {
+        hidden_vectors_out[lane] = embedding_vectors[lane];
+    }
+
+    if (lane < full_width / 4) {
+        const device vec<float, 4>* atlas_vectors =
+            (const device vec<float, 4>*)(
+                full_atlas + position * full_width);
+        ((device vec<float, 4>*)(full_angles))[lane] =
+            atlas_vectors[lane];
+    }
+    if (lane < sliding_width / 4) {
+        const device vec<float, 4>* atlas_vectors =
+            (const device vec<float, 4>*)(
+                sliding_atlas + position * sliding_width);
+        ((device vec<float, 4>*)(sliding_angles))[lane] =
+            atlas_vectors[lane];
+    }
+}
+
 // ── Dense (bf16) MLP kernels ──────────────────────────────────────────
 
 // Dense gate/up fused + SwiGLU (bf16 fused plane).
@@ -3191,19 +3283,6 @@ kernel void laguna_shared_nvfp4_down_residual_halved_bf16_v1(
     }
 }
 
-// Ordinal-key helpers used by the top-8 routed packed QMV variants below.
-// (verbatim from lagunaDecodeRouterOrdinalHeader + lagunaRouterTop8Prologue
-// Header; laguna_router_key_ordinal already defined above.)
-METAL_FUNC bool laguna_router_ordinal_before(
-    uint a, uint a_index, uint b, uint b_index) {
-    if (a < b) {
-        return true;
-    }
-    if (b < a) {
-        return false;
-    }
-    return a_index < b_index;
-}
 
 // Simd-shuffle-only comparator-minimum extraction; lane `l` owns experts
 // `l + 32j`, `mask` bit `j` marks extracted. Each routed slot performs only
