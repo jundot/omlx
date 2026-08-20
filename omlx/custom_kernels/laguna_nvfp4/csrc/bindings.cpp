@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/variant.h>
 
 #include "laguna_nvfp4_kernels.h"
@@ -38,6 +39,20 @@ NB_MODULE(_ext, m) {
         &omlx::laguna_nvfp4::routed_nvfp4_down_reduce,
         "activated"_a, "down_weight"_a, "down_scales"_a,
         "indices"_a, "router_weights"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "full_qk_norm_yarn",
+        &omlx::laguna_nvfp4::full_qk_norm_yarn,
+        "raw_queries"_a, "raw_keys"_a, "query_weight"_a, "key_weight"_a,
+        "angles"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "sliding_qk_norm_rope",
+        &omlx::laguna_nvfp4::sliding_qk_norm_rope,
+        "raw_queries"_a, "raw_keys"_a, "query_weight"_a, "key_weight"_a,
+        "angles"_a,
         "stream"_a = nb::none());
 
     m.def(

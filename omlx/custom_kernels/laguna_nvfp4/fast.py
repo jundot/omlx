@@ -273,6 +273,70 @@ def routed_nvfp4_down_reduce(
         total = term if total is None else total + term
     return (total * mx.array(2.5, mx.float32)).astype(mx.bfloat16)
 
+
+def _qk_norm_rope_fallback(
+    raw_queries, raw_keys, query_weight, key_weight, angles,
+    q_heads, k_heads, rotary_pairs, mscale=None,
+):
+    """Stock-op fallback for the fused QK-norm+RoPE kernels: rms_norm + the
+    pair rotation. Approximate (few-ulp) vs the kernel's stepwise bf16."""
+    dim = 128
+    norm_q = mx.fast.rms_norm(
+        raw_queries.reshape(q_heads, dim), query_weight, 1e-6)
+    norm_k = mx.fast.rms_norm(
+        raw_keys.reshape(k_heads, dim), key_weight, 1e-6)
+    cos = angles[:rotary_pairs]
+    sin = angles[rotary_pairs : 2 * rotary_pairs]
+
+    def rotate(n):
+        if mscale is not None:
+            # the kernel scales only the rotated pairs (rounded ms in bf16);
+            # the unrotated tail (dims 2*rp..) stays un-scaled
+            rot = (n[..., : 2 * rotary_pairs].astype(mx.float32)
+                   * mx.array(mscale, mx.bfloat16).astype(mx.float32)
+                   ).astype(mx.bfloat16)
+            n = mx.concatenate([rot, n[..., 2 * rotary_pairs :]], axis=-1)
+        first = n[..., :rotary_pairs].astype(mx.float32)
+        second = n[..., rotary_pairs : 2 * rotary_pairs].astype(mx.float32)
+        out1 = (first * cos - second * sin).astype(mx.bfloat16)
+        out2 = (first * sin + second * cos).astype(mx.bfloat16)
+        tail = n[..., 2 * rotary_pairs :]
+        return mx.concatenate([out1, out2, tail], axis=-1)
+
+    return rotate(norm_q).reshape(-1), rotate(norm_k).reshape(-1)
+
+
+def full_qk_norm_yarn(
+    raw_queries, raw_keys, query_weight, key_weight, angles, stream=None
+):
+    """Fused Q/K RMSNorm + partial-RoPE with the YaRN mscale (48 q + 8 k
+    heads, rotary 64). Returns (queries [6144], keys [1024]) bf16."""
+    if _ext is not None and has_symbol("full_qk_norm_yarn"):
+        return _ext.full_qk_norm_yarn(
+            raw_queries, raw_keys, query_weight, key_weight, angles,
+            stream=stream,
+        )
+    return _qk_norm_rope_fallback(
+        raw_queries, raw_keys, query_weight, key_weight, angles,
+        48, 8, 32, mscale=1.3465735912322998,
+    )
+
+
+def sliding_qk_norm_rope(
+    raw_queries, raw_keys, query_weight, key_weight, angles, stream=None
+):
+    """Fused Q/K RMSNorm + full RoPE (64 q + 8 k heads, rotary 128).
+    Returns (queries [8192], keys [1024]) bf16."""
+    if _ext is not None and has_symbol("sliding_qk_norm_rope"):
+        return _ext.sliding_qk_norm_rope(
+            raw_queries, raw_keys, query_weight, key_weight, angles,
+            stream=stream,
+        )
+    return _qk_norm_rope_fallback(
+        raw_queries, raw_keys, query_weight, key_weight, angles,
+        64, 8, 64, mscale=None,
+    )
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

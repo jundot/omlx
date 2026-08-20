@@ -366,6 +366,154 @@ kernel void laguna_routed_nvfp4_down_reduce_bf16_v2(
     }
 }
 
+// Full-attention QK RMSNorm + partial-RoPE with YaRN mscale, fused.
+// (verbatim from lagunaFullQKNormYaRNKernel)
+//   raw_queries [48*128] bf16, raw_keys [8*128] bf16
+//   query_weight [128] bf16, key_weight [128] bf16 (norm weights)
+//   angles [64] float32 (rotary_pairs cos + sin)
+//   queries [48*128] bf16, keys [8*128] bf16
+// Grid: 56 threadgroups (48 q + 8 k heads) x 32 threads.
+kernel void laguna_full_qk_norm_yarn_bf16_128_v4(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* query_weight [[buffer(2)]],
+    const device bfloat* key_weight [[buffer(3)]],
+    const device float* angles [[buffer(4)]],
+    device bfloat* queries [[buffer(5)]],
+    device bfloat* keys [[buffer(6)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint head_dim = 128;
+    constexpr uint rotary_pairs = 32;
+    constexpr uint query_heads = 48;
+    constexpr float yarn_mscale = 1.3465735912322998f;
+
+    const device bfloat* input;
+    const device bfloat* weight;
+    if (head < query_heads) {
+        input = raw_queries + head * head_dim;
+        weight = query_weight;
+    } else {
+        input = raw_keys + (head - query_heads) * head_dim;
+        weight = key_weight;
+    }
+
+    uint base = lane * 4;
+    thread bfloat normalized[4];
+    float sum = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        float value = float(input[base + i]);
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+    for (uint i = 0; i < 4; ++i) {
+        normalized[i] =
+            weight[base + i] *
+            bfloat(float(input[base + i]) * inverse_rms);
+    }
+
+    thread float paired[4];
+    for (uint i = 0; i < 4; ++i) {
+        paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+    }
+
+    device bfloat* output =
+        head < query_heads
+        ? queries + head * head_dim
+        : keys + (head - query_heads) * head_dim;
+    if (lane < 8) {
+        bfloat rounded_mscale = bfloat(yarn_mscale);
+        for (uint i = 0; i < 4; ++i) {
+            uint pair = base + i;
+            float first =
+                float(bfloat(normalized[i] * rounded_mscale));
+            float second =
+                float(bfloat(bfloat(paired[i]) * rounded_mscale));
+            float cosine = angles[pair];
+            float sine = angles[pair + rotary_pairs];
+            output[pair] = bfloat(first * cosine - second * sine);
+            output[pair + rotary_pairs] =
+                bfloat(first * sine + second * cosine);
+        }
+    } else if (lane >= 16) {
+        for (uint i = 0; i < 4; ++i) {
+            output[base + i] = normalized[i];
+        }
+    }
+}
+
+// Sliding-attention QK RMSNorm + full RoPE, fused.
+// (verbatim from lagunaSlidingQKNormRoPEKernel)
+//   raw_queries [64*128] bf16, raw_keys [8*128] bf16
+//   angles [128] float32 (rotary_pairs cos + sin, full 128-dim rotation)
+// Grid: 72 threadgroups (64 q + 8 k heads) x 32 threads.
+kernel void laguna_sliding_qk_norm_rope_bf16_128_v1(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* query_weight [[buffer(2)]],
+    const device bfloat* key_weight [[buffer(3)]],
+    const device float* angles [[buffer(4)]],
+    device bfloat* queries [[buffer(5)]],
+    device bfloat* keys [[buffer(6)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint head_dim = 128;
+    constexpr uint rotary_pairs = 64;
+    constexpr uint query_heads = 64;
+
+    const device bfloat* input;
+    const device bfloat* weight;
+    if (head < query_heads) {
+        input = raw_queries + head * head_dim;
+        weight = query_weight;
+    } else {
+        input = raw_keys + (head - query_heads) * head_dim;
+        weight = key_weight;
+    }
+
+    uint base = lane * 4;
+    thread bfloat normalized[4];
+    float sum = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        float value = float(input[base + i]);
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+    for (uint i = 0; i < 4; ++i) {
+        normalized[i] =
+            weight[base + i] *
+            bfloat(float(input[base + i]) * inverse_rms);
+    }
+
+    thread float paired[4];
+    for (uint i = 0; i < 4; ++i) {
+        paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+    }
+
+    device bfloat* output =
+        head < query_heads
+        ? queries + head * head_dim
+        : keys + (head - query_heads) * head_dim;
+    if (lane < 16) {
+        for (uint i = 0; i < 4; ++i) {
+            uint pair = base + i;
+            float first = float(normalized[i]);
+            float second = paired[i];
+            float cosine = angles[pair];
+            float sine = angles[pair + rotary_pairs];
+            output[pair] = bfloat(first * cosine - second * sine);
+            output[pair + rotary_pairs] =
+                bfloat(first * sine + second * cosine);
+        }
+    }
+}
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input

@@ -403,6 +403,124 @@ array routed_nvfp4_down_reduce(
         {activated, down_weight, down_scales, indices, router_weights});
 }
 
+// QkNormRopePrimitive: fused Q/K RMSNorm + RoPE (full-YaRN or sliding).
+//   inputs[0] = raw_queries [QH*128] bf16
+//   inputs[1] = raw_keys [KH*128] bf16
+//   inputs[2] = query_weight [128] bf16
+//   inputs[3] = key_weight [128] bf16
+//   inputs[4] = angles [rotary_pairs*2] float32
+//   output[0] = queries [QH*128] bf16
+//   output[1] = keys [KH*128] bf16
+class QkNormRopePrimitive : public Primitive {
+ public:
+    QkNormRopePrimitive(Stream s, bool full_yarn)
+        : Primitive(s), full_yarn_(full_yarn) {}
+
+ private:
+    bool full_yarn_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 QkNormRopePrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+
+        const char* kname = full_yarn_
+            ? "laguna_full_qk_norm_yarn_bf16_128_v4"
+            : "laguna_sliding_qk_norm_rope_bf16_128_v1";
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+
+        int groups = full_yarn_ ? 56 : 72;
+        MTL::Size group_dims(32, 1, 1);
+        MTL::Size grid_dims(groups, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(QkNormRopePrimitive)
+};
+
+std::pair<array, array> full_qk_norm_yarn(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    StreamOrDevice s) {
+    if (raw_queries.ndim() != 1 || raw_queries.dtype() != bfloat16 ||
+        raw_keys.ndim() != 1 || raw_keys.dtype() != bfloat16 ||
+        raw_queries.shape(0) != 48 * 128 ||
+        raw_keys.shape(0) != 8 * 128 ||
+        query_weight.ndim() != 1 || key_weight.ndim() != 1 ||
+        query_weight.shape(0) != 128 || key_weight.shape(0) != 128 ||
+        angles.ndim() != 1 || angles.dtype() != float32 ||
+        angles.shape(0) != 64) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 full_qk_norm_yarn: shape mismatch — "
+               "raw_queries " << raw_queries.shape() << ", raw_keys "
+            << raw_keys.shape() << ", angles " << angles.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<QkNormRopePrimitive>(s_stream, true);
+    Shape q_shape{static_cast<ShapeElem>(48 * 128)};
+    Shape k_shape{static_cast<ShapeElem>(8 * 128)};
+    auto outs = array::make_arrays(
+        {q_shape, k_shape}, {bfloat16, bfloat16}, prim,
+        {raw_queries, raw_keys, query_weight, key_weight, angles});
+    return {outs[0], outs[1]};
+}
+
+std::pair<array, array> sliding_qk_norm_rope(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    StreamOrDevice s) {
+    if (raw_queries.ndim() != 1 || raw_queries.dtype() != bfloat16 ||
+        raw_keys.ndim() != 1 || raw_keys.dtype() != bfloat16 ||
+        raw_queries.shape(0) != 64 * 128 ||
+        raw_keys.shape(0) != 8 * 128 ||
+        query_weight.ndim() != 1 || key_weight.ndim() != 1 ||
+        query_weight.shape(0) != 128 || key_weight.shape(0) != 128 ||
+        angles.ndim() != 1 || angles.dtype() != float32 ||
+        angles.shape(0) != 128) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 sliding_qk_norm_rope: shape mismatch — "
+               "raw_queries " << raw_queries.shape() << ", raw_keys "
+            << raw_keys.shape() << ", angles " << angles.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<QkNormRopePrimitive>(s_stream, false);
+    Shape q_shape{static_cast<ShapeElem>(64 * 128)};
+    Shape k_shape{static_cast<ShapeElem>(8 * 128)};
+    auto outs = array::make_arrays(
+        {q_shape, k_shape}, {bfloat16, bfloat16}, prim,
+        {raw_queries, raw_keys, query_weight, key_weight, angles});
+    return {outs[0], outs[1]};
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

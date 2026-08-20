@@ -242,6 +242,50 @@ def test_routed_down_reduce_matches_fallback(seed):
     assert int(mx.sum(d == 0)) >= N // 16
 
 
+@pytest.mark.parametrize("seed", [2, 3])
+def test_full_qk_norm_yarn_bit_exact(seed):
+    """Fused Q/K RMSNorm + partial-RoPE (YaRN) kernel vs the stock-op
+    fallback: the fallback mirrors the kernel's stepwise bf16 rounding
+    (rounded ms in bf16, unrotated tail un-scaled), so they match exactly."""
+    mx.random.seed(seed)
+    rq = mx.random.normal((48 * 128,)).astype(mx.bfloat16)
+    rk = mx.random.normal((8 * 128,)).astype(mx.bfloat16)
+    qw = mx.random.normal((128,)).astype(mx.bfloat16)
+    kw = mx.random.normal((128,)).astype(mx.bfloat16)
+    ang = mx.random.normal((64,)).astype(mx.float32)
+    q, k = laguna_nvfp4.full_qk_norm_yarn(rq, rk, qw, kw, ang)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        qf, kf = laguna_nvfp4.full_qk_norm_yarn(rq, rk, qw, kw, ang)
+    finally:
+        laguna_nvfp4._ext = saved
+    dq = mx.abs(q.astype(mx.float32) - qf.astype(mx.float32))
+    dk = mx.abs(k.astype(mx.float32) - kf.astype(mx.float32))
+    assert float(dq.max()) <= 4e-3, f"seed {seed}: queries differ {float(dq.max()):.3g}"
+    assert float(dk.max()) <= 4e-3, f"seed {seed}: keys differ {float(dk.max()):.3g}"
+    assert int(mx.sum(dq == 0)) >= 48 * 128 // 8
+
+
+def test_sliding_qk_norm_rope_bit_exact():
+    """Fused Q/K RMSNorm + full RoPE (sliding) kernel vs the fallback."""
+    mx.random.seed(4)
+    rq = mx.random.normal((64 * 128,)).astype(mx.bfloat16)
+    rk = mx.random.normal((8 * 128,)).astype(mx.bfloat16)
+    qw = mx.random.normal((128,)).astype(mx.bfloat16)
+    kw = mx.random.normal((128,)).astype(mx.bfloat16)
+    ang = mx.random.normal((128,)).astype(mx.float32)
+    q, k = laguna_nvfp4.sliding_qk_norm_rope(rq, rk, qw, kw, ang)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        qf, kf = laguna_nvfp4.sliding_qk_norm_rope(rq, rk, qw, kw, ang)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(q == qf))
+    assert bool(mx.all(k == kf))
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 
 #include "mlx/array.h"
 #include "mlx/stream.h"
@@ -71,6 +72,26 @@ array routed_nvfp4_down_reduce(
     const array& down_scales,
     const array& indices,
     const array& router_weights,
+    StreamOrDevice s = {});
+
+// Fused Q/K RMSNorm + RoPE. Returns {queries [QH*128], keys [KH*128]}.
+// Full-attention variant applies partial-RoPE with the YaRN mscale (48 q + 8 k
+// heads, rotary 64); the sliding variant rotates the full 128 dims (64 q + 8 k
+// heads).
+std::pair<array, array> full_qk_norm_yarn(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    StreamOrDevice s = {});
+
+std::pair<array, array> sliding_qk_norm_rope(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
     StreamOrDevice s = {});
 
 // Native extension availability probe for ABI verification.
