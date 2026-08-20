@@ -722,6 +722,18 @@ def maybe_apply_pre_load_patches(
                 # attachment when they're absent.
                 has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
                 set_mtp_attach_enabled(has_mtp_weights)
+                if mtp_enabled and not has_mtp_weights:
+                    # Without this line the load-time "Speculative backend
+                    # selected ... active" log is the last word, and the
+                    # silent downgrade reads as MTP running at 0% gain
+                    # (#2150-class confusion; observed on the
+                    # mlx-community Qwen3.8-27B-bf16 export).
+                    logger.info(
+                        "MTP head declared in %s config but the checkpoint "
+                        "ships no mtp.* weights — speculative decoding "
+                        "unavailable, serving plain decode (see #1426)",
+                        model_name,
+                    )
 
                 # Sanitize-preservation patch runs unconditionally: the
                 # stock mlx-vlm Model.sanitize strips every ``mtp.*`` key,
