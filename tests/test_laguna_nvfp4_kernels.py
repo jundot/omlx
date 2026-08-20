@@ -441,6 +441,31 @@ def test_residual_rms_router_bit_exact():
     assert bool(mx.all(ky == kyf))
 
 
+def test_prefill_moe_tail_bit_exact():
+    """Prefill MoE tail vs the faithful bf16-stepwise reference (the kernel
+    rounds each product and the running total to bf16, then x2.5 and the
+    shared/residual adds — all bf16)."""
+    rows = 3
+    mx.random.seed(31)
+    ex = mx.random.normal((1, rows, 8, 2048), scale=0.02).astype(mx.bfloat16)
+    rw = mx.random.normal((1, rows, 8), scale=0.1).astype(mx.float32)
+    sh = mx.random.normal((1, rows, 2048), scale=0.05).astype(mx.bfloat16)
+    re = mx.random.normal((1, rows, 2048), scale=0.05).astype(mx.bfloat16)
+    y = laguna_nvfp4.prefill_moe_tail(ex, rw, sh, re)
+    # faithful reference
+    ex2 = ex.astype(mx.float32)
+    w2 = rw.astype(mx.bfloat16).astype(mx.float32)
+    tot = mx.zeros((1, rows, 2048), mx.float32)
+    for e in range(8):
+        p = (ex2[:, :, e, :] * w2[..., e : e + 1]).astype(mx.bfloat16)
+        tot = ((tot + p.astype(mx.float32)).astype(mx.bfloat16)).astype(mx.float32)
+    scaled = (tot * mx.array(2.5, mx.float32)).astype(mx.bfloat16)
+    ref = (scaled.astype(mx.float32) + sh.astype(mx.float32)).astype(mx.bfloat16)
+    ref = (ref.astype(mx.float32) + re.astype(mx.float32)).astype(mx.bfloat16)
+    assert bool(mx.all(y == ref.reshape(-1))), (
+        f"moe_tail diverges at {int(mx.sum(y == ref.reshape(-1)))}/{rows*2048}")
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

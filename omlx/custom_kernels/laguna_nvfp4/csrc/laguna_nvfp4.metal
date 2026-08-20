@@ -1395,6 +1395,52 @@ kernel void laguna_residual_rms_router_bf16_2048_rpg8(
     }
 }
 
+// Prefill MoE tail: weighted expert combine (x2.5) + shared + residual.
+// (verbatim from lagunaPrefillMoETailKernel)
+//   expert_outputs [rows][8][2048] bf16, router_weights [rows][8] fp32
+//   shared_output [rows][2048] bf16, residual [rows][2048] bf16
+//   output [rows][2048] bf16
+// Grid: (512, rows) threads (4 cols per thread).
+kernel void laguna_prefill_moe_tail_bf16_v1(
+    const device bfloat* expert_outputs [[buffer(0)]],
+    const device float* router_weights [[buffer(1)]],
+    const device bfloat* shared_output [[buffer(2)]],
+    const device bfloat* residual [[buffer(3)]],
+    device bfloat* output [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col0 = gid.x;
+
+    constexpr uint hidden = 2048;
+    constexpr uint experts = 8;
+    constexpr uint n_cols = 4;
+
+    uint col = col0 * n_cols;
+
+    const device bfloat* expert_row =
+        expert_outputs + (row * experts) * hidden + col;
+    const device float* weight_row = router_weights + row * experts;
+
+    bfloat expert_weights[experts];
+    for (uint e = 0; e < experts; ++e) {
+        expert_weights[e] = bfloat(weight_row[e]);
+    }
+
+    for (uint i = 0; i < n_cols; ++i) {
+        bfloat total = bfloat(0);
+        for (uint e = 0; e < experts; ++e) {
+            bfloat product =
+                bfloat(expert_row[e * hidden + i] * expert_weights[e]);
+            total = bfloat(product + total);
+        }
+        bfloat scaled = bfloat(total * bfloat(2.5f));
+        bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
+        output[row * hidden + col + i] =
+            bfloat(residual[row * hidden + col + i] + r2);
+    }
+}
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input

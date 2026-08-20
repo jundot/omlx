@@ -160,6 +160,15 @@ std::vector<array> residual_rms_router(
     const array& correction_bias,
     StreamOrDevice s = {});
 
+// Prefill MoE tail: weighted expert combine (x2.5) + shared + residual.
+// Returns [rows*2048] bf16.
+array prefill_moe_tail(
+    const array& expert_outputs,
+    const array& router_weights,
+    const array& shared_output,
+    const array& residual,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

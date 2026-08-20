@@ -968,6 +968,78 @@ std::vector<array> residual_rms_router(
     return outs;
 }
 
+// PrefillMoeTailPrimitive: weighted expert combine + shared + residual.
+class PrefillMoeTailPrimitive : public Primitive {
+ public:
+    explicit PrefillMoeTailPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 PrefillMoeTailPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_prefill_moe_tail_bf16_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+        // The Swift wrapper's grid is in THREADS: (hidden/4, rows) threads
+        // with a 256-thread group -> (hidden/1024, rows) threadgroups.
+        int rows = static_cast<int>(inputs[0].shape(1));
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(2048 / 4 / 256, rows, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(PrefillMoeTailPrimitive)
+};
+
+array prefill_moe_tail(
+    const array& expert_outputs,
+    const array& router_weights,
+    const array& shared_output,
+    const array& residual,
+    StreamOrDevice s) {
+    // expert_outputs [1, rows, 8, 2048]; router_weights [1, rows, 8];
+    // shared_output/residual [1, rows, 2048] (the Swift batched layout).
+    int rows = static_cast<int>(expert_outputs.shape(1));
+    if (expert_outputs.ndim() != 4 || expert_outputs.dtype() != bfloat16 ||
+        expert_outputs.shape(0) != 1 ||
+        expert_outputs.shape(2) != 8 || expert_outputs.shape(3) != 2048 ||
+        router_weights.ndim() != 3 || router_weights.dtype() != float32 ||
+        router_weights.shape(0) != 1 || router_weights.shape(1) != rows ||
+        router_weights.shape(2) != 8 ||
+        shared_output.ndim() != 3 || shared_output.dtype() != bfloat16 ||
+        shared_output.shape(0) != 1 || shared_output.shape(1) != rows ||
+        shared_output.shape(2) != 2048 ||
+        residual.ndim() != 3 || residual.dtype() != bfloat16 ||
+        residual.shape(0) != 1 || residual.shape(1) != rows ||
+        residual.shape(2) != 2048) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 prefill_moe_tail: shape mismatch — "
+               "expert_outputs " << expert_outputs.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<PrefillMoeTailPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(rows * 2048)};
+    return array(out_shape, bfloat16, prim,
+                 {expert_outputs, router_weights, shared_output, residual});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

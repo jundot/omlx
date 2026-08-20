@@ -498,6 +498,24 @@ def residual_rms_router(
     )
     return summed, normalized, logits, keys
 
+
+def prefill_moe_tail(
+    expert_outputs, router_weights, shared_output, residual, stream=None,
+):
+    """Prefill MoE tail (verbatim from lagunaPrefillMoETailKernel): the
+    weighted 8-expert combine (x2.5) + shared + residual. Returns
+    [rows*2048] bf16."""
+    if _ext is not None and has_symbol("prefill_moe_tail"):
+        return _ext.prefill_moe_tail(
+            expert_outputs, router_weights, shared_output, residual,
+            stream=stream,
+        )
+    w = router_weights.astype(mx.bfloat16)  # [1, rows, 8]
+    y = mx.sum(expert_outputs * w[..., None], axis=2) * mx.array(
+        2.5, mx.float32)  # [1, rows, 2048]
+    y = (y + shared_output + residual).astype(mx.bfloat16)
+    return y.reshape(-1)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,
