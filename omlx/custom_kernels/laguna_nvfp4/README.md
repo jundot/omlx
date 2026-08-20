@@ -46,14 +46,15 @@ case analysis).
 | `laguna_sliding_fused_attn_ring_v1` | `lagunaSlidingFusedAttentionKernel` | ✅ fast-exp ULP vs reference |
 | `laguna_residual_rms_router_bf16_2048_rpg8` | `lagunaResidualRMSNormRouterSource(8)` | ✅ bit-exact (4 outputs) |
 | `laguna_prefill_moe_tail_bf16_v1` | `lagunaPrefillMoETailKernel` | ✅ bit-exact |
+| `laguna_prefill_router_tournament_v1` | `lagunaPrefillRouterTournamentKernelSource` | ✅ bit-exact |
 
 Not yet ported (documented follow-up): the LM-head prune family
 (`LagunaLmHeadPrune.swift` — coarse int5 argmax + exact-winner threshold +
-sparse refine), the prefill router tournament/top8 + qk_norm prefill
-variants, the sorted moe_tail, the decode ordinal/tournament router
-variants, and the lane-major scale-bank variants of the QKV/o_proj kernels.
-These are draft-side or prefill-adjacent and do not change the decode hot
-path already covered.
+sparse refine; requires the challenge's int5 checkpoint transform omlx does
+not produce), the prefill router top8 / sorted moe_tail / qk_norm prefill
+variants, the decode ordinal/tournament router variants, and the lane-major
+scale-bank variants of the QKV/o_proj kernels. These are draft-side or
+prefill-adjacent and do not change the decode hot path already covered.
 
 ## Correctness posture (important)
 
