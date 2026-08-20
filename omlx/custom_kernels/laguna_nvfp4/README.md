@@ -46,7 +46,10 @@ case analysis).
 | `laguna_sliding_fused_attn_ring_v1` | `lagunaSlidingFusedAttentionKernel` | ✅ fast-exp ULP vs reference |
 | `laguna_residual_rms_router_bf16_2048_rpg8` | `lagunaResidualRMSNormRouterSource(8)` | ✅ bit-exact (4 outputs) |
 | `laguna_prefill_moe_tail_bf16_v1` | `lagunaPrefillMoETailKernel` | ✅ bit-exact |
-| `laguna_prefill_router_tournament_v1` | `lagunaPrefillRouterTournamentKernelSource` | ✅ bit-exact |
+| `laguna_prefill_router_tournament_v1/_norm_v1` | `lagunaPrefillRouterTournamentKernelSource` | ✅ bit-exact |
+| `laguna_decode_router_top8_ordinal_v1/_norm_v1/_table_v1/_table_norm_v1` | `lagunaDecodeRouterOrdinalKernelSource` | ✅ bit-exact |
+| `laguna_prefill_router_top8_v1/_norm_v1` | `lagunaPrefillRouterTop8KernelSource` | ✅ bit-exact |
+| `laguna_prefill_router_tournament_ordinal_active64_v2/_norm_active64_v2` | `lagunaPrefillRouterTournamentOrdinalKernelSource` | ✅ bit-exact |
 | `laguna_lmhead_int5_coarse_*` + argmax stage1 + exact-winner + inline exact (`lm_head_prune`) | `LagunaLmHeadPrune.swift` family | ✅ real-model validated |
 
 ## LM-head int5 prune
@@ -59,11 +62,11 @@ pass. Real-model validation (Poolside 100k×2048 lm_head + a real hidden row):
 prune argmax == stock argmax, winner slot bf16-exact, zero non-winner slots
 above the winner — the prune's certified-bound contract.
 
-Not yet ported (documented follow-up): the prefill router top8 / sorted
-moe_tail / qk_norm prefill variants, the decode ordinal/tournament router
-variants, and the lane-major scale-bank variants of the QKV/o_proj kernels.
-These are prefill-adjacent or alternate scale-layout variants and do not
-change the decode hot path already covered.
+Not yet ported (documented follow-up): the prefill sorted moe_tail / qk_norm
+prefill variants, and the lane-major scale-bank variants of the QKV/o_proj
+kernels. These are prefill-adjacent or alternate scale-layout variants and do
+not change the decode hot path already covered. (The decode ordinal +
+prefill top8/tournament router variants ARE ported — see the table above.)
 
 ## Correctness posture (important)
 
