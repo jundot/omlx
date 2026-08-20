@@ -1594,6 +1594,60 @@ std::vector<array> decode_embedding_rope_atlas(
         {tokens, embedding_weight, full_atlas, sliding_atlas, atlas_position});
 }
 
+// FullFusedAttnGrowPrimitive: fused full-attention decode (grow regime).
+class FullFusedAttnGrowPrimitive : public Primitive {
+ public:
+    explicit FullFusedAttnGrowPrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 FullFusedAttnGrowPrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_full_fused_attn_grow_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        enc.set_output_array(out, c++);
+        // grid (heads/2 * 1024) threads / 1024 group -> 24 groups
+        MTL::Size group_dims(1024, 1, 1);
+        MTL::Size grid_dims(48 / 2, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(FullFusedAttnGrowPrimitive)
+};
+
+array full_fused_attn_grow(
+    const array& raw_queries, const array& raw_keys, const array& raw_values,
+    const array& query_weight, const array& key_weight, const array& angles,
+    const array& k_cache, const array& v_cache, const array& params,
+    const array& scale_arr, StreamOrDevice s) {
+    if (raw_queries.ndim() != 1 || raw_queries.dtype() != bfloat16 ||
+        raw_queries.shape(0) != 48 * 128 ||
+        raw_keys.shape(0) != 8 * 128 || raw_values.shape(0) != 8 * 128 ||
+        query_weight.shape(0) != 128 || key_weight.shape(0) != 128 ||
+        angles.dtype() != float32 || angles.shape(0) != 64 ||
+        params.ndim() != 1 || params.dtype() != uint32 ||
+        params.shape(0) != 3 ||
+        scale_arr.ndim() != 1 || scale_arr.dtype() != float32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 full_fused_attn_grow: shape mismatch — "
+               "raw_queries " << raw_queries.shape() << ", angles "
+            << angles.shape() << ", params " << params.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<FullFusedAttnGrowPrimitive>(s_stream);
+    Shape o{static_cast<ShapeElem>(48 * 128)};
+    return array(o, bfloat16, prim,
+                 {raw_queries, raw_keys, raw_values, query_weight, key_weight,
+                  angles, k_cache, v_cache, params, scale_arr});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

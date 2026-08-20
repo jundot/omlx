@@ -230,6 +230,13 @@ std::vector<array> decode_embedding_rope_atlas(
     const array& full_atlas, const array& sliding_atlas,
     const array& atlas_position, StreamOrDevice s = {});
 
+// Fused full-attention decode (grow regime). Returns [48*128] bf16.
+array full_fused_attn_grow(
+    const array& raw_queries, const array& raw_keys, const array& raw_values,
+    const array& query_weight, const array& key_weight, const array& angles,
+    const array& k_cache, const array& v_cache, const array& params,
+    const array& scale_arr, StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

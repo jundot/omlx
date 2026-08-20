@@ -669,6 +669,55 @@ def test_inject_probes_run():
     assert y2.shape == (256,)
 
 
+def test_full_fused_attn_grow_matches_reference():
+    """Fused full-attention grow vs a Python reference of the same
+    norm+YaRN+flash arithmetic: matches within fast-exp ULP."""
+    mx.random.seed(9)
+    rq = mx.random.normal((48 * 128,)).astype(mx.bfloat16)
+    rk = mx.random.normal((8 * 128,)).astype(mx.bfloat16)
+    rv = mx.random.normal((8 * 128,)).astype(mx.bfloat16)
+    qw = mx.random.normal((128,)).astype(mx.bfloat16)
+    kw = mx.random.normal((128,)).astype(mx.bfloat16)
+    ang = mx.random.normal((64,)).astype(mx.float32)
+    cap = 512
+    kc = mx.random.normal((8, cap, 128)).astype(mx.bfloat16)
+    vc = mx.random.normal((8, cap, 128)).astype(mx.bfloat16)
+    widx, N = 17, 100
+    scale = 0.0883
+    y = laguna_nvfp4.full_fused_attn_grow(
+        rq, rk, rv, qw, kw, ang, kc, vc,
+        mx.array([widx, N, cap], mx.uint32), mx.array([scale], mx.float32))
+
+    # reference: partial-YaRN norm, then flash attention over the first N
+    def norm_yarn(x, w):
+        n = mx.fast.rms_norm(x.reshape(-1, 128), w, 1e-6).reshape(-1, 128)
+        ms = mx.array(1.3465735912322998, mx.bfloat16).astype(mx.float32)
+        # partial rotary: pairs p and p+32, cosine at angles[p], sine at angles[p+32]
+        # the kernel's partial rotary couples pair p with pair p+32:
+        # output[p] = first*cos - second*sin, output[p+32] = first*sin + second*cos
+        first = (n[..., :32].astype(mx.float32) * ms).astype(mx.bfloat16).astype(mx.float32)
+        second = (n[..., 32:64].astype(mx.float32) * ms).astype(mx.bfloat16).astype(mx.float32)
+        c = ang[:32].astype(mx.float32)[None, :]
+        s_ = ang[32:].astype(mx.float32)[None, :]
+        o1 = (first * c - second * s_).astype(mx.bfloat16)
+        o2 = (first * s_ + second * c).astype(mx.bfloat16)
+        return mx.concatenate([o1, o2, n[..., 64:]], axis=-1)
+    q = norm_yarn(rq, qw).reshape(48, 128)
+    k = norm_yarn(rk, kw).reshape(8, 128)
+    K = mx.concatenate([kc[:, :widx], k[:, None], kc[:, widx + 1 : cap]], axis=1)[:, :N]
+    V = mx.concatenate([vc[:, :widx], rv.reshape(8, 128)[:, None], vc[:, widx + 1 : cap]], axis=1)[:, :N]
+    refs = []
+    for h in range(48):
+        kvh = h // 6
+        sc = (q[h].astype(mx.float32) * scale) @ K[kvh].astype(mx.float32).T
+        m = sc.max(); e = mx.exp(sc - m); wsum = e.sum()
+        refs.append(((e[:, None] * V[kvh].astype(mx.float32)).sum(0) / wsum)
+                    .astype(mx.bfloat16))
+    ref = mx.concatenate(refs)
+    d = mx.abs(y.astype(mx.float32) - ref.astype(mx.float32))
+    assert float(d.max()) <= 2e-3, f"full attn grow diverges: {float(d.max()):.4g}"
+
+
 @pytestmark_real
 def test_lm_head_prune_real_model():
     """The int5 prune pipeline on the REAL lm_head: the assembled argmax

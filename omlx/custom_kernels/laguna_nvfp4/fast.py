@@ -694,6 +694,21 @@ def decode_embedding_rope_atlas(
     hidden = embedding_weight[int(tokens[0])]
     return hidden, full_atlas[pos], sliding_atlas[pos]
 
+
+def full_fused_attn_grow(
+    raw_queries, raw_keys, raw_values, query_weight, key_weight, angles,
+    k_cache, v_cache, params, scale_arr, stream=None,
+):
+    """Fused full-attention decode (grow regime; verbatim
+    laguna_full_fused_attn_grow_v1). Returns attended [48*128] bf16."""
+    if _ext is not None and has_symbol("full_fused_attn_grow"):
+        return _ext.full_fused_attn_grow(
+            raw_queries, raw_keys, raw_values, query_weight, key_weight,
+            angles, k_cache, v_cache, params, scale_arr, stream=stream)
+    raise RuntimeError(
+        "laguna_nvfp4 full_fused_attn_grow requires the native extension "
+        "(the fused grow path has no pure-mlx equivalent).")
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

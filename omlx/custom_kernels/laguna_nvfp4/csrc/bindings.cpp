@@ -150,6 +150,14 @@ NB_MODULE(_ext, m) {
         "atlas_position"_a, "stream"_a = nb::none());
 
     m.def(
+        "full_fused_attn_grow",
+        &omlx::laguna_nvfp4::full_fused_attn_grow,
+        "raw_queries"_a, "raw_keys"_a, "raw_values"_a,
+        "query_weight"_a, "key_weight"_a, "angles"_a,
+        "k_cache"_a, "v_cache"_a, "params"_a, "scale_arr"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,
