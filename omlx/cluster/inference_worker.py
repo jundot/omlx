@@ -991,7 +991,7 @@ def run_worker(args: argparse.Namespace) -> int:
     # Before the load, not after it. Loading a 300 GB model takes twenty
     # minutes, and a peer that goes away inside that window left every other
     # rank blocked in its first collective with nothing watching at all.
-    _start_peer_watchdog(
+    peer_watchdog = _start_peer_watchdog(
         marker,
         assignments,
         [host for host in args.peer_hosts.split(",") if host],
@@ -1250,6 +1250,12 @@ def run_worker(args: argparse.Namespace) -> int:
             )
         raise
     finally:
+        # Stop watching peers before the markers start disappearing: ranks
+        # unlink their markers during a clean teardown, and a still-armed
+        # watchdog reads that as a lost peer and calls os._exit(1).
+        if peer_watchdog is not None:
+            with suppress(Exception):
+                peer_watchdog.stop()
         marker.stop_heartbeat()
         if not preserve_failure_marker:
             marker.remove()

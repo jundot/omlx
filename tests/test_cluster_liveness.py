@@ -251,6 +251,31 @@ def test_the_watchdog_reports_once_and_stops(tmp_path):
     assert "mac-studio" in losses[0]
 
 
+def test_stop_during_a_scan_in_flight_does_not_fire(tmp_path):
+    """A clean teardown calls stop() and then unlinks the runtime markers.
+
+    A peer scan already in flight at that moment sees missing peers; firing
+    on_lost would os._exit(1) a rank that is shutting down on purpose. The
+    stop flag must win even when it is raised mid-scan.
+    """
+
+    losses = []
+    watchdog = PeerWatchdog(HOSTS, deployment_id="d", state_dir=str(tmp_path),
+                            interval=0.0, on_lost=losses.append,
+                            failure_tolerance=1)
+
+    def scan_racing_teardown():
+        watchdog.stop()  # teardown lands while the scan is in flight
+        return (
+            PeerHealth("test-mbp", 0, True, 0.0),
+            PeerHealth("mac-studio", 1, False, None, detail="gone"),
+        )
+
+    watchdog.run_once = scan_racing_teardown  # type: ignore[method-assign]
+    watchdog.run(sleep=lambda _s: None)
+    assert losses == []
+
+
 def test_a_healthy_cluster_keeps_the_watchdog_quiet(tmp_path):
     losses = []
     watchdog = PeerWatchdog(HOSTS, deployment_id="d", state_dir=str(tmp_path),

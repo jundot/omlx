@@ -527,6 +527,12 @@ class PeerWatchdog:
             if not failed_ranks:
                 continue
             failed = tuple(item for item in health if item.rank in failed_ranks)
+            # Re-check AFTER the peer scan: a clean teardown calls stop()
+            # and then unlinks the runtime markers, so a scan already in
+            # flight sees missing peers — firing the callback here would
+            # os._exit(1) a rank that is shutting down on purpose.
+            if self._stop:
+                return
             if self._on_lost is not None:
                 self._on_lost(describe_failure(failed))
             return
