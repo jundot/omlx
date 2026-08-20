@@ -114,6 +114,8 @@ class ModelSettings:
             ANE/GPU prompt processing.
         qwen35_ane_prefill_sequence_length: Exact flattened token count routed
             through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
+            projection block padded to the compiled ANE shape (zero disables).
         qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
             across the ANE instances.
         qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
@@ -233,6 +235,7 @@ class ModelSettings:
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
     qwen35_ane_prefill_enabled: bool = False
     qwen35_ane_prefill_sequence_length: int = 2048
+    qwen35_ane_prefill_tail_padding_min_tokens: int = 0
     qwen35_ane_prefill_fraction: float = 0.53
     qwen35_ane_prefill_fused_down: bool = False
     qwen35_ane_prefill_max_layers: int = 64

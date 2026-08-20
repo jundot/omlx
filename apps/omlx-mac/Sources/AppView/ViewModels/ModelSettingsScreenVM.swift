@@ -36,6 +36,7 @@ final class ModelSettingsScreenVM {
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
+        case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
         case qwen35AnePrefillDualAne, qwen35AnePrefillGdn
         case qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnMaxLayers
@@ -267,6 +268,7 @@ final class ModelSettingsScreenVM {
     // benchmark path. The feature itself remains opt-in.
     var qwen35AnePrefillEnabled: Bool = false
     var qwen35AnePrefillSequenceLength: String = "2048"
+    var qwen35AnePrefillTailPaddingMinTokens: String = "0"
     var qwen35AnePrefillFraction: String = "0.53"
     var qwen35AnePrefillMaxLayers: String = "64"
     var qwen35AnePrefillDualAne: Bool = true
@@ -378,7 +380,8 @@ final class ModelSettingsScreenVM {
             return true
         case .turboquantKvEnabled, .turboquantKvBits:
             return true
-        case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength:
+        case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
+             .qwen35AnePrefillTailPaddingMinTokens:
             return true
         case .qwen35AnePrefillFraction, .qwen35AnePrefillMaxLayers:
             return true
@@ -519,6 +522,7 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
+                self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
                 self.qwen35AnePrefillFraction = s?.qwen35AnePrefillFraction.map { Self.formatPct($0) } ?? "0.53"
                 self.qwen35AnePrefillMaxLayers = s?.qwen35AnePrefillMaxLayers.map(String.init) ?? "64"
                 self.qwen35AnePrefillDualAne = s?.qwen35AnePrefillDualAne ?? true
@@ -669,6 +673,14 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillSequenceLength:
             switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
             case .success(let value): patch.qwen35AnePrefillSequenceLength = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillTailPaddingMinTokens:
+            switch QwenAneSettingsValidator.tailPadding(
+                qwen35AnePrefillTailPaddingMinTokens,
+                sequenceLength: qwen35AnePrefillSequenceLength
+            ) {
+            case .success(let value): patch.qwen35AnePrefillTailPaddingMinTokens = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillFraction:
@@ -852,6 +864,9 @@ final class ModelSettingsScreenVM {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
         qwen35AnePrefillEnabled = recommendation.enabled
         qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+        qwen35AnePrefillTailPaddingMinTokens = String(
+            recommendation.tailPaddingMinTokens ?? 0
+        )
         if let fraction = recommendation.mlpFraction {
             qwen35AnePrefillFraction = Self.formatPct(fraction)
         }
@@ -1127,6 +1142,7 @@ final class ModelSettingsScreenVM {
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {
                 putInt(ProfileSettingsKey.qwen35AnePrefillSequenceLength, qwen35AnePrefillSequenceLength)
+                putInt(ProfileSettingsKey.qwen35AnePrefillTailPaddingMinTokens, qwen35AnePrefillTailPaddingMinTokens)
                 putDouble(ProfileSettingsKey.qwen35AnePrefillFraction, qwen35AnePrefillFraction)
                 putInt(ProfileSettingsKey.qwen35AnePrefillMaxLayers, qwen35AnePrefillMaxLayers)
                 putBool(ProfileSettingsKey.qwen35AnePrefillDualAne, qwen35AnePrefillDualAne)
@@ -1411,6 +1427,13 @@ final class ModelSettingsScreenVM {
         case .success: break
         case .failure(let error): lastError = error.message; return false
         }
+        switch QwenAneSettingsValidator.tailPadding(
+            qwen35AnePrefillTailPaddingMinTokens,
+            sequenceLength: qwen35AnePrefillSequenceLength
+        ) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
         switch QwenAneSettingsValidator.mlpFraction(
             qwen35AnePrefillFraction,
             cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
@@ -1542,6 +1565,20 @@ enum QwenAneSettingsValidator {
         integer(raw, label: "ANE prompt block") { value in
             value >= 1024 && value.isMultiple(of: 64)
                 ? nil : "ANE prompt block must be a multiple of 64 and at least 1024."
+        }
+    }
+
+    static func tailPadding(
+        _ raw: String, sequenceLength: String
+    ) -> Result<Int, SamplingValidationError> {
+        let block: Int
+        switch promptBlock(sequenceLength) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): block = value
+        }
+        return integer(raw, label: "ANE tail padding threshold") { value in
+            value >= 0 && value < block
+                ? nil : "ANE tail padding threshold must be zero or less than the prompt block."
         }
     }
 

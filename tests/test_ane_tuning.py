@@ -35,7 +35,7 @@ def test_cpu_worker_search_space_is_independent_of_saved_settings():
 
 
 def test_candidate_settings_are_transient_copy():
-    base = ModelSettings()
+    base = ModelSettings(qwen35_ane_prefill_tail_padding_min_tokens=1500)
     request = ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048)
     candidate = ane_tuning._Candidate(
         "test", True, 0.25, True, 0.35, True, 0.125, 0.20, 0.10
@@ -51,8 +51,10 @@ def test_candidate_settings_are_transient_copy():
     assert tuned.qwen35_ane_prefill_cpu_fraction == 0.125
     assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.20
     assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.10
+    assert tuned.qwen35_ane_prefill_tail_padding_min_tokens == 0
     assert base.qwen35_ane_prefill_enabled is False
     assert base.qwen35_ane_prefill_fraction == 0.53
+    assert base.qwen35_ane_prefill_tail_padding_min_tokens == 1500
 
 
 def test_candidate_settings_preserve_single_ane_mode():
@@ -326,6 +328,7 @@ async def test_tuner_recommends_best_combined_split(monkeypatch):
         "processing_tps": 125.0,
         "speedup_percent": 25.0,
         "sequence_length": 2048,
+        "tail_padding_min_tokens": 1639,
     }
 
 
@@ -827,7 +830,24 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "processing_tps": 100.0,
         "speedup_percent": 0.0,
         "sequence_length": run.request.sequence_length,
+        "tail_padding_min_tokens": 0,
     }
+
+
+@pytest.mark.parametrize(
+    ("gpu_tps", "tuned_tps", "expected"),
+    [
+        (349.4, 527.4, 1357),
+        (100.0, 125.0, 1639),
+        (100.0, 100.0, 0),
+        (100.0, 99.0, 0),
+        (None, 125.0, 0),
+    ],
+)
+def test_tail_padding_threshold_uses_current_tuner_throughput(
+    gpu_tps, tuned_tps, expected
+):
+    assert ane_tuning._tail_padding_min_tokens(2048, gpu_tps, tuned_tps) == expected
 
 
 def test_profile_refinement_rebalances_mlp_without_cpu_share(monkeypatch):

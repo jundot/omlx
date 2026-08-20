@@ -410,6 +410,14 @@ class BatchedEngine(BaseEngine):
                     return enable_qwen35_ane_prefill(
                         self._model,
                         sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
                         fraction=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_fraction",

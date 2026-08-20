@@ -166,6 +166,7 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune_preparing",
         "modal.model_settings.qwen_ane_tune_test",
         "modal.model_settings.qwen_ane_tune_throughput",
+        "modal.model_settings.qwen_ane_tail_padding",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -180,6 +181,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     fields = {
         "qwen35_ane_prefill_enabled",
         "qwen35_ane_prefill_sequence_length",
+        "qwen35_ane_prefill_tail_padding_min_tokens",
         "qwen35_ane_prefill_fraction",
         "qwen35_ane_prefill_max_layers",
         "qwen35_ane_prefill_dual_ane",
@@ -212,6 +214,7 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
 
     for field in (
         "qwen35_ane_prefill_sequence_length",
+        "qwen35_ane_prefill_tail_padding_min_tokens",
         "qwen35_ane_prefill_fraction",
         "qwen35_ane_prefill_cpu_fraction",
         "qwen35_ane_prefill_cpu_down_fraction",

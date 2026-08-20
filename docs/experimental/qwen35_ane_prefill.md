@@ -36,9 +36,10 @@ remain on GPU.
   FP16 range before writing any checkpoint files.
 - An MLP prefill call whose flattened token count matches the fixed configured
   sequence length, or a single-prompt call that is wider: wide chunks are tiled
-  internally into fixed-shape blocks plus a residual tail on the ordinary
-  quantized linears. Decode, target verification, chunks narrower than the
-  fixed shape, and unsupported layers automatically use the existing path.
+  internally into fixed-shape blocks. A tuner-calibrated suffix may zero-pad a
+  sufficiently large residual intermediate activation to one fixed ANE tile;
+  smaller tails, decode, target verification, and unsupported layers use the
+  existing path.
 - Fixed-shape ANE programs and their combined affine suffixes are prepared eagerly
   on the MLX executor while the model starts. For the 64-layer 27B target this
   adds a substantial startup phase, but the first matching prompt no longer
@@ -72,6 +73,7 @@ where the native q8 tile is not profitable.
 {
   "qwen35_ane_prefill_enabled": true,
   "qwen35_ane_prefill_sequence_length": 2048,
+  "qwen35_ane_prefill_tail_padding_min_tokens": 0,
   "qwen35_ane_prefill_fraction": 0.53,
   "qwen35_ane_prefill_max_layers": 64,
   "qwen35_ane_prefill_dual_ane": true,
@@ -140,12 +142,22 @@ MLP and GDN splits normally. CPU gate/up, down-projection, and GDN sharing are
 all calibrated in either mode when the checkpoint has the required eager FP16
 rows and the matching native symbols are available.
 
+After selecting the best full-model candidate, the tuner derives the first
+profitable padded tail from measurements made by the current run. If `S` is
+the fixed ANE sequence length, `G` is GPU-only prompt throughput, and `H` is
+the winning hybrid throughput, the crossover is
+`floor(S * G / H) + 1` tokens. This is the first integer tail for which the
+estimated GPU time (`tail / G`) exceeds one padded hybrid tile (`S / H`). The
+tuner writes zero when the hybrid candidate does not beat GPU-only, which
+keeps padding disabled. Saved thresholds are cleared during each search so an
+older calibration cannot influence a new result.
+
 The scheduler keeps its normal prompt chunk width; chunks wider than the
-compiled ANE shape are tiled internally. sequence_length must therefore not
-exceed the delivered chunk width: chunks narrower than the compiled shape
-cannot tile onto it, and the load logs a warning when the configuration can
-never execute. With boundary caching on, delivered chunks are cut at the
-2,048-token cache block edge, so 2,048 remains the safe default everywhere.
+compiled ANE shape are tiled internally. Chunks narrower than the compiled
+shape can use a padded intermediate tile only when they meet the calibrated
+threshold; otherwise they stay on the ordinary GPU path. With boundary caching
+on, delivered chunks are cut at the 2,048-token cache block edge, so 2,048
+remains the safe default everywhere.
 A 4K benchmark request prefills only 4,095 tokens because the final token is
 reserved for generation kickoff; the benchmark screen's ANE alignment option
 adds one token so an exact multiple of the fixed shape is prefilled.
@@ -170,8 +182,11 @@ a normal learned token, not a state-neutral null token. Appending it changes
 the logits and advances both the KV cache and Gated DeltaNet recurrent state.
 Padding can only be made semantically inert by carrying a mask through cache
 positions, RoPE, and every recurrent update; the normal single-request path
-does not provide that guarantee, so synthetic padding is not used to force ANE
-shapes.
+does not provide that guarantee, so synthetic token padding is not used to
+force ANE shapes. Intermediate tail padding is different: it adds zero rows
+only around the tokenwise MLP and GDN input projections, slices those rows from
+the projection result before GDN recurrence or later model stages, and never
+alters the token sequence, positions, or cache state.
 
 For the combined-only path, the native bridge directly merges the planar ANE
 prefix and row-major GPU suffix while applying SwiGLU. This avoids materializing

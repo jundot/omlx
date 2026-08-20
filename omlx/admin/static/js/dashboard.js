@@ -30,6 +30,7 @@
         'turboquant_skip_last',
         'qwen35_ane_prefill_enabled',
         'qwen35_ane_prefill_sequence_length',
+        'qwen35_ane_prefill_tail_padding_min_tokens',
         'qwen35_ane_prefill_fraction',
         'qwen35_ane_prefill_fused_down',
         'qwen35_ane_prefill_max_layers',
@@ -224,6 +225,7 @@
                 is_diffusion_model: false,
                 qwen35_ane_prefill_enabled: false,
                 qwen35_ane_prefill_sequence_length: 2048,
+                qwen35_ane_prefill_tail_padding_min_tokens: 0,
                 qwen35_ane_prefill_fraction: 0.53,
                 qwen35_ane_prefill_fused_down: false,
                 qwen35_ane_prefill_max_layers: 64,
@@ -7380,6 +7382,7 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
                     qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
                     qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
                     qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
@@ -7838,6 +7841,11 @@
                         `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
                     );
                 }
+                if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
+                    parts.push(
+                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
+                    );
+                }
                 return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
             },
 
@@ -7997,6 +8005,9 @@
                 const patch = {
                     qwen35_ane_prefill_enabled: !!recommendation.enabled,
                     qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                    qwen35_ane_prefill_tail_padding_min_tokens: Number(
+                        recommendation.tail_padding_min_tokens || 0
+                    ),
                 };
                 if (recommendation.enabled) {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
@@ -8164,6 +8175,15 @@
                     error = 'ANE prompt block must be a multiple of 64.';
                 }
                 if (error) return error;
+                error = integer(
+                    this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
+                    'ANE tail padding threshold',
+                    0,
+                );
+                if (error) return error;
+                if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
+                    return 'ANE tail padding threshold must be less than the prompt block.';
+                }
                 error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
                 if (error) return error;
                 error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
@@ -8287,6 +8307,9 @@
                                 // blank numeric input must fall back to the server default
                                 // instead of coercing to 0 and failing an unrelated save.
                                 qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
+                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
+                                    : 0,
                                 qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
                                 qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
@@ -8395,6 +8418,7 @@
                                     turboquant_kv_bits: 4,
                                     qwen35_ane_prefill_enabled: false,
                                     qwen35_ane_prefill_sequence_length: 2048,
+                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
                                     qwen35_ane_prefill_fraction: 0.53,
                                     qwen35_ane_prefill_max_layers: 64,
                                     qwen35_ane_prefill_dual_ane: true,
@@ -8498,6 +8522,7 @@
                         this.modelSettings.turboquant_kv_bits = 4;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
+                        this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
                         this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
                         this.modelSettings.qwen35_ane_prefill_max_layers = 64;
                         this.modelSettings.qwen35_ane_prefill_dual_ane = true;

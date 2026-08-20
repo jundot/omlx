@@ -105,6 +105,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     let qwen35AnePrefillEnabled: Bool?
     let qwen35AnePrefillSequenceLength: Int?
+    let qwen35AnePrefillTailPaddingMinTokens: Int?
     let qwen35AnePrefillFraction: Double?
     let qwen35AnePrefillFusedDown: Bool?
     let qwen35AnePrefillMaxLayers: Int?
@@ -186,6 +187,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillEnabled: Bool? = nil
     var qwen35AnePrefillSequenceLength: Int? = nil
+    var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
     var qwen35AnePrefillFraction: Double? = nil
     var qwen35AnePrefillFusedDown: Bool? = nil
     var qwen35AnePrefillMaxLayers: Int? = nil

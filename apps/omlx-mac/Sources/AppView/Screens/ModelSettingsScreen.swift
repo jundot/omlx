@@ -1269,6 +1269,17 @@ private struct ExperimentalSection: View {
                                   isNumeric: true, range: 1024...262_144,
                                   step: 64, width: 190)
                     }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.tail_padding.label",
+                                      defaultValue: "Pad Intermediate Tails From",
+                                      comment: "Row label for the Qwen ANE intermediate tail threshold"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.tail_padding.sub",
+                                         defaultValue: "Residual projection blocks at least this large are zero-padded to the ANE shape. Zero disables padding; Tune ANE Split calculates the crossover.",
+                                         comment: "Sublabel explaining Qwen ANE intermediate tail padding")) {
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillTailPaddingMinTokens),
+                                  placeholder: "0", mono: true,
+                                  isNumeric: true, range: 0...262_143,
+                                  step: 1, width: 190)
+                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
                                       comment: "Row label for the Qwen MLP ANE workload fraction"),
@@ -1774,6 +1785,9 @@ private struct ExperimentalSection: View {
             let down = Int(((recommendation.cpuDownFraction ?? 0) * 100).rounded())
             let gdn = Int(((recommendation.cpuGdnFraction ?? 0) * 100).rounded())
             parts.append("CPU \(gate)%/\(down)%/\(gdn)%")
+        }
+        if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
+            parts.append("Pad tails ≥\(threshold)")
         }
         return String(
             format: "%@ · %.1f tok/s (%+.1f%%)",

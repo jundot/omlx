@@ -619,6 +619,7 @@
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
+  "modal.model_settings.qwen_ane_tail_padding": "Pad tails from",
   "modal.model_settings.qwen_ane_mlp_fraction": "MLP on ANE",
   "modal.model_settings.qwen_ane_mlp_layers": "MLP layer limit",
   "modal.model_settings.qwen_ane_dual": "Use both ANEs",

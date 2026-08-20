@@ -50,6 +50,7 @@ class _AnePrefillConfig:
     cpu_shared_resource: bool = True
     ane_down_fraction: float = 0.0
     fused_down: bool = False
+    tail_padding_min_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class _AneGDNConfig:
     cpu_fraction: float = 0.0
     cpu_threads: int = 8
     cpu_shared_resource: bool = True
+    tail_padding_min_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -233,6 +235,19 @@ def _tiled_input_plan(
     if full_blocks < 1:
         return None
     return full_blocks, tail_rows
+
+
+def _pad_fixed_shape_tail(x: mx.array, sequence_length: int) -> mx.array:
+    """Zero-pad one tokenwise projection input to an ANE program's shape."""
+    rows = int(x.shape[-2])
+    if rows <= 0 or rows >= sequence_length:
+        raise ValueError("ANE tail padding requires 1..sequence_length-1 rows")
+    return mx.pad(x, [(0, 0), (0, sequence_length - rows), (0, 0)])
+
+
+def _tail_padding_profitable(rows: int, config: Any) -> bool:
+    threshold = int(getattr(config, "tail_padding_min_tokens", 0) or 0)
+    return 0 < threshold <= rows < int(config.sequence_length)
 
 
 def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
@@ -1459,8 +1474,16 @@ def _gdn_backend(
     if rows == config.sequence_length:
         return _gdn_backend_exact(gdn, x, target_verify)
     if rows < config.sequence_length:
-        # Decode and short chunks exit before the tiling planner; this wrapper
-        # runs on every GDN call of every layer of every decode step.
+        if _tail_padding_profitable(rows, config):
+            padded = _gdn_backend_exact(
+                gdn,
+                _pad_fixed_shape_tail(x, config.sequence_length),
+                target_verify,
+            )
+            if padded is not None:
+                return tuple(value[..., :rows, :] for value in padded)
+        # Decode and unprofitable short chunks exit before the tiling planner;
+        # this wrapper runs on every GDN call of every layer of every decode.
         return None
 
     plan = _tiled_input_plan(
@@ -1482,12 +1505,24 @@ def _gdn_backend(
 
     if tail_rows:
         tail_x = x[:, full_blocks * config.sequence_length :, :]
-        projected.append(
-            tuple(
-                _tail_qmm_or_linear(linear, tail_x, config.variant)
-                for linear in _gdn_linears(gdn)
+        padded = None
+        if _tail_padding_profitable(tail_rows, config):
+            padded = _gdn_backend_exact(
+                gdn,
+                _pad_fixed_shape_tail(tail_x, config.sequence_length),
+                target_verify,
             )
-        )
+        if padded is not None:
+            projected.append(
+                tuple(value[..., :tail_rows, :] for value in padded)
+            )
+        else:
+            projected.append(
+                tuple(
+                    _tail_qmm_or_linear(linear, tail_x, config.variant)
+                    for linear in _gdn_linears(gdn)
+                )
+            )
 
     return tuple(
         mx.concatenate([part[index] for part in projected], axis=-2)
@@ -1775,8 +1810,16 @@ def _backend(
     if rows == config.sequence_length:
         return _backend_exact(mlp, x, target_verify)
     if rows < config.sequence_length:
-        # Decode and short chunks exit before the tiling planner; this wrapper
-        # runs on every MLP call of every layer of every decode step.
+        if _tail_padding_profitable(rows, config):
+            padded = _backend_exact(
+                mlp,
+                _pad_fixed_shape_tail(x, config.sequence_length),
+                target_verify,
+            )
+            if padded is not None:
+                return padded[..., :rows, :]
+        # Decode and unprofitable short chunks exit before the tiling planner;
+        # this wrapper runs on every MLP call of every layer of every decode.
         return None
 
     plan = _tiled_input_plan(
@@ -1798,11 +1841,23 @@ def _backend(
 
     if tail_rows:
         tail_x = x[:, full_blocks * config.sequence_length :, :]
-        gate = _tail_qmm_or_linear(mlp.gate_proj, tail_x, config.variant)
-        up = _tail_qmm_or_linear(mlp.up_proj, tail_x, config.variant)
-        outputs.append(
-            _tail_qmm_or_linear(mlp.down_proj, swiglu(gate, up), config.variant)
-        )
+        padded = None
+        if _tail_padding_profitable(tail_rows, config):
+            padded = _backend_exact(
+                mlp,
+                _pad_fixed_shape_tail(tail_x, config.sequence_length),
+                target_verify,
+            )
+        if padded is not None:
+            outputs.append(padded[..., :tail_rows, :])
+        else:
+            gate = _tail_qmm_or_linear(mlp.gate_proj, tail_x, config.variant)
+            up = _tail_qmm_or_linear(mlp.up_proj, tail_x, config.variant)
+            outputs.append(
+                _tail_qmm_or_linear(
+                    mlp.down_proj, swiglu(gate, up), config.variant
+                )
+            )
     return mx.concatenate(outputs, axis=-2)
 
 
@@ -2158,6 +2213,7 @@ def _enable_dual_procedure_banks(
         cpu_fraction=cpu_gdn_fraction,
         cpu_threads=config.cpu_threads,
         cpu_shared_resource=config.cpu_shared_resource,
+        tail_padding_min_tokens=config.tail_padding_min_tokens,
     )
     with _COMPILE_LOCK:
         # Incremental staging (issue #2781): with the native builder each fp32
@@ -2714,6 +2770,7 @@ def _enable_fused_gdn_banks(
         cpu_fraction=cpu_fraction,
         cpu_threads=config.cpu_threads,
         cpu_shared_resource=config.cpu_shared_resource,
+        tail_padding_min_tokens=config.tail_padding_min_tokens,
     )
     prepared: list[tuple[Any, _CombinedGDNState, mx.array, mx.array]] = []
     with _COMPILE_LOCK:
@@ -2783,6 +2840,7 @@ def enable_qwen35_ane_prefill(
     cpu_gdn_fraction: float = 0.0,
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
+    tail_padding_min_tokens: int = 0,
 ) -> int:
     """Enable the private ANE backend on eligible MLPs in ``model``.
 
@@ -2813,6 +2871,10 @@ def enable_qwen35_ane_prefill(
         raise ValueError("ANE CPU GDN fraction must be between 0.0 and 0.50")
     if not 0 <= cpu_threads <= 64:
         raise ValueError("ANE CPU worker count must be between 0 and 64")
+    if not 0 <= tail_padding_min_tokens < sequence_length:
+        raise ValueError(
+            "ANE tail padding threshold must be zero or less than sequence_length"
+        )
 
     env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
     if env in ("0", "false", "off"):
@@ -2846,7 +2908,9 @@ def enable_qwen35_ane_prefill(
         cpu_shared_resource=cpu_shared_resource,
         ane_down_fraction=ane_down_fraction if dual_ane else 0.0,
         fused_down=fused_down and dual_ane,
+        tail_padding_min_tokens=tail_padding_min_tokens,
     )
+    model._omlx_ane_tail_padding_min_tokens = tail_padding_min_tokens
     if ane_down_fraction > 0 and not dual_ane:
         logger.warning(
             "Experimental ANE down projection currently requires dual ANE; "
@@ -3023,6 +3087,7 @@ def enable_qwen35_ane_prefill(
             cpu_fraction=cpu_gdn_fraction,
             cpu_threads=cpu_threads,
             cpu_shared_resource=config.cpu_shared_resource,
+            tail_padding_min_tokens=config.tail_padding_min_tokens,
         )
         for module in model.modules() if hasattr(model, "modules") else ():
             if gdn_count >= gdn_max_layers:
@@ -3137,5 +3202,8 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
         ),
         "resident_programs": int(
             getattr(model, "_omlx_ane_resident_program_count", 0) or 0
+        ),
+        "tail_padding_min_tokens": int(
+            getattr(model, "_omlx_ane_tail_padding_min_tokens", 0) or 0
         ),
     }

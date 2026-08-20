@@ -355,6 +355,56 @@ def test_mlp_wide_call_tiles_full_blocks_and_keeps_gpu_tail(monkeypatch):
     assert result[:, 2048:].tolist()[0][0][0] == 30
 
 
+def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
+    calls = []
+
+    def exact(_mlp, block, _target_verify=False):
+        calls.append((int(block.shape[-2]), float(mx.sum(block).item())))
+        return mx.full(block.shape, 7, dtype=block.dtype)
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            2048, 0.53, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 4095, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    assert result is not None
+    mx.eval(result)
+
+    assert result.shape == (1, 4095, 8)
+    assert calls == [(2048, 16384.0), (2048, 16376.0)]
+    assert bool(mx.all(result == 7))
+
+
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+    seen = []
+
+    def exact(_mlp, block, _target_verify=False):
+        seen.append(block)
+        return block + 2
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            2048, 0.53, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    assert result is not None
+    mx.eval(result, *seen)
+
+    assert result.shape == x.shape
+    assert seen[0].shape == (1, 2048, 8)
+    assert bool(mx.all(seen[0][:, :1400] == 1))
+    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(result == 3))
+
+
 def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
     calls = []
 
@@ -425,6 +475,33 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
     ]
     assert [part[0, 0, 0].item() for part in result] == [1, 2, 3, 4]
     assert [part[0, -1, 0].item() for part in result] == [10, 20, 30, 40]
+
+
+def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
+    calls = []
+
+    def exact(_gdn, block, _target_verify=False):
+        calls.append((int(block.shape[-2]), float(mx.sum(block).item())))
+        return tuple(
+            mx.full((1, block.shape[-2], 1), value, dtype=block.dtype)
+            for value in (1, 2, 3, 4)
+        )
+
+    monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    gdn = SimpleNamespace(
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(
+            2048, 0.50, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 4095, 8), dtype=mx.float16)
+
+    result = ane_patch._gdn_backend(gdn, x)
+    assert result is not None
+    mx.eval(*result)
+
+    assert [part.shape for part in result] == [(1, 4095, 1)] * 4
+    assert calls == [(2048, 16384.0), (2048, 16376.0)]
+    assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
 def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
@@ -2202,6 +2279,7 @@ def test_prefill_status_reports_configured_layers():
         "gdn_layers": 4,
         "dual_ane_layers": 8,
         "resident_programs": 24,
+        "tail_padding_min_tokens": 0,
     }
 
 

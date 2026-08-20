@@ -112,6 +112,7 @@ async def test_qwen_ane_prefill_settings_are_persisted():
         admin_routes.ModelSettingsRequest(
             qwen35_ane_prefill_enabled=True,
             qwen35_ane_prefill_sequence_length=2048,
+            qwen35_ane_prefill_tail_padding_min_tokens=1357,
             qwen35_ane_prefill_fraction=0.53,
             qwen35_ane_prefill_max_layers=64,
             qwen35_ane_prefill_dual_ane=True,
@@ -123,6 +124,7 @@ async def test_qwen_ane_prefill_settings_are_persisted():
 
     assert settings.qwen35_ane_prefill_enabled is True
     assert settings.qwen35_ane_prefill_sequence_length == 2048
+    assert settings.qwen35_ane_prefill_tail_padding_min_tokens == 1357
     assert settings.qwen35_ane_prefill_fraction == 0.53
     assert settings.qwen35_ane_prefill_max_layers == 64
     assert settings.qwen35_ane_prefill_dual_ane is True
@@ -177,6 +179,21 @@ async def test_qwen_ane_prefill_rejects_invalid_block_size():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(
                 qwen35_ane_prefill_sequence_length=2000
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_rejects_tail_threshold_at_block_size():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+
+    with pytest.raises(admin_routes.HTTPException, match="less than"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                qwen35_ane_prefill_tail_padding_min_tokens=2048
             ),
         )
 

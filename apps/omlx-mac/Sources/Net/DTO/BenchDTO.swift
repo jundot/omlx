@@ -279,6 +279,7 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let processingTps: Double
     let speedupPercent: Double
     let sequenceLength: Int
+    let tailPaddingMinTokens: Int?
 }
 
 struct ANETuningStatusResponse: Codable, Sendable {

@@ -47,6 +47,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_skip_last",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
     "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",

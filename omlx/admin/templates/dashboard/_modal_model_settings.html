@@ -734,12 +734,19 @@
                                         </div>
 
                                         <div x-show="modelSettings.qwen35_ane_prefill_enabled" x-transition class="space-y-4 pt-1">
-                                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_prompt_block') }}</label>
                                                     <input type="number"
                                                            x-model.number="modelSettings.qwen35_ane_prefill_sequence_length"
                                                            min="1024" step="64" required placeholder="2048"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_tail_padding') }}</label>
+                                                    <input type="number"
+                                                           x-model.number="modelSettings.qwen35_ane_prefill_tail_padding_min_tokens"
+                                                           min="0" step="1" required placeholder="0"
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 </div>
                                                 <div>

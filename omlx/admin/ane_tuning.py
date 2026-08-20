@@ -297,6 +297,30 @@ def _refresh_speedups(run: ANETuningRun) -> None:
         )
 
 
+def _tail_padding_min_tokens(
+    sequence_length: int,
+    gpu_tps: float | None,
+    tuned_tps: float | None,
+) -> int:
+    """Return the first tail length whose GPU time exceeds one hybrid tile.
+
+    For positive throughput values, a GPU tail costs ``rows / gpu_tps`` and a
+    padded fixed-shape hybrid call costs ``sequence_length / tuned_tps``. The
+    strict integer crossover is therefore floor(S * G / H) + 1. Zero disables
+    padding when tuning found no gain or no partial tile can be profitable.
+    """
+    if (
+        sequence_length <= 1
+        or gpu_tps is None
+        or tuned_tps is None
+        or gpu_tps <= 0
+        or tuned_tps <= gpu_tps
+    ):
+        return 0
+    threshold = int(sequence_length * gpu_tps / tuned_tps) + 1
+    return threshold if 0 < threshold < sequence_length else 0
+
+
 def _set_phase_running(run: ANETuningRun, slot: int, message: str) -> None:
     run.phase = "calibrating"
     run.message = message
@@ -398,6 +422,9 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
         candidate.enabled and candidate.fused_down
     )
     settings.qwen35_ane_prefill_sequence_length = request.sequence_length
+    # Saved calibration must not alter the search. The winning run computes a
+    # fresh crossover from this run's GPU and hybrid throughput measurements.
+    settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
     if candidate.mlp_fraction is not None:
         settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction
     settings.qwen35_ane_prefill_gdn = bool(
@@ -2132,6 +2159,11 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             )
             gdn_enabled = False
             gdn_fraction = None
+        tail_padding_min_tokens = _tail_padding_min_tokens(
+            run.request.sequence_length,
+            baseline_result.get("processing_tps"),
+            best.get("processing_tps") if best.get("enabled") else None,
+        )
         run.recommendation = {
             "enabled": bool(best["enabled"]),
             "mlp_fraction": best["mlp_fraction"],
@@ -2147,6 +2179,7 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             "processing_tps": best["processing_tps"],
             "speedup_percent": best["speedup_percent"],
             "sequence_length": run.request.sequence_length,
+            "tail_padding_min_tokens": tail_padding_min_tokens,
         }
         run.status = "completed"
         run.phase = "completed"
@@ -2208,6 +2241,7 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 "processing_tps": baseline_result["processing_tps"],
                 "speedup_percent": baseline_result.get("speedup_percent"),
                 "sequence_length": run.request.sequence_length,
+                "tail_padding_min_tokens": 0,
             }
     finally:
         _restore_speed_priority(engine_pool, previous_speed_priority)
