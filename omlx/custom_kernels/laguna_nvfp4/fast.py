@@ -370,6 +370,42 @@ def decode_nvfp4_qkv_r1(
         transpose=True, group_size=16, bits=4, mode="nvfp4", stream=stream,
     ).squeeze(0).astype(mx.bfloat16)
 
+
+def oproj_act(
+    attention_output: mx.array,
+    gate_values: mx.array,
+    weight_codes: mx.array,
+    weight_scales: mx.array,
+    heads: int,
+    stream=None,
+) -> mx.array:
+    """Gated affine o_proj with a pre-activated per-head gate, fused in one
+    kernel (verbatim from lagunaGatedAffineOProjNVFP4Source with
+    preActivatedGate, default flag config).
+
+    Parameters
+    ----------
+    attention_output : [heads*128] bf16
+    gate_values      : [heads] bf16       — pre-activated per-head gate
+    weight_codes     : [2048, heads*16] uint32
+    weight_scales    : [2048, heads*8] uint8
+
+    Returns [2048] bf16.
+    """
+    if _ext is not None and has_symbol("oproj_act"):
+        return _ext.oproj_act(
+            attention_output, gate_values, weight_codes, weight_scales,
+            heads, stream=stream,
+        )
+    in_vec = heads * 128
+    # the kernel rounds the per-element gate product to bf16 before the qdot
+    gated = (attention_output.reshape(heads, 128).astype(mx.float32)
+             * gate_values[:, None].astype(mx.float32)).astype(mx.bfloat16)
+    return mx.quantized_matmul(
+        gated.reshape(1, in_vec), weight_codes, scales=weight_scales,
+        transpose=True, group_size=16, bits=4, mode="nvfp4", stream=stream,
+    ).squeeze(0).astype(mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

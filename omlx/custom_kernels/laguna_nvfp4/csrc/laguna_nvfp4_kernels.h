@@ -107,6 +107,20 @@ array decode_nvfp4_qkv_r1(
     int heads,
     StreamOrDevice s = {});
 
+// Gated affine o_proj (pre-activated per-head gate), fused in one kernel.
+//   attention_output [heads*128] bf16
+//   gate_values      [heads] bf16
+//   weight_codes     [2048, heads*16] uint32
+//   weight_scales    [2048, heads*8] uint8
+// Returns [2048] bf16.
+array oproj_act(
+    const array& attention_output,
+    const array& gate_values,
+    const array& weight_codes,
+    const array& weight_scales,
+    int heads,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

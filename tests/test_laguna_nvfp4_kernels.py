@@ -308,6 +308,28 @@ def test_decode_qkv_r1_bit_exact(heads):
     assert bool(mx.all(y == yf)), f"heads {heads}: QKV kernel diverges"
 
 
+@pytest.mark.parametrize("heads", [48, 64])
+def test_oproj_act_bit_exact(heads):
+    """Gated affine o_proj (pre-activated gate) vs the stock path: the
+    kernel's bf16 per-element gate product + nvfp4 qdot reproduces the
+    stock decode path byte-for-byte — bit-exact."""
+    in_vec = heads * 128
+    mx.random.seed(13 + heads)
+    attn = mx.random.normal((in_vec,), scale=0.1).astype(mx.bfloat16)
+    gate = mx.random.uniform(0.5, 1.5, (heads,)).astype(mx.bfloat16)
+    wq, ws = mx.quantize(
+        mx.random.normal((2048, in_vec), scale=0.02),
+        group_size=16, bits=4, mode="nvfp4")
+    y = laguna_nvfp4.oproj_act(attn, gate, wq, ws, heads)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        yf = laguna_nvfp4.oproj_act(attn, gate, wq, ws, heads)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(y == yf)), f"heads {heads}: o_proj diverges"
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

@@ -598,6 +598,87 @@ array decode_nvfp4_qkv_r1(
                  {normalized, weight_codes, weight_scales});
 }
 
+// OProjActPrimitive: gated affine o_proj (pre-activated per-head gate).
+//   inputs[0] = attention_output [heads*128] bf16
+//   inputs[1] = gate_values [heads] bf16
+//   inputs[2] = weight_codes [2048, heads*16] uint32
+//   inputs[3] = weight_scales [2048, heads*8] uint8
+//   output[0] = projected [2048] bf16
+class OProjActPrimitive : public Primitive {
+ public:
+    OProjActPrimitive(Stream s, int heads)
+        : Primitive(s), heads_(heads) {}
+
+ private:
+    int heads_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 OProjActPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        std::string kname = "laguna_oproj_act_h"
+            + std::to_string(heads_) + "_v1_sc1_se1";
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        int out_vec = 2048;
+        MTL::Size group_dims(64, 1, 1);
+        MTL::Size grid_dims((out_vec / 8) * 64 / 64, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(OProjActPrimitive)
+};
+
+array oproj_act(
+    const array& attention_output,
+    const array& gate_values,
+    const array& weight_codes,
+    const array& weight_scales,
+    int heads,
+    StreamOrDevice s) {
+    int in_vec = heads * 128;
+    if (attention_output.ndim() != 1 || attention_output.dtype() != bfloat16 ||
+        attention_output.shape(0) != in_vec ||
+        gate_values.ndim() != 1 || gate_values.dtype() != bfloat16 ||
+        gate_values.shape(0) != heads ||
+        weight_codes.ndim() != 2 || weight_codes.dtype() != uint32 ||
+        weight_codes.shape(0) != 2048 || weight_codes.shape(1) != in_vec / 8 ||
+        weight_scales.ndim() != 2 || weight_scales.dtype() != uint8 ||
+        weight_scales.shape(0) != 2048 || weight_scales.shape(1) != in_vec / 16) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 oproj_act: shape mismatch — attention_output "
+            << attention_output.shape() << ", gate_values "
+            << gate_values.shape() << ", weight_codes "
+            << weight_codes.shape() << ", weight_scales "
+            << weight_scales.shape() << ", heads " << heads;
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<OProjActPrimitive>(s_stream, heads);
+    Shape out_shape{static_cast<ShapeElem>(2048)};
+    return array(out_shape, bfloat16, prim,
+                 {attention_output, gate_values, weight_codes, weight_scales});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }
