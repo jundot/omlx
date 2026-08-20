@@ -12,6 +12,7 @@ Key features:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -979,7 +980,11 @@ class _DeepSeekV4PrefillMemoryProfile:
         pooled_dim: int,
         overlap: bool,
     ) -> int:
-        pooled = (num_tokens // ratio) * pooled_dim
+        # Charge the pooled rows at backing CAPACITY, not logical length:
+        # PoolingCache grows geometrically (cache_extras._grow_pool:
+        # ``max(needed, 2 * cap)``), so physical residency reaches twice
+        # the logical rows after a growth step.
+        pooled = 2 * (num_tokens // ratio) * pooled_dim
         projection_dim = pooled_dim * (2 if overlap else 1)
         # PoolingCache allocates full KV/gate remainder buffers on first use.
         buffers = 2 * ratio * projection_dim
@@ -1340,6 +1345,13 @@ def estimate_mla_kv_bytes_per_token(
     kv_lora_rank = _cfg_get(config, "kv_lora_rank")
     rope_dim = _cfg_get(config, "qk_rope_head_dim")
     if not (_pos_int(kv_lora_rank) and _pos_int(rope_dim)):
+        # DeepSeek-V4 has ``q_lora_rank`` but no ``kv_lora_rank``, so the
+        # MLA test above misses it — yet its pooled K-only caches are even
+        # further from the uniform formula than MLA's latent is.
+        if str(_cfg_get(config, "model_type", "") or "").startswith("deepseek_v4"):
+            return _estimate_deepseek_v4_kv_bytes_per_token(
+                config, cache_list, dtype_size
+            )
         return None
 
     if cache_list is None:
@@ -1386,6 +1398,68 @@ def _ane_prefill_transient_bytes(model: Any) -> int:
         return int(ane_prefill_transient_bytes(model))
     except Exception:  # noqa: BLE001 - patch optional; never break estimation
         return 0
+
+
+def _estimate_deepseek_v4_kv_bytes_per_token(
+    config: Any,
+    cache_list: Any,
+    dtype_size: float,
+) -> float | None:
+    """Average resident KV bytes/token across DeepSeek-V4's pooled caches.
+
+    V4 stores no expanded K/V: every layer keeps a 128-token K-only rotating
+    window (a constant, not per-token growth), and compressed layers add
+    K-only main + indexer pools holding one entry per ``compress_ratio``
+    tokens. The uniform ``kv_heads * head_dim * 2`` formula prices this as a
+    dense 1-head K+V cache — ~6-13x over.
+    """
+    heads = _cfg_get(config, "num_attention_heads")
+    kv_heads = _cfg_get(config, "num_key_value_heads") or heads
+    if kv_heads != 1 or not _pos_int(_cfg_get(config, "q_lora_rank")):
+        return None
+    head_dim = _cfg_get(config, "head_dim")
+    if not _pos_int(head_dim):
+        return None
+    index_head_dim = _cfg_get(config, "index_head_dim")
+    if not _pos_int(index_head_dim):
+        index_head_dim = 0
+
+    # Prefer the live cache's layer count: on a pipeline-sharded rank it
+    # reflects only the local layers, which the config total would not.
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    layer_count = None
+    if cache_list is not None:
+        try:
+            layer_count = len(cache_list)
+        except Exception:
+            layer_count = None
+    if not _pos_int(layer_count):
+        layer_count = num_layers if _pos_int(num_layers) else None
+    if layer_count is None:
+        return None
+
+    # x2: pooled rows are charged at backing capacity — PoolingCache grows
+    # geometrically (cache_extras._grow_pool), so physical residency
+    # reaches twice the logical rows after a growth step.
+    pooled_elems = 2.0 * float(head_dim + index_head_dim)
+    ratios = _cfg_get(config, "compress_ratios")
+    if (
+        isinstance(ratios, Sequence)
+        and not isinstance(ratios, (str, bytes))
+        and _pos_int(num_layers)
+        and len(ratios) >= num_layers
+        and all(r in (0, 4, 128) for r in tuple(ratios)[:num_layers])
+    ):
+        # Ratio-0 layers are window-only: zero per-token growth.
+        avg_elems = (
+            sum(pooled_elems / r for r in tuple(ratios)[:num_layers] if r)
+            / num_layers
+        )
+    else:
+        # Ratios unknown: charge every layer at the strongest known
+        # compression's cost (1/4) — still conservative per layer.
+        avg_elems = pooled_elems / 4.0
+    return avg_elems * float(layer_count) * float(dtype_size)
 
 
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
@@ -1491,6 +1565,20 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             config, cache_list, dtype_size
         )
 
+        # Same model-specific prefill strategy the Scheduler installs
+        # (Scheduler._set_model_info_for_monitor) — without it a DeepSeek-V4
+        # guard falls back to dense full-context SDPA math, the 81.25 GiB
+        # false positive of issue #2521, on the engines that bypass the
+        # scheduler and on cluster ranks.
+        wsdpa_dtype_supported = False
+        with contextlib.suppress(Exception):
+            wsdpa_dtype_supported = getattr(model, "dtype", None) == mx.bfloat16
+        prefill_memory_profile = make_prefill_memory_profile(
+            config,
+            compute_dtype_size=float(dtype_size),
+            wsdpa_dtype_supported=wsdpa_dtype_supported,
+        )
+
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
@@ -1509,6 +1597,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
                 ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
+                prefill_memory_profile=prefill_memory_profile,
             )
             logger.debug(
                 f"Model info for memory estimation: "

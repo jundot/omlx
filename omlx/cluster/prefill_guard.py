@@ -39,6 +39,7 @@ def rank_monitor(
     *,
     layer_count: int = 0,
     tensor_parallel_size: int = 1,
+    start_layer: int | None = None,
 ) -> Any | None:
     """A ``MemoryMonitor`` calibrated to the slice this rank actually holds.
 
@@ -70,14 +71,69 @@ def rank_monitor(
     stage_layers = int(layer_count) if layer_count else num_layers
     stage_layers = max(1, min(stage_layers, num_layers or stage_layers))
 
-    # Tensor parallel: heads are split across ranks, so both the KV this rank
-    # stores and the attention transient it computes shrink with the shard.
+    # Tensor parallel: heads are split across ranks, so the attention
+    # transient this rank computes shrinks with the shard. The KV override is
+    # NOT divided: it exists only for MLA/DeepSeek-V4 latent caches
+    # (``estimate_mla_kv_bytes_per_token`` returns None for everything else),
+    # and ``shard()`` splits query heads while every rank keeps that latent
+    # whole — dividing under-reserved each rank by exactly the TP degree.
     tp = max(1, int(tensor_parallel_size))
+    profile = getattr(monitor, "_prefill_memory_profile", None)
+    if (
+        profile is not None
+        and num_layers
+        and stage_layers < num_layers
+        and getattr(profile, "local_layers", 0)
+    ):
+        # Pipeline: the profile was built for the whole model, but this
+        # rank prefills only its stage. Prefer the EXACT ratio counts of
+        # the stage's layer range — V4 mixes ratio-0/4/128 layers, and a
+        # proportional split under-reserves a stage holding mostly the
+        # expensive ratio-4 layers. Proportional ceil stays as the
+        # fallback when the range or the ratios are unknown.
+        import contextlib
+        import dataclasses
+        import math
+
+        ratio4 = ratio128 = None
+        config = getattr(model, "config", None) or getattr(model, "args", None)
+        ratios = getattr(config, "compress_ratios", None)
+        if (
+            start_layer is not None
+            and isinstance(ratios, (list, tuple))
+            and len(ratios) >= start_layer + stage_layers
+        ):
+            window = tuple(ratios[start_layer : start_layer + stage_layers])
+            ratio4 = sum(1 for r in window if r == 4)
+            ratio128 = sum(1 for r in window if r == 128)
+        if ratio4 is None:
+            frac = stage_layers / num_layers
+            ratio4 = math.ceil(profile.ratio4_layers * frac)
+            ratio128 = math.ceil(profile.ratio128_layers * frac)
+        with contextlib.suppress(Exception):  # unscalable profile: keep as-is
+            profile = dataclasses.replace(
+                profile,
+                local_layers=stage_layers,
+                ratio4_layers=ratio4,
+                ratio128_layers=ratio128,
+            )
     if tp > 1:
         kv_heads = max(1, kv_heads // tp)
         heads = max(1, heads // tp)
-        if kv_override:
-            kv_override = float(kv_override) / tp
+        if profile is not None and getattr(profile, "num_attention_heads", 0):
+            # The profile's transient terms scale with this rank's head
+            # shard too; its pooled-cache terms (layer counts, indexer
+            # heads) are replicated, so only the head count changes. At
+            # 128 heads / TP=2 this also aligns the profile's WSDPA route
+            # check with the 64-head shard each rank actually runs.
+            import contextlib
+            import dataclasses
+
+            with contextlib.suppress(Exception):
+                profile = dataclasses.replace(
+                    profile,
+                    num_attention_heads=max(1, profile.num_attention_heads // tp),
+                )
 
     monitor.set_model_info(
         num_layers=num_layers or stage_layers,
@@ -86,7 +142,13 @@ def rank_monitor(
         dtype_size=dtype_size,
         num_attention_heads=heads,
         num_kv_cache_layers=stage_layers,
+        # ``set_model_info`` stores every field unconditionally, so the
+        # profile and score dtype extracted by ``set_model_info_from_model``
+        # must be threaded through or this second call silently drops them.
+        compute_dtype_size=getattr(monitor, "_score_dtype_size", None),
         kv_bytes_per_token=kv_override,
+        rotating_layer_specs=getattr(monitor, "_rotating_layer_specs", None),
+        prefill_memory_profile=profile,
     )
     return monitor
 
@@ -238,6 +300,7 @@ def build_guard(
     node_id: str = "",
     layer_count: int = 0,
     tensor_parallel_size: int = 1,
+    start_layer: int | None = None,
     memory_guard_tier: str = "balanced",
     prefill_step_size: int = _DEFAULT_PREFILL_STEP,
 ) -> RankPrefillGuard:
@@ -256,6 +319,7 @@ def build_guard(
             model,
             layer_count=layer_count,
             tensor_parallel_size=tensor_parallel_size,
+            start_layer=start_layer,
         ),
         rank=rank,
         node_id=node_id,

@@ -1214,6 +1214,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             layer_count=(
                                 assignment.end_layer - assignment.start_layer
                             ),
+                            start_layer=assignment.start_layer,
                             tensor_parallel_size=assignment.tensor_parallel_size,
                             memory_guard_tier=guard_tier,
                             # The attention peak is set by the prefill chunk, so the

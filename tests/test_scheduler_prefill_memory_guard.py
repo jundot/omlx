@@ -916,7 +916,9 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
     )
     assert est is not None
     assert est.estimated < limit
-    assert est.kv_exact < 2 * gib
+    # ~2.7 GiB with pooled rows charged at PoolingCache backing capacity
+    # (2x logical length) — still ~30x below the dense mis-charge.
+    assert est.kv_exact < 3 * gib
     assert est.transient < 20 * gib
 
     old_kv = 200_000 * 43 * 512 * 2 * 2 + 43 * (128 + 2048 - 1) * 512 * 2 * 2

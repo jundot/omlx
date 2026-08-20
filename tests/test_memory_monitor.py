@@ -937,15 +937,17 @@ class TestDeepSeekV4PrefillMemoryProfile:
         chunk = 2048
 
         local = 43 * (128 + chunk - 1) * 512
-        ratio4_main = (tokens // 4) * 512 + 4 * 4 * 1024
-        ratio4_index = (tokens // 4) * 128 + 4 * 4 * 256
-        ratio128_main = (tokens // 128) * 512 + 2 * 128 * 512
+        # Pooled rows are charged at backing capacity — 2x the logical
+        # length, PoolingCache._grow_pool's geometric-growth worst case.
+        ratio4_main = 2 * (tokens // 4) * 512 + 4 * 4 * 1024
+        ratio4_index = 2 * (tokens // 4) * 128 + 4 * 4 * 256
+        ratio128_main = 2 * (tokens // 128) * 512 + 2 * 128 * 512
         expected = (local + 21 * (ratio4_main + ratio4_index) + 20 * ratio128_main) * 2
 
         assert (
             monitor.estimate_resident_kv_bytes(tokens, chunk_tokens=chunk) == expected
         )
-        assert expected < 2 * 1024**3
+        assert expected < 3 * 1024**3
 
     def test_native_prefill_transient_does_not_charge_dense_full_context_sdpa(
         self, monkeypatch

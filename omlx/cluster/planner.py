@@ -108,6 +108,11 @@ class ModelLayout:
     # proportion to the layers it holds, so a plan that fits the weights
     # still fits once a long prompt fills the cache.
     kv_bytes_per_token_per_layer: int = 0
+    # Optional per-layer prices for models whose layers differ (DeepSeek-V4
+    # mixes ratio-0/4/128 pools). A pipeline stage holding mostly the
+    # cheap-average layers would be under-reserved by the scalar; stage
+    # pricing sums the exact slice when this table is present.
+    kv_bytes_per_token_by_layer: tuple[int, ...] = ()
     # MLA models keep one latent cache per layer that every tensor-parallel
     # member holds whole; sharding divides the heads, not this cache.
     kv_replicated_across_tp: bool = False
@@ -180,6 +185,7 @@ class ModelLayout:
             "supports_tensor_parallel": self.supports_tensor_parallel,
             "supports_pipeline": self.supports_pipeline,
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
+            "kv_bytes_per_token_by_layer": list(self.kv_bytes_per_token_by_layer),
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
 
@@ -218,6 +224,10 @@ class ModelLayout:
                 ),
                 kv_bytes_per_token_per_layer=int(
                     payload.get("kv_bytes_per_token_per_layer", 0)
+                ),
+                kv_bytes_per_token_by_layer=tuple(
+                    int(value)
+                    for value in payload.get("kv_bytes_per_token_by_layer", ())
                 ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
@@ -793,19 +803,76 @@ def _declares_pipeline(model_type: str, *, seen: frozenset[str] = frozenset()) -
     )
 
 
+def _deepseek_v4_pooled_kv(config: dict[str, Any]) -> bool:
+    """DeepSeek-V4's cache shape: MQA over one shared latent, no MLA ranks.
+
+    V4 has ``q_lora_rank`` but no ``kv_lora_rank``, so the MLA test misses
+    it; its single KV head stores pooled K-only latents that ``shard()``
+    never divides.
+    """
+
+    heads = _config_int(config, "num_attention_heads", 1)
+    return (
+        str(config.get("model_type") or "").startswith("deepseek_v4")
+        and _config_int(config, "num_key_value_heads", heads) == 1
+        and _config_int(config, "q_lora_rank", 0) > 0
+        and _config_int(config, "kv_lora_rank", 0) == 0
+    )
+
+
 def _kv_cache_replicated_across_tp(config: dict[str, Any]) -> bool:
     """Whether every tensor-parallel member holds this model's full KV cache.
 
     ``shard()`` splits attention heads, but an MLA latent cache is not
     per-head: GLM/DeepSeek-style layers store one compressed latent plus RoPE
     key that every member of the group needs whole. Dividing that reservation
-    by the TP degree under-reserved each rank by exactly that factor.
+    by the TP degree under-reserved each rank by exactly that factor. The
+    same holds for DeepSeek-V4's pooled MQA latent — only query heads split.
     """
 
+    if _deepseek_v4_pooled_kv(config):
+        return True
     return (
         _config_int(config, "kv_lora_rank", 0) > 0
         and _config_int(config, "qk_rope_head_dim", 0) > 0
     )
+
+
+def _deepseek_v4_kv_bytes_by_layer(config: dict[str, Any]) -> tuple[int, ...]:
+    """Per-layer pooled-KV bytes/token for DeepSeek-V4's mixed layers.
+
+    V4 stores no expanded K/V: every layer keeps a K-only 128-token
+    rotating window (a constant, not per-token growth), and compressed
+    layers add K-only main + indexer pools holding one entry per ``ratio``
+    tokens. The dense formula prices this as 2048 B/tok/layer — ~6-13x
+    over — but averaging across layers under-reserves a pipeline stage
+    that holds mostly ratio-4 layers, so stage pricing needs the table.
+    The x2 factor charges the pools at backing CAPACITY: PoolingCache
+    grows geometrically (``_grow_pool``: ``max(needed, 2 * cap)``), so
+    physical residency reaches twice the logical rows.
+    """
+
+    dtype_size = 2  # fp16/bf16 cache even when weights are quantised
+    head_dim = _config_int(config, "head_dim", 0)
+    if head_dim <= 0:
+        return ()
+    index_head_dim = max(_config_int(config, "index_head_dim", 0), 0)
+    pooled = (head_dim + index_head_dim) * dtype_size * 2
+    ratios = config.get("compress_ratios")
+    num_layers = _config_int(config, "num_hidden_layers", 0)
+    if num_layers <= 0:
+        return ()
+    if (
+        isinstance(ratios, (list, tuple))
+        and len(ratios) >= num_layers
+        and all(r in (0, 4, 128) for r in ratios[:num_layers])
+    ):
+        return tuple(
+            (pooled // r) if r else 0 for r in ratios[:num_layers]
+        )
+    # Ratios unknown: charge every layer at the strongest known
+    # compression's cost (1/4) — still conservative per layer.
+    return (max(1, pooled // 4),) * num_layers
 
 
 def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
@@ -823,6 +890,12 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
 
     # Stored cache is fp16/bf16 even when weights are quantised.
     dtype_size = 2
+
+    if _deepseek_v4_pooled_kv(config):
+        table = _deepseek_v4_kv_bytes_by_layer(config)
+        if not table:
+            return 0
+        return max(1, sum(table) // len(table))
 
     if _kv_cache_replicated_across_tp(config):
         # One KV head holding latent + RoPE, not expanded K/V tensors.
@@ -1056,6 +1129,11 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         supports_pipeline=_supports_pipeline(_model_config(root)),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
             _model_config(root)
+        ),
+        kv_bytes_per_token_by_layer=(
+            _deepseek_v4_kv_bytes_by_layer(_model_config(root))
+            if _deepseek_v4_pooled_kv(_model_config(root))
+            else ()
         ),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(
             _model_config(root)
@@ -1470,7 +1548,9 @@ def plan_unequal_pipeline(
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
-        kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
+        kv_bytes = _kv_bytes_for_stage(
+            model, end - start, context_tokens, start_layer=start
+        )
         planned = model.fixed_weight_bytes + layer_weight_bytes + kv_bytes
         if planned > node.usable_bytes:
             raise PlanningError(
@@ -1655,17 +1735,28 @@ def _kv_bytes_for_stage(
     layer_count: int,
     context_tokens: int,
     tensor_parallel_size: int = 1,
+    start_layer: int | None = None,
 ) -> int:
     """KV bytes a node holds for its layers at the planned context length.
 
     KV is per layer, so a node reserves in proportion to the layers it carries.
     Under tensor parallelism the heads of each layer are split across the
     group, so each member holds its share — except an MLA latent cache, which
-    is not per-head and stays whole on every member.
+    is not per-head and stays whole on every member. When the layout carries
+    per-layer prices and the caller names the stage's layer range, the exact
+    slice is summed — a scalar average under-reserves a stage that holds
+    mostly the expensive layers.
     """
 
     if model.kv_bytes_per_token_per_layer <= 0 or context_tokens <= 0:
         return 0
+    table = model.kv_bytes_per_token_by_layer
+    if table and start_layer is not None and 0 <= start_layer < len(table):
+        per_token = sum(table[start_layer : start_layer + layer_count])
+        total = per_token * context_tokens
+        if model.kv_replicated_across_tp:
+            return total
+        return total // max(1, tensor_parallel_size)
     total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
     if model.kv_replicated_across_tp:
         return total
@@ -1918,7 +2009,11 @@ def plan_hybrid(
         per_member = stage_layer_bytes // tensor_parallel_size
         remainder = stage_layer_bytes % tensor_parallel_size
         kv_bytes = _kv_bytes_for_stage(
-            model, end - start, context_tokens, tensor_parallel_size
+            model,
+            end - start,
+            context_tokens,
+            tensor_parallel_size,
+            start_layer=start,
         )
         for tp_rank, node in enumerate(group):
             held_layer_bytes = per_member + (1 if tp_rank < remainder else 0)
