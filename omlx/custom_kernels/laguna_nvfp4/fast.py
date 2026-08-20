@@ -516,6 +516,25 @@ def prefill_moe_tail(
     y = (y + shared_output + residual).astype(mx.bfloat16)
     return y.reshape(-1)
 
+
+def prefill_router_tournament(
+    logits: mx.array, correction_bias: mx.array, stream=None,
+):
+    """Prefill router tournament (batched 2-phase bitonic; verbatim from
+    lagunaPrefillRouterTournamentKernelSource). Returns (indices, scores)
+    [rows*8] each (scores are the raw sigmoids, the bias orders the sort)."""
+    if _ext is not None and has_symbol("prefill_router_tournament"):
+        return _ext.prefill_router_tournament(
+            logits, correction_bias, stream=stream)
+    rows = logits.shape[0] // 256
+    x = logits.astype(mx.float32).reshape(rows, 256)
+    y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
+    score = mx.where(x < 0, y, 1.0 - y)
+    key = score + correction_bias.astype(mx.float32)[None, :]
+    ids = mx.argsort(-key, axis=1)[:, :8].astype(mx.uint32)
+    vals = mx.take_along_axis(score, ids.astype(mx.int32), axis=1)
+    return ids.reshape(-1), vals.reshape(-1).astype(mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

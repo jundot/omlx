@@ -169,6 +169,13 @@ array prefill_moe_tail(
     const array& residual,
     StreamOrDevice s = {});
 
+// Prefill router tournament (batched 2-phase bitonic). Returns {indices,
+// scores} [rows*8].
+std::pair<array, array> prefill_router_tournament(
+    const array& logits,
+    const array& correction_bias,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

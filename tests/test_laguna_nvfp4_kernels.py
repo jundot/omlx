@@ -466,6 +466,23 @@ def test_prefill_moe_tail_bit_exact():
         f"moe_tail diverges at {int(mx.sum(y == ref.reshape(-1)))}/{rows*2048}")
 
 
+def test_prefill_router_tournament_bit_exact():
+    """Batched 2-phase bitonic prefill router vs the fallback: bit-exact."""
+    rows = 3
+    mx.random.seed(41)
+    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    idx, sc = laguna_nvfp4.prefill_router_tournament(logits, cb)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        idxf, scf = laguna_nvfp4.prefill_router_tournament(logits, cb)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(idx == idxf))
+    assert bool(mx.all(sc == scf))
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

@@ -1441,6 +1441,128 @@ kernel void laguna_prefill_moe_tail_bf16_v1(
     }
 }
 
+// Prefill router tournament: 8x 32-lane bitonic sorts then a 64-candidate
+// network over the top-8s, per row. (verbatim from
+// lagunaPrefillRouterTournamentKernelSource, non-normalizing epilogue)
+//   logits [rows*256], correction_bias [256] fp32
+//   router_indices [rows*8] uint32, router_scores [rows*8] bf16
+// Grid: (256, rows) threads (one threadgroup per row).
+kernel void laguna_prefill_router_tournament_v1(
+    const device bfloat* logits [[buffer(0)]],
+    const device float* correction_bias [[buffer(1)]],
+    device uint32_t* router_indices [[buffer(2)]],
+    device bfloat* router_scores [[buffer(3)]],
+    uint2 tlane [[thread_position_in_threadgroup]],
+    uint2 tgrid [[threadgroup_position_in_grid]])
+{
+    uint lane = tlane.x;
+    uint row = tgrid.y;
+    threadgroup float xchg_keys[256];
+    threadgroup uint xchg_indices[256];
+    threadgroup float xchg_scores[256];
+    threadgroup float candidate_keys[64];
+    threadgroup uint candidate_indices[64];
+    threadgroup float candidate_scores[64];
+
+    float x = float(logits[row * 256 + lane]);
+    float y = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+    float my_score = x < 0.0f ? y : 1.0f - y;
+    float my_key = -(my_score + float(correction_bias[lane]));
+    uint my_index = lane;
+
+    for (uint sequence = 2; sequence <= 32; sequence <<= 1) {
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+            float other_key = simd_shuffle_xor(my_key, ushort(stride));
+            uint other_index = simd_shuffle_xor(my_index, ushort(stride));
+            float other_score = simd_shuffle_xor(my_score, ushort(stride));
+
+            bool is_lower = (lane & stride) == 0;
+            float a_key = is_lower ? my_key : other_key;
+            uint a_index = is_lower ? my_index : other_index;
+            float a_score = is_lower ? my_score : other_score;
+            float b_key = is_lower ? other_key : my_key;
+            uint b_index = is_lower ? other_index : my_index;
+            float b_score = is_lower ? other_score : my_score;
+
+            bool lower_wants_better = (lane & sequence) == 0;
+            bool b_before_a = laguna_router_key_before(
+                b_key, b_index, a_key, a_index);
+            bool a_before_b = laguna_router_key_before(
+                a_key, a_index, b_key, b_index);
+            bool swap = lower_wants_better ? b_before_a : a_before_b;
+            if (swap) {
+                my_key = is_lower ? b_key : a_key;
+                my_index = is_lower ? b_index : a_index;
+                my_score = is_lower ? b_score : a_score;
+            }
+        }
+    }
+
+    uint block = lane >> 5;
+    uint within_block = lane & 31;
+    bool block_ascending = (block & 1) == 0;
+    uint rank_in_block = block_ascending ? within_block : (31 - within_block);
+    bool is_local_top8 = block_ascending ? (within_block < 8) : (within_block >= 24);
+    if (is_local_top8) {
+        candidate_keys[block * 8 + rank_in_block] = my_key;
+        candidate_indices[block * 8 + rank_in_block] = my_index;
+        candidate_scores[block * 8 + rank_in_block] = my_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float my_key2 = candidate_keys[lane & 63];
+    uint my_index2 = candidate_indices[lane & 63];
+    float my_score2 = candidate_scores[lane & 63];
+    for (uint sequence = 2; sequence <= 64; sequence <<= 1) {
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+            float other_key;
+            uint other_index;
+            float other_score;
+            if (stride < 32) {
+                other_key = simd_shuffle_xor(my_key2, ushort(stride));
+                other_index = simd_shuffle_xor(my_index2, ushort(stride));
+                other_score = simd_shuffle_xor(my_score2, ushort(stride));
+            } else {
+                xchg_keys[lane] = my_key2;
+                xchg_indices[lane] = my_index2;
+                xchg_scores[lane] = my_score2;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint partner = lane ^ stride;
+                other_key = xchg_keys[partner];
+                other_index = xchg_indices[partner];
+                other_score = xchg_scores[partner];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            bool is_lower = (lane & stride) == 0;
+            float a_key = is_lower ? my_key2 : other_key;
+            uint a_index = is_lower ? my_index2 : other_index;
+            float a_score = is_lower ? my_score2 : other_score;
+            float b_key = is_lower ? other_key : my_key2;
+            uint b_index = is_lower ? other_index : my_index2;
+            float b_score = is_lower ? other_score : my_score2;
+
+            bool lower_wants_better = (lane & sequence) == 0;
+            bool b_before_a = laguna_router_key_before(
+                b_key, b_index, a_key, a_index);
+            bool a_before_b = laguna_router_key_before(
+                a_key, a_index, b_key, b_index);
+            bool swap = lower_wants_better ? b_before_a : a_before_b;
+            if (swap) {
+                my_key2 = is_lower ? b_key : a_key;
+                my_index2 = is_lower ? b_index : a_index;
+                my_score2 = is_lower ? b_score : a_score;
+            }
+        }
+    }
+
+    if (lane < 8) {
+        router_indices[row * 8 + lane] = my_index2;
+        router_scores[row * 8 + lane] = bfloat(my_score2);
+    }
+}
+
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input

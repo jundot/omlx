@@ -104,6 +104,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "prefill_router_tournament",
+        &omlx::laguna_nvfp4::prefill_router_tournament,
+        "logits"_a, "correction_bias"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,

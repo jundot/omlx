@@ -1040,6 +1040,71 @@ array prefill_moe_tail(
                  {expert_outputs, router_weights, shared_output, residual});
 }
 
+// PrefillRouterTournamentPrimitive: batched 2-phase bitonic router.
+class PrefillRouterTournamentPrimitive : public Primitive {
+ public:
+    explicit PrefillRouterTournamentPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 PrefillRouterTournamentPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        auto kernel = get_laguna_kernel(
+            d, "laguna_prefill_router_tournament_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        int rows = static_cast<int>(inputs[0].shape(0) / 256);
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(1, rows, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(PrefillRouterTournamentPrimitive)
+};
+
+std::pair<array, array> prefill_router_tournament(
+    const array& logits,
+    const array& correction_bias,
+    StreamOrDevice s) {
+    int rows = static_cast<int>(logits.shape(0) / 256);
+    if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
+        correction_bias.ndim() != 1 || correction_bias.dtype() != float32 ||
+        correction_bias.shape(0) != 256) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 prefill_router_tournament: shape mismatch — "
+               "logits " << logits.shape() << ", correction_bias "
+            << correction_bias.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<PrefillRouterTournamentPrimitive>(s_stream);
+    Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
+    Shape score_shape{static_cast<ShapeElem>(rows * 8)};
+    auto outs = array::make_arrays(
+        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
+        {logits, correction_bias});
+    return {outs[0], outs[1]};
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }
