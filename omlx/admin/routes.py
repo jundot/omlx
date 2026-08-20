@@ -6217,11 +6217,20 @@ async def delete_hf_model(
             return
         raise exc_info[1].with_traceback(exc_info[2])
 
-    try:
+    def _delete_model_dir() -> None:
         if sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
+        # Deliberately leave <root>/.locks/<entry> alone: another process may
+        # hold one of those lock files mid-download, and unlinking a held
+        # lock lets a second writer acquire a fresh inode and race the first.
+        # The stale zero-byte residue is cosmetic; sweep it offline if needed.
+
+    # rmtree of a large model (tens of GB, thousands of blobs) must not
+    # block the event loop; run it off-thread like the lookup above.
+    try:
+        await asyncio.to_thread(_delete_model_dir)
         logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
         logger.error(f"Failed to delete model directory {model_path}: {e}")
