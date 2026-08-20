@@ -56,6 +56,34 @@ def _enrollment_client() -> TestClient:
     return TestClient(app)
 
 
+def test_ssh_key_generation_requires_explicit_overwrite(monkeypatch, tmp_path):
+    from omlx.cluster import ssh_keys
+
+    calls = []
+    key_pair = SimpleNamespace(
+        key_type="ed25519",
+        fingerprint="SHA256:test",
+        public_key="ssh-ed25519 AAAA test",
+        private_key_path=tmp_path / "omlx_cluster",
+        public_key_path=tmp_path / "omlx_cluster.pub",
+    )
+
+    def generate(*, overwrite=False):
+        calls.append(overwrite)
+        return key_pair
+
+    monkeypatch.setattr(ssh_keys, "generate_ssh_key_pair", generate)
+
+    assert _client().post("/admin/api/cluster/ssh-key/generate").status_code == 200
+    assert (
+        _client()
+        .post("/admin/api/cluster/ssh-key/generate?overwrite=true")
+        .status_code
+        == 200
+    )
+    assert calls == [False, True]
+
+
 def _worker_claim() -> dict:
     return {
         "node_id": "cuda-worker-1-machine",

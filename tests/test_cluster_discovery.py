@@ -5,6 +5,7 @@ from omlx.cluster.discovery import (
     DiscoveryOutput,
     clear_peer_transport_cache,
     discover_all_peers,
+    discover_omlx_peers,
     discover_ssh_peers,
     generate_pairing_token,
     parse_browse_instances,
@@ -135,6 +136,42 @@ def test_discovery_returns_untrusted_suggestions():
             "service": "_ssh._tcp.local.",
         }
     ]
+
+
+def test_ssh_discovery_does_not_rediscover_internal_fqdn_as_local(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.socket.gethostname",
+        lambda: "local-mac.example.internal",
+    )
+
+    def runner(args, timeout):
+        if "-B" in args:
+            return DiscoveryOutput(
+                "12:00 Add 2 14 local. _ssh._tcp. Local Mac Studio\n"
+            )
+        return DiscoveryOutput(
+            "service can be reached at local-mac.local.:22 (interface 14)\n"
+        )
+
+    assert discover_ssh_peers(runner=runner)["peers"] == []
+
+
+def test_omlx_discovery_does_not_rediscover_internal_fqdn_as_local(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.socket.gethostname",
+        lambda: "local-mac.example.internal",
+    )
+
+    def runner(args, timeout):
+        if "-B" in args:
+            return DiscoveryOutput(
+                "12:00 Add 2 14 local. _omlx._tcp. oMLX on Local Mac Studio\n"
+            )
+        return DiscoveryOutput(
+            "service can be reached at local-mac.local.:8000 (interface 14)\n"
+        )
+
+    assert discover_omlx_peers(runner=runner)["peers"] == []
 
 
 def test_pairing_token_generation_and_verification():

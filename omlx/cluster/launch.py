@@ -808,6 +808,18 @@ def _run_cluster_ssh(
     return completed
 
 
+def _raise_for_ssh_transport_failure(
+    ssh_target: str,
+    completed: subprocess.CompletedProcess[str],
+) -> None:
+    """Keep OpenSSH failures out of remote interpreter fallback."""
+
+    if completed.returncode != 255:
+        return
+    detail = completed.stderr.strip() or "OpenSSH exited with status 255"
+    raise DistributedLaunchError(f"SSH to {ssh_target} failed: {detail}")
+
+
 def discover_remote_python_executable(
     ssh_target: str,
     *,
@@ -858,6 +870,7 @@ def discover_remote_python_executable(
             timeout=timeout,
             runner=runner,
         )
+        _raise_for_ssh_transport_failure(ssh_target, completed)
         if completed.returncode != 0:
             continue
         lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
@@ -896,6 +909,7 @@ def discover_remote_system_python(
             timeout=timeout,
             runner=runner,
         )
+        _raise_for_ssh_transport_failure(ssh_target, completed)
         if completed.returncode != 0:
             continue
         lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]

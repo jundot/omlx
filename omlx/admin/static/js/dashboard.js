@@ -2286,15 +2286,30 @@
 
             async generateClusterSshKey() {
                 if (this.clusterSshKeyGenerating) return;
+                const overwrite = Boolean(this.clusterSshKey?.available);
+                if (overwrite && !window.confirm(
+                    'Regenerating this key disconnects every paired worker. '
+                    + 'You will need to exchange keys again on every Mac. Continue?'
+                )) return;
                 this.clusterSshKeyGenerating = true;
                 try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/generate', {
+                    const endpoint = '/admin/api/cluster/ssh-key/generate'
+                        + (overwrite ? '?overwrite=true' : '');
+                    const response = await fetch(endpoint, {
                         method: 'POST',
                     });
                     if (response.ok) {
                         this.clusterSshKey = await response.json();
-                        // Show success notification
-                        this.showNotification('SSH key generated successfully', 'success');
+                        this.clusterExchangeToken = null;
+                        this.clusterPeerExchangeToken = '';
+                        this.clusterKeyExchangeResult = null;
+                        if (overwrite) this.invalidateClusterPeer(true);
+                        this.showNotification(
+                            overwrite
+                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
+                                : 'SSH key generated successfully',
+                            'success'
+                        );
                     } else {
                         const error = await response.json();
                         this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');

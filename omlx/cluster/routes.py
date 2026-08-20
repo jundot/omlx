@@ -2202,13 +2202,18 @@ async def cluster_ssh_key():
 
 
 @router.post("/ssh-key/generate")
-async def cluster_generate_ssh_key():
-    """Generate a new SSH key pair for cluster authentication."""
+async def cluster_generate_ssh_key(
+    overwrite: bool = Query(default=False),
+):
+    """Create the managed SSH key, rotating it only when explicitly requested."""
 
     from .ssh_keys import generate_ssh_key_pair
 
     try:
-        key_pair = await asyncio.to_thread(generate_ssh_key_pair, overwrite=True)
+        key_pair = await asyncio.to_thread(
+            generate_ssh_key_pair,
+            overwrite=overwrite,
+        )
         return {
             "success": True,
             "key_type": key_pair.key_type,

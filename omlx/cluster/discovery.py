@@ -212,6 +212,12 @@ def parse_lookup_target(output: str) -> tuple[str, int] | None:
     return match.group(1).removesuffix("."), port
 
 
+def _bonjour_host_label(hostname: str) -> str:
+    """Return the Mac name shared by internal DNS and Bonjour aliases."""
+
+    return hostname.rstrip(".").lower().split(".", 1)[0]
+
+
 def discover_ssh_peers(
     *,
     timeout: float = 1.5,
@@ -222,7 +228,7 @@ def discover_ssh_peers(
     if not 0.1 <= timeout <= 10:
         raise ValueError("Bonjour discovery timeout must be between 0.1 and 10s")
     executable = shutil.which("dns-sd") or _DNS_SD
-    local_hostname = socket.gethostname().lower().removesuffix(".local")
+    local_hostname = _bonjour_host_label(socket.gethostname())
     browse = runner(
         [executable, "-B", "_ssh._tcp", "local."],
         timeout,
@@ -245,7 +251,7 @@ def discover_ssh_peers(
         hostname, port = target
         if (
             port != 22
-            or hostname.lower().removesuffix(".local") == local_hostname
+            or _bonjour_host_label(hostname) == local_hostname
         ):
             return None
         return {
@@ -330,7 +336,7 @@ def discover_omlx_peers(
     if not 0.1 <= timeout <= 10:
         raise ValueError("Bonjour discovery timeout must be between 0.1 and 10s")
     executable = shutil.which("dns-sd") or _DNS_SD
-    local_hostname = socket.gethostname().lower().removesuffix(".local")
+    local_hostname = _bonjour_host_label(socket.gethostname())
 
     browse = runner(
         [executable, "-B", _OMLX_SERVICE, "local."],
@@ -353,7 +359,7 @@ def discover_omlx_peers(
         if target is None:
             return None
         hostname, port = target
-        if hostname.lower().removesuffix(".local") == local_hostname:
+        if _bonjour_host_label(hostname) == local_hostname:
             return None
         return {
             "name": instance,

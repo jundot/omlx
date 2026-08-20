@@ -11,6 +11,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -133,42 +134,61 @@ def generate_ssh_key_pair(
     key_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(key_path.parent, 0o700)
 
-    # Generate the key pair
-    keygen = _ssh_keygen_executable()
-    result = subprocess.run(
-        [
-            keygen,
-            "-t",
-            _SSH_KEY_TYPE,
-            "-b",
-            str(_SSH_KEY_BITS),
-            "-f",
-            str(key_path),
-            "-N",
-            "",  # No passphrase
-            "-C",
-            comment,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # ssh-keygen prompts before overwriting an existing path, which a server
+    # process cannot answer. Build rotations beside the live key and replace
+    # it only after both new files exist.
+    rotation_dir = None
+    generation_path = key_path
+    if key_path.exists() and overwrite:
+        rotation_dir = tempfile.TemporaryDirectory(
+            prefix=f".{key_path.name}-",
+            dir=key_path.parent,
+        )
+        generation_path = Path(rotation_dir.name) / key_path.name
 
-    if result.returncode != 0:
-        raise RuntimeError(f"ssh-keygen failed: {result.stderr.strip()}")
+    try:
+        keygen = _ssh_keygen_executable()
+        result = subprocess.run(
+            [
+                keygen,
+                "-t",
+                _SSH_KEY_TYPE,
+                "-b",
+                str(_SSH_KEY_BITS),
+                "-f",
+                str(generation_path),
+                "-N",
+                "",  # No passphrase
+                "-C",
+                comment,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
-    # Set proper permissions
-    os.chmod(key_path, 0o600)
-    os.chmod(Path(str(key_path) + ".pub"), 0o644)
+        if result.returncode != 0:
+            raise RuntimeError(f"ssh-keygen failed: {result.stderr.strip()}")
 
-    pubkey_path = Path(str(key_path) + ".pub")
-    public_key = pubkey_path.read_text().strip()
+        generated_public_path = Path(str(generation_path) + ".pub")
+        public_key = generated_public_path.read_text().strip()
+        fingerprint = _key_fingerprint(public_key)
+        if rotation_dir is not None:
+            os.replace(generated_public_path, Path(str(key_path) + ".pub"))
+            os.replace(generation_path, key_path)
+
+        pubkey_path = Path(str(key_path) + ".pub")
+        os.chmod(key_path, 0o600)
+        os.chmod(pubkey_path, 0o644)
+    finally:
+        if rotation_dir is not None:
+            rotation_dir.cleanup()
 
     return SSHKeyPair(
         private_key_path=key_path,
         public_key_path=pubkey_path,
         public_key=public_key,
-        fingerprint=_key_fingerprint(public_key),
+        fingerprint=fingerprint,
         key_type=_SSH_KEY_TYPE,
         created_at=time.time(),
     )
@@ -589,5 +609,3 @@ def store_key_in_keychain(*, service: str = "omlx-cluster", account: str = "ssh-
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-
-

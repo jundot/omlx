@@ -462,6 +462,9 @@ def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
     assert "t('cluster.pairing.shared_secret_hint')" in cluster
     assert "data-cluster-ssh-setup" in cluster
     assert "openClusterPairingSetup()" in javascript
+    assert "Regenerating this key disconnects every paired worker" in javascript
+    assert "?overwrite=true" in javascript
+    assert "Regenerating disconnects every paired worker" in cluster
 
 
 def test_every_dashboard_locale_names_cluster_tab():

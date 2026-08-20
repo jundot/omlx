@@ -1623,6 +1623,7 @@
                                             </div>
                                             <div class="text-xs text-neutral-500 mt-1 font-mono break-all" x-text="clusterSshKey.fingerprint"></div>
                                             <div class="text-[10px] text-neutral-400 mt-1" x-text="'Created: ' + new Date(clusterSshKey.created_at * 1000).toLocaleString()"></div>
+                                            <div class="text-[10px] text-amber-700 mt-1">Regenerating disconnects every paired worker. You must exchange keys again on every Mac.</div>
                                         </div>
                                         <button @click="generateClusterSshKey()"
                                                 :disabled="clusterSshKeyGenerating"
