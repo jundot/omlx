@@ -239,6 +239,71 @@ class TestQuantInference:
         _infer_mtp_quant_overrides(model, weights)
         assert quant[self.DP] == {"group_size": 32, "bits": 3, "mode": "affine"}
 
+    def test_affine_head_in_mxfp4_base_infers_affine_mode(self, glm, mtp_active):
+        """An affine-packed head merged into an mxfp4 base must not inherit
+        the base mode: mxfp4 at the head's affine group size dies with
+        "mxfp4 quantization requires group size 32". Biases presence is
+        the affine tell (mxfp4 packs carry none)."""
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 32, "bits": 4, "mode": "mxfp4"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        model, quant = glm.Model(args), cfg["quantization"]
+        w, s, b = _fake_triplet((4, 64), 32, bits=4, gs=16)
+        weights = {
+            f"{self.DP}.weight": w,
+            f"{self.DP}.scales": s,
+            f"{self.DP}.biases": b,
+        }
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == {"group_size": 16, "bits": 4, "mode": "affine"}
+
+    def test_biasless_pack_keeps_base_mode(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 32, "bits": 4, "mode": "mxfp4"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        model, quant = glm.Model(args), cfg["quantization"]
+        w, s, _ = _fake_triplet((4, 64), 32, bits=4, gs=16)
+        weights = {f"{self.DP}.weight": w, f"{self.DP}.scales": s}
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == {"group_size": 16, "bits": 4, "mode": "mxfp4"}
+
+    def test_mxfp4_head_in_affine_base_gets_mxfp4_override(self, glm, mtp_active):
+        """The reverse mix: an mxfp4-packed head merged into an affine base.
+
+        Shape math assumes affine packing, so it would publish a bogus
+        affine override for a pack whose scales are uint8 e8m0 exponents.
+        The uint8 dtype is the mxfp4 tell — the spec is fixed at 4-bit/32.
+        """
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        model, quant = glm.Model(args), cfg["quantization"]
+        w, s, _ = _fake_triplet((4, 64), 32, bits=4, gs=32)
+        weights = {
+            f"{self.DP}.weight": w,
+            f"{self.DP}.scales": s.astype(mx.uint8),
+        }
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+
     def test_global_matching_module_not_written(self, glm, mtp_active):
         from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
             _infer_mtp_quant_overrides,
@@ -326,6 +391,26 @@ class TestSanitize:
         ):
             assert expected in out, expected
         model.load_weights(list(out.items()), strict=True)
+
+    def test_quantized_eh_proj_triplet_maps_to_head_root(self, glm, mtp_active):
+        """External affine heads ship eh_proj as weight/scales/biases.
+
+        Only .weight was in the special map, so the triplet's tail
+        stranded under mtp.0.block.eh_proj.* and strict load rejected the
+        merged checkpoint (seen with inferencerlabs/GLM-5.2-MTP-MLX).
+        """
+        mx.random.seed(0)
+        args = glm.ModelArgs.from_dict(TINY_CFG)
+        model = glm.Model(args)
+        raw = _raw_hf_weights(glm, model)
+        n_main = TINY_CFG["num_hidden_layers"]
+        raw[f"model.layers.{n_main}.eh_proj.scales"] = mx.zeros((64, 4))
+        raw[f"model.layers.{n_main}.eh_proj.biases"] = mx.zeros((64, 4))
+
+        out = model.sanitize(raw)
+        assert "mtp.0.eh_proj.scales" in out
+        assert "mtp.0.eh_proj.biases" in out
+        assert not any(k.startswith("mtp.0.block.eh_proj") for k in out)
 
     def test_layer_count_restored_after_sanitize(self, glm, mtp_active):
         args = glm.ModelArgs.from_dict(TINY_CFG)

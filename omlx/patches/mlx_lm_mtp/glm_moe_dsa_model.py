@@ -151,6 +151,8 @@ def _infer_mtp_quant_overrides(model: Any, weights: dict[str, Any]) -> None:
     dequant already relies on that). Runs from sanitize, i.e. before
     ``nn.quantize``.
     """
+    import mlx.core as mx
+
     quant = getattr(model.args, "quantization", None)
     if not isinstance(quant, dict):
         return
@@ -173,16 +175,29 @@ def _infer_mtp_quant_overrides(model: Any, weights: dict[str, Any]) -> None:
         s_dim = int(weights[key].shape[-1])
         if in_dim <= 0 or s_dim <= 0 or (32 * p_dim) % in_dim or in_dim % s_dim:
             continue
-        bits = 32 * p_dim // in_dim
-        gs = in_dim // s_dim
-        if not 1 <= bits <= 8 or (bits, gs) == (g_bits, g_gs):
+        # The mode must be inferred per module, not inherited — either
+        # mixed-mode direction breaks otherwise: an affine head in an
+        # mxfp4 base gets quantized as mxfp4 at its affine group size
+        # ("mxfp4 quantization requires group size 32"), and an mxfp4
+        # head in an affine base gets a bogus affine override from shape
+        # math that assumes affine packing. mxfp4 packs carry uint8
+        # scales and no biases; affine packs ship both in a float dtype.
+        if weights[key].dtype == mx.uint8:
+            bits, gs, module_mode = 4, 32, "mxfp4"
+        else:
+            bits = 32 * p_dim // in_dim
+            gs = in_dim // s_dim
+            module_mode = "affine" if f"{path}.biases" in weights else mode
+        if not 1 <= bits <= 8 or (bits, gs, module_mode) == (g_bits, g_gs, mode):
             continue
-        quant[path] = {"group_size": gs, "bits": bits, "mode": mode}
+        quant[path] = {"group_size": gs, "bits": bits, "mode": module_mode}
         logger.info(
-            "Inferred MTP quantization override %s: %d-bit group_size=%d",
+            "Inferred MTP quantization override %s: %d-bit group_size=%d "
+            "mode=%s",
             path,
             bits,
             gs,
+            module_mode,
         )
 
 
@@ -517,6 +532,12 @@ def _patch_model(glm: Any) -> None:
             remapped: Dict[str, Any] = {}
             special = {
                 "eh_proj.weight": "eh_proj.weight",
+                # Quantized external heads (affine packs) ship the
+                # projection as a weight/scales/biases triplet; without
+                # these two entries the triplet's tail strands under
+                # mtp.<i>.block.* and strict load rejects it.
+                "eh_proj.scales": "eh_proj.scales",
+                "eh_proj.biases": "eh_proj.biases",
                 "enorm.weight": "enorm.weight",
                 "hnorm.weight": "hnorm.weight",
                 "shared_head.norm.weight": "norm.weight",
