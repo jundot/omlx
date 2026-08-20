@@ -82,6 +82,16 @@ documented, per the laguna branch's established opt-in posture.
 Real-model decode A/B (256-token, Poolside pin): **12.27 vs 12.80 ms/tok
 (+4.3%)** with the routed+shared kernels on.
 
+### Attention kernels: not directly wireable in omlx
+
+The challenge's runtime re-quantizes the attention projections to NVFP4
+group-16 (`LagunaRuntimeWeights` step) so its decode QKV / o_proj / QK-norm
+kernels target NVFP4 banks. omlx's stock Laguna attention keeps the bf16
+projections, so those kernels have no matching bank to dispatch against
+without adopting the challenge's attention re-quantization transform —
+documented as a separate follow-up, not part of this port's decode hot-path
+wiring.
+
 ## Build
 
 ```bash
