@@ -1106,10 +1106,9 @@ private struct ExperimentalSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        // Most experimental fields are profile edits. Qwen ANE controls are
-        // load-time hardware settings, so they save directly to the model;
-        // leaving them as working-profile-only edits makes a visually enabled
-        // switch a no-op until an unrelated profile action is performed.
+        // Experimental fields, including Qwen ANE controls, are profile
+        // edits. Applying a profile persists the load-time settings and the
+        // engine picks them up when it reloads.
         ListGroup {
             if vm.isQwen35AnePrefillModel {
                 Row(label: String(localized: "settings.experimental.qwen_ane.label",
@@ -1118,17 +1117,14 @@ private struct ExperimentalSection: View {
                     sublabel: String(localized: "settings.experimental.qwen_ane.sub",
                                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
                                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
-                    Toggle("", isOn: saved(
-                        $vm.qwen35AnePrefillEnabled,
-                        field: .qwen35AnePrefillEnabled
-                    ))
+                    Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
                         .labelsHidden().toggleStyle(.switch)
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
                     sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Calibrates ANE and GPU work on real model layers, then verifies the predicted split end to end. Saved settings change only when you apply the result.",
+                                     defaultValue: "Calibrates ANE and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
                         if !vm.aneTuningIsRunning {
@@ -1163,13 +1159,10 @@ private struct ExperimentalSection: View {
                                 .foregroundStyle(theme.textSecondary)
                                 .lineLimit(2)
                                 .multilineTextAlignment(.trailing)
-                            Button(vm.aneTuningIsApplying ? "Applying…" : "Apply result") {
-                                Task {
-                                    await vm.applyANETuningRecommendation(client: client)
-                                }
+                            Button("Use result") {
+                                vm.applyANETuningRecommendation()
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
-                            .disabled(vm.aneTuningIsApplying)
                         } else {
                             Button("Tune for this Mac") {
                                 Task { await vm.startANETuning(client: client) }
@@ -1234,13 +1227,10 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.sequence.sub",
                                          defaultValue: "Only prompt chunks exactly matching this token count use the ANE path. 2,048 is the measured default.",
                                          comment: "Sublabel explaining the fixed Qwen ANE prompt block size")) {
-                        TextInput(text: $vm.qwen35AnePrefillSequenceLength,
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength),
                                   placeholder: "2048", mono: true,
                                   isNumeric: true, range: 1024...262_144,
                                   step: 64, width: 190)
-                            .onSubmit {
-                                Task { await vm.save(.qwen35AnePrefillSequenceLength, client: client) }
-                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
@@ -1248,13 +1238,10 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_fraction.sub",
                                          defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
                                          comment: "Sublabel explaining the Qwen MLP ANE workload fraction")) {
-                        TextInput(text: $vm.qwen35AnePrefillFraction,
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillFraction),
                                   placeholder: "0.53", mono: true,
                                   isNumeric: true, range: 0.05...0.90,
                                   step: 0.005, width: 190)
-                            .onSubmit {
-                                Task { await vm.save(.qwen35AnePrefillFraction, client: client) }
-                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_layers.label",
                                       defaultValue: "MLP Layer Limit",
@@ -1262,11 +1249,8 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_layers.sub",
                                          defaultValue: "Maximum eligible MLP layers prepared eagerly. The selected default covers the measured 64-layer model.",
                                          comment: "Sublabel explaining the maximum number of Qwen MLP ANE layers")) {
-                        TextInput(text: $vm.qwen35AnePrefillMaxLayers,
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillMaxLayers),
                                   placeholder: "64", mono: true, width: 90)
-                            .onSubmit {
-                                Task { await vm.save(.qwen35AnePrefillMaxLayers, client: client) }
-                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.dual.label",
                                       defaultValue: "Use Both ANEs",
@@ -1274,10 +1258,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.dual.sub",
                                          defaultValue: "Pin one resident procedure bank to each physical ANE. Recommended on M3 Ultra.",
                                          comment: "Sublabel describing dual-ANE Qwen prefill")) {
-                        Toggle("", isOn: saved(
-                            $vm.qwen35AnePrefillDualAne,
-                            field: .qwen35AnePrefillDualAne
-                        ))
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillDualAne))
                             .labelsHidden().toggleStyle(.switch)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.gdn.label",
@@ -1286,10 +1267,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.gdn.sub",
                                          defaultValue: "Also split eligible GDN z+qkv input projections across ANE and GPU.",
                                          comment: "Sublabel describing Qwen GDN ANE acceleration")) {
-                        Toggle("", isOn: saved(
-                            $vm.qwen35AnePrefillGdn,
-                            field: .qwen35AnePrefillGdn
-                        ))
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillGdn))
                             .labelsHidden().toggleStyle(.switch)
                     }
                     if vm.qwen35AnePrefillGdn {
@@ -1299,13 +1277,10 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_fraction.sub",
                                              defaultValue: "GDN projection channels assigned to both ANEs; the GPU handles the remainder.",
                                              comment: "Sublabel explaining the Qwen GDN ANE workload fraction")) {
-                            TextInput(text: $vm.qwen35AnePrefillGdnFraction,
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnFraction),
                                       placeholder: "0.5", mono: true,
                                       isNumeric: true, range: 0.05...0.90,
                                       step: 0.005, width: 190)
-                                .onSubmit {
-                                    Task { await vm.save(.qwen35AnePrefillGdnFraction, client: client) }
-                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_layers.label",
                                           defaultValue: "GDN Layer Limit",
@@ -1313,13 +1288,10 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_layers.sub",
                                              defaultValue: "Maximum eligible GDN layers prepared eagerly. The selected default covers 48 layers.",
                                              comment: "Sublabel explaining the maximum number of Qwen GDN ANE layers")) {
-                            TextInput(text: $vm.qwen35AnePrefillGdnMaxLayers,
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnMaxLayers),
                                       placeholder: "48", mono: true,
                                       isNumeric: true, range: 0...256,
                                       step: 1, width: 190)
-                                .onSubmit {
-                                    Task { await vm.save(.qwen35AnePrefillGdnMaxLayers, client: client) }
-                                }
                         }
                     }
                 }
@@ -1600,15 +1572,6 @@ private struct ExperimentalSection: View {
                               placeholder: "4", mono: true, width: 80)
                 }
             }
-        }
-    }
-
-    private func saved<T: Equatable>(
-        _ binding: Binding<T>,
-        field: ModelSettingsScreenVM.Field
-    ) -> Binding<T> {
-        vm.bind(binding) {
-            Task { await vm.save(field, client: client) }
         }
     }
 

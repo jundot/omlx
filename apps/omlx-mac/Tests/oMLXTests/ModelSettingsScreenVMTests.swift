@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import oMLX
 
 @MainActor
@@ -101,6 +102,61 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["qwen35_ane_prefill_gdn"]?.value as? Bool, true)
         XCTAssertEqual(settings["qwen35_ane_prefill_gdn_fraction"]?.value as? Double, 0.5)
         XCTAssertEqual(settings["qwen35_ane_prefill_gdn_max_layers"]?.value as? Int, 48)
+    }
+
+    func testDisabledQwenAneSettingIsIncludedInWorkingProfile() {
+        let settings = ModelSettingsScreenVM().currentSettingsDict()
+
+        XCTAssertEqual(settings["qwen35_ane_prefill_enabled"]?.value as? Bool, false)
+        XCTAssertNil(settings["qwen35_ane_prefill_sequence_length"])
+    }
+
+    func testQwenAneProfileBindingCreatesWorkingState() {
+        let vm = ModelSettingsScreenVM()
+        let binding = vm.bindProfile(Binding(
+            get: { vm.qwen35AnePrefillEnabled },
+            set: { vm.qwen35AnePrefillEnabled = $0 }
+        ))
+
+        binding.wrappedValue = true
+
+        XCTAssertTrue(vm.qwen35AnePrefillEnabled)
+        XCTAssertTrue(vm.profileDirty)
+    }
+
+    func testApplyingQwenAneTunerResultStagesWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.aneTuningStatus = ANETuningStatusResponse(
+            tuningId: "tune-1",
+            modelId: "qwen",
+            status: "complete",
+            phase: "complete",
+            message: "Done",
+            current: 1,
+            total: 1,
+            results: [],
+            recommendation: ANETuningRecommendationDTO(
+                enabled: true,
+                mlpFraction: 0.467,
+                gdnEnabled: true,
+                gdnFraction: 0.527,
+                processingTps: 123.4,
+                speedupPercent: 12.3,
+                sequenceLength: 2112
+            ),
+            error: nil,
+            terminationReason: nil
+        )
+
+        vm.applyANETuningRecommendation()
+
+        XCTAssertTrue(vm.profileDirty)
+        XCTAssertTrue(vm.qwen35AnePrefillEnabled)
+        XCTAssertEqual(vm.qwen35AnePrefillSequenceLength, "2112")
+        XCTAssertEqual(vm.qwen35AnePrefillFraction, "0.467")
+        XCTAssertTrue(vm.qwen35AnePrefillDualAne)
+        XCTAssertTrue(vm.qwen35AnePrefillGdn)
+        XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")
     }
 
     func testQwenAneCompatibilityUsesQwenConfigFamily() {
