@@ -567,6 +567,46 @@ def test_prefill_router_tournament_ordinal_bit_exact(normalizing):
     assert bool(mx.all(cc == ccf))
 
 
+def test_router_variants_tie_and_nan_edge_cases():
+    """Exact ties (all-equal bias) and a NaN logit: every ordinal/float
+    router variant elects the same top-8 (index tie-break ascending) and
+    matches the stock fallback bit-exactly."""
+    logits = mx.full((256,), 0.3, mx.bfloat16)
+    cb = mx.zeros((256,), mx.float32)
+    nan = mx.where(
+        mx.arange(256) == 100,
+        mx.array(float("nan"), mx.float32).astype(mx.bfloat16),
+        logits,
+    )
+    for lg in (logits, nan):
+        idx, sc = laguna_nvfp4.decode_router_top8_ordinal(lg, cb, False, True)
+        saved = laguna_nvfp4._ext
+        try:
+            laguna_nvfp4._ext = None
+            idxf, scf = laguna_nvfp4.decode_router_top8_ordinal(lg, cb, False, True)
+        finally:
+            laguna_nvfp4._ext = saved
+        assert bool(mx.all(idx == idxf))
+        assert bool(mx.all(sc == scf))
+    bl = mx.broadcast_to(logits, (3, 256)).reshape(-1)
+    for fn in (
+        lambda: laguna_nvfp4.prefill_router_top8(bl, cb, True),
+        lambda: laguna_nvfp4.prefill_router_tournament(bl, cb, False),
+        lambda: laguna_nvfp4.prefill_router_tournament_ordinal(bl, cb, False),
+        lambda: laguna_nvfp4.prefill_router_tournament_ordinal(bl, cb, True),
+    ):
+        idx, sc = fn()
+        saved = laguna_nvfp4._ext
+        try:
+            laguna_nvfp4._ext = None
+            idxf, scf = fn()
+        finally:
+            laguna_nvfp4._ext = saved
+        assert bool(mx.all(idx == idxf))
+        assert bool(mx.all(sc == scf))
+
+
+
 
 @pytestmark_real
 def test_lm_head_prune_real_model():
