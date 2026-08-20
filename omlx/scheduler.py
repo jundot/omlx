@@ -61,6 +61,7 @@ from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
+from .render_cache import encode_cached
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
@@ -7926,7 +7927,12 @@ class Scheduler:
         # Tokenize if needed
         if request.prompt_token_ids is None:
             if isinstance(request.prompt, str):
-                request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+                # The engine's admission preflight already encoded this exact
+                # prompt; the shared memo turns this second full-prompt BPE
+                # pass into a lookup.
+                request.prompt_token_ids = encode_cached(
+                    self.tokenizer, request.prompt
+                )
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)

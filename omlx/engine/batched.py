@@ -6,14 +6,17 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import contextlib
 import copy
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..render_cache import RENDER_MEMO_MAX_CHARS, RenderMemo, encode_cached
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -72,6 +75,10 @@ class BatchedEngine(BaseEngine):
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
         self._prefill_eviction_callback = prefill_eviction_callback
+        # One request renders the same conversation up to three times
+        # (preflight, thinking detection, the engine's own render); the memo
+        # collapses those to one Jinja pass. See omlx/render_cache.py.
+        self._render_memo = RenderMemo()
 
         self._model = None
         self._tokenizer = None
@@ -276,6 +283,13 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
         )
+        # Stamp the encode-memo scope BEFORE Scheduler.__init__ deep-copies
+        # this tokenizer (its "Already borrowed" isolation): deepcopy carries
+        # the attribute, so the copy shares the memo; id()-based keys never
+        # match across the copy.
+        if not hasattr(self._tokenizer, "_omlx_cache_id"):
+            with contextlib.suppress(Exception):  # slotted/frozen tokenizer
+                self._tokenizer._omlx_cache_id = uuid.uuid4().hex
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
@@ -661,6 +675,51 @@ class BatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
     ) -> str:
+        """Memoized front door for ``_apply_chat_template_uncached``.
+
+        The key is computed over the messages as passed — before the
+        uncached path strips the non-standard ``partial`` key — so it is
+        deterministic for both first and repeat calls. A non-serializable
+        message payload yields a None key and falls through uncached.
+        """
+        # Lazy: tests and subclasses construct engines without running this
+        # class's __init__.
+        memo = getattr(self, "_render_memo", None)
+        if memo is None:
+            memo = self._render_memo = RenderMemo()
+        key = RenderMemo.key(
+            messages,
+            tools,
+            chat_template_kwargs,
+            is_partial,
+            getattr(self, "_enable_thinking", None),
+            str(getattr(self, "model_type", "") or ""),
+        )
+        cached = memo.get(key)
+        if cached is not None:
+            # The uncached path strips the non-standard "partial" key as a
+            # side effect; keep that visible to callers on a hit too.
+            for msg in messages:
+                if isinstance(msg, dict):
+                    msg.pop("partial", None)
+            return cached
+        prompt = self._apply_chat_template_uncached(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+        if isinstance(prompt, str) and len(prompt) <= RENDER_MEMO_MAX_CHARS:
+            memo.put(key, prompt)
+        return prompt
+
+    def _apply_chat_template_uncached(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> str:
         """Apply chat template to messages.
 
         Args:
@@ -748,7 +807,7 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer.encode(prompt))
+        return len(encode_cached(self._tokenizer, prompt))
 
     @staticmethod
     def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -802,8 +861,10 @@ class BatchedEngine(BaseEngine):
                 non_system_prompt = self._apply_chat_template(
                     non_system, template_tools, chat_template_kwargs=ct_kwargs
                 )
-                full_tokens = len(self._tokenizer.encode(prompt))
-                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                full_tokens = len(encode_cached(self._tokenizer, prompt))
+                non_system_tokens = len(
+                    encode_cached(self._tokenizer, non_system_prompt)
+                )
                 system_end = full_tokens - non_system_tokens
                 if system_end > 0:
                     kwargs["specprefill_system_end"] = system_end
@@ -1124,7 +1185,7 @@ class BatchedEngine(BaseEngine):
         # through the existing handler chain so the response shape stays
         # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(encode_cached(self._tokenizer, prompt))
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -1154,7 +1215,7 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(encode_cached(self._tokenizer, prompt))
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_completion: tokenizer.encode raised "

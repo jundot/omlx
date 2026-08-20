@@ -632,6 +632,34 @@ class TestBatchedEngineModelType:
         assert engine.model_type is None
 
 
+class TestApplyChatTemplateRenderMemo:
+    def test_second_identical_render_is_a_memo_hit(self):
+        """One Jinja pass per request: the repeat render must not touch the
+        tokenizer, must return the identical prompt, and must still strip
+        the non-standard 'partial' key from the fresh messages list."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine._tokenizer = mock_tokenizer
+
+        def fresh_messages():
+            return [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "{", "partial": True},
+            ]
+
+        first = engine._apply_chat_template(fresh_messages(), is_partial=True)
+        assert mock_tokenizer.apply_chat_template.call_count == 1
+
+        repeat = fresh_messages()
+        second = engine._apply_chat_template(repeat, is_partial=True)
+        assert second == first
+        assert mock_tokenizer.apply_chat_template.call_count == 1
+        assert all("partial" not in m for m in repeat)
+
+
 class TestApplyChatTemplatePartialMode:
     """Tests for partial mode support in _apply_chat_template()."""
 
@@ -809,6 +837,11 @@ class TestApplyChatTemplatePartialMode:
         count_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
 
         # Phase 2: chat.  Operates on the same (now-stripped) messages list.
+        # Reset the render memo so this phase renders for real — a memo hit
+        # would replay phase 1's call_args and make the comparison vacuous.
+        from omlx.render_cache import RenderMemo
+
+        engine._render_memo = RenderMemo()
         engine._apply_chat_template(messages, is_partial=is_partial)
         chat_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
 
