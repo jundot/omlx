@@ -149,6 +149,34 @@ class TestMemoryMonitor:
         expected = 64 * 8 * 128 * 2 * 2 * 32
         assert estimate == expected
 
+    def test_estimate_block_memory_uses_kv_cache_layers(self):
+        """Hybrid recurrent layers do not add per-token KV bytes."""
+        monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+        monitor.set_model_info(
+            num_layers=64,
+            num_kv_heads=4,
+            head_dim=256,
+            dtype_size=2,
+            num_kv_cache_layers=16,
+        )
+
+        # 16 KV-cache layers × K/V × 4 heads × 256 values × 2 bytes × 64
+        # tokens = 4 MiB. The previous all-layer estimate was 16 MiB.
+        assert monitor.estimate_block_memory(64) == 4 * 1024**2
+
+    def test_estimate_block_memory_preserves_zero_kv_cache_layers(self):
+        """Rotating-only models do not fall back to all transformer layers."""
+        monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=2,
+            head_dim=128,
+            dtype_size=2,
+            num_kv_cache_layers=0,
+        )
+
+        assert monitor.estimate_block_memory(64) == 0
+
     def test_estimate_block_memory_default_values(self):
         """Test block memory estimation with default values."""
         monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
@@ -669,15 +697,13 @@ class TestEstimateResidentKvBytes:
         m.set_fixed_state_bytes(999)
         assert m.estimate_resident_kv_bytes(0) == 0
 
-    def test_prompt_kv_and_block_memory_bytes_unchanged(self):
-        """Regression pin: the throttle static term and the paged-SSD
-        writer-cap input must not move with the resident-KV extension."""
+    def test_prompt_kv_and_block_memory_use_full_kv_layers_only(self):
+        """Both per-token estimates exclude fixed-state layer classes."""
         m = self._make(num_kv_cache_layers=5, rotating_layer_specs=[(25, 1024)])
         per_layer_token = 8 * 128 * 2 * 2
-        # estimate_prompt_kv_bytes: full (num_kv_cache_layers) only.
+        # Both estimates charge only the five full-attention KV layers.
         assert m.estimate_prompt_kv_bytes(1000) == 1000 * 5 * per_layer_token
-        # estimate_block_memory: all num_layers, ignores layer classes.
-        assert m.estimate_block_memory(1) == 30 * 8 * 128 * 2 * 2
+        assert m.estimate_block_memory(1) == 5 * 8 * 128 * 2 * 2
 
 
 class TestSetModelInfoFromModelRotating:

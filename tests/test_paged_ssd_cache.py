@@ -3126,11 +3126,14 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
       > construction path still does not pass them.
     """
 
-    def _make_scheduler(self, tmp_path, block_size_tokens, model_layers):
+    def _make_scheduler(
+        self, tmp_path, block_size_tokens, model_layers, kv_cache_layers=None
+    ):
         """Build a Scheduler with paged SSD cache enabled at the given
         block size and a model whose config exposes ``model_layers``
         layers (so the memory monitor produces a real per-token KV
-        estimate rather than its default)."""
+        estimate rather than its default). When ``kv_cache_layers`` is
+        provided, the remaining layers use fixed recurrent state."""
         from unittest.mock import MagicMock
 
         from omlx.scheduler import Scheduler, SchedulerConfig
@@ -3146,6 +3149,16 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
         model = MagicMock()
         model.layers = []
         model.config = _Config()
+        if kv_cache_layers is not None:
+            from mlx_lm.models.cache import ArraysCache, KVCache
+
+            model.make_cache = lambda: [
+                *[KVCache() for _ in range(kv_cache_layers)],
+                *[
+                    ArraysCache(size=2)
+                    for _ in range(model_layers - kv_cache_layers)
+                ],
+            ]
 
         tokenizer = MagicMock()
         tokenizer.eos_token_id = 2
@@ -3248,6 +3261,21 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
         )
         assert mgr._max_pending_writes == expected_cap
         assert mgr._write_queue.maxsize == mgr._max_pending_writes
+
+        mgr.close()
+
+    def test_hybrid_model_uses_kv_layers_for_ssd_estimate(self, tmp_path):
+        """The SSD queue estimate must ignore fixed-state hybrid layers."""
+        sched = self._make_scheduler(
+            tmp_path / "hybrid",
+            block_size_tokens=1024,
+            model_layers=64,
+            kv_cache_layers=16,
+        )
+
+        mgr = sched.paged_ssd_cache_manager
+        expected = 16 * 8 * 192 * 2 * 2
+        assert mgr._expected_kv_bytes_per_token == expected
 
         mgr.close()
 

@@ -12415,10 +12415,10 @@ class Scheduler:
             # happy path here is ``has_model_info() is True``; this
             # else branch only fires for skeletal test fixtures.
             if self.memory_monitor is not None and self.memory_monitor.has_model_info():
-                # ``estimate_block_memory(1)`` returns all-layers K+V
-                # bytes for a single token at the dtype the monitor was
-                # configured with — exactly the per-token cost the
-                # queue cap needs to weigh.
+                # ``estimate_block_memory(1)`` returns the per-token K+V
+                # bytes for the layers that actually retain KV state at the
+                # dtype the monitor was configured with. Recurrent layers
+                # keep fixed state and must not inflate the block estimate.
                 expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
                     1
                 )

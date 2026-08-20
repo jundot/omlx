@@ -542,9 +542,13 @@ class MemoryMonitor:
         """
         Estimate memory usage for a KV cache block.
 
+        The default layer count is the number of layers that retain KV state.
+        When cache layout information is unavailable, it falls back to the
+        configured transformer layer count.
+
         Args:
             block_size: Number of tokens in the block
-            num_layers: Override stored num_layers
+            num_layers: Override the stored KV-cache layer count
             num_kv_heads: Override stored num_kv_heads
             head_dim: Override stored head_dim
             dtype_size: Override stored dtype_size
@@ -552,7 +556,17 @@ class MemoryMonitor:
         Returns:
             Estimated memory in bytes for one block.
         """
-        layers = num_layers or self._num_layers or 32  # Default for ~7B model
+        # A block grows with the layers that retain per-token KV state, not
+        # with recurrent or other layers whose state is fixed per sequence.
+        # Keep an explicit ``num_layers`` override for callers that need a
+        # custom estimate, while preserving a genuine zero for rotating-only
+        # models.
+        if num_layers is not None:
+            layers = num_layers
+        elif self._num_kv_cache_layers is not None:
+            layers = self._num_kv_cache_layers
+        else:
+            layers = self._num_layers or 32  # Default for ~7B model
         kv_heads = num_kv_heads or self._num_kv_heads or 8
         dim = head_dim or self._head_dim or 128
         dtype = dtype_size or self._dtype_size

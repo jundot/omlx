@@ -71,12 +71,12 @@ _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
 
 # Conservative defaults for the per-block cost estimator. The actual
-# bytes-per-block depends on the model (num_layers × num_kv_heads ×
+# bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
 # head_dim × dtype_size × block_size_tokens × 2). At construction time
 # the PagedSSDCacheManager doesn't always know these — see __init__'s
 # ``expected_kv_bytes_per_token`` parameter — so the module-level
-# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB
-# spread across all layers. Smaller models will be over-conservative
+# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB.
+# Smaller models will be over-conservative
 # (fine), larger models or larger blocks should pass an explicit value.
 _DEFAULT_BLOCK_SIZE_TOKENS = 256
 _DEFAULT_KV_BYTES_PER_TOKEN = 200_000
@@ -1587,9 +1587,10 @@ class PagedSSDCacheManager(CacheManager):
                 don't pin gigabytes at saturation; passing a smaller value lets
                 the cap grow to give workloads with many tiny blocks enough
                 burst headroom.
-            expected_kv_bytes_per_token: Per-token KV byte estimate (all
-                layers, K + V, dtype). Together with ``expected_block_size_tokens``
-                this drives the bytes-aware queue cap. Defaults to a
+            expected_kv_bytes_per_token: Per-token KV byte estimate (KV-cache
+                layers, K + V, dtype). Together with
+                ``expected_block_size_tokens`` this drives the bytes-aware
+                queue cap. Defaults to a
                 35B-class bf16 estimate; pass an explicit value for
                 quantized models or unusually wide/narrow architectures.
             expected_layer_cache_types: Optional current cache layout. When
