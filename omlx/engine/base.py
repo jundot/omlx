@@ -589,6 +589,19 @@ class BaseNonStreamingEngine(ActivityTrackingMixin, ABC):
     support streaming or chat completion interfaces.
     """
 
+    def set_memory_soft_limit(self, soft_limit_bytes: int) -> None:
+        """Receive the ProcessMemoryEnforcer's soft watermark.
+
+        Non-scheduler engines have no ``_memory_limit_bytes`` for the
+        enforcer to propagate into; engines with a decode-fairness gate
+        (see forward_fairness.py) use the watermark to resume per-forward
+        cache clearing under memory pressure. Default is a no-op for
+        engines without a gate.
+        """
+        gate = getattr(self, "_fairness", None)
+        if gate is not None:
+            gate.set_memory_soft_limit(soft_limit_bytes)
+
     @property
     @abstractmethod
     def model_name(self) -> str:

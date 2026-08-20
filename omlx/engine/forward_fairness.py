@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode-fairness participation for engines that bypass the Scheduler.
 
-EmbeddingEngine and RerankerEngine submit their forward passes straight
-onto the global MLX executor and never pass through ``Scheduler.step()``,
-so the ``decode_fairness`` protocol (chunk caps, shared hold windows and
-decode-time debt -- see scheduler.py) cannot see them: a sustained
+EmbeddingEngine submits its forward passes straight onto the global MLX
+executor and never passes through ``Scheduler.step()``, so the
+``decode_fairness`` protocol (chunk caps, shared hold windows and
+decode-time debt -- see scheduler.py) cannot see it: a sustained
 ``/v1/embeddings`` load keeps the GPU command queue full with back-to-back
 prefill-sized forwards and starves concurrent chat decode. Metal cannot
 preempt a running kernel, so bounding forward duration and leaving the GPU
@@ -12,6 +12,11 @@ quiet during hold windows IS the interleave mechanism; this gate applies
 those two rules to non-scheduler forwards, reusing the process-global
 ``DecodeActivityRegistry`` hold deadline that scheduler prefills already
 honor -- concurrent embedders and prefillers pause together.
+
+RerankerEngine shares the gap, but its models run several forward passes
+inside one ``model.rerank()`` call, so gating the request boundary would
+not let decodes interleave between documents; wiring the gate into those
+internal forward boundaries is a follow-up.
 
 The gate is inert while no other engine is decoding (uncontended forwards
 run back-to-back exactly as before), and it honors the same live
@@ -23,6 +28,8 @@ from __future__ import annotations
 
 import time
 from typing import Any
+
+import mlx.core as mx
 
 from ..decode_activity import get_decode_activity
 from ..scheduler import (
@@ -51,6 +58,19 @@ class ForwardFairnessGate:
         self._key = key
         self._config = scheduler_config
         self._per_item_s_ema: float | None = None
+        # Soft memory watermark, pushed by ProcessMemoryEnforcer on every
+        # tick (same value schedulers receive as _memory_limit_bytes).
+        # 0 = no watermark propagated yet; written by the enforcer thread,
+        # read on the MLX executor thread -- a single int attribute, so
+        # torn reads are impossible under CPython.
+        self._memory_soft_limit_bytes: int = 0
+
+    def set_memory_soft_limit(self, soft_limit_bytes: int) -> None:
+        """Receive the enforcer's soft watermark (0 clears it)."""
+        try:
+            self._memory_soft_limit_bytes = max(0, int(soft_limit_bytes))
+        except (TypeError, ValueError):
+            self._memory_soft_limit_bytes = 0
 
     @property
     def enabled(self) -> bool:
@@ -136,7 +156,23 @@ class ForwardFairnessGate:
 
         The flush is process-global: under decode contention it dumps the
         decoding engine's warm buffer pool on every forward, forcing that
-        engine back to allocator round-trips mid-decode (mirrors
-        ``Scheduler._should_clear_after_chunk``).
+        engine back to allocator round-trips mid-decode. Mirroring
+        ``Scheduler._should_clear_after_chunk``, the skip therefore only
+        holds while memory stays comfortably below the enforcer's soft
+        watermark: once ``active + cache`` crosses it -- or while no
+        watermark has been propagated at all -- every forward clears, so a
+        sustained mixed workload with varying input shapes cannot keep
+        growing the buffer cache under pressure. The cache size is part of
+        the usage on purpose: cached-but-free buffers are exactly what the
+        skip lets accumulate.
         """
-        return not self.contended()
+        if not self.contended():
+            return True
+        limit = self._memory_soft_limit_bytes
+        if limit <= 0:
+            return True
+        try:
+            usage = int(mx.get_active_memory()) + int(mx.get_cache_memory())
+        except Exception:
+            return True
+        return usage >= limit
