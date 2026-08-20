@@ -514,8 +514,365 @@ kernel void laguna_sliding_qk_norm_rope_bf16_128_v1(
     }
 }
 
+// Batched (multi-row prefill) full-attention QK RMSNorm + partial-RoPE with
+// the YaRN mscale. (verbatim from lagunaPrefillFullQKNormYaRNKernel; 4
+// heads per threadgroup via the simdgroup index — the h1 twin below uses
+// one head per threadgroup)
+//   raw_queries [rows*48*128] bf16, raw_keys [rows*8*128] bf16
+//   query_weight [128] bf16, key_weight [128] bf16
+//   angles [atlas*64] float32, offsets [1] int32
+//   queries [48*rows*128] bf16, keys [8*rows*128] bf16
+// Grid: (14, rows) threadgroups of (128 = 4 simdgroups) threads.
+kernel void laguna_prefill_full_qk_norm_yarn_bf16_128_v2(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* query_weight [[buffer(2)]],
+    const device bfloat* key_weight [[buffer(3)]],
+    const device float* angles [[buffer(4)]],
+    const device int32_t* offsets [[buffer(5)]],
+    device bfloat* queries [[buffer(6)]],
+    device bfloat* keys [[buffer(7)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]])
+{
+constexpr uint head_dim = 128;
+constexpr uint rotary_pairs = 32;
+constexpr uint query_heads = 48;
+constexpr uint kv_heads = 8;
+constexpr float yarn_mscale = 1.3465735912322998f;
+
+uint t = threadgroup_position_in_grid.y;
+uint length = threadgroups_per_grid.y;
+uint head = threadgroup_position_in_grid.x * 4
+    + simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+const device bfloat* input;
+const device bfloat* weight;
+device bfloat* output;
+if (head < query_heads) {
+    input = raw_queries + (t * query_heads + head) * head_dim;
+    weight = query_weight;
+    output = queries + (head * length + t) * head_dim;
+} else {
+    uint khead = head - query_heads;
+    input = raw_keys + (t * kv_heads + khead) * head_dim;
+    weight = key_weight;
+    output = keys + (khead * length + t) * head_dim;
+}
+
+uint base = lane * 4;
+thread bfloat normalized[4];
+float sum = 0.0f;
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    float value = float(input[base + i]);
+    sum += value * value;
+}
+sum = simd_sum(sum);
+float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    normalized[i] =
+        weight[base + i] *
+        bfloat(float(input[base + i]) * inverse_rms);
+}
+
+thread float paired[4];
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+}
+
+const device float* angle_row =
+    angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
+if (lane < 8) {
+    bfloat rounded_mscale = bfloat(yarn_mscale);
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; ++i) {
+        uint pair = base + i;
+        float first =
+            float(bfloat(normalized[i] * rounded_mscale));
+        float second =
+            float(bfloat(bfloat(paired[i]) * rounded_mscale));
+        float cosine = angle_row[pair];
+        float sine = angle_row[pair + rotary_pairs];
+        output[pair] = bfloat(first * cosine - second * sine);
+        output[pair + rotary_pairs] =
+            bfloat(first * sine + second * cosine);
+    }
+} else if (lane >= 16) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; ++i) {
+        output[base + i] = normalized[i];
+    }
+}
+}
+
+// Batched full-attention QK-norm, one head per threadgroup (h1).
+// (verbatim from lagunaPrefillFullQKNormYaRNH1Kernel)
+// Grid: (56, rows) x (32 = 1 simdgroup) threads.
+kernel void laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v2(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* query_weight [[buffer(2)]],
+    const device bfloat* key_weight [[buffer(3)]],
+    const device float* angles [[buffer(4)]],
+    const device int32_t* offsets [[buffer(5)]],
+    device bfloat* queries [[buffer(6)]],
+    device bfloat* keys [[buffer(7)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]])
+{
+constexpr uint head_dim = 128;
+constexpr uint rotary_pairs = 32;
+constexpr uint query_heads = 48;
+constexpr uint kv_heads = 8;
+constexpr float yarn_mscale = 1.3465735912322998f;
+
+uint t = threadgroup_position_in_grid.y;
+uint length = threadgroups_per_grid.y;
+uint head = threadgroup_position_in_grid.x;
+uint lane = thread_index_in_simdgroup;
+
+const device bfloat* input;
+const device bfloat* weight;
+device bfloat* output;
+if (head < query_heads) {
+    input = raw_queries + (t * query_heads + head) * head_dim;
+    weight = query_weight;
+    output = queries + (head * length + t) * head_dim;
+} else {
+    uint khead = head - query_heads;
+    input = raw_keys + (t * kv_heads + khead) * head_dim;
+    weight = key_weight;
+    output = keys + (khead * length + t) * head_dim;
+}
+
+uint base = lane * 4;
+thread bfloat normalized[4];
+float sum = 0.0f;
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    float value = float(input[base + i]);
+    sum += value * value;
+}
+sum = simd_sum(sum);
+float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    normalized[i] =
+        weight[base + i] *
+        bfloat(float(input[base + i]) * inverse_rms);
+}
+
+thread float paired[4];
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    paired[i] = simd_shuffle(float(normalized[i]), lane ^ 8);
+}
+
+const device float* angle_row =
+    angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
+if (lane < 8) {
+    bfloat rounded_mscale = bfloat(yarn_mscale);
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; ++i) {
+        uint pair = base + i;
+        float first =
+            float(bfloat(normalized[i] * rounded_mscale));
+        float second =
+            float(bfloat(bfloat(paired[i]) * rounded_mscale));
+        float cosine = angle_row[pair];
+        float sine = angle_row[pair + rotary_pairs];
+        output[pair] = bfloat(first * cosine - second * sine);
+        output[pair + rotary_pairs] =
+            bfloat(first * sine + second * cosine);
+    }
+} else if (lane >= 16) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; ++i) {
+        output[base + i] = normalized[i];
+    }
+}
+}
+
+// Batched (multi-row prefill) sliding-attention QK RMSNorm + full RoPE.
+// (verbatim from lagunaPrefillSlidingQKNormRoPEKernel; 4 heads per tg)
+//   raw_queries [rows*64*128] bf16, raw_keys [rows*8*128] bf16
+//   angles [rows*128] float32, offsets [1] int32
+//   queries [64*rows*128] bf16, keys [8*rows*128] bf16
+// Grid: (18, rows) x (128) threads.
+kernel void laguna_prefill_sliding_qk_norm_rope_bf16_128_v2(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* query_weight [[buffer(2)]],
+    const device bfloat* key_weight [[buffer(3)]],
+    const device float* angles [[buffer(4)]],
+    const device int32_t* offsets [[buffer(5)]],
+    device bfloat* queries [[buffer(6)]],
+    device bfloat* keys [[buffer(7)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]])
+{
+constexpr uint head_dim = 128;
+constexpr uint rotary_pairs = 64;
+constexpr uint query_heads = 64;
+constexpr uint kv_heads = 8;
+
+uint t = threadgroup_position_in_grid.y;
+uint length = threadgroups_per_grid.y;
+uint head = threadgroup_position_in_grid.x * 4
+    + simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+const device bfloat* input;
+const device bfloat* weight;
+device bfloat* output;
+if (head < query_heads) {
+    input = raw_queries + (t * query_heads + head) * head_dim;
+    weight = query_weight;
+    output = queries + (head * length + t) * head_dim;
+} else {
+    uint khead = head - query_heads;
+    input = raw_keys + (t * kv_heads + khead) * head_dim;
+    weight = key_weight;
+    output = keys + (khead * length + t) * head_dim;
+}
+
+uint base = lane * 4;
+thread bfloat normalized[4];
+float sum = 0.0f;
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    float value = float(input[base + i]);
+    sum += value * value;
+}
+sum = simd_sum(sum);
+float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    normalized[i] =
+        weight[base + i] *
+        bfloat(float(input[base + i]) * inverse_rms);
+}
+
+thread float paired[4];
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+}
+
+const device float* angle_row =
+    angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
+if (lane < 16) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; ++i) {
+        uint pair = base + i;
+        float first = float(normalized[i]);
+        float second = paired[i];
+        float cosine = angle_row[pair];
+        float sine = angle_row[pair + rotary_pairs];
+        output[pair] = bfloat(first * cosine - second * sine);
+        output[pair + rotary_pairs] =
+            bfloat(first * sine + second * cosine);
+    }
+}
+}
+
+// Batched sliding-attention QK-norm, one head per threadgroup (h1).
+// (verbatim from lagunaPrefillSlidingQKNormRoPEH1Kernel)
+// Grid: (72, rows) x (32) threads.
+kernel void laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v2(
+    const device bfloat* raw_queries [[buffer(0)]],
+    const device bfloat* raw_keys [[buffer(1)]],
+    const device bfloat* query_weight [[buffer(2)]],
+    const device bfloat* key_weight [[buffer(3)]],
+    const device float* angles [[buffer(4)]],
+    const device int32_t* offsets [[buffer(5)]],
+    device bfloat* queries [[buffer(6)]],
+    device bfloat* keys [[buffer(7)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]])
+{
+constexpr uint head_dim = 128;
+constexpr uint rotary_pairs = 64;
+constexpr uint query_heads = 64;
+constexpr uint kv_heads = 8;
+
+uint t = threadgroup_position_in_grid.y;
+uint length = threadgroups_per_grid.y;
+uint head = threadgroup_position_in_grid.x;
+uint lane = thread_index_in_simdgroup;
+
+const device bfloat* input;
+const device bfloat* weight;
+device bfloat* output;
+if (head < query_heads) {
+    input = raw_queries + (t * query_heads + head) * head_dim;
+    weight = query_weight;
+    output = queries + (head * length + t) * head_dim;
+} else {
+    uint khead = head - query_heads;
+    input = raw_keys + (t * kv_heads + khead) * head_dim;
+    weight = key_weight;
+    output = keys + (khead * length + t) * head_dim;
+}
+
+uint base = lane * 4;
+thread bfloat normalized[4];
+float sum = 0.0f;
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    float value = float(input[base + i]);
+    sum += value * value;
+}
+sum = simd_sum(sum);
+float inverse_rms = metal::precise::rsqrt(sum / 128.0f + 1.0e-6f);
+
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    normalized[i] =
+        weight[base + i] *
+        bfloat(float(input[base + i]) * inverse_rms);
+}
+
+thread float paired[4];
+#pragma clang loop unroll(full)
+for (uint i = 0; i < 4; ++i) {
+    paired[i] = simd_shuffle(float(normalized[i]), lane ^ 16);
+}
+
+const device float* angle_row =
+    angles + (uint(offsets[0]) + t) * (2 * rotary_pairs);
+if (lane < 16) {
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; ++i) {
+        uint pair = base + i;
+        float first = float(normalized[i]);
+        float second = paired[i];
+        float cosine = angle_row[pair];
+        float sine = angle_row[pair + rotary_pairs];
+        output[pair] = bfloat(first * cosine - second * sine);
+        output[pair + rotary_pairs] =
+            bfloat(first * sine + second * cosine);
+    }
+}
+}
+
 // Tail NVFP4 header for the decode QKV family (resolved at the challenge's
-// default flag config: DARKBLOOM_QKV_TAIL_FOLD / TAIL_NVFP4_SCALE_FOLD on).
+// default config: DARKBLOOM_QKV_TAIL_FOLD / TAIL_NVFP4_SCALE_FOLD on).
 static inline float laguna_tail_nvfp4_scale(uint8_t bits) {
     ushort raw = ushort(bits) << 7;
     return float(as_type<half>(raw));
@@ -1557,6 +1914,53 @@ kernel void laguna_prefill_moe_tail_bf16_v1(
         output[row * hidden + col + i] =
             bfloat(residual[row * hidden + col + i] + r2);
     }
+}
+
+// Prefill SORTED MoE tail: weighted 8-expert combine (x2.5) + shared +
+// residual with an inverse-order permutation gather over the sorted expert
+// rows. (verbatim from lagunaPrefillSortedMoETailKernel)
+//   sorted_expert_outputs [rows*8*2048] bf16 (sorted-regime plane)
+//   inverse_order [rows*8] uint32 — sorted pos -> original pos
+//   router_weights [rows*8] fp32, shared_output [rows*2048] bf16
+//   residual [rows*2048] bf16, output [rows*2048] bf16
+// Grid: (512, rows) threads (2048/4 cols per row) x 256-thread groups.
+kernel void laguna_prefill_sorted_moe_tail_bf16_v1(
+    const device bfloat* sorted_expert_outputs [[buffer(0)]],
+    const device uint32_t* inverse_order [[buffer(1)]],
+    const device float* router_weights [[buffer(2)]],
+    const device bfloat* shared_output [[buffer(3)]],
+    const device bfloat* residual [[buffer(4)]],
+    device bfloat* output [[buffer(5)]],
+    uint2 thread_position_in_grid [[thread_position_in_grid]])
+{
+constexpr uint hidden = 2048;
+constexpr uint experts = 8;
+constexpr uint n_cols = 4;
+
+uint row = thread_position_in_grid.y;
+uint col = thread_position_in_grid.x * n_cols;
+const device float* weight_row = router_weights + row * experts;
+
+bfloat expert_weights[experts];
+uint sorted_rows[experts];
+for (uint e = 0; e < experts; ++e) {
+    expert_weights[e] = bfloat(weight_row[e]);
+    sorted_rows[e] = inverse_order[row * experts + e];
+}
+
+for (uint i = 0; i < n_cols; ++i) {
+    bfloat total = bfloat(0);
+    for (uint e = 0; e < experts; ++e) {
+        bfloat product = bfloat(
+            sorted_expert_outputs[sorted_rows[e] * hidden + col + i] *
+            expert_weights[e]);
+        total = bfloat(product + total);
+    }
+    bfloat scaled = bfloat(total * bfloat(2.5f));
+    bfloat r2 = bfloat(scaled + shared_output[row * hidden + col + i]);
+    output[row * hidden + col + i] =
+        bfloat(residual[row * hidden + col + i] + r2);
+}
 }
 
 // Prefill router tournament: 8x 32-lane bitonic sorts then a 64-candidate

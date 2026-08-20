@@ -521,6 +521,150 @@ std::pair<array, array> sliding_qk_norm_rope(
     return {outs[0], outs[1]};
 }
 
+// PrefillQkNormRopePrimitive: batched (multi-row) fused Q/K RMSNorm + RoPE.
+//   inputs[0] = raw_queries [rows*QH*128] bf16
+//   inputs[1] = raw_keys [rows*KH*128] bf16
+//   inputs[2] = query_weight [128] bf16
+//   inputs[3] = key_weight [128] bf16
+//   inputs[4] = angles [atlas*2*rotary_pairs] float32
+//   inputs[5] = offsets [1] int32 (per-row angle atlas base)
+//   output[0] = queries [QH*rows*128] bf16 (head-major, row inner)
+//   output[1] = keys [KH*rows*128] bf16
+// Grid: ((QH+KH)/hpg, rows) threadgroups; hpg = 4 (128 threads) or 1 (32).
+class PrefillQkNormRopePrimitive : public Primitive {
+ public:
+    PrefillQkNormRopePrimitive(Stream s, bool full_yarn, bool h1)
+        : Primitive(s), full_yarn_(full_yarn), h1_(h1) {}
+
+ private:
+    bool full_yarn_;
+    bool h1_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 PrefillQkNormRopePrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+
+        const char* kname = full_yarn_
+            ? (h1_ ? "laguna_prefill_full_qk_norm_yarn_bf16_128_h1_v2"
+                   : "laguna_prefill_full_qk_norm_yarn_bf16_128_v2")
+            : (h1_ ? "laguna_prefill_sliding_qk_norm_rope_bf16_128_h1_v2"
+                   : "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2");
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+
+        int heads = full_yarn_ ? 48 : 64;
+        int rows = static_cast<int>(inputs[0].shape(0) / (heads * 128));
+        int heads_per_group = h1_ ? 1 : 4;
+        // Swift dispatch is in THREADS: (heads+kv)/hpg * (32*hpg) threads in
+        // x, rows in y -> MTL threadgroups = threads / group size.
+        MTL::Size group_dims(heads_per_group * 32, 1, 1);
+        MTL::Size grid_dims((heads + 8) / heads_per_group, rows, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(PrefillQkNormRopePrimitive)
+};
+
+std::pair<array, array> prefill_full_qk_norm_yarn(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    const array& offsets,
+    bool h1,
+    StreamOrDevice s) {
+    constexpr int heads = 48;
+    constexpr int kv_heads = 8;
+    constexpr int rotary_pairs = 32;
+    int rows = static_cast<int>(raw_queries.shape(0) / (heads * 128));
+    if (raw_queries.ndim() != 1 || raw_queries.dtype() != bfloat16 ||
+        raw_queries.shape(0) % (heads * 128) != 0 ||
+        raw_keys.ndim() != 1 || raw_keys.dtype() != bfloat16 ||
+        raw_keys.shape(0) != rows * kv_heads * 128 ||
+        query_weight.ndim() != 1 || key_weight.ndim() != 1 ||
+        query_weight.shape(0) != 128 || key_weight.shape(0) != 128 ||
+        angles.ndim() != 1 || angles.dtype() != float32 ||
+        angles.shape(0) % (2 * rotary_pairs) != 0 ||
+        offsets.ndim() != 1 || offsets.dtype() != int32 ||
+        offsets.shape(0) < 1) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 prefill_full_qk_norm_yarn: shape mismatch — "
+               "raw_queries " << raw_queries.shape() << ", raw_keys "
+            << raw_keys.shape() << ", angles " << angles.shape()
+            << ", offsets " << offsets.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<PrefillQkNormRopePrimitive>(s_stream, true, h1);
+    Shape q_shape{static_cast<ShapeElem>(heads * rows * 128)};
+    Shape k_shape{static_cast<ShapeElem>(kv_heads * rows * 128)};
+    auto outs = array::make_arrays(
+        {q_shape, k_shape}, {bfloat16, bfloat16}, prim,
+        {raw_queries, raw_keys, query_weight, key_weight, angles, offsets});
+    return {outs[0], outs[1]};
+}
+
+std::pair<array, array> prefill_sliding_qk_norm_rope(
+    const array& raw_queries,
+    const array& raw_keys,
+    const array& query_weight,
+    const array& key_weight,
+    const array& angles,
+    const array& offsets,
+    bool h1,
+    StreamOrDevice s) {
+    constexpr int heads = 64;
+    constexpr int kv_heads = 8;
+    constexpr int rotary_pairs = 64;
+    int rows = static_cast<int>(raw_queries.shape(0) / (heads * 128));
+    if (raw_queries.ndim() != 1 || raw_queries.dtype() != bfloat16 ||
+        raw_queries.shape(0) % (heads * 128) != 0 ||
+        raw_keys.ndim() != 1 || raw_keys.dtype() != bfloat16 ||
+        raw_keys.shape(0) != rows * kv_heads * 128 ||
+        query_weight.ndim() != 1 || key_weight.ndim() != 1 ||
+        query_weight.shape(0) != 128 || key_weight.shape(0) != 128 ||
+        angles.ndim() != 1 || angles.dtype() != float32 ||
+        angles.shape(0) % (2 * rotary_pairs) != 0 ||
+        offsets.ndim() != 1 || offsets.dtype() != int32 ||
+        offsets.shape(0) < 1) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 prefill_sliding_qk_norm_rope: shape mismatch — "
+               "raw_queries " << raw_queries.shape() << ", raw_keys "
+            << raw_keys.shape() << ", angles " << angles.shape()
+            << ", offsets " << offsets.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<PrefillQkNormRopePrimitive>(s_stream, false, h1);
+    Shape q_shape{static_cast<ShapeElem>(heads * rows * 128)};
+    Shape k_shape{static_cast<ShapeElem>(kv_heads * rows * 128)};
+    auto outs = array::make_arrays(
+        {q_shape, k_shape}, {bfloat16, bfloat16}, prim,
+        {raw_queries, raw_keys, query_weight, key_weight, angles, offsets});
+    return {outs[0], outs[1]};
+}
+
 // DecodeQkvR1Primitive: fused Q/K/V NVFP4 projection for one token.
 //   inputs[0] = normalized [2048] bf16
 //   inputs[1] = weight_codes [rows][1024] uint8
@@ -813,90 +957,6 @@ std::pair<array, array> decode_router_top8(
     return {outs[0], outs[1]};
 }
 
-// DecodeRouterTop8OrdinalPrimitive: 256-lane bitonic top-8 router with the
-// ordinal payload (uint ordinal + uint index, no score carried through the
-// network; the winner sigmoid comes from the score table arm or a final
-// recompute). 4 kernels: x normalizing x score_table.
-class DecodeRouterTop8OrdinalPrimitive : public Primitive {
- public:
-    DecodeRouterTop8OrdinalPrimitive(Stream s, bool normalizing, bool score_table)
-        : Primitive(s), normalizing_(normalizing), score_table_(score_table) {}
-
- private:
-    bool normalizing_;
-    bool score_table_;
-
-    void eval_cpu(
-        const std::vector<array>& /* inputs */,
-        std::vector<array>& /* outputs */) override {
-        throw std::runtime_error(
-            "laguna_nvfp4 DecodeRouterTop8OrdinalPrimitive has no CPU path.");
-    }
-
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        std::vector<array>& outputs) override {
-        auto& s = stream();
-        auto& d = metal::device(s.device);
-        for (auto& out : outputs) {
-            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-        }
-        const char* kname = nullptr;
-        if (normalizing_) {
-            kname = score_table_
-                ? "laguna_decode_router_top8_ordinal_table_norm_v1"
-                : "laguna_decode_router_top8_ordinal_norm_v1";
-        } else {
-            kname = score_table_
-                ? "laguna_decode_router_top8_ordinal_table_v1"
-                : "laguna_decode_router_top8_ordinal_v1";
-        }
-        auto kernel = get_laguna_kernel(d, kname);
-        auto& enc = metal::get_command_encoder(s);
-        enc.set_compute_pipeline_state(kernel);
-        int c = 0;
-        for (const auto& in : inputs) {
-            enc.set_input_array(in, c++);
-        }
-        for (auto& out : outputs) {
-            enc.set_output_array(out, c++);
-        }
-        // Swift grid is in THREADS: (256,1,1) with a 256-thread group =>
-        // 1 threadgroup.
-        MTL::Size group_dims(256, 1, 1);
-        MTL::Size grid_dims(1, 1, 1);
-        enc.dispatch_threadgroups(grid_dims, group_dims);
-    }
-
-    DEFINE_NAME(DecodeRouterTop8OrdinalPrimitive)
-};
-
-std::pair<array, array> decode_router_top8_ordinal(
-    const array& logits,
-    const array& correction_bias,
-    bool normalizing,
-    bool score_table,
-    StreamOrDevice s) {
-    if (logits.ndim() != 1 || logits.shape(0) != 256 ||
-        correction_bias.ndim() != 1 || correction_bias.shape(0) != 256 ||
-        correction_bias.dtype() != float32) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 decode_router_top8_ordinal: shape mismatch — "
-               "logits " << logits.shape() << ", correction_bias "
-            << correction_bias.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<DecodeRouterTop8OrdinalPrimitive>(
-        s_stream, normalizing, score_table);
-    Shape idx_shape{static_cast<ShapeElem>(8)};
-    Shape score_shape{static_cast<ShapeElem>(8)};
-    auto outs = array::make_arrays(
-        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
-        {logits, correction_bias});
-    return {outs[0], outs[1]};
-}
-
 // SlidingFusedAttnRingPrimitive: fused sliding-attention decode (ring).
 //   inputs[0] raw_queries [64*128], [1] raw_keys [8*128], [2] raw_values
 //   [3] query_weight [128], [4] key_weight [128], [5] angles [128] fp32
@@ -1124,22 +1184,18 @@ array prefill_moe_tail(
                  {expert_outputs, router_weights, shared_output, residual});
 }
 
-// PrefillRouterTop8Primitive: per-row O(256) predecessor count over the
-// 256 choice keys (stable total order), rank-ordered top-8 emitters plus a
-// per-row winner score table. 2 kernels: x normalizing.
-class PrefillRouterTop8Primitive : public Primitive {
+// PrefillSortedMoeTailPrimitive: weighted expert combine + shared + residual
+// with an inverse-order permutation gather over the sorted expert plane.
+class PrefillSortedMoeTailPrimitive : public Primitive {
  public:
-    explicit PrefillRouterTop8Primitive(Stream s, bool normalizing)
-        : Primitive(s), normalizing_(normalizing) {}
+    explicit PrefillSortedMoeTailPrimitive(Stream s) : Primitive(s) {}
 
  private:
-    bool normalizing_;
-
     void eval_cpu(
         const std::vector<array>& /* inputs */,
         std::vector<array>& /* outputs */) override {
         throw std::runtime_error(
-            "laguna_nvfp4 PrefillRouterTop8Primitive has no CPU path.");
+            "laguna_nvfp4 PrefillSortedMoeTailPrimitive has no CPU path.");
     }
 
     void eval_gpu(
@@ -1147,67 +1203,76 @@ class PrefillRouterTop8Primitive : public Primitive {
         std::vector<array>& outputs) override {
         auto& s = stream();
         auto& d = metal::device(s.device);
-        for (auto& out : outputs) {
-            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-        }
-        const char* kname = normalizing_
-            ? "laguna_prefill_router_top8_norm_v1"
-            : "laguna_prefill_router_top8_v1";
-        auto kernel = get_laguna_kernel(d, kname);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel =
+            get_laguna_kernel(d, "laguna_prefill_sorted_moe_tail_bf16_v1");
         auto& enc = metal::get_command_encoder(s);
         enc.set_compute_pipeline_state(kernel);
         int c = 0;
         for (const auto& in : inputs) {
             enc.set_input_array(in, c++);
         }
-        for (auto& out : outputs) {
-            enc.set_output_array(out, c++);
-        }
-        int rows = static_cast<int>(inputs[0].shape(0) / 256);
-        // Swift grid is in THREADS: (256, rows) with a 256-thread group =>
-        // threadgroups (1, rows, 1).
+        enc.set_output_array(out, c++);
+        // Swift grid is in THREADS: (hidden/4, rows) with a 256-thread
+        // group -> (hidden/4/256, rows) threadgroups.
+        int rows = static_cast<int>(inputs[0].shape(1));
         MTL::Size group_dims(256, 1, 1);
-        MTL::Size grid_dims(1, rows, 1);
+        MTL::Size grid_dims(2048 / 4 / 256, rows, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
 
-    DEFINE_NAME(PrefillRouterTop8Primitive)
+    DEFINE_NAME(PrefillSortedMoeTailPrimitive)
 };
 
-std::pair<array, array> prefill_router_top8(
-    const array& logits,
-    const array& correction_bias,
-    bool normalizing,
+array prefill_sorted_moe_tail(
+    const array& sorted_expert_outputs,
+    const array& inverse_order,
+    const array& router_weights,
+    const array& shared_output,
+    const array& residual,
     StreamOrDevice s) {
-    int rows = static_cast<int>(logits.shape(0) / 256);
-    if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
-        correction_bias.ndim() != 1 || correction_bias.dtype() != float32 ||
-        correction_bias.shape(0) != 256) {
+    // sorted_expert_outputs [1, rows, 8, 2048]; inverse_order [rows*8]
+    // uint32; router_weights [1, rows, 8]; shared_output/residual
+    // [1, rows, 2048] (the Swift batched layout).
+    int rows = static_cast<int>(sorted_expert_outputs.shape(1));
+    if (sorted_expert_outputs.ndim() != 4 ||
+        sorted_expert_outputs.dtype() != bfloat16 ||
+        sorted_expert_outputs.shape(0) != 1 ||
+        sorted_expert_outputs.shape(2) != 8 ||
+        sorted_expert_outputs.shape(3) != 2048 ||
+        inverse_order.ndim() != 1 || inverse_order.dtype() != uint32 ||
+        inverse_order.shape(0) != rows * 8 ||
+        router_weights.ndim() != 3 || router_weights.dtype() != float32 ||
+        router_weights.shape(0) != 1 || router_weights.shape(1) != rows ||
+        router_weights.shape(2) != 8 ||
+        shared_output.ndim() != 3 || shared_output.dtype() != bfloat16 ||
+        shared_output.shape(0) != 1 || shared_output.shape(1) != rows ||
+        shared_output.shape(2) != 2048 ||
+        residual.ndim() != 3 || residual.dtype() != bfloat16 ||
+        residual.shape(0) != 1 || residual.shape(1) != rows ||
+        residual.shape(2) != 2048) {
         std::ostringstream msg;
-        msg << "laguna_nvfp4 prefill_router_top8: shape mismatch — logits "
-            << logits.shape() << ", correction_bias "
-            << correction_bias.shape();
+        msg << "laguna_nvfp4 prefill_sorted_moe_tail: shape mismatch — "
+               "sorted_expert_outputs " << sorted_expert_outputs.shape()
+            << ", inverse_order " << inverse_order.shape()
+            << ", router_weights " << router_weights.shape();
         throw std::invalid_argument(msg.str());
     }
     auto s_stream = to_stream(s);
-    auto prim = std::make_shared<PrefillRouterTop8Primitive>(s_stream, normalizing);
-    Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
-    Shape score_shape{static_cast<ShapeElem>(rows * 8)};
-    auto outs = array::make_arrays(
-        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
-        {logits, correction_bias});
-    return {outs[0], outs[1]};
+    auto prim = std::make_shared<PrefillSortedMoeTailPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(rows * 2048)};
+    return array(out_shape, bfloat16, prim,
+                 {sorted_expert_outputs, inverse_order, router_weights,
+                  shared_output, residual});
 }
 
 // PrefillRouterTournamentPrimitive: batched 2-phase bitonic router.
 class PrefillRouterTournamentPrimitive : public Primitive {
  public:
-    explicit PrefillRouterTournamentPrimitive(Stream s, bool normalizing)
-        : Primitive(s), normalizing_(normalizing) {}
+    explicit PrefillRouterTournamentPrimitive(Stream s) : Primitive(s) {}
 
  private:
-    bool normalizing_;
-
     void eval_cpu(
         const std::vector<array>& /* inputs */,
         std::vector<array>& /* outputs */) override {
@@ -1223,10 +1288,8 @@ class PrefillRouterTournamentPrimitive : public Primitive {
         for (auto& out : outputs) {
             out.set_data(mlx::core::allocator::malloc(out.nbytes()));
         }
-        const char* kname = normalizing_
-            ? "laguna_prefill_router_tournament_norm_v1"
-            : "laguna_prefill_router_tournament_v1";
-        auto kernel = get_laguna_kernel(d, kname);
+        auto kernel = get_laguna_kernel(
+            d, "laguna_prefill_router_tournament_v1");
         auto& enc = metal::get_command_encoder(s);
         enc.set_compute_pipeline_state(kernel);
         int c = 0;
@@ -1248,7 +1311,6 @@ class PrefillRouterTournamentPrimitive : public Primitive {
 std::pair<array, array> prefill_router_tournament(
     const array& logits,
     const array& correction_bias,
-    bool normalizing,
     StreamOrDevice s) {
     int rows = static_cast<int>(logits.shape(0) / 256);
     if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
@@ -1261,81 +1323,7 @@ std::pair<array, array> prefill_router_tournament(
         throw std::invalid_argument(msg.str());
     }
     auto s_stream = to_stream(s);
-    auto prim = std::make_shared<PrefillRouterTournamentPrimitive>(s_stream, normalizing);
-    Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
-    Shape score_shape{static_cast<ShapeElem>(rows * 8)};
-    auto outs = array::make_arrays(
-        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
-        {logits, correction_bias});
-    return {outs[0], outs[1]};
-}
-
-// PrefillRouterTournamentOrdinalPrimitive: batched 2-phase tournament with
-// the ordinal payload (uint ordinal + index; one 64-candidate phase-2 set
-// on lanes 0..63, per-row original-score table). 2 kernels: x normalizing.
-class PrefillRouterTournamentOrdinalPrimitive : public Primitive {
- public:
-    explicit PrefillRouterTournamentOrdinalPrimitive(Stream s, bool normalizing)
-        : Primitive(s), normalizing_(normalizing) {}
-
- private:
-    bool normalizing_;
-
-    void eval_cpu(
-        const std::vector<array>& /* inputs */,
-        std::vector<array>& /* outputs */) override {
-        throw std::runtime_error(
-            "laguna_nvfp4 PrefillRouterTournamentOrdinalPrimitive has no CPU path.");
-    }
-
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        std::vector<array>& outputs) override {
-        auto& s = stream();
-        auto& d = metal::device(s.device);
-        for (auto& out : outputs) {
-            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-        }
-        const char* kname = normalizing_
-            ? "laguna_prefill_router_tournament_ordinal_norm_active64_v2"
-            : "laguna_prefill_router_tournament_ordinal_active64_v2";
-        auto kernel = get_laguna_kernel(d, kname);
-        auto& enc = metal::get_command_encoder(s);
-        enc.set_compute_pipeline_state(kernel);
-        int c = 0;
-        for (const auto& in : inputs) {
-            enc.set_input_array(in, c++);
-        }
-        for (auto& out : outputs) {
-            enc.set_output_array(out, c++);
-        }
-        int rows = static_cast<int>(inputs[0].shape(0) / 256);
-        MTL::Size group_dims(256, 1, 1);
-        MTL::Size grid_dims(1, rows, 1);
-        enc.dispatch_threadgroups(grid_dims, group_dims);
-    }
-
-    DEFINE_NAME(PrefillRouterTournamentOrdinalPrimitive)
-};
-
-std::pair<array, array> prefill_router_tournament_ordinal(
-    const array& logits,
-    const array& correction_bias,
-    bool normalizing,
-    StreamOrDevice s) {
-    int rows = static_cast<int>(logits.shape(0) / 256);
-    if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
-        correction_bias.ndim() != 1 || correction_bias.dtype() != float32 ||
-        correction_bias.shape(0) != 256) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 prefill_router_tournament_ordinal: shape "
-               "mismatch — logits " << logits.shape()
-            << ", correction_bias " << correction_bias.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<PrefillRouterTournamentOrdinalPrimitive>(
-        s_stream, normalizing);
+    auto prim = std::make_shared<PrefillRouterTournamentPrimitive>(s_stream);
     Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
     Shape score_shape{static_cast<ShapeElem>(rows * 8)};
     auto outs = array::make_arrays(
@@ -1583,370 +1571,6 @@ array dense_down_residual(
 
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
-}
-
-// ---------------------------------------------------------------------------
-// Launch-schedule / scale-layout variants (rows1, halved, packed, top-8)
-// ---------------------------------------------------------------------------
-
-// NamedKernelPrimitive: single-output Metal dispatch with the kernel name and
-// grid geometry fixed per variant. Inputs bind in order, then the output.
-class NamedKernelPrimitive : public Primitive {
- public:
-    NamedKernelPrimitive(Stream s, std::string kernel, int groups, int threads)
-        : Primitive(s),
-          kernel_(std::move(kernel)),
-          groups_(groups),
-          threads_(threads) {}
-
- private:
-    std::string kernel_;
-    int groups_;
-    int threads_;
-
-    void eval_cpu(
-        const std::vector<array>& /* inputs */,
-        std::vector<array>& /* outputs */) override {
-        throw std::runtime_error(
-            "laguna_nvfp4 NamedKernelPrimitive has no CPU path.");
-    }
-
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        std::vector<array>& outputs) override {
-        auto& s = stream();
-        auto& d = metal::device(s.device);
-        auto& out = outputs[0];
-        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-
-        auto kernel = get_laguna_kernel(d, kernel_);
-        auto& enc = metal::get_command_encoder(s);
-        enc.set_compute_pipeline_state(kernel);
-
-        int c = 0;
-        for (const auto& in : inputs) {
-            enc.set_input_array(in, c++);
-        }
-        enc.set_output_array(out, c++);
-
-        MTL::Size group_dims(threads_, 1, 1);
-        MTL::Size grid_dims(groups_, 1, 1);
-        enc.dispatch_threadgroups(grid_dims, group_dims);
-    }
-};
-
-class SharedSwiGLUQmvRows1Primitive : public NamedKernelPrimitive {
- public:
-    explicit SharedSwiGLUQmvRows1Primitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1", 256, 64) {}
-    DEFINE_NAME(SharedSwiGLUQmvRows1Primitive)
-};
-
-class SharedSwiGLUQmvRows1HalvedPrimitive : public NamedKernelPrimitive {
- public:
-    explicit SharedSwiGLUQmvRows1HalvedPrimitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_bf16_v1",
-              256, 64) {}
-    DEFINE_NAME(SharedSwiGLUQmvRows1HalvedPrimitive)
-};
-
-class SharedSwiGLUQmvRows1WidePrimitive : public NamedKernelPrimitive {
- public:
-    explicit SharedSwiGLUQmvRows1WidePrimitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_wide_bf16_v1",
-              256, 64) {}
-    DEFINE_NAME(SharedSwiGLUQmvRows1WidePrimitive)
-};
-
-class SharedDownResidualHalvedPrimitive : public NamedKernelPrimitive {
- public:
-    explicit SharedDownResidualHalvedPrimitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_shared_nvfp4_down_residual_halved_bf16_v1",
-              256, 64) {}
-    DEFINE_NAME(SharedDownResidualHalvedPrimitive)
-};
-
-class RoutedSwiGLUQmvRows1Primitive : public NamedKernelPrimitive {
- public:
-    explicit RoutedSwiGLUQmvRows1Primitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_routed_nvfp4_swiglu_qmv_rows1_bf16_v1", 2048, 64) {}
-    DEFINE_NAME(RoutedSwiGLUQmvRows1Primitive)
-};
-
-class RoutedSwiGLUQMVPackedPrimitive : public NamedKernelPrimitive {
- public:
-    explicit RoutedSwiGLUQMVPackedPrimitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1", 1024, 64) {}
-    DEFINE_NAME(RoutedSwiGLUQMVPackedPrimitive)
-};
-
-class RoutedSwiGLUQMVPackedTop8Primitive : public NamedKernelPrimitive {
- public:
-    explicit RoutedSwiGLUQMVPackedTop8Primitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1",
-              1024, 64) {}
-    DEFINE_NAME(RoutedSwiGLUQMVPackedTop8Primitive)
-};
-
-class RoutedSwiGLUQMVPackedTop8R1Primitive : public NamedKernelPrimitive {
- public:
-    explicit RoutedSwiGLUQMVPackedTop8R1Primitive(Stream s)
-        : NamedKernelPrimitive(
-              s, "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
-              2048, 64) {}
-    DEFINE_NAME(RoutedSwiGLUQMVPackedTop8R1Primitive)
-};
-
-// Shared validation shared by the rows1 QMV variants (same contract as
-// shared_nvfp4_swiglu_qmv): x [K] bf16, w [2N, K/2 bytes] uint8/uint32,
-// scales [2N, K/16] uint8 or the 1-D halved plane.
-static void validate_shared_qmv(
-    const array& x, const array& w, const array& scales) {
-    int64_t K = x.shape(0);
-    int64_t N = w.shape(0) / 2;
-    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
-    int64_t row_bytes = w.shape(1) * dtype_bytes;
-    if (x.ndim() != 1 || x.dtype() != bfloat16 ||
-        w.ndim() != 2 ||
-        w.shape(0) != 2 * N || row_bytes * 2 != K) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 shared rows1 qmv: shape mismatch — "
-               "x " << x.shape() << ", w " << w.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    if (scales.ndim() != 2 || scales.shape(0) != 2 * N ||
-        scales.shape(1) * 16 != K) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 shared rows1 qmv: scale shape mismatch — "
-               "scales " << scales.shape();
-        throw std::invalid_argument(msg.str());
-    }
-}
-
-array shared_nvfp4_swiglu_qmv_rows1(
-    const array& x,
-    const array& w,
-    const array& scales,
-    StreamOrDevice s) {
-    validate_shared_qmv(x, w, scales);
-    int64_t N = w.shape(0) / 2;
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<SharedSwiGLUQmvRows1Primitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(N)};
-    return array(out_shape, bfloat16, prim, {x, w, scales});
-}
-
-array shared_nvfp4_swiglu_qmv_rows1_halved(
-    const array& x,
-    const array& w,
-    const array& scales,
-    StreamOrDevice s) {
-    int64_t K = x.shape(0);
-    int64_t N = w.shape(0) / 2;
-    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
-    int64_t row_bytes = w.shape(1) * dtype_bytes;
-    if (x.ndim() != 1 || x.dtype() != bfloat16 ||
-        w.ndim() != 2 || w.shape(0) != 2 * N || row_bytes * 2 != K ||
-        scales.ndim() != 1 || scales.dtype() != uint8 ||
-        scales.shape(0) != 128 + 2 * N * (K / 32)) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 shared_nvfp4_swiglu_qmv_rows1_halved: shape "
-               "mismatch — x " << x.shape() << ", w " << w.shape()
-            << ", scales " << scales.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim =
-        std::make_shared<SharedSwiGLUQmvRows1HalvedPrimitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(N)};
-    return array(out_shape, bfloat16, prim, {x, w, scales});
-}
-
-array shared_nvfp4_swiglu_qmv_rows1_halved_wide(
-    const array& x,
-    const array& w,
-    const array& scales,
-    StreamOrDevice s) {
-    int64_t K = x.shape(0);
-    int64_t N = w.shape(0) / 2;
-    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
-    int64_t row_bytes = w.shape(1) * dtype_bytes;
-    if (x.ndim() != 1 || x.dtype() != bfloat16 ||
-        w.ndim() != 2 || w.shape(0) != 2 * N || row_bytes * 2 != K ||
-        scales.ndim() != 1 || scales.dtype() != uint8 ||
-        scales.shape(0) != 128 + 2 * N * (K / 32)) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 shared_nvfp4_swiglu_qmv_rows1_halved_wide: "
-               "shape mismatch — x " << x.shape() << ", w " << w.shape()
-            << ", scales " << scales.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim =
-        std::make_shared<SharedSwiGLUQmvRows1WidePrimitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(N)};
-    return array(out_shape, bfloat16, prim, {x, w, scales});
-}
-
-array shared_nvfp4_down_residual_halved(
-    const array& activated,
-    const array& down_weight,
-    const array& down_scales,
-    const array& routed,
-    const array& residual,
-    StreamOrDevice s) {
-    int64_t N = routed.shape(0);
-    int64_t K2 = activated.shape(0);
-    if (activated.ndim() != 1 || activated.dtype() != bfloat16 ||
-        routed.ndim() != 1 || residual.ndim() != 1 ||
-        routed.dtype() != bfloat16 || residual.dtype() != bfloat16 ||
-        down_weight.ndim() != 2 || down_scales.ndim() != 1 ||
-        down_scales.dtype() != uint8 ||
-        down_weight.shape(0) != N ||
-        down_weight.shape(1) * 8 != K2 ||
-        down_scales.shape(0) != 128 + N * (K2 / 32) ||
-        residual.shape(0) != N) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 shared_nvfp4_down_residual_halved: shape "
-               "mismatch — activated " << activated.shape()
-            << ", down_weight " << down_weight.shape()
-            << ", down_scales " << down_scales.shape()
-            << ", routed " << routed.shape() << ", residual "
-            << residual.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<SharedDownResidualHalvedPrimitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(N)};
-    return array(
-        out_shape,
-        bfloat16,
-        prim,
-        {activated, down_weight, down_scales, routed, residual});
-}
-
-array routed_nvfp4_swiglu_qmv_rows1(
-    const array& input,
-    const array& fused_weight,
-    const array& fused_scales,
-    const array& indices,
-    StreamOrDevice s) {
-    int64_t K = input.shape(0);
-    int64_t E = fused_weight.shape(0);
-    int64_t N = fused_weight.shape(1) / 2;
-    int64_t R = indices.shape(0);
-    int64_t dtype_bytes = (fused_weight.dtype() == uint8) ? 1 : 4;
-    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
-        fused_weight.ndim() != 3 || fused_scales.ndim() != 3 ||
-        fused_weight.shape(2) * dtype_bytes * 2 != input.shape(0) ||
-        fused_scales.shape(0) != E || fused_scales.shape(1) != 2 * N ||
-        fused_scales.shape(2) * 16 != input.shape(0) ||
-        indices.ndim() != 1 || indices.dtype() != uint32) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 routed_nvfp4_swiglu_qmv_rows1: shape mismatch — "
-               "input " << input.shape() << ", fused_weight "
-            << fused_weight.shape() << ", fused_scales "
-            << fused_scales.shape() << ", indices " << indices.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<RoutedSwiGLUQmvRows1Primitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(R * N)};
-    return array(
-        out_shape, bfloat16, prim,
-        {input, fused_weight, fused_scales, indices});
-}
-
-array routed_nvfp4_swiglu_qmv_packed(
-    const array& input,
-    const array& fused_weight,
-    const array& packed_scales,
-    const array& indices,
-    StreamOrDevice s) {
-    int64_t N = fused_weight.shape(1) / 2;
-    int64_t E = fused_weight.shape(0);
-    int64_t R = indices.shape(0);
-    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
-        fused_weight.ndim() != 3 ||
-        packed_scales.ndim() != 1 || packed_scales.dtype() != uint8 ||
-        packed_scales.shape(0) != 128 + E * 65536 ||
-        indices.ndim() != 1 || indices.dtype() != uint32) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 routed_nvfp4_swiglu_qmv_packed: shape mismatch — "
-               "input " << input.shape() << ", fused_weight "
-            << fused_weight.shape() << ", packed_scales "
-            << packed_scales.shape() << ", indices " << indices.shape();
-        throw std::invalid_argument(msg.str());
-    }
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<RoutedSwiGLUQMVPackedPrimitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(R * N)};
-    return array(
-        out_shape, bfloat16, prim,
-        {input, fused_weight, packed_scales, indices});
-}
-
-static void validate_routed_packed_top8_inputs(
-    const array& input,
-    const array& fused_weight,
-    const array& packed_scales,
-    const array& router_keys) {
-    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
-        fused_weight.ndim() != 3 ||
-        packed_scales.ndim() != 1 || packed_scales.dtype() != uint8 ||
-        packed_scales.shape(0) != 128 + fused_weight.shape(0) * 65536 ||
-        router_keys.ndim() != 1 || router_keys.dtype() != uint32 ||
-        router_keys.shape(0) != 256) {
-        std::ostringstream msg;
-        msg << "laguna_nvfp4 routed top8 packed qmv: shape mismatch — "
-               "input " << input.shape() << ", fused_weight "
-            << fused_weight.shape() << ", packed_scales "
-            << packed_scales.shape() << ", router_keys "
-            << router_keys.shape();
-        throw std::invalid_argument(msg.str());
-    }
-}
-
-array routed_nvfp4_swiglu_qmv_packed_top8keys(
-    const array& input,
-    const array& fused_weight,
-    const array& packed_scales,
-    const array& router_keys,
-    StreamOrDevice s) {
-    validate_routed_packed_top8_inputs(
-        input, fused_weight, packed_scales, router_keys);
-    int64_t N = fused_weight.shape(1) / 2;
-    auto s_stream = to_stream(s);
-    auto prim = std::make_shared<RoutedSwiGLUQMVPackedTop8Primitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(8 * N)};
-    return array(
-        out_shape, bfloat16, prim,
-        {input, fused_weight, packed_scales, router_keys});
-}
-
-array routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
-    const array& input,
-    const array& fused_weight,
-    const array& packed_scales,
-    const array& router_keys,
-    StreamOrDevice s) {
-    validate_routed_packed_top8_inputs(
-        input, fused_weight, packed_scales, router_keys);
-    int64_t N = fused_weight.shape(1) / 2;
-    auto s_stream = to_stream(s);
-    auto prim =
-        std::make_shared<RoutedSwiGLUQMVPackedTop8R1Primitive>(s_stream);
-    Shape out_shape{static_cast<ShapeElem>(8 * N)};
-    return array(
-        out_shape, bfloat16, prim,
-        {input, fused_weight, packed_scales, router_keys});
 }
 
 }  // namespace omlx::laguna_nvfp4
