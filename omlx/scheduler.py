@@ -12419,9 +12419,23 @@ class Scheduler:
                 # bytes for the layers that actually retain KV state at the
                 # dtype the monitor was configured with. Recurrent layers
                 # keep fixed state and must not inflate the block estimate.
-                expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
-                    1
+                # A rotating-only or ArraysCache-only layout therefore has a
+                # legitimate zero estimate; it is not a safe queue-sizing
+                # value because the cap formula would treat every block as a
+                # one-byte payload and select the 256-entry ceiling.
+                estimated_kv_bytes_per_token = (
+                    self.memory_monitor.estimate_block_memory(1)
                 )
+                expected_kv_bytes_per_token = (
+                    estimated_kv_bytes_per_token
+                    if estimated_kv_bytes_per_token > 0
+                    else 200_000  # PagedSSDCacheManager default
+                )
+                if estimated_kv_bytes_per_token <= 0:
+                    logger.debug(
+                        "No per-token KV layers detected; using the "
+                        "PagedSSDCacheManager default for pending-write sizing"
+                    )
             else:
                 expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
 
