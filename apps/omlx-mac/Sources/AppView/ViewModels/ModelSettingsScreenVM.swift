@@ -282,7 +282,6 @@ final class ModelSettingsScreenVM {
     var aneTuningID: String?
     var aneTuningIsRunning: Bool = false
     var aneTuningStatus: ANETuningStatusResponse?
-    var aneTuningIsApplying: Bool = false
     var aneTuningAllowCPU: Bool = true
     var aneTuningAllowCPUGate: Bool = true
     var aneTuningAllowCPUDown: Bool = true
@@ -844,61 +843,39 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    func applyANETuningRecommendation(client: OMLXClient) async {
+    /// Stage the best tuner result in the working profile. The user can then
+    /// update the active profile or save it as a new one without detaching the
+    /// model from its current profile via a direct settings write.
+    func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
-        aneTuningIsApplying = true
-        defer { aneTuningIsApplying = false }
-
-        var patch = ModelSettingsPatch()
-        patch.qwen35AnePrefillEnabled = recommendation.enabled
-        patch.qwen35AnePrefillSequenceLength = recommendation.sequenceLength
-        if recommendation.enabled {
-            patch.qwen35AnePrefillFraction = recommendation.mlpFraction
-            patch.qwen35AnePrefillDualAne = true
-            patch.qwen35AnePrefillGdn = recommendation.gdnEnabled
-            if recommendation.gdnEnabled {
-                patch.qwen35AnePrefillGdnFraction = recommendation.gdnFraction
-            }
-            patch.qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
-            patch.qwen35AnePrefillCpuFraction = recommendation.cpuFraction
-            patch.qwen35AnePrefillCpuDownFraction = recommendation.cpuDownFraction
-            patch.qwen35AnePrefillCpuGdnFraction = recommendation.cpuGdnFraction
-            patch.qwen35AnePrefillCpuThreads = recommendation.cpuThreads
-            patch.qwen35AnePrefillCpuSharedResource = recommendation.cpuSharedResource
+        qwen35AnePrefillEnabled = recommendation.enabled
+        qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+        if let fraction = recommendation.mlpFraction {
+            qwen35AnePrefillFraction = Self.formatPct(fraction)
         }
-
-        do {
-            _ = try await client.updateModelSettings(id: modelID, patch: patch)
-            qwen35AnePrefillEnabled = recommendation.enabled
-            qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
-            if let fraction = recommendation.mlpFraction {
-                qwen35AnePrefillFraction = Self.formatPct(fraction)
-            }
-            qwen35AnePrefillDualAne = true
-            qwen35AnePrefillGdn = recommendation.gdnEnabled
-            if let fraction = recommendation.gdnFraction {
-                qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
-            }
-            qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
-            if let fraction = recommendation.cpuFraction {
-                qwen35AnePrefillCpuFraction = Self.formatPct(fraction)
-            }
-            if let fraction = recommendation.cpuDownFraction {
-                qwen35AnePrefillCpuDownFraction = Self.formatPct(fraction)
-            }
-            if let fraction = recommendation.cpuGdnFraction {
-                qwen35AnePrefillCpuGdnFraction = Self.formatPct(fraction)
-            }
-            if let threads = recommendation.cpuThreads {
-                qwen35AnePrefillCpuThreads = String(threads)
-            }
-            if let sharedResource = recommendation.cpuSharedResource {
-                qwen35AnePrefillCpuSharedResource = sharedResource
-            }
-            lastError = nil
-        } catch {
-            lastError = error.omlxDescription
+        qwen35AnePrefillDualAne = true
+        qwen35AnePrefillGdn = recommendation.gdnEnabled
+        if let fraction = recommendation.gdnFraction {
+            qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
         }
+        qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
+        if let fraction = recommendation.cpuFraction {
+            qwen35AnePrefillCpuFraction = Self.formatPct(fraction)
+        }
+        if let fraction = recommendation.cpuDownFraction {
+            qwen35AnePrefillCpuDownFraction = Self.formatPct(fraction)
+        }
+        if let fraction = recommendation.cpuGdnFraction {
+            qwen35AnePrefillCpuGdnFraction = Self.formatPct(fraction)
+        }
+        if let threads = recommendation.cpuThreads {
+            qwen35AnePrefillCpuThreads = String(threads)
+        }
+        if let sharedResource = recommendation.cpuSharedResource {
+            qwen35AnePrefillCpuSharedResource = sharedResource
+        }
+        profileDirty = true
+        lastError = nil
     }
 
     // MARK: - Chat-template kwarg list mutation
@@ -1339,6 +1316,7 @@ final class ModelSettingsScreenVM {
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
         let cleanName = name.trimmingCharacters(in: .whitespaces)
         guard !cleanName.isEmpty, scope != .preset else { return }
+        guard validateQwenAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1385,6 +1363,7 @@ final class ModelSettingsScreenVM {
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         guard scope != .preset else { return }
+        guard validateQwenAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1419,6 +1398,38 @@ final class ModelSettingsScreenVM {
             await load(modelID: modelID, client: client)
         } catch {
             self.lastError = error.omlxDescription
+        }
+    }
+
+    private func validateQwenAneWorkingSettings() -> Bool {
+        guard qwen35AnePrefillEnabled else { return true }
+
+        switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        switch QwenAneSettingsValidator.mlpFraction(
+            qwen35AnePrefillFraction,
+            cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
+        ) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        switch QwenAneSettingsValidator.mlpLayers(qwen35AnePrefillMaxLayers) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        guard qwen35AnePrefillGdn else { return true }
+        switch QwenAneSettingsValidator.gdnFraction(
+            qwen35AnePrefillGdnFraction,
+            cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
+        ) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        switch QwenAneSettingsValidator.gdnLayers(qwen35AnePrefillGdnMaxLayers) {
+        case .success: return true
+        case .failure(let error): lastError = error.message; return false
         }
     }
 

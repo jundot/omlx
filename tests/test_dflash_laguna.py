@@ -463,3 +463,36 @@ def test_laguna_draft_rejects_mixed_attention_flavors():
         LagunaDFlashDraftModelArgs.from_dict(
             _draft_config(layer_types=["full_attention", "sliding_attention"])
         )
+
+
+def test_target_ops_logits_last_only_slices_before_lm_head():
+    """logits_last_only=True must equal full-logits[:, -1:, :] at tolerance.
+
+    The DFlash target path slices the post-norm hidden states to the last
+    position BEFORE the vocabulary head (Swift lagunaLastTokenHidden), so the
+    prefill lm_head never computes the dead [L-1, vocab] slab. A [1,1,H] head
+    matmul is ULP-divergent from the [B,L,H] full matmul (frame divergence,
+    see docs/laguna-mlxfast-port-correctness.md C2); asserted at the repo
+    tolerance, matching the DFlash reference layer's frame-divergence tolerance.
+    """
+    from omlx.patches.dflash_laguna import LagunaTargetOps
+
+    model = _target_model()
+    ops = LagunaTargetOps()
+    inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    full, _ = ops.forward_with_hidden_capture(
+        model,
+        input_ids=inputs,
+        cache=model.make_cache(),
+    )
+    last_only, captured = ops.forward_with_hidden_capture(
+        model,
+        input_ids=inputs,
+        cache=model.make_cache(),
+        capture_layer_ids={1},
+        logits_last_only=True,
+    )
+    assert last_only.shape == (1, 1, full.shape[-1])
+    _assert_close(last_only, full[:, -1:, :])
+    assert set(captured) == {1, -1}

@@ -802,3 +802,104 @@ class TestAnthropicAudioConversion:
         assert isinstance(content, list)
         assert len(content) == 1
         assert content[0]["type"] == "input_audio"
+
+
+class TestClientBudgetMarkerStripping:
+    """Tests for Claude Code `<total_tokens>` budget-marker stripping.
+
+    Claude Code appends a freshly decremented
+    `<total_tokens>N tokens left</total_tokens>` block to the system prompt
+    on every request, which mutates the prompt head and defeats prefix
+    caching. The markers are informational only and are stripped like the
+    billing header blocks.
+    """
+
+    def test_strip_from_system_string(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            system=(
+                "You are a helpful assistant."
+                "\n\n<total_tokens>15000000 tokens left</total_tokens>"
+                "\n\n<total_tokens>14999436 tokens left</total_tokens>"
+            ),
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "You are a helpful assistant."
+
+    def test_strip_from_system_blocks(self):
+        from omlx.api.anthropic_utils import _extract_system_text
+
+        text = _extract_system_text(
+            [
+                {"type": "text", "text": "Identity line."},
+                {
+                    "type": "text",
+                    "text": "Body.\n\n<total_tokens>123 tokens left</total_tokens>",
+                },
+            ]
+        )
+
+        assert text == "Identity line.\nBody."
+
+    def test_system_without_marker_is_untouched(self):
+        from omlx.api.anthropic_utils import _extract_system_text
+
+        text = "Plain system prompt.\nNo markers here."
+
+        assert _extract_system_text(text) == text
+
+    def test_strip_from_inline_system_message(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="system",
+                    content=(
+                        "Inline system."
+                        "\n\n<total_tokens>42 tokens left</total_tokens>"
+                    ),
+                ),
+                AnthropicMessage(role="user", content="Hello"),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, consolidate_system_messages=False
+        )
+
+        system_contents = [
+            m["content"] for m in messages if m["role"] == "system"
+        ]
+        assert any(c == "Inline system." for c in system_contents)
+        assert all("<total_tokens>" not in c for c in system_contents)
+
+    def test_marker_in_user_content_is_preserved(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=(
+                        "Quoting a log line: "
+                        "<total_tokens>7 tokens left</total_tokens>"
+                    ),
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        assert "<total_tokens>7 tokens left</total_tokens>" in messages[-1]["content"]

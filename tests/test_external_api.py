@@ -138,6 +138,19 @@ class TestExternalEndpointConfig:
         with pytest.raises(ValueError, match="JSON object"):
             _config(extra_body=value)
 
+    def test_max_tokens_override_defaults_to_none(self):
+        cfg = _config()
+        assert cfg.max_tokens_override is None
+
+    def test_max_tokens_override_accepts_positive_int(self):
+        cfg = _config(max_tokens_override=8192)
+        assert cfg.max_tokens_override == 8192
+
+    @pytest.mark.parametrize("value", [0, -1, 1_000_001, 2**31])
+    def test_max_tokens_override_rejects_out_of_range(self, value):
+        with pytest.raises(ValueError):
+            _config(max_tokens_override=value)
+
 
 # =============================================================================
 # Streaming chat completion
@@ -605,8 +618,8 @@ class TestChatCompletion:
 
 
 class TestExternalChatAdapter:
-    def _adapter(self, handler, profile="deterministic"):
-        client = _client(handler)
+    def _adapter(self, handler, profile="deterministic", **config_overrides):
+        client = _client(handler, **config_overrides)
         return ExternalChatAdapter(client, profile), client
 
     async def test_deterministic_sends_temperature_zero_whitelist_only(self):
@@ -787,3 +800,56 @@ class TestExternalChatAdapter:
         assert output.text == ""
         assert output.external_status == "http_error"
         assert "429" in output.error_message
+
+    async def test_max_tokens_override_raises_small_budget(self):
+        """Thinking models: the 8192 floor must lift the MMLU 128 budget."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return _completion_response()
+
+        adapter, client = self._adapter(handler, max_tokens_override=8192)
+        try:
+            await adapter.chat(
+                messages=[{"role": "user", "content": "q"}],
+                max_tokens=128,
+            )
+        finally:
+            await client.aclose()
+        assert captured["body"]["max_tokens"] == 8192
+
+    async def test_max_tokens_override_never_shrinks_budget(self):
+        """A floor below the benchmark default must not shrink it."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return _completion_response()
+
+        adapter, client = self._adapter(handler, max_tokens_override=64)
+        try:
+            await adapter.chat(
+                messages=[{"role": "user", "content": "q"}],
+                max_tokens=128,
+            )
+        finally:
+            await client.aclose()
+        assert captured["body"]["max_tokens"] == 128
+
+    async def test_no_override_keeps_benchmark_budget(self):
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return _completion_response()
+
+        adapter, client = self._adapter(handler)
+        try:
+            await adapter.chat(
+                messages=[{"role": "user", "content": "q"}],
+                max_tokens=2048,
+            )
+        finally:
+            await client.aclose()
+        assert captured["body"]["max_tokens"] == 2048
