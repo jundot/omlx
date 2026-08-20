@@ -82,6 +82,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "decode_router_top8_ordinal",
+        &omlx::laguna_nvfp4::decode_router_top8_ordinal,
+        "logits"_a, "correction_bias"_a, "normalizing"_a, "score_table"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "sliding_fused_attn_ring",
         &omlx::laguna_nvfp4::sliding_fused_attn_ring,
         "raw_queries"_a, "raw_keys"_a, "raw_values"_a,
@@ -104,9 +110,21 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "prefill_router_top8",
+        &omlx::laguna_nvfp4::prefill_router_top8,
+        "logits"_a, "correction_bias"_a, "normalizing"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "prefill_router_tournament",
         &omlx::laguna_nvfp4::prefill_router_tournament,
-        "logits"_a, "correction_bias"_a,
+        "logits"_a, "correction_bias"_a, "normalizing"_a = false,
+        "stream"_a = nb::none());
+
+    m.def(
+        "prefill_router_tournament_ordinal",
+        &omlx::laguna_nvfp4::prefill_router_tournament_ordinal,
+        "logits"_a, "correction_bias"_a, "normalizing"_a,
         "stream"_a = nb::none());
 
     m.def(

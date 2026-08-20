@@ -136,6 +136,17 @@ std::pair<array, array> decode_router_top8(
     bool normalizing,
     StreamOrDevice s = {});
 
+// Decode router top-8, ordinal payload (same network geometry, uint ordinal
+// + index payload via laguna_router_key_ordinal). Returns {indices, scores}
+// [8]. score_table selects the per-lane original-score table arm (avoids
+// the final winner sigmoid recompute).
+std::pair<array, array> decode_router_top8_ordinal(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    bool score_table,
+    StreamOrDevice s = {});
+
 // Fused sliding-attention decode (steady ring regime). Returns [64*128] bf16.
 array sliding_fused_attn_ring(
     const array& raw_queries,
@@ -169,11 +180,30 @@ array prefill_moe_tail(
     const array& residual,
     StreamOrDevice s = {});
 
+// Prefill router top-8 (per-row O(256) predecessor count over the choice
+// keys, stable total order). Returns {indices, scores} [rows*8]; the
+// normalizing epilogue folds the 8 selected sigmoids in index order.
+std::pair<array, array> prefill_router_top8(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    StreamOrDevice s = {});
+
 // Prefill router tournament (batched 2-phase bitonic). Returns {indices,
 // scores} [rows*8].
 std::pair<array, array> prefill_router_tournament(
     const array& logits,
     const array& correction_bias,
+    bool normalizing = false,
+    StreamOrDevice s = {});
+
+// Prefill router tournament, ordinal payload (uint ordinal + index, one
+// 64-candidate phase-2 set on lanes 0..63). Returns {indices, scores}
+// [rows*8].
+std::pair<array, array> prefill_router_tournament_ordinal(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
     StreamOrDevice s = {});
 
 // LM-head int5 prune pipeline (verbatim from LagunaLmHeadPrune.swift):

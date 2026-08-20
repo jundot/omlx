@@ -448,6 +448,37 @@ def decode_router_top8(
     return ids, vals.astype(mx.bfloat16)
 
 
+def decode_router_top8_ordinal(
+    logits: mx.array,
+    correction_bias: mx.array,
+    normalizing: bool = False,
+    score_table: bool = False,
+    stream=None,
+):
+    """Decode router top-8, ordinal payload (same 256-lane bitonic network,
+    uint ordinal + index sorted via laguna_router_key_ordinal; verbatim from
+    lagunaDecodeRouterOrdinalKernelSource). Returns (indices, scores) [8].
+    The score-table arm reads the winner's original sigmoid from TG memory;
+    the recompute arm re-derives it — both byte-identical.
+    """
+    if _ext is not None and has_symbol("decode_router_top8_ordinal"):
+        return _ext.decode_router_top8_ordinal(
+            logits, correction_bias, normalizing, score_table, stream=stream)
+    # Fallback: identical math to decode_router_top8 (the ordinal transform
+    # is order-preserving on the float keys, so the top-8 set and order match
+    # the float-payload network exactly).
+    x = logits.astype(mx.float32)
+    y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
+    score = mx.where(x < 0, y, 1.0 - y)
+    key = score + correction_bias.astype(mx.float32)
+    ids = mx.argsort(-key, axis=0)[:8].astype(mx.uint32)
+    vals = mx.take(score, ids)
+    if normalizing:
+        vals = vals / mx.maximum(mx.sum(vals), 1e-6)
+    return ids, vals.astype(mx.bfloat16)
+
+
+
 def sliding_fused_attn_ring(
     raw_queries, raw_keys, raw_values, query_weight, key_weight, angles,
     k_cache, v_cache, params, scale_arr, stream=None,
@@ -517,15 +548,24 @@ def prefill_moe_tail(
     return y.reshape(-1)
 
 
-def prefill_router_tournament(
-    logits: mx.array, correction_bias: mx.array, stream=None,
+def prefill_router_top8(
+    logits: mx.array, correction_bias: mx.array, normalizing: bool = False,
+    stream=None,
 ):
-    """Prefill router tournament (batched 2-phase bitonic; verbatim from
-    lagunaPrefillRouterTournamentKernelSource). Returns (indices, scores)
-    [rows*8] each (scores are the raw sigmoids, the bias orders the sort)."""
-    if _ext is not None and has_symbol("prefill_router_tournament"):
-        return _ext.prefill_router_tournament(
-            logits, correction_bias, stream=stream)
+    """Prefill router top-8 (per-row O(256) predecessor count over the 256
+    choice keys, stable total order; verbatim from
+    lagunaPrefillRouterTop8KernelSource). Returns (indices, scores)[rows*8].
+    """
+    if _ext is not None and has_symbol("prefill_router_top8"):
+        return _ext.prefill_router_top8(
+            logits, correction_bias, normalizing, stream=stream)
+    return _prefill_stock_fallback(logits, correction_bias, normalizing, stream)
+
+
+def _prefill_stock_fallback(logits, correction_bias, normalizing, stream):
+    """Shared stock fallback: batched argsort by the bias-ordered key, then
+    the raw sigmoid scores (the index tie break matches the kernels' stable
+    total order on exact ties)."""
     rows = logits.shape[0] // 256
     x = logits.astype(mx.float32).reshape(rows, 256)
     y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
@@ -533,7 +573,40 @@ def prefill_router_tournament(
     key = score + correction_bias.astype(mx.float32)[None, :]
     ids = mx.argsort(-key, axis=1)[:, :8].astype(mx.uint32)
     vals = mx.take_along_axis(score, ids.astype(mx.int32), axis=1)
+    if normalizing:
+        vals = vals / mx.maximum(mx.sum(vals, axis=1, keepdims=True), 1e-6)
     return ids.reshape(-1), vals.reshape(-1).astype(mx.bfloat16)
+
+
+def prefill_router_tournament(
+    logits: mx.array, correction_bias: mx.array, normalizing: bool = False,
+    stream=None,
+):
+    """Prefill router tournament (batched 2-phase bitonic; verbatim from
+    lagunaPrefillRouterTournamentKernelSource; the normalizing epilogue
+    simd-folds the 8 winner sigmoids). Returns (indices, scores) [rows*8]
+    each (scores are the raw sigmoids, the bias orders the sort)."""
+    if _ext is not None and has_symbol("prefill_router_tournament"):
+        return _ext.prefill_router_tournament(
+            logits, correction_bias, normalizing, stream=stream)
+    return _prefill_stock_fallback(logits, correction_bias, normalizing, stream)
+
+
+def prefill_router_tournament_ordinal(
+    logits: mx.array, correction_bias: mx.array, normalizing: bool = False,
+    stream=None,
+):
+    """Prefill router tournament, ordinal: same two-phase schedule with the
+    (uint ordinal, uint index) payload and one 64-candidate phase-2 set on
+    lanes 0..63 (verbatim from
+    lagunaPrefillRouterTournamentOrdinalKernelSource). Returns (indices,
+    scores) [rows*8] (scores are the raw sigmoids, the bias orders the
+    sort)."""
+    if _ext is not None and has_symbol("prefill_router_tournament_ordinal"):
+        return _ext.prefill_router_tournament_ordinal(
+            logits, correction_bias, normalizing, stream=stream)
+    return _prefill_stock_fallback(logits, correction_bias, normalizing, stream)
+
 
 
 # ---------------------------------------------------------------------------

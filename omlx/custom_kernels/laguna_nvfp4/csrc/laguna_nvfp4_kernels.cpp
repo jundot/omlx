@@ -813,6 +813,90 @@ std::pair<array, array> decode_router_top8(
     return {outs[0], outs[1]};
 }
 
+// DecodeRouterTop8OrdinalPrimitive: 256-lane bitonic top-8 router with the
+// ordinal payload (uint ordinal + uint index, no score carried through the
+// network; the winner sigmoid comes from the score table arm or a final
+// recompute). 4 kernels: x normalizing x score_table.
+class DecodeRouterTop8OrdinalPrimitive : public Primitive {
+ public:
+    DecodeRouterTop8OrdinalPrimitive(Stream s, bool normalizing, bool score_table)
+        : Primitive(s), normalizing_(normalizing), score_table_(score_table) {}
+
+ private:
+    bool normalizing_;
+    bool score_table_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 DecodeRouterTop8OrdinalPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        const char* kname = nullptr;
+        if (normalizing_) {
+            kname = score_table_
+                ? "laguna_decode_router_top8_ordinal_table_norm_v1"
+                : "laguna_decode_router_top8_ordinal_norm_v1";
+        } else {
+            kname = score_table_
+                ? "laguna_decode_router_top8_ordinal_table_v1"
+                : "laguna_decode_router_top8_ordinal_v1";
+        }
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        // Swift grid is in THREADS: (256,1,1) with a 256-thread group =>
+        // 1 threadgroup.
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(1, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(DecodeRouterTop8OrdinalPrimitive)
+};
+
+std::pair<array, array> decode_router_top8_ordinal(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    bool score_table,
+    StreamOrDevice s) {
+    if (logits.ndim() != 1 || logits.shape(0) != 256 ||
+        correction_bias.ndim() != 1 || correction_bias.shape(0) != 256 ||
+        correction_bias.dtype() != float32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 decode_router_top8_ordinal: shape mismatch — "
+               "logits " << logits.shape() << ", correction_bias "
+            << correction_bias.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<DecodeRouterTop8OrdinalPrimitive>(
+        s_stream, normalizing, score_table);
+    Shape idx_shape{static_cast<ShapeElem>(8)};
+    Shape score_shape{static_cast<ShapeElem>(8)};
+    auto outs = array::make_arrays(
+        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
+        {logits, correction_bias});
+    return {outs[0], outs[1]};
+}
+
 // SlidingFusedAttnRingPrimitive: fused sliding-attention decode (ring).
 //   inputs[0] raw_queries [64*128], [1] raw_keys [8*128], [2] raw_values
 //   [3] query_weight [128], [4] key_weight [128], [5] angles [128] fp32
@@ -1040,12 +1124,90 @@ array prefill_moe_tail(
                  {expert_outputs, router_weights, shared_output, residual});
 }
 
+// PrefillRouterTop8Primitive: per-row O(256) predecessor count over the
+// 256 choice keys (stable total order), rank-ordered top-8 emitters plus a
+// per-row winner score table. 2 kernels: x normalizing.
+class PrefillRouterTop8Primitive : public Primitive {
+ public:
+    explicit PrefillRouterTop8Primitive(Stream s, bool normalizing)
+        : Primitive(s), normalizing_(normalizing) {}
+
+ private:
+    bool normalizing_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 PrefillRouterTop8Primitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        const char* kname = normalizing_
+            ? "laguna_prefill_router_top8_norm_v1"
+            : "laguna_prefill_router_top8_v1";
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        int rows = static_cast<int>(inputs[0].shape(0) / 256);
+        // Swift grid is in THREADS: (256, rows) with a 256-thread group =>
+        // threadgroups (1, rows, 1).
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(1, rows, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(PrefillRouterTop8Primitive)
+};
+
+std::pair<array, array> prefill_router_top8(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    StreamOrDevice s) {
+    int rows = static_cast<int>(logits.shape(0) / 256);
+    if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
+        correction_bias.ndim() != 1 || correction_bias.dtype() != float32 ||
+        correction_bias.shape(0) != 256) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 prefill_router_top8: shape mismatch — logits "
+            << logits.shape() << ", correction_bias "
+            << correction_bias.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<PrefillRouterTop8Primitive>(s_stream, normalizing);
+    Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
+    Shape score_shape{static_cast<ShapeElem>(rows * 8)};
+    auto outs = array::make_arrays(
+        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
+        {logits, correction_bias});
+    return {outs[0], outs[1]};
+}
+
 // PrefillRouterTournamentPrimitive: batched 2-phase bitonic router.
 class PrefillRouterTournamentPrimitive : public Primitive {
  public:
-    explicit PrefillRouterTournamentPrimitive(Stream s) : Primitive(s) {}
+    explicit PrefillRouterTournamentPrimitive(Stream s, bool normalizing)
+        : Primitive(s), normalizing_(normalizing) {}
 
  private:
+    bool normalizing_;
+
     void eval_cpu(
         const std::vector<array>& /* inputs */,
         std::vector<array>& /* outputs */) override {
@@ -1061,8 +1223,10 @@ class PrefillRouterTournamentPrimitive : public Primitive {
         for (auto& out : outputs) {
             out.set_data(mlx::core::allocator::malloc(out.nbytes()));
         }
-        auto kernel = get_laguna_kernel(
-            d, "laguna_prefill_router_tournament_v1");
+        const char* kname = normalizing_
+            ? "laguna_prefill_router_tournament_norm_v1"
+            : "laguna_prefill_router_tournament_v1";
+        auto kernel = get_laguna_kernel(d, kname);
         auto& enc = metal::get_command_encoder(s);
         enc.set_compute_pipeline_state(kernel);
         int c = 0;
@@ -1084,6 +1248,7 @@ class PrefillRouterTournamentPrimitive : public Primitive {
 std::pair<array, array> prefill_router_tournament(
     const array& logits,
     const array& correction_bias,
+    bool normalizing,
     StreamOrDevice s) {
     int rows = static_cast<int>(logits.shape(0) / 256);
     if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
@@ -1096,7 +1261,81 @@ std::pair<array, array> prefill_router_tournament(
         throw std::invalid_argument(msg.str());
     }
     auto s_stream = to_stream(s);
-    auto prim = std::make_shared<PrefillRouterTournamentPrimitive>(s_stream);
+    auto prim = std::make_shared<PrefillRouterTournamentPrimitive>(s_stream, normalizing);
+    Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
+    Shape score_shape{static_cast<ShapeElem>(rows * 8)};
+    auto outs = array::make_arrays(
+        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
+        {logits, correction_bias});
+    return {outs[0], outs[1]};
+}
+
+// PrefillRouterTournamentOrdinalPrimitive: batched 2-phase tournament with
+// the ordinal payload (uint ordinal + index; one 64-candidate phase-2 set
+// on lanes 0..63, per-row original-score table). 2 kernels: x normalizing.
+class PrefillRouterTournamentOrdinalPrimitive : public Primitive {
+ public:
+    explicit PrefillRouterTournamentOrdinalPrimitive(Stream s, bool normalizing)
+        : Primitive(s), normalizing_(normalizing) {}
+
+ private:
+    bool normalizing_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 PrefillRouterTournamentOrdinalPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        const char* kname = normalizing_
+            ? "laguna_prefill_router_tournament_ordinal_norm_active64_v2"
+            : "laguna_prefill_router_tournament_ordinal_active64_v2";
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        int rows = static_cast<int>(inputs[0].shape(0) / 256);
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(1, rows, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(PrefillRouterTournamentOrdinalPrimitive)
+};
+
+std::pair<array, array> prefill_router_tournament_ordinal(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    StreamOrDevice s) {
+    int rows = static_cast<int>(logits.shape(0) / 256);
+    if (logits.ndim() != 1 || logits.shape(0) % 256 != 0 ||
+        correction_bias.ndim() != 1 || correction_bias.dtype() != float32 ||
+        correction_bias.shape(0) != 256) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 prefill_router_tournament_ordinal: shape "
+               "mismatch — logits " << logits.shape()
+            << ", correction_bias " << correction_bias.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<PrefillRouterTournamentOrdinalPrimitive>(
+        s_stream, normalizing);
     Shape idx_shape{static_cast<ShapeElem>(rows * 8)};
     Shape score_shape{static_cast<ShapeElem>(rows * 8)};
     auto outs = array::make_arrays(

@@ -483,6 +483,91 @@ def test_prefill_router_tournament_bit_exact():
     assert bool(mx.all(sc == scf))
 
 
+@pytest.mark.parametrize("normalizing", [False, True])
+@pytest.mark.parametrize("score_table", [False, True])
+def test_decode_router_top8_ordinal_bit_exact(normalizing, score_table):
+    """Decode ordinal top-8 (4 kernels: normalizing x score-table) vs the
+    fallback: indices and scores bit-exact (the ordinal transform is
+    order-preserving, so the elected top-8 and winner sigmoids match the
+    float-payload network exactly)."""
+    mx.random.seed(51)
+    logits = mx.random.normal((256,), scale=1.0).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    idx, sc = laguna_nvfp4.decode_router_top8_ordinal(
+        logits, cb, normalizing, score_table)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        idxf, scf = laguna_nvfp4.decode_router_top8_ordinal(
+            logits, cb, normalizing, score_table)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(idx == idxf))
+    assert bool(mx.all(sc == scf))
+
+
+@pytest.mark.parametrize("normalizing", [False, True])
+def test_prefill_router_top8_bit_exact(normalizing):
+    """Prefill predecessor-count top-8 (2 kernels) vs the fallback:
+    bit-exact (the kernel's stable per-lane rank order equals argsort's)."""
+    rows = 3
+    mx.random.seed(53)
+    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    idx, sc = laguna_nvfp4.prefill_router_top8(logits, cb, normalizing)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        idxf, scf = laguna_nvfp4.prefill_router_top8(logits, cb, normalizing)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(idx == idxf))
+    assert bool(mx.all(sc == scf))
+
+
+@pytest.mark.parametrize("normalizing", [False, True])
+def test_prefill_router_tournament_norm_bit_exact(normalizing):
+    """Prefill tournament (2 variants: raw + normalizing epilogue) vs the
+    fallback: bit-exact indices and scores."""
+    rows = 3
+    mx.random.seed(55)
+    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    idx, sc = laguna_nvfp4.prefill_router_tournament(logits, cb, normalizing)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        idxf, scf = laguna_nvfp4.prefill_router_tournament(
+            logits, cb, normalizing)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(idx == idxf))
+    assert bool(mx.all(sc == scf))
+
+
+@pytest.mark.parametrize("normalizing", [False, True])
+def test_prefill_router_tournament_ordinal_bit_exact(normalizing):
+    """Tournament ordinal (2 variants, active64 phase-2) vs the fallback:
+    bit-exact indices and scores (the per-row original-score table feeds the
+    same winner sigmoids as the raw sigmoid recompute)."""
+    rows = 3
+    mx.random.seed(57)
+    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    idx, cc = laguna_nvfp4.prefill_router_tournament_ordinal(
+        logits, cb, normalizing)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        idxf, ccf = laguna_nvfp4.prefill_router_tournament_ordinal(
+            logits, cb, normalizing)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(idx == idxf))
+    assert bool(mx.all(cc == ccf))
+
+
+
 @pytestmark_real
 def test_lm_head_prune_real_model():
     """The int5 prune pipeline on the REAL lm_head: the assembled argmax
