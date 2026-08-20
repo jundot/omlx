@@ -521,6 +521,83 @@ std::pair<array, array> sliding_qk_norm_rope(
     return {outs[0], outs[1]};
 }
 
+// DecodeQkvR1Primitive: fused Q/K/V NVFP4 projection for one token.
+//   inputs[0] = normalized [2048] bf16
+//   inputs[1] = weight_codes [rows][1024] uint8
+//   inputs[2] = weight_scales [rows][128] uint8
+//   output[0] = projected [rows] bf16
+class DecodeQkvR1Primitive : public Primitive {
+ public:
+    DecodeQkvR1Primitive(Stream s, int heads)
+        : Primitive(s), heads_(heads) {}
+
+ private:
+    int heads_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 DecodeQkvR1Primitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        std::string kname = "laguna_decode_nvfp4_qkv_h"
+            + std::to_string(heads_) + "_r1_v1_se1_sd1";
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        int rows = (heads_ + 2 * 8) * 128;
+        MTL::Size group_dims(64, 1, 1);
+        MTL::Size grid_dims(rows / 2, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(DecodeQkvR1Primitive)
+};
+
+array decode_nvfp4_qkv_r1(
+    const array& normalized,
+    const array& weight_codes,
+    const array& weight_scales,
+    int heads,
+    StreamOrDevice s) {
+    int rows = (heads + 2 * 8) * 128;
+    if (normalized.ndim() != 1 || normalized.dtype() != bfloat16 ||
+        normalized.shape(0) != 2048 ||
+        weight_codes.ndim() != 2 || weight_codes.dtype() != uint8 ||
+        weight_codes.shape(0) != rows ||
+        weight_codes.shape(1) != 1024 ||
+        weight_scales.ndim() != 2 || weight_scales.dtype() != uint8 ||
+        weight_scales.shape(0) != rows || weight_scales.shape(1) != 128) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 decode_nvfp4_qkv_r1: shape mismatch — "
+               "normalized " << normalized.shape() << ", weight_codes "
+            << weight_codes.shape() << ", weight_scales "
+            << weight_scales.shape() << ", heads " << heads;
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<DecodeQkvR1Primitive>(s_stream, heads);
+    Shape out_shape{static_cast<ShapeElem>(rows)};
+    return array(out_shape, bfloat16, prim,
+                 {normalized, weight_codes, weight_scales});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

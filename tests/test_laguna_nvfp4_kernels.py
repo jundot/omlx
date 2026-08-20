@@ -286,6 +286,28 @@ def test_sliding_qk_norm_rope_bit_exact():
     assert bool(mx.all(k == kf))
 
 
+@pytest.mark.parametrize("heads", [48, 64])
+def test_decode_qkv_r1_bit_exact(heads):
+    """Fused Q/K/V NVFP4 projection (R1) vs the stock nvfp4 matmul: the
+    kernel's tail header (fold/defer/seed-elide) reproduces the stock
+    decode path byte-for-byte — bit-exact."""
+    rows = (heads + 16) * 128
+    mx.random.seed(11 + heads)
+    x = mx.random.normal((2048,), scale=0.1).astype(mx.bfloat16)
+    wq, ws = mx.quantize(
+        mx.random.normal((rows, 2048), scale=0.02),
+        group_size=16, bits=4, mode="nvfp4")
+    codes = wq.view(mx.uint8).reshape(rows, -1)
+    y = laguna_nvfp4.decode_nvfp4_qkv_r1(x, codes, ws, heads)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        yf = laguna_nvfp4.decode_nvfp4_qkv_r1(x, codes, ws, heads)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(y == yf)), f"heads {heads}: QKV kernel diverges"
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

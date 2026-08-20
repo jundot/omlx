@@ -94,6 +94,19 @@ std::pair<array, array> sliding_qk_norm_rope(
     const array& angles,
     StreamOrDevice s = {});
 
+// Fused Q/K/V NVFP4 projection for one decode token (R1, one row per
+// simdgroup). rows = (heads + 2*nkv_heads)*128.
+//   normalized    [2048] bf16
+//   weight_codes  [rows, 1024] uint8
+//   weight_scales [rows, 128] uint8
+// Returns [rows] bf16.
+array decode_nvfp4_qkv_r1(
+    const array& normalized,
+    const array& weight_codes,
+    const array& weight_scales,
+    int heads,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

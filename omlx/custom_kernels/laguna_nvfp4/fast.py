@@ -337,6 +337,39 @@ def sliding_qk_norm_rope(
         64, 8, 64, mscale=None,
     )
 
+
+def decode_nvfp4_qkv_r1(
+    normalized: mx.array,
+    weight_codes: mx.array,
+    weight_scales: mx.array,
+    heads: int,
+    stream=None,
+) -> mx.array:
+    """Fused Q/K/V NVFP4 projection for one decode token (R1, one row per
+    simdgroup) — verbatim from lagunaDecodeNVFP4QKVR1Source (tail header at
+    the default fold/defer config).
+
+    Parameters
+    ----------
+    normalized    : [2048] bf16        — attention input
+    weight_codes  : [rows, 1024] uint8 — fused Q/K/V plane
+    weight_scales : [rows, 128] uint8  — E4M3 group-16 scales
+    heads         : int                — query head count (48 full / 64 sliding)
+
+    Returns [rows] bf16 (rows = (heads + 16)*128).
+    """
+    if _ext is not None and has_symbol("decode_nvfp4_qkv_r1"):
+        return _ext.decode_nvfp4_qkv_r1(
+            normalized, weight_codes, weight_scales, heads, stream=stream)
+    # Fallback: stock nvfp4 matmul over the fused plane (reinterpret the
+    # kernel's byte plane as the uint32 layout mx expects — same bytes).
+    rows = weight_codes.shape[0]
+    codes = weight_codes.view(mx.uint32).reshape(rows, -1)
+    return mx.quantized_matmul(
+        normalized[None, :], codes, scales=weight_scales,
+        transpose=True, group_size=16, bits=4, mode="nvfp4", stream=stream,
+    ).squeeze(0).astype(mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

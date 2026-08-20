@@ -56,6 +56,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "decode_nvfp4_qkv_r1",
+        &omlx::laguna_nvfp4::decode_nvfp4_qkv_r1,
+        "normalized"_a, "weight_codes"_a, "weight_scales"_a, "heads"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,
