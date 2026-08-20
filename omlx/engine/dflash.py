@@ -397,16 +397,25 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 20 * 1024**3
         )
-        # Prefix-snapshot insert threshold. dflash-mlx skips inserting a snapshot whose prompt is
-        # longer than `max_snapshot_tokens` (default 32_000, dflash_mlx/runtime/config.py), and oMLX
-        # never passed the field, so on this path the default was unreachable. An agent workload
-        # carries a large fixed prefix — system prompt plus tool schemas — and a ~50k-token prompt
-        # therefore never entered the cache at all: every turn re-prefilled the whole thing (measured
-        # 80-93s per turn on an M5 Pro with a 35B MoE). 0 disables the cap; the cache stays bounded by
-        # `prefix_cache_max_bytes` and `prefix_cache_max_entries` either way. Defaults to None so the
-        # dflash-mlx default still applies when the setting is absent.
-        raw_max_snapshot = getattr(model_settings, "dflash_max_snapshot_tokens", None) if model_settings else None
-        self._max_snapshot_tokens = int(raw_max_snapshot) if raw_max_snapshot is not None else None
+        # Prefix-snapshot insert threshold. dflash-mlx skips inserting a
+        # snapshot whose prompt is longer than `max_snapshot_tokens` (default
+        # 32_000, dflash_mlx/runtime/config.py), and oMLX never passed the
+        # field, so on this path the default was unreachable. An agent workload
+        # carries a large fixed prefix — system prompt plus tool schemas — and a
+        # ~50k-token prompt therefore never entered the cache at all: every turn
+        # re-prefilled the whole thing (measured 80-93s per turn on an M5 Pro
+        # with a 35B MoE). 0 disables the cap; the cache stays bounded by
+        # `prefix_cache_max_bytes` and `prefix_cache_max_entries` either way.
+        # Defaults to None so the dflash-mlx default still applies when the
+        # setting is absent.
+        raw_max_snapshot = (
+            getattr(model_settings, "dflash_max_snapshot_tokens", None)
+            if model_settings
+            else None
+        )
+        self._max_snapshot_tokens = (
+            int(raw_max_snapshot) if raw_max_snapshot is not None else None
+        )
         self._draft_window_size = (
             getattr(model_settings, "dflash_draft_window_size", None)
             if model_settings

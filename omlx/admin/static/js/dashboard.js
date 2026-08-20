@@ -52,6 +52,7 @@
         'dflash_in_memory_cache_max_bytes',
         'dflash_ssd_cache',
         'dflash_ssd_cache_max_bytes',
+        'dflash_max_snapshot_tokens',
         'dflash_draft_window_size',
         'dflash_draft_sink_size',
         'dflash_block_size',
@@ -7352,6 +7353,7 @@
                     dflash_ssd_cache_max_gib: s.dflash_ssd_cache_max_bytes
                         ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
                         : 20,
+                    dflash_max_snapshot_tokens: s.dflash_max_snapshot_tokens ?? null,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
                     dflash_block_size: s.dflash_block_size ?? null,
@@ -8212,6 +8214,15 @@
                                 dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
                                     : 20 * (1024 ** 3),
+                                // Prefix-snapshot insert cap. Empty → dflash default (32000);
+                                // 0 → no cap. Zero is a real value here, so it is tested for
+                                // emptiness rather than truthiness — the shape the sliding-window
+                                // fields below use would send 0 as null and restore the default.
+                                dflash_max_snapshot_tokens: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_max_snapshot_tokens !== null
+                                    && this.modelSettings.dflash_max_snapshot_tokens !== ''
+                                    ? parseInt(this.modelSettings.dflash_max_snapshot_tokens)
+                                    : null,
                                 // Long-context tuning. Empty → oMLX default.
                                 dflash_draft_window_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_draft_window_size
@@ -8283,6 +8294,7 @@
                                     dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
                                     dflash_ssd_cache: false,
                                     dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
+                                    dflash_max_snapshot_tokens: null,
                                     dflash_draft_window_size: null,
                                     dflash_draft_sink_size: null,
                                     dflash_block_size: null,
@@ -8380,6 +8392,7 @@
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
+                        this.modelSettings.dflash_max_snapshot_tokens = null;
                         this.modelSettings.dflash_draft_window_size = null;
                         this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
