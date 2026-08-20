@@ -1488,6 +1488,99 @@ array lm_head_prune(
     return array(av, bfloat16, inline_prim, {coarse, delta, thr, lm_head, x});
 }
 
+// DenseGateUpSwiGLUPrimitive: bf16 dense gate/up fused + SwiGLU.
+class DenseGateUpSwiGLUPrimitive : public Primitive {
+ public:
+    explicit DenseGateUpSwiGLUPrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 DenseGateUpSwiGLUPrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_dense_gate_up_swiglu_bf16_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        enc.set_output_array(out, c++);
+        MTL::Size group_dims(64, 1, 1);       // 2 simdgroups
+        MTL::Size grid_dims(8192 / 64, 1, 1); // 128 groups
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(DenseGateUpSwiGLUPrimitive)
+};
+
+array dense_gate_up_swiglu(
+    const array& input,
+    const array& fused_weight,
+    StreamOrDevice s) {
+    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
+        input.shape(0) != 2048 ||
+        fused_weight.ndim() != 2 || fused_weight.dtype() != bfloat16 ||
+        fused_weight.shape(0) != 2 * 8192 || fused_weight.shape(1) != 2048) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 dense_gate_up_swiglu: shape mismatch — input "
+            << input.shape() << ", fused_weight " << fused_weight.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<DenseGateUpSwiGLUPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(8192)};
+    return array(out_shape, bfloat16, prim, {input, fused_weight});
+}
+
+// DenseDownResidualPrimitive: bf16 dense down + residual.
+class DenseDownResidualPrimitive : public Primitive {
+ public:
+    explicit DenseDownResidualPrimitive(Stream s) : Primitive(s) {}
+ private:
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("laguna_nvfp4 DenseDownResidualPrimitive has no CPU path.");
+    }
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        auto kernel = get_laguna_kernel(d, "laguna_dense_down_residual_bf16_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) enc.set_input_array(in, c++);
+        enc.set_output_array(out, c++);
+        MTL::Size group_dims(64, 1, 1);
+        MTL::Size grid_dims(2048 / 16, 1, 1); // 128 groups, 16 rows each
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+    DEFINE_NAME(DenseDownResidualPrimitive)
+};
+
+array dense_down_residual(
+    const array& activated,
+    const array& down_weight,
+    const array& residual,
+    StreamOrDevice s) {
+    if (activated.ndim() != 1 || activated.dtype() != bfloat16 ||
+        activated.shape(0) != 8192 ||
+        down_weight.ndim() != 2 || down_weight.dtype() != bfloat16 ||
+        down_weight.shape(0) != 2048 || down_weight.shape(1) != 8192 ||
+        residual.ndim() != 1 || residual.dtype() != bfloat16 ||
+        residual.shape(0) != 2048) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 dense_down_residual: shape mismatch — activated "
+            << activated.shape() << ", down_weight " << down_weight.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<DenseDownResidualPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(2048)};
+    return array(out_shape, bfloat16, prim, {activated, down_weight, residual});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

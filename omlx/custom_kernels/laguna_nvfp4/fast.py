@@ -664,6 +664,34 @@ def lm_head_prune(
     return (lm_head.astype(mx.float32) @ x.astype(mx.float32)).astype(
         mx.bfloat16)
 
+
+def dense_gate_up_swiglu(
+    input_x: mx.array, fused_weight: mx.array, stream=None,
+) -> mx.array:
+    """Dense bf16 gate/up fused + SwiGLU (verbatim from
+    lagunaDenseGateUpSwiGLUKernel). Returns [8192] bf16."""
+    if _ext is not None and has_symbol("dense_gate_up_swiglu"):
+        return _ext.dense_gate_up_swiglu(input_x, fused_weight, stream=stream)
+    gate = (input_x @ fused_weight[:8192].T).astype(mx.bfloat16)
+    up = (input_x @ fused_weight[8192:].T).astype(mx.bfloat16)
+    g32 = gate.astype(mx.float32)
+    u32 = up.astype(mx.float32)
+    sig = mx.sigmoid(g32)
+    return (g32 * sig * u32).astype(mx.bfloat16)
+
+
+def dense_down_residual(
+    activated: mx.array, down_weight: mx.array, residual: mx.array,
+    stream=None,
+) -> mx.array:
+    """Dense bf16 down_proj + residual (verbatim from
+    lagunaDenseDownResidualKernel). Returns [2048] bf16."""
+    if _ext is not None and has_symbol("dense_down_residual"):
+        return _ext.dense_down_residual(
+            activated, down_weight, residual, stream=stream)
+    down = (activated @ down_weight.T).astype(mx.bfloat16)
+    return (residual + down).astype(mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

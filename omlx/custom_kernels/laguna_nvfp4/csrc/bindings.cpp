@@ -134,6 +134,18 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "dense_gate_up_swiglu",
+        &omlx::laguna_nvfp4::dense_gate_up_swiglu,
+        "input"_a, "fused_weight"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "dense_down_residual",
+        &omlx::laguna_nvfp4::dense_down_residual,
+        "activated"_a, "down_weight"_a, "residual"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,

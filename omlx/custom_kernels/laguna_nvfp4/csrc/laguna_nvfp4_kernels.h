@@ -217,6 +217,19 @@ array lm_head_prune(
     const array& lm_head,
     StreamOrDevice s = {});
 
+// Dense (bf16) fused gate/up + SwiGLU. Returns [8192] bf16.
+array dense_gate_up_swiglu(
+    const array& input,
+    const array& fused_weight,
+    StreamOrDevice s = {});
+
+// Dense (bf16) down_proj + residual, fused. Returns [2048] bf16.
+array dense_down_residual(
+    const array& activated,
+    const array& down_weight,
+    const array& residual,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

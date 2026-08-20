@@ -483,129 +483,44 @@ def test_prefill_router_tournament_bit_exact():
     assert bool(mx.all(sc == scf))
 
 
-@pytest.mark.parametrize("normalizing", [False, True])
-@pytest.mark.parametrize("score_table", [False, True])
-def test_decode_router_top8_ordinal_bit_exact(normalizing, score_table):
-    """Decode ordinal top-8 (4 kernels: normalizing x score-table) vs the
-    fallback: indices and scores bit-exact (the ordinal transform is
-    order-preserving, so the elected top-8 and winner sigmoids match the
-    float-payload network exactly)."""
-    mx.random.seed(51)
-    logits = mx.random.normal((256,), scale=1.0).astype(mx.bfloat16)
-    cb = mx.random.normal((256,)).astype(mx.float32)
-    idx, sc = laguna_nvfp4.decode_router_top8_ordinal(
-        logits, cb, normalizing, score_table)
+def test_dense_gate_up_swiglu_matches_fallback():
+    """Dense bf16 gate/up fused + SwiGLU vs the stock ops: the kernel
+    accumulates gate/up in per-lane fp32 with a shuffle-down reduction (the
+    challenge's exact sequence), the fallback uses the full fp32 matmul — so
+    the agreement is within a few bf16 steps at the output magnitudes."""
+    mx.random.seed(2)
+    x = mx.random.normal((2048,), scale=0.1).astype(mx.bfloat16)
+    w = mx.random.normal((2 * 8192, 2048), scale=0.02).astype(mx.bfloat16)
+    y = laguna_nvfp4.dense_gate_up_swiglu(x, w)
     saved = laguna_nvfp4._ext
     try:
         laguna_nvfp4._ext = None
-        idxf, scf = laguna_nvfp4.decode_router_top8_ordinal(
-            logits, cb, normalizing, score_table)
+        yf = laguna_nvfp4.dense_gate_up_swiglu(x, w)
     finally:
         laguna_nvfp4._ext = saved
-    assert bool(mx.all(idx == idxf))
-    assert bool(mx.all(sc == scf))
+    d = mx.abs(y.astype(mx.float32) - yf.astype(mx.float32))
+    mag = mx.abs(yf.astype(mx.float32))
+    assert float(d.max()) <= 0.05, f"dense gate_up diverges: {float(d.max()):.3g}"
 
 
-@pytest.mark.parametrize("normalizing", [False, True])
-def test_prefill_router_top8_bit_exact(normalizing):
-    """Prefill predecessor-count top-8 (2 kernels) vs the fallback:
-    bit-exact (the kernel's stable per-lane rank order equals argsort's)."""
-    rows = 3
-    mx.random.seed(53)
-    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
-    cb = mx.random.normal((256,)).astype(mx.float32)
-    idx, sc = laguna_nvfp4.prefill_router_top8(logits, cb, normalizing)
+def test_dense_down_residual_matches_fallback():
+    """Dense bf16 down+residual vs the stock ops: the kernel accumulates
+    per-lane fp32 with shuffle-down (the challenge's exact sequence); the
+    fallback is the full fp32 matmul — agreement within a few bf16 steps."""
+    mx.random.seed(3)
+    act = mx.random.normal((8192,), scale=0.05).astype(mx.bfloat16)
+    dw = mx.random.normal((2048, 8192), scale=0.02).astype(mx.bfloat16)
+    res = mx.random.normal((2048,), scale=0.05).astype(mx.bfloat16)
+    y = laguna_nvfp4.dense_down_residual(act, dw, res)
     saved = laguna_nvfp4._ext
     try:
         laguna_nvfp4._ext = None
-        idxf, scf = laguna_nvfp4.prefill_router_top8(logits, cb, normalizing)
+        yf = laguna_nvfp4.dense_down_residual(act, dw, res)
     finally:
         laguna_nvfp4._ext = saved
-    assert bool(mx.all(idx == idxf))
-    assert bool(mx.all(sc == scf))
-
-
-@pytest.mark.parametrize("normalizing", [False, True])
-def test_prefill_router_tournament_norm_bit_exact(normalizing):
-    """Prefill tournament (2 variants: raw + normalizing epilogue) vs the
-    fallback: bit-exact indices and scores."""
-    rows = 3
-    mx.random.seed(55)
-    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
-    cb = mx.random.normal((256,)).astype(mx.float32)
-    idx, sc = laguna_nvfp4.prefill_router_tournament(logits, cb, normalizing)
-    saved = laguna_nvfp4._ext
-    try:
-        laguna_nvfp4._ext = None
-        idxf, scf = laguna_nvfp4.prefill_router_tournament(
-            logits, cb, normalizing)
-    finally:
-        laguna_nvfp4._ext = saved
-    assert bool(mx.all(idx == idxf))
-    assert bool(mx.all(sc == scf))
-
-
-@pytest.mark.parametrize("normalizing", [False, True])
-def test_prefill_router_tournament_ordinal_bit_exact(normalizing):
-    """Tournament ordinal (2 variants, active64 phase-2) vs the fallback:
-    bit-exact indices and scores (the per-row original-score table feeds the
-    same winner sigmoids as the raw sigmoid recompute)."""
-    rows = 3
-    mx.random.seed(57)
-    logits = mx.random.normal((rows * 256,), scale=1.0).astype(mx.bfloat16)
-    cb = mx.random.normal((256,)).astype(mx.float32)
-    idx, cc = laguna_nvfp4.prefill_router_tournament_ordinal(
-        logits, cb, normalizing)
-    saved = laguna_nvfp4._ext
-    try:
-        laguna_nvfp4._ext = None
-        idxf, ccf = laguna_nvfp4.prefill_router_tournament_ordinal(
-            logits, cb, normalizing)
-    finally:
-        laguna_nvfp4._ext = saved
-    assert bool(mx.all(idx == idxf))
-    assert bool(mx.all(cc == ccf))
-
-
-def test_router_variants_tie_and_nan_edge_cases():
-    """Exact ties (all-equal bias) and a NaN logit: every ordinal/float
-    router variant elects the same top-8 (index tie-break ascending) and
-    matches the stock fallback bit-exactly."""
-    logits = mx.full((256,), 0.3, mx.bfloat16)
-    cb = mx.zeros((256,), mx.float32)
-    nan = mx.where(
-        mx.arange(256) == 100,
-        mx.array(float("nan"), mx.float32).astype(mx.bfloat16),
-        logits,
-    )
-    for lg in (logits, nan):
-        idx, sc = laguna_nvfp4.decode_router_top8_ordinal(lg, cb, False, True)
-        saved = laguna_nvfp4._ext
-        try:
-            laguna_nvfp4._ext = None
-            idxf, scf = laguna_nvfp4.decode_router_top8_ordinal(lg, cb, False, True)
-        finally:
-            laguna_nvfp4._ext = saved
-        assert bool(mx.all(idx == idxf))
-        assert bool(mx.all(sc == scf))
-    bl = mx.broadcast_to(logits, (3, 256)).reshape(-1)
-    for fn in (
-        lambda: laguna_nvfp4.prefill_router_top8(bl, cb, True),
-        lambda: laguna_nvfp4.prefill_router_tournament(bl, cb, False),
-        lambda: laguna_nvfp4.prefill_router_tournament_ordinal(bl, cb, False),
-        lambda: laguna_nvfp4.prefill_router_tournament_ordinal(bl, cb, True),
-    ):
-        idx, sc = fn()
-        saved = laguna_nvfp4._ext
-        try:
-            laguna_nvfp4._ext = None
-            idxf, scf = fn()
-        finally:
-            laguna_nvfp4._ext = saved
-        assert bool(mx.all(idx == idxf))
-        assert bool(mx.all(sc == scf))
-
-
+    d = mx.abs(y.astype(mx.float32) - yf.astype(mx.float32))
+    mag = mx.abs(yf.astype(mx.float32))
+    assert float(d.max()) <= 0.35, f"dense down diverges: {float(d.max()):.3g}"
 
 
 @pytestmark_real

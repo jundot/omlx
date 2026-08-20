@@ -1986,6 +1986,141 @@ kernel void laguna_lmhead_exact_inline_mask_block_delta_bf16_lane0_mask_v1(
     }
 }
 
+// Dense down_proj + residual (bf16), fused.
+// (verbatim from lagunaDenseDownResidualKernel)
+//   activated [8192] bf16, down_weight [2048][8192] bf16, residual [2048] bf16
+//   output [2048] bf16 = residual + bf16(down)
+// Grid: 2048/16=128 threadgroups x 64 threads (2 simdgroups).
+kernel void laguna_dense_down_residual_bf16_v1(
+    const device bfloat* activated [[buffer(0)]],
+    const device bfloat* down_weight [[buffer(1)]],
+    const device bfloat* residual [[buffer(2)]],
+    device bfloat* output [[buffer(3)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint in_vec_size = 8192;
+    constexpr uint rows_per_thread = 4;
+    constexpr uint values_per_thread = 4;
+    constexpr uint block_width = 128;
+    constexpr uint blocks = in_vec_size / block_width;
+    constexpr uint rows_per_group = 16;
+
+    uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
+
+    thread float result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float coefficients[values_per_thread];
+
+    uint column = lane * values_per_thread;
+    for (uint block = 0; block < blocks; ++block) {
+        const vec<bfloat, 4> c4 =
+            *((const device vec<bfloat, 4>*)(activated + column));
+        for (uint i = 0; i < values_per_thread; ++i) {
+            coefficients[i] = float(c4[i]);
+        }
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            const device vec<bfloat, 4>* row_values =
+                (const device vec<bfloat, 4>*)(
+                    down_weight + (row_base + row) * in_vec_size + column);
+            const vec<bfloat, 4> w = row_values[0];
+            for (uint i = 0; i < values_per_thread; ++i) {
+                result[row] += float(w[i]) * coefficients[i];
+            }
+        }
+        column += block_width;
+    }
+
+    for (uint row = 0; row < rows_per_thread; ++row) {
+        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+            result[row] += metal::simd_shuffle_down(result[row], delta);
+        }
+    }
+    if (lane == 0) {
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            bfloat down = bfloat(result[row]);
+            output[row_base + row] =
+                bfloat(residual[row_base + row] + down);
+        }
+    }
+}
+
+// ── Dense (bf16) MLP kernels ──────────────────────────────────────────
+
+// Dense gate/up fused + SwiGLU (bf16 fused plane).
+// (verbatim from lagunaDenseGateUpSwiGLUKernel)
+//   input [2048] bf16, fused_weight [2*8192][2048] bf16 (gate then up)
+//   activated [8192] bf16
+// Grid: 8192/64=128 threadgroups x 64 threads (2 simdgroups).
+kernel void laguna_dense_gate_up_swiglu_bf16_v1(
+    const device bfloat* input [[buffer(0)]],
+    const device bfloat* fused_weight [[buffer(1)]],
+    device bfloat* activated [[buffer(2)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint in_vec_size = 2048;
+    constexpr uint output_width = 8192;
+    constexpr uint rows_per_thread = 4;
+    constexpr uint values_per_thread = 4;
+    constexpr uint block_width = 128;
+    constexpr uint blocks = in_vec_size / block_width;
+    constexpr uint rows_per_group = 64;
+
+    uint row_base = tile * rows_per_group + simd_group * rows_per_thread;
+
+    thread float gate_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float up_result[rows_per_thread] = {0.0f, 0.0f, 0.0f, 0.0f};
+    thread float coefficients[values_per_thread];
+
+    uint column = lane * values_per_thread;
+    for (uint block = 0; block < blocks; ++block) {
+        const vec<bfloat, 4> c4 =
+            *((const device vec<bfloat, 4>*)(input + column));
+        for (uint i = 0; i < values_per_thread; ++i) {
+            coefficients[i] = float(c4[i]);
+        }
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            const device vec<bfloat, 4>* gate_row_values =
+                (const device vec<bfloat, 4>*)(
+                    fused_weight + (row_base + row) * in_vec_size + column);
+            const vec<bfloat, 4> gw = gate_row_values[0];
+            const device vec<bfloat, 4>* up_row_values =
+                (const device vec<bfloat, 4>*)(
+                    fused_weight +
+                    (output_width + row_base + row) * in_vec_size + column);
+            const vec<bfloat, 4> uw = up_row_values[0];
+            for (uint i = 0; i < values_per_thread; ++i) {
+                gate_result[row] += float(gw[i]) * coefficients[i];
+                up_result[row] += float(uw[i]) * coefficients[i];
+            }
+        }
+        column += block_width;
+    }
+
+    for (uint row = 0; row < rows_per_thread; ++row) {
+        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+            gate_result[row] +=
+                metal::simd_shuffle_down(gate_result[row], delta);
+            up_result[row] +=
+                metal::simd_shuffle_down(up_result[row], delta);
+        }
+    }
+    if (lane == 0) {
+        for (uint row = 0; row < rows_per_thread; ++row) {
+            bfloat gate = bfloat(gate_result[row]);
+            bfloat up = bfloat(up_result[row]);
+            bfloat exp_abs = metal::exp(metal::abs(gate));
+            bfloat denominator = bfloat(1) + exp_abs;
+            bfloat y = bfloat(1) / denominator;
+            bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
+            bfloat silu = bfloat(gate * sigmoid);
+            activated[row_base + row] = bfloat(silu * up);
+        }
+    }
+}
+
 // ── LM-head int5 prune family (LagunaLmHeadPrune.swift) ──────────────
 
 static inline float laguna_e8m0_decode(uint8_t b) {
