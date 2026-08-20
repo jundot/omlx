@@ -128,6 +128,13 @@ std::pair<array, array> residual_rms(
     const array& weight,
     StreamOrDevice s = {});
 
+// Decode router top-8 bitonic tournament. Returns {indices, scores} [8].
+std::pair<array, array> decode_router_top8(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

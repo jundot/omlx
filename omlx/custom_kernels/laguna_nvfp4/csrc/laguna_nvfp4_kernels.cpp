@@ -744,6 +744,75 @@ std::pair<array, array> residual_rms(
     return {outs[0], outs[1]};
 }
 
+// DecodeRouterTop8Primitive: 256-lane bitonic top-8 router (2 outputs).
+class DecodeRouterTop8Primitive : public Primitive {
+ public:
+    DecodeRouterTop8Primitive(Stream s, bool normalizing)
+        : Primitive(s), normalizing_(normalizing) {}
+
+ private:
+    bool normalizing_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 DecodeRouterTop8Primitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        const char* kname = normalizing_
+            ? "laguna_decode_router_top8_norm_v2"
+            : "laguna_decode_router_top8_v3";
+        auto kernel = get_laguna_kernel(d, kname);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(1, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(DecodeRouterTop8Primitive)
+};
+
+std::pair<array, array> decode_router_top8(
+    const array& logits,
+    const array& correction_bias,
+    bool normalizing,
+    StreamOrDevice s) {
+    if (logits.ndim() != 1 || logits.shape(0) != 256 ||
+        correction_bias.ndim() != 1 || correction_bias.shape(0) != 256 ||
+        correction_bias.dtype() != float32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 decode_router_top8: shape mismatch — logits "
+            << logits.shape() << ", correction_bias "
+            << correction_bias.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<DecodeRouterTop8Primitive>(s_stream, normalizing);
+    Shape idx_shape{static_cast<ShapeElem>(8)};
+    Shape score_shape{static_cast<ShapeElem>(8)};
+    auto outs = array::make_arrays(
+        {idx_shape, score_shape}, {uint32, bfloat16}, prim,
+        {logits, correction_bias});
+    return {outs[0], outs[1]};
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

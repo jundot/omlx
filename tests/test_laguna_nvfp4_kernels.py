@@ -348,6 +348,25 @@ def test_residual_rms_bit_exact():
     assert bool(mx.all(n == nf))
 
 
+@pytest.mark.parametrize("normalizing", [False, True])
+def test_decode_router_top8_bit_exact(normalizing):
+    """Decode router top-8 bitonic tournament vs the fallback: indices and
+    (sigmoid) scores match exactly (the correction bias orders the sort key
+    only)."""
+    mx.random.seed(19)
+    logits = mx.random.normal((256,), scale=1.0).astype(mx.bfloat16)
+    cb = mx.random.normal((256,)).astype(mx.float32)
+    idx, sc = laguna_nvfp4.decode_router_top8(logits, cb, normalizing)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        idxf, scf = laguna_nvfp4.decode_router_top8(logits, cb, normalizing)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(idx == idxf))
+    assert bool(mx.all(sc == scf))
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

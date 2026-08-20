@@ -422,6 +422,31 @@ def residual_rms(
     normalized = mx.fast.rms_norm(summed, weight, 1e-6)
     return summed, normalized
 
+
+def decode_router_top8(
+    logits: mx.array,
+    correction_bias: mx.array,
+    normalizing: bool = False,
+    stream=None,
+):
+    """Decode router top-8 (256-lane bitonic tournament; verbatim from
+    lagunaDecodeRouterTop8KernelSource). Returns (indices, scores) [8].
+    """
+    if _ext is not None and has_symbol("decode_router_top8"):
+        return _ext.decode_router_top8(
+            logits, correction_bias, normalizing, stream=stream)
+    # Fallback: sigmoid scores; the correction bias orders the sort key only
+    # (the kernel emits the raw sigmoid as the score, as per the challenge).
+    x = logits.astype(mx.float32)
+    y = 1.0 / (1.0 + mx.exp(mx.abs(x)))
+    score = mx.where(x < 0, y, 1.0 - y)
+    key = score + correction_bias.astype(mx.float32)
+    ids = mx.argsort(-key, axis=0)[:8].astype(mx.uint32)
+    vals = mx.take(score, ids)
+    if normalizing:
+        vals = vals / mx.maximum(mx.sum(vals), 1e-6)
+    return ids, vals.astype(mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

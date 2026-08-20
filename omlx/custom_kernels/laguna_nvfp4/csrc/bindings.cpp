@@ -75,6 +75,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "decode_router_top8",
+        &omlx::laguna_nvfp4::decode_router_top8,
+        "logits"_a, "correction_bias"_a, "normalizing"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,
