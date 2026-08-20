@@ -151,4 +151,53 @@ NB_MODULE(_ext, m) {
         "activated"_a, "down_weight"_a, "down_scales"_a,
         "routed"_a, "residual"_a,
         "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_swiglu_qmv_rows1",
+        &omlx::laguna_nvfp4::shared_nvfp4_swiglu_qmv_rows1,
+        "x"_a, "w"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_swiglu_qmv_rows1_halved",
+        &omlx::laguna_nvfp4::shared_nvfp4_swiglu_qmv_rows1_halved,
+        "x"_a, "w"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_swiglu_qmv_rows1_halved_wide",
+        &omlx::laguna_nvfp4::shared_nvfp4_swiglu_qmv_rows1_halved_wide,
+        "x"_a, "w"_a, "scales"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "shared_nvfp4_down_residual_halved",
+        &omlx::laguna_nvfp4::shared_nvfp4_down_residual_halved,
+        "activated"_a, "down_weight"_a, "down_scales"_a,
+        "routed"_a, "residual"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_rows1",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_rows1,
+        "input"_a, "fused_weight"_a, "fused_scales"_a, "indices"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_packed",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_packed,
+        "input"_a, "fused_weight"_a, "packed_scales"_a, "indices"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_packed_top8keys",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_packed_top8keys,
+        "input"_a, "fused_weight"_a, "packed_scales"_a, "router_keys"_a,
+        "stream"_a = nb::none());
+
+    m.def(
+        "routed_nvfp4_swiglu_qmv_packed_top8keys_r1",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv_packed_top8keys_r1,
+        "input"_a, "fused_weight"_a, "packed_scales"_a, "router_keys"_a,
+        "stream"_a = nb::none());
 }

@@ -725,3 +725,223 @@ def shared_nvfp4_down_residual(
         stream=stream,
     ).squeeze(0)  # [N]
     return (residual + (routed + shared)).astype(mx.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Launch-schedule / scale-layout variants (rows1, halved, packed, top-8)
+# ---------------------------------------------------------------------------
+
+def _depack_shared_halved_fused(plane: mx.array) -> mx.array:
+    """Inverse of halved_group32_scale_plane for the shared fused gate/up
+    plane (allowed flat pairs [0, 32768]): [128 + 1024*64] uint8 → the stock
+    [1024, 128] group-16 plane by repeating the even bytes and patching the
+    two header-preserved odd bytes (gate row 0 and up row 0 pair 0)."""
+    header = plane[:128].astype(mx.uint8)
+    halved = plane[128:].reshape(1024, 64)
+    full = mx.repeat(halved, 2, axis=-1)  # [1024, 128]
+    flat = full.reshape(-1)
+    flat = mx.where(mx.arange(flat.size) == 1, header[0], flat)
+    flat = mx.where(mx.arange(flat.size) == 512 * 128 + 1, header[1], flat)
+    return flat.reshape(1024, 128)
+
+
+def shared_nvfp4_swiglu_qmv_rows1(
+    x: mx.array, w: mx.array, scales: mx.array, stream=None,
+) -> mx.array:
+    """R1 scheduling twin of shared_nvfp4_swiglu_qmv (one output row per
+    simdgroup; 256 tiles). Same layouts, same fallback."""
+    if _ext is not None and has_symbol("shared_nvfp4_swiglu_qmv_rows1"):
+        return _ext.shared_nvfp4_swiglu_qmv_rows1(x, w, scales, stream=stream)
+    return shared_nvfp4_swiglu_qmv(x, w, scales, stream=stream)
+
+
+def shared_nvfp4_swiglu_qmv_rows1_halved(
+    x: mx.array, w: mx.array, scales: mx.array, stream=None,
+) -> mx.array:
+    """Halved group-32 twin of shared_nvfp4_swiglu_qmv_rows1 (scales are the
+    1-D [128 + 1024*64] halved plane)."""
+    if _ext is not None and has_symbol("shared_nvfp4_swiglu_qmv_rows1_halved"):
+        return _ext.shared_nvfp4_swiglu_qmv_rows1_halved(
+            x, w, scales, stream=stream)
+    full = _depack_shared_halved_fused(scales)
+    return shared_nvfp4_swiglu_qmv(x, w, full, stream=stream)
+
+
+def shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+    x: mx.array, w: mx.array, scales: mx.array, stream=None,
+) -> mx.array:
+    """Wide-codes twin (two groups per lane) over the same halved plane."""
+    if _ext is not None and has_symbol("shared_nvfp4_swiglu_qmv_rows1_halved_wide"):
+        return _ext.shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+            x, w, scales, stream=stream)
+    full = _depack_shared_halved_fused(scales)
+    return shared_nvfp4_swiglu_qmv(x, w, full, stream=stream)
+
+
+def _depack_shared_halved_down(plane: mx.array) -> mx.array:
+    """[128 + 2048*16] halved group-32 shared down plane -> [2048, 32] stock
+    group-16 scales (flat pair 0 patched from the header)."""
+    header = plane[:128].astype(mx.uint8)
+    halved = plane[128:].reshape(2048, 16)
+    full = mx.repeat(halved, 2, axis=-1)  # [2048, 32]
+    flat = full.reshape(-1)
+    flat = mx.where(mx.arange(flat.size) == 1, header[0], flat)
+    return flat.reshape(2048, 32)
+
+
+def shared_nvfp4_down_residual_halved(
+    activated, down_weight, down_scales, routed, residual, stream=None,
+):
+    """Shared-expert down_proj + routed/residual adds over the halved
+    group-32 down scale plane (128-byte header + [2048*16] bytes)."""
+    if _ext is not None and has_symbol("shared_nvfp4_down_residual_halved"):
+        return _ext.shared_nvfp4_down_residual_halved(
+            activated, down_weight, down_scales, routed, residual,
+            stream=stream,
+        )
+    full = _depack_shared_halved_down(down_scales)
+    return shared_nvfp4_down_residual(
+        activated, down_weight, full, routed, residual, stream=stream)
+
+
+def routed_nvfp4_swiglu_qmv_rows1(
+    input_x, fused_weight, fused_scales, indices, stream=None,
+):
+    """R1 scheduling twin of routed_nvfp4_swiglu_qmv (one output row per
+    simdgroup, 256 tiles per expert). Same layouts, same fallback."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_rows1"):
+        return _ext.routed_nvfp4_swiglu_qmv_rows1(
+            input_x, fused_weight, fused_scales, indices, stream=stream)
+    return routed_nvfp4_swiglu_qmv(
+        input_x, fused_weight, fused_scales, indices, stream=stream)
+
+
+def _packed_routed_gateup_order():
+    """Walk-order row-block gather index of preparePackedRoutedGateUpBank:
+    packed position p = tile*32 + kblock*4 + sub reads the fused plane's
+    row-block (fusedRow*4 + kblock); fusedRow = gate/up pair-interleaved
+    mapping of logical_row = tile*4 + sub//2."""
+    rows = 1024
+    order = []
+    for tile in range(rows // 8):
+        for kb in range(4):
+            for sub in range(8):
+                logical = tile * 4 + sub // 2
+                gate_row = (logical // 32) * 64 + logical % 32
+                fused_row = gate_row if sub % 2 == 0 else gate_row + 32
+                order.append(fused_row * 4 + kb)
+    return mx.array(order, mx.int32)
+
+
+def packed_routed_gateup_scales(
+    fused_scales: mx.array,
+) -> mx.array:
+    """Build the packed routed gate/up scale bank (challenge
+    preparePackedRoutedGateUpBank): [E, 1024, 128] uint8 -> the 1-D
+    [128 + E*65536] halved walk-order bank, or None when the group-32
+    halving certificate fails (only flat pairs 0 and 16 may differ)."""
+    E, rows, _ = fused_scales.shape
+    row_blocks = fused_scales.reshape(E, rows * 4, 32)
+    packed = mx.take(row_blocks, _packed_routed_gateup_order(), axis=1)
+    return halved_group32_scale_plane(packed, [0, 16])
+
+
+def _depack_routed_gateup_scales(packed: mx.array) -> mx.array:
+    """Inverse of packed_routed_gateup_scales: the 1-D packed halved bank ->
+    the stock [E, 1024, 128] group-16 uint8 plane (even bytes repeated, the
+    two header odd bytes patched back into packed flat bytes 1 and 33)."""
+    header = packed[:128].astype(mx.uint8)
+    E = (packed.size - 128) // 65536
+    body = packed[128:].reshape(E, 4096, 16)
+    blocks = mx.repeat(body, 2, axis=-1)  # [E, 4096, 32]
+    flat = blocks.reshape(-1)  # expert e occupies [e*131072, (e+1)*131072)
+    ar = mx.arange(flat.size)
+    flat = mx.where(ar == 1, header[0], flat)
+    flat = mx.where(ar == 33, header[1], flat)
+    blocks = flat.reshape(E, 4096, 32)
+    order = _packed_routed_gateup_order()
+    inv = mx.argsort(order)  # inverse permutation
+    orig = mx.take(blocks, inv, axis=1)
+    return orig.reshape(E, 1024, 128)
+
+
+def _routed_packed_fallback(
+    input_x, fused_weight, packed_scales, experts, stream=None,
+):
+    """Shared per-slot fallback for the packed routed gate/up QMV variants:
+    de-pack the scale bank to the stock [E, 1024, 128] plane, un-interleave
+    the fused code plane, and run the stock nvfp4 matmul + swiglu per slot."""
+    N = fused_weight.shape[1] // 2
+    full_scales = _depack_routed_gateup_scales(packed_scales)
+    fw = fused_weight.reshape(
+        fused_weight.shape[0], N // 32, 2, 32, fused_weight.shape[-1])
+    fs = full_scales.reshape(
+        full_scales.shape[0], N // 32, 2, 32, full_scales.shape[-1])
+    gate_w = mx.concatenate([fw[:, p, 0] for p in range(N // 32)], axis=1)
+    up_w = mx.concatenate([fw[:, p, 1] for p in range(N // 32)], axis=1)
+    gate_s = mx.concatenate([fs[:, p, 0] for p in range(N // 32)], axis=1)
+    up_s = mx.concatenate([fs[:, p, 1] for p in range(N // 32)], axis=1)
+    outs = []
+    for e in experts:
+        e = int(e)
+        g = mx.quantized_matmul(
+            input_x[None, :], gate_w[e], scales=gate_s[e], transpose=True,
+            group_size=16, bits=4, mode="nvfp4", stream=stream)
+        u = mx.quantized_matmul(
+            input_x[None, :], up_w[e], scales=up_s[e], transpose=True,
+            group_size=16, bits=4, mode="nvfp4", stream=stream)
+        outs.append(_swiglu(g, u)[0])
+    return mx.concatenate(outs)
+
+
+def routed_nvfp4_swiglu_qmv_packed(
+    input_x, fused_weight, packed_scales, indices, stream=None,
+):
+    """Routed fused gate/up QMV over the packed walk-order scale bank
+    (per-expert [tile 128][kblock 4][sub 8][16 B] behind the 128-byte
+    header)."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_packed"):
+        return _ext.routed_nvfp4_swiglu_qmv_packed(
+            input_x, fused_weight, packed_scales, indices, stream=stream)
+    return _routed_packed_fallback(
+        input_x, fused_weight, packed_scales,
+        [int(indices[s]) for s in range(indices.size)], stream=stream)
+
+
+def _top8_slots_from_keys(router_keys):
+    """Per-slot top-8 experts of the ordinal router keys: slot r owns the
+    (r+1)-th smallest (ordinal, index) — the exact order of the kernel's
+    per-slot extraction rounds."""
+    keys = router_keys.astype(mx.int64)
+    comb = (keys << 32) | mx.arange(256, dtype=mx.int64)
+    return mx.argsort(comb)[:8].astype(mx.uint32)
+
+
+def routed_nvfp4_swiglu_qmv_packed_top8keys(
+    input_x, fused_weight, packed_scales, router_keys, stream=None,
+):
+    """Packed routed QMV with the simd-shuffle top-8 ordinal expert
+    selection: router_keys [256] uint32 ordinal keys, slot r picks the
+    (r+1)-th smallest key (expert slot output placement, winner is the
+    route)."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_packed_top8keys"):
+        return _ext.routed_nvfp4_swiglu_qmv_packed_top8keys(
+            input_x, fused_weight, packed_scales, router_keys, stream=stream)
+    experts = _top8_slots_from_keys(router_keys)
+    return _routed_packed_fallback(
+        input_x, fused_weight, packed_scales,
+        [int(e) for e in experts], stream=stream)
+
+
+def routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+    input_x, fused_weight, packed_scales, router_keys, stream=None,
+):
+    """R1 scheduling twin of routed_nvfp4_swiglu_qmv_packed_top8keys (one
+    output row per simdgroup, twice the threadgroups)."""
+    if _ext is not None and has_symbol("routed_nvfp4_swiglu_qmv_packed_top8keys_r1"):
+        return _ext.routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+            input_x, fused_weight, packed_scales, router_keys, stream=stream)
+    experts = _top8_slots_from_keys(router_keys)
+    return _routed_packed_fallback(
+        input_x, fused_weight, packed_scales,
+        [int(e) for e in experts], stream=stream)

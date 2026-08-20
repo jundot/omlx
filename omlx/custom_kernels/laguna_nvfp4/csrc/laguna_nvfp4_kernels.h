@@ -233,4 +233,85 @@ array dense_down_residual(
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 
+// R1 scheduling twin of shared_nvfp4_swiglu_qmv (one output row per
+// simdgroup). Scalar layout matches the base kernel; halved variants take
+// the 1-D group-32 halved scale plane (128-byte patch header + even bytes).
+//   x      [K]        bf16 activations (K = 2048)
+//   w      [2N, K/2]  uint8 fused gate/up NVFP4 codes (N = 512)
+//   scales [2N, K/16] uint8 E4M3 group scales
+// Returns [N] bf16 silu(gate) * up.
+array shared_nvfp4_swiglu_qmv_rows1(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Halved group-32 twin of shared_nvfp4_swiglu_qmv_rows1.
+//   scales [128 + 2N*(K/32)] uint8 halved group-32 plane
+// Returns [N] bf16.
+array shared_nvfp4_swiglu_qmv_rows1_halved(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Wide-codes twin (two groups per lane over the same halved plane).
+array shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s = {});
+
+// Shared-expert down_proj + routed + residual adds over the halved
+// group-32 scale plane.
+//   down_scales [128 + N*(K2/32)] uint8 halved group-32 down plane
+// Returns [N] bf16 residual + (routed + shared).
+array shared_nvfp4_down_residual_halved(
+    const array& activated,
+    const array& down_weight,
+    const array& down_scales,
+    const array& routed,
+    const array& residual,
+    StreamOrDevice s = {});
+
+// R1 scheduling twin of routed_nvfp4_swiglu_qmv (one output row per
+// simdgroup). Same layouts as the base kernel.
+array routed_nvfp4_swiglu_qmv_rows1(
+    const array& input,
+    const array& fused_weight,
+    const array& fused_scales,
+    const array& indices,
+    StreamOrDevice s = {});
+
+// Routed fused gate/up QMV over the packed walk-order scale bank built by
+// the challenge's preparePackedRoutedGateUpBank.
+//   packed_scales [128 + E*65536] uint8 packed halved group-32 bank
+// Returns [R*N] bf16 per-slot silu(gate) * up.
+array routed_nvfp4_swiglu_qmv_packed(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& indices,
+    StreamOrDevice s = {});
+
+// Packed routed QMV with the per-slot top-8 ordinal extraction over
+// router_keys (instead of an indices buffer) as the expert selector.
+//   router_keys [256] uint32 per-expert ordinal keys
+// Returns [8*N] bf16.
+array routed_nvfp4_swiglu_qmv_packed_top8keys(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& router_keys,
+    StreamOrDevice s = {});
+
+// R1 scheduling twin of routed_nvfp4_swiglu_qmv_packed_top8keys (one
+// output row per simdgroup, twice the threadgroups).
+array routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& router_keys,
+    StreamOrDevice s = {});
+
 }  // namespace omlx::laguna_nvfp4

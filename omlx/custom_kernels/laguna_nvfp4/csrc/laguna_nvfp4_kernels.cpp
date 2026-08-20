@@ -1585,4 +1585,368 @@ int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }
 
+// ---------------------------------------------------------------------------
+// Launch-schedule / scale-layout variants (rows1, halved, packed, top-8)
+// ---------------------------------------------------------------------------
+
+// NamedKernelPrimitive: single-output Metal dispatch with the kernel name and
+// grid geometry fixed per variant. Inputs bind in order, then the output.
+class NamedKernelPrimitive : public Primitive {
+ public:
+    NamedKernelPrimitive(Stream s, std::string kernel, int groups, int threads)
+        : Primitive(s),
+          kernel_(std::move(kernel)),
+          groups_(groups),
+          threads_(threads) {}
+
+ private:
+    std::string kernel_;
+    int groups_;
+    int threads_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 NamedKernelPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        auto kernel = get_laguna_kernel(d, kernel_);
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        MTL::Size group_dims(threads_, 1, 1);
+        MTL::Size grid_dims(groups_, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+};
+
+class SharedSwiGLUQmvRows1Primitive : public NamedKernelPrimitive {
+ public:
+    explicit SharedSwiGLUQmvRows1Primitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_shared_nvfp4_swiglu_qmv_rows1_bf16_v1", 256, 64) {}
+    DEFINE_NAME(SharedSwiGLUQmvRows1Primitive)
+};
+
+class SharedSwiGLUQmvRows1HalvedPrimitive : public NamedKernelPrimitive {
+ public:
+    explicit SharedSwiGLUQmvRows1HalvedPrimitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_bf16_v1",
+              256, 64) {}
+    DEFINE_NAME(SharedSwiGLUQmvRows1HalvedPrimitive)
+};
+
+class SharedSwiGLUQmvRows1WidePrimitive : public NamedKernelPrimitive {
+ public:
+    explicit SharedSwiGLUQmvRows1WidePrimitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_shared_nvfp4_swiglu_qmv_rows1_halved_wide_bf16_v1",
+              256, 64) {}
+    DEFINE_NAME(SharedSwiGLUQmvRows1WidePrimitive)
+};
+
+class SharedDownResidualHalvedPrimitive : public NamedKernelPrimitive {
+ public:
+    explicit SharedDownResidualHalvedPrimitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_shared_nvfp4_down_residual_halved_bf16_v1",
+              256, 64) {}
+    DEFINE_NAME(SharedDownResidualHalvedPrimitive)
+};
+
+class RoutedSwiGLUQmvRows1Primitive : public NamedKernelPrimitive {
+ public:
+    explicit RoutedSwiGLUQmvRows1Primitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_routed_nvfp4_swiglu_qmv_rows1_bf16_v1", 2048, 64) {}
+    DEFINE_NAME(RoutedSwiGLUQmvRows1Primitive)
+};
+
+class RoutedSwiGLUQMVPackedPrimitive : public NamedKernelPrimitive {
+ public:
+    explicit RoutedSwiGLUQMVPackedPrimitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_routed_nvfp4_swiglu_qmv_packed_bf16_v1", 1024, 64) {}
+    DEFINE_NAME(RoutedSwiGLUQMVPackedPrimitive)
+};
+
+class RoutedSwiGLUQMVPackedTop8Primitive : public NamedKernelPrimitive {
+ public:
+    explicit RoutedSwiGLUQMVPackedTop8Primitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_bf16_v1",
+              1024, 64) {}
+    DEFINE_NAME(RoutedSwiGLUQMVPackedTop8Primitive)
+};
+
+class RoutedSwiGLUQMVPackedTop8R1Primitive : public NamedKernelPrimitive {
+ public:
+    explicit RoutedSwiGLUQMVPackedTop8R1Primitive(Stream s)
+        : NamedKernelPrimitive(
+              s, "laguna_routed_nvfp4_swiglu_qmv_packed_top8keys_r1_bf16_v2",
+              2048, 64) {}
+    DEFINE_NAME(RoutedSwiGLUQMVPackedTop8R1Primitive)
+};
+
+// Shared validation shared by the rows1 QMV variants (same contract as
+// shared_nvfp4_swiglu_qmv): x [K] bf16, w [2N, K/2 bytes] uint8/uint32,
+// scales [2N, K/16] uint8 or the 1-D halved plane.
+static void validate_shared_qmv(
+    const array& x, const array& w, const array& scales) {
+    int64_t K = x.shape(0);
+    int64_t N = w.shape(0) / 2;
+    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
+    int64_t row_bytes = w.shape(1) * dtype_bytes;
+    if (x.ndim() != 1 || x.dtype() != bfloat16 ||
+        w.ndim() != 2 ||
+        w.shape(0) != 2 * N || row_bytes * 2 != K) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared rows1 qmv: shape mismatch — "
+               "x " << x.shape() << ", w " << w.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    if (scales.ndim() != 2 || scales.shape(0) != 2 * N ||
+        scales.shape(1) * 16 != K) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared rows1 qmv: scale shape mismatch — "
+               "scales " << scales.shape();
+        throw std::invalid_argument(msg.str());
+    }
+}
+
+array shared_nvfp4_swiglu_qmv_rows1(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s) {
+    validate_shared_qmv(x, w, scales);
+    int64_t N = w.shape(0) / 2;
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<SharedSwiGLUQmvRows1Primitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(out_shape, bfloat16, prim, {x, w, scales});
+}
+
+array shared_nvfp4_swiglu_qmv_rows1_halved(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s) {
+    int64_t K = x.shape(0);
+    int64_t N = w.shape(0) / 2;
+    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
+    int64_t row_bytes = w.shape(1) * dtype_bytes;
+    if (x.ndim() != 1 || x.dtype() != bfloat16 ||
+        w.ndim() != 2 || w.shape(0) != 2 * N || row_bytes * 2 != K ||
+        scales.ndim() != 1 || scales.dtype() != uint8 ||
+        scales.shape(0) != 128 + 2 * N * (K / 32)) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared_nvfp4_swiglu_qmv_rows1_halved: shape "
+               "mismatch — x " << x.shape() << ", w " << w.shape()
+            << ", scales " << scales.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim =
+        std::make_shared<SharedSwiGLUQmvRows1HalvedPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(out_shape, bfloat16, prim, {x, w, scales});
+}
+
+array shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    StreamOrDevice s) {
+    int64_t K = x.shape(0);
+    int64_t N = w.shape(0) / 2;
+    int64_t dtype_bytes = (w.dtype() == uint8) ? 1 : 4;
+    int64_t row_bytes = w.shape(1) * dtype_bytes;
+    if (x.ndim() != 1 || x.dtype() != bfloat16 ||
+        w.ndim() != 2 || w.shape(0) != 2 * N || row_bytes * 2 != K ||
+        scales.ndim() != 1 || scales.dtype() != uint8 ||
+        scales.shape(0) != 128 + 2 * N * (K / 32)) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared_nvfp4_swiglu_qmv_rows1_halved_wide: "
+               "shape mismatch — x " << x.shape() << ", w " << w.shape()
+            << ", scales " << scales.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim =
+        std::make_shared<SharedSwiGLUQmvRows1WidePrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(out_shape, bfloat16, prim, {x, w, scales});
+}
+
+array shared_nvfp4_down_residual_halved(
+    const array& activated,
+    const array& down_weight,
+    const array& down_scales,
+    const array& routed,
+    const array& residual,
+    StreamOrDevice s) {
+    int64_t N = routed.shape(0);
+    int64_t K2 = activated.shape(0);
+    if (activated.ndim() != 1 || activated.dtype() != bfloat16 ||
+        routed.ndim() != 1 || residual.ndim() != 1 ||
+        routed.dtype() != bfloat16 || residual.dtype() != bfloat16 ||
+        down_weight.ndim() != 2 || down_scales.ndim() != 1 ||
+        down_scales.dtype() != uint8 ||
+        down_weight.shape(0) != N ||
+        down_weight.shape(1) * 8 != K2 ||
+        down_scales.shape(0) != 128 + N * (K2 / 32) ||
+        residual.shape(0) != N) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 shared_nvfp4_down_residual_halved: shape "
+               "mismatch — activated " << activated.shape()
+            << ", down_weight " << down_weight.shape()
+            << ", down_scales " << down_scales.shape()
+            << ", routed " << routed.shape() << ", residual "
+            << residual.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<SharedDownResidualHalvedPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(
+        out_shape,
+        bfloat16,
+        prim,
+        {activated, down_weight, down_scales, routed, residual});
+}
+
+array routed_nvfp4_swiglu_qmv_rows1(
+    const array& input,
+    const array& fused_weight,
+    const array& fused_scales,
+    const array& indices,
+    StreamOrDevice s) {
+    int64_t K = input.shape(0);
+    int64_t E = fused_weight.shape(0);
+    int64_t N = fused_weight.shape(1) / 2;
+    int64_t R = indices.shape(0);
+    int64_t dtype_bytes = (fused_weight.dtype() == uint8) ? 1 : 4;
+    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
+        fused_weight.ndim() != 3 || fused_scales.ndim() != 3 ||
+        fused_weight.shape(2) * dtype_bytes * 2 != input.shape(0) ||
+        fused_scales.shape(0) != E || fused_scales.shape(1) != 2 * N ||
+        fused_scales.shape(2) * 16 != input.shape(0) ||
+        indices.ndim() != 1 || indices.dtype() != uint32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 routed_nvfp4_swiglu_qmv_rows1: shape mismatch — "
+               "input " << input.shape() << ", fused_weight "
+            << fused_weight.shape() << ", fused_scales "
+            << fused_scales.shape() << ", indices " << indices.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<RoutedSwiGLUQmvRows1Primitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(R * N)};
+    return array(
+        out_shape, bfloat16, prim,
+        {input, fused_weight, fused_scales, indices});
+}
+
+array routed_nvfp4_swiglu_qmv_packed(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& indices,
+    StreamOrDevice s) {
+    int64_t N = fused_weight.shape(1) / 2;
+    int64_t E = fused_weight.shape(0);
+    int64_t R = indices.shape(0);
+    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
+        fused_weight.ndim() != 3 ||
+        packed_scales.ndim() != 1 || packed_scales.dtype() != uint8 ||
+        packed_scales.shape(0) != 128 + E * 65536 ||
+        indices.ndim() != 1 || indices.dtype() != uint32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 routed_nvfp4_swiglu_qmv_packed: shape mismatch — "
+               "input " << input.shape() << ", fused_weight "
+            << fused_weight.shape() << ", packed_scales "
+            << packed_scales.shape() << ", indices " << indices.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<RoutedSwiGLUQMVPackedPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(R * N)};
+    return array(
+        out_shape, bfloat16, prim,
+        {input, fused_weight, packed_scales, indices});
+}
+
+static void validate_routed_packed_top8_inputs(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& router_keys) {
+    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
+        fused_weight.ndim() != 3 ||
+        packed_scales.ndim() != 1 || packed_scales.dtype() != uint8 ||
+        packed_scales.shape(0) != 128 + fused_weight.shape(0) * 65536 ||
+        router_keys.ndim() != 1 || router_keys.dtype() != uint32 ||
+        router_keys.shape(0) != 256) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 routed top8 packed qmv: shape mismatch — "
+               "input " << input.shape() << ", fused_weight "
+            << fused_weight.shape() << ", packed_scales "
+            << packed_scales.shape() << ", router_keys "
+            << router_keys.shape();
+        throw std::invalid_argument(msg.str());
+    }
+}
+
+array routed_nvfp4_swiglu_qmv_packed_top8keys(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& router_keys,
+    StreamOrDevice s) {
+    validate_routed_packed_top8_inputs(
+        input, fused_weight, packed_scales, router_keys);
+    int64_t N = fused_weight.shape(1) / 2;
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<RoutedSwiGLUQMVPackedTop8Primitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(8 * N)};
+    return array(
+        out_shape, bfloat16, prim,
+        {input, fused_weight, packed_scales, router_keys});
+}
+
+array routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+    const array& input,
+    const array& fused_weight,
+    const array& packed_scales,
+    const array& router_keys,
+    StreamOrDevice s) {
+    validate_routed_packed_top8_inputs(
+        input, fused_weight, packed_scales, router_keys);
+    int64_t N = fused_weight.shape(1) / 2;
+    auto s_stream = to_stream(s);
+    auto prim =
+        std::make_shared<RoutedSwiGLUQMVPackedTop8R1Primitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(8 * N)};
+    return array(
+        out_shape, bfloat16, prim,
+        {input, fused_weight, packed_scales, router_keys});
+}
+
 }  // namespace omlx::laguna_nvfp4

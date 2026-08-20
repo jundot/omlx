@@ -605,3 +605,227 @@ def test_real_model_fused_plane_matches_stock():
         f"max diff {float(d.max()):.6g} exceeds 4 ulp"
     )
     assert int(mx.sum(d == 0)) >= w.shape[0] // 4
+
+
+# ---------------------------------------------------------------------------
+# Launch-schedule / scale-layout variants (rows1, halved, packed, top-8)
+# ---------------------------------------------------------------------------
+
+def _ulp_diff(y_a, y_b):
+    d = mx.abs(y_a.astype(mx.float32) - y_b.astype(mx.float32))
+    mag = mx.abs(y_b.astype(mx.float32))
+    ulp = mx.finfo(mx.bfloat16).eps * mx.maximum(mag, 1e-6)
+    return d, ulp
+
+
+@pytest.mark.parametrize("seed", [20, 21])
+def test_shared_rows1_matches_stock_within_ulp(seed):
+    """R1 shared QMV (one row per simdgroup) vs the stock nvfp4 path: same
+    ULP bound as the base kernel."""
+    x = mx.random.normal((_K,), scale=0.1).astype(mx.bfloat16)
+    w, scales = _fused_plane(seed)
+    y_native = laguna_nvfp4.shared_nvfp4_swiglu_qmv_rows1(x, w, scales)
+    y_stock = _stock_path(x, w, scales)
+    d, ulp = _ulp_diff(y_native, y_stock)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max diff {float(d.max()):.6g} exceeds 4 ulp "
+        f"({float((d / ulp).max()):.2f} ulps)")
+    assert int(mx.sum(d == 0)) >= _N // 8
+
+
+@pytest.mark.parametrize("seed", [22, 23])
+def test_shared_rows1_halved_matches_fallback_within_ulp(seed):
+    """Group-32 halved plane twin vs the de-halved fallback: the halved
+    plane is lossless (certificate) so the kernels agree with the stock
+    path within the usual ULP."""
+    x = mx.random.normal((_K,), scale=0.1).astype(mx.bfloat16)
+    w, scales = _fused_plane(seed)
+    plane = laguna_nvfp4.halved_group32_scale_plane(scales, [0, 32768])
+    assert plane is not None, "shareq halved certificate failed"
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.shared_nvfp4_swiglu_qmv_rows1_halved(
+            x, w, plane)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.shared_nvfp4_swiglu_qmv_rows1_halved(
+            x, w, plane)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max {float((d / ulp).max()):.2f} ulps")
+    assert int(mx.sum(d == 0)) >= _N // 8
+
+
+@pytest.mark.parametrize("seed", [24, 25])
+def test_shared_rows1_halved_wide_matches_fallback_within_ulp(seed):
+    """Wide-codes halved twin (two groups per lane) vs the fallback: same
+    halved plane, same ULP agreement."""
+    x = mx.random.normal((_K,), scale=0.1).astype(mx.bfloat16)
+    w, scales = _fused_plane(seed)
+    plane = laguna_nvfp4.halved_group32_scale_plane(scales, [0, 32768])
+    assert plane is not None
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+            x, w, plane)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.shared_nvfp4_swiglu_qmv_rows1_halved_wide(
+            x, w, plane)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max {float((d / ulp).max()):.2f} ulps")
+    assert int(mx.sum(d == 0)) >= _N // 8
+
+
+@pytest.mark.parametrize("seed", [26, 27])
+def test_shared_down_residual_halved_matches_fallback(seed):
+    """Halved shared down+residual vs the de-halved fallback: the kernel and
+    the stock path agree within ULP (and mostly bit-exact)."""
+    N2, K2 = 2048, 512
+    mx.random.seed(seed)
+    down = mx.random.normal((N2, K2), scale=0.02)
+    dq, ds = mx.quantize(down, group_size=16, bits=4, mode="nvfp4")
+    plane = laguna_nvfp4.halved_group32_scale_plane(ds, [0])
+    assert plane is not None, "down halved certificate failed"
+    activated = mx.random.normal((K2,), scale=0.1).astype(mx.bfloat16)
+    routed = mx.random.normal((N2,), scale=0.01).astype(mx.bfloat16)
+    residual = mx.random.normal((N2,), scale=0.01).astype(mx.bfloat16)
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.shared_nvfp4_down_residual_halved(
+            activated, dq, plane, routed, residual)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.shared_nvfp4_down_residual_halved(
+            activated, dq, plane, routed, residual)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max diff {float(d.max()):.6g} "
+        f"({float((d / ulp).max()):.2f} ulps)")
+    assert int(mx.sum(d == 0)) >= N2 // 8
+
+
+def _routed_pair(seed):
+    """Synthetic routed gate/up planes + packed scale bank."""
+    E, R, K, N = 256, 8, _K, _N
+    mx.random.seed(seed)
+    g = mx.random.normal((E, N, K), scale=0.02)
+    u = mx.random.normal((E, N, K), scale=0.02)
+    gq, gs = mx.quantize(g, group_size=16, bits=4, mode="nvfp4")
+    uq, us = mx.quantize(u, group_size=16, bits=4, mode="nvfp4")
+    plane = laguna_nvfp4._pair_interleave_fused(gq, uq, N)
+    pscales = laguna_nvfp4._pair_interleave_fused(gs, us, N)
+    x = mx.random.normal((K,), scale=0.1).astype(mx.bfloat16)
+    packed = laguna_nvfp4.packed_routed_gateup_scales(pscales)
+    assert packed is not None, "packed routed bank certificate failed"
+    return x, plane, pscales, packed
+
+
+@pytest.mark.parametrize("seed", [28, 29])
+def test_routed_rows1_matches_fallback_within_ulp(seed):
+    """R1 routed gate/up QMV vs the routed fallback."""
+    x, plane, pscales, _ = _routed_pair(seed)
+    indices = mx.array([3, 10, 42, 77, 99, 128, 200, 255], mx.uint32)
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.routed_nvfp4_swiglu_qmv_rows1(
+            x, plane, pscales, indices)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.routed_nvfp4_swiglu_qmv_rows1(
+            x, plane, pscales, indices)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max {float((d / ulp).max()):.2f} ulps")
+    assert int(mx.sum(d == 0)) >= _N * 8 // 8
+
+
+@pytest.mark.parametrize("seed", [30, 31])
+def test_routed_packed_matches_fallback_within_ulp(seed):
+    """Packed walk-order scale bank (128-byte header + halved) vs the
+    de-packed fallback."""
+    x, plane, _, packed = _routed_pair(seed)
+    indices = mx.array([3, 10, 42, 77, 99, 128, 200, 255], mx.uint32)
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed(
+            x, plane, packed, indices)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed(
+            x, plane, packed, indices)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max {float((d / ulp).max()):.2f} ulps")
+    assert int(mx.sum(d == 0)) >= _N * 8 // 8
+
+
+def _ordinal_keys(seed):
+    mx.random.seed(seed)
+    logits = mx.random.normal((256,), scale=1.0)
+    sc = 1.0 / (1.0 + mx.exp(-logits))
+    key = -(sc + mx.zeros(256))
+    bits = key.view(mx.uint32)
+    magnitude = bits & 0x7FFFFFFF
+    keys = mx.where(
+        magnitude > 0x7F800000,
+        mx.full_like(bits, 0xFFFFFFFF),
+        mx.where(
+            magnitude == 0,
+            mx.full_like(bits, 0x80000000),
+            mx.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000),
+        ),
+    )
+    return keys
+
+
+@pytest.mark.parametrize("seed", [32, 33])
+def test_routed_packed_top8keys_matches_fallback_within_ulp(seed):
+    """Top-8 ordinal selection packed QMV vs the sorted-order fallback: the
+    kernel's per-slot extraction is the (ordinal, index)-sorted order and the
+    gate/up body matches the packed kernel."""
+    x, plane, _, packed = _routed_pair(seed)
+    keys = _ordinal_keys(seed + 100)
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed_top8keys(
+            x, plane, packed, keys)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed_top8keys(
+            x, plane, packed, keys)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max {float((d / ulp).max()):.2f} ulps")
+    # the expert routing is exact (the restoration rounds match the order)
+    assert int(mx.sum(d == 0)) >= _N * 8 // 8
+
+
+@pytest.mark.parametrize("seed", [34, 35])
+def test_routed_packed_top8keys_r1_matches_fallback_within_ulp(seed):
+    """R1 scheduling twin of the top-8 packed QMV: same ULP contract, plus
+    bit-identity with the two-rows-per-simdgroup twin."""
+    x, plane, _, packed = _routed_pair(seed)
+    keys = _ordinal_keys(seed + 7)
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+            x, plane, packed, keys)
+        y_twin = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed_top8keys(
+            x, plane, packed, keys)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.routed_nvfp4_swiglu_qmv_packed_top8keys_r1(
+            x, plane, packed, keys)
+    finally:
+        laguna_nvfp4._ext = saved
+    d, ulp = _ulp_diff(y_native, y_fb)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max ulp {float((d / ulp).max()):.2f}")
+    assert bool(mx.all(y_native == y_twin)), "r1 twin diverges from packed"
