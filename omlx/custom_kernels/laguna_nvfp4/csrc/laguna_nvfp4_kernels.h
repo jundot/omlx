@@ -43,6 +43,21 @@ array shared_nvfp4_down_residual(
     const array& residual,
     StreamOrDevice s = {});
 
+// Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
+//   input        [K]      bf16 routed-expert input (K = 2048)
+//   fused_weight [E, 2N, K/8] uint32 per-expert pair-interleaved gate/up
+//                    planes (K/2 bytes/row): 32-row [gate; up] pairs
+//                    (N = 512, E = 256)
+//   fused_scales [E, 2N, K/16] uint8 E4M3 group scales
+//   indices      [R] uint32 top-R routed expert ids (R = 8)
+// Returns [R*N] bf16 per-slot silu(gate) * up.
+array routed_nvfp4_swiglu_qmv(
+    const array& input,
+    const array& fused_weight,
+    const array& fused_scales,
+    const array& indices,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

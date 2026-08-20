@@ -28,6 +28,12 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "routed_nvfp4_swiglu_qmv",
+        &omlx::laguna_nvfp4::routed_nvfp4_swiglu_qmv,
+        "input"_a, "fused_weight"_a, "fused_scales"_a, "indices"_a,
+        "stream"_a = nb::none());
+
+    m.def(
         "shared_nvfp4_down_residual",
         &omlx::laguna_nvfp4::shared_nvfp4_down_residual,
         "activated"_a, "down_weight"_a, "down_scales"_a,

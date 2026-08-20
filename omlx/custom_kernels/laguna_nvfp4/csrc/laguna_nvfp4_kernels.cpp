@@ -239,6 +239,85 @@ array shared_nvfp4_down_residual(
         {activated, down_weight, down_scales, routed, residual});
 }
 
+// RoutedSwiGLUQmvPrimitive:
+//   inputs[0] = input [K] bf16
+//   inputs[1] = fused_weight [E, 2N, K/8] uint32 pair-interleaved planes
+//   inputs[2] = fused_scales [E, 2N, K/16] uint8 E4M3 scales
+//   inputs[3] = indices [R] uint32 routed expert ids
+//   output[0] = activated [R*N] bf16
+class RoutedSwiGLUQmvPrimitive : public Primitive {
+ public:
+    explicit RoutedSwiGLUQmvPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 RoutedSwiGLUQmvPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        auto kernel = get_laguna_kernel(
+            d, "laguna_routed_nvfp4_swiglu_qmv_bf16_v2");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        // 1024 groups: 8 expert slots x 128 tiles; threadgroup 2 simdgroups.
+        MTL::Size group_dims(64, 1, 1);
+        MTL::Size grid_dims(1024, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(RoutedSwiGLUQmvPrimitive)
+};
+
+array routed_nvfp4_swiglu_qmv(
+    const array& input,
+    const array& fused_weight,
+    const array& fused_scales,
+    const array& indices,
+    StreamOrDevice s) {
+    int64_t K = input.shape(0);
+    int64_t E = fused_weight.shape(0);
+    int64_t N = fused_weight.shape(1) / 2;
+    int64_t R = indices.shape(0);
+    if (input.ndim() != 1 || input.dtype() != bfloat16 ||
+        fused_weight.ndim() != 3 || fused_scales.ndim() != 3 ||
+        fused_weight.shape(1) != 2 * N ||
+        fused_scales.shape(0) != E ||
+        fused_scales.shape(1) != 2 * N ||
+        fused_scales.shape(2) * 16 != K ||
+        fused_weight.shape(2) * 8 != K ||
+        indices.ndim() != 1 || indices.dtype() != uint32) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 routed_nvfp4_swiglu_qmv: shape mismatch — "
+               "input " << input.shape() << ", fused_weight "
+            << fused_weight.shape() << ", fused_scales "
+            << fused_scales.shape() << ", indices " << indices.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<RoutedSwiGLUQmvPrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(R * N)};
+    return array(
+        out_shape, bfloat16, prim,
+        {input, fused_weight, fused_scales, indices});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }
