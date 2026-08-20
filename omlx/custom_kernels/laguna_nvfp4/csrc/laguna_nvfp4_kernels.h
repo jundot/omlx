@@ -58,6 +58,21 @@ array routed_nvfp4_swiglu_qmv(
     const array& indices,
     StreamOrDevice s = {});
 
+// Routed-expert down_proj + weighted reduction fused in one kernel.
+//   activated      [R*K2] bf16      per-slot swiglu outputs (R=8, K2=512)
+//   down_weight    [E, N, K2/8] uint32 per-expert NVFP4 planes (N=2048)
+//   down_scales    [128 + E*N*16] uint8 halved group-32 planes
+//   indices        [R] uint32 routed expert ids
+//   router_weights [R] float32 routed scores
+// Returns [N] bf16 sum_slots(act * w) * 2.5.
+array routed_nvfp4_down_reduce(
+    const array& activated,
+    const array& down_weight,
+    const array& down_scales,
+    const array& indices,
+    const array& router_weights,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 

@@ -318,6 +318,91 @@ array routed_nvfp4_swiglu_qmv(
         {input, fused_weight, fused_scales, indices});
 }
 
+// RoutedDownReducePrimitive:
+//   inputs[0] = activated [R*K2] bf16 per-slot swiglu outputs (R=8, K2=512)
+//   inputs[1] = down_weight [E, N, K2/8] uint32 per-expert NVFP4 planes
+//   inputs[2] = down_scales [128 + E*N*16] uint8 halved group-32 planes
+//   inputs[3] = indices [R] uint32 routed expert ids
+//   inputs[4] = router_weights [R] float32 routed scores
+//   output[0] = routed [N] bf16 = sum_slots(act * w) * 2.5
+class RoutedDownReducePrimitive : public Primitive {
+ public:
+    explicit RoutedDownReducePrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 RoutedDownReducePrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        auto kernel = get_laguna_kernel(
+            d, "laguna_routed_nvfp4_down_reduce_bf16_v2");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        enc.set_output_array(out, c++);
+
+        // 512 tiles x 256 threads (8 simdgroups = 8 expert slots).
+        MTL::Size group_dims(256, 1, 1);
+        MTL::Size grid_dims(512, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(RoutedDownReducePrimitive)
+};
+
+array routed_nvfp4_down_reduce(
+    const array& activated,
+    const array& down_weight,
+    const array& down_scales,
+    const array& indices,
+    const array& router_weights,
+    StreamOrDevice s) {
+    int64_t N = 2048;
+    int64_t K2 = 512;
+    int64_t R = indices.shape(0);
+    int64_t E = down_weight.shape(0);
+    int64_t scale_rows = down_scales.shape(0) - 128;
+    if (activated.ndim() != 1 || activated.dtype() != bfloat16 ||
+        activated.shape(0) != R * K2 ||
+        down_weight.ndim() != 3 || down_weight.dtype() != uint32 ||
+        down_weight.shape(1) != N || down_weight.shape(2) != K2 / 8 ||
+        down_scales.ndim() != 1 || down_scales.dtype() != uint8 ||
+        down_scales.shape(0) != 128 + E * N * (K2 / 32) ||
+        indices.ndim() != 1 || indices.dtype() != uint32 ||
+        indices.shape(0) != R ||
+        router_weights.ndim() != 1 || router_weights.dtype() != float32 ||
+        router_weights.shape(0) != R) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 routed_nvfp4_down_reduce: shape mismatch — "
+               "activated " << activated.shape() << ", down_weight "
+            << down_weight.shape() << ", down_scales " << down_scales.shape()
+            << ", indices " << indices.shape() << ", router_weights "
+            << router_weights.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<RoutedDownReducePrimitive>(s_stream);
+    Shape out_shape{static_cast<ShapeElem>(N)};
+    return array(
+        out_shape, bfloat16, prim,
+        {activated, down_weight, down_scales, indices, router_weights});
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

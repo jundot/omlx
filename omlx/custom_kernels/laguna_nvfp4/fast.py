@@ -187,6 +187,92 @@ def routed_nvfp4_swiglu_qmv(
     return mx.concatenate(outs)
 
 
+
+
+def halved_group32_scale_plane(
+    scales: mx.array, allowed_flat_pairs: list[int] | None = None
+) -> mx.array | None:
+    """Build the halved group-32 scale plane (challenge
+    lagunaHalvedGroup32ScalePlane): one byte per 32 weights, taken as the
+    even group-16 bytes in flat order, prefixed by a 128-byte patch header
+    holding the allowed odd-byte exceptions. Returns None when any
+    non-allowed pair's even/odd bytes differ (the certificate fails).
+    """
+    allowed = allowed_flat_pairs or []
+    flat = scales.astype(mx.uint8).reshape(-1)
+    pair_count = flat.size // 2
+    pairs = flat.reshape(pair_count, 2)
+    even = pairs[:, 0]
+    odd = pairs[:, 1]
+    mismatch = (even != odd).astype(mx.int32)
+    violations = int(mx.sum(mismatch))
+    for idx in allowed:
+        violations -= int(mismatch[idx])
+    if violations != 0:
+        return None
+    header = mx.zeros((128,), mx.uint8)
+    for slot, idx in enumerate(allowed):
+        if slot >= 128:
+            break
+        header = mx.where(
+            mx.arange(128) == slot,
+            odd[idx].astype(mx.uint8),
+            header,
+        )
+    return mx.concatenate([header, even.astype(mx.uint8)])
+
+def routed_nvfp4_down_reduce(
+    activated: mx.array,
+    down_weight: mx.array,
+    down_scales: mx.array,
+    indices: mx.array,
+    router_weights: mx.array,
+    stream=None,
+) -> mx.array:
+    """Routed-expert down_proj + weighted reduction fused in one kernel
+    (challenge lagunaRoutedDownReduceKernel).
+
+    Parameters
+    ----------
+    activated      : [R*K2] bf16          — per-slot swiglu outputs
+    down_weight    : [E, N, K2/8] uint32  — per-expert NVFP4 down planes
+    down_scales    : [128 + E*N*16] uint8 — halved group-32 scale planes
+    indices        : [R] uint32           — routed expert ids
+    router_weights : [R] float32          — routed scores
+
+    Returns [N] bf16 sum_slots(act * w) * 2.5.
+    """
+    if _ext is not None and has_symbol("routed_nvfp4_down_reduce"):
+        return _ext.routed_nvfp4_down_reduce(
+            activated, down_weight, down_scales, indices, router_weights,
+            stream=stream,
+        )
+    # Fallback: de-halve the group-32 plane back to group-16 and run the
+    # stock nvfp4 matmul per routed expert, then the weighted reduction.
+    N, K2 = 2048, 512
+    E = down_weight.shape[0]
+    R = indices.shape[0]
+    halved = mx.reshape(down_scales[128:], (E, N, 16))
+    g16 = mx.repeat(halved, 2, axis=-1)  # [E, N, 32]
+    # pair-0 exception: row 0 groups 0/1 — the odd byte is the header value
+    h0 = down_scales[0].astype(mx.uint8)
+    g16 = mx.where(
+        mx.reshape(mx.arange(N * 32, dtype=mx.uint32), (1, N, 32)) == 1,
+        mx.broadcast_to(h0[None, None, None], g16.shape),
+        g16,
+    )
+    total = None
+    for slot in range(R):
+        e = int(indices[slot])
+        x_slot = activated[slot * K2 : (slot + 1) * K2]
+        down = mx.quantized_matmul(
+            x_slot[None, :], down_weight[e], scales=g16[e], transpose=True,
+            group_size=16, bits=4, mode="nvfp4", stream=stream,
+        ).squeeze(0)
+        term = down * router_weights[slot]
+        total = term if total is None else total + term
+    return (total * mx.array(2.5, mx.float32)).astype(mx.bfloat16)
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

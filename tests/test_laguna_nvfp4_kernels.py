@@ -138,6 +138,39 @@ def test_down_residual_matches_stock_within_ulp(seed):
     assert int(mx.sum(d == 0)) >= N2 // 8
 
 
+@pytest.mark.parametrize("seed", [5, 6])
+def test_routed_matches_fallback_within_ulp(seed):
+    """Routed pair-interleaved plane kernel vs the pure-mlx fallback: the
+    kernel and the fallback must agree within a few ulps (the fallback is
+    validated against the stock path by construction)."""
+    E, R = 256, 8
+    mx.random.seed(seed)
+    g = mx.random.normal((E, _N, _K), scale=0.02)
+    u = mx.random.normal((E, _N, _K), scale=0.02)
+    gq, gs = mx.quantize(g, group_size=16, bits=4, mode="nvfp4")
+    uq, us = mx.quantize(u, group_size=16, bits=4, mode="nvfp4")
+    plane = laguna_nvfp4._pair_interleave_fused(gq, uq, _N)
+    pscales = laguna_nvfp4._pair_interleave_fused(gs, us, _N)
+    x = mx.random.normal((_K,), scale=0.1).astype(mx.bfloat16)
+    indices = mx.array([3, 10, 42, 77, 99, 128, 200, 255], mx.uint32)
+
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.routed_nvfp4_swiglu_qmv(
+            x, plane, pscales, indices)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.routed_nvfp4_swiglu_qmv(
+            x, plane, pscales, indices)
+    finally:
+        laguna_nvfp4._ext = saved
+    d = mx.abs(y_native.astype(mx.float32) - y_fb.astype(mx.float32))
+    mag = mx.abs(y_fb.astype(mx.float32))
+    ulp = mx.finfo(mx.bfloat16).eps * mx.maximum(mag, 1e-6)
+    assert bool(mx.all(d <= 4 * ulp)), (
+        f"seed {seed}: max {float((d/ulp).max()):.2f} ulps")
+    assert int(mx.sum(d == 0)) >= _N * R // 8
+
+
 def test_fallback_agrees_with_native_shape():
     """The pure-mlx fallback and the native path share the public contract."""
     x = mx.random.normal((_K,)).astype(mx.bfloat16)
@@ -171,6 +204,42 @@ pytestmark_real = pytest.mark.skipif(
     not os.path.isdir(_LAGUNA_MODEL),
     reason="Poolside Laguna XS 2.1 NVFP4 model not staged",
 )
+
+
+@pytest.mark.parametrize("seed", [9, 10])
+def test_routed_down_reduce_matches_fallback(seed):
+    """Routed down-reduce kernel vs the pure-mlx fallback. The kernel keeps
+    the challenge's bf16 weighted-sum semantics (per-product bf16 rounding),
+    the fallback accumulates in fp32 then rounds once — so the agreement is
+    within a few bf16 steps, with most outputs bit-exact."""
+    K2, N, E, R = 512, 2048, 256, 8
+    mx.random.seed(seed)
+    dw = mx.random.normal((E, N, K2), scale=0.02)
+    dq, ds = mx.quantize(dw, group_size=16, bits=4, mode="nvfp4")
+    plane = laguna_nvfp4.halved_group32_scale_plane(ds, [0])
+    assert plane is not None
+    act = mx.random.normal((R * K2,), scale=0.1).astype(mx.bfloat16)
+    inds = mx.array([3, 10, 42, 77, 99, 128, 200, 255], mx.uint32)
+    rw = mx.random.normal((R,), scale=0.1).astype(mx.float32)
+
+    saved = laguna_nvfp4._ext
+    try:
+        y_native = laguna_nvfp4.routed_nvfp4_down_reduce(
+            act, dq, plane, inds, rw)
+        laguna_nvfp4._ext = None
+        y_fb = laguna_nvfp4.routed_nvfp4_down_reduce(
+            act, dq, plane, inds, rw)
+    finally:
+        laguna_nvfp4._ext = saved
+    d = mx.abs(y_native.astype(mx.float32) - y_fb.astype(mx.float32))
+    # The kernel keeps the challenge's bf16 per-product weighted-sum rounding;
+    # the fallback accumulates in fp32. At these magnitudes (|act*| ~ 0.01-0.05)
+    # a per-product bf16 rounding step is ~2.4e-4, so the absolute difference
+    # across the 8-product sum stays below ~2e-3 even where cancellation makes
+    # the per-element ulp tiny.
+    assert float(d.max()) <= 2.0e-3, (
+        f"seed {seed}: max abs diff {float(d.max()):.6g} > 2e-3")
+    assert int(mx.sum(d == 0)) >= N // 16
 
 
 @pytestmark_real

@@ -255,6 +255,117 @@ kernel void laguna_shared_nvfp4_down_residual_bf16_v1(
     }
 }
 
+// Routed-expert down_proj + weighted reduction over the 8 routed slots,
+// fused in one kernel (verbatim from lagunaRoutedDownReduceKernel).
+//   activated       [8][512] bf16         — per-slot swiglu outputs
+//   down_weight     [E][2048][64] uint32  — per-expert NVFP4 down planes
+//   down_scales     [128 + E*2048*16] uint8 — halved group-32 planes
+//                                            (128-byte patch header)
+//   indices         [8] uint32            — routed expert ids
+//   router_weights  [8] fp32              — routed scores
+//   routed          [2048] bf16           — sum_slots(act * w) * 2.5
+// Grid: 512 tiles x (256 threads = 8 simdgroups; slot = simdgroup).
+kernel void laguna_routed_nvfp4_down_reduce_bf16_v2(
+    const device bfloat* activated [[buffer(0)]],
+    const device uint8_t* down_weight [[buffer(1)]],
+    const device uint8_t* down_scales [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    const device float* router_weights [[buffer(4)]],
+    device bfloat* routed [[buffer(5)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint expert_slot [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint input_width = 512;
+    constexpr uint output_width = 2048;
+    constexpr uint experts_per_token = 8;
+    constexpr uint outputs_per_simd = 4;
+    constexpr uint values_per_lane = 16;
+    constexpr uint packed_row_bytes = 256;
+    constexpr uint scale_patch_bytes = 128;
+    constexpr uint scale_row_bytes = 16;
+    constexpr uint packed_expert_bytes =
+        output_width * packed_row_bytes;
+    constexpr uint scale_expert_bytes =
+        output_width * scale_row_bytes;
+
+    uint first_row = tile * outputs_per_simd;
+    uint expert = uint(indices[expert_slot]);
+
+    const device bfloat* expert_input =
+        activated + expert_slot * input_width;
+    const device uint8_t* expert_weight =
+        (const device uint8_t*)down_weight +
+        expert * packed_expert_bytes;
+    const device uint8_t* expert_scales =
+        down_scales + scale_patch_bytes + expert * scale_expert_bytes;
+
+    thread float input_values[values_per_lane];
+    const device vec<bfloat, 4>* input_vectors =
+        (const device vec<bfloat, 4>*)(
+            expert_input + lane * values_per_lane);
+    for (uint i = 0; i < values_per_lane / 4; ++i) {
+        const vec<bfloat, 4> values = input_vectors[i];
+        input_values[4 * i] = values[0];
+        input_values[4 * i + 1] = values[1];
+        input_values[4 * i + 2] = values[2];
+        input_values[4 * i + 3] = values[3];
+    }
+
+    thread float result[outputs_per_simd] = {
+        0.0f, 0.0f, 0.0f, 0.0f
+    };
+    uint2 row_codes[outputs_per_simd];
+    uint8_t row_sb[outputs_per_simd];
+    for (uint row = 0; row < outputs_per_simd; ++row) {
+        uint output_row = first_row + row;
+        row_codes[row] = *(const device uint2*)(
+            expert_weight + output_row * packed_row_bytes + lane * 8);
+        row_sb[row] =
+            (expert == 0 && output_row == 0 && lane == 1)
+            ? down_scales[0]
+            : expert_scales[output_row * scale_row_bytes + (lane >> 1)];
+    }
+    for (uint row = 0; row < outputs_per_simd; ++row) {
+        result[row] = laguna_nvfp4_qdot_codes_16(
+            row_codes[row],
+            input_values,
+            laguna_nvfp4_scale(row_sb[row]));
+    }
+    {
+        const vec<float, 4> packed_rows = simd_sum(
+            vec<float, 4>(result[0], result[1], result[2], result[3]));
+        result[0] = packed_rows.x;
+        result[1] = packed_rows.y;
+        result[2] = packed_rows.z;
+        result[3] = packed_rows.w;
+    }
+
+    threadgroup bfloat expert_outputs[
+        experts_per_token * outputs_per_simd
+    ];
+    if (lane == 0) {
+        for (uint row = 0; row < outputs_per_simd; ++row) {
+            expert_outputs[
+                expert_slot * outputs_per_simd + row
+            ] = bfloat(result[row] * 4194304.0f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (expert_slot == 0 && lane < outputs_per_simd) {
+        bfloat total = bfloat(0);
+        for (uint slot = 0; slot < experts_per_token; ++slot) {
+            bfloat route_weight = bfloat(router_weights[slot]);
+            bfloat product = bfloat(
+                expert_outputs[slot * outputs_per_simd + lane] *
+                route_weight);
+            total = bfloat(product + total);
+        }
+        routed[first_row + lane] = bfloat(total * bfloat(2.5f));
+    }
+}
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input
