@@ -47,6 +47,10 @@ instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 
 instantiate_dsa_topk_indices(float16, half, 2048, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);
+// topk=1024: DeepSeek-V4-Pro's index_topk. The kernel is generic over TOPK
+// (strided loops + ceil-div segments; nothing ties it to 512/2048).
+instantiate_dsa_topk_indices(float16, half, 1024, 1024);
+instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 1024, 1024);
 instantiate_dsa_topk_indices(float16, half, 512, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 512, 1024);
 

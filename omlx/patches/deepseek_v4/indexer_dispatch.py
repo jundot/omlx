@@ -75,5 +75,5 @@ def native_indexer_shape_eligible(
         and pooled_tokens > index_topk
         and n_heads in (32, 64)
         and head_dim == 128
-        and index_topk in (512, 2048)
+        and index_topk in (512, 1024, 2048)
     )

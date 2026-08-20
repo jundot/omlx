@@ -418,7 +418,7 @@ class DSATopKIndicesPrimitive : public Primitive {
     if (scores.ndim() != 4 || scores.shape(1) != 1) {
       return true;
     }
-    if (topk != 512 && topk != 2048) {
+    if (topk != 512 && topk != 1024 && topk != 2048) {
       return true;
     }
     return scores.shape(-1) < topk;
