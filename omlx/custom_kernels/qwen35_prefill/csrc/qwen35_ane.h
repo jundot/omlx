@@ -63,6 +63,7 @@ private:
 };
 
 bool qwen35_ane_available();
+bool qwen35_ane_hybrid_nax_enabled();
 bool qwen35_cpu_shared_resource_available();
 void qwen35_ane_profile_set_enabled(bool enabled);
 void qwen35_ane_profile_reset();

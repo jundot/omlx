@@ -37,6 +37,9 @@ NB_MODULE(_ext, m) {
       "qwen35_ane_available",
       &omlx::qwen35_prefill_kernels::qwen35_ane_available);
   m.def(
+      "qwen35_ane_hybrid_nax_enabled",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_hybrid_nax_enabled);
+  m.def(
       "qwen35_ane_profile_set_enabled",
       &omlx::qwen35_prefill_kernels::qwen35_ane_profile_set_enabled,
       "enabled"_a);

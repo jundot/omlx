@@ -1351,6 +1351,32 @@ std::string hybrid_classic_qmm_name(int bits, int group_size,
          type + "_bm_64_bk_32_bn_64";
 }
 
+template <typename Device, typename Library>
+MTL::ComputePipelineState *hybrid_qmm_kernel(
+    Device &device, const Library &classic_library, int bits, int group_size,
+    const std::string &type, int K, int N) {
+  // The bundled hybrid NAX kernel currently uses the same 64x64x64 tile as
+  // variant 0 of the standalone qmm op. Select it per projection: the fused
+  // gate/up and down suffixes have different K/N shapes, and either one must
+  // be able to fall back independently if a future architecture is not tile
+  // compatible.
+  if (K % 64 == 0 && N % 64 == 0 && hybrid_nax_enabled()) {
+    try {
+      auto nax_library = device.get_library(
+          "omlx_qwen35_prefill_kernels_nax", binary_dir());
+      return device.get_kernel(
+          hybrid_nax_qmm_name(bits, group_size, type), nax_library);
+    } catch (const std::exception &) {
+      // Keep the fused ANE path usable with an older/incomplete app bundle.
+      // This mirrors the established hybrid suffix behavior and avoids
+      // retrying a missing NAX pipeline on every layer.
+      g_hybrid_nax_runtime_ok.store(false, std::memory_order_relaxed);
+    }
+  }
+  return device.get_kernel(
+      hybrid_classic_qmm_name(bits, group_size, type), classic_library);
+}
+
 BNNSNDArrayDescriptor cpu_matrix_descriptor(void *data, int rows, int cols,
                                              BNNSDataType dtype) {
   BNNSNDArrayDescriptor descriptor{};
@@ -2469,10 +2495,11 @@ public:
                   profile_now_ns() - operation_start);
     }
 
-    std::string qmm_name = "qwen35_q4_affine_qmm128_t_" +
-                           metal_type_name(x.dtype()) + "_bm_64_bk_32_bn_64";
-    auto qmm = device.get_kernel(qmm_name, library);
-    encoder.set_compute_pipeline_state(qmm);
+    const std::string qmm_type = metal_type_name(x.dtype());
+    auto gate_up_qmm = hybrid_qmm_kernel(
+        device, library, 4, group_size_, qmm_type, input_dim,
+        2 * gpu_hidden);
+    encoder.set_compute_pipeline_state(gate_up_qmm);
     encoder.set_input_array(gate_up_weight, 0);
     encoder.set_input_array(gate_up_scales, 1);
     encoder.set_input_array(gate_up_biases, 2);
@@ -2497,7 +2524,9 @@ public:
                              MTL::Size(16, 16, 1));
     encoder.end_encoding();
 
-    encoder.set_compute_pipeline_state(qmm);
+    auto down_qmm = hybrid_qmm_kernel(
+        device, library, 4, group_size_, qmm_type, gpu_hidden, output_dim);
+    encoder.set_compute_pipeline_state(down_qmm);
     encoder.set_input_array(down_weight, 0);
     encoder.set_input_array(down_scales, 1);
     encoder.set_input_array(down_biases, 2);
@@ -2657,6 +2686,8 @@ private:
 };
 
 } // namespace
+
+bool qwen35_ane_hybrid_nax_enabled() { return hybrid_nax_enabled(); }
 
 bool qwen35_cpu_shared_resource_available() {
   return cpu_shared_resource_policy_available();

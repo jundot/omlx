@@ -2685,11 +2685,17 @@ def enable_qwen35_ane_prefill(
             logger.info(
                 "Eagerly compiled %d fused MLP/down and %d GDN procedures "
                 "into %d "
-                "instance-pinned ANE programs (sequence_length=%d)",
+                "instance-pinned ANE programs (sequence_length=%d, "
+                "gpu_suffix=%s)",
                 count,
                 gdn_count,
                 resident_programs,
                 sequence_length,
+                (
+                    "NAX"
+                    if fast.qwen35_ane_hybrid_nax_enabled()
+                    else "classic Metal"
+                ),
             )
             return count
 

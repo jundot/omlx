@@ -125,3 +125,14 @@ def test_qmm_nax_disabled_without_kernels(monkeypatch):
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
     assert fast._qmm_nax_kwargs()["use_nax"] is False
+
+
+def test_ane_hybrid_nax_capability_reports_native_state(monkeypatch):
+    fake_ext = types.SimpleNamespace(qwen35_ane_hybrid_nax_enabled=lambda: True)
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    assert fast.qwen35_ane_hybrid_nax_enabled() is True
+
+
+def test_ane_hybrid_nax_capability_is_false_for_older_extension(monkeypatch):
+    monkeypatch.setattr(fast, "_ext", types.SimpleNamespace())
+    assert fast.qwen35_ane_hybrid_nax_enabled() is False

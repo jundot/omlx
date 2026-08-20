@@ -348,6 +348,15 @@ def qwen35_ane_available() -> bool:
     )
 
 
+def qwen35_ane_hybrid_nax_enabled() -> bool:
+    """Whether ANE hybrid GPU suffixes currently select bundled NAX QMM."""
+    return bool(
+        _ext is not None
+        and hasattr(_ext, "qwen35_ane_hybrid_nax_enabled")
+        and _ext.qwen35_ane_hybrid_nax_enabled()
+    )
+
+
 _ANE_PROFILE_KEYS = (
     "operations",
     "pack_ns",
