@@ -1220,6 +1220,30 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return create_with_tools(self._executor_tokenizer, tools)
         return factory.create_session(self._executor_tokenizer)
 
+    def _update_prefill_activity(
+        self,
+        activity_id: str,
+        *,
+        processed: int,
+        total: int,
+        elapsed_seconds: float,
+        complete: bool = False,
+    ) -> None:
+        """Publish DFlash prefill progress in the scheduler-compatible shape."""
+        processed = max(0, int(processed))
+        total = max(0, int(total))
+        elapsed_seconds = max(0.0, float(elapsed_seconds))
+        speed = processed / elapsed_seconds if elapsed_seconds > 0 else 0.0
+        eta = max(0.0, (total - processed) / speed) if speed > 0 else None
+        self._update_activity(
+            activity_id,
+            phase="generate" if complete else "prefill",
+            prefill_processed=processed,
+            prefill_total=total,
+            prefill_speed=speed,
+            prefill_eta=0.0 if complete else eta,
+        )
+
     def _run_generate_streaming(
         self,
         prompt_tokens: list[int],
@@ -1233,6 +1257,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        activity_id: str,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -1241,7 +1266,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return promptly so the single MLX executor thread is freed for the
         next request.
         """
-        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+        from dflash_mlx.engine.events import (
+            PrefillCompleteEvent,
+            PrefillProgressEvent,
+            SummaryEvent,
+            TokenEvent,
+        )
 
         event_iter = None
         cache_manager = None
@@ -1276,6 +1306,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 if detokenizer is not None:
                     detokenizer.reset()
 
+            activity_token_count = 0
+            generation_started_at: float | None = None
+            prefill_started_at = time.perf_counter()
             for event in event_iter:
                 if stop_event.is_set():
                     logger.info("DFlash generation aborted by client")
@@ -1286,6 +1319,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
                         continue
+                    if generation_started_at is None:
+                        generation_started_at = time.perf_counter()
+                    activity_token_count += 1
+                    self._update_activity(
+                        activity_id,
+                        phase="generate",
+                        token_count=activity_token_count,
+                        generation_elapsed_seconds=max(
+                            0.0, time.perf_counter() - generation_started_at
+                        ),
+                    )
                     if parser_session is not None:
                         result = parser_session.process_token(token_id)
                         text = result.stream_text
@@ -1301,6 +1345,23 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         continue
                     asyncio.run_coroutine_threadsafe(
                         queue.put((text, [token_id], False, None)), loop
+                    )
+
+                elif isinstance(event, PrefillProgressEvent):
+                    self._update_prefill_activity(
+                        activity_id,
+                        processed=event.tokens_processed,
+                        total=event.tokens_total,
+                        elapsed_seconds=time.perf_counter() - prefill_started_at,
+                    )
+
+                elif isinstance(event, PrefillCompleteEvent):
+                    self._update_prefill_activity(
+                        activity_id,
+                        processed=event.prompt_token_count,
+                        total=event.prompt_token_count,
+                        elapsed_seconds=int(event.prefill_us) / 1e6,
+                        complete=True,
                     )
 
                 elif isinstance(event, SummaryEvent):
@@ -1454,10 +1515,23 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         stop_event = threading.Event()
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
-        activity_id = self._begin_activity("generate", detail="generating")
+        activity_id = self._begin_activity(
+            "generate",
+            detail="generating",
+            metadata={
+                "prompt_tokens": len(prompt_tokens),
+                "max_tokens": max_tokens,
+                "phase": "prefill",
+            },
+        )
 
         def _run():
-            from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+            from dflash_mlx.engine.events import (
+                PrefillCompleteEvent,
+                PrefillProgressEvent,
+                SummaryEvent,
+                TokenEvent,
+            )
 
             event_iter = None
             cache_manager = None
@@ -1485,6 +1559,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
                 first_token_at: float | None = None
+                prefill_started_at = time.perf_counter()
                 parser_final = None
                 for event in event_iter:
                     if stop_event.is_set():
@@ -1497,11 +1572,33 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         if token_id in stop_ids:
                             continue
                         tokens.append(token_id)
-                        self._update_activity(activity_id, token_count=len(tokens))
+                        self._update_activity(
+                            activity_id,
+                            phase="generate",
+                            token_count=len(tokens),
+                            generation_elapsed_seconds=max(
+                                0.0, time.perf_counter() - first_token_at
+                            ),
+                        )
                         if parser_session is not None:
                             result = parser_session.process_token(token_id)
                             if result.visible_text:
                                 parsed_visible_parts.append(result.visible_text)
+                    elif isinstance(event, PrefillProgressEvent):
+                        self._update_prefill_activity(
+                            activity_id,
+                            processed=event.tokens_processed,
+                            total=event.tokens_total,
+                            elapsed_seconds=time.perf_counter() - prefill_started_at,
+                        )
+                    elif isinstance(event, PrefillCompleteEvent):
+                        self._update_prefill_activity(
+                            activity_id,
+                            processed=event.prompt_token_count,
+                            total=event.prompt_token_count,
+                            elapsed_seconds=int(event.prefill_us) / 1e6,
+                            complete=True,
+                        )
                     elif isinstance(event, SummaryEvent):
                         summary = event
                         self._record_speculation_summary(event)
@@ -1692,7 +1789,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
-        activity_id = self._begin_activity("generate", detail="generating")
+        activity_id = self._begin_activity(
+            "generate",
+            detail="generating",
+            metadata={
+                "prompt_tokens": prompt_len,
+                "max_tokens": max_tokens,
+                "phase": "prefill",
+            },
+        )
         self._active_request = True
         future = loop.run_in_executor(
             get_mlx_executor(),
@@ -1708,6 +1813,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             queue,
             loop,
             stop_event,
+            activity_id,
         )
 
         total_text = ""
@@ -1724,7 +1830,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
                 total_text += new_text
                 total_completion += len(new_tokens)
-                self._update_activity(activity_id, token_count=total_completion)
 
                 finish_reason = None
                 if finished:
