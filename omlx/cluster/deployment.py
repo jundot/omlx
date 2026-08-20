@@ -341,9 +341,16 @@ class ClusterDeployment:
         return "jaccl" if self.backend.startswith("jaccl") else "ring"
 
     def hostfile_dict(self) -> dict[str, Any]:
+        # Fast Metal sync is the upstream-recommended default for JACCL
+        # clusters (5-6x slower without it), but it has real failure modes
+        # (#2330's cross-stream-fence hang) — an operator who sets the
+        # variable themselves, including to 0, wins over our default.
+        import os
+
+        fast_synch = os.environ.get("MLX_METAL_FAST_SYNCH", "1").strip() or "1"
         return {
             "backend": self.backend,
-            "envs": ["MLX_METAL_FAST_SYNCH=1"],
+            "envs": [f"MLX_METAL_FAST_SYNCH={fast_synch}"],
             "hosts": [
                 {
                     "ssh": host.ssh,

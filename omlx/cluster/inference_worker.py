@@ -962,6 +962,14 @@ def run_worker(args: argparse.Namespace) -> int:
     group = mx.distributed.init(backend=init_backend, strict=True)
     rank = group.rank()
     world_size = group.size()
+    # Surface the effective fast-synch mode: it changes cluster throughput
+    # by up to 5-6x and has caused a real hang (#2330), so a support log
+    # without it cannot be interpreted.
+    print(
+        f"[rank {rank}] backend={args.backend} world_size={world_size} "
+        f"MLX_METAL_FAST_SYNCH={os.environ.get('MLX_METAL_FAST_SYNCH', '<unset>')}",
+        flush=True,
+    )
     if world_size != len(assignments):
         raise RuntimeError(
             f"runtime world size {world_size} does not match plan size "

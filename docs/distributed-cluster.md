@@ -225,6 +225,15 @@ decode latency of a pipeline still includes every stage and inter-stage send.
 The live view therefore shows both predicted stage time and observed
 end-to-end measurements so a poor cut, cache miss, or slow link is visible.
 
+**Metal fast synchronization.** Every spawned rank runs with
+`MLX_METAL_FAST_SYNCH=1` by default: without it, MLX's cross-GPU
+synchronization can make distributed inference several times slower. Setting
+the variable yourself before activation — including to `0` — overrides the
+default for every rank, which is the escape hatch if a workload hits a
+fast-synch-specific issue (a cross-stream fence hang of that kind was fixed
+in #2330). Each rank prints its effective value at startup so a support log
+always shows which mode was active.
+
 ## Diagnostics
 
 ```bash

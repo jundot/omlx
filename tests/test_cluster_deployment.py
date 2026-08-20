@@ -87,6 +87,21 @@ def test_deployment_round_trip_and_worker_plan_are_json_only():
     assert deployment.distributed_init_backend == "jaccl"
 
 
+def test_operator_fast_synch_setting_overrides_the_default(monkeypatch):
+    """An operator who sets MLX_METAL_FAST_SYNCH wins — including 0.
+
+    Fast synch is the right default, but it has real failure modes
+    (#2330's cross-stream-fence hang), so the escape hatch must work.
+    """
+    deployment = _deployment()
+    monkeypatch.setenv("MLX_METAL_FAST_SYNCH", "0")
+    assert deployment.hostfile_dict()["envs"] == ["MLX_METAL_FAST_SYNCH=0"]
+    monkeypatch.setenv("MLX_METAL_FAST_SYNCH", "  ")
+    assert deployment.hostfile_dict()["envs"] == ["MLX_METAL_FAST_SYNCH=1"]
+    monkeypatch.delenv("MLX_METAL_FAST_SYNCH")
+    assert deployment.hostfile_dict()["envs"] == ["MLX_METAL_FAST_SYNCH=1"]
+
+
 def test_deployment_round_trip_preserves_the_selected_context():
     deployment = _deployment()
     deployment = ClusterDeployment(
