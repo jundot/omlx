@@ -106,7 +106,8 @@ def load_lm(
             sanitized = super().sanitize(weights)
             return mixed.transform_weights_exact(sanitized)
 
-    def get_model_classes(_config):
+    def get_model_classes(config):
+        del config
         return ExactModelOptModel, model_args_class
 
     # mlx-lm treats every compressed-tensors checkpoint as affine 4-bit by
@@ -157,7 +158,7 @@ def install_dflash_modelopt_loader() -> bool:
         return False
 
     current_load = dflash_loading.load
-    if getattr(current_load, _DFLASH_LOADER_MARKER, False):
+    if getattr(current_load, _DFLASH_LOADER_MARKER, False) is True:
         return False
 
     original_load = current_load
@@ -168,7 +169,7 @@ def install_dflash_modelopt_loader() -> bool:
         return original_load(path_or_hf_repo, *args, **kwargs)
 
     setattr(load_with_modelopt_target, _DFLASH_LOADER_MARKER, True)
-    setattr(load_with_modelopt_target, "_omlx_original_load", original_load)
+    load_with_modelopt_target._omlx_original_load = original_load
     dflash_loading.load = load_with_modelopt_target
     logger.debug("Qwen3.8 ModelOpt DFlash target loader installed")
     return True

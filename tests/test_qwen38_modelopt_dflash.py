@@ -146,7 +146,7 @@ def test_load_lm_suppresses_generic_quantization_but_reports_source_config(
     assert kwargs["model_config"]["quantization_config"] is None
     assert kwargs["model_config"]["quantize_activations"] is False
 
-    model_class, args_class = kwargs["get_model_classes"](_config())
+    model_class, args_class = kwargs["get_model_classes"](config=_config())
     assert issubclass(model_class, qwen3_5.Model)
     assert args_class is qwen3_5.ModelArgs
 
