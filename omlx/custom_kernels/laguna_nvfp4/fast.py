@@ -406,6 +406,22 @@ def oproj_act(
         transpose=True, group_size=16, bits=4, mode="nvfp4", stream=stream,
     ).squeeze(0).astype(mx.bfloat16)
 
+
+def residual_rms(
+    residual: mx.array,
+    branch: mx.array,
+    weight: mx.array,
+    stream=None,
+):
+    """Fused residual add + RMSNorm (verbatim from
+    lagunaResidualRMSNormKernel). Returns (summed, normalized) [2048] bf16.
+    """
+    if _ext is not None and has_symbol("residual_rms"):
+        return _ext.residual_rms(residual, branch, weight, stream=stream)
+    summed = (residual + branch).astype(mx.bfloat16)
+    normalized = mx.fast.rms_norm(summed, weight, 1e-6)
+    return summed, normalized
+
 def shared_nvfp4_down_residual(
     activated: mx.array,
     down_weight: mx.array,

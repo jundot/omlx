@@ -679,6 +679,71 @@ array oproj_act(
                  {attention_output, gate_values, weight_codes, weight_scales});
 }
 
+// ResidualRmsPrimitive: fused residual add + RMSNorm (2 outputs).
+class ResidualRmsPrimitive : public Primitive {
+ public:
+    explicit ResidualRmsPrimitive(Stream s) : Primitive(s) {}
+
+ private:
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error(
+            "laguna_nvfp4 ResidualRmsPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        for (auto& out : outputs) {
+            out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+        }
+        auto kernel = get_laguna_kernel(d, "laguna_residual_rms_bf16_2048_v1");
+        auto& enc = metal::get_command_encoder(s);
+        enc.set_compute_pipeline_state(kernel);
+        int c = 0;
+        for (const auto& in : inputs) {
+            enc.set_input_array(in, c++);
+        }
+        for (auto& out : outputs) {
+            enc.set_output_array(out, c++);
+        }
+        int rows = static_cast<int>(inputs[0].shape(0) / 2048);
+        MTL::Size group_dims(512, 1, 1);
+        MTL::Size grid_dims(rows, 1, 1);
+        enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    DEFINE_NAME(ResidualRmsPrimitive)
+};
+
+std::pair<array, array> residual_rms(
+    const array& residual,
+    const array& branch,
+    const array& weight,
+    StreamOrDevice s) {
+    if (residual.ndim() != 1 || residual.dtype() != bfloat16 ||
+        branch.ndim() != 1 || branch.dtype() != bfloat16 ||
+        weight.ndim() != 1 || weight.dtype() != bfloat16 ||
+        residual.shape(0) != 2048 || branch.shape(0) != 2048 ||
+        weight.shape(0) != 2048) {
+        std::ostringstream msg;
+        msg << "laguna_nvfp4 residual_rms: shape mismatch — residual "
+            << residual.shape() << ", branch " << branch.shape()
+            << ", weight " << weight.shape();
+        throw std::invalid_argument(msg.str());
+    }
+    auto s_stream = to_stream(s);
+    auto prim = std::make_shared<ResidualRmsPrimitive>(s_stream);
+    Shape shape{static_cast<ShapeElem>(2048)};
+    auto outs = array::make_arrays(
+        {shape, shape}, {bfloat16, bfloat16}, prim,
+        {residual, branch, weight});
+    return {outs[0], outs[1]};
+}
+
 int64_t abi_probe(const array& a) {
     return static_cast<int64_t>(a.size());
 }

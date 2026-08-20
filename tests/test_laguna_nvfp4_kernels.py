@@ -330,6 +330,24 @@ def test_oproj_act_bit_exact(heads):
     assert bool(mx.all(y == yf)), f"heads {heads}: o_proj diverges"
 
 
+def test_residual_rms_bit_exact():
+    """Fused residual add + RMSNorm vs the stock ops: bit-exact (the kernel
+    mirrors rms_single_row, and the summed row is the same bf16 add)."""
+    mx.random.seed(17)
+    res = mx.random.normal((2048,), scale=1.0).astype(mx.bfloat16)
+    br = mx.random.normal((2048,), scale=0.1).astype(mx.bfloat16)
+    w = mx.random.normal((2048,)).astype(mx.bfloat16)
+    s, n = laguna_nvfp4.residual_rms(res, br, w)
+    saved = laguna_nvfp4._ext
+    try:
+        laguna_nvfp4._ext = None
+        sf, nf = laguna_nvfp4.residual_rms(res, br, w)
+    finally:
+        laguna_nvfp4._ext = saved
+    assert bool(mx.all(s == sf))
+    assert bool(mx.all(n == nf))
+
+
 @pytestmark_real
 def test_real_model_fused_plane_matches_stock():
     """Real layer-1 shared expert fused plane + real hidden state: the kernel

@@ -732,6 +732,65 @@ LAGUNA_OPROJ_ACT_KERNEL(
 LAGUNA_OPROJ_ACT_KERNEL(
     laguna_oproj_act_h64_v1_sc1_se1, 64)
 
+// Post-attention residual add + RMSNorm, fused.
+// (verbatim from lagunaResidualRMSNormKernel)
+//   residual [2048] bf16, branch [2048] bf16, weight [2048] bf16
+//   summed [2048] bf16, normalized [2048] bf16
+// Grid: `rows` threadgroups x 512 threads (16 simdgroups).
+kernel void laguna_residual_rms_bf16_2048_v1(
+    const device bfloat* residual [[buffer(0)]],
+    const device bfloat* branch [[buffer(1)]],
+    const device bfloat* weight [[buffer(2)]],
+    device bfloat* summed [[buffer(3)]],
+    device bfloat* normalized [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint axis_size = 2048;
+    constexpr uint n_reads = 4;
+    constexpr uint simd_size = 32;
+
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[simd_size];
+    uint base = row * axis_size + lid * n_reads;
+
+    thread bfloat values[n_reads];
+    float acc = 0.0f;
+    for (uint i = 0; i < n_reads; ++i) {
+        bfloat value = bfloat(residual[base + i] + branch[base + i]);
+        values[i] = value;
+        summed[base + i] = value;
+        float fv = float(value);
+        acc += fv * fv;
+    }
+
+    acc = simd_sum(acc);
+    if (simd_group == 0) {
+        local_sums[simd_lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        local_sums[simd_group] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        acc = simd_sum(local_sums[simd_lane]);
+        if (simd_lane == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / 2048.0f + 1.0e-6f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float laguna_inv_mean = local_inv_mean[0];
+
+    for (uint i = 0; i < n_reads; ++i) {
+        normalized[base + i] =
+            weight[lid * n_reads + i] *
+            bfloat(float(values[i]) * laguna_inv_mean);
+    }
+}
+
 // Routed-expert fused gate/up NVFP4 QMV with in-kernel SwiGLU.
 // (verbatim from lagunaRoutedSwiGLUQMVKernel)
 //   input        [2048] bf16           — routed-expert input

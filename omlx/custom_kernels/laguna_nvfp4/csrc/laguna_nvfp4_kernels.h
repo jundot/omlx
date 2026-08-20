@@ -121,6 +121,13 @@ array oproj_act(
     int heads,
     StreamOrDevice s = {});
 
+// Fused residual add + RMSNorm. Returns {summed, normalized} [2048] bf16.
+std::pair<array, array> residual_rms(
+    const array& residual,
+    const array& branch,
+    const array& weight,
+    StreamOrDevice s = {});
+
 // Native extension availability probe for ABI verification.
 int64_t abi_probe(const array& a);
 
