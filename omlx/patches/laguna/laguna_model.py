@@ -482,6 +482,19 @@ class LagunaSparseMoeBlock(nn.Module):
             self._fused_gateup_scales = mx.concatenate([gate.scales, up.scales], axis=1)
             self._fused_gateup_split = gate.weight.shape[1]
             self._routed_down_proj = down
+            if _LAGUNA_NVFP4_KERNELS:
+                # Kernel layouts: pair-interleaved [gate; up] plane (32-row
+                # pairs) and the halved group-32 down scale planes.
+                from omlx.custom_kernels.laguna_nvfp4 import fast as _ln
+
+                self._kernel_plane = _ln._pair_interleave_fused(
+                    gate.weight, up.weight,
+                    gate.weight.shape[1])
+                self._kernel_plane_scales = _ln._pair_interleave_fused(
+                    gate.scales, up.scales, gate.scales.shape[1])
+                self._kernel_down = down.weight
+                self._kernel_down_scales = _ln.halved_group32_scale_plane(
+                    down.scales, [0])
         self._fusion_ready = ready
         return ready
 
@@ -518,6 +531,42 @@ class LagunaSparseMoeBlock(nn.Module):
     ) -> mx.array:
         inds, scores = self.gate(x)
         if (
+            _LAGUNA_NVFP4_KERNELS
+            and x.shape[1] == 1
+            and inds.size < 64
+            and self._prepare_fused_gate_up()
+            and getattr(self, "_kernel_plane", None) is not None
+        ):
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _fn
+
+            if _fn.has_native() and _fn.has_symbol("routed_nvfp4_swiglu_qmv"):
+                inds_flat = inds.reshape(-1).astype(mx.uint32)
+                scores_flat = scores.reshape(-1).astype(mx.float32)
+                act = _fn.routed_nvfp4_swiglu_qmv(
+                    x.reshape(-1),
+                    self._kernel_plane,
+                    self._kernel_plane_scales,
+                    inds_flat,
+                )  # [8*512]
+                if (
+                    _fn.has_symbol("routed_nvfp4_down_reduce")
+                    and getattr(self, "_kernel_down_scales", None) is not None
+                ):
+                    y = _fn.routed_nvfp4_down_reduce(
+                        act,
+                        self._kernel_down,
+                        self._kernel_down_scales,
+                        inds_flat,
+                        scores_flat,
+                    )  # [2048] — includes the kernel's x2.5
+                    if self.routed_scaling_factor != 2.5:
+                        y = y * mx.array(
+                            self.routed_scaling_factor / 2.5, mx.float32)
+                else:
+                    y = self._moe_fused_forward(x, inds)
+            else:
+                y = self._moe_fused_forward(x, inds)
+        elif (
             _FUSED_ROUTED_GATE_UP
             and x.shape[1] == 1
             and inds.size < 64
