@@ -33,6 +33,9 @@ class _FakeMX:
     def eval(self, *values):
         self.events.append(("eval", values))
 
+    def synchronize(self):
+        self.events.append(("synchronize",))
+
     def clear_cache(self):
         self.events.append(("clear",))
 
@@ -55,12 +58,18 @@ def test_progressive_materializer_evaluates_fixed_then_each_layer_in_order():
     )
 
     assert layers == (0, 2)
+    # Every clear_cache is fenced by a synchronize: eval() only schedules the
+    # materialization, and recycling Metal buffers under in-flight kernels is
+    # a use-after-free on M3/M4.
     assert mx.events == [
         ("eval", ("embedding", "head")),
+        ("synchronize",),
         ("clear",),
         ("eval", ("layer-0",)),
+        ("synchronize",),
         ("clear",),
         ("eval", ("layer-2",)),
+        ("synchronize",),
         ("clear",),
     ]
     assert [item["phase"] for item in progress] == [
@@ -77,6 +86,9 @@ def test_fixed_phase_is_visible_before_large_fixed_weights_materialize():
     class TimelineMX:
         def eval(self, *values):
             timeline.append(("eval", values))
+
+        def synchronize(self):
+            timeline.append(("synchronize",))
 
         def clear_cache(self):
             timeline.append(("clear",))
@@ -230,6 +242,10 @@ def test_native_tensor_strategy_materializes_and_shards_one_layer_at_a_time():
     assert [layer.name for layer in model.model.layers] == ["zero", "one", "two"]
     assert [item["layers_loaded"] for item in progress] == [1, 2, 3]
     assert sum(event[0] == "clear" for event in mx.events) == 3
+    # Buffer recycling must never run under in-flight kernels.
+    for index, event in enumerate(mx.events):
+        if event[0] == "clear":
+            assert mx.events[index - 1] == ("synchronize",)
 
 
 def test_native_tensor_strategy_skips_read_only_forwarding_layer_property():

@@ -53,9 +53,11 @@ def materialize_parameters_progressively(
             }
         )
     _eval_values(mx_module, fixed)
+    mx_module.synchronize()
     mx_module.clear_cache()
     for loaded, index in enumerate(ordered, start=1):
         _eval_values(mx_module, layers[index])
+        mx_module.synchronize()
         mx_module.clear_cache()
         if progress is not None:
             progress(
@@ -216,6 +218,7 @@ def progressive_sharded_load(
                 }
             )
         _eval_values(mx_module, fixed)
+        mx_module.synchronize()
         mx_module.clear_cache()
         strategy = apply_tensor_strategy(
             model,
@@ -232,6 +235,7 @@ def progressive_sharded_load(
             if _layer_index(path) is None
         ]
         _eval_values(mx_module, sharded_fixed)
+        mx_module.synchronize()
         mx_module.clear_cache()
         if progress is not None:
             progress({"phase": "tensor_ready", "strategy": strategy})

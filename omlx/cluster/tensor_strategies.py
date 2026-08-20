@@ -150,6 +150,7 @@ def _native_layerwise_shard(
             owner.layers = [layer]
             model.shard(group)
             mx.eval(layer.parameters())
+            mx.synchronize()
             mx.clear_cache()
             _emit(
                 progress,
@@ -461,6 +462,7 @@ def _shard_qwen3_next(
                 mlp.up_proj, "all-to-sharded", group=group
             )
         mx.eval(layer.parameters())
+        mx.synchronize()
         mx.clear_cache()
         _emit(
             progress,
@@ -610,6 +612,7 @@ def _shard_nemotron_h(
                 )
             layer.mixer = _wrap_sharded_moe(mixer, group, mx)
         mx.eval(layer.parameters())
+        mx.synchronize()
         mx.clear_cache()
         _emit(
             progress,

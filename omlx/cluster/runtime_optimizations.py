@@ -419,6 +419,7 @@ def install_runtime_optimizations(
                     local_state.queue_prefill_sends = False
                 flush_prefill_sends()
                 mx.eval([cache.state for cache in instance.prompt_cache])
+                mx.synchronize()
                 mx.clear_cache()
         finally:
             local_state.queue_prefill_sends = False
@@ -430,6 +431,7 @@ def install_runtime_optimizations(
             for cache in instance.prompt_cache:
                 cache.finalize()
             mx.eval([cache.state for cache in instance.prompt_cache])
+            mx.synchronize()
             mx.clear_cache()
 
     def coordinator_generation_step(instance: Any) -> Any:
