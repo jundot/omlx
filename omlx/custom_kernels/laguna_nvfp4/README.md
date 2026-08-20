@@ -103,8 +103,13 @@ documented, per the laguna branch's established opt-in posture.
   (replace the gather-qmm routed path, with the 2.5 kernel scale compensated
   against the model's `moe_routed_scaling_factor`).
 
-Real-model decode A/B (256-token, Poolside pin): **12.27 vs 12.80 ms/tok
-(+4.3%)** with the routed+shared kernels on.
+Real-model decode A/B (256-token, Poolside pin, interleaved off/on to
+cancel thermal drift): **13.23 vs 13.26 ms/tok (−0.3%, within noise)** with
+the routed+shared kernels on — the fused kernels are correct (bit-exact /
+ULP) and individually faster on the shared-expert path (~1.05x isolated),
+but the end-to-end decode is dominated by the bf16 attention + the (not
+requantized) projection stream, so the integrated win is neutral at this
+scale. Reproduce with `tools/qwen38_mtp/bench_laguna_kernels.py`.
 
 ### Attention kernels: not directly wireable in omlx
 
