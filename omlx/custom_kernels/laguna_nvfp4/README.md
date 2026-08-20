@@ -43,10 +43,17 @@ case analysis).
 | `laguna_oproj_act_h*_v1_sc1_se1` | `lagunaGatedAffineOProjNVFP4Source` | ✅ bit-exact (h48/h64) |
 | `laguna_residual_rms_bf16_2048_v1` | `lagunaResidualRMSNormKernel` | ✅ bit-exact |
 | `laguna_decode_router_top8_v3/_norm_v2` | `lagunaDecodeRouterTop8KernelSource` | ✅ bit-exact |
+| `laguna_sliding_fused_attn_ring_v1` | `lagunaSlidingFusedAttentionKernel` | ✅ fast-exp ULP vs reference |
+| `laguna_residual_rms_router_bf16_2048_rpg8` | `lagunaResidualRMSNormRouterSource(8)` | ✅ bit-exact (4 outputs) |
+| `laguna_prefill_moe_tail_bf16_v1` | `lagunaPrefillMoETailKernel` | ✅ bit-exact |
 
-Not yet ported: the sliding fused-attention ring, the prefill family
-(moe_tail, router tournament/top8, qk_norm prefill), the residual-rms-router
-combo, and the LM-head prune family.
+Not yet ported (documented follow-up): the LM-head prune family
+(`LagunaLmHeadPrune.swift` — coarse int5 argmax + exact-winner threshold +
+sparse refine), the prefill router tournament/top8 + qk_norm prefill
+variants, the sorted moe_tail, the decode ordinal/tournament router
+variants, and the lane-major scale-bank variants of the QKV/o_proj kernels.
+These are draft-side or prefill-adjacent and do not change the decode hot
+path already covered.
 
 ## Correctness posture (important)
 
