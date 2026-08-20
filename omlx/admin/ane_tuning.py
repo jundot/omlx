@@ -116,6 +116,9 @@ class ANETuningRun:
     recommendation: dict[str, Any] | None = None
     error_message: str = ""
     termination_reason: str = ""
+    # Smallest gdn_fraction whose aligned ANE slice covers the z projection
+    # on the calibrated checkpoint; None when GDN is absent (issue #2899).
+    gdn_floor: float | None = None
     task: asyncio.Task | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -442,6 +445,11 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     settings.qwen35_ane_prefill_dual_ane = bool(
         getattr(base, "qwen35_ane_prefill_dual_ane", True)
     )
+    # The tuner reaches into the engine for the raw model and compares prompt
+    # throughput across slots, so it must stage the plain LM engine: a DFlash
+    # engine exposes no _model and would skew every measurement (issue #2914).
+    if hasattr(settings, "dflash_enabled"):
+        settings.dflash_enabled = False
     return settings
 
 
@@ -669,7 +677,32 @@ def _balanced_fractions(
     ]
 
 
-def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candidate:
+def _min_viable_gdn_fraction(patch: Any, gdn: Any, alignment: int) -> float | None:
+    """Smallest gdn_fraction that engages the ANE on ``gdn``.
+
+    Mirrors the bank rule: the aligned slice ``(int(total * f) // alignment)
+    * alignment`` must cover the z projection, otherwise every GDN layer is
+    rejected and 0 procedures compile, silently (issue #2899).
+    """
+    qkv, z, _, _ = patch._gdn_linears(gdn)
+    z_outputs = int(z.weight.shape[0])
+    total = z_outputs + int(qkv.weight.shape[0])
+    if total <= 0:
+        return None
+    ane_min = ((z_outputs + alignment - 1) // alignment) * alignment
+    if ane_min > total:
+        return None
+    fraction = ane_min / total
+    if (int(total * fraction) // alignment) * alignment < ane_min:
+        fraction = (ane_min + 1) / total
+    return fraction
+
+
+def _profile_refinement(
+    candidate: _Candidate,
+    result: dict[str, Any],
+    gdn_floor: float | None = None,
+) -> _Candidate:
     """Use full-model branch completion rates for one bounded correction."""
     profile = result.get("_profile") or {}
     mlp = profile.get("mlp") or {}
@@ -724,9 +757,14 @@ def _profile_refinement(candidate: _Candidate, result: dict[str, Any]) -> _Candi
         gpu_time = float(gdn.get("gpu_completion_ns", 0.0)) / gdn_ops
         widths = [float(gdn_fraction)]
         times = [ane_time]
-        choices = [
-            sorted(set([*_gdn_fraction_grid(), 0.465, 0.55]))
-        ]
+        # Below the structural floor a fraction compiles 0 GDN procedures at
+        # apply time, so the refinement must not pick one (issue #2899).
+        gdn_grid = sorted(
+            set([*_gdn_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.53, 0.55])
+        )
+        if gdn_floor is not None:
+            gdn_grid = [value for value in gdn_grid if value >= gdn_floor]
+        choices = [gdn_grid or [float(gdn_fraction)]]
         if cpu_gdn_fraction > 0:
             widths.append(cpu_gdn_fraction)
             times.append(float(gdn.get("cpu_completion_ns", 0.0)) / gdn_ops)
@@ -1575,6 +1613,10 @@ def _calibrate_components_sync(
         if run.request.allow_ane_gdn
         else None
     )
+    if gdn is not None:
+        run.gdn_floor = _min_viable_gdn_fraction(
+            patch, gdn, 128 if dual_ane else 64
+        )
 
     gate = mlp.gate_proj
     down = mlp.down_proj
@@ -1948,6 +1990,11 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         )
         active_slot = _GATE_SLOT
         choice = await _calibrate_components(run, engine, base_settings)
+        # Release the calibration engine before staging the verify engine:
+        # this local reference kept the full model alive across the reload,
+        # doubling residency and OOMing 48 GB machines at the verify slot
+        # (issue #2908).
+        engine = None
 
         candidate = _Candidate(
             label="Predicted optimum",
@@ -1967,7 +2014,11 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             run, _VERIFY_SLOT, engine_pool, base_settings, candidate
         )
 
-        profiled = _profile_refinement(candidate, run.results[_VERIFY_SLOT])
+        profiled = _profile_refinement(
+            candidate,
+            run.results[_VERIFY_SLOT],
+            gdn_floor=run.gdn_floor,
+        )
         gdn_profile_changed = any(
             getattr(profiled, name) != getattr(candidate, name)
             for name in ("gdn_fraction", "cpu_gdn_fraction")
@@ -2063,11 +2114,29 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             or best["speedup_percent"] < 1.0
         ):
             best = baseline_result
+        # The persisted recommendation must match what actually ran: when the
+        # winning slot's profile proves GDN executed 0 operations (while MLP
+        # profiling worked), gdn_enabled would only mislead (issue #2899).
+        gdn_enabled = bool(best["gdn_enabled"])
+        gdn_fraction = best["gdn_fraction"]
+        profile = best.get("_profile") or {}
+        mlp_ops = float((profile.get("mlp") or {}).get("operations", 0) or 0)
+        gdn_ops = float((profile.get("gdn") or {}).get("operations", 0) or 0)
+        if gdn_enabled and mlp_ops > 0 and gdn_ops <= 0:
+            logger.warning(
+                "ANE tuner: recommended slot ran 0 GDN operations "
+                "(gdn_fraction=%s is below this model's floor %s); "
+                "persisting the recommendation with GDN disabled",
+                gdn_fraction,
+                run.gdn_floor,
+            )
+            gdn_enabled = False
+            gdn_fraction = None
         run.recommendation = {
             "enabled": bool(best["enabled"]),
             "mlp_fraction": best["mlp_fraction"],
-            "gdn_enabled": bool(best["gdn_enabled"]),
-            "gdn_fraction": best["gdn_fraction"],
+            "gdn_enabled": gdn_enabled,
+            "gdn_fraction": gdn_fraction,
             "cpu_enabled": bool(best.get("cpu_enabled", False)),
             "cpu_fraction": best.get("cpu_fraction"),
             "cpu_down_fraction": best.get("cpu_down_fraction"),

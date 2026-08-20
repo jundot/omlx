@@ -1899,7 +1899,7 @@ def _bank_chunk_spans(
     start = 0
     span_bytes = 0
     for index, weight in enumerate(weights):
-        nbytes = weight.nbytes
+        nbytes = getattr(weight, "nbytes", weight)
         if index > start and span_bytes + nbytes > max_bytes:
             spans.append((start, index))
             start = index
@@ -1909,10 +1909,9 @@ def _bank_chunk_spans(
     return spans
 
 
-def _compile_dual_banks(
-    weights0: list[mx.array],
-    weights1: list[mx.array],
-    sequence_length: int,
+def _bank_split_ladder(
+    source_bytes: list[int],
+    compile_span: Any,
 ) -> tuple[list[Any], list[Any], int] | None:
     """Compile the two instance-pinned procedure banks with a split ladder.
 
@@ -1923,14 +1922,14 @@ def _compile_dual_banks(
     program-create under the window while per-eval mapping pages between
     them, matching the behaviour that lets the per-layer path work there.
 
-    Returns ``(models0, models1, resident_program_count)``, or ``None`` when
-    every attempt failed and the caller should use the per-layer fallback.
+    ``compile_span(start, stop)`` compiles that span for both instances and
+    returns ``(models0, models1)``. Returns ``(models0, models1,
+    resident_program_count)``, or ``None`` when every attempt failed and the
+    caller should use the per-layer fallback.
     ``OMLX_QWEN35_ANE_BANK_MAX_BYTES`` forces an initial per-bank byte cap.
     The cap counts the packed source weights handed to the bank compiler,
     which run about four times the compiled INT8 program size.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
-
     cap = 0
     raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
     if raw:
@@ -1940,27 +1939,22 @@ def _compile_dual_banks(
             logger.warning(
                 "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
             )
-    total_bytes = sum(weight.nbytes for weight in weights0)
-    largest_bytes = max((weight.nbytes for weight in weights0), default=0)
+    total_bytes = sum(source_bytes)
+    largest_bytes = max(source_bytes, default=0)
 
     for _ in range(4):
         spans = (
-            [(0, len(weights0))] if cap <= 0 else _bank_chunk_spans(weights0, cap)
+            [(0, len(source_bytes))]
+            if cap <= 0
+            else _bank_chunk_spans(source_bytes, cap)
         )
         try:
             models0: list[Any] = []
             models1: list[Any] = []
             for start, stop in spans:
-                models0.extend(
-                    fast.qwen35_ane_compile_linear_bank(
-                        weights0[start:stop], sequence_length, 1
-                    )
-                )
-                models1.extend(
-                    fast.qwen35_ane_compile_linear_bank(
-                        weights1[start:stop], sequence_length, 2
-                    )
-                )
+                span0, span1 = compile_span(start, stop)
+                models0.extend(span0)
+                models1.extend(span1)
         except Exception:
             # Drop banks that loaded before the failure so their device
             # mappings are released before the smaller retry.
@@ -1969,7 +1963,7 @@ def _compile_dual_banks(
                 "ANE procedure bank compilation failed (%d banks per "
                 "instance, %d procedures, %.2f GiB per instance)",
                 len(spans),
-                len(weights0),
+                len(source_bytes),
                 total_bytes / (1 << 30),
                 exc_info=True,
             )
@@ -1994,7 +1988,7 @@ def _compile_dual_banks(
         if len(spans) > 1:
             logger.info(
                 "Compiled %d ANE procedures into %d split banks per instance",
-                len(weights0),
+                len(source_bytes),
                 len(spans),
             )
         return models0, models1, 2 * len(spans)
@@ -2003,6 +1997,32 @@ def _compile_dual_banks(
         "Packed dual-ANE compilation failed; falling back to per-layer programs"
     )
     return None
+
+
+def _compile_dual_banks(
+    weights0: list[mx.array],
+    weights1: list[mx.array],
+    sequence_length: int,
+) -> tuple[list[Any], list[Any], int] | None:
+    """Compile the dual banks from fully staged fp32 slices.
+
+    Kept for the calibration path and stale extensions; the production
+    enable path streams slices through the incremental builder instead
+    (issue #2781). See :func:`_bank_split_ladder` for the retry contract.
+    """
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    return _bank_split_ladder(
+        [int(weight.nbytes) for weight in weights0],
+        lambda start, stop: (
+            fast.qwen35_ane_compile_linear_bank(
+                weights0[start:stop], sequence_length, 1
+            ),
+            fast.qwen35_ane_compile_linear_bank(
+                weights1[start:stop], sequence_length, 2
+            ),
+        ),
+    )
 
 
 def _compile_single_banks(
@@ -2128,8 +2148,8 @@ def _enable_dual_procedure_banks(
     ):
         return None
 
-    prepared_mlps: list[tuple[Any, _CombinedMLPState, mx.array, mx.array]] = []
-    prepared_gdns: list[tuple[Any, _CombinedGDNState, mx.array, mx.array]] = []
+    prepared_mlps: list[tuple[Any, _CombinedMLPState]] = []
+    prepared_gdns: list[tuple[Any, _CombinedGDNState]] = []
     gdn_config = _AneGDNConfig(
         config.sequence_length,
         gdn_fraction,
@@ -2140,6 +2160,45 @@ def _enable_dual_procedure_banks(
         cpu_shared_resource=config.cpu_shared_resource,
     )
     with _COMPILE_LOCK:
+        # Incremental staging (issue #2781): with the native builder each fp32
+        # slice is handed over as soon as its layer is prepared and released
+        # right away, so the peak fp32 staging is one layer instead of every
+        # layer at once (~16 GiB on a 27B). The builder retains quarter-size
+        # INT8 chunks and the split ladder recompiles spans from those chunks
+        # without touching the fp32 sources. A stale extension without the
+        # builder falls back to the previous hold-everything path.
+        builder0 = builder1 = None
+        if fast.has_symbol("AneLinearBankBuilder"):
+            try:
+                builder0 = fast.qwen35_ane_linear_bank_builder(
+                    config.sequence_length
+                )
+                builder1 = fast.qwen35_ane_linear_bank_builder(
+                    config.sequence_length
+                )
+            except Exception:
+                logger.debug(
+                    "ANE bank builder unavailable; staging all slices at once"
+                )
+                builder0 = builder1 = None
+        weights0: list[mx.array] = []
+        weights1: list[mx.array] = []
+        source_bytes: list[int] = []
+
+        def _stage(dense0: mx.array, dense1: mx.array) -> None:
+            source_bytes.append(int(dense0.nbytes))
+            if builder0 is not None:
+                # The builder reads the raw fp32 buffers from C++, outside
+                # MLX's own accessors, so make the GPU writes fully visible
+                # before handing the pointers over.
+                mx.eval(dense0, dense1)
+                mx.synchronize()
+                builder0.add(dense0)
+                builder1.add(dense1)
+            else:
+                weights0.append(dense0)
+                weights1.append(dense1)
+
         for module in mlp_candidates:
             try:
                 prepared = _prepare_pair_for_bank(module, config)
@@ -2151,7 +2210,8 @@ def _enable_dual_procedure_banks(
                 continue
             if prepared is not None:
                 state, dense0, dense1 = prepared
-                prepared_mlps.append((module, state, dense0, dense1))
+                _stage(dense0, dense1)
+                prepared_mlps.append((module, state))
 
         if gdn and gdn_max_layers:
             for module in model.modules() if hasattr(model, "modules") else ():
@@ -2169,7 +2229,8 @@ def _enable_dual_procedure_banks(
                     continue
                 if prepared is not None:
                     state, dense0, dense1 = prepared
-                    prepared_gdns.append((module, state, dense0, dense1))
+                    _stage(dense0, dense1)
+                    prepared_gdns.append((module, state))
 
         try:
             down_layer_stride = max(
@@ -2180,7 +2241,7 @@ def _enable_dual_procedure_banks(
             down_layer_stride = 1
         down_entries = [
             (index, state.down_ane)
-            for index, (_, state, _, _) in enumerate(prepared_mlps)
+            for index, (_, state) in enumerate(prepared_mlps)
             if state.down_ane is not None and index % down_layer_stride == 0
         ]
         combine_down = bool(
@@ -2190,22 +2251,14 @@ def _enable_dual_procedure_banks(
             ).strip().lower()
             in ("1", "true", "on")
         )
-        down_by_mlp = dict(down_entries)
-        procedure_entries: list[tuple[str, int]] = []
-        weights0: list[mx.array] = []
-        weights1: list[mx.array] = []
-        for index, (_, _state, dense0, dense1) in enumerate(prepared_mlps):
-            procedure_entries.append(("mlp", index))
-            weights0.append(dense0)
-            weights1.append(dense1)
-            if combine_down and index in down_by_mlp:
+        procedure_entries: list[tuple[str, int]] = [
+            *(("mlp", index) for index in range(len(prepared_mlps))),
+            *(("gdn", index) for index in range(len(prepared_gdns))),
+        ]
+        if combine_down:
+            for index, down_state in down_entries:
+                _stage(down_state.compile_weight0, down_state.compile_weight1)
                 procedure_entries.append(("down", index))
-                weights0.append(down_by_mlp[index].compile_weight0)
-                weights1.append(down_by_mlp[index].compile_weight1)
-        for index, (_, _, dense0, dense1) in enumerate(prepared_gdns):
-            procedure_entries.append(("gdn", index))
-            weights0.append(dense0)
-            weights1.append(dense1)
         separate_down_entries = [] if combine_down else down_entries
         down_weights0 = [
             state.compile_weight0 for _, state in separate_down_entries
@@ -2222,10 +2275,22 @@ def _enable_dual_procedure_banks(
                 "falling back to per-layer programs"
             )
             return None
-        mx.eval(*weights0, *weights1)
-        banked_models = _compile_dual_banks(
-            weights0, weights1, config.sequence_length
-        )
+        if builder0 is not None:
+            banked_models = _bank_split_ladder(
+                source_bytes,
+                lambda start, stop: (
+                    builder0.compile(1, start, stop),
+                    builder1.compile(2, start, stop),
+                ),
+            )
+        else:
+            mx.eval(*weights0, *weights1)
+            banked_models = _compile_dual_banks(
+                weights0, weights1, config.sequence_length
+            )
+        weights0 = []
+        weights1 = []
+        builder0 = builder1 = None
         if banked_models is None:
             return None
         models0, models1, resident_program_count = banked_models
@@ -2247,19 +2312,20 @@ def _enable_dual_procedure_banks(
             else:
                 down_models0, down_models1, down_programs = down_banks
                 resident_program_count += down_programs
+        down_weights0 = []
+        down_weights1 = []
 
         if len(models0) != len(procedure_entries) or len(models1) != len(
             procedure_entries
         ):
             raise RuntimeError("ANE procedure bank returned an incomplete model list")
-        _warm_ane_models([*models0, *models1, *down_models0, *down_models1])
 
         selected_down_layers = {index for index, _ in down_entries}
         assigned_mlp_states = [
             state
             if index in selected_down_layers
             else replace(state, down_ane=None)
-            for index, (_, state, _, _) in enumerate(prepared_mlps)
+            for index, (_, state) in enumerate(prepared_mlps)
         ]
         assigned_gdn_states = [entry[1] for entry in prepared_gdns]
         if config.ane_down_fraction > 0 and not down_entries:
@@ -2309,21 +2375,162 @@ def _enable_dual_procedure_banks(
                 down_ane=down_state,
             )
 
-        for (module, _, _, _), state in zip(
+        for (module, _), state in zip(
             prepared_mlps, assigned_mlp_states, strict=True
         ):
             module._omlx_ane_prefill_config = config
             module._omlx_ane_prefill_state = state
-        for (module, _, _, _), state in zip(
+        for (module, _), state in zip(
             prepared_gdns, assigned_gdn_states, strict=True
         ):
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
 
+        # Pay every procedure's first-evaluation cost now, while the model is
+        # still loading, so the first user request measures inference rather
+        # than ANE warmup. Guarded per-model so an older compiled extension
+        # without warmup() degrades to the previous behavior instead of
+        # failing the load.
+        # A warmup failure latches ANE off for the owning module right here.
+        # The per-module flag is checked at graph construction, which is the
+        # only place the failure can still be intercepted: by evaluation time
+        # the sticky per-procedure error re-raises inside the scheduler and
+        # fails every request instead of falling back (#2940). Remaining
+        # procedures keep warming, so one broken procedure costs one module
+        # its ANE path rather than taking down the request path.
+        warm_start = time.perf_counter()
+        warmed = 0
+        disabled = 0
+        for procedure, (kind, index) in enumerate(procedure_entries):
+            module = (
+                prepared_gdns[index][0]
+                if kind == "gdn"
+                else prepared_mlps[index][0]
+            )
+            try:
+                for warm_model in (models0[procedure], models1[procedure]):
+                    warmup = getattr(warm_model, "warmup", None)
+                    if warmup is None:
+                        continue
+                    warmup()
+                    warmed += 1
+            except Exception:
+                if kind == "gdn":
+                    module._omlx_ane_gdn_failed = True
+                else:
+                    module._omlx_ane_prefill_failed = True
+                disabled += 1
+                logger.warning(
+                    "ANE warmup failed for procedure %d; disabling ANE for "
+                    "its %s module and continuing",
+                    procedure,
+                    "GDN" if kind == "gdn" else "MLP",
+                    exc_info=True,
+                )
+        for procedure, (index, _) in enumerate(separate_down_entries):
+            module = prepared_mlps[index][0]
+            try:
+                for warm_model in (
+                    down_models0[procedure],
+                    down_models1[procedure],
+                ):
+                    warmup = getattr(warm_model, "warmup", None)
+                    if warmup is None:
+                        continue
+                    warmup()
+                    warmed += 1
+            except Exception:
+                module._omlx_ane_prefill_failed = True
+                disabled += 1
+                logger.warning(
+                    "ANE down warmup failed for procedure %d; disabling ANE "
+                    "for its MLP module and continuing",
+                    procedure,
+                    exc_info=True,
+                )
+        if disabled:
+            logger.warning(
+                "Disabled ANE on %d of %d modules after warmup failures; "
+                "they fall back to GPU",
+                disabled,
+                procedure_count,
+            )
+        if warmed:
+            logger.info(
+                "Warmed %d ANE procedures in %.1fs at load",
+                warmed,
+                time.perf_counter() - warm_start,
+            )
+
+        # When CPU sharing is on, the first dispatch additionally pays BNNS
+        # setup and the first touch of the eagerly dequantized FP16 CPU rows,
+        # which measured as a collapsed first request (prefill and decode).
+        # One dummy chunk per shared module moves that cost to load time; the
+        # merged output is discarded. Same soft-failure contract as above.
+        cpu_mlps = [
+            module
+            for module, state in prepared_mlps
+            if getattr(state, "cpu_outputs", 0)
+            or getattr(state, "down_cpu", None) is not None
+        ]
+        cpu_gdns = [
+            module
+            for module, state in prepared_gdns
+            if getattr(state, "cpu_outputs", 0)
+        ]
+        if cpu_mlps or cpu_gdns:
+            warm_start = time.perf_counter()
+            warmed = 0
+            inputs: dict[int, mx.array] = {}
+
+            def _warm_input(linear: Any) -> mx.array:
+                dim = int(linear.weight.shape[1]) * 32 // int(linear.bits)
+                x = inputs.get(dim)
+                if x is None:
+                    x = mx.zeros(
+                        (1, config.sequence_length, dim), dtype=linear.scales.dtype
+                    )
+                    mx.eval(x)
+                    inputs[dim] = x
+                return x
+
+            try:
+                for module in cpu_mlps:
+                    out = _backend(module, _warm_input(module.gate_proj))
+                    if out is not None:
+                        mx.eval(out)
+                        warmed += 1
+                for module in cpu_gdns:
+                    out = _gdn_backend(module, _warm_input(module.in_proj_qkv))
+                    if out is not None:
+                        mx.eval(*out)
+                        warmed += 1
+            except Exception:
+                logger.warning(
+                    "CPU sharing warmup failed after %d modules; continuing, "
+                    "the runtime failure latch handles broken modules at "
+                    "first use",
+                    warmed,
+                    exc_info=True,
+                )
+            if warmed:
+                logger.info(
+                    "Warmed the CPU sharing path on %d modules in %.1fs at load",
+                    warmed,
+                    time.perf_counter() - warm_start,
+                )
+
     model._omlx_ane_down_prefill_count = sum(
         state.down_ane is not None for state in assigned_mlp_states
     )
+
+    # Return the staging buffers to the OS now that compilation and warmup
+    # are done. Synchronize first so no in-flight command buffer still
+    # references a cached allocation (the issue #300 recipe); this runs on
+    # the MLX executor thread like the engine pool's own calls (issue #2781).
+    mx.synchronize()
+    mx.clear_cache()
 
     return (
         len(prepared_mlps),
@@ -2887,6 +3094,32 @@ def enable_qwen35_ane_prefill(
             "the whole model runs prefill on GPU"
         )
     return count
+
+
+def ane_prefill_transient_bytes(model: Any) -> int:
+    """Bytes of fp16 ANE I/O surfaces held by ``model``'s compiled slices.
+
+    Every compiled procedure owns a fixed-shape input and output IOSurface of
+    ``dim * sequence_length * 2`` bytes, allocated at compile time and dirtied
+    at first use, which is exactly the first-request spike of issue #2841.
+    Reads the dims off the live native models, so packing, dual splits, and
+    partial banks are all accounted exactly. 0 when no ANE slice is attached.
+    """
+    total = 0
+    for module in model.modules() if hasattr(model, "modules") else ():
+        for state_attr in ("_omlx_ane_prefill_state", "_omlx_ane_gdn_state"):
+            state = getattr(module, state_attr, None)
+            if state is None:
+                continue
+            for ane_model in (state.model, getattr(state, "model1", None)):
+                input_dim = getattr(ane_model, "input_dim", 0)
+                output_dim = getattr(ane_model, "output_dim", 0)
+                seq = getattr(ane_model, "sequence_length", 0)
+                try:
+                    total += (int(input_dim) + int(output_dim)) * int(seq) * 2
+                except (TypeError, ValueError):
+                    continue
+    return total
 
 
 def qwen35_ane_prefill_status(model: Any) -> dict:

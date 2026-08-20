@@ -6,6 +6,7 @@ import stat
 import pytest
 
 from omlx.cluster.enrollment import (
+    JOIN_SESSION_TTL_SECONDS,
     ClusterEnrollmentStore,
     EnrolledNode,
     EnrollmentError,
@@ -71,6 +72,27 @@ def test_join_key_is_single_use_and_status_never_returns_the_secret(tmp_path):
         )
 
 
+def test_default_join_key_survives_fresh_worker_prerequisite_install(tmp_path):
+    clock = _Clock()
+    store = ClusterEnrollmentStore(tmp_path, clock=clock)
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+    )
+
+    clock.now += 15 * 60
+
+    _, session = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+    assert session.node_id == "cuda-worker-1-machine"
+
+
 def test_expired_join_key_and_session_fail_closed(tmp_path):
     clock = _Clock()
     store = ClusterEnrollmentStore(tmp_path, clock=clock)
@@ -104,9 +126,30 @@ def test_expired_join_key_and_session_fail_closed(tmp_path):
         ssh_port=22,
         addresses=("10.42.0.21",),
     )
-    clock.now += 1201
+    clock.now += JOIN_SESSION_TTL_SECONDS + 1
     with pytest.raises(EnrollmentError, match="invalid or expired"):
         store.authorize_session(raw_session)
+
+
+def test_claim_session_outlives_an_allowed_worker_dependency_install(tmp_path):
+    clock = _Clock()
+    store = ClusterEnrollmentStore(tmp_path, clock=clock)
+    raw_key, _ = store.issue_join_key(
+        controller_url="http://10.42.0.10:8000",
+        source_digest="a" * 64,
+    )
+    raw_session, session = store.claim(
+        raw_key,
+        node_id="cuda-worker-1-machine",
+        hostname="cuda-worker-1",
+        ssh_user="omlxworker",
+        ssh_port=22,
+        addresses=("10.42.0.21",),
+    )
+
+    clock.now += 90 * 60
+
+    assert store.authorize_session(raw_session) == session
 
 
 def test_completion_is_bound_to_claimed_worker_identity(tmp_path):

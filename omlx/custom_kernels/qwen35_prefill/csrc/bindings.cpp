@@ -63,6 +63,24 @@ NB_MODULE(_ext, m) {
           "warmup",
           &omlx::qwen35_prefill_kernels::AneLinearModel::warmup,
           nb::call_guard<nb::gil_scoped_release>());
+  nb::class_<omlx::qwen35_prefill_kernels::AneLinearBankBuilder>(
+      m, "AneLinearBankBuilder")
+      .def(nb::init<int>(), "sequence_length"_a)
+      .def(
+          "add",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::add,
+          "weight"_a,
+          nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro(
+          "size",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::size)
+      .def(
+          "compile",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::compile,
+          "ane_instance"_a,
+          "start"_a,
+          "stop"_a,
+          nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_linear",
       static_cast<std::shared_ptr<

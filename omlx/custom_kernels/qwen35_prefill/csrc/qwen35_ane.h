@@ -49,6 +49,7 @@ private:
   explicit AneLinearModel(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 
+  friend class AneLinearBankBuilder;
   friend std::shared_ptr<AneLinearModel>
   qwen35_ane_compile_linear(const mlx::core::array &, int, int);
   friend std::vector<std::shared_ptr<AneLinearModel>>
@@ -64,6 +65,29 @@ private:
       const std::vector<mlx::core::array> &,
       const std::vector<mlx::core::array> &,
       const std::vector<mlx::core::array> &, int, int);
+};
+
+// Incremental builder for one instance-pinned procedure bank. add() converts
+// a fp32 slice to the INT8 program format immediately, so the caller can
+// release each staging array before preparing the next layer instead of
+// holding every slice until compile time (issue #2781, ~16 GiB on a 27B).
+// compile() assembles and loads one program from the stored chunks
+// [start, stop), which lets the split-ladder retry without the fp32 sources.
+class AneLinearBankBuilder {
+public:
+  explicit AneLinearBankBuilder(int sequence_length);
+  ~AneLinearBankBuilder();
+  AneLinearBankBuilder(const AneLinearBankBuilder &) = delete;
+  AneLinearBankBuilder &operator=(const AneLinearBankBuilder &) = delete;
+
+  void add(const mlx::core::array &weight);
+  int size() const;
+  std::vector<std::shared_ptr<AneLinearModel>>
+  compile(int ane_instance, int start, int stop);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 bool qwen35_ane_available();

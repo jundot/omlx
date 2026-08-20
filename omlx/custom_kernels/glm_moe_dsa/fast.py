@@ -90,6 +90,14 @@ def _probe_mask_fold(ext) -> bool:
 _EXT_MASK_FOLD = _probe_mask_fold(_ext)
 
 
+def _probe_mma_score(ext) -> bool:
+    """True iff the built extension exposes the v25 M2 MMA score kernel."""
+    return getattr(ext, "dsa_indexer_scores_mma", None) is not None
+
+
+_EXT_MMA_SCORE = _probe_mma_score(_ext)
+
+
 NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
@@ -139,6 +147,39 @@ def _native_stream_kwargs(stream) -> dict[str, object]:
     if isinstance(stream, mx.DeviceType):
         stream = None
     return {"stream": stream}
+
+
+def dsa_indexer_scores_mma(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    mask_ratio: int = 0,
+    mask_q_offset: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """v25 M2 from-scratch MMA indexer scores (~1.37x over the Steel kernel).
+
+    Serves ONLY bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal;
+    the extension raises on anything else — callers gate and fall back to
+    ``dsa_indexer_scores``. Same fused pooled-ratio mask semantics
+    (``mask_ratio``/``mask_q_offset``) and bit-exact output vs the Steel
+    kernel. No slow-path fallback: requires a local extension build that
+    exposes the symbol (probe with ``_EXT_MMA_SCORE``).
+    """
+    if not (_ext is not None and _EXT_MMA_SCORE):
+        raise RuntimeError(
+            "dsa_indexer_scores_mma requires a local extension build that "
+            "exposes the v25 MMA score kernel"
+        )
+    return _ext.dsa_indexer_scores_mma(
+        queries,
+        keys,
+        weights,
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def dsa_indexer_scores(

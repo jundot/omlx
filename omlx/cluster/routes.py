@@ -151,7 +151,7 @@ class ClusterJoinKeyRequest(BaseModel):
     controller_ip: str = Field(min_length=2, max_length=64)
     controller_port: int = Field(ge=1, le=65535)
     scheme: Literal["http", "https"] = "http"
-    ttl_seconds: int = Field(default=600, ge=30, le=600)
+    ttl_seconds: int = Field(default=1800, ge=30, le=1800)
 
 
 class ClusterWorkerClaimRequest(BaseModel):
@@ -2202,20 +2202,27 @@ async def cluster_ssh_key():
 
 
 @router.post("/ssh-key/generate")
-async def cluster_generate_ssh_key():
-    """Generate a new SSH key pair for cluster authentication."""
+async def cluster_generate_ssh_key(
+    overwrite: bool = Query(default=False),
+):
+    """Create the managed SSH key, rotating it only when explicitly requested."""
 
     from .ssh_keys import generate_ssh_key_pair
 
     try:
-        key_pair = await asyncio.to_thread(generate_ssh_key_pair, overwrite=True)
+        key_pair = await asyncio.to_thread(
+            generate_ssh_key_pair,
+            overwrite=overwrite,
+        )
         return {
             "success": True,
+            "available": True,
             "key_type": key_pair.key_type,
             "fingerprint": key_pair.fingerprint,
             "public_key": key_pair.public_key,
             "private_key_path": str(key_pair.private_key_path),
             "public_key_path": str(key_pair.public_key_path),
+            "created_at": key_pair.created_at,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

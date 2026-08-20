@@ -26,6 +26,7 @@ import logging
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -1035,7 +1036,24 @@ class GlobalSettings:
                 )
 
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse settings file {path}: {e}")
+            # A corrupt settings file silently reverting the server to
+            # defaults is security-relevant (auth.api_key lives here), so
+            # preserve the evidence and be loud instead of a debug-level shrug.
+            backup = path.with_name(
+                f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            )
+            try:
+                os.replace(path, backup)
+                logger.error(
+                    f"Settings file {path} is corrupt ({e}); moved it to "
+                    f"{backup} and continuing with defaults. Restore it or "
+                    "reconfigure, otherwise API-key auth may be disabled."
+                )
+            except OSError:
+                logger.error(
+                    f"Settings file {path} is corrupt ({e}) and could not be "
+                    "moved aside; continuing with defaults."
+                )
         except OSError as e:
             logger.warning(f"Failed to read settings file {path}: {e}")
 
@@ -1342,18 +1360,29 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        # Write to a temp file and rename so a crash or a concurrent
+        # writer can never leave a torn settings.json (same pattern as
+        # ModelSettingsManager._save). The rename also carries the temp
+        # file's 0o600 mode onto the destination. The temp name embeds the
+        # pid: with a shared name, two processes saving at once interleave
+        # inside the same temp file and the rename publishes the mix.
+        temp_file = settings_file.with_name(
+            f"{settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            if os.name == "posix" and settings_file.exists():
-                settings_file.chmod(0o600)
             with os.fdopen(
-                os.open(settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
                 "w",
                 encoding="utf-8",
             ) as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, settings_file)
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def save_cli_overrides(self, args: Any) -> None:

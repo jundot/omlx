@@ -12184,6 +12184,8 @@ class Scheduler:
                 return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
             if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+                from .memory_monitor import _ane_prefill_transient_bytes
+
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
@@ -12197,6 +12199,11 @@ class Scheduler:
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
                     prefill_memory_profile=prefill_memory_profile,
+                    # ANE prefill holds fixed-shape I/O surfaces the first
+                    # long prompt dirties on top of KV+SDPA (issue #2841).
+                    ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
+                        self.model
+                    ),
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
@@ -12415,13 +12422,27 @@ class Scheduler:
             # happy path here is ``has_model_info() is True``; this
             # else branch only fires for skeletal test fixtures.
             if self.memory_monitor is not None and self.memory_monitor.has_model_info():
-                # ``estimate_block_memory(1)`` returns all-layers K+V
-                # bytes for a single token at the dtype the monitor was
-                # configured with — exactly the per-token cost the
-                # queue cap needs to weigh.
-                expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
-                    1
+                # ``estimate_block_memory(1)`` returns the per-token K+V
+                # bytes for the layers that actually retain KV state at the
+                # dtype the monitor was configured with. Recurrent layers
+                # keep fixed state and must not inflate the block estimate.
+                # A rotating-only or ArraysCache-only layout therefore has a
+                # legitimate zero estimate; it is not a safe queue-sizing
+                # value because the cap formula would treat every block as a
+                # one-byte payload and select the 256-entry ceiling.
+                estimated_kv_bytes_per_token = (
+                    self.memory_monitor.estimate_block_memory(1)
                 )
+                expected_kv_bytes_per_token = (
+                    estimated_kv_bytes_per_token
+                    if estimated_kv_bytes_per_token > 0
+                    else 200_000  # PagedSSDCacheManager default
+                )
+                if estimated_kv_bytes_per_token <= 0:
+                    logger.debug(
+                        "No per-token KV layers detected; using the "
+                        "PagedSSDCacheManager default for pending-write sizing"
+                    )
             else:
                 expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
 

@@ -52,6 +52,11 @@ class _MLP(nn.Module):
         )
 
 
+def _no_bank_builder(sequence_length):
+    """Force the pre-builder staging path regardless of the built extension."""
+    raise RuntimeError("bank builder disabled for this test")
+
+
 class _Model(nn.Module):
     def __init__(self, count):
         super().__init__()
@@ -650,6 +655,9 @@ def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
 def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -720,6 +728,9 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -768,6 +779,9 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -798,6 +812,9 @@ def test_enable_env_cap_forces_split_banks(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "1")
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -827,6 +844,9 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
 
@@ -2244,6 +2264,9 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 def test_enable_survives_warmup_failure(monkeypatch, caplog):
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
 
@@ -2284,3 +2307,223 @@ def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
         fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
     )
     assert ane_patch._prepare_cpu_linear(linear, 0.25) is not None
+
+
+def test_enable_warms_the_cpu_sharing_path(monkeypatch):
+    """CPU-shared modules get one dummy dispatch at load, not at first use."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda weights, sequence_length, ane_instance: [object() for _ in weights],
+    )
+    warmed = []
+    monkeypatch.setattr(
+        ane_patch, "_backend", lambda module, x: warmed.append(module) or mx.zeros(1)
+    )
+
+    model = _Model(2)
+    for layer in model.layers:
+        for linear in (layer.gate_proj, layer.up_proj, layer.down_proj):
+            linear.scales = linear.scales.astype(mx.float16)
+            linear.biases = linear.biases.astype(mx.float16)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=2,
+        dual_ane=True,
+        cpu_fraction=0.25,
+    )
+
+    assert count == 2
+    assert {id(m) for m in warmed} == {id(layer) for layer in model.layers}
+
+    # Without a CPU share the dummy dispatch must not run.
+    warmed.clear()
+    plain = _Model(2)
+    count = ane_patch.enable_qwen35_ane_prefill(
+        plain,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=2,
+        dual_ane=True,
+    )
+    assert count == 2
+    assert warmed == []
+
+
+# --- ANE prefill transient memory estimate (issue #2841) ---
+
+
+def test_ane_prefill_transient_bytes_reads_live_model_dims():
+    """The estimate sums (input + output) * seq * 2 over the compiled models."""
+    seq = 2048
+
+    def _ane_model(input_dim, output_dim):
+        return SimpleNamespace(
+            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+        )
+
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_state=SimpleNamespace(
+            model=_ane_model(5120, 4608), model1=_ane_model(5120, 4608)
+        )
+    )
+    gdn = SimpleNamespace(
+        _omlx_ane_gdn_state=SimpleNamespace(
+            model=_ane_model(5120, 768), model1=None
+        )
+    )
+    model = SimpleNamespace(modules=lambda: [mlp, gdn, SimpleNamespace()])
+
+    expected = 2 * (5120 + 4608) * seq * 2 + (5120 + 768) * seq * 2
+    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+
+
+def test_ane_prefill_transient_bytes_zero_without_ane():
+    """A model with no compiled ANE slice reserves nothing."""
+    assert ane_patch.ane_prefill_transient_bytes(SimpleNamespace()) == 0
+    plain = SimpleNamespace(modules=lambda: [SimpleNamespace()])
+    assert ane_patch.ane_prefill_transient_bytes(plain) == 0
+
+
+# --- incremental bank builder staging (issue #2781) ---
+
+
+class _RecorderBankBuilder:
+    """Stands in for the native AneLinearBankBuilder."""
+
+    def __init__(self, fail_full_span_once=False):
+        self.added = []
+        self.compiled_spans = []
+        self._fail_full_span_once = fail_full_span_once
+
+    def add(self, weight):
+        self.added.append(weight)
+
+    @property
+    def size(self):
+        return len(self.added)
+
+    def compile(self, ane_instance, start, stop):
+        if self._fail_full_span_once and stop - start == len(self.added):
+            self._fail_full_span_once = False
+            raise RuntimeError("bank load failed (0x20004)")
+        self.compiled_spans.append((ane_instance, start, stop))
+        return [object() for _ in range(stop - start)]
+
+
+def _builder_test_setup(monkeypatch, builders):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", lambda seq: builders.pop(0)
+    )
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda *a, **k: pytest.fail(
+            "the builder path must not stage all weights at once"
+        ),
+    )
+
+
+def test_enable_streams_layers_through_the_bank_builder(monkeypatch):
+    """Each layer is handed to the builder as prepared, not held until compile."""
+    builder0 = _RecorderBankBuilder()
+    builder1 = _RecorderBankBuilder()
+    _builder_test_setup(monkeypatch, [builder0, builder1])
+
+    model = _Model(4)
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    assert len(builder0.added) == 4
+    assert len(builder1.added) == 4
+    assert builder0.compiled_spans == [(1, 0, 4)]
+    assert builder1.compiled_spans == [(2, 0, 4)]
+    assert model._omlx_ane_resident_program_count == 2
+    states = [layer._omlx_ane_prefill_state for layer in model.layers]
+    assert all(s.model is not None and s.model1 is not None for s in states)
+
+
+def test_builder_split_ladder_retries_without_restaging(monkeypatch):
+    """A monolithic load failure retries in spans from the stored chunks."""
+    builder0 = _RecorderBankBuilder(fail_full_span_once=True)
+    builder1 = _RecorderBankBuilder()
+    _builder_test_setup(monkeypatch, [builder0, builder1])
+
+    model = _Model(4)
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    # staged exactly once despite the retry
+    assert len(builder0.added) == 4
+    # first attempt failed on the monolithic span, retry split into two banks
+    assert builder0.compiled_spans[0][1:] != (0, 4) or len(
+        builder0.compiled_spans
+    ) > 1
+    assert model._omlx_ane_resident_program_count == 4
+
+
+def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
+    """One broken procedure disables its module; the rest keep warming (#2940)."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    warm_calls = []
+
+    class _WarmModel:
+        def __init__(self, index):
+            self.index = index
+
+        def warmup(self):
+            if self.index == 1:
+                raise RuntimeError("ANE evaluation failed")
+            warm_calls.append(self.index)
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        return [_WarmModel(i) for i in range(len(weights))]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(3)
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=3,
+            dual_ane=True,
+        )
+
+    assert count == 3
+    assert getattr(model.layers[1], "_omlx_ane_prefill_failed", False)
+    assert not getattr(model.layers[0], "_omlx_ane_prefill_failed", False)
+    assert not getattr(model.layers[2], "_omlx_ane_prefill_failed", False)
+    assert sorted(warm_calls) == [0, 0, 2, 2]
+    assert "disabling ANE" in caplog.text

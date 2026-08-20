@@ -56,6 +56,35 @@ def _enrollment_client() -> TestClient:
     return TestClient(app)
 
 
+def test_ssh_key_generation_requires_explicit_overwrite(monkeypatch, tmp_path):
+    from omlx.cluster import ssh_keys
+
+    calls = []
+    key_pair = SimpleNamespace(
+        key_type="ed25519",
+        fingerprint="SHA256:test",
+        public_key="ssh-ed25519 AAAA test",
+        private_key_path=tmp_path / "omlx_cluster",
+        public_key_path=tmp_path / "omlx_cluster.pub",
+        created_at=123.0,
+    )
+
+    def generate(*, overwrite=False):
+        calls.append(overwrite)
+        return key_pair
+
+    monkeypatch.setattr(ssh_keys, "generate_ssh_key_pair", generate)
+
+    created = _client().post("/admin/api/cluster/ssh-key/generate")
+    rotated = _client().post("/admin/api/cluster/ssh-key/generate?overwrite=true")
+
+    assert created.status_code == 200
+    assert rotated.status_code == 200
+    assert created.json()["available"] is True
+    assert rotated.json()["created_at"] == 123.0
+    assert calls == [False, True]
+
+
 def _worker_claim() -> dict:
     return {
         "node_id": "cuda-worker-1-machine",
@@ -194,7 +223,7 @@ def test_cluster_status_route(monkeypatch):
 
     response = _client().get(
         "/admin/api/cluster/status",
-        params={"route_to": "192.168.100.197"},
+        params={"route_to": "198.51.100.197"},
     )
 
     assert response.status_code == 200
@@ -1196,6 +1225,7 @@ def test_cuda_join_command_is_single_use_pinned_and_not_cached(
     assert "/cluster/join/bootstrap.py" in payload["command"]
     assert payload["controller_key_fingerprint"] == fingerprint
     assert payload["single_use"] is True
+    assert payload["expires_at"] - payload["created_at"] == 30 * 60
     assert '"join_key":' not in _enrollment_client().get(
         "/admin/api/cluster/join-status"
     ).text

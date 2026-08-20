@@ -428,6 +428,16 @@ def qwen35_ane_compile_linear_bank(
     )
 
 
+def qwen35_ane_linear_bank_builder(sequence_length: int):
+    """Incremental bank builder: add() converts one fp32 slice at a time so
+    the caller can release each staging array immediately (issue #2781)."""
+    if not qwen35_ane_available() or _ext is None or not hasattr(
+        _ext, "AneLinearBankBuilder"
+    ):
+        raise RuntimeError("Private ANE procedure-bank builder is unavailable")
+    return _ext.AneLinearBankBuilder(sequence_length)
+
+
 def qwen35_ane_affine_qmm_t(
     x: mx.array,
     gpu_weight: mx.array,

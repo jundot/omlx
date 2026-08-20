@@ -71,15 +71,27 @@ _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
 
 # Conservative defaults for the per-block cost estimator. The actual
-# bytes-per-block depends on the model (num_layers × num_kv_heads ×
+# bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
 # head_dim × dtype_size × block_size_tokens × 2). At construction time
 # the PagedSSDCacheManager doesn't always know these — see __init__'s
 # ``expected_kv_bytes_per_token`` parameter — so the module-level
-# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB
-# spread across all layers. Smaller models will be over-conservative
-# (fine), larger models or larger blocks should pass an explicit value.
+# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB.
+# Smaller models will be over-conservative (fine), while larger models or
+# larger blocks should pass an explicit value.
 _DEFAULT_BLOCK_SIZE_TOKENS = 256
 _DEFAULT_KV_BYTES_PER_TOKEN = 200_000
+
+
+def _normalize_kv_bytes_per_token(value: int) -> int:
+    """Return a safe positive estimate for writer-queue sizing.
+
+    A model with only fixed-state or rotating caches can legitimately report
+    zero *per-token* KV bytes.  Zero is not a useful queue-sizing input,
+    though: it would make every block appear to cost one byte and pin the
+    pending-write cap at its 256-entry ceiling.  Use the conservative manager
+    default for that case so the queue remains bounded by a realistic budget.
+    """
+    return value if value > 0 else _DEFAULT_KV_BYTES_PER_TOKEN
 
 
 def _compute_max_pending_writes(
@@ -118,10 +130,12 @@ def _compute_max_pending_writes(
 
     Defaults target a 35B-class bf16 model at the default
     ``paged_cache_block_size=256``; pass an explicit
-    ``kv_bytes_per_token`` for larger models or quantized configs.
+    ``kv_bytes_per_token`` for larger models or quantized configs. A
+    non-positive estimate uses the conservative default as well.
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        kv_bytes_per_token = _normalize_kv_bytes_per_token(kv_bytes_per_token)
         block_bytes = max(1, block_size_tokens * kv_bytes_per_token)
         target = int(total_bytes * target_fraction / block_bytes)
         hard_cap = max(1, int(total_bytes * hard_fraction / block_bytes))
@@ -1587,11 +1601,13 @@ class PagedSSDCacheManager(CacheManager):
                 don't pin gigabytes at saturation; passing a smaller value lets
                 the cap grow to give workloads with many tiny blocks enough
                 burst headroom.
-            expected_kv_bytes_per_token: Per-token KV byte estimate (all
-                layers, K + V, dtype). Together with ``expected_block_size_tokens``
-                this drives the bytes-aware queue cap. Defaults to a
-                35B-class bf16 estimate; pass an explicit value for
-                quantized models or unusually wide/narrow architectures.
+            expected_kv_bytes_per_token: Per-token KV byte estimate (KV-cache
+                layers, K + V, dtype). Together with
+                ``expected_block_size_tokens`` this drives the bytes-aware
+                queue cap. Defaults to a 35B-class bf16 estimate; non-positive
+                values use that same conservative default. Pass an explicit
+                value for quantized models or unusually wide/narrow
+                architectures.
             expected_layer_cache_types: Optional current cache layout. When
                 provided, blocks with a different per-layer type list are
                 skipped at startup.
@@ -1699,15 +1715,17 @@ class PagedSSDCacheManager(CacheManager):
         # cap appropriately. Falls back to the module-level constant
         # when no override is supplied.
         #
-        # Stash the inputs the constructor was called with so callers
-        # (and the plumbing-regression test) can verify what reached
-        # the manager without depending on the cap math landing in a
-        # particular floor/ceiling band on the test host.
+        # Stash the effective inputs so callers (and the plumbing-regression
+        # tests) can verify what reached the manager without depending on the
+        # cap math landing in a particular floor/ceiling band on the test
+        # host.
         self._expected_block_size_tokens = expected_block_size_tokens
-        self._expected_kv_bytes_per_token = expected_kv_bytes_per_token
+        self._expected_kv_bytes_per_token = _normalize_kv_bytes_per_token(
+            expected_kv_bytes_per_token
+        )
         self._max_pending_writes = _compute_max_pending_writes(
             block_size_tokens=expected_block_size_tokens,
-            kv_bytes_per_token=expected_kv_bytes_per_token,
+            kv_bytes_per_token=self._expected_kv_bytes_per_token,
         )
         self._write_queue: queue.Queue = queue.Queue(maxsize=self._max_pending_writes)
         # Track which block hashes are queued for background write

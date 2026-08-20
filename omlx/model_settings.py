@@ -8,6 +8,7 @@ flags, and metadata.
 import copy
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -504,17 +505,24 @@ class ModelSettingsManager:
             },
         }
 
+        # Write to temp file first, then rename for atomicity. The pid in
+        # the temp name keeps concurrent processes from sharing a temp path
+        # and renaming each other's partial writes into place.
+        temp_file = self.settings_file.with_name(
+            f"{self.settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            # Write to temp file first, then rename for atomicity
-            temp_file = self.settings_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def get_settings(self, model_id: str) -> ModelSettings:
@@ -712,15 +720,18 @@ class ModelSettingsManager:
     def _save_profiles(self) -> None:
         """Write profiles to disk atomically (temp file + rename)."""
         data = {"version": PROFILES_VERSION, "profiles": self._profiles}
-        temp_file = self.profiles_file.with_suffix(".tmp")
+        temp_file = self.profiles_file.with_name(
+            f"{self.profiles_file.name}.{os.getpid()}.tmp"
+        )
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(self.profiles_file)
         except Exception as e:
             logger.error(f"Failed to save profiles file: {e}")
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+            temp_file.unlink(missing_ok=True)
             raise
 
     @staticmethod
@@ -1226,13 +1237,18 @@ class ModelSettingsManager:
     def _save_templates(self) -> None:
         """Must be called while holding the lock."""
         data = {"version": TEMPLATES_VERSION, "templates": self._templates}
+        temp_file = self.templates_file.with_name(
+            f"{self.templates_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            temp_file = self.templates_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(self.templates_file)
         except Exception as e:
             logger.error(f"Failed to save templates file: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def list_templates(self) -> list[dict]:

@@ -1290,7 +1290,7 @@
                             controller_ip: controllerIp,
                             controller_port: port,
                             scheme: secure ? 'https' : 'http',
-                            ttl_seconds: 600,
+                            ttl_seconds: 1800,
                         }),
                     });
                     if (response.status === 401) {
@@ -2305,15 +2305,30 @@
 
             async generateClusterSshKey() {
                 if (this.clusterSshKeyGenerating) return;
+                const overwrite = Boolean(this.clusterSshKey?.available);
+                if (overwrite && !window.confirm(
+                    'Regenerating this key disconnects every paired worker. '
+                    + 'You will need to exchange keys again on every Mac. Continue?'
+                )) return;
                 this.clusterSshKeyGenerating = true;
                 try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/generate', {
+                    const endpoint = '/admin/api/cluster/ssh-key/generate'
+                        + (overwrite ? '?overwrite=true' : '');
+                    const response = await fetch(endpoint, {
                         method: 'POST',
                     });
                     if (response.ok) {
                         this.clusterSshKey = await response.json();
-                        // Show success notification
-                        this.showNotification('SSH key generated successfully', 'success');
+                        this.clusterExchangeToken = null;
+                        this.clusterPeerExchangeToken = '';
+                        this.clusterKeyExchangeResult = null;
+                        if (overwrite) this.invalidateClusterPeer(true);
+                        this.showNotification(
+                            overwrite
+                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
+                                : 'SSH key generated successfully',
+                            'success'
+                        );
                     } else {
                         const error = await response.json();
                         this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');
@@ -4232,10 +4247,35 @@
                 const candidates = this.clusterLogicalNodes().filter(node => (
                     node.memberCount === 2
                     && node.accelerator === 'cuda'
-                    && !node.fabricVerified
                 ));
                 for (const node of candidates) {
                     if (!await this.verifyCudaSupernode(node)) return false;
+                }
+                return true;
+            },
+
+            async prepareCudaSupernodesForActivation({ rebuildPlan = false } = {}) {
+                const planRevision = Number(this._clusterPlanRevision || 0);
+                if (
+                    typeof this.ensureCudaSupernodesVerified === 'function'
+                    && !await this.ensureCudaSupernodesVerified()
+                ) {
+                    const message = this.clusterCudaFabricVerificationError
+                        || 'Verify the CUDA direct link before starting the cluster.';
+                    if (rebuildPlan) this.clusterPlanError = message;
+                    else this.clusterAutoconfigureError = message;
+                    return false;
+                }
+                if (
+                    rebuildPlan
+                    && Number(this._clusterPlanRevision || 0) !== planRevision
+                ) {
+                    await this.runClusterPlan();
+                    if (!this.clusterActivationReady()) {
+                        this.clusterPlanError = this.clusterPlanError
+                            || 'Rebuild the plan after verifying the CUDA direct link.';
+                        return false;
+                    }
                 }
                 return true;
             },
@@ -5361,15 +5401,7 @@
                         'Choose a worker before starting the cluster.';
                     return;
                 }
-                if (
-                    typeof this.ensureCudaSupernodesVerified === 'function'
-                    && !await this.ensureCudaSupernodesVerified()
-                ) {
-                    this.clusterAutoconfigureError =
-                        this.clusterCudaFabricVerificationError
-                        || 'Verify the CUDA direct link before starting the cluster.';
-                    return;
-                }
+                if (!await this.prepareCudaSupernodesForActivation()) return;
                 const linkStatus = await this.loadClusterLinkStatus();
                 if (linkStatus?.setup_available) {
                     const ready = await this.prepareClusterLink();
@@ -6262,6 +6294,9 @@
 
             async activateClusterDeployment() {
                 if (!this.clusterActivationReady()) return;
+                if (!await this.prepareCudaSupernodesForActivation({
+                    rebuildPlan: true,
+                })) return;
                 this.clusterActivationLoading = true;
                 this.clusterActivationResult = null;
                 this.clusterPlanChanges = null;

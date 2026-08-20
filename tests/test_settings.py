@@ -746,6 +746,31 @@ class TestMCPSettings:
         restored = GlobalSettings.load(base_path=tmp_path)
         assert restored.mcp.expose_tools is True
 
+    def test_global_settings_save_is_atomic(self, tmp_path):
+        """save() must never leave a temp file or a torn settings.json."""
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.save()
+
+        settings_file = tmp_path / "settings.json"
+        assert settings_file.exists()
+        json.loads(settings_file.read_text())  # parses cleanly
+        assert not list(tmp_path.glob("settings.json*.tmp"))
+        if os.name == "posix":
+            assert (settings_file.stat().st_mode & 0o777) == 0o600
+
+    def test_global_settings_corrupt_file_is_moved_aside(self, tmp_path):
+        """A corrupt settings.json is preserved as evidence, not silently eaten."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"server": {"port": 9999}}garbage-tail')
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+
+        assert restored.server.port == 8000  # defaults, not the torn file
+        assert not settings_file.exists()
+        backups = list(tmp_path.glob("settings.json.corrupt-*"))
+        assert len(backups) == 1
+        assert "garbage-tail" in backups[0].read_text()
+
 
 class TestHuggingFaceSettings:
     """Tests for HuggingFaceSettings dataclass."""

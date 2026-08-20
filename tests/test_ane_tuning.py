@@ -488,7 +488,7 @@ async def test_full_model_gdn_correction_precedes_worker_runner_up(monkeypatch):
             alternate_reason="CPU worker count",
         )
 
-    def profile_refinement(candidate, result):
+    def profile_refinement(candidate, result, gdn_floor=None):
         return ane_tuning.replace(
             candidate,
             gdn_fraction=0.45,
@@ -828,3 +828,91 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "speedup_percent": 0.0,
         "sequence_length": run.request.sequence_length,
     }
+
+
+def test_profile_refinement_rebalances_mlp_without_cpu_share(monkeypatch):
+    """cpu_fraction 0 must keep the plain two-way ANE/GPU rebalance."""
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    candidate = ane_tuning._Candidate("predicted", True, 0.5, False, None)
+    operations = 192
+    result = {
+        "_profile": {
+            "mlp": {
+                "operations": operations,
+                "ane0_eval_ns": 19.0e6 * operations,
+                "ane1_eval_ns": 19.0e6 * operations,
+                "gpu_completion_ns": 10.0e6 * operations,
+            }
+        }
+    }
+
+    refined = ane_tuning._profile_refinement(candidate, result)
+
+    assert refined.mlp_fraction == 0.35
+    assert not refined.cpu_fraction
+
+
+def test_min_viable_gdn_fraction_matches_bank_rule():
+    """The floor is the smallest fraction whose aligned slice covers z."""
+    from types import SimpleNamespace
+
+    from omlx.patches import qwen35_ane_prefill as patch
+
+    gdn = SimpleNamespace(
+        in_proj_z=SimpleNamespace(weight=SimpleNamespace(shape=(512, 1))),
+        in_proj_qkv=SimpleNamespace(weight=SimpleNamespace(shape=(1536, 1))),
+    )
+    floor = ane_tuning._min_viable_gdn_fraction(patch, gdn, 128)
+    assert floor == 0.25
+    total = 2048
+    assert (int(total * floor) // 128) * 128 >= 512
+    assert (int(total * 0.15) // 128) * 128 < 512
+
+    # z larger than the whole projection can never engage
+    impossible = SimpleNamespace(
+        in_proj_z=SimpleNamespace(weight=SimpleNamespace(shape=(2050, 1))),
+        in_proj_qkv=SimpleNamespace(weight=SimpleNamespace(shape=(10, 1))),
+    )
+    assert ane_tuning._min_viable_gdn_fraction(patch, impossible, 128) is None
+
+
+def test_profile_refinement_respects_the_gdn_floor(monkeypatch):
+    """The refinement grid must not offer fractions below the floor (#2899)."""
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.15, 0.25, 0.35, 0.45, 0.53]
+    )
+    candidate = ane_tuning._Candidate("predicted", True, 0.5, True, 0.45)
+    operations = 144
+    result = {
+        "_profile": {
+            "gdn": {
+                "operations": operations,
+                # ANE much slower than GPU -> the balancer wants a tiny fraction
+                "ane0_eval_ns": 40.0e6 * operations,
+                "ane1_eval_ns": 40.0e6 * operations,
+                "gpu_completion_ns": 6.0e6 * operations,
+            }
+        }
+    }
+
+    unclamped = ane_tuning._profile_refinement(candidate, result)
+    assert unclamped.gdn_fraction < 0.4  # sanity: the pull downward is real
+
+    clamped = ane_tuning._profile_refinement(candidate, result, gdn_floor=0.42)
+    assert clamped.gdn_fraction >= 0.42
+
+
+def test_settings_for_candidate_disables_dflash():
+    """Tuner staging must load the plain LM engine, never DFlash (#2914)."""
+    from omlx.model_settings import ModelSettings
+
+    base = ModelSettings(dflash_enabled=True)
+    request = ane_tuning.ANETuningRequest(model_id="m")
+    candidate = ane_tuning._Candidate("GPU only", False)
+
+    settings = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert settings.dflash_enabled is False
+    assert base.dflash_enabled is True

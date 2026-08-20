@@ -61,6 +61,7 @@ def _run_one_click(proposal: dict, *, link_status: dict | None = None) -> dict:
             "clusterClusterHostsPayload",
             "autoconfigureCluster",
             "prepareClusterLink",
+            "prepareCudaSupernodesForActivation",
             "startCluster",
             "activateClusterProposal",
         )
@@ -1668,6 +1669,76 @@ const node = {
     } == {"connectx-live-proof"}
     assert result["invalidated"] is True
     assert result["error"] == ""
+
+
+def test_activation_reverifies_a_cached_connectx_pair():
+    result = _run_dashboard_helpers(
+        ("ensureCudaSupernodesVerified",),
+        """
+let calls = 0;
+component.clusterLogicalNodes = () => [{
+  memberCount: 2,
+  accelerator: 'cuda',
+  fabricVerified: true,
+}];
+component.verifyCudaSupernode = async () => { calls += 1; return true; };
+(async () => {
+  const verified = await component.ensureCudaSupernodesVerified();
+  process.stdout.write(JSON.stringify({ verified, calls }));
+})().catch(error => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result == {"verified": True, "calls": 1}
+
+
+def test_activation_guard_rebuilds_a_plan_changed_by_cuda_reverification():
+    result = _run_dashboard_helpers(
+        ("prepareCudaSupernodesForActivation",),
+        """
+let planBuilds = 0;
+component._clusterPlanRevision = 4;
+component.ensureCudaSupernodesVerified = async () => {
+  component._clusterPlanRevision = 5;
+  return true;
+};
+component.runClusterPlan = async () => { planBuilds += 1; };
+component.clusterActivationReady = () => true;
+(async () => {
+  const prepared = await component.prepareCudaSupernodesForActivation({
+    rebuildPlan: true,
+  });
+  process.stdout.write(JSON.stringify({ prepared, planBuilds }));
+})().catch(error => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result == {"prepared": True, "planBuilds": 1}
+
+
+def test_manual_activation_stops_when_cuda_reverification_fails():
+    result = _run_dashboard_helpers(
+        ("activateClusterDeployment",),
+        """
+let guardCalls = 0;
+let deploymentCalls = 0;
+global.fetch = async () => {
+  deploymentCalls += 1;
+  return { status: 200, ok: true, json: async () => ({}) };
+};
+component.clusterActivationReady = () => true;
+component.prepareCudaSupernodesForActivation = async () => {
+  guardCalls += 1;
+  return false;
+};
+(async () => {
+  await component.activateClusterDeployment();
+  process.stdout.write(JSON.stringify({ guardCalls, deploymentCalls }));
+})().catch(error => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result == {"guardCalls": 1, "deploymentCalls": 0}
 
 
 def test_model_picker_ranks_real_fit_and_uses_friendly_names():

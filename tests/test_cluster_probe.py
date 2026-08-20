@@ -124,8 +124,8 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
             "system_profiler": (0, NO_PEER_THUNDERBOLT, ""),
             "route": (
                 0,
-                "   route to: 192.168.100.197\n"
-                "destination: 192.168.100.197\n"
+                "   route to: 198.51.100.197\n"
+                "destination: 198.51.100.197\n"
                 "  interface: en7\n",
                 "",
             ),
@@ -133,7 +133,7 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
     )
 
     status = probe.collect_cluster_status(
-        route_to="192.168.100.197",
+        route_to="198.51.100.197",
         runner=runner,
         now=lambda: datetime(2026, 7, 26, 12, 0, tzinfo=UTC),
     )
