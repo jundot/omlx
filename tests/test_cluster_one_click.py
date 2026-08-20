@@ -1670,6 +1670,27 @@ const node = {
     assert result["error"] == ""
 
 
+def test_activation_reverifies_a_cached_connectx_pair():
+    result = _run_dashboard_helpers(
+        ("ensureCudaSupernodesVerified",),
+        """
+let calls = 0;
+component.clusterLogicalNodes = () => [{
+  memberCount: 2,
+  accelerator: 'cuda',
+  fabricVerified: true,
+}];
+component.verifyCudaSupernode = async () => { calls += 1; return true; };
+(async () => {
+  const verified = await component.ensureCudaSupernodesVerified();
+  process.stdout.write(JSON.stringify({ verified, calls }));
+})().catch(error => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result == {"verified": True, "calls": 1}
+
+
 def test_model_picker_ranks_real_fit_and_uses_friendly_names():
     result = _run_dashboard_helpers(
         (

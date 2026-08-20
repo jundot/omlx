@@ -109,6 +109,7 @@ def test_cuda_workers_join_from_a_gui_generated_one_time_command():
     assert "async revokeClusterJoinCommand()" in javascript
     assert "/admin/api/cluster/join-keys" in javascript
     assert "/admin/api/cluster/join-status" in javascript
+    assert "ttl_seconds: 1800" in javascript
     assert "service: 'oMLX CUDA Worker'" in javascript
     assert "selected.set(peer.ssh, peer)" in javascript
     # The command contains the one-time credential and therefore stays only

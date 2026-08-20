@@ -1271,7 +1271,7 @@
                             controller_ip: controllerIp,
                             controller_port: port,
                             scheme: secure ? 'https' : 'http',
-                            ttl_seconds: 600,
+                            ttl_seconds: 1800,
                         }),
                     });
                     if (response.status === 401) {
@@ -4213,7 +4213,6 @@
                 const candidates = this.clusterLogicalNodes().filter(node => (
                     node.memberCount === 2
                     && node.accelerator === 'cuda'
-                    && !node.fabricVerified
                 ));
                 for (const node of candidates) {
                     if (!await this.verifyCudaSupernode(node)) return false;

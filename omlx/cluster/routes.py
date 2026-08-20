@@ -151,7 +151,7 @@ class ClusterJoinKeyRequest(BaseModel):
     controller_ip: str = Field(min_length=2, max_length=64)
     controller_port: int = Field(ge=1, le=65535)
     scheme: Literal["http", "https"] = "http"
-    ttl_seconds: int = Field(default=600, ge=30, le=600)
+    ttl_seconds: int = Field(default=1800, ge=30, le=1800)
 
 
 class ClusterWorkerClaimRequest(BaseModel):
