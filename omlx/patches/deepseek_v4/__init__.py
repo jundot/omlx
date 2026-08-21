@@ -12,8 +12,11 @@ without modifying the pinned mlx-lm. The patch:
    path used by ``_get_classes`` finds them. Also aliases
    ``deepseek_v4_mtp`` to the same module for converted checkpoints that
    encode the MTP variant in ``model_type``.
-3. Replaces ``mlx_lm.utils.load_model`` with a copy that handles
-   ``F8_E8M0`` dtype fallback and the DeepSeek V4 ``fp8`` quant_method.
+3. Registers the ``F8_E8M0`` dtype fallback, the ratio-128 attention
+   policy and the DeepSeek V4 ``fp8`` quant_method with the shared
+   ``load_model`` in ``omlx.patches.mlx_lm_load_model_inputs``, which
+   applies them whether the checkpoint is read from disk or handed in
+   as a weight dict.
 4. Replaces ``mlx_lm.generate._make_cache`` with a copy aware of
    ``PoolingCache`` → ``BatchPoolingCache`` conversion.
 5. Wraps ``mlx_lm.tokenizer_utils.AutoTokenizer`` with a fallback that

@@ -16,7 +16,7 @@ pinned mlx-lm v0.31.3 (`ed1fca4`) without modifying the upstream package.
 | `deepseek_v4_model.py` | PR 1192 `mlx_lm/models/deepseek_v4.py` | 1:1 copy — do not edit |
 | `hyper_connection.py` | PR 1192 `mlx_lm/models/hyper_connection.py` | 1:1 copy — do not edit |
 | `cache_extras.py` | PR 1192 `mlx_lm/models/cache.py` lines 903-1447 | PoolingCache + BatchPoolingCache, 1:1 |
-| `utils_patch.py` | adapted from PR 1192 `mlx_lm/utils.py` | replacement `load_model` + `_load_safetensors` |
+| `utils_patch.py` | adapted from PR 1192 `mlx_lm/utils.py` | `_load_safetensors`, plus the ratio-128 config transform and `fp8` quant handler registered with the shared `load_model` |
 | `generate_patch.py` | adapted from PR 1192 `mlx_lm/generate.py` | replacement `_make_cache` |
 | `cache_handlers.py` | omlx-side, new | PoolingCache / BatchPoolingCache handlers for omlx CacheTypeRegistry |
 | `__init__.py` | omlx-side, new | `apply_deepseek_v4_patch()` orchestration |
