@@ -461,10 +461,12 @@ def test_cluster_fabric_shows_deployed_hosts_while_a_job_is_live():
         "clusterNeuralFabricEdges()", 1
     )[0]
 
-    # With a live job and known membership the ring renders only hosts that
-    # hold ranks; without one, candidate discovery behavior is unchanged.
+    # With a live job and known membership the ring renders exactly the
+    # rank-holding deployment hosts; without one, candidate discovery
+    # behavior is unchanged.
     assert "(job?.live && memberKeys)" in fabric
-    assert "this.clusterLogicalNodes().filter(node =>" in fabric
+    assert "this.clusterLogicalNodes(" in fabric
+    assert "clusterDeploymentAlignedQuickNodes()" in fabric
     assert ": this.clusterLogicalNodes();" in fabric
     # Membership comes from deployment hosts joined to job assignments, with
     # mDNS suffixes stripped so discovered names match deployed node ids.
@@ -474,6 +476,15 @@ def test_cluster_fabric_shows_deployed_hosts_while_a_job_is_live():
     assert "deployment?.hosts" in member_keys
     assert "item?.node_id" in member_keys
     assert "/\\.local\\.?$/" in javascript
+
+    # Alignment is not only subtractive: a rank-holding host that browser
+    # selection forgot is restored as a placeholder node.
+    aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
+        "clusterPairTitle()", 1
+    )[0]
+    assert "hosts.forEach(host => {" in aligned
+    assert "memberKeys.has(key)" in aligned
+    assert "deployedPlaceholder: true," in aligned
 
 
 def test_cluster_pool_summary_excludes_non_members_while_a_job_is_live():
@@ -485,7 +496,7 @@ def test_cluster_pool_summary_excludes_non_members_while_a_job_is_live():
     aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
         "clusterPairTitle()", 1
     )[0]
-    assert "this.clusterQuickNodes().filter(node =>" in aligned
+    assert "quickNodes.filter(node =>" in aligned
     pair_title = javascript.split("clusterPairTitle()", 1)[1].split(
         "clusterDeviceCountLabel()", 1
     )[0]
