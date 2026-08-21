@@ -339,6 +339,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
+        # Why the runtime fallback engaged. Set with _in_fallback_mode and
+        # read through the public `fallback_reason` for status reporting.
+        self._fallback_reason: str | None = None
         self._fallback_lock = asyncio.Lock()
         # Primary-mode prefill memory guard. DFlash bypasses the scheduler, so
         # it can't receive the enforcer's watermarks through one; this holder
@@ -692,6 +695,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         self._loaded = True
         self._in_fallback_mode = False
+        self._fallback_reason = None
         max_ctx_display = (
             "unlimited" if self._max_dflash_ctx is None else self._max_dflash_ctx
         )
@@ -755,8 +759,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         except Exception as exc:
             logger.debug(f"dflash cache end_request failed: {exc}")
 
-    async def _evict_dflash_and_start_fallback(self) -> None:
-        """Evict dflash models from memory, verify release, then start fallback engine."""
+    async def _evict_dflash_and_start_fallback(self, reason: str) -> None:
+        """Evict dflash models from memory, verify release, then start fallback engine.
+
+        ``reason`` is retained for status reporting: the switch is permanent
+        for this engine, so a client that sees DFlash configured needs to know
+        the runtime stopped using it and why.
+        """
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
 
         from ..engine_core import get_mlx_executor
@@ -837,6 +846,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
         await self._fallback_engine.start()
         self._in_fallback_mode = True
+        self._fallback_reason = reason
         logger.info(f"DFlash fallback engine started: {self._fallback_engine_type}")
 
     async def stop(self) -> None:
@@ -860,6 +870,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._output_parser_factory = None
         self._prefill_guard = None
         self._in_fallback_mode = False
+        self._fallback_reason = None
         self._loaded = False
         # Revert class-level __call__ patches dflash installed during start().
         # Required so a subsequent Native MTP load on the same process sees
@@ -1050,6 +1061,35 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     @property
     def supports_multimodal_fallback(self) -> bool:
         return self._fallback_engine_type == "vlm"
+
+    @property
+    def in_fallback_mode(self) -> bool:
+        """True once a runtime fallback replaced the DFlash path.
+
+        Long context or multimodal content evicts the DFlash runtime after a
+        successful load, and the engine stays on the fallback engine until it
+        is reloaded. Callers reporting the effective engine must read this
+        rather than assume DFlash is still serving.
+        """
+        return self._in_fallback_mode
+
+    @property
+    def fallback_engine_type(self) -> str:
+        """Engine type serving requests once the runtime fallback engaged."""
+        return self._fallback_engine_type
+
+    @property
+    def fallback_reason(self) -> str | None:
+        """Why the runtime fallback engaged; ``None`` while DFlash serves."""
+        return self._fallback_reason
+
+    _MULTIMODAL_FALLBACK_REASON = "image content requires the VLM engine"
+
+    def _context_fallback_reason(self, prompt_token_count: int) -> str:
+        return (
+            f"prompt of {prompt_token_count} tokens reached the DFlash "
+            f"context limit of {self._max_dflash_ctx}"
+        )
 
     _MULTIMODAL_TYPES = frozenset({"image", "image_url", "input_image"})
 
@@ -1423,7 +1463,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
                         f"evicting dflash models and switching to {self._fallback_engine_type} engine"
                     )
-                    await self._evict_dflash_and_start_fallback()
+                    await self._evict_dflash_and_start_fallback(
+                        self._context_fallback_reason(len(prompt_tokens))
+                    )
             return await self._fallback_engine.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1646,7 +1688,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
                         f"evicting dflash models and switching to {self._fallback_engine_type} engine"
                     )
-                    await self._evict_dflash_and_start_fallback()
+                    await self._evict_dflash_and_start_fallback(
+                        self._context_fallback_reason(len(prompt_tokens))
+                    )
             async for output in self._fallback_engine.stream_generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1831,7 +1875,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "DFlash multimodal fallback: image content detected, "
                         "switching to VLM engine"
                     )
-                    await self._evict_dflash_and_start_fallback()
+                    await self._evict_dflash_and_start_fallback(
+                        self._MULTIMODAL_FALLBACK_REASON
+                    )
             return await self._fallback_engine.chat(
                 messages,
                 max_tokens=max_tokens,
@@ -1909,7 +1955,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "DFlash multimodal fallback: image content detected, "
                         "switching to VLM engine"
                     )
-                    await self._evict_dflash_and_start_fallback()
+                    await self._evict_dflash_and_start_fallback(
+                        self._MULTIMODAL_FALLBACK_REASON
+                    )
             async for output in self._fallback_engine.stream_chat(
                 messages,
                 max_tokens=max_tokens,
@@ -1986,6 +2034,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             "max_dflash_ctx": self._max_dflash_ctx,
             "fallback_engine_type": self._fallback_engine_type,
             "in_fallback_mode": self._in_fallback_mode,
+            "fallback_reason": self._fallback_reason,
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,

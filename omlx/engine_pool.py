@@ -17,6 +17,7 @@ import asyncio
 import gc
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -58,6 +59,51 @@ logger = logging.getLogger(__name__)
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+
+# Fallback reasons reach API clients, so they are bounded and redacted:
+# loader errors can embed absolute checkpoint paths and, when an inner
+# exception was formatted with its traceback, whole stack frames.
+_MAX_FALLBACK_REASON_CHARS = 200
+_PATHISH_RE = re.compile(r"~?(?:/[^\s/,;:'\"]+){2,}/?")
+# Effective engine identity per engine class, for clients that must assert
+# which backend actually serves a model (issue #2896).
+_ENGINE_KIND_BY_CLASS = {
+    "DFlashEngine": "dflash",
+    "DistributedBatchedEngine": "distributed",
+    "VLMBatchedEngine": "vlm",
+    "BatchedEngine": "batched",
+    "EmbeddingEngine": "embedding",
+    "RerankerEngine": "reranker",
+    "STTEngine": "audio_stt",
+    "TTSEngine": "audio_tts",
+    "STSEngine": "audio_sts",
+}
+
+
+def _sanitized_fallback_reason(text: str) -> str:
+    """Bound and redact a fallback reason before it reaches API clients.
+
+    Whitespace is collapsed so a multi-line message cannot leak a stack
+    trace line by line, filesystem-path runs become ``<path>``, and the
+    result is truncated to a fixed budget so an unbounded loader message
+    cannot inflate the status response.
+    """
+
+    collapsed = " ".join(str(text).split())
+    redacted = _PATHISH_RE.sub("<path>", collapsed)
+    if len(redacted) > _MAX_FALLBACK_REASON_CHARS:
+        redacted = redacted[: _MAX_FALLBACK_REASON_CHARS - 3].rstrip() + "..."
+    return redacted
+
+
+def _engine_kind(engine: object) -> str | None:
+    """Effective engine identity for a live engine instance.
+
+    ``None`` for a class the pool never constructs, so callers fall back to
+    the engine type they asked for instead of leaking a class name.
+    """
+
+    return _ENGINE_KIND_BY_CLASS.get(type(engine).__name__)
 
 
 def _positive_int(value: object) -> int:
@@ -240,6 +286,14 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Requested-versus-effective state for the engine that currently serves
+    # this model (issue #2896). DFlash fails soft into the model's natural
+    # engine, so a client cannot infer the effective backend from settings
+    # alone. All four describe the live engine and reset on unload.
+    effective_engine: str | None = None
+    dflash_requested: bool = False
+    dflash_active: bool = False
+    dflash_fallback_reason: str | None = None
 
 
 class EnginePool:
@@ -2243,6 +2297,10 @@ class EnginePool:
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
+        entry.effective_engine = None
+        entry.dflash_requested = False
+        entry.dflash_active = False
+        entry.dflash_fallback_reason = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2495,61 +2553,74 @@ class EnginePool:
             pass
 
             # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
+            # since DFlash has its own model loading pipeline. Every branch
+            # that declines or fails records why, so /v1/models/status can
+            # tell a silent fallback from a real DFlash load (issue #2896).
             engine = None
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
-                dflash_enabled = getattr(model_settings, "dflash_enabled", False)
-                dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if (
-                    dflash_enabled
-                    and dflash_draft
-                    and self._entry_is_diffusion_model(entry)
-                ):
-                    logger.warning(
-                        "DFlash is not supported for diffusion models; "
-                        "loading %s with its native VLM engine",
-                        model_id,
-                    )
-                elif dflash_enabled and dflash_draft:
-                    try:
-                        from .engine.dflash import DFlashEngine
+            dflash_enabled = bool(getattr(model_settings, "dflash_enabled", False))
+            dflash_draft = getattr(model_settings, "dflash_draft_model", None)
+            entry.dflash_requested = dflash_enabled
+            entry.dflash_active = False
+            entry.dflash_fallback_reason = None
+            if dflash_enabled and deployment is not None:
+                entry.dflash_fallback_reason = (
+                    "DFlash is not supported with distributed inference"
+                )
+            elif dflash_enabled and not dflash_draft:
+                entry.dflash_fallback_reason = (
+                    "DFlash is enabled but no draft model is configured"
+                )
+            elif dflash_enabled and self._entry_is_diffusion_model(entry):
+                logger.warning(
+                    "DFlash is not supported for diffusion models; "
+                    "loading %s with its native VLM engine",
+                    model_id,
+                )
+                entry.dflash_fallback_reason = (
+                    "DFlash is not supported for diffusion models"
+                )
+            elif dflash_enabled:
+                try:
+                    from .engine.dflash import DFlashEngine
 
-                        engine = DFlashEngine(
-                            model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
-                            draft_quant_enabled=getattr(
-                                model_settings, "dflash_draft_quant_enabled", False
-                            ),
-                            draft_quant_weight_bits=getattr(
-                                model_settings, "dflash_draft_quant_weight_bits", 4
-                            ),
-                            draft_quant_activation_bits=getattr(
-                                model_settings, "dflash_draft_quant_activation_bits", 16
-                            ),
-                            draft_quant_group_size=getattr(
-                                model_settings, "dflash_draft_quant_group_size", 64
-                            ),
-                            model_settings=model_settings,
-                            fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
-                            omlx_ssd_cache_dir=getattr(
-                                self._scheduler_config, "paged_ssd_cache_dir", None
-                            ),
-                        )
-                        logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
-                        )
-                    except ImportError:
-                        logger.warning(
-                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                            f"Falling back to default engine."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"DFlash init failed for {model_id}: {e}. "
-                            f"Falling back to default engine."
-                        )
+                    engine = DFlashEngine(
+                        model_name=entry.model_path,
+                        draft_model_path=dflash_draft,
+                        draft_quant_enabled=getattr(
+                            model_settings, "dflash_draft_quant_enabled", False
+                        ),
+                        draft_quant_weight_bits=getattr(
+                            model_settings, "dflash_draft_quant_weight_bits", 4
+                        ),
+                        draft_quant_activation_bits=getattr(
+                            model_settings, "dflash_draft_quant_activation_bits", 16
+                        ),
+                        draft_quant_group_size=getattr(
+                            model_settings, "dflash_draft_quant_group_size", 64
+                        ),
+                        model_settings=model_settings,
+                        fallback_engine_type=effective_type,
+                        scheduler_config=self._scheduler_config,
+                        omlx_ssd_cache_dir=getattr(
+                            self._scheduler_config, "paged_ssd_cache_dir", None
+                        ),
+                    )
+                    logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
+                except ImportError:
+                    logger.warning(
+                        f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
+                        f"Falling back to default engine."
+                    )
+                    entry.dflash_fallback_reason = "dflash-mlx is not installed"
+                except Exception as e:
+                    logger.warning(
+                        f"DFlash init failed for {model_id}: {e}. "
+                        f"Falling back to default engine."
+                    )
+                    entry.dflash_fallback_reason = _sanitized_fallback_reason(
+                        f"DFlash init failed: {type(e).__name__}: {e}"
+                    )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py
@@ -2647,6 +2718,10 @@ class EnginePool:
                     logger.warning(
                         f"DFlash start failed for {model_id}: {start_error}. "
                         f"Falling back to {effective_type} engine."
+                    )
+                    entry.dflash_fallback_reason = _sanitized_fallback_reason(
+                        "DFlash start failed: "
+                        f"{type(start_error).__name__}: {start_error}"
                     )
                     try:
                         await engine.stop()
@@ -2785,6 +2860,8 @@ class EnginePool:
 
             self._validate_llm_engine_ready(model_id, engine)
             entry.engine = engine
+            entry.effective_engine = _engine_kind(engine) or effective_type
+            entry.dflash_active = entry.effective_engine == "dflash"
             entry.last_access = time.time()
             self._current_model_memory += resident_size
             load_completed = True
@@ -2982,9 +3059,45 @@ class EnginePool:
 
         logger.info("Engine pool shutdown complete")
 
+    @staticmethod
+    def _live_dflash_status(entry: EngineEntry) -> dict:
+        """Effective-engine keys for one model, resolved against its engine.
+
+        A DFlash engine can drop the DFlash path after a successful load: a
+        prompt over the context limit or multimodal content evicts the DFlash
+        runtime and starts the natural engine for the rest of that engine's
+        life. The attach-time record would keep claiming DFlash, so ask the
+        live engine and report the fallback it switched to (issue #2896).
+        """
+
+        effective = entry.effective_engine
+        active = entry.dflash_active
+        reason = entry.dflash_fallback_reason
+        engine = entry.engine
+        if active and getattr(engine, "in_fallback_mode", False):
+            effective = getattr(engine, "fallback_engine_type", None) or effective
+            active = False
+            detail = getattr(engine, "fallback_reason", None) or "trigger not recorded"
+            reason = _sanitized_fallback_reason(f"DFlash runtime fallback: {detail}")
+        return {
+            "effective_engine": effective,
+            "dflash_requested": entry.dflash_requested,
+            "dflash_active": active,
+            "dflash_fallback_reason": reason,
+        }
+
     def get_status(self) -> dict:
         """
         Get pool status for monitoring endpoints.
+
+        ``engine_type`` stays the model's configured engine. ``effective_engine``
+        names the engine that actually serves it right now, and the ``dflash_*``
+        keys separate a real DFlash load from a silent fallback (issue #2896):
+        requested and active both true means DFlash serves the model; requested
+        true with active false carries ``dflash_fallback_reason``; requested
+        false means DFlash was never asked for. The pair covers a startup
+        fallback and a post-load runtime fallback alike; all four describe the
+        live engine and are reset when the model unloads.
 
         Returns:
             Dictionary with pool status information
@@ -3013,6 +3126,7 @@ class EnginePool:
                     "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
+                    **self._live_dflash_status(e),
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
                     "realtime_stt": is_realtime_stt_model(
