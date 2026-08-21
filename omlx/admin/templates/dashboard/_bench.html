@@ -14,6 +14,7 @@
                 <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
                     <button
                         @click="setBenchTab('throughput')"
+                        x-a11y-pressed="benchTab === 'throughput'"
                         :class="benchTab === 'throughput'
                             ? 'bg-neutral-900 text-white'
                             : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -22,6 +23,7 @@
                     </button>
                     <button
                         @click="setBenchTab('accuracy')"
+                        x-a11y-pressed="benchTab === 'accuracy'"
                         :class="benchTab === 'accuracy'
                             ? 'bg-neutral-900 text-white'
                             : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -30,6 +32,7 @@
                     </button>
                     <button
                         @click="setBenchTab('context')"
+                        x-a11y-pressed="benchTab === 'context'"
                         :class="benchTab === 'context'
                             ? 'bg-neutral-900 text-white'
                             : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"

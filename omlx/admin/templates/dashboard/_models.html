@@ -4,6 +4,7 @@
                     <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
                         <button
                             @click="setModelsTab('manager')"
+                            x-a11y-pressed="modelsTab === 'manager'"
                             :class="modelsTab === 'manager'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -12,6 +13,7 @@
                         </button>
                         <button
                             @click="setModelsTab('downloader')"
+                            x-a11y-pressed="modelsTab === 'downloader'"
                             :class="modelsTab === 'downloader'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -20,6 +22,7 @@
                         </button>
                         <button
                             @click="setModelsTab('quantizer')"
+                            x-a11y-pressed="modelsTab === 'quantizer'"
                             :class="modelsTab === 'quantizer'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -28,6 +31,7 @@
                         </button>
                         <button
                             @click="setModelsTab('uploader')"
+                            x-a11y-pressed="modelsTab === 'uploader'"
                             :class="modelsTab === 'uploader'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -102,18 +106,18 @@
                             <div x-show="hfModels.length > 0" class="overflow-x-auto">
                                 <!-- Table Header -->
                                 <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
-                                    <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('name')">
+                                    <button type="button" class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('name')">
                                         {{ t('models.manager.table.model') }}
                                         <span x-show="managerSortBy === 'name'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                                    </div>
-                                    <div class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('type')">
+                                    </button>
+                                    <button type="button" class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('type')">
                                         {{ t('models.manager.table.type') }}
                                         <span x-show="managerSortBy === 'type'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                                    </div>
-                                    <div class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('size')">
+                                    </button>
+                                    <button type="button" class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('size')">
                                         {{ t('models.manager.table.size') }}
                                         <span x-show="managerSortBy === 'size'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                                    </div>
+                                    </button>
                                     <div class="w-20 text-center"></div>
                                 </div>
 
@@ -126,7 +130,9 @@
                                             <!-- Name -->
                                             <div class="min-w-0 flex-1 flex items-center gap-2">
                                                 <template x-if="managerModelInfo(model.name)">
-                                                    <button
+                                                    <button type="button"
+                                                        x-a11y-pressed="managerModelInfo(model.name)?.is_favorite"
+                                                        :aria-label="managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip')"
                                                         @click.stop="updateModelSetting(model.name, 'is_favorite', !managerModelInfo(model.name)?.is_favorite)"
                                                         @mouseenter="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
                                                         @mouseleave="hideTip()"
@@ -219,6 +225,7 @@
                         <!-- Source Switcher (HF / MS) -->
                         <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5 mb-6 w-fit">
                             <button @click="downloaderSource = 'hf'"
+                                    x-a11y-pressed="downloaderSource === 'hf'"
                                     :class="downloaderSource === 'hf'
                                         ? 'bg-white text-neutral-900 shadow-sm'
                                         : 'text-neutral-500 hover:text-neutral-700'"
@@ -226,6 +233,7 @@
                                 {{ t('models.downloader.source.hf') }}
                             </button>
                             <button @click="downloaderSource = 'ms'; initMsDownloader()"
+                                    x-a11y-pressed="downloaderSource === 'ms'"
                                     :class="downloaderSource === 'ms'
                                         ? 'bg-white text-neutral-900 shadow-sm'
                                         : 'text-neutral-500 hover:text-neutral-700'"
@@ -365,6 +373,7 @@
                                 <!-- Filter toggles -->
                                 <div class="mt-3 flex items-center gap-2">
                                     <button @click="hfSearchFiltersOpen = !hfSearchFiltersOpen"
+                                            :aria-expanded="hfSearchFiltersOpen"
                                             :class="hfSearchFiltersOpen ? 'bg-neutral-900 text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                             class="px-3 py-1.5 text-xs font-medium rounded-lg transition-all flex items-center gap-1.5">
                                         <i data-lucide="sliders-horizontal" class="w-3.5 h-3.5"></i>
@@ -452,6 +461,7 @@
                                 </div>
                                 <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                     <button @click="hfRecommendedTab = 'trending'; hfPage.trending = 1; hfTableSort = 'rank'; hfTableSortDir = 'asc'"
+                                            x-a11y-pressed="hfRecommendedTab === 'trending'"
                                             :class="hfRecommendedTab === 'trending'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
@@ -459,6 +469,7 @@
                                         {{ t('models.browse.tab.trending') }}
                                     </button>
                                     <button @click="hfRecommendedTab = 'popular'; hfPage.popular = 1; hfTableSort = 'rank'; hfTableSortDir = 'asc'"
+                                            x-a11y-pressed="hfRecommendedTab === 'popular'"
                                             :class="hfRecommendedTab === 'popular'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
@@ -466,6 +477,7 @@
                                         {{ t('models.browse.tab.popular') }}
                                     </button>
                                     <button @click="hfRecommendedTab = 'search'; hfPage.search = 1"
+                                            x-a11y-pressed="hfRecommendedTab === 'search'"
                                             :class="hfRecommendedTab === 'search'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
@@ -631,6 +643,7 @@
                                         <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
                                             <template x-for="p in getTotalPages(hfRecommendedTab)" :key="p">
                                                 <button @click="setPage(hfRecommendedTab, p)"
+                                                        :aria-current="hfPage[hfRecommendedTab] === p ? 'page' : null"
                                                         :class="hfPage[hfRecommendedTab] === p
                                                             ? 'bg-neutral-900 text-white'
                                                             : 'text-neutral-600 hover:bg-neutral-100'"
@@ -768,6 +781,7 @@
                                             <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
                                                 <template x-for="p in getTotalPages('search')" :key="p">
                                                     <button @click="setPage('search', p)"
+                                                            :aria-current="hfPage.search === p ? 'page' : null"
                                                             :class="hfPage.search === p
                                                                 ? 'bg-neutral-900 text-white'
                                                                 : 'text-neutral-600 hover:bg-neutral-100'"
@@ -994,6 +1008,7 @@
                                             </div>
                                             <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                                 <button @click="msRecommendedTab = 'trending'"
+                                                        x-a11y-pressed="msRecommendedTab === 'trending'"
                                                         :class="msRecommendedTab === 'trending'
                                                             ? 'bg-white text-neutral-900 shadow-sm'
                                                             : 'text-neutral-500 hover:text-neutral-700'"
@@ -1001,6 +1016,7 @@
                                                     {{ t('models.browse.tab.trending') }}
                                                 </button>
                                                 <button @click="msRecommendedTab = 'popular'"
+                                                        x-a11y-pressed="msRecommendedTab === 'popular'"
                                                         :class="msRecommendedTab === 'popular'
                                                             ? 'bg-white text-neutral-900 shadow-sm'
                                                             : 'text-neutral-500 hover:text-neutral-700'"
@@ -1008,6 +1024,7 @@
                                                     {{ t('models.browse.tab.popular') }}
                                                 </button>
                                                 <button @click="msRecommendedTab = 'search'"
+                                                        x-a11y-pressed="msRecommendedTab === 'search'"
                                                         :class="msRecommendedTab === 'search'
                                                             ? 'bg-white text-neutral-900 shadow-sm'
                                                             : 'text-neutral-500 hover:text-neutral-700'"
@@ -1080,6 +1097,7 @@
                                                     <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
                                                         <template x-for="p in getMsTotalPages('trending')" :key="p">
                                                             <button @click="setMsPage('trending', p)"
+                                                                    :aria-current="msPage.trending === p ? 'page' : null"
                                                                     :class="msPage.trending === p
                                                                         ? 'bg-neutral-900 text-white'
                                                                         : 'text-neutral-600 hover:bg-neutral-100'"
@@ -1134,6 +1152,7 @@
                                                     <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
                                                         <template x-for="p in getMsTotalPages('popular')" :key="p">
                                                             <button @click="setMsPage('popular', p)"
+                                                                    :aria-current="msPage.popular === p ? 'page' : null"
                                                                     :class="msPage.popular === p
                                                                         ? 'bg-neutral-900 text-white'
                                                                         : 'text-neutral-600 hover:bg-neutral-100'"
@@ -1192,6 +1211,7 @@
                                                         <div class="px-6 py-3 border-t border-neutral-100 flex items-center justify-center gap-1">
                                                             <template x-for="p in getMsTotalPages('search')" :key="p">
                                                                 <button @click="setMsPage('search', p)"
+                                                                        :aria-current="msPage.search === p ? 'page' : null"
                                                                         :class="msPage.search === p
                                                                             ? 'bg-neutral-900 text-white'
                                                                             : 'text-neutral-600 hover:bg-neutral-100'"
@@ -1373,6 +1393,8 @@
                                             <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.enhanced_help') }}</p>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="oqEnhanced"
+                                                :aria-label="window.t('models.oq.enhanced_label')"
                                                 @click="oqEnhanced = !oqEnhanced"
                                                 :class="oqEnhanced ? 'bg-black' : 'bg-neutral-200'"
                                                 class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1387,6 +1409,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_reuse_cache_help') }}</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="oqeReuseImatrixCache"
+                                                    :aria-label="window.t('models.oq.imatrix_reuse_cache')"
                                                     @click="oqeReuseImatrixCache = !oqeReuseImatrixCache"
                                                     :class="oqeReuseImatrixCache ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1407,6 +1431,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_strict_help') }}</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="oqeStrictImatrix"
+                                                    :aria-label="window.t('models.oq.imatrix_strict')"
                                                     @click="oqeStrictImatrix = !oqeStrictImatrix"
                                                     :class="oqeStrictImatrix ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1428,6 +1454,8 @@
                                         <div x-show="oqSelectedModelIsVLM()" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">Text Only</span>
                                             <button type="button"
+                                                    x-a11y-switch="oqTextOnly"
+                                                    aria-label="Text Only"
                                                     @click="oqTextOnly = !oqTextOnly"
                                                     :class="oqTextOnly ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1448,6 +1476,8 @@
                                                    class="text-xs text-amber-600 mt-1 leading-relaxed">{{ t('models.oq.preserve_mtp_unavailable') }}</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="oqPreserveMtp"
+                                                    :aria-label="window.t('models.oq.preserve_mtp')"
                                                     @click="if (oqSelectedModelHasMtp()) oqPreserveMtp = !oqPreserveMtp"
                                                     :disabled="!oqSelectedModelHasMtp()"
                                                     :class="[
@@ -1482,11 +1512,13 @@
                                             </div>
                                             <div class="flex gap-1.5 shrink-0">
                                                 <button type="button" @click="oqDtype='bfloat16'"
+                                                        x-a11y-pressed="oqDtype === 'bfloat16'"
                                                         :class="oqDtype==='bfloat16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     bfloat16
                                                 </button>
                                                 <button type="button" @click="oqDtype='float16'"
+                                                        x-a11y-pressed="oqDtype === 'float16'"
                                                         :class="oqDtype==='float16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     float16
@@ -1975,7 +2007,10 @@
                                                     <label class="text-xs font-medium text-neutral-500" x-text="window.t('models.uploader.modal_redownload_label')"></label>
                                                     <p class="text-[10px] text-neutral-400 mt-0.5" x-text="window.t('models.uploader.modal_redownload_hint')"></p>
                                                 </div>
-                                                <button @click="uploadRedownloadNotice = !uploadRedownloadNotice"
+                                                <button type="button"
+                                                        x-a11y-switch="uploadRedownloadNotice"
+                                                        :aria-label="window.t('models.uploader.modal_redownload_label')"
+                                                        @click="uploadRedownloadNotice = !uploadRedownloadNotice"
                                                         class="relative w-10 h-5 rounded-full transition-colors duration-200 shrink-0 ml-3"
                                                         :class="uploadRedownloadNotice ? 'bg-neutral-900' : 'bg-neutral-200'">
                                                     <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200"
@@ -1986,7 +2021,10 @@
                                         <!-- Private toggle -->
                                         <div class="flex items-center justify-between">
                                             <label class="text-xs font-medium text-neutral-500" x-text="window.t('models.uploader.modal_private_label')"></label>
-                                            <button @click="uploadPrivate = !uploadPrivate"
+                                            <button type="button"
+                                                    x-a11y-switch="uploadPrivate"
+                                                    :aria-label="window.t('models.uploader.modal_private_label')"
+                                                    @click="uploadPrivate = !uploadPrivate"
                                                     class="relative w-10 h-5 rounded-full transition-colors duration-200"
                                                     :class="uploadPrivate ? 'bg-neutral-900' : 'bg-neutral-200'">
                                                 <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200"
@@ -2064,11 +2102,13 @@
                                     <div x-data="{ detailTab: 'card' }" class="flex-1 min-h-0 flex flex-col">
                                         <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5 mb-4 shrink-0 w-fit">
                                             <button @click="detailTab = 'card'"
+                                                    x-a11y-pressed="detailTab === 'card'"
                                                     :class="detailTab === 'card' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                                 {{ t('models.detail.tab.model_card') }}
                                             </button>
                                             <button @click="detailTab = 'files'"
+                                                    x-a11y-pressed="detailTab === 'files'"
                                                     :class="detailTab === 'files' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                                 {{ t('models.detail.tab.files') }}
@@ -2077,6 +2117,7 @@
                                                       x-text="'(' + hfModelDetail.files.length + ')'"></span>
                                             </button>
                                             <button @click="detailTab = 'tags'"
+                                                    x-a11y-pressed="detailTab === 'tags'"
                                                     :class="detailTab === 'tags' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                                 {{ t('models.detail.tab.tags') }}
@@ -2184,11 +2225,13 @@
                                     <div x-data="{ detailTab: 'card' }" class="flex-1 min-h-0 flex flex-col">
                                         <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5 mb-4 shrink-0 w-fit">
                                             <button @click="detailTab = 'card'"
+                                                    x-a11y-pressed="detailTab === 'card'"
                                                     :class="detailTab === 'card' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                                 {{ t('models.detail.tab.model_card') }}
                                             </button>
                                             <button @click="detailTab = 'tags'"
+                                                    x-a11y-pressed="detailTab === 'tags'"
                                                     :class="detailTab === 'tags' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                                     class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                                 {{ t('models.detail.tab.tags') }}

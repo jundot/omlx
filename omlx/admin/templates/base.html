@@ -25,6 +25,36 @@
 
     <!-- Alpine.js -->
     <script defer src="/admin/static/js/alpine.min.js"></script>
+    <script>
+        // Give custom visual switches consistent accessibility semantics.
+        // Usage: x-a11y-switch="booleanExpression" plus an accessible name.
+        document.addEventListener('alpine:init', function() {
+            Alpine.directive('a11y-switch', function(el, directive, utilities) {
+                var evaluateChecked = utilities.evaluateLater(directive.expression);
+
+                el.setAttribute('role', 'switch');
+                var knob = el.querySelector(':scope > span');
+                if (knob) knob.setAttribute('aria-hidden', 'true');
+
+                utilities.effect(function() {
+                    evaluateChecked(function(checked) {
+                        el.setAttribute('aria-checked', checked ? 'true' : 'false');
+                    });
+                });
+            });
+
+            // Expose the state of buttons used as selectable options.
+            Alpine.directive('a11y-pressed', function(el, directive, utilities) {
+                var evaluatePressed = utilities.evaluateLater(directive.expression);
+
+                utilities.effect(function() {
+                    evaluatePressed(function(pressed) {
+                        el.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+                    });
+                });
+            });
+        });
+    </script>
 
     <!-- Lucide Icons -->
     <script src="/admin/static/js/lucide.min.js"></script>

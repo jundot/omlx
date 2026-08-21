@@ -34,6 +34,7 @@
             <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
                 <button
                     @click="setMainTab('status')"
+                    x-a11y-pressed="mainTab === 'status'"
                     :class="mainTab === 'status'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -45,6 +46,7 @@
                 <button
                     x-show="globalSettings.server.distributed_inference_active"
                     x-cloak
+                    x-a11y-pressed="mainTab === 'cluster'"
                     @click="setMainTab('cluster')"
                     :class="mainTab === 'cluster'
                         ? 'bg-white text-neutral-900 shadow-sm'
@@ -57,6 +59,7 @@
                 <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
                     <button
                         @click="setMainTab('models')"
+                        x-a11y-pressed="mainTab === 'models'"
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -84,6 +87,7 @@
                     >
                         <button
                             @click="setModelsTab('manager'); modelsDropdown = false;"
+                            x-a11y-pressed="mainTab === 'models' && modelsTab === 'manager'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'manager'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -94,6 +98,7 @@
                         </button>
                         <button
                             @click="setModelsTab('downloader'); modelsDropdown = false;"
+                            x-a11y-pressed="mainTab === 'models' && modelsTab === 'downloader'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'downloader'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -104,6 +109,7 @@
                         </button>
                         <button
                             @click="setModelsTab('quantizer'); modelsDropdown = false;"
+                            x-a11y-pressed="mainTab === 'models' && modelsTab === 'quantizer'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'quantizer'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -114,6 +120,7 @@
                         </button>
                         <button
                             @click="setModelsTab('uploader'); modelsDropdown = false;"
+                            x-a11y-pressed="mainTab === 'models' && modelsTab === 'uploader'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'uploader'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -127,6 +134,7 @@
                 <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
                     <button
                         @click="setMainTab('settings')"
+                        x-a11y-pressed="mainTab === 'settings'"
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -149,6 +157,7 @@
                     >
                         <button
                             @click="setSettingsTab('global'); settingsDropdown = false"
+                            x-a11y-pressed="mainTab === 'settings' && activeTab === 'global'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'global'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -159,6 +168,7 @@
                         </button>
                         <button
                             @click="setSettingsTab('models'); settingsDropdown = false"
+                            x-a11y-pressed="mainTab === 'settings' && activeTab === 'models'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'models'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -169,6 +179,7 @@
                         </button>
                         <button
                             @click="setSettingsTab('integrations'); settingsDropdown = false"
+                            x-a11y-pressed="mainTab === 'settings' && activeTab === 'integrations'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'integrations'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -181,6 +192,7 @@
                 </div>
                 <button
                     @click="setMainTab('logs')"
+                    x-a11y-pressed="mainTab === 'logs'"
                     :class="mainTab === 'logs'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -192,6 +204,7 @@
                 <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
                     <button
                         @click="setMainTab('bench')"
+                        x-a11y-pressed="mainTab === 'bench'"
                         :class="mainTab === 'bench'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -213,6 +226,7 @@
                     >
                         <button
                             @click="setBenchTab('throughput'); benchDropdown = false;"
+                            x-a11y-pressed="mainTab === 'bench' && benchTab === 'throughput'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'bench' && benchTab === 'throughput'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -223,6 +237,7 @@
                         </button>
                         <button
                             @click="setBenchTab('accuracy'); benchDropdown = false;"
+                            x-a11y-pressed="mainTab === 'bench' && benchTab === 'accuracy'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'bench' && benchTab === 'accuracy'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -233,6 +248,7 @@
                         </button>
                         <button
                             @click="setBenchTab('context'); benchDropdown = false;"
+                            x-a11y-pressed="mainTab === 'bench' && benchTab === 'context'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'bench' && benchTab === 'context'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -289,6 +305,7 @@
                     >
                         <button
                             @click="setTheme('auto'); themeDropdown = false"
+                            x-a11y-pressed="theme === 'auto'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="theme === 'auto'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -299,6 +316,7 @@
                         </button>
                         <button
                             @click="setTheme('light'); themeDropdown = false"
+                            x-a11y-pressed="theme === 'light'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="theme === 'light'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -309,6 +327,7 @@
                         </button>
                         <button
                             @click="setTheme('dark'); themeDropdown = false"
+                            x-a11y-pressed="theme === 'dark'"
                             class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="theme === 'dark'
                                 ? 'text-neutral-900 bg-neutral-100'
@@ -358,6 +377,7 @@
              class="lg:hidden border-t border-neutral-100 px-4 pt-3 pb-2">
             <div class="max-w-7xl mx-auto space-y-1">
                 <button @click="setMainTab('status'); mobileMenuOpen = false"
+                        x-a11y-pressed="mainTab === 'status'"
                         :class="mainTab === 'status' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
@@ -365,6 +385,7 @@
                 </button>
                 <button x-show="globalSettings.server.distributed_inference_active"
                         x-cloak
+                        x-a11y-pressed="mainTab === 'cluster'"
                         @click="setMainTab('cluster'); mobileMenuOpen = false"
                         :class="mainTab === 'cluster' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
@@ -372,6 +393,7 @@
                     {{ t('navbar.tab.cluster') }}
                 </button>
                 <button @click="setMainTab('models'); mobileMenuOpen = false"
+                        x-a11y-pressed="mainTab === 'models'"
                         :class="mainTab === 'models' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
@@ -382,18 +404,21 @@
                           x-cloak></span>
                 </button>
                 <button @click="setMainTab('settings'); mobileMenuOpen = false"
+                        x-a11y-pressed="mainTab === 'settings'"
                         :class="mainTab === 'settings' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="settings" class="w-4 h-4"></i>
                     {{ t('navbar.tab.settings') }}
                 </button>
                 <button @click="setMainTab('logs'); mobileMenuOpen = false"
+                        x-a11y-pressed="mainTab === 'logs'"
                         :class="mainTab === 'logs' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="scroll-text" class="w-4 h-4"></i>
                     {{ t('navbar.tab.logs') }}
                 </button>
                 <button @click="setMainTab('bench'); mobileMenuOpen = false"
+                        x-a11y-pressed="mainTab === 'bench'"
                         :class="mainTab === 'bench' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="gauge" class="w-4 h-4"></i>
@@ -407,18 +432,24 @@
                 <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
                     <div class="flex items-center gap-1">
                         <button @click="setTheme('auto')"
+                                x-a11y-pressed="theme === 'auto'"
+                                :aria-label="window.t('navbar.theme.auto')"
                                 class="p-2 rounded-full transition-all duration-200"
                                 :class="theme === 'auto' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                                 :title="window.t('navbar.theme.auto')">
                             <i data-lucide="sun-moon" class="w-4 h-4"></i>
                         </button>
                         <button @click="setTheme('light')"
+                                x-a11y-pressed="theme === 'light'"
+                                :aria-label="window.t('navbar.theme.light_mode')"
                                 class="p-2 rounded-full transition-all duration-200"
                                 :class="theme === 'light' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                                 :title="window.t('navbar.theme.light_mode')">
                             <i data-lucide="sun" class="w-4 h-4"></i>
                         </button>
                         <button @click="setTheme('dark')"
+                                x-a11y-pressed="theme === 'dark'"
+                                :aria-label="window.t('navbar.theme.dark_mode')"
                                 class="p-2 rounded-full transition-all duration-200"
                                 :class="theme === 'dark' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                                 :title="window.t('navbar.theme.dark_mode')">

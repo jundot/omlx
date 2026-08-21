@@ -395,6 +395,7 @@
   "settings.model.hide_helper_models_desc": "Не показывать модели dFlash, Assistant и Draft в ответе API /v1/models",
   "settings.model.model_directories": "Каталоги моделей",
   "settings.model.add": "Добавить",
+  "settings.model.remove_directory": "Удалить каталог",
   "settings.model.placeholder_primary": "Основной каталог моделей",
   "settings.model.placeholder_additional": "Дополнительный каталог моделей",
   "settings.model.hf_cache": "Использовать локальный кэш Hugging Face",

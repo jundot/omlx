@@ -395,6 +395,7 @@
   "settings.model.hide_helper_models_desc": "從 /v1/models API 中隱藏 dFlash、Assistant 和 Draft 模型",
   "settings.model.model_directories": "模型目錄",
   "settings.model.add": "新增",
+  "settings.model.remove_directory": "移除目錄",
   "settings.model.placeholder_primary": "主要模型目錄",
   "settings.model.placeholder_additional": "附加模型目錄",
   "settings.model.hf_cache": "使用 Hugging Face 本機快取",

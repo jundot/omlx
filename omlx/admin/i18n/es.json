@@ -395,6 +395,7 @@
   "settings.model.hide_helper_models_desc": "Oculta los modelos dFlash, Assistant y Draft de la API /v1/models",
   "settings.model.model_directories": "Directorios de Modelos",
   "settings.model.add": "Agregar",
+  "settings.model.remove_directory": "Eliminar directorio",
   "settings.model.placeholder_primary": "Directorio principal de modelos",
   "settings.model.placeholder_additional": "Directorio adicional de modelos",
   "settings.model.hf_cache": "Use Hugging Face local cache",

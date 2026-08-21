@@ -1117,9 +1117,13 @@
                         <div class="flex items-center gap-0 flex-1 min-w-0">
                             <i x-show="chat.pinned" data-lucide="pin" class="w-3 h-3 flex-shrink-0 mr-1"
                                 style="color: var(--timeline-accent);"></i>
-                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);"
+                            <!-- A real button so the chat can be opened from the keyboard;
+                                 the row div keeps its click target for the mouse. -->
+                            <button type="button" @click.stop="loadChat(chat.id)"
+                                x-a11y-pressed="currentChatId === chat.id"
+                                class="text-sm truncate flex-1 text-left" style="color: var(--text-primary);"
                                 :title="displayChatTitle(chat)"
-                                x-text="displayChatTitle(chat)"></span>
+                                x-text="displayChatTitle(chat)"></button>
                             <button @click.stop="togglePinChat(chat.id)"
                                 class="p-1 hover:bg-surface-alt rounded transition-opacity"
                                 :class="chat.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'"
@@ -1193,6 +1197,7 @@
                     style="min-width: 15rem; max-height: 18rem;">
                     <template x-for="model in availableModels" :key="model.id">
                         <button @click="selectModel(model.id); modelMenuOpen = false"
+                            x-a11y-pressed="model.id === currentModel"
                             class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted transition-colors"
                             :class="model.id === currentModel ? 'font-semibold' : ''"
                             style="color: var(--text-primary);">
@@ -1942,6 +1947,7 @@
             <div class="flex items-center gap-1">
                 <div class="flex flex-1 items-center gap-1">
                     <button @click="rightSidebarTab = 'settings'"
+                        x-a11y-pressed="rightSidebarTab === 'settings'"
                         class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'settings'
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
@@ -1950,6 +1956,7 @@
                         <span>{{ t('chat.model_tab') }}</span>
                     </button>
                     <button @click="rightSidebarTab = 'profile'"
+                        x-a11y-pressed="rightSidebarTab === 'profile'"
                         class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'profile'
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
@@ -1958,6 +1965,7 @@
                         <span>{{ t('chat.profile_tab') }}</span>
                     </button>
                     <button @click="rightSidebarTab = 'chat'"
+                        x-a11y-pressed="rightSidebarTab === 'chat'"
                         class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'chat'
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
@@ -1986,13 +1994,18 @@
                         <div>
                             <!-- Normal row -->
                             <template x-if="!(editingPromptProfileName && activePromptProfile === p.name)">
-                                <div @click="selectPromptProfile(p.name)"
-                                    class="flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer group transition-colors"
+                                <div class="flex items-center gap-2 px-3 py-2 rounded-lg group transition-colors"
                                     :class="activePromptProfile === p.name ? 'bg-surface-muted' : 'hover:bg-surface-muted'">
-                                    <span class="w-2 h-2 rounded-full flex-shrink-0"
-                                        :class="activePromptProfile === p.name ? 'bg-blue-500' : 'border border-line'"></span>
-                                    <span class="flex-1 text-xs font-medium truncate"
-                                        style="color: var(--text-primary);" x-text="p.name"></span>
+                                    <!-- The row's label area is a real button so the profile can be
+                                         selected by keyboard and its state announced. -->
+                                    <button type="button" @click="selectPromptProfile(p.name)"
+                                        x-a11y-pressed="activePromptProfile === p.name"
+                                        class="flex flex-1 min-w-0 items-center gap-2 text-left cursor-pointer">
+                                        <span class="w-2 h-2 rounded-full flex-shrink-0"
+                                            :class="activePromptProfile === p.name ? 'bg-blue-500' : 'border border-line'"></span>
+                                        <span class="flex-1 text-xs font-medium truncate"
+                                            style="color: var(--text-primary);" x-text="p.name"></span>
+                                    </button>
                                     <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                                         :class="{'!opacity-100': activePromptProfile === p.name}">
                                         <button x-show="p.name !== 'System Default'" @click.stop="startRenamingPromptProfile()"

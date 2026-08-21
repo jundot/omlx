@@ -395,6 +395,7 @@
   "settings.model.hide_helper_models_desc": "dFlash・Assistant・Draft モデルを /v1/models API から非表示にします",
   "settings.model.model_directories": "モデルディレクトリ",
   "settings.model.add": "追加",
+  "settings.model.remove_directory": "ディレクトリを削除",
   "settings.model.placeholder_primary": "メインモデルディレクトリ",
   "settings.model.placeholder_additional": "追加モデルディレクトリ",
   "settings.model.hf_cache": "Use Hugging Face local cache",

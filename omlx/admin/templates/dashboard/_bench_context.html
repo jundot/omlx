@@ -37,7 +37,8 @@
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('ctx_bench.config.target') }}</label>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <template x-for="t in ctxBenchTargetOptions()" :key="t">
-                                        <button
+                                        <button type="button"
+                                            x-a11y-pressed="ctxBenchTarget === t"
                                             @click="ctxBenchTarget = t"
                                             :disabled="ctxBenchRunning"
                                             :class="ctxBenchTarget === t
@@ -54,7 +55,8 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('settings.resource.prefill_priority.label') }}</label>
                                 <div class="flex rounded-lg border border-neutral-200 overflow-hidden w-fit">
-                                    <button
+                                    <button type="button"
+                                        x-a11y-pressed="globalSettings.scheduler.prefill_priority !== 'speed'"
                                         @click="saveCtxBenchPriority('context')"
                                         :disabled="ctxBenchRunning"
                                         :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
@@ -62,7 +64,8 @@
                                         <i data-lucide="maximize-2" class="w-3.5 h-3.5"></i>
                                         {{ t('settings.resource.prefill_priority.max_context') }}
                                     </button>
-                                    <button
+                                    <button type="button"
+                                        x-a11y-pressed="globalSettings.scheduler.prefill_priority === 'speed'"
                                         @click="saveCtxBenchPriority('speed')"
                                         :disabled="ctxBenchRunning"
                                         :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"

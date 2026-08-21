@@ -60,7 +60,10 @@
 
                             <!-- Auto-scroll toggle -->
                             <div class="flex items-center gap-2">
-                                <button type="button" @click="logAutoScroll = !logAutoScroll"
+                                <button type="button"
+                                        x-a11y-switch="logAutoScroll"
+                                        :aria-label="window.t('logs.auto_scroll')"
+                                        @click="logAutoScroll = !logAutoScroll"
                                         :class="logAutoScroll ? 'bg-black' : 'bg-neutral-200'"
                                         class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none">
                                     <span :class="logAutoScroll ? 'translate-x-4' : 'translate-x-0'"
@@ -82,6 +85,7 @@
                                 <div class="flex gap-1">
                                     <template x-for="lvl in ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']" :key="lvl">
                                         <button type="button"
+                                                x-a11y-pressed="logMinLevel === lvl"
                                                 @click="logMinLevel = lvl"
                                                 :class="[levelButtonClass(lvl), logMinLevel === lvl ? 'ring-2 ring-offset-1 ring-neutral-500' : '']"
                                                 class="px-2 py-1 text-xs font-mono font-semibold rounded transition-all"

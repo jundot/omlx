@@ -395,6 +395,7 @@
   "settings.model.hide_helper_models_desc": "dFlash, Assistant, Draft 모델을 /v1/models API에서 숨깁니다",
   "settings.model.model_directories": "모델 디렉토리",
   "settings.model.add": "추가",
+  "settings.model.remove_directory": "디렉터리 제거",
   "settings.model.placeholder_primary": "기본 모델 디렉토리",
   "settings.model.placeholder_additional": "추가 모델 디렉토리",
   "settings.model.hf_cache": "Use Hugging Face local cache",

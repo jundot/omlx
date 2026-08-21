@@ -45,16 +45,19 @@
                             <!-- Scope toggle -->
                             <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
                                 <button type="button" @click="setScope('preset')"
+                                        x-a11y-pressed="profileScope === 'preset'"
                                         :class="profileScope === 'preset' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                         class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                     {{ t('modal.model_settings.profiles.scope_preset') }}
                                 </button>
                                 <button type="button" @click="setScope('global')"
+                                        x-a11y-pressed="profileScope === 'global'"
                                         :class="profileScope === 'global' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                         class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                     {{ t('modal.model_settings.profiles.scope_global') }}
                                 </button>
                                 <button type="button" @click="setScope('model')"
+                                        x-a11y-pressed="profileScope === 'model'"
                                         :class="profileScope === 'model' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
                                         class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                     {{ t('modal.model_settings.profiles.scope_model') }}
@@ -172,6 +175,7 @@
                             <template x-for="p in profiles" :key="p.name">
                                 <div class="inline-flex items-center gap-1">
                                     <button type="button" @click="applyProfileToForm(p)"
+                                            x-a11y-pressed="activeProfileName === p.name"
                                             @mouseenter="showTip($event.currentTarget, profileTooltip(p))"
                                             @mouseleave="hideTip()"
                                             :class="activeProfileName === p.name
@@ -244,6 +248,7 @@
                                            :placeholder="t('modal.model_settings.profiles.name_placeholder')"
                                            class="min-w-0 flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
                                     <button type="button"
+                                            x-a11y-pressed="p._editExposeAsModel ?? p.expose_as_model"
                                             @click="p._editExposeAsModel = !(p._editExposeAsModel ?? p.expose_as_model)"
                                             :title="t('modal.model_settings.profiles.expose_as_model')"
                                             :class="(p._editExposeAsModel ?? p.expose_as_model)
@@ -433,7 +438,10 @@
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.enable_thinking') }}</span>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.enable_thinking_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="
+                                    <button type="button"
+                                            x-a11y-switch="modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)"
+                                            :aria-label="window.t('modal.model_settings.enable_thinking')"
+                                            @click="
                                             const effective = modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false);
                                             modelSettings.enable_thinking = !effective;
                                         "
@@ -459,7 +467,10 @@
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.thinking_budget_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                    <button type="button"
+                                            x-a11y-switch="modelSettings.enableThinkingBudget"
+                                            :aria-label="window.t('modal.model_settings.thinking_budget')"
+                                            @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
                                             :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
@@ -482,7 +493,10 @@
                                         <p x-show="modelSettings.vlm_mtp_enabled"
                                            class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                     </div>
-                                    <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
+                                    <button type="button"
+                                            x-a11y-switch="modelSettings.guided_grammar_enabled"
+                                            :aria-label="window.t('modal.model_settings.guided_grammar')"
+                                            @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
                                             :disabled="modelSettings.vlm_mtp_enabled"
                                             :class="[
                                                 modelSettings.guided_grammar_enabled ? 'bg-black' : 'bg-neutral-200',
@@ -509,7 +523,10 @@
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.limit_tool_result') }}</span>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.limit_tool_result_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.enableToolResultLimit = !modelSettings.enableToolResultLimit; if (!modelSettings.enableToolResultLimit) modelSettings.max_tool_result_tokens = null;"
+                                    <button type="button"
+                                            x-a11y-switch="modelSettings.enableToolResultLimit"
+                                            :aria-label="window.t('modal.model_settings.limit_tool_result')"
+                                            @click="modelSettings.enableToolResultLimit = !modelSettings.enableToolResultLimit; if (!modelSettings.enableToolResultLimit) modelSettings.max_tool_result_tokens = null;"
                                             :class="modelSettings.enableToolResultLimit ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableToolResultLimit ? 'translate-x-5' : 'translate-x-0'"
@@ -530,7 +547,10 @@
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.force_sampling') }}</span>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.force_sampling_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.force_sampling = !modelSettings.force_sampling"
+                                    <button type="button"
+                                            x-a11y-switch="modelSettings.force_sampling"
+                                            :aria-label="window.t('modal.model_settings.force_sampling')"
+                                            @click="modelSettings.force_sampling = !modelSettings.force_sampling"
                                             :class="modelSettings.force_sampling ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.force_sampling ? 'translate-x-5' : 'translate-x-0'"
@@ -546,7 +566,10 @@
                                         <span class="text-sm font-medium text-red-700">{{ t('modal.model_settings.trust_remote_code') }}</span>
                                         <p class="text-xs text-red-600 mt-0.5">{{ t('modal.model_settings.trust_remote_code_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.trust_remote_code = !modelSettings.trust_remote_code"
+                                    <button type="button"
+                                            x-a11y-switch="modelSettings.trust_remote_code"
+                                            :aria-label="window.t('modal.model_settings.trust_remote_code')"
+                                            @click="modelSettings.trust_remote_code = !modelSettings.trust_remote_code"
                                             :class="modelSettings.trust_remote_code ? 'bg-red-600' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
                                         <span :class="modelSettings.trust_remote_code ? 'translate-x-5' : 'translate-x-0'"
@@ -693,6 +716,8 @@
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="modelSettings.mtp_enabled"
+                                                :aria-label="window.t('modal.model_settings.lightning_mtp')"
                                                 @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
                                                 :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
@@ -725,6 +750,8 @@
                                                 <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_hint') }}</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="modelSettings.qwen35_ane_prefill_enabled"
+                                                    :aria-label="window.t('modal.model_settings.qwen_ane')"
                                                     @click="modelSettings.qwen35_ane_prefill_enabled = !modelSettings.qwen35_ane_prefill_enabled"
                                                     :class="modelSettings.qwen35_ane_prefill_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -770,6 +797,8 @@
                                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_dual_hint') }}</p>
                                                 </div>
                                                 <button type="button"
+                                                        x-a11y-switch="modelSettings.qwen35_ane_prefill_dual_ane"
+                                                        :aria-label="window.t('modal.model_settings.qwen_ane_dual')"
                                                         @click="modelSettings.qwen35_ane_prefill_dual_ane = !modelSettings.qwen35_ane_prefill_dual_ane"
                                                         :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -785,6 +814,8 @@
                                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_hint') }}</p>
                                                     </div>
                                                     <button type="button"
+                                                            x-a11y-switch="modelSettings.qwen35_ane_prefill_cpu_enabled"
+                                                            :aria-label="window.t('modal.model_settings.qwen_ane_cpu')"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
                                                             :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -828,6 +859,8 @@
                                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_scheduler_hint') }}</p>
                                                     </div>
                                                     <button type="button"
+                                                            x-a11y-switch="modelSettings.qwen35_ane_prefill_cpu_shared_resource"
+                                                            :aria-label="window.t('modal.model_settings.qwen_ane_cpu_scheduler')"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_shared_resource = !modelSettings.qwen35_ane_prefill_cpu_shared_resource"
                                                             :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -843,6 +876,8 @@
                                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_gdn_hint') }}</p>
                                                 </div>
                                                 <button type="button"
+                                                        x-a11y-switch="modelSettings.qwen35_ane_prefill_gdn"
+                                                        :aria-label="window.t('modal.model_settings.qwen_ane_gdn')"
                                                         @click="modelSettings.qwen35_ane_prefill_gdn = !modelSettings.qwen35_ane_prefill_gdn"
                                                         :class="modelSettings.qwen35_ane_prefill_gdn ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1004,6 +1039,8 @@
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="modelSettings.turboquant_kv_enabled"
+                                                :aria-label="window.t('modal.model_settings.turboquant_kv')"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
@@ -1040,6 +1077,8 @@
                                                 <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.index_cache_hint') }} (<a href="https://github.com/THUDM/IndexCache" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="modelSettings.enableIndexCache"
+                                                    :aria-label="window.t('modal.model_settings.index_cache')"
                                                     @click="if (!modelSettings.is_paroquant) { modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null; }"
                                                     :disabled="modelSettings.is_paroquant"
                                                     :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
@@ -1068,6 +1107,8 @@
                                             <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="modelSettings.specprefill_enabled"
+                                                aria-label="SpecPrefill"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
@@ -1124,6 +1165,8 @@
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="modelSettings.dflash_enabled"
+                                                aria-label="DFlash"
                                                 @click="if (modelSettings.dflash_compatible && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
                                                 :disabled="!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.dflash_compatible
@@ -1160,7 +1203,10 @@
                                                     <span class="text-sm font-medium text-neutral-700">Quantization</span>
                                                     <p class="text-xs text-neutral-500 mt-0.5">Enable quantization for the draft model (weight, activation bits &amp; group size).</p>
                                                 </div>
-                                                <button type="button" @click="modelSettings.dflash_draft_quant_enabled = !modelSettings.dflash_draft_quant_enabled"
+                                                <button type="button"
+                                                        x-a11y-switch="modelSettings.dflash_draft_quant_enabled"
+                                                        aria-label="Quantization"
+                                                        @click="modelSettings.dflash_draft_quant_enabled = !modelSettings.dflash_draft_quant_enabled"
                                                         :class="modelSettings.dflash_draft_quant_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="modelSettings.dflash_draft_quant_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -1241,7 +1287,10 @@
                                                 <span class="text-sm font-medium text-neutral-700">In-memory cache</span>
                                                 <p class="text-xs text-neutral-500 mt-0.5">DFlash L1 prefix snapshot cache in RAM. Speeds up multi-turn chats with shared prefixes.</p>
                                             </div>
-                                            <button type="button" @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
+                                            <button type="button"
+                                                    x-a11y-switch="modelSettings.dflash_in_memory_cache"
+                                                    aria-label="In-memory cache"
+                                                    @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
                                                     :class="modelSettings.dflash_in_memory_cache ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="modelSettings.dflash_in_memory_cache ? 'translate-x-5' : 'translate-x-0'"
@@ -1268,6 +1317,8 @@
                                                 <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">Requires in-memory cache to be enabled.</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="modelSettings.dflash_ssd_cache"
+                                                    aria-label="SSD cache"
                                                     @click="if (modelSettings.dflash_ssd_cache_available && modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = !modelSettings.dflash_ssd_cache"
                                                     :disabled="!modelSettings.dflash_ssd_cache_available || !modelSettings.dflash_in_memory_cache"
                                                     :class="[
@@ -1300,6 +1351,8 @@
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_conflict') }}</p>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="modelSettings.vlm_mtp_enabled"
+                                                :aria-label="window.t('modal.model_settings.vlm_mtp')"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled && !vlmMtpProcessorConflict()) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled || vlmMtpProcessorConflict()"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"

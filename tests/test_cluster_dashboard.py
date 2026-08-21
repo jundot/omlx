@@ -37,7 +37,10 @@ def test_cluster_navigation_exists_for_desktop_and_mobile():
 
     assert dashboard.count('{% include "dashboard/_cluster.html" %}') == 1
     assert navbar.count("setMainTab('cluster')") == 2
-    assert navbar.count("mainTab === 'cluster'") == 2
+    # Each entry point styles itself from mainTab and exposes the same state to
+    # assistive technology, so the expression appears twice per entry point.
+    assert navbar.count("x-a11y-pressed=\"mainTab === 'cluster'\"") == 2
+    assert navbar.count("mainTab === 'cluster'") == 4
     assert navbar.count("navbar.tab.cluster") == 2
     assert navbar.count(
         'x-show="globalSettings.server.distributed_inference_active"'

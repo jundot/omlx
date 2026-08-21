@@ -3,6 +3,7 @@
             <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
                 <button
                     @click="setSettingsTab('global')"
+                    x-a11y-pressed="activeTab === 'global'"
                     :class="activeTab === 'global'
                         ? 'bg-neutral-900 text-white'
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -12,6 +13,7 @@
                 </button>
                 <button
                     @click="setSettingsTab('models')"
+                    x-a11y-pressed="activeTab === 'models'"
                     :class="activeTab === 'models'
                         ? 'bg-neutral-900 text-white'
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -21,6 +23,7 @@
                 </button>
                 <button
                     @click="setSettingsTab('integrations')"
+                    x-a11y-pressed="activeTab === 'integrations'"
                     :class="activeTab === 'integrations'
                         ? 'bg-neutral-900 text-white'
                         : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -119,6 +122,8 @@
                                            x-show="globalSettings.server.host !== '127.0.0.1'" x-cloak>{{ t('settings.auth.skip_verification_warning') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.auth.skip_api_key_verification"
+                                            :aria-label="window.t('settings.auth.skip_verification')"
                                             @click="globalSettings.auth.skip_api_key_verification = !globalSettings.auth.skip_api_key_verification"
                                             :class="globalSettings.auth.skip_api_key_verification ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -289,6 +294,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.model_fallback_desc') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.model.model_fallback"
+                                            :aria-label="window.t('settings.model.model_fallback')"
                                             @click="globalSettings.model.model_fallback = !globalSettings.model.model_fallback"
                                             :class="globalSettings.model.model_fallback ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -302,6 +309,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.hide_helper_models_desc') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.model.hide_helper_models"
+                                            :aria-label="window.t('settings.model.hide_helper_models')"
                                             @click="globalSettings.model.hide_helper_models = !globalSettings.model.hide_helper_models"
                                             :class="globalSettings.model.hide_helper_models ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -327,6 +336,8 @@
                                                        class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs"
                                                        :placeholder="index === 0 ? '{{ t('settings.model.placeholder_primary') }}' : '{{ t('settings.model.placeholder_additional') }}'">
                                                 <button @click="if (globalSettings.model.model_dirs.length > 1) globalSettings.model.model_dirs.splice(index, 1)"
+                                                        :disabled="globalSettings.model.model_dirs.length <= 1"
+                                                        :aria-label="window.t('settings.model.remove_directory')"
                                                         class="flex-shrink-0 p-1.5 rounded-lg transition-colors"
                                                         :class="globalSettings.model.model_dirs.length > 1 ? 'text-neutral-400 hover:text-red-500 hover:bg-red-50' : 'text-neutral-200 cursor-not-allowed'">
                                                     <i data-lucide="minus" class="w-3.5 h-3.5"></i>
@@ -344,6 +355,8 @@
                                            x-text="globalSettings.huggingface.hf_cache_path"></p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.huggingface.hf_cache_enabled"
+                                            :aria-label="window.t('settings.model.hf_cache')"
                                             @click="globalSettings.huggingface.hf_cache_enabled = !globalSettings.huggingface.hf_cache_enabled"
                                             :class="globalSettings.huggingface.hf_cache_enabled ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -417,6 +430,8 @@
                                             <span class="text-xs text-neutral-500">GB</span>
                                         </div>
                                         <button type="button"
+                                                x-a11y-switch="globalSettings.memory.prefill_memory_guard"
+                                                :aria-label="window.t('settings.resource.prefill_memory_guard')"
                                                 @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
                                                 :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
                                                 class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -438,6 +453,7 @@
                                     <div class="flex flex-wrap items-center gap-2 sm:gap-3">
                                         <input type="range" min="0" max="50" step="1"
                                                x-model.number="hotCachePercent"
+                                               :aria-label="window.t('settings.resource.hot_cache_limit')"
                                                @input="updateHotCacheFromSlider()"
                                                class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
                                                       [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
@@ -445,9 +461,12 @@
                                                       [&::-webkit-slider-thumb]:shadow-sm">
                                         <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
                                             <span x-text="hotCachePercent === 0 ? window.t('settings.resource.off') : hotCachePercent + '%'"></span>
-                                            <span class="text-neutral-400 ml-1">(</span><span x-show="!editingHotCache" @click="editingHotCache = true" class="cursor-pointer hover:text-neutral-900" x-text="hotCacheSizeGB"></span><input x-show="editingHotCache"
+                                            <span class="text-neutral-400 ml-1">(</span><button type="button" x-show="!editingHotCache" @click="editingHotCache = true"
+                                                    :aria-label="window.t('settings.resource.hot_cache_limit')"
+                                                    class="cursor-pointer hover:text-neutral-900" x-text="hotCacheSizeGB"></button><input x-show="editingHotCache"
                                                    type="number"
                                                    :value="hotCacheSizeGB"
+                                                   :aria-label="window.t('settings.resource.hot_cache_limit')"
                                                    @change="updateHotCacheFromInput($event.target.value); editingHotCache = false"
                                                    @blur="editingHotCache = false"
                                                    @keydown.enter="updateHotCacheFromInput($event.target.value); editingHotCache = false"
@@ -470,6 +489,7 @@
                                     <div class="flex flex-wrap items-center gap-2 sm:gap-3">
                                         <input type="range" min="0" max="100" step="1"
                                                x-model.number="cachePercent"
+                                               :aria-label="window.t('settings.resource.cold_cache_limit')"
                                                @input="updateCacheFromSlider()"
                                                class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
                                                       [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
@@ -477,9 +497,12 @@
                                                       [&::-webkit-slider-thumb]:shadow-sm">
                                         <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
                                             <span x-text="cachePercent + '%'"></span>
-                                            <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
+                                            <span class="text-neutral-400 ml-1">(</span><button type="button" x-show="!editingCache" @click="editingCache = true"
+                                                    :aria-label="window.t('settings.resource.cold_cache_limit')"
+                                                    class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></button><input x-show="editingCache"
                                                    type="number"
                                                    :value="cacheSizeGB"
+                                                   :aria-label="window.t('settings.resource.cold_cache_limit')"
                                                    @change="updateCacheFromInput($event.target.value); editingCache = false"
                                                    @blur="editingCache = false"
                                                    @keydown.enter="updateCacheFromInput($event.target.value); editingCache = false"
@@ -523,6 +546,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.chunked_prefill_description') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.scheduler.chunked_prefill"
+                                            :aria-label="window.t('settings.resource.chunked_prefill')"
                                             @click="globalSettings.scheduler.chunked_prefill = !globalSettings.scheduler.chunked_prefill"
                                             :class="globalSettings.scheduler.chunked_prefill ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -537,6 +562,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.decode_fairness_description') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.scheduler.decode_fairness"
+                                            :aria-label="window.t('settings.resource.decode_fairness')"
                                             @click="globalSettings.scheduler.decode_fairness = !globalSettings.scheduler.decode_fairness"
                                             :class="globalSettings.scheduler.decode_fairness ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -552,6 +579,7 @@
                                     </div>
                                     <div class="flex rounded-lg border border-neutral-200 overflow-hidden flex-shrink-0">
                                         <button type="button"
+                                                x-a11y-pressed="globalSettings.scheduler.prefill_priority !== 'speed'"
                                                 @click="globalSettings.scheduler.prefill_priority = 'context'"
                                                 :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                                 class="px-3 py-1.5 text-xs font-medium transition-all flex items-center gap-1.5">
@@ -559,6 +587,7 @@
                                             {{ t('settings.resource.prefill_priority.max_context') }}
                                         </button>
                                         <button type="button"
+                                                x-a11y-pressed="globalSettings.scheduler.prefill_priority === 'speed'"
                                                 @click="globalSettings.scheduler.prefill_priority = 'speed'"
                                                 :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                                 class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200 flex items-center gap-1.5">
@@ -601,7 +630,10 @@
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.cache.enabled') }}</label>
                                     </div>
-                                    <button type="button" @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
+                                    <button type="button"
+                                            x-a11y-switch="globalSettings.cache.enabled"
+                                            :aria-label="window.t('settings.cache.enabled')"
+                                            @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
                                             :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -618,7 +650,10 @@
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.cache.hot_cache_only_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
+                                    <button type="button"
+                                            x-a11y-switch="globalSettings.cache.hot_cache_only"
+                                            :aria-label="window.t('settings.cache.hot_cache_only')"
+                                            @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
                                             :class="globalSettings.cache.hot_cache_only ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.hot_cache_only ? 'translate-x-5' : 'translate-x-0'"
@@ -737,6 +772,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.mcp.expose_tools_hint') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.mcp.expose_tools"
+                                            :aria-label="window.t('settings.mcp.expose_tools')"
                                             @click="globalSettings.mcp.expose_tools = !globalSettings.mcp.expose_tools"
                                             :class="globalSettings.mcp.expose_tools ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -827,6 +864,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.distributed_inference_hint') }}</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="globalSettings.server.distributed_inference_enabled"
+                                                    :aria-label="window.t('settings.advanced.distributed_inference_enabled')"
                                                     @click="globalSettings.server.distributed_inference_enabled = !globalSettings.server.distributed_inference_enabled"
                                                     :class="globalSettings.server.distributed_inference_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -863,6 +902,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.preserve_mid_system_cache_hint') }}</p>
                                             </div>
                                             <button type="button"
+                                                    x-a11y-switch="globalSettings.server.preserve_mid_system_cache"
+                                                    :aria-label="window.t('settings.advanced.preserve_mid_system_cache')"
                                                     @click="globalSettings.server.preserve_mid_system_cache = !globalSettings.server.preserve_mid_system_cache"
                                                     :class="globalSettings.server.preserve_mid_system_cache ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1076,6 +1117,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.enabled_hint') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.integrations.markitdown_enabled"
+                                            :aria-label="window.t('settings.integrations.markitdown.enabled')"
                                             @click="globalSettings.integrations.markitdown_enabled = !globalSettings.integrations.markitdown_enabled; saveIntegrationSettings().then(() => loadModels())"
                                             :class="globalSettings.integrations.markitdown_enabled ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1089,6 +1132,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.expose_model_hint') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.integrations.markitdown_expose_model && globalSettings.integrations.markitdown_enabled"
+                                            :aria-label="window.t('settings.integrations.markitdown.expose_model')"
                                             @click="globalSettings.integrations.markitdown_expose_model = !globalSettings.integrations.markitdown_expose_model; saveIntegrationSettings().then(() => loadModels())"
                                             :disabled="!globalSettings.integrations.markitdown_enabled"
                                             :class="[
@@ -1241,6 +1286,8 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_truncate_hint') }}</p>
                                     </div>
                                     <button type="button"
+                                            x-a11y-switch="globalSettings.integrations.web_search_content_truncate"
+                                            :aria-label="window.t('settings.integrations.websearch.content_truncate')"
                                             @click="globalSettings.integrations.web_search_content_truncate = !globalSettings.integrations.web_search_content_truncate; saveIntegrationSettings()"
                                             :class="globalSettings.integrations.web_search_content_truncate ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1347,34 +1394,34 @@
                         <div class="overflow-x-auto">
                         <!-- Table Header -->
                         <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
-                            <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
+                            <button type="button" class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
                                 {{ t('settings.models.table.model') }}
                                 <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
-                            <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
+                            </button>
+                            <button type="button" class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
                                 {{ t('settings.models.table.type') }}
                                 <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
-                            <div class="hidden sm:flex w-60 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
+                            </button>
+                            <button type="button" class="hidden sm:flex w-60 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
                                 {{ t('settings.models.table.size') }}
                                 <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
-                            <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('loaded')">
+                            </button>
+                            <button type="button" class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('loaded')">
                                 {{ t('settings.models.table.status') }}
                                 <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
-                            <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
+                            </button>
+                            <button type="button" class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
                                 {{ t('settings.models.table.pin') }}
                                 <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
-                            <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_hidden')">
+                            </button>
+                            <button type="button" class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_hidden')">
                                 {{ t('settings.models.table.visible') }}
                                 <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
-                            <div class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
+                            </button>
+                            <button type="button" class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
                                 {{ t('settings.models.table.default') }}
                                 <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
-                            </div>
+                            </button>
                             <div class="w-10 text-center"></div>
                         </div>
 
@@ -1389,7 +1436,9 @@
                                         <!-- Model Name -->
                                         <div class="flex-1 min-w-0 flex items-center gap-3">
                                             <template x-if="!model.virtual">
-                                                <button
+                                                <button type="button"
+                                                    x-a11y-pressed="model.is_favorite"
+                                                    :aria-label="(model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip')) + ': ' + model.id"
                                                     @click="updateModelSetting(model.id, 'is_favorite', !model.is_favorite)"
                                                     @mouseenter="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
                                                     @mouseleave="hideTip()"
@@ -1489,7 +1538,9 @@
                                         <!-- Pin Toggle -->
                                         <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual">
-                                                <button
+                                                <button type="button"
+                                                    x-a11y-switch="model.pinned"
+                                                    :aria-label="window.t('settings.models.table.pin') + ': ' + model.id"
                                                     @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
                                                     @mouseenter="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
                                                     @mouseleave="hideTip()"
@@ -1512,7 +1563,9 @@
                                         <!-- Visibility Toggle (on = visible in /v1/models) -->
                                         <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual">
-                                                <button
+                                                <button type="button"
+                                                    x-a11y-switch="!model.is_hidden"
+                                                    :aria-label="window.t('settings.models.table.visible') + ': ' + model.id"
                                                     @click="updateModelSetting(model.id, 'is_hidden', !model.is_hidden)"
                                                     @mouseenter="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
                                                     @mouseleave="hideTip()"
@@ -1535,7 +1588,9 @@
                                         <!-- Default Radio (only for LLM models) -->
                                         <div class="hidden sm:flex w-14 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual && (model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type)">
-                                                <button
+                                                <button type="button"
+                                                    x-a11y-pressed="model.is_default"
+                                                    :aria-label="(model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip')) + ': ' + model.id"
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
                                                     @mouseenter="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
                                                     @mouseleave="hideTip()"

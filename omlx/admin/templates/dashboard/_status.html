@@ -9,12 +9,16 @@
                         <div class="flex flex-wrap items-center gap-2">
                             <!-- Scope toggle -->
                             <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
-                                <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                <button type="button"
+                                        x-a11y-pressed="statsScope === 'session'"
+                                        @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
                                         :class="statsScope === 'session' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                         class="px-3 py-1.5 text-xs font-medium transition-all">
                                     {{ t('status.scope_session') }}
                                 </button>
-                                <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                                <button type="button"
+                                        x-a11y-pressed="statsScope === 'alltime'"
+                                        @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
                                         :class="statsScope === 'alltime' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
                                         class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200">
                                     {{ t('status.scope_alltime') }}
@@ -673,6 +677,8 @@
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.mode') }}</label>
                                     <div class="flex items-center gap-3">
                                         <button type="button"
+                                                x-a11y-switch="globalSettings.claude_code.mode === 'local'"
+                                                :aria-label="window.t('status.claude_code.mode_local')"
                                                 @click="globalSettings.claude_code.mode = (globalSettings.claude_code.mode === 'cloud' ? 'local' : 'cloud'); saveClaudeCodeSettings()"
                                                 :class="globalSettings.claude_code.mode === 'local' ? 'bg-neutral-900' : 'bg-neutral-200'"
                                                 class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">

@@ -53,3 +53,143 @@ def test_focus_ring_contrasts_with_login_backgrounds():
     assert _contrast_ratio(light_ring, "#ffffff") >= 3
     assert _contrast_ratio(dark_ring, dark_page) >= 3
     assert _contrast_ratio(dark_ring, dark_control) >= 3
+
+
+def _switch_button_tags(template: Path) -> list[tuple[int, str]]:
+    """Return (line number, opening tag) for every custom toggle switch."""
+    source = template.read_text(encoding="utf-8")
+    tags = []
+    for match in re.finditer(r"<button\b[^>]*>", source):
+        tag = match.group(0)
+        if "w-11 h-6" not in tag:
+            continue
+        tags.append((source.count("\n", 0, match.start()) + 1, tag))
+    return tags
+
+
+def test_every_toggle_switch_exposes_state_and_name():
+    unlabeled = []
+    for template in sorted((ROOT / "omlx/admin/templates").rglob("*.html")):
+        for line, tag in _switch_button_tags(template):
+            location = f"{template.relative_to(ROOT)}:{line}"
+            if "x-a11y-switch" not in tag:
+                unlabeled.append(f"{location} missing x-a11y-switch")
+            elif "aria-label" not in tag:
+                unlabeled.append(f"{location} missing aria-label")
+
+    assert not unlabeled, "toggle switches without accessible state/name:\n" + "\n".join(
+        unlabeled
+    )
+
+
+STATE_ANNOTATIONS = (
+    "x-a11y-pressed",
+    "aria-pressed",
+    "x-a11y-switch",
+    "aria-checked",
+    "aria-current",
+    "aria-expanded",
+    "aria-selected",
+)
+
+# Conditions that drive styling without representing selection state, so the
+# control needs no aria state. Keyed by the condition rather than by line so the
+# list survives edits above it.
+NON_STATE_CONDITIONS = (
+    # Transient "Copied!" feedback on copy-to-clipboard buttons.
+    "copied",
+    "wiredLimitCopied",
+    # Hover-only restyling; these buttons swap their visible label instead.
+    "hover",
+    # Toggles that rename themselves (title/label) rather than expose pressed.
+    "chat.pinned",
+    "micActive()",
+    "chatSettings.webSearchEnabled",
+    # Styling that mirrors an actual `disabled` attribute.
+    "promptDirty && activePromptProfile",
+    "importingMtplx",
+    "aneTuning.running",
+    "globalSettings.model.model_dirs.length > 1",
+    # Progress/result feedback on a one-shot action button.
+    "uploadTokenValidated",
+)
+
+
+def _opening_tags(source: str):
+    """Yield (line, tag, tag name) for elements that may be interactive."""
+    for match in re.finditer(r"<(button|a|div|label|span)\b", source):
+        index, quote = match.end(), None
+        while index < len(source):
+            char = source[index]
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in "\"'":
+                quote = char
+            elif char == ">":
+                break
+            index += 1
+        yield source.count("\n", 0, match.start()) + 1, source[match.start() : index + 1], match.group(1)
+
+
+def test_selectable_controls_expose_their_state():
+    """A control whose :class branches on state must expose that state to AT."""
+    unexposed = []
+    for template in sorted((ROOT / "omlx/admin/templates").rglob("*.html")):
+        source = template.read_text(encoding="utf-8")
+        for line, tag, name in _opening_tags(source):
+            if any(annotation in tag for annotation in STATE_ANNOTATIONS):
+                continue
+            binding = re.search(r':class="([^"]*)"', tag) or re.search(
+                r":class='([^']*)'", tag
+            )
+            if binding is None or "?" not in binding.group(1):
+                continue
+            if name not in ("button", "a") and "@click" not in tag:
+                continue
+            condition = " ".join(binding.group(1).split()).split("?")[0].strip()
+            if condition in NON_STATE_CONDITIONS:
+                continue
+            unexposed.append(
+                f"{template.relative_to(ROOT)}:{line} state-styled on `{condition}`"
+            )
+
+    assert not unexposed, (
+        "controls that restyle on state without exposing it (add an aria state, "
+        "or list the condition in NON_STATE_CONDITIONS):\n" + "\n".join(unexposed)
+    )
+
+
+# Pointer-only conveniences: each duplicates an action that keyboard users can
+# already reach, so they need no role or tab stop of their own.
+POINTER_ONLY_CLICKS = (
+    # The chat row is clickable for the mouse; its title is a real button.
+    "if (renamingChatId !== chat.id) loadChat(chat.id)",
+    # Timeline dots scroll to a message that is reachable by reading the thread.
+    "scrollToMessage(dot.index)",
+)
+
+
+def test_clickable_non_button_elements_are_keyboard_operable():
+    """@click on a non-interactive element needs a role and a tab stop."""
+    unreachable = []
+    for template in sorted((ROOT / "omlx/admin/templates").rglob("*.html")):
+        source = template.read_text(encoding="utf-8")
+        for line, tag, name in _opening_tags(source):
+            if name in ("button", "a") or "@click" not in tag:
+                continue
+            # Overlays, dismiss backdrops and stop-propagation wrappers are not
+            # controls; they only mirror an action offered elsewhere.
+            if "cursor-pointer" not in tag:
+                continue
+            if 'role="' in tag and "tabindex=" in tag:
+                continue
+            handler = re.search(r'@click="([^"]*)"', tag)
+            if handler and handler.group(1) in POINTER_ONLY_CLICKS:
+                continue
+            unreachable.append(f"{template.relative_to(ROOT)}:{line} <{name}> @click")
+
+    assert not unreachable, (
+        "clickable elements that keyboard users cannot reach:\n"
+        + "\n".join(unreachable)
+    )

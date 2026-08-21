@@ -40,6 +40,8 @@
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.thinking') }}</label>
                                 <div class="flex items-center gap-3">
                                     <button type="button"
+                                            x-a11y-switch="accEnableThinking"
+                                            :aria-label="window.t('acc_bench.config.thinking')"
                                             @click="if (!accExternalEnabled) accEnableThinking = !accEnableThinking"
                                             :disabled="accExternalEnabled"
                                             :class="[accEnableThinking ? 'bg-black' : 'bg-neutral-200', accExternalEnabled ? 'opacity-40 cursor-not-allowed' : '']"
@@ -86,6 +88,8 @@
                                         <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.sampling') }}</label>
                                         <div class="flex items-center gap-3">
                                             <button type="button"
+                                                    x-a11y-switch="accSamplingProfile === 'model_settings'"
+                                                    :aria-label="window.t('acc_bench.config.sampling_model')"
                                                     @click="accSamplingProfile = accSamplingProfile === 'model_settings' ? 'deterministic' : 'model_settings'"
                                                     :class="accSamplingProfile === 'model_settings' ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -174,6 +178,12 @@
                                             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
                                                 <template x-for="b in group.benchmarks" :key="b.key">
                                                     <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                         @keydown.enter.prevent="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                         @keydown.space.prevent="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                         role="checkbox"
+                                                         tabindex="0"
+                                                         :aria-checked="accBenchmarks[b.key] ? 'true' : 'false'"
+                                                         :aria-label="b.label"
                                                          class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
                                                          :class="accBenchmarks[b.key]
                                                              ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
