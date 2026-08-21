@@ -142,18 +142,23 @@ steps, single process per variant (median of 3):
 
 | config | decode | vs stock |
 |---|---|---|
-| stock (`OMLX_LAGUNA_NVFP4_KERNELS=0`) | 67.4 tok/s (14.85 ms/tok) | — |
-| full kernel stack (=1, ATTN=1, FUSED=1) | 100.0 tok/s (10.00 ms/tok) | **+48%** |
+| stock (`OMLX_LAGUNA_NVFP4_KERNELS=0`) | 63.1 tok/s (15.86 ms/tok) | — |
+| full kernel stack (=1, ATTN=1, FUSED=1) | 94.9 tok/s (10.53 ms/tok) | **+50%** |
+
+(raw per-step loop reads higher: 67.4 -> 104.7 tok/s, +55%; the batch
+pipeline adds ~0.5 ms/step of harness overhead.)
 
 Individual contributions (all opt-in, guard + fallback): the NVFP4 QKV
 bank (`OMLX_LAGUNA_NVFP4_ATTN=1`) is the largest single win (+28% over
-stock); the routed/shared MoE kernels add ~+6%; the fused ring attention
-and gated o_proj each ~+3%; the LM-head prune ~+2.5%. The remaining gap to
-the challenge repo's Swift benchmark (138.7 tok/s on the same prompt) is
-structural: the challenge compiles the whole decode in Swift with minimal
-per-op dispatch, which the MLX Python kernel boundary cannot fully
-replicate (per-layer Python dispatch over 40 layers × ~6 ops). Reproduce
-with `tools/qwen38_mtp/bench_laguna_kernels.py` or `/tmp/bench_fused.py`.
+stock); the routed/shared MoE kernels add ~+10% (routed qmv+down-reduce,
+then the shared-expert down+routed+residual fusion); the fused ring + grow
+attention and gated o_proj each ~+3%; the LM-head prune ~+2.5%; the fused
+residual+RMS+router ~+1%. The remaining gap to the challenge repo's Swift
+benchmark (138.7 tok/s on the same prompt) is structural: the challenge
+compiles the whole decode in Swift with minimal per-op dispatch, which the
+Swift-wrapped MLX Python kernel boundary cannot fully replicate (per-layer
+Python dispatch over 40 layers). Reproduce with
+`tools/qwen38_mtp/bench_laguna_kernels.py` or `/tmp/bench_fused.py`.
 
 ### Attention kernels: wired via the opt-in NVFP4 attention bank
 
