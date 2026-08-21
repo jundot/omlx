@@ -41,10 +41,47 @@ final class ModelsScreenVM {
     }
 
     func load(id: String, client: OMLXClient) {
+        if let model = allModels.first(where: { $0.id == id }), model.isAttachableDrafter {
+            attachDrafter(model, client: client)
+            return
+        }
         Task { [weak self] in
             do {
                 _ = try await client.loadModel(id: id)
                 await self?.refresh()
+            } catch {
+                guard let self else { return }
+                self.lastError = error.omlxDescription
+            }
+        }
+    }
+
+    /// Attach an MTP/Assistant drafter to its chat model instead of
+    /// loading it standalone: enable VLM MTP on the target with this
+    /// drafter, then load the target. When the target is already loaded
+    /// the settings change makes the server rebuild its engine with the
+    /// drafter attached, so no explicit load call is needed.
+    private func attachDrafter(_ drafter: ModelDTO, client: OMLXClient) {
+        Task { [weak self] in
+            do {
+                guard let self else { return }
+                guard let target = MtpDrafterPairing.resolveTarget(
+                    drafter: drafter, in: self.allModels
+                ) else {
+                    self.lastError = String(
+                        localized: "models.library.attach.no_target",
+                        defaultValue: "Can't find a chat model to attach drafter \(drafter.id) to. Attach it manually via the chat model's settings instead.",
+                        comment: "Error shown when clicking Load on a speculative-decoding drafter whose companion chat model can't be found; placeholder is the drafter model id")
+                    return
+                }
+                var patch = ModelSettingsPatch()
+                patch.vlmMtpEnabled = true
+                patch.vlmMtpDraftModel = drafter.id
+                _ = try await client.updateModelSettings(id: target.id, patch: patch)
+                if !target.loaded && !target.isLoading {
+                    _ = try await client.loadModel(id: target.id)
+                }
+                await self.refresh()
             } catch {
                 guard let self else { return }
                 self.lastError = error.omlxDescription

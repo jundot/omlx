@@ -28,6 +28,17 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let pinned: Bool?
     let isDefault: Bool?
     let isFavorite: Bool?
+    /// True when the checkpoint is a speculative-decoding drafter that
+    /// cannot serve requests standalone (server rejects loading it as the
+    /// main model).
+    let isHelper: Bool?
+    /// Intrinsic drafter family from the server: `mtp` / `assistant` /
+    /// `dflash` / `draft`; nil for chat models and for drafts known only
+    /// by being referenced from another model's settings.
+    let helperKind: String?
+    /// Original Hub repo id (e.g. `mlx-community/Qwen3.8-27B-MTP-8bit`)
+    /// when the model was downloaded rather than converted locally.
+    let sourceRepoId: String?
     let engineType: String?
     let modelType: String?
     /// Lower-level config-derived model class (e.g. `deepseek_v32`,
@@ -66,6 +77,13 @@ extension ModelDTO {
             return estimatedSizeFormatted ?? ""
         }
         return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
+    }
+
+    /// True for MTP / Assistant drafter checkpoints, which the Models
+    /// screen "Load" button attaches to their chat model instead of
+    /// loading standalone (the server rejects standalone loads).
+    var isAttachableDrafter: Bool {
+        helperKind == "mtp" || helperKind == "assistant"
     }
 }
 
