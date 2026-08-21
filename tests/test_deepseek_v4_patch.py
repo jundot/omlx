@@ -197,6 +197,43 @@ class TestUtilsPatch:
         assert model.args.use_native_ratio128_attention is expected_enabled
         assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
+    @pytest.mark.parametrize(
+        ("bits", "expected_enabled"),
+        ((4, True), (2, False)),
+        ids=("four-bit-native", "sub-four-bit-reference"),
+    )
+    def test_ratio128_policy_also_applies_to_weights_held_in_memory(
+        self, applied_patch, bits, expected_enabled
+    ):
+        """A V4 checkpoint arriving over the fabric gets the same policy as
+        one read off disk — no model_path, no config.json, no safetensors."""
+        import mlx.nn as nn
+        from mlx_lm.utils import load_model
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class CapturingModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.args = args
+
+        model, loaded_config = load_model(
+            None,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (CapturingModel, dsv4.ModelArgs),
+            config={
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 1,
+                "compress_ratios": [128],
+                "quantization": {"bits": bits, "group_size": 8, "mode": "affine"},
+            },
+            weights={},
+        )
+
+        assert model.args.use_native_ratio128_attention is expected_enabled
+        assert loaded_config["use_native_ratio128_attention"] is expected_enabled
+
 
 class TestGeneratePatch:
     """mlx_lm.generate._make_cache replaced."""
@@ -1029,10 +1066,10 @@ class TestPatchedLoadModelTrustRemoteCode:
 
         from mlx_lm import utils
 
-        from omlx.patches.deepseek_v4 import utils_patch
-
         load_weights = MagicMock(side_effect=AssertionError("weights were opened"))
-        monkeypatch.setattr(utils_patch, "_load_safetensors", load_weights)
+        # The patch installs the F8_E8M0-capable reader here, and load_model
+        # resolves it off mlx_lm.utils at call time.
+        monkeypatch.setattr(utils, "_load_safetensors", load_weights)
 
         with pytest.raises(ValueError, match="trust_remote_code=True"):
             utils.load_model(tmp_path, lazy=True)

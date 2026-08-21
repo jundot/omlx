@@ -191,7 +191,8 @@ def apply_deepseek_v4_patch() -> bool:
     _register_module("mlx_lm.models.deepseek_v4", "deepseek_v4_model.py")
     _register_model_type_aliases()
 
-    # 4. Patch utils.load_model (F8_E8M0 fallback + fp8 quant branch).
+    # 4. Register with load_model (F8_E8M0 fallback, fp8 quantization,
+    #    ratio-128 attention policy).
     from .utils_patch import apply_utils_patch
 
     apply_utils_patch()
