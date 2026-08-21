@@ -1977,19 +1977,37 @@ def init_server(
             f"No models found in {', '.join(dir_list)}. Add models to serve them."
         )
 
-    # Set default model (from settings file, fallback to first model)
+    # Set default model (from settings file, fallback to first model).
+    # Drafter checkpoints (MTP/Assistant/DFlash) can't serve requests
+    # standalone, so they are never eligible as the default model — an older
+    # settings file may still point at one from before the helper guards.
     available_models = _server_state.engine_pool.get_model_ids()
+
+    def _is_helper_model(model_id: str) -> bool:
+        entry = _server_state.engine_pool.get_entry(model_id)
+        return bool(entry and getattr(entry, "is_helper", False))
+
+    servable_models = [m for m in available_models if not _is_helper_model(m)]
+    if not servable_models:
+        servable_models = available_models
     if available_models:
         if settings_default:
-            if settings_default in available_models:
+            if settings_default in servable_models:
                 _server_state.default_model = settings_default
+            elif settings_default in available_models:
+                logger.warning(
+                    f"Default model '{settings_default}' is a "
+                    "speculative-decoding drafter and cannot serve requests "
+                    f"standalone, using '{servable_models[0]}' instead"
+                )
+                _server_state.default_model = servable_models[0]
             else:
                 logger.warning(
                     f"Default model '{settings_default}' not found, using first model"
                 )
-                _server_state.default_model = available_models[0]
+                _server_state.default_model = servable_models[0]
         else:
-            _server_state.default_model = available_models[0]
+            _server_state.default_model = servable_models[0]
     else:
         _server_state.default_model = None
 

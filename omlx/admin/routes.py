@@ -2729,6 +2729,18 @@ async def update_model_settings(
         # Also update the engine pool entry
         entry.is_pinned = request.is_pinned
     if request.is_default is not None:
+        if request.is_default and getattr(entry, "is_helper", False):
+            # Drafter checkpoints (MTP/Assistant/DFlash) can't serve requests
+            # standalone; a default pointing at one breaks bare API calls.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"'{model_id}' is a speculative-decoding drafter "
+                    f"({entry.helper_kind or 'draft'}) and cannot be the "
+                    "default model; set its target chat model as default "
+                    "instead."
+                ),
+            )
         current_settings.is_default = request.is_default
         if server_state:
             if request.is_default:

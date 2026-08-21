@@ -17,10 +17,14 @@ class _FakeEntry:
         engine_type: str = "batched",
         model_type: str = "llm",
         config_model_type: str | None = None,
+        is_helper: bool = False,
+        helper_kind: str | None = None,
     ):
         self.engine_type = engine_type
         self.model_type = model_type
         self.config_model_type = config_model_type
+        self.is_helper = is_helper
+        self.helper_kind = helper_kind
         self.engine = None
         self.is_pinned = False
         self.is_loading = False
@@ -743,6 +747,20 @@ class TestDefaultModelPointer:
         r = c.put("/admin/api/models/model-b/settings", json={"is_default": False})
         assert r.status_code == 200, r.text
         assert admin_routes._get_server_state().default_model == "model-a"
+
+    def test_setting_default_on_a_drafter_is_rejected(self, client):
+        """Speculative-decoding drafters can't serve requests standalone, so
+        they must never become the default model."""
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["model-mtp"] = _FakeEntry(
+            "model-mtp", is_helper=True, helper_kind="mtp"
+        )
+
+        r = c.put("/admin/api/models/model-mtp/settings", json={"is_default": True})
+        assert r.status_code == 400, r.text
+        assert "drafter" in r.json()["detail"]
+        assert admin_routes._get_server_state().default_model is None
 
 
 class TestExposeAsModelAPI:

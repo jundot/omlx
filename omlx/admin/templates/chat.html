@@ -1182,6 +1182,18 @@
                     style="color: var(--text-primary); max-width: 18rem;">
                     <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                     <span class="truncate min-w-0" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
+                    <!-- Speculative decoding active on the current model: badge
+                         the picker so the drafter selection is visible. -->
+                    <template x-if="speculativeStateFor(currentModel)">
+                        <span class="flex items-center gap-0.5 px-1 py-0.5 rounded border border-line flex-shrink-0 text-[10px]"
+                            style="color: var(--timeline-accent);"
+                            :title="window.t('chat.drafter_enabled_notice')
+                                .replace('{drafter}', speculativeStateFor(currentModel).draftId)
+                                .replace('{target}', currentModel)">
+                            <i data-lucide="zap" class="w-3 h-3"></i>
+                            <span x-text="drafterKindLabel(speculativeStateFor(currentModel).kind)"></span>
+                        </span>
+                    </template>
                     <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0 transition-transform"
                         :style="modelMenuOpen ? 'color: var(--text-tertiary);' : 'color: var(--text-tertiary); transform: rotate(180deg);'"></i>
                 </button>
@@ -1215,16 +1227,20 @@
                                 <button @click="selectModelOrDrafter(drafter.id); modelMenuOpen = false"
                                     :disabled="!drafter.targetId"
                                     class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left transition-colors"
-                                    :class="drafter.targetId ? 'hover:bg-surface-muted' : 'opacity-50 cursor-not-allowed'"
+                                    :class="(drafter.targetId ? 'hover:bg-surface-muted' : 'opacity-50 cursor-not-allowed')
+                                        + (isDrafterActive(drafter) ? ' font-semibold' : '')"
                                     style="color: var(--text-primary);"
                                     :title="drafter.targetId
                                         ? window.t('chat.drafter_enable_on').replace('{target}', drafter.targetName || drafter.targetId)
                                         : window.t('chat.drafter_needs_target')">
-                                    <i data-lucide="zap" class="w-3 h-3 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                                    <i data-lucide="zap" class="w-3 h-3 flex-shrink-0"
+                                        :style="isDrafterActive(drafter) ? 'color: var(--timeline-accent);' : 'color: var(--text-tertiary);'"></i>
                                     <span class="flex-1 min-w-0 truncate" x-text="drafter.name"></span>
                                     <span class="text-[10px] px-1 py-0.5 rounded border border-line flex-shrink-0"
                                         style="color: var(--text-tertiary);"
                                         x-text="drafter.kindLabel"></span>
+                                    <i data-lucide="check" class="w-3 h-3 flex-shrink-0"
+                                        :style="'color: var(--timeline-accent); visibility:' + (isDrafterActive(drafter) ? 'visible' : 'hidden')"></i>
                                 </button>
                             </template>
                         </div>
@@ -3077,6 +3093,27 @@
                 return { mtp: 'MTP', assistant: 'Assistant', dflash: 'DFlash' }[kind] || 'Draft';
             },
 
+            /** Active speculative-decoding state for a chat model, derived from
+                its saved settings: {kind, draftId} or null when disabled. */
+            speculativeStateFor(modelId) {
+                const admin = (this._adminModelsList || []).find(m => m.id === modelId);
+                const s = admin?.settings || {};
+                if (s.dflash_enabled && s.dflash_draft_model) {
+                    return { kind: 'dflash', draftId: s.dflash_draft_model };
+                }
+                if (s.vlm_mtp_enabled && s.vlm_mtp_draft_model) {
+                    return { kind: 'mtp', draftId: s.vlm_mtp_draft_model };
+                }
+                return null;
+            },
+
+            /** True when this drafter is the enabled draft model of the
+                currently selected chat model. */
+            isDrafterActive(drafter) {
+                const spec = this.speculativeStateFor(this.currentModel);
+                return Boolean(spec && drafter && spec.draftId === drafter.id);
+            },
+
             /** Name-pair a drafter to its chat model by stripping the drafter
                 marker segment: "…-Qwen3.8-27B-MTP-8bit" → "…-Qwen3.8-27B-8bit". */
             resolveDrafterTarget(drafterId) {
@@ -3170,6 +3207,14 @@
                         return false;
                     }
                     await this.selectModel(drafter.targetId);
+                    // Refresh the cached admin list so the picker's speculative
+                    // badge reflects the new settings immediately. Inline (not
+                    // fetchAdminModelsList) to keep the Bearer header and avoid
+                    // clearing the cache on failure.
+                    fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders })
+                        .then(r => (r.ok ? r.json() : null))
+                        .then(d => { if (d) this._adminModelsList = d.models || []; })
+                        .catch(() => {});
                     let notice = window.t('chat.drafter_enabled_notice')
                         .replace('{drafter}', drafter.name)
                         .replace('{target}', drafter.targetName || drafter.targetId);
