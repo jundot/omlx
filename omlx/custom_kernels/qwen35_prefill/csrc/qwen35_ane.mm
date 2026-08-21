@@ -7,6 +7,9 @@
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -111,10 +114,226 @@ void load_ane_framework() {
   }
 }
 
+// Opt-in persistent compile cache for private-ANE programs. The default
+// (unset or any value other than exactly "1") keeps the historical
+// temp-directory path that is deleted when the program unloads.
+bool ane_compile_cache_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("OMLX_QWEN35_ANE_COMPILE_CACHE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+NSString *ane_compile_cache_root_directory() {
+  NSArray *roots = NSSearchPathForDirectoriesInDomains(
+      NSCachesDirectory, NSUserDomainMask, YES);
+  NSString *root = roots.firstObject ?: NSTemporaryDirectory();
+  return [[[root stringByAppendingPathComponent:@"omlx"]
+      stringByAppendingPathComponent:@"ane"]
+      stringByAppendingPathComponent:@"v1"];
+}
+
+// ~/Library/Caches/omlx/ane/v1/<os-build>/<identifier>.i<instance>. The ANE
+// identifier covers weights, shapes, sequence length, and split layout. The
+// remaining path components invalidate artifacts when the cache schema or the
+// OS compiler/runtime changes.
+NSString *ane_compile_cache_directory(NSString *identifier, int ane_instance) {
+  NSString *os_build =
+      [[NSProcessInfo processInfo] operatingSystemVersionString];
+  os_build =
+      [os_build stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+  os_build =
+      [os_build stringByReplacingOccurrencesOfString:@":" withString:@"_"];
+  NSString *entry =
+      [NSString stringWithFormat:@"%@.i%d", identifier, ane_instance];
+  return [[ane_compile_cache_root_directory()
+      stringByAppendingPathComponent:os_build]
+      stringByAppendingPathComponent:entry];
+}
+
+std::string error_text(NSString *prefix, NSError *error);
+
+// Residual risk: acquisition has no timeout, so a suspended process holding
+// this lock blocks later loads of the same entry until the holder exits.
+// Accept that for now; revisit with a bounded timeout if it hurts.
+class ScopedAneCacheLock {
+public:
+  explicit ScopedAneCacheLock(NSString *entry_directory) {
+    NSString *parent = [entry_directory stringByDeletingLastPathComponent];
+    NSError *error = nil;
+    if (![[NSFileManager defaultManager]
+            createDirectoryAtPath:parent
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:&error]) {
+      throw std::runtime_error(
+          error_text(@"ANE compile cache parent creation failed", error));
+    }
+    NSString *lock_path = [entry_directory stringByAppendingString:@".lock"];
+    fd_ = open(lock_path.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
+    if (fd_ < 0) {
+      throw std::runtime_error("ANE compile cache lock open failed.");
+    }
+    if (flock(fd_, LOCK_EX) != 0) {
+      close(fd_);
+      fd_ = -1;
+      throw std::runtime_error("ANE compile cache lock acquisition failed.");
+    }
+  }
+
+
+  ~ScopedAneCacheLock() {
+    if (fd_ >= 0) {
+      flock(fd_, LOCK_UN);
+      close(fd_);
+    }
+  }
+
+  ScopedAneCacheLock(const ScopedAneCacheLock &) = delete;
+  ScopedAneCacheLock &operator=(const ScopedAneCacheLock &) = delete;
+
+private:
+  int fd_ = -1;
+};
+
 std::string error_text(NSString *prefix, NSError *error) {
   NSString *value =
       error ? [NSString stringWithFormat:@"%@: %@", prefix, error] : prefix;
   return std::string([value UTF8String]);
+}
+
+void remove_ane_staging_directory(NSString *directory) noexcept {
+  if (directory == nil) {
+    return;
+  }
+  NSString *cache_prefix =
+      [ane_compile_cache_root_directory() stringByAppendingString:@"/"];
+  if (!ane_compile_cache_enabled() ||
+      ![directory hasPrefix:cache_prefix]) {
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    return;
+  }
+  try {
+    // Compile/load and cleanup mutate the same shared staging path.
+    ScopedAneCacheLock cache_lock(directory);
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+  } catch (const std::exception &failure) {
+    // Cleanup must not make model teardown fail. Leaving staging behind is
+    // safer than deleting another process's in-progress compile inputs.
+    NSLog(@"oMLX: ANE compile cache cleanup deferred (%s)", failure.what());
+  }
+}
+
+// Cache-first load for one private-ANE program. When the cache is disabled
+// (the default) this is the historical sequence: staging directory,
+// stage files, compile, load, delete on unload. When enabled, the model URL
+// points at a stable cache path so the private runtime can reuse a program
+// it already compiled in an earlier process; the lock serializes writers,
+// and a restored program whose load fails is invalidated and recompiled
+// exactly once. An unavailable cache root or lock fails open to the
+// historical temp path instead of breaking the load. Apple owns the
+// persistent compiled artifacts; oMLX only stages its MIL and weight inputs,
+// and the caller deletes that staging directory on unload as before. The
+// helper writes `mil` as model.mil and each blob of `weight_files` under
+// weights/ in a directory that has just been cleared.
+NSString *load_or_compile_ane_model(
+    id model, NSString *identifier, int ane_instance,
+    NSDictionary *execution_options, NSData *mil,
+    NSDictionary<NSString *, NSData *> *weight_files,
+    NSString *compile_what, NSString *load_what) {
+  NSString *directory = nil;
+  bool restored = false;
+  std::unique_ptr<ScopedAneCacheLock> cache_lock;
+  if (ane_compile_cache_enabled()) {
+    try {
+      directory = ane_compile_cache_directory(identifier, ane_instance);
+      // Hold the entry lock from probe through load so a second process
+      // compiling the same program waits instead of racing the writes.
+      cache_lock = std::make_unique<ScopedAneCacheLock>(directory);
+      ((void (*)(id, SEL, id))objc_msgSend)(
+          model, @selector(setModelURL:),
+          [NSURL fileURLWithPath:directory isDirectory:YES]);
+      restored = ((BOOL (*)(id, SEL))objc_msgSend)(
+          model, @selector(compiledModelExists));
+      if (restored) {
+        NSLog(@"oMLX: ANE compile cache hit identifier=%@ instance=%d",
+              identifier, ane_instance);
+      } else {
+        NSLog(@"oMLX: ANE compile cache miss identifier=%@ instance=%d",
+              identifier, ane_instance);
+      }
+    } catch (const std::exception &failure) {
+      // Fail open: the cache only accelerates loads. An unusable root or
+      // lock must degrade to the historical temp path, never fail the load.
+      NSLog(@"oMLX: ANE compile cache unavailable (%s), using a temporary "
+            @"directory",
+            failure.what());
+      cache_lock.reset();
+      directory = nil;
+      restored = false;
+    }
+  }
+  if (directory == nil) {
+    directory = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:identifier];
+    ((void (*)(id, SEL, id))objc_msgSend)(
+        model, @selector(setModelURL:),
+        [NSURL fileURLWithPath:directory isDirectory:YES]);
+  }
+  auto compile_fresh = [&]() {
+    // Clear any stale or half-written entry first: a crash mid-compile can
+    // leave an incomplete cache entry, and it must never be reused.
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    NSString *weight_directory =
+        [directory stringByAppendingPathComponent:@"weights"];
+    [[NSFileManager defaultManager]
+        createDirectoryAtPath:weight_directory
+        withIntermediateDirectories:YES
+        attributes:nil
+        error:nil];
+    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
+          atomically:YES];
+    for (NSString *name in weight_files) {
+      [weight_files[name]
+          writeToFile:[weight_directory stringByAppendingPathComponent:name]
+               atomically:YES];
+    }
+    NSError *error = nil;
+    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        model, @selector(compileWithQoS:options:error:), 21,
+        execution_options, &error);
+    if (!ok) {
+      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+      throw std::runtime_error(error_text(
+          [compile_what stringByAppendingString:@" compilation failed"],
+          error));
+    }
+  };
+
+  if (!restored) {
+    compile_fresh();
+  }
+  NSError *error = nil;
+  BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+      model, @selector(loadWithQoS:options:error:), 21, execution_options,
+      &error);
+  if (!ok && restored) {
+    // Corrupt or incompatible entry: invalidate it and compile exactly
+    // once more before giving up.
+    NSLog(@"oMLX: ANE compile cache fallback identifier=%@ instance=%d",
+          identifier, ane_instance);
+    compile_fresh();
+    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        model, @selector(loadWithQoS:options:error:), 21, execution_options,
+        &error);
+  }
+  if (!ok) {
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    throw std::runtime_error(error_text(
+        [load_what stringByAppendingString:@" load failed"], error));
+  }
+  return directory;
 }
 
 NSData *make_blob(const void *bytes, size_t byte_count) {
@@ -479,9 +698,7 @@ public:
         ((BOOL (*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
             model_, @selector(unloadWithQoS:error:), 21, &error);
       }
-      if (directory_) {
-        [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
-      }
+      remove_ane_staging_directory(directory_);
       [model_ release];
       [directory_ release];
       [execution_options_ release];
@@ -577,40 +794,14 @@ public:
 
       id identifier = ((id (*)(id, SEL))objc_msgSend)(
           model, @selector(hexStringIdentifier));
-      NSString *directory =
-          [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
+      NSString *directory = load_or_compile_ane_model(
+          model, identifier, ane_instance, execution_options_, mil,
+          @{
+            @"weight_data.bin" : data_blob,
+            @"weight_scale.bin" : scale_blob,
+          },
+          @"ANE", @"ANE model");
       directory_ = [directory copy];
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      NSString *weight_directory =
-          [directory stringByAppendingPathComponent:@"weights"];
-      [[NSFileManager defaultManager] createDirectoryAtPath:weight_directory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:nil];
-      [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-            atomically:YES];
-      [data_blob
-          writeToFile:[weight_directory
-                          stringByAppendingPathComponent:@"weight_data.bin"]
-           atomically:YES];
-      [scale_blob
-          writeToFile:[weight_directory
-                          stringByAppendingPathComponent:@"weight_scale.bin"]
-           atomically:YES];
-
-      NSError *error = nil;
-      BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(compileWithQoS:options:error:), 21,
-          execution_options_, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE compilation failed", error));
-      }
-      ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(loadWithQoS:options:error:), 21,
-          execution_options_, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE model load failed", error));
-      }
       model_ = [model retain];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
@@ -705,38 +896,14 @@ public:
 
       id identifier = ((id (*)(id, SEL))objc_msgSend)(
           model, @selector(hexStringIdentifier));
-      NSString *directory =
-          [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
+      NSString *directory = load_or_compile_ane_model(
+          model, identifier, ane_instance, @{}, mil,
+          @{
+            @"weight.bin" : weight_blob,
+          },
+          @"ANE", @"ANE model");
       directory_ = [directory copy];
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      NSString *weight_directory =
-          [directory stringByAppendingPathComponent:@"weights"];
-      [[NSFileManager defaultManager] createDirectoryAtPath:weight_directory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:nil];
-      [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-            atomically:YES];
-      NSDictionary *files = @{
-        @"weight.bin" : weight_blob,
-      };
-      for (NSString *name in files) {
-        [files[name]
-            writeToFile:[weight_directory stringByAppendingPathComponent:name]
-             atomically:YES];
-      }
 
-      NSError *error = nil;
-      BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(compileWithQoS:options:error:), 21, @{}, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE compilation failed", error));
-      }
-      ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(loadWithQoS:options:error:), 21, @{}, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE model load failed", error));
-      }
       model_ = [model retain];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
@@ -852,9 +1019,7 @@ public:
         ((BOOL (*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
             model_, @selector(unloadWithQoS:error:), 21, &error);
       }
-      if (directory_) {
-        [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
-      }
+      remove_ane_staging_directory(directory_);
       [request_ release];
       [execution_options_ release];
       [event_ release];
@@ -1297,41 +1462,12 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
     }
     id identifier = ((id (*)(id, SEL))objc_msgSend)(
         model, @selector(hexStringIdentifier));
-    NSString *directory =
-        [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
-    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-    NSString *weight_directory =
-        [directory stringByAppendingPathComponent:@"weights"];
-    [[NSFileManager defaultManager]
-        createDirectoryAtPath:weight_directory
-        withIntermediateDirectories:YES
-        attributes:nil
-        error:nil];
-    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-          atomically:YES];
-    [weight_blob
-        writeToFile:[weight_directory stringByAppendingPathComponent:
-                                          @"weight.bin"]
-         atomically:YES];
-
-    NSError *error = nil;
-    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(compileWithQoS:options:error:), 21,
-        execution_options, &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE procedure bank compilation failed", error));
-    }
-    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(loadWithQoS:options:error:), 21, execution_options,
-        &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE procedure bank load failed", error));
-    }
-
+    NSString *directory = load_or_compile_ane_model(
+        model, identifier, ane_instance, execution_options, mil,
+        @{
+          @"weight.bin" : weight_blob,
+        },
+        @"ANE procedure bank", @"ANE procedure bank");
     auto program =
         std::make_shared<SharedAneProgram>(model, directory, execution_options);
     std::vector<std::shared_ptr<AneLinearModel>> result;
@@ -1515,40 +1651,12 @@ AneFusedBankBuilder::compile(int ane_instance, int start, int stop) {
     }
     id identifier = ((id (*)(id, SEL))objc_msgSend)(
         model, @selector(hexStringIdentifier));
-    NSString *directory =
-        [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
-    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-    NSString *weight_directory =
-        [directory stringByAppendingPathComponent:@"weights"];
-    [[NSFileManager defaultManager]
-        createDirectoryAtPath:weight_directory
-        withIntermediateDirectories:YES
-        attributes:nil
-        error:nil];
-    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-          atomically:YES];
-    [weight_blob
-        writeToFile:[weight_directory stringByAppendingPathComponent:
-                                          @"weight.bin"]
-         atomically:YES];
-
-    NSError *error = nil;
-    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(compileWithQoS:options:error:), 21,
-        execution_options, &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE SwiGLU/down bank compilation failed", error));
-    }
-    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(loadWithQoS:options:error:), 21, execution_options,
-        &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE SwiGLU/down bank load failed", error));
-    }
+    NSString *directory = load_or_compile_ane_model(
+        model, identifier, ane_instance, execution_options, mil,
+        @{
+          @"weight.bin" : weight_blob,
+        },
+        @"ANE SwiGLU/down bank", @"ANE SwiGLU/down bank");
 
     auto program =
         std::make_shared<SharedAneProgram>(model, directory, execution_options);

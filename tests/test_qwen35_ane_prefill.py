@@ -1,4 +1,5 @@
 import logging
+import re
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -2791,3 +2792,75 @@ def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
     ane_patch._warm_cpu_sharing_path(64, [mlp], [gdn])
 
     assert calls == [("mlp", (1, 64, 32)), ("gdn", (1, 64, 32))]
+
+# --- opt-in reuse of Apple ANE compiled programs ---
+
+
+_ANE_MM_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+)
+
+
+@pytest.fixture(scope="module")
+def ane_mm() -> str:
+    return _ANE_MM_PATH.read_text(encoding="utf-8")
+
+
+def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
+    gate = re.search(r"bool ane_compile_cache_enabled\(\) \{.*?\n\}", ane_mm, re.S)
+    assert gate, "ane_compile_cache_enabled() is absent from qwen35_ane.mm"
+    assert 'getenv("OMLX_QWEN35_ANE_COMPILE_CACHE")' in gate.group()
+    assert 'strcmp(value, "1") == 0' in gate.group()
+
+
+def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
+    """Individual linear, single fused SwiGLU/down, linear banks, and fused
+    banks use one instance-aware cache/fallback implementation."""
+    assert ane_mm.count("load_or_compile_ane_model(") == 5
+    assert ane_mm.count("model, identifier, ane_instance") == 4
+    assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
+
+
+def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
+    """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
+    assert "persistent_" not in ane_mm
+    assert ane_mm.count("remove_ane_staging_directory(directory_)") == 2
+    assert "ScopedAneCacheLock cache_lock(directory);" in ane_mm
+    assert "ANE compile cache cleanup deferred" in ane_mm
+    assert "NSTemporaryDirectory()" in ane_mm
+
+
+def test_compile_cache_hit_restores_without_recompiling(ane_mm):
+    assert "@selector(setModelURL:)" in ane_mm
+    assert "@selector(compiledModelExists)" in ane_mm
+    assert re.search(r"if \(!restored\) \{\s*compile_fresh\(\);\s*\}", ane_mm)
+
+
+def test_compile_cache_hit_load_failure_invalidates_then_compiles_once(ane_mm):
+    assert "ANE compile cache fallback" in ane_mm
+    assert ane_mm.count("compile_fresh();") == 2
+    assert ane_mm.count("@selector(loadWithQoS:options:error:)") == 2
+
+
+def test_compile_cache_path_is_stable_per_os_and_instance(ane_mm):
+    assert "NSCachesDirectory" in ane_mm
+    assert 'stringByAppendingPathComponent:@"v1"' in ane_mm
+    assert "operatingSystemVersionString" in ane_mm
+    assert re.search(r'@"%@\.i%d"', ane_mm)
+    assert "fileURLWithPath:directory" in ane_mm
+
+
+def test_compile_cache_serializes_cross_process_writers(ane_mm):
+    assert "#include <sys/file.h>" in ane_mm
+    assert re.search(r"flock\(.*LOCK_EX", ane_mm)
+    assert "Hold the entry lock from probe through load" in ane_mm
+
+
+def test_compile_cache_fails_open_when_root_or_lock_is_unavailable(ane_mm):
+    assert "ANE compile cache unavailable" in ane_mm
+    assert "temporary" in ane_mm
+
+def test_compile_cache_telemetry_uses_native_log_prefix(ane_mm):
+    for event in ("hit", "miss", "fallback"):
+        assert f'@"oMLX: ANE compile cache {event}' in ane_mm
