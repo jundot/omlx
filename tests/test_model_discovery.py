@@ -23,6 +23,7 @@ from omlx.model_discovery import (
     estimate_model_size,
     estimate_text_only_model_size,
     format_size,
+    helper_kind_for_config,
     is_helper_config_model_type,
     is_helper_model_config,
     model_directory_access_error,
@@ -109,6 +110,38 @@ class TestIsHelperModelConfig:
     )
     def test_non_helper_configs(self, config):
         assert is_helper_model_config(config) is False
+
+
+class TestHelperKindForConfig:
+    """Tests for helper_kind_for_config family classification."""
+
+    @pytest.mark.parametrize(
+        "config, expected",
+        [
+            ({"model_type": "qwen3_5_mtp"}, "mtp"),
+            ({"model_type": "QWEN3_5_MTP"}, "mtp"),
+            ({"model_type": "gemma4_assistant"}, "assistant"),
+            ({"model_type": "qwen3", "dflash_config": {"block_size": 16}}, "dflash"),
+            (
+                {"model_type": "qwen3", "architectures": ["DFlashDraftModel"]},
+                "dflash",
+            ),
+            ({"model_type": "foo", "architectures": ["SomeDraftModel"]}, "draft"),
+            ({"model_type": "foo", "architectures": ["FooMtpHead"]}, "mtp"),
+            ({"model_type": "foo", "architectures": ["FooAssistantModel"]}, "assistant"),
+            ({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}, None),
+            ({"model_type": "llama"}, None),
+            ({"model_type": ""}, None),
+            ({}, None),
+            ({"architectures": None}, None),
+            ({"model_type": 123, "architectures": 123}, None),
+            ("not-a-dict", None),
+        ],
+    )
+    def test_kind_classification(self, config, expected):
+        assert helper_kind_for_config(config) == expected
+        # is_helper_model_config stays the boolean projection of the kind.
+        assert is_helper_model_config(config) is (expected is not None)
 
 
 class TestDetectModelType:

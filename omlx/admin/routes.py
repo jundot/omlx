@@ -1941,6 +1941,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 or model_info.get("model_path") in referenced_drafts
                 or model_info.get("source_repo_id") in referenced_drafts
             ),
+            # Intrinsic drafter family ("mtp"/"assistant"/"dflash"/"draft");
+            # None for chat models and for drafts known only by reference.
+            "helper_kind": model_info.get("helper_kind"),
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),

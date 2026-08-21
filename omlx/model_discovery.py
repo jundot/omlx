@@ -93,10 +93,9 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
 # a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
 # architecture name (``DFlashDraftModel``) or a drafter-only config block
 # (``dflash_config``). Keep these in sync with the drafter resolution in
-# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
+# engine_pool.py and the dflash gate in engine/dflash.py when new
 # drafter families are added.
 HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
-_HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
 _HELPER_CONFIG_KEYS = ("dflash_config",)
 
 
@@ -114,6 +113,53 @@ def is_helper_config_model_type(config_model_type: str | None) -> bool:
     return mt.endswith(HELPER_CONFIG_MODEL_TYPE_SUFFIXES)
 
 
+def helper_kind_for_config(config: dict) -> str | None:
+    """Return the speculative-drafter family marked by ``config``, or None.
+
+    Families:
+
+    - ``"mtp"`` — ``*_mtp`` model_type (e.g. ``qwen3_5_mtp``) or an
+      MTP-named architecture.
+    - ``"assistant"`` — ``*_assistant`` model_type (e.g. ``gemma4_assistant``)
+      or an assistant-named architecture.
+    - ``"dflash"`` — a ``dflash_config`` block or a DFlash-named architecture
+      (e.g. ``DFlashDraftModel``; these declare a plain chat ``model_type``
+      such as ``qwen3``).
+    - ``"draft"`` — a drafter architecture name with no family marker;
+      the speculative path it belongs to is unknown.
+
+    None means the config is an ordinary servable model, not a drafter.
+    """
+    if not isinstance(config, dict):
+        return None
+    model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type:
+        mt = model_type.lower()
+        if mt.endswith("_mtp"):
+            return "mtp"
+        if mt.endswith("_assistant"):
+            return "assistant"
+    if any(key in config for key in _HELPER_CONFIG_KEYS):
+        return "dflash"
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    elif not isinstance(architectures, list | tuple | set):
+        return None
+    has_draft_arch = False
+    for arch in architectures:
+        arch_lower = str(arch).lower()
+        if "dflash" in arch_lower:
+            return "dflash"
+        if "mtp" in arch_lower:
+            return "mtp"
+        if "assistant" in arch_lower:
+            return "assistant"
+        if "draft" in arch_lower:
+            has_draft_arch = True
+    return "draft" if has_draft_arch else None
+
+
 def is_helper_model_config(config: dict) -> bool:
     """True when a parsed config.json marks a speculative-decoding drafter.
 
@@ -123,22 +169,7 @@ def is_helper_model_config(config: dict) -> bool:
     (e.g. ``dflash_config``). These are helper checkpoints backing
     dFlash / MTP / assistant speculative decoding, not chat models.
     """
-    if not isinstance(config, dict):
-        return False
-    if is_helper_config_model_type(config.get("model_type")):
-        return True
-    if any(key in config for key in _HELPER_CONFIG_KEYS):
-        return True
-    architectures = config.get("architectures") or []
-    if isinstance(architectures, str):
-        architectures = [architectures]
-    elif not isinstance(architectures, list | tuple | set):
-        return False
-    for arch in architectures:
-        arch_lower = str(arch).lower()
-        if any(token in arch_lower for token in _HELPER_ARCH_TOKENS):
-            return True
-    return False
+    return helper_kind_for_config(config) is not None
 
 
 # Known VLM architectures
@@ -381,6 +412,7 @@ class DiscoveredModel:
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    helper_kind: str | None = None  # "mtp" | "assistant" | "dflash" | "draft"
 
 
 @dataclass(frozen=True)
@@ -1487,13 +1519,13 @@ def _register_model(
         # Read raw config model_type for sub-type detection (e.g., OCR models)
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
-        is_helper = False
+        helper_kind = None
         try:
             import json
             with open(model_dir / "config.json") as f:
                 _config = json.load(f)
             config_model_type = _config.get("model_type", "")
-            is_helper = is_helper_model_config(_config)
+            helper_kind = helper_kind_for_config(_config)
         except Exception:
             pass
 
@@ -1514,7 +1546,8 @@ def _register_model(
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
-            is_helper=is_helper,
+            is_helper=helper_kind is not None,
+            helper_kind=helper_kind,
         )
 
         size_gb = estimated_size / (1024**3)
