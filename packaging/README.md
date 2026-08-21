@@ -13,10 +13,12 @@ this directory only hands it a `_export/` tree of Python layers.
 ## Requirements
 
 - macOS 15.0+ (Sequoia) — required by MLX ≥ 0.29.2
-- Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+ on the host
+- Apple Silicon (M1/M2/M3/M4/M5)
+- Python 3.11–3.13 on the host
 - venvstacks (installed via `pip install -e ".[dev]"` from the repo
   root, or any of `uv`, `pipx run`)
+- Full Xcode and the downloadable Metal Toolchain for custom-kernel builds;
+  Command Line Tools alone do not provide `xcrun metal`
 
 ## Build
 
@@ -34,8 +36,31 @@ Then the Swift bundle:
 ```bash
 apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # bundle GLM-5.2 / MiniMax M3 native kernels
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # bundle Bonsai / GLM / MiniMax / Qwen kernels
 ```
+
+## Donor and Custom-Kernel Build
+
+The app embeds two venvstacks donor layers verbatim:
+
+- `cpython-3.11`, the bundled interpreter and ABI target;
+- `framework-mlx-base`, the bundled MLX and server dependencies.
+
+By default `build.sh` uses the fingerprinted `packaging/_export/`. An explicit
+`OMLX_DONOR_APP` uses that app's Python layers as-is, while
+`--no-rebuild-donor` permits a stale local export or `/Applications/oMLX.app`
+fallback. `swift` and `swift-fast` require and reuse an existing export.
+
+With `--with-custom-kernel`, the script creates a build-only virtualenv from
+the donor's CPython 3.11. It installs `[build-system].requires` from
+`pyproject.toml`, then builds an oMLX wheel through PEP 517. This automatically
+uses the pinned `mlx==0.32.0` and `nanobind==2.13.0` ABI pair without adding
+build tools to the runtime layers. The script extracts only the expected
+Bonsai, GLM, MiniMax, and Qwen native artifacts from that wheel; Qwen's NAX
+metallib is required when the active SDK supports it.
+
+The app-build modes and environment overrides are documented at the top of
+[`apps/omlx-mac/Scripts/build.sh`](../apps/omlx-mac/Scripts/build.sh).
 
 ## Output
 

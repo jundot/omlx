@@ -72,7 +72,7 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
+Optional GLM-5.2 / MiniMax M3 / Qwen3.5 native custom kernels currently require a HEAD build:
 
 ```bash
 brew install jundot/omlx/omlx --HEAD --with-custom-kernel
@@ -107,6 +107,9 @@ Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/
 > ```bash
 > python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
 > ```
+>
+> Qwen ANE prefill setup and tuning are documented in
+> [docs/experimental/qwen35_ane_prefill.md](docs/experimental/qwen35_ane_prefill.md).
 
 ## Quickstart
 
@@ -396,7 +399,7 @@ pytest -m "not slow"
 
 ### macOS App
 
-The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
+The native SwiftUI app lives at `apps/omlx-mac/`. It requires Xcode 26.5+ and host Python 3.11–3.13. The bundle embeds a separate CPython 3.11 runtime from the resolved venvstacks donor. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
 
 ```bash
 # Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + ad-hoc sign)
@@ -408,11 +411,11 @@ open apps/omlx-mac/build/Stage/oMLX.app
 # Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# Stage with optional GLM-5.2 / MiniMax M3 native custom kernels
+# Stage with optional Bonsai / GLM-5.2 / MiniMax M3 / Qwen3.5 native kernels
 apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
-First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
+Custom-kernel app builds create a build-only virtualenv from the donor CPython 3.11 and build an oMLX wheel through PEP 517. The declared build requirements provide the matching MLX and nanobind versions automatically; they are not added to the embedded runtime layer. First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the donor and build details and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
 
 ## Contributing
 

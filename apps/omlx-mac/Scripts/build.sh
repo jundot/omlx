@@ -110,10 +110,13 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
 CUSTOM_KERNEL_DIRS=(
+    "$REPO_ROOT/omlx/custom_kernels/bonsai"
     "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
     "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
     "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
 )
+CUSTOM_KERNEL_PACKAGES=(bonsai glm_moe_dsa minimax_m3 qwen35_prefill)
+CUSTOM_KERNEL_PAYLOAD=""
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
 # copy with platform-specific mlx-metal wheels swapped in.
@@ -189,7 +192,37 @@ fi
 
 # --- Resolve donor: pick a layer source and (re)build via venvstacks if stale
 
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+_python_is_supported() {
+    "$1" -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)' \
+        >/dev/null 2>&1
+}
+
+_resolve_python_bin() {
+    local candidate
+    if [ -n "${PYTHON_BIN:-}" ]; then
+        _python_is_supported "$PYTHON_BIN" \
+            || die "PYTHON_BIN must be Python 3.11-3.13: $PYTHON_BIN"
+        printf "%s\n" "$PYTHON_BIN"
+        return
+    fi
+
+    for candidate in \
+        "$REPO_ROOT/.venv/bin/python" \
+        "$(command -v python3.13 || true)" \
+        "$(command -v python3.12 || true)" \
+        "$(command -v python3.11 || true)" \
+        "$(command -v python3 || true)"
+    do
+        [ -n "$candidate" ] || continue
+        if _python_is_supported "$candidate"; then
+            printf "%s\n" "$candidate"
+            return
+        fi
+    done
+    die "Python 3.11-3.13 not found; set PYTHON_BIN to a supported interpreter."
+}
+
+PYTHON_BIN="$(_resolve_python_bin)"
 
 # Returns 0 if the local _export/ exists and its stored fingerprint matches
 # the current pyproject/venvstacks/lockfile state.
@@ -216,17 +249,6 @@ _custom_kernel_deployment_target() {
     printf "%s\n" "${OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-15.0}}"
 }
 
-_custom_kernel_pythonpath() {
-    [ -n "${DONOR_LAYERS:-}" ] || die "custom kernel build requires resolved donor layers."
-    local mlx_site="$DONOR_LAYERS/framework-mlx-base/lib/python3.11/site-packages"
-    [ -d "$mlx_site" ] || die "donor missing framework MLX site-packages: $mlx_site"
-    if [ -n "${PYTHONPATH:-}" ]; then
-        printf "%s:%s\n" "$mlx_site" "$PYTHONPATH"
-    else
-        printf "%s\n" "$mlx_site"
-    fi
-}
-
 _clean_custom_kernel_build_artifacts() {
     local dir
     for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
@@ -240,6 +262,7 @@ _clean_custom_kernel_build_artifacts() {
 
     if [ -d "$REPO_ROOT/build" ]; then
         for ext_name in \
+            "omlx.custom_kernels.bonsai._ext" \
             "omlx.custom_kernels.glm_moe_dsa._ext" \
             "omlx.custom_kernels.minimax_m3._ext" \
             "omlx.custom_kernels.qwen35_prefill._ext"; do
@@ -267,13 +290,16 @@ _custom_kernel_minos() {
 
 _validate_custom_kernel_deployment_target() {
     local expected="$1"
+    local root="$2"
     local path
     local minos
 
     command -v otool >/dev/null 2>&1 || return 0
 
+    local package
     local dir
-    for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
+    for package in "${CUSTOM_KERNEL_PACKAGES[@]}"; do
+        dir="$root/omlx/custom_kernels/$package"
         for path in "$dir"/_ext*.so "$dir"/lib*.dylib; do
             [ -e "$path" ] || continue
             minos="$(_custom_kernel_minos "$path")"
@@ -284,34 +310,17 @@ _validate_custom_kernel_deployment_target() {
     done
 }
 
-_check_custom_kernel_nanobind() {
-    # setup.py build_ext runs without pip build isolation, so the pyproject
-    # [build-system] nanobind pin is NOT enforced here — the kernels are
-    # built with whatever nanobind $PYTHON_BIN resolves. A version that does
-    # not match the one the bundled mlx wheel was built with isolates the
-    # nanobind NB_DOMAIN: the extensions import and list symbols normally
-    # but reject every mlx array at call time (issue #2139).
-    local custom_kernel_pythonpath="$1"
-    local expected actual
-    expected="$(sed -n 's/^[[:space:]]*"nanobind==\([0-9][0-9.]*\)".*/\1/p' \
-        "$REPO_ROOT/pyproject.toml" | head -1)"
-    [ -n "$expected" ] || die "could not read the nanobind pin from pyproject.toml [build-system]."
-    actual="$(PYTHONPATH="$custom_kernel_pythonpath" "$PYTHON_BIN" -c \
-        'import nanobind; print(nanobind.__version__)' 2>/dev/null)" \
-        || die "nanobind is not importable by $PYTHON_BIN — run: $PYTHON_BIN -m pip install nanobind==$expected"
-    [ "$actual" = "$expected" ] \
-        || die "nanobind $actual does not match the pyproject build pin $expected; the kernels would reject every mlx array at runtime (issue #2139). Run: $PYTHON_BIN -m pip install nanobind==$expected"
-}
-
 _check_custom_kernel_abi() {
     # Import each freshly built extension against the donor (bundled) mlx and
     # exercise the array type caster once. A metallib existence check cannot
     # catch a nanobind ABI mismatch — only an actual call does.
-    local custom_kernel_pythonpath="$1"
+    local root="$1"
+    local donor_python="$DONOR_LAYERS/cpython-3.11/bin/python3"
+    local donor_mlx_site="$DONOR_LAYERS/framework-mlx-base/lib/python3.11/site-packages"
     log "Verifying custom kernel ABI against the bundled MLX…"
     (
-        cd "$REPO_ROOT"
-        PYTHONPATH="$custom_kernel_pythonpath" "$PYTHON_BIN" - <<'PYEOF'
+        cd "$root"
+        PYTHONPATH="$root:$donor_mlx_site" "$donor_python" - <<'PYEOF'
 import importlib.util
 import pathlib
 import sys
@@ -319,7 +328,7 @@ import sys
 import mlx.core as mx
 
 failures = []
-for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+for name in ("bonsai", "glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
     ext_dir = pathlib.Path("omlx/custom_kernels") / name
     so = next(ext_dir.glob("_ext.*.so"), None)
     if so is None:
@@ -350,46 +359,107 @@ PYEOF
     ) || die "custom kernel ABI check failed — the built extensions reject mlx arrays (issue #2139); see output above."
 }
 
+_custom_kernel_build_python() {
+    local donor_python="$DONOR_LAYERS/cpython-3.11/bin/python3"
+    local build_venv="$BUILD_DIR/custom-kernel-build-venv"
+    local actual
+
+    [ -x "$donor_python" ] || die "donor CPython is missing: $donor_python"
+    actual="$("$donor_python" -c \
+        'import sys; print(f"{sys.implementation.name} {sys.version_info.major}.{sys.version_info.minor}")' \
+        2>/dev/null)" || die "could not inspect donor CPython: $donor_python"
+    [ "$actual" = "cpython 3.11" ] \
+        || die "custom kernels require donor CPython 3.11; found $actual at $donor_python"
+
+    if [ ! -x "$build_venv/bin/python" ]; then
+        log "Creating donor-derived custom-kernel build environment…" >&2
+        rm -rf "$build_venv"
+        # The exported runtime omits pip, but stdlib venv uses its bundled
+        # ensurepip wheels to provision pip inside this separate build venv.
+        "$donor_python" -m venv "$build_venv" \
+            || die "could not create custom-kernel build environment with $donor_python"
+    fi
+    printf "%s\n" "$build_venv/bin/python"
+}
+
 _build_custom_kernels() {
-    [ -n "$PYTHON_BIN" ] || die "python3 not found — install Python 3.11+ on PATH or set PYTHON_BIN."
     local deployment_target
     local cmake_args
-    local custom_kernel_pythonpath
+    local build_python
+    local build_venv
+    local requirements_file
+    local wheel_dir
+    local payload_dir
+    local wheel
     deployment_target="$(_custom_kernel_deployment_target)"
     cmake_args="${CMAKE_ARGS:-}"
-    custom_kernel_pythonpath="$(_custom_kernel_pythonpath)"
+    build_python="$(_custom_kernel_build_python)"
+    build_venv="$(dirname "$(dirname "$build_python")")"
+    requirements_file="$BUILD_DIR/custom-kernel-build-requirements.txt"
+    wheel_dir="$BUILD_DIR/custom-kernel-wheel"
+    payload_dir="$BUILD_DIR/custom-kernel-wheel-payload"
 
-    _check_custom_kernel_nanobind "$custom_kernel_pythonpath"
+    "$DONOR_LAYERS/cpython-3.11/bin/python3" \
+        "$PACKAGING_DIR/custom_kernel_wheel.py" requirements \
+        "$REPO_ROOT/pyproject.toml" "$requirements_file" \
+        || die "could not prepare custom-kernel build requirements."
+    log "Provisioning isolated custom-kernel build requirements…"
+    "$build_python" -m pip install \
+        --disable-pip-version-check \
+        --quiet \
+        --requirement "$requirements_file" \
+        || die "could not install custom-kernel build requirements."
+
     log "Building optional native custom kernels (macOS deployment target $deployment_target)…"
     _clean_custom_kernel_build_artifacts
+    rm -rf "$wheel_dir" "$payload_dir"
+    mkdir -p "$wheel_dir"
     (
         cd "$REPO_ROOT"
-        export PYTHONPATH="$custom_kernel_pythonpath"
+        export PATH="$build_venv/bin:$PATH"
+        export OMLX_WITH_CUSTOM_KERNEL=1
         export OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET="$deployment_target"
         export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$deployment_target}"
         if [[ "$cmake_args" != *"CMAKE_OSX_DEPLOYMENT_TARGET"* ]]; then
             export CMAKE_ARGS="${cmake_args:+$cmake_args }-DCMAKE_OSX_DEPLOYMENT_TARGET=$deployment_target"
         fi
-        "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
+        "$build_python" -m pip wheel \
+            --disable-pip-version-check \
+            --no-build-isolation \
+            --no-deps \
+            --wheel-dir "$wheel_dir" \
+            "$REPO_ROOT"
     ) || die "custom kernel build failed; see output above."
-    [ -f "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa/omlx_glm_kernels.metallib" ] \
+
+    wheel="$(find "$wheel_dir" -maxdepth 1 -type f -name 'omlx-*.whl' -print -quit)"
+    [ -n "$wheel" ] || die "custom kernel wheel build finished without an omlx wheel."
+    local extract_args=(extract "$wheel" "$payload_dir")
+    if _sdk_supports_nax; then
+        extract_args+=(--require-nax)
+    fi
+    "$DONOR_LAYERS/cpython-3.11/bin/python3" \
+        "$PACKAGING_DIR/custom_kernel_wheel.py" "${extract_args[@]}" \
+        || die "custom kernel wheel payload extraction failed."
+
+    [ -f "$payload_dir/omlx/custom_kernels/glm_moe_dsa/omlx_glm_kernels.metallib" ] \
         || die "custom kernel build finished but GLM metallib is missing."
-    [ -f "$REPO_ROOT/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
+    [ -f "$payload_dir/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
         || die "custom kernel build finished but MiniMax M3 metallib is missing."
-    [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
+    [ -f "$payload_dir/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
         || die "custom kernel build finished but Qwen3.5 prefill metallib is missing."
     # The NAX (M5 tensor unit) metallib is SDK-gated in cmake, not
     # deployment-gated: any build on SDK 26.2+ must produce it. A silent
     # omission would ship DMGs whose M5 qmm quietly falls back to the
     # classic kernels (same failure shape as issue #2137).
     if _sdk_supports_nax; then
-        [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels_nax.metallib" ] \
+        [ -f "$payload_dir/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels_nax.metallib" ] \
             || die "custom kernel build finished but the Qwen3.5 NAX metallib is missing despite SDK $(xcrun -sdk macosx --show-sdk-version) supporting it; see the cmake output."
     else
         warn "macOS SDK < 26.2: building without the Qwen3.5 NAX metallib; M5 GPUs will use the classic kernels."
     fi
-    _validate_custom_kernel_deployment_target "$deployment_target"
-    _check_custom_kernel_abi "$custom_kernel_pythonpath"
+    _validate_custom_kernel_deployment_target "$deployment_target" "$payload_dir"
+    _check_custom_kernel_abi "$payload_dir"
+    CUSTOM_KERNEL_PAYLOAD="$payload_dir"
     ok "  + custom kernels ($deployment_target)"
 }
 
@@ -562,18 +632,21 @@ RSYNC_EXCLUDES=(
     --exclude='tests'
     --exclude='.git'
     --exclude='custom_kernels/*/csrc'
+    --exclude='custom_kernels/*/*.so'
+    --exclude='custom_kernels/*/*.dylib'
+    --exclude='custom_kernels/*/*.metallib'
 )
-if [ "$WITH_CUSTOM_KERNEL" != "1" ]; then
-    RSYNC_EXCLUDES+=(
-        --exclude='custom_kernels/*/*.so'
-        --exclude='custom_kernels/*/*.dylib'
-        --exclude='custom_kernels/*/*.metallib'
-    )
-fi
 rsync -a \
     "${RSYNC_EXCLUDES[@]}" \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
+
+if [ "$WITH_CUSTOM_KERNEL" = "1" ]; then
+    [ -n "$CUSTOM_KERNEL_PAYLOAD" ] \
+        || die "custom kernel build completed without an extracted payload."
+    rsync -a "$CUSTOM_KERNEL_PAYLOAD/omlx/" "$RESOURCES_DIR/omlx/"
+    ok "  + custom kernel wheel payload"
+fi
 
 log "Writing engine commit metadata..."
 "$PYTHON_BIN" "$PACKAGING_DIR/build.py" --write-engine-commits "$RESOURCES_DIR/omlx" \

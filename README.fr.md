@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11–3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -73,7 +73,7 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-Les kernels natifs personnalisés optionnels pour GLM-5.2 / MiniMax M3 nécessitent actuellement un build HEAD :
+Les kernels natifs personnalisés optionnels pour GLM-5.2 / MiniMax M3 / Qwen3.5 nécessitent actuellement un build HEAD :
 
 ```bash
 brew install omlx --HEAD --with-custom-kernel
@@ -87,11 +87,11 @@ cd omlx
 pip install -e .          # Core uniquement
 pip install -e ".[mcp]"   # Avec support MCP (Model Context Protocol)
 
-# Optionnel : kernels natifs personnalisés GLM-5.2 / MiniMax M3
+# Optionnel : kernels natifs personnalisés GLM-5.2 / MiniMax M3 / Qwen3.5
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4/M5).
+Nécessite macOS 15.0+ (Sequoia), Python 3.11–3.13, et Apple Silicon (M1/M2/M3/M4/M5).
 
 ## Démarrage rapide
 
@@ -360,7 +360,7 @@ open apps/omlx-mac/build/Stage/oMLX.app
 # Forcer une reconstruction de venvstacks (sinon mis en cache par empreinte)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# Préparer avec les kernels natifs personnalisés optionnels GLM-5.2 / MiniMax M3
+# Préparer avec les kernels natifs personnalisés optionnels GLM-5.2 / MiniMax M3 / Qwen3.5
 apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 

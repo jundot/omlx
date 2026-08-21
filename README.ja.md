@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11–3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -72,7 +72,7 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルは、現在 HEAD ビルドが必要です:
+オプションの GLM-5.2 / MiniMax M3 / Qwen3.5 ネイティブカスタムカーネルは、現在 HEAD ビルドが必要です:
 
 ```bash
 brew install omlx --HEAD --with-custom-kernel
@@ -86,11 +86,11 @@ cd omlx
 pip install -e .          # コアのみ
 pip install -e ".[mcp]"   # MCP（Model Context Protocol）サポート付き
 
-# オプション: GLM-5.2 / MiniMax M3 ネイティブカスタムカーネル
+# オプション: GLM-5.2 / MiniMax M3 / Qwen3.5 ネイティブカスタムカーネル
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+とApple Silicon（M1/M2/M3/M4/M5）が必要です。
+Python 3.11–3.13とApple Silicon（M1/M2/M3/M4/M5）が必要です。
 
 ## クイックスタート
 
@@ -357,7 +357,7 @@ open apps/omlx-mac/build/Stage/oMLX.app
 # venvstacks を強制的に再ビルド（通常は fingerprint でキャッシュ）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルを含めてステージング
+# オプションの GLM-5.2 / MiniMax M3 / Qwen3.5 ネイティブカスタムカーネルを含めてステージング
 apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
