@@ -1102,6 +1102,7 @@
   "js.error.mtplx_import_failed": "MTPLX side-car import failed",
   "js.error.update_model_setting_failed": "Failed to update model setting",
   "js.error.load_model_failed": "Failed to load model",
+  "js.error.drafter_no_target": "Can't find a chat model to attach drafter {id} to. Attach it manually via the chat model's settings instead.",
   "js.error.reload_failed": "Failed to reload models",
   "js.error.unload_model_failed": "Failed to unload model",
   "js.error.save_model_settings_failed": "Failed to save model settings",

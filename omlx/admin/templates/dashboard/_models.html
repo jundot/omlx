@@ -144,6 +144,11 @@
                                                     <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                           x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>
                                                 </template>
+                                                <span x-show="managerModelInfo(model.name)?.is_helper" x-cloak
+                                                      class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0"
+                                                      @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
+                                                      @mouseleave="hideTip()"
+                                                      x-text="window.t('settings.models.table.helper_badge')"></span>
                                                 <button x-data="{ copied: false }"
                                                         @click.stop="copyToClipboard(managerModelInfo(model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
                                                         class="p-1 rounded-md transition-all flex-shrink-0"

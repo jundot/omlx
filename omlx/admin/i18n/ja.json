@@ -1102,6 +1102,7 @@
   "js.error.mtplx_import_failed": "MTPLXサイドカーのインポートに失敗しました",
   "js.error.update_model_setting_failed": "モデル設定の更新に失敗しました",
   "js.error.load_model_failed": "モデルのロードに失敗しました",
+  "js.error.drafter_no_target": "ドラフター {id} をアタッチするチャットモデルが見つかりません。チャットモデルの設定から手動でアタッチしてください。",
   "js.error.reload_failed": "モデルのリロードに失敗しました",
   "js.error.unload_model_failed": "モデルのアンロードに失敗しました",
   "js.error.save_model_settings_failed": "モデル設定の保存に失敗しました",

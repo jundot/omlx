@@ -1102,6 +1102,7 @@
   "js.error.mtplx_import_failed": "MTPLX 边车导入失败",
   "js.error.update_model_setting_failed": "更新模型设置失败",
   "js.error.load_model_failed": "加载模型失败",
+  "js.error.drafter_no_target": "找不到可挂载 drafter {id} 的聊天模型，请改为在聊天模型的设置中手动挂载。",
   "js.error.reload_failed": "重新加载模型失败",
   "js.error.unload_model_failed": "卸载模型失败",
   "js.error.save_model_settings_failed": "保存模型设置失败",

@@ -1102,6 +1102,7 @@
   "js.error.mtplx_import_failed": "Echec de l'import du side-car MTPLX",
   "js.error.update_model_setting_failed": "Impossible de mettre à jour le paramètre du modèle",
   "js.error.load_model_failed": "Impossible de charger le modèle",
+  "js.error.drafter_no_target": "Aucun modèle de chat auquel attacher le drafter {id}. Attachez-le manuellement via les paramètres du modèle de chat.",
   "js.error.reload_failed": "Impossible de recharger les modèles",
   "js.error.unload_model_failed": "Impossible de décharger le modèle",
   "js.error.save_model_settings_failed": "Impossible d'enregistrer les paramètres du modèle",

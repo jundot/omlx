@@ -1102,6 +1102,7 @@
   "js.error.mtplx_import_failed": "MTPLX 사이드카 가져오기 실패",
   "js.error.update_model_setting_failed": "모델 설정 업데이트에 실패했습니다",
   "js.error.load_model_failed": "모델 로드에 실패했습니다",
+  "js.error.drafter_no_target": "드래프터 {id}를 연결할 채팅 모델을 찾을 수 없습니다. 채팅 모델 설정에서 수동으로 연결해 주세요.",
   "js.error.reload_failed": "모델 새로고침에 실패했습니다",
   "js.error.unload_model_failed": "모델 언로드에 실패했습니다",
   "js.error.save_model_settings_failed": "모델 설정 저장에 실패했습니다",
