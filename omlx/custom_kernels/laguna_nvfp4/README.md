@@ -112,29 +112,59 @@ documented, per the laguna branch's established opt-in posture.
 
 ## Wired into the model
 
-`omlx/patches/laguna/laguna_model.py`:
+`omlx/patches/laguna/laguna_model.py` (decode path, env-gated
+`OMLX_LAGUNA_NVFP4_KERNELS`=1, stock-op fallback; env off stays
+bit-identical):
 - the shared-expert fused gate/up + SwiGLU kernel (single dispatch),
 - the routed pair-interleaved swiglu + halved-plane down-reduce kernels
   (replace the gather-qmm routed path, with the 2.5 kernel scale compensated
-  against the model's `moe_routed_scaling_factor`).
+  against the model's `moe_routed_scaling_factor`),
+- the sliding fused ring attention (`laguna_sliding_fused_attn_ring`):
+  single-token steady-ring decode — QK RMSNorm + RoPE + in-place K/V ring
+  write + online-softmax attention in ONE dispatch; the ring clock advances
+  exactly as the stock `update_in_place` (token 1) would. Engaged for the 30
+  sliding layers once the ring is at window capacity (offset >= 512). RoPE
+  angle rows come from a load-time atlas materialized through the family's
+  own stock rope (probe-seed broadcast, exactly the challenge's
+  `prepareRoPEAngleAtlases`).
+- the full fused attention grow (`laguna_full_fused_attn_grow`): the 10
+  full-attention layers' [QK-norm + YaRN + KV write + sdpa] fused when the
+  KVCache buffer has spare capacity.
+- the gated per-head o_proj (`oproj_act`) fused with the NVFP4 o-bank,
+  replacing the softplus-gate-multiply + o_proj tail,
+- the LM-head int5 prune pipeline (`lm_head_prune`) replacing the
+  100352-wide bf16 head matmul for single-row decode (argmax-exact),
+- the fused residual + RMSNorm + MoE router GEMV
+  (`residual_rms_router`) for single-token sparse decode.
 
-Real-model decode A/B (256-token, Poolside pin, interleaved off/on to
-cancel thermal drift): **13.23 vs 13.26 ms/tok (−0.3%, within noise)** with
-the routed+shared kernels on — the fused kernels are correct (bit-exact /
-ULP) and individually faster on the shared-expert path (~1.05x isolated),
-but the end-to-end decode is dominated by the bf16 attention + the (not
-requantized) projection stream, so the integrated win is neutral at this
-scale. Reproduce with `tools/qwen38_mtp/bench_laguna_kernels.py`.
+Measured decode A/B on the real model, 512-token prompt / 128 decode
+steps, single process per variant (median of 3):
 
-### Attention kernels: not directly wireable in omlx
+| config | decode | vs stock |
+|---|---|---|
+| stock (`OMLX_LAGUNA_NVFP4_KERNELS=0`) | 67.4 tok/s (14.85 ms/tok) | — |
+| full kernel stack (=1, ATTN=1, FUSED=1) | 100.0 tok/s (10.00 ms/tok) | **+48%** |
+
+Individual contributions (all opt-in, guard + fallback): the NVFP4 QKV
+bank (`OMLX_LAGUNA_NVFP4_ATTN=1`) is the largest single win (+28% over
+stock); the routed/shared MoE kernels add ~+6%; the fused ring attention
+and gated o_proj each ~+3%; the LM-head prune ~+2.5%. The remaining gap to
+the challenge repo's Swift benchmark (138.7 tok/s on the same prompt) is
+structural: the challenge compiles the whole decode in Swift with minimal
+per-op dispatch, which the MLX Python kernel boundary cannot fully
+replicate (per-layer Python dispatch over 40 layers × ~6 ops). Reproduce
+with `tools/qwen38_mtp/bench_laguna_kernels.py` or `/tmp/bench_fused.py`.
+
+### Attention kernels: wired via the opt-in NVFP4 attention bank
 
 The challenge's runtime re-quantizes the attention projections to NVFP4
 group-16 (`LagunaRuntimeWeights` step) so its decode QKV / o_proj / QK-norm
-kernels target NVFP4 banks. omlx's stock Laguna attention keeps the bf16
-projections, so those kernels have no matching bank to dispatch against
-without adopting the challenge's attention re-quantization transform —
-documented as a separate follow-up, not part of this port's decode hot-path
-wiring.
+kernels target NVFP4 banks. omlx adopts the same transform under
+`OMLX_LAGUNA_NVFP4_ATTN=1` (opt-in; the NVFP4 approximation changes the
+decode numerics from the bf16 serial path, so it stays off by default). The
+fused ring / grow attention and `oproj_act` then dispatch against that
+bank. Env-off (`OMLX_LAGUNA_NVFP4_KERNELS=0`) keeps the stock bf16 path
+bit-identical.
 
 ## Build
 
