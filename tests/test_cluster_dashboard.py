@@ -507,6 +507,33 @@ def test_cluster_pool_summary_excludes_non_members_while_a_job_is_live():
     assert "this.clusterDeploymentAlignedQuickNodes().length" in device_count
 
 
+def test_fabric_membership_uses_job_matched_deployment_and_clean_keys():
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The deployment is selected by the live job's deployment_id, falling
+    # back to the first entry only when the status payload omits it.
+    assert "clusterLiveDeployment() {" in javascript
+    assert "String(item.deployment_id)" in javascript
+    member_keys = javascript.split("clusterLiveFabricMemberKeys()", 1)[1].split(
+        "clusterFabricNodeMatchesKeys(node, memberKeys)", 1
+    )[0]
+    assert "this.clusterLiveDeployment()" in member_keys
+    assert "if (nodeId) byNodeId.set(nodeId, host);" in member_keys
+    assert "if (!nodeId) return;" in member_keys
+
+    # Host identity keys drop user@ prefixes as well as mDNS suffixes.
+    host_keys = javascript.split("clusterFabricHostKeys(host) {", 1)[1].split(
+        "return keys;", 1
+    )[0]
+    assert "lastIndexOf('@')" in host_keys
+
+    # Sets have no .some(): the restoration loop must spread before scanning.
+    aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
+        "clusterPairTitle()", 1
+    )[0]
+    assert "[...this.clusterFabricHostKeys(host)]" in aligned
+
+
 def test_tensor_parallel_controls_are_derived_from_detected_node_count():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")

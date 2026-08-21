@@ -4346,17 +4346,36 @@
                 );
             },
 
+            // The deployment hosting the live job, matched by deployment_id
+            // with a first-entry fallback for status payloads that omit the
+            // job's id; null when nothing is deployed.
+            clusterLiveDeployment() {
+                const deployments = this.clusterDeployments || [];
+                const job = this.clusterNeuralFabricJob();
+                return deployments.find(
+                    item => item?.deployment_id
+                        && String(item.deployment_id)
+                            === String(job?.deployment_id)
+                ) || deployments[0] || null;
+            },
+
             // Normalized identity keys for one deployment host (or ring node):
-            // ssh target, node id, and known IPs, with mDNS suffixes stripped
-            // so a discovered "wnio.local" peer matches host id "wnio".
+            // ssh target (with any user@ prefix dropped), node id, and known
+            // IPs, with mDNS suffixes stripped so a discovered "wnio.local"
+            // peer matches host id "wnio" and "admin@wnio.local" matches too.
             clusterFabricHostKeys(host) {
                 const keys = new Set();
                 const push = value => {
                     const raw = String(value ?? '').trim().toLowerCase();
                     if (!raw) return;
-                    keys.add(raw);
-                    const bare = raw.replace(/\.local\.?$/, '');
-                    if (bare) keys.add(bare);
+                    for (const key of [raw, raw.replace(/\.local\.?$/, '')]) {
+                        if (!key) continue;
+                        keys.add(key);
+                        const at = key.lastIndexOf('@');
+                        if (at !== -1 && at + 1 < key.length) {
+                            keys.add(key.slice(at + 1));
+                        }
+                    }
                 };
                 push(host?.ssh);
                 push(host?.node_id);
@@ -4372,17 +4391,17 @@
             clusterLiveFabricMemberKeys() {
                 const job = this.clusterNeuralFabricJob();
                 if (!job?.live) return null;
-                const deployment = (this.clusterDeployments || [])[0] || null;
+                const deployment = this.clusterLiveDeployment();
                 const hosts = Array.isArray(deployment?.hosts)
                     ? deployment.hosts
                     : [];
                 if (!hosts.length) return null;
-                const byNodeId = new Map(
-                    hosts.map(host => [
-                        String(host?.node_id || '').trim().toLowerCase(),
-                        host,
-                    ])
-                );
+                const byNodeId = new Map();
+                hosts.forEach(host => {
+                    const nodeId = String(host?.node_id || '')
+                        .trim().toLowerCase();
+                    if (nodeId) byNodeId.set(nodeId, host);
+                });
                 const assignments = Array.isArray(job.assignments)
                     && job.assignments.length
                     ? job.assignments
@@ -4391,9 +4410,10 @@
                         : []);
                 const keys = new Set();
                 assignments.forEach(item => {
-                    const host = byNodeId.get(
-                        String(item?.node_id || '').trim().toLowerCase()
-                    );
+                    const nodeId = String(item?.node_id || '')
+                        .trim().toLowerCase();
+                    if (!nodeId) return;
+                    const host = byNodeId.get(nodeId);
                     if (!host) return;
                     this.clusterFabricHostKeys(host).forEach(key => keys.add(key));
                 });
@@ -4913,13 +4933,13 @@
                 const present = new Set();
                 aligned.forEach(node =>
                     this.clusterFabricHostKeys(node).forEach(key => present.add(key)));
-                const deployment = (this.clusterDeployments || [])[0] || null;
+                const deployment = this.clusterLiveDeployment();
                 const hosts = Array.isArray(deployment?.hosts)
                     ? deployment.hosts
                     : [];
                 const loopback = new Set(['127.0.0.1', 'localhost', '::1']);
                 hosts.forEach(host => {
-                    const hostKeys = this.clusterFabricHostKeys(host);
+                    const hostKeys = [...this.clusterFabricHostKeys(host)];
                     if (!hostKeys.some(key => memberKeys.has(key))) return;
                     if (hostKeys.some(key => present.has(key))) return;
                     const ssh = String(host?.ssh || '').trim();
