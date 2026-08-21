@@ -61,6 +61,10 @@ class SamplingParams:
     xtc_probability: float = 0.0
     xtc_threshold: float = 0.1
     repetition_penalty: float = 1.0
+    # Look-back window (tokens) for the repetition penalty. None = engine
+    # default (mlx-lm uses 20). Loop units longer than the window never
+    # overlap their own penalty context.
+    repetition_context_size: Optional[int] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None

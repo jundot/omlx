@@ -2937,6 +2937,10 @@ class Scheduler:
                 if sampling_params.frequency_penalty != 0.0
                 else None
             ),
+            # None keeps mlx-lm's default window (20 tokens).
+            repetition_context_size=(
+                sampling_params.repetition_context_size or 20
+            ),
         )
 
         suppress_processor = _make_suppress_logits_processor(
@@ -5624,6 +5628,10 @@ class Scheduler:
                 sampling_params.frequency_penalty
                 if sampling_params.frequency_penalty != 0.0
                 else None
+            ),
+            # None keeps mlx-lm's default window (20 tokens).
+            repetition_context_size=(
+                sampling_params.repetition_context_size or 20
             ),
         )
 

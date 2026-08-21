@@ -251,6 +251,75 @@ def test_completion_payload_folds_thinking_budget_into_chat_template_kwargs():
     assert payload["chat_template_kwargs"] == {"thinking_budget": 512}
 
 
+def test_payloads_forward_repetition_context_size_when_requested():
+    engine = DistributedBatchedEngine(_deployment())
+    kwargs = {"repetition_context_size": 128}
+    chat = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs=dict(kwargs),
+    )
+    completion = engine._completion_payload(
+        prompt="hi",
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs=dict(kwargs),
+    )
+    assert chat["repetition_context_size"] == 128
+    assert completion["repetition_context_size"] == 128
+
+
+def test_payloads_omit_repetition_context_size_by_default():
+    # The key must stay off the wire unless the client asked for it: ranks
+    # running mlx-lm default the window to 20 tokens when it is absent.
+    engine = DistributedBatchedEngine(_deployment())
+    chat = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={},
+    )
+    completion = engine._completion_payload(
+        prompt="hi",
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={},
+    )
+    assert "repetition_context_size" not in chat
+    assert "repetition_context_size" not in completion
+
+
 def test_model_thinking_budget_is_supported_by_distributed_engine():
     engine = DistributedBatchedEngine(
         _deployment(),

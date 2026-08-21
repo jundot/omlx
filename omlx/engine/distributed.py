@@ -422,6 +422,13 @@ class DistributedBatchedEngine(BatchedEngine):
             "xtc_threshold": kwargs.get("xtc_threshold", 0.1),
             "stream": stream,
         }
+        repetition_context_size = kwargs.get("repetition_context_size")
+        if repetition_context_size is not None:
+            # Widens mlx-lm's look-back window for the repetition penalty
+            # (default 20 tokens). Verbatim loop units longer than that
+            # window never overlap their own penalty context, so the
+            # penalty is inert no matter its value.
+            payload["repetition_context_size"] = repetition_context_size
         if stop:
             payload["stop"] = stop
         if kwargs.get("seed") is not None:
@@ -488,6 +495,10 @@ class DistributedBatchedEngine(BatchedEngine):
             "xtc_threshold": kwargs.get("xtc_threshold", 0.1),
             "stream": stream,
         }
+        repetition_context_size = kwargs.get("repetition_context_size")
+        if repetition_context_size is not None:
+            # See _completion_payload: widens the penalty look-back window.
+            payload["repetition_context_size"] = repetition_context_size
         if tools:
             payload["tools"] = tools
         if stop:
