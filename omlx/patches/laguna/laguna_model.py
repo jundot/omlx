@@ -689,6 +689,41 @@ class LagunaSparseMoeBlock(nn.Module):
             y = self._moe_fused_forward(x, inds)
         else:
             y = self.switch_mlp(x, inds)
+        # Fused shared-expert down + routed + residual adds (challenge
+        # lagunaSharedDownResidual): ONE kernel replaces the shared
+        # down_proj and the combine for a single-token decode step, when the
+        # shared expert's NVFP4 down matches the kernel layout
+        # ([2048, 64] uint32 codes + [2048, 32] uint8 group-16 scales) and
+        # the routed output already carries its x2.5 scale.
+        if (residual is not None
+                and _LAGUNA_NVFP4_KERNELS
+                and x.shape[1] == 1):
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _fsd
+
+            if (_fsd.has_native()
+                    and _fsd.has_symbol("shared_nvfp4_down_residual")
+                    and self.shared_expert._prepare_fused_gate_up()):
+                sdw = self.shared_expert.down_proj.weight
+                sds = self.shared_expert.down_proj.scales
+                if (sdw.ndim == 2 and sdw.shape == (2048, 64)
+                        and sdw.dtype == mx.uint32
+                        and sds.ndim == 2 and sds.shape == (2048, 32)
+                        and sds.dtype == mx.uint8):
+                    try:
+                        from omlx.custom_kernels.laguna_nvfp4 import fast as _fn2
+                        sh_act = _fn2.shared_nvfp4_swiglu_qmv(
+                            x.reshape(-1),
+                            self.shared_expert._fused_gateup_weight,
+                            self.shared_expert._fused_gateup_scales,
+                        )  # [512]
+                        out = _fsd.shared_nvfp4_down_residual(
+                            sh_act, sdw, sds,
+                            y.astype(mx.bfloat16).reshape(-1),
+                            residual.astype(mx.bfloat16).reshape(-1),
+                        )
+                        return out.reshape(1, 1, -1)
+                    except Exception:
+                        pass
         if _COMPILED_FUSIONS:
             shared = self.shared_expert(x)
             if residual is not None:
