@@ -1230,9 +1230,12 @@
                                     :class="(drafter.targetId ? 'hover:bg-surface-muted' : 'opacity-50 cursor-not-allowed')
                                         + (isDrafterActive(drafter) ? ' font-semibold' : '')"
                                     style="color: var(--text-primary);"
-                                    :title="drafter.targetId
-                                        ? window.t('chat.drafter_enable_on').replace('{target}', drafter.targetName || drafter.targetId)
-                                        : window.t('chat.drafter_needs_target')">
+                                    :title="!drafter.targetId
+                                        ? window.t('chat.drafter_needs_target')
+                                        : (isDrafterActive(drafter)
+                                            ? window.t('chat.drafter_disable_on')
+                                            : window.t('chat.drafter_enable_on')
+                                        ).replace('{target}', drafter.targetName || drafter.targetId)">
                                     <i data-lucide="zap" class="w-3 h-3 flex-shrink-0"
                                         :style="isDrafterActive(drafter) ? 'color: var(--timeline-accent);' : 'color: var(--text-tertiary);'"></i>
                                     <span class="flex-1 min-w-0 truncate" x-text="drafter.name"></span>
@@ -3173,7 +3176,11 @@
                     await this.selectModel(value);
                     return;
                 }
-                const ok = await this.selectDrafter(drafter);
+                // Toggle: clicking the active drafter turns speculative
+                // decoding back off.
+                const ok = this.isDrafterActive(drafter)
+                    ? await this.disableDrafter(drafter)
+                    : await this.selectDrafter(drafter);
                 if (!ok && revertTo) {
                     // The <select>'s x-model already moved; restore the previous model.
                     this.currentModel = revertTo;
@@ -3226,6 +3233,52 @@
                 } catch (e) {
                     console.error('Failed to enable drafter:', e);
                     alert(window.t('chat.drafter_enable_failed'));
+                    return false;
+                }
+            },
+
+            /** Disable speculative decoding on the drafter's target chat
+                model. The stored draft-model pairing is kept so re-enabling
+                restores it. Returns true on success. */
+            async disableDrafter(drafter) {
+                if (!drafter || !drafter.targetId) return false;
+                const payload = drafter.kind === 'dflash'
+                    ? { dflash_enabled: false }
+                    : { vlm_mtp_enabled: false };
+                const apiHeaders = this.getApiKey()
+                    ? { 'Authorization': `Bearer ${this.getApiKey()}` }
+                    : {};
+                try {
+                    const resp = await fetch(
+                        `/admin/api/models/${encodeURIComponent(drafter.targetId)}/settings`,
+                        {
+                            method: 'PUT',
+                            credentials: 'same-origin',
+                            headers: { 'Content-Type': 'application/json', ...apiHeaders },
+                            body: JSON.stringify(payload),
+                        }
+                    );
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok) {
+                        alert(data.detail || window.t('chat.drafter_disable_failed'));
+                        return false;
+                    }
+                    // Same inline refresh as selectDrafter: drop the badge.
+                    fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders })
+                        .then(r => (r.ok ? r.json() : null))
+                        .then(d => { if (d) this._adminModelsList = d.models || []; })
+                        .catch(() => {});
+                    let notice = window.t('chat.drafter_disabled_notice')
+                        .replace('{drafter}', drafter.name)
+                        .replace('{target}', drafter.targetName || drafter.targetId);
+                    if (data.requires_reload && !data.auto_reloaded) {
+                        notice += ' ' + window.t('chat.drafter_reload_notice');
+                    }
+                    alert(notice);
+                    return true;
+                } catch (e) {
+                    console.error('Failed to disable drafter:', e);
+                    alert(window.t('chat.drafter_disable_failed'));
                     return false;
                 }
             },
