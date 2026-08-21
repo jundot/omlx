@@ -4895,8 +4895,20 @@
                     .join(' + ');
             },
 
+            // Quick nodes aligned to the running deployment: while a job is
+            // live and membership is known, remembered Bonjour candidates
+            // that hold no rank are excluded from every summary that claims
+            // to describe the running cluster. Without a live job the full
+            // candidate list is returned untouched.
+            clusterDeploymentAlignedQuickNodes() {
+                const memberKeys = this.clusterLiveFabricMemberKeys();
+                if (!memberKeys) return this.clusterQuickNodes();
+                return this.clusterQuickNodes().filter(node =>
+                    this.clusterFabricNodeMatchesKeys(node, memberKeys));
+            },
+
             clusterPairTitle() {
-                const nodes = this.clusterQuickNodes();
+                const nodes = this.clusterDeploymentAlignedQuickNodes();
                 if (nodes.length === 1) return `${nodes[0].name} · finding workers`;
                 const logical = this.clusterLogicalNodes();
                 const mixed = new Set(nodes.map(node => node.accelerator)).size > 1;
@@ -4908,7 +4920,7 @@
             },
 
             clusterDeviceCountLabel() {
-                const devices = this.clusterQuickNodes().length;
+                const devices = this.clusterDeploymentAlignedQuickNodes().length;
                 const units = this.clusterLogicalNodes().length;
                 return units === devices
                     ? `${devices} device${devices === 1 ? '' : 's'}`

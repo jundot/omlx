@@ -476,6 +476,26 @@ def test_cluster_fabric_shows_deployed_hosts_while_a_job_is_live():
     assert "/\\.local\\.?$/" in javascript
 
 
+def test_cluster_pool_summary_excludes_non_members_while_a_job_is_live():
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The compute-pool title and device count describe the running cluster,
+    # so they must use deployment-aligned nodes instead of raw candidates.
+    assert "clusterDeploymentAlignedQuickNodes()" in javascript
+    aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
+        "clusterPairTitle()", 1
+    )[0]
+    assert "this.clusterQuickNodes().filter(node =>" in aligned
+    pair_title = javascript.split("clusterPairTitle()", 1)[1].split(
+        "clusterDeviceCountLabel()", 1
+    )[0]
+    assert "const nodes = this.clusterDeploymentAlignedQuickNodes();" in pair_title
+    device_count = javascript.split("clusterDeviceCountLabel()", 1)[1].split(
+        "clusterPeerDisplayName()", 1
+    )[0]
+    assert "this.clusterDeploymentAlignedQuickNodes().length" in device_count
+
+
 def test_tensor_parallel_controls_are_derived_from_detected_node_count():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
