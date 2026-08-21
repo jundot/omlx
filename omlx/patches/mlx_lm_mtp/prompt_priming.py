@@ -83,12 +83,14 @@ def priming_enabled() -> bool:
 
 
 def prime_window() -> int:
-    """Max prompt length (tokens) to prime; 0 = unlimited.
+    """Max tokens to fold into one prime context; 0 = unlimited.
 
-    Escape hatch for the head-cache memory cost on very long prompts (one
-    full-attention layer of KV over the prompt). Prompts longer than the
-    window run unprimed — a coarse cap, not a suffix window, because the
-    prompt length is unknown while chunks stream through the model.
+    Escape hatch for the head-cache memory cost of priming (one
+    full-attention layer of KV over the folded span). The cap is measured
+    against the span actually folded this request — with a warm prefix cache
+    that is only the boundary remainder, not the full prompt — so a
+    long-context request with a small remainder still primes. A remainder
+    larger than the window runs unprimed.
     """
     try:
         return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
@@ -274,10 +276,16 @@ def maybe_capture(
         drop_ctx(host)
         ctx = None
     window = prime_window()
-    if window and offset_after > window:
-        if ctx is not None:
-            drop_ctx(host)
-        return
+    if window:
+        # Cap by the primed span (the head-KV the window exists to bound),
+        # not the absolute prompt offset: on a warm prefix cache only the
+        # boundary remainder is ever folded, so a long-context request with a
+        # small remainder is exactly the cheap case priming is for (#2909).
+        folded = ctx.folded if ctx is not None else 0
+        if folded + seq_len > window:
+            if ctx is not None:
+                drop_ctx(host)
+            return
     if ctx is None:
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
