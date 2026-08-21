@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for models/vlm.py — VLMModelAdapter for BatchGenerator compatibility."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
@@ -570,6 +571,81 @@ class TestPerRequestMRoPEDecode:
             assert pos_ids[section, 0, 1].item() == 51.0
             assert pos_ids[section, 1, 0].item() == 80.0
             assert pos_ids[section, 1, 1].item() == 81.0
+
+    def test_qwen_mtp_verify_hidden_preserves_mrope_positions(self):
+        """Positioned MTP verification must stay on the mRoPE adapter path."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+        from omlx.speculative.vlm_mtp import _VLMAdapterMTPProxy
+
+        vlm = self._make_mrope_vlm_model()
+        hidden = mx.zeros((1, 3, 8))
+        gdn_states = [{"state": "verify"}]
+        output = SimpleNamespace(
+            logits=None,
+            hidden_states=[hidden],
+            shared_kv_states={"full": object()},
+            gdn_states=gdn_states,
+        )
+        vlm.language_model.return_value = output
+        vlm.language_model.speculative_logits_from_hidden = MagicMock(
+            side_effect=lambda value: value
+        )
+
+        adapter = VLMModelAdapter(vlm)
+        adapter.set_batch_rope_deltas(mx.array([-50.0]))
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([100])
+
+        result = proxy.speculative_verify_hidden(
+            mx.zeros((1, 3), dtype=mx.int32),
+            [cache_layer],
+        )
+
+        assert result == (hidden, output.shared_kv_states, gdn_states)
+        call_kwargs = vlm.language_model.call_args.kwargs
+        assert call_kwargs["return_hidden"] is True
+        assert call_kwargs["return_shared_kv"] is True
+        assert call_kwargs["skip_logits"] is True
+        pos_ids = call_kwargs["position_ids"]
+        assert pos_ids.shape == (3, 1, 3)
+        assert pos_ids[0, 0].tolist() == [50.0, 51.0, 52.0]
+
+    def test_minimax_mtp_verify_hidden_preserves_2d_positions(self):
+        """The proxy uses each mRoPE adapter's native position-id layout."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+        from omlx.speculative.vlm_mtp import _VLMAdapterMTPProxy
+
+        vlm = self._make_minimax_m3_vlm_model()
+        hidden = mx.zeros((1, 3, 8))
+        vlm.language_model.return_value = SimpleNamespace(
+            logits=None,
+            hidden_states=[hidden],
+            shared_kv_states={},
+            gdn_states=None,
+        )
+        vlm.language_model.speculative_logits_from_hidden = MagicMock(
+            side_effect=lambda value: value
+        )
+
+        adapter = VLMModelAdapter(vlm)
+        adapter.set_batch_rope_deltas(mx.array([-50.0]))
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([100])
+
+        proxy.speculative_verify_hidden(
+            mx.zeros((1, 3), dtype=mx.int32),
+            [cache_layer],
+        )
+
+        position_ids = vlm.language_model.call_args.kwargs["position_ids"]
+        assert position_ids.shape == (1, 3)
+        assert position_ids[0].tolist() == [50.0, 51.0, 52.0]
 
     def test_get_last_rope_deltas(self):
         """get_last_rope_deltas extracts value from language model."""
