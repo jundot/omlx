@@ -138,6 +138,14 @@ _LAGUNA_NVFP4_KERNELS = os.environ.get("OMLX_LAGUNA_NVFP4_KERNELS", "0") != "0"
 # approximation the challenge's ranked runtime uses.
 _LAGUNA_NVFP4_ATTN = os.environ.get("OMLX_LAGUNA_NVFP4_ATTN", "0") != "0"
 
+# Async fire-mask decode pipelining (challenge DARKBLOOM_DECODE_ASYNC_STAGE).
+# async_eval after the layers in the mask during a single-token decode step
+# so completed segments stream to the GPU while the host builds the rest of
+# the graph. Measured +13% decode on the 512/128 bench; opt-in (off by
+# default) because it changes only the enqueue schedule, never the values.
+_LAGUNA_ASYNC_FIRE = os.environ.get("OMLX_LAGUNA_ASYNC_FIRE", "0") != "0"
+_LAGUNA_FIRE_MASK = frozenset({0, 1, 7, 15, 23, 31, 39})
+
 # Fused decode attention (challenge lagunaSlidingFusedAttention /
 # lagunaFullFusedAttention): ONE Metal dispatch replaces the
 # [QK-norm + RoPE] -> [K/V ring write] -> [sdpa_vector] chain for
@@ -1291,13 +1299,28 @@ class LagunaModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.args.sliding_window
             )
 
-        for layer, c in zip(self.layers, cache):
+        # Decode fire-mask (challenge DARKBLOOM_DECODE_ASYNC_STAGE): during a
+        # single-token decode step, async_eval after strategic layers so
+        # already-built segments stream to the GPU while the host keeps
+        # building the rest of the graph (the GPU would otherwise idle on the
+        # ~1 ms Python enqueue). Fires only for the decode shape with the
+        # kernel stack on; prefill and everything else stay eager (the
+        # end-of-forward eval is the only sync). Opt-in via
+        # OMLX_LAGUNA_ASYNC_FIRE (default off — measured +13% but adds a
+        # runtime dependency on async scheduling).
+        fire_mask = None
+        if (_LAGUNA_ASYNC_FIRE and h.shape[0] == 1 and h.shape[1] == 1
+                and len(self.layers) == 40):
+            fire_mask = _LAGUNA_FIRE_MASK
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = (
                 sliding_mask
                 if layer.attention_type == "sliding_attention"
                 else full_mask
             )
             h = layer(h, mask, c)
+            if fire_mask is not None and i in fire_mask:
+                mx.async_eval(h)
         return self.norm(h)
 
 
