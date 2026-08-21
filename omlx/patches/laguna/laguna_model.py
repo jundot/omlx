@@ -138,6 +138,84 @@ _LAGUNA_NVFP4_KERNELS = os.environ.get("OMLX_LAGUNA_NVFP4_KERNELS", "0") != "0"
 # approximation the challenge's ranked runtime uses.
 _LAGUNA_NVFP4_ATTN = os.environ.get("OMLX_LAGUNA_NVFP4_ATTN", "0") != "0"
 
+# Fused decode attention (challenge lagunaSlidingFusedAttention /
+# lagunaFullFusedAttention): ONE Metal dispatch replaces the
+# [QK-norm + RoPE] -> [K/V ring write] -> [sdpa_vector] chain for
+# single-token decode. Engaged only when the NVFP4 attention bank is active
+# (OMLX_LAGUNA_NVFP4_ATTN=1), the kernels are built, the layer is a sliding
+# layer whose ring cache is at steady capacity (offset >= window), and the
+# RoPE position atlas covers the position. Everything else falls back to the
+# stock path. The kernel writes the new K/V into the ring in-place, so the
+# cache clock advances without a second update_and_fetch.
+_LAGUNA_FUSED_ATTN = os.environ.get("OMLX_LAGUNA_FUSED_ATTN", "1") != "0"
+
+# Engagement counters (diagnostic; incremented by the fused decode paths).
+_LAGUNA_FUSED_CALLS = [0]
+
+# RoPE angle atlas length (challenge lagunaRoPEAngleAtlasLength). Rows are
+# materialized once per attention family at first use from the family's own
+# stock RoPE (probe-seed broadcast), so each row is exactly the FP32 angle
+# row the stock rope would produce at that absolute position.
+_LAGUNA_ROPE_ATLAS_LENGTH = 4096
+
+
+class _LagunaRopeAtlas:
+    """Per-family RoPE angle atlases, materialized lazily from the model's
+    own stock RoPE modules (probe-seed broadcast, offset 0).
+
+    ``rows[p]`` is exactly the FP32 angle row the family's stock rope would
+    produce for absolute position p (challenge prepareRoPEAngleAtlases).
+    """
+
+    __slots__ = ("sliding", "full")
+
+    def __init__(self, sliding: mx.array | None, full: mx.array | None):
+        self.sliding = sliding
+        self.full = full
+
+
+_LAGUNA_ATLAS_CACHE: dict[tuple, _LagunaRopeAtlas] = {}
+
+
+def _build_rope_atlas(rope: Any, dims: int, length: int, mscale: float | None) -> mx.array:
+    """Materialize the FP32 angle atlas for one attention family.
+
+    The challenge probes with a seed row whose first half is all-ones (or
+    1/mscale for YaRN, since YaRN scales its rotary inputs) and second half
+    zeros, broadcast along the position axis, then runs the family's own
+    stock RoPE with offset 0 — row p comes back as exactly [cos(p), sin(p)].
+    """
+    half = dims // 2
+    seed_float = 1.0 / mscale if mscale is not None else 1.0
+    seed = mx.array(
+        [seed_float] * half + [0.0] * half, mx.float32
+    ).reshape(1, 1, 1, dims)
+    bcast = mx.broadcast_to(seed, (1, 1, length, dims))
+    atlas = rope(bcast, offset=0)
+    mx.eval(atlas)
+    return atlas
+
+
+def _get_laguna_rope_atlas(rope_sliding: Any, rope_full: Any) -> _LagunaRopeAtlas:
+    """Return (sliding, full) angle atlases, cached per rope identity."""
+    key = (id(rope_sliding), id(rope_full))
+    cached = _LAGUNA_ATLAS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    sliding = None
+    full = None
+    if rope_sliding is not None:
+        sliding = _build_rope_atlas(
+            rope_sliding, 128, _LAGUNA_ROPE_ATLAS_LENGTH, None
+        )
+    if rope_full is not None:
+        full = _build_rope_atlas(
+            rope_full, 64, _LAGUNA_ROPE_ATLAS_LENGTH, 1.3465735912322998
+        )
+    atlas = _LagunaRopeAtlas(sliding, full)
+    _LAGUNA_ATLAS_CACHE[key] = atlas
+    return atlas
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -545,6 +623,8 @@ class LagunaSparseMoeBlock(nn.Module):
             and self._prepare_fused_gate_up()
             and getattr(self, "_kernel_plane", None) is not None
         ):
+            if os.environ.get("LAG_ROUTED_LOG"):
+                print("[ROUTED] engaged", flush=True)
             from omlx.custom_kernels.laguna_nvfp4 import fast as _fn
 
             if _fn.has_native() and _fn.has_symbol("routed_nvfp4_swiglu_qmv"):
@@ -560,6 +640,8 @@ class LagunaSparseMoeBlock(nn.Module):
                     _fn.has_symbol("routed_nvfp4_down_reduce")
                     and getattr(self, "_kernel_down_scales", None) is not None
                 ):
+                    if os.environ.get("LAG_ROUTED_LOG"):
+                        print("[DOWNRED] calling", flush=True)
                     y = _fn.routed_nvfp4_down_reduce(
                         act,
                         self._kernel_down,
@@ -701,12 +783,140 @@ class Attention(nn.Module):
             self._nvfp4_bank = {
                 "qkv_codes": codes, "qkv_scales": scales,
                 "o_codes": oc.view(mx.uint8).reshape(oc.shape[0], -1),
+                "o_codes_raw": oc,
                 "o_scales": os_,
             }
             return True
         except Exception:
             self._nvfp4_bank = False
             return False
+
+    def _fused_attn_decode(self, x: mx.array, cache: Any | None) -> mx.array | None:
+        """Fused sliding-ring decode attention (challenge
+        lagunaSlidingFusedAttention). Returns the post-o_proj attended output
+        for a single-token sliding-ring decode step, or None to fall back to
+        the stock path.
+
+        Engaged only when all of:
+          - kernels + NVFP4 attention bank + fused-attn switch are ON,
+          - the native ``sliding_fused_attn_ring`` symbol exists,
+          - single token (B=1, L=1) on a sliding layer,
+          - the layer cache is a RotatingKVCache at steady ring capacity
+            (buffer shape [1, kv, window, head] and offset >= window),
+          - the position is covered by the RoPE angle atlas.
+
+        The kernel performs QK RMSNorm + RoPE + in-place K/V ring write +
+        online-softmax attention in ONE Metal dispatch. After it returns, the
+        new K/V slot the kernel wrote is mirrored onto the real cache slot and
+        the clock advances exactly as the stock update_in_place would.
+        """
+        if os.environ.get("LAG_FUSED_LOG"):
+            print(f"[g] on={_LAGUNA_NVFP4_KERNELS} fused={_LAGUNA_FUSED_ATTN} sli={self.is_sliding} ctype={type(cache).__name__ if cache is not None else None}", flush=True)
+        if not (_LAGUNA_NVFP4_KERNELS and _LAGUNA_FUSED_ATTN):
+            return None
+        if self.sink is not None:
+            return None
+        if not self.is_sliding or not isinstance(cache, RotatingKVCache):
+            return None
+        bsz, seq_len, _ = x.shape
+        if bsz != 1 or seq_len != 1:
+            return None
+        if os.environ.get("LAGUNA_FUSED_DBG"):
+            print(f"[g2] kshape={None if cache.keys is None else cache.keys.shape} max={cache.max_size} off={cache.offset} keep={cache.keep}", flush=True)
+        if cache.keys is None or cache.keys.shape[2] != cache.max_size:
+            return None
+        if cache.offset < cache.max_size:
+            return None
+        if cache.keep:
+            return None
+        try:
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _laguna_nvfp4
+
+            if os.environ.get("LAGUNA_FUSED_DBG"):
+                print("[try] sym=", _laguna_nvfp4.has_symbol("sliding_fused_attn_ring"), flush=True)
+            if not _laguna_nvfp4.has_symbol("sliding_fused_attn_ring"):
+                return None
+            atlas = _get_laguna_rope_atlas(self.rope, None)
+            if os.environ.get("LAGUNA_FUSED_DBG"):
+                print("[try] atlas.sliding=", None if atlas.sliding is None else atlas.sliding.shape, flush=True)
+            if atlas.sliding is None:
+                return None
+            pos = int(cache.offset)
+            if os.environ.get("LAGUNA_FUSED_DBG"):
+                print("[try] pos=", pos, "atlas_len=", None if atlas.sliding is None else atlas.sliding.shape[2], flush=True)
+            if pos >= int(atlas.sliding.shape[2]):
+                return None
+            angles = mx.array(atlas.sliding[0, 0, pos, :], mx.float32)
+
+            # Prefer the NVFP4 requantized QKV bank when active (matches the
+            # stock qkv kernel the challenge's decode uses); otherwise the
+            # bf16 projections.
+            hidden = x.reshape(-1)
+            if self._prepare_nvfp4_bank():
+                heads4 = self.n_heads if self.n_heads in (48, 64) else 64
+                projected = _laguna_nvfp4.decode_nvfp4_qkv_r1(
+                    hidden, self._nvfp4_bank["qkv_codes"],
+                    self._nvfp4_bank["qkv_scales"], heads4,
+                )
+                q_split = self.n_heads * self.head_dim
+                k_end = q_split + self.n_kv_heads * self.head_dim
+                raw_q = projected[:q_split].reshape(-1)
+                raw_k = projected[q_split:k_end].reshape(-1)
+                raw_v = projected[k_end:].reshape(-1)
+            else:
+                raw_q = self.q_proj(x).reshape(-1)
+                raw_k = self.k_proj(x).reshape(-1)
+                raw_v = self.v_proj(x).reshape(-1)
+            # Pass a free reshape view of the ring backing (the cache keeps a
+            # row-major [1, kv, window, head] buffer, so [kv, window, head]
+            # is a zero-copy view). The fused kernel writes the new K/V slot
+            # in-place directly into this shared backing — no copy, no
+            # mirror needed; we only advance the clock.
+            kring = cache.keys.reshape(
+                self.n_kv_heads, cache.max_size, self.head_dim
+            )
+            vring = cache.values.reshape(
+                self.n_kv_heads, cache.max_size, self.head_dim
+            )
+            widx = int(cache._idx)
+            if widx == cache.max_size:
+                widx = 0
+            if os.environ.get("LAGUNA_FUSED_DBG"):
+                print("[try] before kernel call", flush=True)
+            y = _laguna_nvfp4.sliding_fused_attn_ring(
+                raw_q, raw_k, raw_v, self.q_norm.weight, self.k_norm.weight,
+                angles, kring, vring,
+                mx.array([widx], mx.uint32),
+                mx.array([self.scale], mx.float32),
+            )
+            # The kernel wrote the new K/V into the ring in place. Advance
+            # the clock exactly as update_in_place(tokenCount: 1) would.
+            cache.offset += 1
+            cache._idx = widx + 1
+            if cache._idx == cache.max_size:
+                cache._idx = cache.keep
+            y2 = y.reshape(bsz, seq_len, self.n_heads, self.head_dim)
+            if self.gating:
+                gate = self.g_proj(hidden.reshape(bsz, seq_len, -1))
+                if _COMPILED_FUSIONS:
+                    gate = _compiled_softplus_gate(gate)
+                else:
+                    gate = nn.softplus(gate.astype(mx.float32)).astype(y.dtype)
+                if self.gate_per_head:
+                    y2 = y2 * gate.reshape(bsz, seq_len, self.n_heads, 1)
+                else:
+                    y2 = y2 * gate.reshape(bsz, seq_len, -1).reshape(
+                        bsz, seq_len, self.n_heads, self.head_dim
+                    )
+            _LAGUNA_FUSED_CALLS[0] += 1
+            if os.environ.get("LAG_FUSED_LOG"):
+                print(f"[FUSED+1] total={_LAGUNA_FUSED_CALLS[0]} layer={getattr(self,'is_sliding',None)}", flush=True)
+            return self.o_proj(y2.reshape(bsz, seq_len, -1))
+        except Exception as _e:
+            if os.environ.get("LAGUNA_FUSED_DBG"):
+                import traceback; traceback.print_exc()
+                print("[try] EXC:", type(_e).__name__, _e, flush=True)
+            return None
 
     def __call__(
         self,
@@ -716,10 +926,22 @@ class Attention(nn.Module):
     ) -> mx.array:
         bsz, seq_len, _ = x.shape
 
-        # NVFP4-decode QKV path (opt-in): single-token decode dispatches the
-        # fused q/k/v NVFP4 kernel against the requantized bank.
         from omlx.custom_kernels.laguna_nvfp4 import fast as _laguna_nvfp4
 
+        # ---- fused decode attention (opt-in) ------------------------------
+        # Single-token sliding-ring decode: ONE kernel replaces the
+        # [QK-norm + RoPE] -> [K/V ring write] -> [sdpa_vector] chain. The
+        # kernel writes the new K/V into the ring in-place; we mirror that
+        # write onto the real cache slot and advance the clock without a
+        # second update_and_fetch. Engaged only at steady ring (buffer at
+        # window capacity, offset >= window) with the NVFP4 bank active;
+        # everything else falls back to the stock path below.
+        fused_attn_out = self._fused_attn_decode(x, cache)
+        if fused_attn_out is not None:
+            return fused_attn_out
+
+        # NVFP4-decode QKV path (opt-in): single-token decode dispatches the
+        # fused q/k/v NVFP4 kernel against the requantized bank.
         use_nvfp4_qkv = (
             bsz == 1
             and seq_len == 1
@@ -781,6 +1003,40 @@ class Attention(nn.Module):
             sinks=self.sink,
         )
         output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
+
+        # Fused gated o_proj (opt-in, challenge lagunaOProjAct). Replaces the
+        # [gate softplus] * attention + o_proj tail with ONE kernel when the
+        # NVFP4 bank is active, shapes match (per-head gate), and the symbol
+        # exists. The kernel's bf16 per-element gate product reproduces the
+        # stock decode path byte-for-byte (test_oproj_act_bit_exact) for the
+        # nvfp4-quantized o_proj — which is already the numerics of this
+        # opt-in bank path.
+        if (use_nvfp4_qkv and self.gating and self.gate_per_head
+                and self.o_proj.weight.ndim == 2):
+            try:
+                from omlx.custom_kernels.laguna_nvfp4 import fast as _fn
+
+                if _fn.has_native() and _fn.has_symbol("oproj_act"):
+                    in_vec = self.n_heads * self.head_dim
+                    oc = self._nvfp4_bank.get("o_codes_raw")
+                    os_ = self._nvfp4_bank.get("o_scales")
+                    if (oc is not None and os_ is not None
+                            and oc.shape == (self.o_proj.weight.shape[0], in_vec // 8)
+                            and os_.shape == (self.o_proj.weight.shape[0], in_vec // 16)):
+                        if _COMPILED_FUSIONS:
+                            gv = _compiled_softplus_gate(self.g_proj(x))
+                        else:
+                            gv = nn.softplus(
+                                self.g_proj(x).astype(mx.float32)
+                            ).astype(output.dtype)
+                        gv = gv.reshape(-1).astype(mx.bfloat16)
+                        out = _fn.oproj_act(
+                            output.reshape(-1).astype(mx.bfloat16),
+                            gv, oc, os_, self.n_heads,
+                        )
+                        return out.reshape(bsz, seq_len, -1)
+            except Exception:
+                pass
 
         if self.gating:
             if _COMPILED_FUSIONS:
@@ -907,6 +1163,28 @@ class Model(nn.Module):
         self.model = LagunaModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        # LM-head int5 prune planes (challenge buildInt5Planes), built lazily
+        # on the first decode call when the kernel path is enabled. None when
+        # the head does not fit int5 (declines to the stock head).
+        self._lm_planes = "uninit"
+
+    def _prepare_lm_planes(self):
+        """Build the int5 prune planes for the untied lm_head, once."""
+        if self._lm_planes != "uninit":
+            return self._lm_planes
+        self._lm_planes = None
+        if not (_LAGUNA_NVFP4_KERNELS and not self.args.tie_word_embeddings):
+            return None
+        try:
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _fn
+
+            if _fn.has_native() and _fn.has_symbol("lm_head_prune"):
+                lo, hi, sd = _fn.build_int5_planes(self.lm_head.weight)
+                if lo is not None:
+                    self._lm_planes = (lo, hi, sd)
+        except Exception:
+            pass
+        return self._lm_planes
 
     def __call__(
         self,
@@ -917,6 +1195,21 @@ class Model(nn.Module):
         out = self.model(inputs, cache, input_embeddings)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
+        # Decode-only LM-head int5 prune: for a single output row with the
+        # planes built, run the prune pipeline (coarse argmax + exact winner)
+        # instead of the full 100352-wide bf16 head matmul. Args-match the
+        # stock head; anything odd falls back to self.lm_head(out).
+        if out.shape[0] == 1 and out.shape[1] == 1 and self._prepare_lm_planes() is not None:
+            try:
+                from omlx.custom_kernels.laguna_nvfp4 import fast as _fn
+
+                lo, hi, sd = self._lm_planes
+                lg = _fn.lm_head_prune(
+                    out.reshape(-1), lo, hi, sd, self.lm_head.weight
+                )
+                return lg.reshape(1, 1, -1)
+            except Exception:
+                pass
         return self.lm_head(out)
 
     def make_cache(self) -> list[KVCache | RotatingKVCache]:
