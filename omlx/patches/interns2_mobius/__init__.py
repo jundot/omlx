@@ -9,8 +9,9 @@ sanitize, so this patch brings up text generation only.
 
 MLX-LM resolves model architectures with a dynamic import under its own
 namespace, keyed on the checkpoint's top-level ``model_type`` ("interns2_mobius").
-Until upstream ships the module, register the vendored file under that name so
-the normal loader path remains unchanged.
+The vendored file tracks the module proposed upstream in ml-explore/mlx-lm#1771;
+until that ships, register it under that name so the normal loader path remains
+unchanged.
 """
 
 from __future__ import annotations
@@ -22,6 +23,11 @@ import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Upstream PR the vendored file tracks. Head SHA intentionally omitted: the PR
+# branch still moves, so pinning a SHA here would rot (cf. mimo_v2/laguna, which
+# pin merged PRs).
+PR_URL = "https://github.com/ml-explore/mlx-lm/pull/1771"
 
 _MODULE_NAME = "mlx_lm.models.interns2_mobius"
 _APPLIED = False
@@ -79,7 +85,7 @@ def apply_interns2_mobius_patch() -> bool:
 
     _APPLIED = True
     if applied:
-        logger.info("Intern-S2-Mobius mlx-lm patch applied")
+        logger.info("Intern-S2-Mobius mlx-lm patch applied (mlx-lm#1771)")
         return True
 
     logger.debug("mlx_lm.models.interns2_mobius already available upstream")
@@ -90,4 +96,4 @@ def is_applied() -> bool:
     return _APPLIED
 
 
-__all__ = ["apply_interns2_mobius_patch", "is_applied"]
+__all__ = ["PR_URL", "apply_interns2_mobius_patch", "is_applied"]

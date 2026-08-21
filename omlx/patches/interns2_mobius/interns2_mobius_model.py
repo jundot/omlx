@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: MIT
+# ruff: noqa
 # Copyright © 2025 Apple Inc.
+# Vendored from ml-explore/mlx-lm#1771, plus the MTP draft-head classes (not in
+# the upstream PR); keep the shared parts byte-identical for pin-bump diffing.
 
 from __future__ import annotations
 
@@ -47,6 +51,9 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
     attention_bias: bool = False
     tie_word_embeddings: bool = False
+    mtp_num_hidden_layers: int = 0
+    mtp_num_experts: int = 256
+    mtp_num_experts_per_tok: int = 8
 
     @classmethod
     def from_dict(cls, params):
@@ -243,9 +250,9 @@ class InternS2MobiusGatedDeltaNet(nn.Module):
             )
         ]
 
-        # Match the HF kernel's `use_qk_l2norm_in_kernel=True` plus 1/sqrt(d)
-        # query scaling: rms_norm(x) == l2norm(x) * sqrt(d), so these factors
-        # reduce to l2norm(q)/sqrt(d) and l2norm(k).
+        # HF's `use_qk_l2norm_in_kernel` plus 1/sqrt(d) query scaling: since
+        # rms_norm(x) == l2norm(x) * sqrt(d), these reduce to l2norm(q)/sqrt(d)
+        # and l2norm(k).
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
@@ -424,11 +431,8 @@ def _router_topk_kernel(logits: mx.array, k: int) -> tuple[mx.array, mx.array]:
 
 
 def _router_topk_ops(logits: mx.array, k: int) -> tuple[mx.array, mx.array]:
-    idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+    idx = mx.argpartition(logits, kth=-k, axis=-1)[..., -k:]
     top = mx.take_along_axis(logits, idx, axis=-1)
-    # Softmax over the selected logits equals renormalising a full softmax,
-    # since softmax is monotonic and so picks the same k. Emitted in the logits'
-    # dtype (see router_topk).
     scores = mx.softmax(top, axis=-1, precise=True).astype(logits.dtype)
     return idx.astype(mx.uint32), scores
 
@@ -436,21 +440,13 @@ def _router_topk_ops(logits: mx.array, k: int) -> tuple[mx.array, mx.array]:
 def router_topk(
     logits: mx.array, k: int, use_kernel: bool = True
 ) -> tuple[mx.array, mx.array]:
-    """Top-k experts and their softmax weights.
+    """Top-k experts and their softmax weights, in one dispatch.
 
-    Replaces an upcast, argpartition over all experts, gather and softmax --
-    four kernels per layer on a decode step that is bound by kernel launches.
     Softmax over the selected logits equals renormalising a softmax over all of
-    them, because softmax is monotonic and so picks the same k.
-
-    Experts tying on the boundary logit may be picked differently than
-    argpartition picks them, which is free to break ties any way it likes.
-    Tied logits carry equal weight, so either choice is as correct.
-
-    The Metal kernel is selected only under the same guard the recurrent layers
-    use (`gated_delta.py`), falling back to pure MLX ops on CUDA/CPU. Scores are
-    emitted in the logits' dtype (bf16 here); HF routes in fp32, a deliberate
-    deviation measured token-identical. A fully `-inf` logit row would yield NaN
+    them, so this fuses the routing softmax into the top-k. The Metal kernel is
+    guarded like the recurrent layers (`gated_delta.py`) and falls back to MLX
+    ops on CUDA/CPU. Scores are emitted in the logits' dtype (bf16); HF routes in
+    fp32, a deviation measured token-identical. A fully `-inf` row would give NaN
     scores, but gate logits are never `-inf` for this model.
     """
     assert logits.ndim == 2, "router_topk expects 2-D [tokens, experts] logits"
@@ -562,12 +558,13 @@ class InternS2MobiusModel(nn.Module):
             for b in range(args.num_blocks)
         ]
         self.norm = InternS2MobiusRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        # A representative cache index per layer type, for building the masks.
-        # None when the config has no layer of that type.
-        self.ssm_idx = next((i for i, l in enumerate(self.layers) if l.is_linear), None)
-        self.fa_idx = next(
-            (i for i, l in enumerate(self.layers) if not l.is_linear), None
-        )
+        # One representative cache of each type builds the two masks. The fixed
+        # indices assume layers alternate as (linear, ..., full) within every
+        # `full_attention_interval` block; assert it rather than mis-mask.
+        self.ssm_idx = 0
+        self.fa_idx = args.full_attention_interval - 1
+        assert self.layers[self.ssm_idx].is_linear
+        assert not self.layers[self.fa_idx].is_linear
 
     def __call__(
         self,
@@ -579,22 +576,168 @@ class InternS2MobiusModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = (
-            create_attention_mask(h, cache[self.fa_idx])
-            if self.fa_idx is not None
-            else None
-        )
-        ssm_mask = (
-            create_ssm_mask(h, cache[self.ssm_idx])
-            if self.ssm_idx is not None
-            else None
-        )
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, self.meta_mlp[i % self.num_blocks], mask=mask, cache=c)
 
         return self.norm(h)
+
+
+class InternS2MobiusMTPMoeBlock(nn.Module):
+    """The MTP head's own routed-expert bank plus its shared expert.
+
+    The MTP owns its experts outright rather than drawing on the model's shared
+    banks, but the shared-expert fold applies unchanged: the head's one shared
+    expert sits past the routed experts as an always-selected extra, with its
+    sigmoid gate as the combining weight.
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.top_k = args.mtp_num_experts_per_tok
+        self.num_experts = args.mtp_num_experts
+        self.gate = nn.Linear(args.hidden_size, args.mtp_num_experts, bias=False)
+        self.switch_mlp = FusedSwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.mtp_num_experts + 1
+        )
+        self.shared_expert_gate = nn.Linear(args.hidden_size, 1, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        inds, scores = router_topk(self.gate(x), self.top_k)
+
+        shared_ind = mx.full(inds.shape[:-1] + (1,), self.num_experts, inds.dtype)
+        inds = mx.concatenate([inds, shared_ind], axis=-1)
+        scores = mx.concatenate(
+            [scores, mx.sigmoid(self.shared_expert_gate(x))], axis=-1
+        )
+
+        y = self.switch_mlp(x, inds)
+        return (y * scores[..., None]).sum(axis=-2)
+
+
+class InternS2MobiusMTPLayer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.self_attn = InternS2MobiusAttention(args)
+        self.mlp = InternS2MobiusMTPMoeBlock(args)
+        self.input_layernorm = InternS2MobiusRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_attention_layernorm = InternS2MobiusRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+
+        normed = self.post_attention_layernorm(h)
+        B, S, D = normed.shape
+        out = self.mlp(normed.reshape(-1, D))
+        return h + out.reshape(B, S, D)
+
+
+class InternS2MobiusMTP(nn.Module):
+    """Multi-token-prediction draft head carried in the checkpoint's `mtp.*` keys.
+
+    Slot `i` consumes the target model's final hidden state at position `i`
+    together with the embedding of token `i+1`, and its output predicts token
+    `i+2`. `mtp_use_dedicated_embeddings` is false, so the embedding table and
+    the LM head are the target model's and are passed in rather than owned.
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
+        self.pre_fc_norm_embedding = InternS2MobiusRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = InternS2MobiusRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.layers = [
+            InternS2MobiusMTPLayer(args) for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = InternS2MobiusRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        token_embed: mx.array,
+        hidden: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        h = self.fc(
+            mx.concatenate(
+                [
+                    self.pre_fc_norm_embedding(token_embed),
+                    self.pre_fc_norm_hidden(hidden),
+                ],
+                axis=-1,
+            )
+        )
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = create_attention_mask(h, cache[0])
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
+        return self.norm(h)
+
+    def make_cache(self):
+        return [KVCache() for _ in self.layers]
+
+    def sanitize(self, weights):
+        """Fuse `mtp.*` expert keys into the FusedSwitchGLU layout, idempotently."""
+        for k in [k for k in weights if k.startswith("mtp.")]:
+            weights[k[len("mtp.") :]] = weights.pop(k)
+
+        for i in range(self.args.mtp_num_hidden_layers):
+            prefix = f"layers.{i}.mlp"
+            if f"{prefix}.switch_mlp.down_proj.weight" in weights:
+                continue  # already sanitized
+
+            slots = [f"{prefix}.experts.{e}" for e in range(self.args.mtp_num_experts)]
+            slots.append(f"{prefix}.shared_expert")
+
+            gate_up = mx.stack(
+                [
+                    mx.concatenate(
+                        [
+                            weights.pop(f"{s}.gate_proj.weight"),
+                            weights.pop(f"{s}.up_proj.weight"),
+                        ],
+                        axis=0,
+                    )
+                    for s in slots
+                ]
+            )
+            mx.eval(gate_up)
+            weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = gate_up
+
+            down = mx.stack([weights.pop(f"{s}.down_proj.weight") for s in slots])
+            mx.eval(down)
+            weights[f"{prefix}.switch_mlp.down_proj.weight"] = down
+        return weights
+
+    @property
+    def quant_predicate(self):
+        # Handed straight to nn.quantize, so it also skips modules with no
+        # quantized form.
+        def predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            if path.endswith("gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
 
 class Model(nn.Module):
@@ -696,9 +839,8 @@ class Model(nn.Module):
                         + [e[part][None] for e in extra],
                         axis=0,
                     )
-                    # Materialize per projection so its sources are released
-                    # before the next bank is built; leaving every bank pending
-                    # until the final eval doubles peak memory over the experts.
+                    # Materialize per bank (see stack_gate_up) so sources are
+                    # released before the next bank builds.
                     mx.eval(stacked)
                     weights[f"{prefix}.{name}.{part}"] = stacked
 

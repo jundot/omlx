@@ -84,6 +84,7 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
+    "interns2_mobius",
 }
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
