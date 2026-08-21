@@ -4360,9 +4360,10 @@
             },
 
             // Normalized identity keys for one deployment host (or ring node):
-            // ssh target (with any user@ prefix dropped), node id, and known
-            // IPs, with mDNS suffixes stripped so a discovered "wnio.local"
-            // peer matches host id "wnio" and "admin@wnio.local" matches too.
+            // ssh destination (with any user@ prefix dropped), node id, and
+            // known IPs, with mDNS suffixes stripped so a discovered
+            // "worker-a.local" peer matches host id "worker-a" and a
+            // "user@worker-a.local" destination matches too.
             clusterFabricHostKeys(host) {
                 const keys = new Set();
                 const push = value => {

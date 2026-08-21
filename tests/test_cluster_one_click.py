@@ -1615,7 +1615,7 @@ component.clusterStatus = { runtime_jobs: { jobs: [
     live: true,
     deployment_id: 'dep-b',
     assignments: [
-      { rank: 0, node_id: 'wnio' },
+      { rank: 0, node_id: 'worker-a' },
       { rank: 1, node_id: '' },
     ],
   },
@@ -1623,13 +1623,13 @@ component.clusterStatus = { runtime_jobs: { jobs: [
 component.clusterDeployments = [
   {
     deployment_id: 'dep-a',
-    hosts: [{ node_id: 'ghost', ssh: 'ghost.local' }],
+    hosts: [{ node_id: 'stale', ssh: 'stale.local' }],
   },
   {
     deployment_id: 'dep-b',
     hosts: [
-      { node_id: 'wnio', ssh: 'admin@Wnio.Local' },
-      { node_id: '', ssh: 'blank.local' },
+      { node_id: 'worker-a', ssh: 'Ops@Worker-A.Local' },
+      { node_id: '', ssh: 'unassigned.local' },
     ],
   },
 ];
@@ -1638,7 +1638,7 @@ const keys = [...(component.clusterLiveFabricMemberKeys() || [])];
 process.stdout.write(JSON.stringify({
   deploymentId: deployment.deployment_id,
   keys,
-  hostKeyProbe: [...component.clusterFabricHostKeys({ ssh: 'user@Spark-2.local' })],
+  hostKeyProbe: [...component.clusterFabricHostKeys({ ssh: 'user@node-2.local' })],
 }));
 """,
     )
@@ -1647,10 +1647,10 @@ process.stdout.write(JSON.stringify({
     # blank node ids never shadow the lookup map, and user@ / mDNS
     # decoration is stripped so identity keys line up across sources.
     assert result["deploymentId"] == "dep-b"
-    assert "wnio" in result["keys"]
-    assert "admin@wnio.local" in result["keys"]
-    assert all(not key.startswith("blank") for key in result["keys"])
-    assert "spark-2" in result["hostKeyProbe"]
+    assert "worker-a" in result["keys"]
+    assert "ops@worker-a.local" in result["keys"]
+    assert all(not key.startswith("unassigned") for key in result["keys"])
+    assert "node-2" in result["hostKeyProbe"]
 
 
 def test_dashboard_verifies_connectx_and_persists_group_in_plan_payload():
