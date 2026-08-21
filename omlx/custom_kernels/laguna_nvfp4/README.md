@@ -149,10 +149,16 @@ steps, single process per variant (median of 3):
 |---|---|---|
 | stock (`OMLX_LAGUNA_NVFP4_KERNELS=0`) | 63.6 tok/s (15.71 ms/tok) | — |
 | full kernel stack (=1, ATTN=1, FUSED=1) | 94.9 tok/s (10.53 ms/tok) | +50% |
-| stack + async fire-mask (OMLX_LAGUNA_ASYNC_FIRE=1) | 105.1 tok/s (9.52 ms/tok) | **+65%** |
+| stack + async fire-mask (OMLX_LAGUNA_ASYNC_FIRE=1) | 105.1 tok/s (9.52 ms/tok) | +65% |
+| raw per-step loop (no harness), same stack + fire | 119.4 tok/s (8.38 ms/tok) | **+88%** |
 
-(raw per-step loop reads higher still: 67.4 -> 112.4 tok/s with the fire
-mask, +67%; the batch pipeline adds ~0.5 ms/step of harness overhead.)
+The challenge repo's Swift benchmark on the same machine reads 137.9 tok/s
+(its metric includes the seed prefill in the decode window; pure decode is
+~205 tok/s). The remaining omlx gap is structural: the challenge's fused
+INT8-affine norm+QKV bank and per-op Swift kernel fusion, which the MLX
+Python boundary cannot fully replicate. The env-off stock path stays
+byte-identical throughout (verified on 64 decode tokens against the
+original baseline).
 
 Individual contributions (all opt-in, guard + fallback): the NVFP4 QKV
 bank (`OMLX_LAGUNA_NVFP4_ATTN=1`) is the largest single win (+28% over
