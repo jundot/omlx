@@ -732,6 +732,30 @@ class LagunaSparseMoeBlock(nn.Module):
                         return out.reshape(1, 1, -1)
                     except Exception:
                         pass
+        # Prefill (multi-token) fused combine tail (challenge
+        # lagunaPrefillMoETail): ONE kernel does the weighted 8-expert
+        # combine (x2.5) + shared + residual. Engaged when the expert output
+        # carries the [.., 8, 2048] routed axis and shapes match; otherwise
+        # the compiled eager combine.
+        if (_LAGUNA_NVFP4_KERNELS
+                and x.shape[1] > 1
+                and y.ndim == 4 and y.shape[-2] == 8
+                and residual is not None):
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _fpt
+
+            if _fpt.has_native() and _fpt.has_symbol("prefill_moe_tail"):
+                try:
+                    rows = x.shape[0] * x.shape[1]
+                    sh = self.shared_expert(x)
+                    out = _fpt.prefill_moe_tail(
+                        y.reshape(1, rows, 8, 2048),
+                        scores.astype(mx.bfloat16).reshape(1, rows, 8),
+                        sh.reshape(1, rows, 2048),
+                        residual.reshape(1, rows, 2048),
+                    )
+                    return out.reshape(x.shape[0], x.shape[1], 2048)
+                except Exception:
+                    pass
         if _COMPILED_FUSIONS:
             shared = self.shared_expert(x)
             if residual is not None:
