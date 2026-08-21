@@ -613,9 +613,37 @@ class LagunaSparseMoeBlock(nn.Module):
         ).squeeze(-2)
 
     def __call__(
-        self, x: mx.array, residual: mx.array | None = None
+        self, x: mx.array, residual: mx.array | None = None,
+        precomputed_logits: mx.array | None = None,
     ) -> mx.array:
-        inds, scores = self.gate(x)
+        if precomputed_logits is not None:
+            # The fused residual+RMS+router kernel already computed the raw
+            # router logits; run only the eager top-k tail (sigmoid +
+            # correction-ordered argpartition + normalize) on them.
+            logits = precomputed_logits.astype(mx.float32)
+            scores = (
+                mx.sigmoid(logits)
+                if self.gate.use_sigmoid else mx.softmax(logits, axis=-1)
+            )
+            corrected = scores + self.gate.e_score_correction_bias.astype(
+                scores.dtype
+            )
+            k = self.gate.top_k
+            inds = mx.stop_gradient(
+                mx.argpartition(-corrected, kth=k - 1, axis=-1)[..., :k]
+            )
+            weights = mx.take_along_axis(scores, inds, axis=-1)
+            if self.gate.norm_topk_prob:
+                if _COMPILED_FUSIONS:
+                    weights = _compiled_topk_normalize(weights)
+                else:
+                    weights = weights / mx.sum(
+                        weights, axis=-1, keepdims=True
+                    )
+            inds = inds.astype(mx.uint32)
+            scores = weights.astype(x.dtype)
+        else:
+            inds, scores = self.gate(x)
         if (
             _LAGUNA_NVFP4_KERNELS
             and x.shape[1] == 1
@@ -623,8 +651,6 @@ class LagunaSparseMoeBlock(nn.Module):
             and self._prepare_fused_gate_up()
             and getattr(self, "_kernel_plane", None) is not None
         ):
-            if os.environ.get("LAG_ROUTED_LOG"):
-                print("[ROUTED] engaged", flush=True)
             from omlx.custom_kernels.laguna_nvfp4 import fast as _fn
 
             if _fn.has_native() and _fn.has_symbol("routed_nvfp4_swiglu_qmv"):
@@ -640,8 +666,6 @@ class LagunaSparseMoeBlock(nn.Module):
                     _fn.has_symbol("routed_nvfp4_down_reduce")
                     and getattr(self, "_kernel_down_scales", None) is not None
                 ):
-                    if os.environ.get("LAG_ROUTED_LOG"):
-                        print("[DOWNRED] calling", flush=True)
                     y = _fn.routed_nvfp4_down_reduce(
                         act,
                         self._kernel_down,
@@ -810,40 +834,101 @@ class Attention(nn.Module):
         new K/V slot the kernel wrote is mirrored onto the real cache slot and
         the clock advances exactly as the stock update_in_place would.
         """
-        if os.environ.get("LAG_FUSED_LOG"):
-            print(f"[g] on={_LAGUNA_NVFP4_KERNELS} fused={_LAGUNA_FUSED_ATTN} sli={self.is_sliding} ctype={type(cache).__name__ if cache is not None else None}", flush=True)
         if not (_LAGUNA_NVFP4_KERNELS and _LAGUNA_FUSED_ATTN):
             return None
         if self.sink is not None:
-            return None
-        if not self.is_sliding or not isinstance(cache, RotatingKVCache):
-            return None
+            return None  # the fused kernels have no attention-sink slot
         bsz, seq_len, _ = x.shape
         if bsz != 1 or seq_len != 1:
-            return None
-        if os.environ.get("LAGUNA_FUSED_DBG"):
-            print(f"[g2] kshape={None if cache.keys is None else cache.keys.shape} max={cache.max_size} off={cache.offset} keep={cache.keep}", flush=True)
-        if cache.keys is None or cache.keys.shape[2] != cache.max_size:
-            return None
-        if cache.offset < cache.max_size:
-            return None
-        if cache.keep:
             return None
         try:
             from omlx.custom_kernels.laguna_nvfp4 import fast as _laguna_nvfp4
 
-            if os.environ.get("LAGUNA_FUSED_DBG"):
-                print("[try] sym=", _laguna_nvfp4.has_symbol("sliding_fused_attn_ring"), flush=True)
+            # ---- full-attention grow branch --------------------------------
+            # The 10 full-attention layers use a plain KVCache that grows in
+            # steps. When the buffer has spare capacity for the new slot
+            # (offset+1 <= capacity), the fused grow kernel writes the new
+            # K/V in place at widx=offset and attends all N=offset cached
+            # positions in ONE dispatch (challenge lagunaFullFusedAttention).
+            if not self.is_sliding and isinstance(cache, KVCache):
+                if (cache.keys is None or cache.values is None
+                        or cache.offset >= cache.keys.shape[2]
+                        or cache.offset + 1 > cache.keys.shape[2]):
+                    return None
+                if not _laguna_nvfp4.has_symbol("full_fused_attn_grow"):
+                    return None
+                if self.n_heads != 48:
+                    return None
+                atlas = _get_laguna_rope_atlas(None, self.rope)
+                if atlas.full is None:
+                    return None
+                pos = int(cache.offset)
+                if pos >= int(atlas.full.shape[2]):
+                    return None
+                angles = mx.array(atlas.full[0, 0, pos, :], mx.float32)
+                hidden = x.reshape(-1)
+                if self._prepare_nvfp4_bank():
+                    heads4 = self.n_heads if self.n_heads in (48, 64) else 64
+                    projected = _laguna_nvfp4.decode_nvfp4_qkv_r1(
+                        hidden, self._nvfp4_bank["qkv_codes"],
+                        self._nvfp4_bank["qkv_scales"], heads4,
+                    )
+                    q_split = self.n_heads * self.head_dim
+                    k_end = q_split + self.n_kv_heads * self.head_dim
+                    raw_q = projected[:q_split].reshape(-1)
+                    raw_k = projected[q_split:k_end].reshape(-1)
+                    raw_v = projected[k_end:].reshape(-1)
+                else:
+                    raw_q = self.q_proj(x).reshape(-1)
+                    raw_k = self.k_proj(x).reshape(-1)
+                    raw_v = self.v_proj(x).reshape(-1)
+                N = int(cache.offset)
+                capacity = int(cache.keys.shape[2])
+                widx = N
+                kc = cache.keys.reshape(
+                    self.n_kv_heads, capacity, self.head_dim
+                )
+                vc = cache.values.reshape(
+                    self.n_kv_heads, capacity, self.head_dim
+                )
+                y = _laguna_nvfp4.full_fused_attn_grow(
+                    raw_q, raw_k, raw_v, self.q_norm.weight,
+                    self.k_norm.weight, angles, kc, vc,
+                    mx.array([widx, N, capacity], mx.uint32),
+                    mx.array([self.scale], mx.float32),
+                )
+                cache.offset += 1
+                y2 = y.reshape(bsz, seq_len, self.n_heads, self.head_dim)
+                if self.gating:
+                    gate = self.g_proj(hidden.reshape(bsz, seq_len, -1))
+                    if _COMPILED_FUSIONS:
+                        gate = _compiled_softplus_gate(gate)
+                    else:
+                        gate = nn.softplus(gate.astype(mx.float32)).astype(y.dtype)
+                    if self.gate_per_head:
+                        y2 = y2 * gate.reshape(bsz, seq_len, self.n_heads, 1)
+                    else:
+                        y2 = y2 * gate.reshape(
+                            bsz, seq_len, -1
+                        ).reshape(bsz, seq_len, self.n_heads, self.head_dim)
+                return self.o_proj(y2.reshape(bsz, seq_len, -1))
+
+            # ---- sliding-ring branch --------------------------------------
+            if not self.is_sliding or not isinstance(cache, RotatingKVCache):
+                return None
+            if cache.keys is None or cache.keys.shape[2] != cache.max_size:
+                return None  # not yet at steady ring capacity
+            if cache.offset < cache.max_size:
+                return None
+            if cache.keep:
+                return None  # fused ring requires keep == 0
             if not _laguna_nvfp4.has_symbol("sliding_fused_attn_ring"):
                 return None
+            # RoPE angle atlas row for the current absolute position
             atlas = _get_laguna_rope_atlas(self.rope, None)
-            if os.environ.get("LAGUNA_FUSED_DBG"):
-                print("[try] atlas.sliding=", None if atlas.sliding is None else atlas.sliding.shape, flush=True)
             if atlas.sliding is None:
                 return None
             pos = int(cache.offset)
-            if os.environ.get("LAGUNA_FUSED_DBG"):
-                print("[try] pos=", pos, "atlas_len=", None if atlas.sliding is None else atlas.sliding.shape[2], flush=True)
             if pos >= int(atlas.sliding.shape[2]):
                 return None
             angles = mx.array(atlas.sliding[0, 0, pos, :], mx.float32)
@@ -881,8 +966,6 @@ class Attention(nn.Module):
             widx = int(cache._idx)
             if widx == cache.max_size:
                 widx = 0
-            if os.environ.get("LAGUNA_FUSED_DBG"):
-                print("[try] before kernel call", flush=True)
             y = _laguna_nvfp4.sliding_fused_attn_ring(
                 raw_q, raw_k, raw_v, self.q_norm.weight, self.k_norm.weight,
                 angles, kring, vring,
@@ -909,13 +992,8 @@ class Attention(nn.Module):
                         bsz, seq_len, self.n_heads, self.head_dim
                     )
             _LAGUNA_FUSED_CALLS[0] += 1
-            if os.environ.get("LAG_FUSED_LOG"):
-                print(f"[FUSED+1] total={_LAGUNA_FUSED_CALLS[0]} layer={getattr(self,'is_sliding',None)}", flush=True)
             return self.o_proj(y2.reshape(bsz, seq_len, -1))
         except Exception as _e:
-            if os.environ.get("LAGUNA_FUSED_DBG"):
-                import traceback; traceback.print_exc()
-                print("[try] EXC:", type(_e).__name__, _e, flush=True)
             return None
 
     def __call__(
@@ -1095,6 +1173,39 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
+        # Fused residual + RMSNorm + router GEMV (challenge
+        # lagunaResidualRMSNormRouter): ONE kernel replaces the
+        # post_attention_layernorm and the router projection for a
+        # single-token sparse decode step. Returns (summed, normalized,
+        # router_logits, _); the sparse block consumes the normalized input
+        # and computes the top-k from the raw router logits. Falls back to
+        # the stock path on any guard failure.
+        if (isinstance(self.mlp, LagunaSparseMoeBlock)
+                and _LAGUNA_NVFP4_KERNELS
+                and x.shape[0] == 1 and x.shape[1] == 1
+                and self.mlp.gate.use_sigmoid
+                and self.mlp.gate.router_logit_softcapping <= 0.0):
+            from omlx.custom_kernels.laguna_nvfp4 import fast as _fnr
+
+            if _fnr.has_native() and _fnr.has_symbol("residual_rms_router"):
+                try:
+                    rw = self.mlp.gate.proj.weight
+                    if (rw.ndim == 2 and rw.shape == (256, 2048)
+                            and rw.dtype == mx.bfloat16
+                            and x.dtype == mx.bfloat16
+                            and r.dtype == mx.bfloat16):
+                        summed, normed, rlogits, _rkeys = _fnr.residual_rms_router(
+                            x.reshape(-1), r.reshape(-1),
+                            self.post_attention_layernorm.weight,
+                            rw,
+                            self.mlp.gate.e_score_correction_bias.astype(mx.float32),
+                        )
+                        return self.mlp(
+                            normed.reshape(1, 1, -1), residual=h,
+                            precomputed_logits=rlogits.reshape(1, 1, -1),
+                        )
+                except Exception:
+                    pass
         mlp_input = self.post_attention_layernorm(h)
         if isinstance(self.mlp, LagunaSparseMoeBlock):
             # Fold the decoder residual add into the (compiled) sparse combine.
