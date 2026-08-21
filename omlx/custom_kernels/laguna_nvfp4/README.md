@@ -135,18 +135,24 @@ bit-identical):
 - the LM-head int5 prune pipeline (`lm_head_prune`) replacing the
   100352-wide bf16 head matmul for single-row decode (argmax-exact),
 - the fused residual + RMSNorm + MoE router GEMV
-  (`residual_rms_router`) for single-token sparse decode.
+  (`residual_rms_router`) for single-token sparse decode,
+- async fire-mask decode pipelining (challenge DARKBLOOM_DECODE_ASYNC_STAGE):
+  `mx.async_eval` after layers 0,1,7,15,23,31,39 during single-token decode
+  so completed segments stream to the GPU while the host builds the rest of
+  the graph. Token-identical (verified 65/65) — changes only the enqueue
+  schedule. Opt-in via `OMLX_LAGUNA_ASYNC_FIRE`.
 
 Measured decode A/B on the real model, 512-token prompt / 128 decode
 steps, single process per variant (median of 3):
 
 | config | decode | vs stock |
 |---|---|---|
-| stock (`OMLX_LAGUNA_NVFP4_KERNELS=0`) | 63.1 tok/s (15.86 ms/tok) | — |
-| full kernel stack (=1, ATTN=1, FUSED=1) | 94.9 tok/s (10.53 ms/tok) | **+50%** |
+| stock (`OMLX_LAGUNA_NVFP4_KERNELS=0`) | 63.6 tok/s (15.71 ms/tok) | — |
+| full kernel stack (=1, ATTN=1, FUSED=1) | 94.9 tok/s (10.53 ms/tok) | +50% |
+| stack + async fire-mask (OMLX_LAGUNA_ASYNC_FIRE=1) | 105.1 tok/s (9.52 ms/tok) | **+65%** |
 
-(raw per-step loop reads higher: 67.4 -> 104.7 tok/s, +55%; the batch
-pipeline adds ~0.5 ms/step of harness overhead.)
+(raw per-step loop reads higher still: 67.4 -> 112.4 tok/s with the fire
+mask, +67%; the batch pipeline adds ~0.5 ms/step of harness overhead.)
 
 Individual contributions (all opt-in, guard + fallback): the NVFP4 QKV
 bank (`OMLX_LAGUNA_NVFP4_ATTN=1`) is the largest single win (+28% over
