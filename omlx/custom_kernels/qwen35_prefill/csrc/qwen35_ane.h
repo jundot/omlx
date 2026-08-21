@@ -38,6 +38,10 @@ public:
   Ticket begin(MTL::CommandBuffer *command_buffer);
   void execute(Ticket ticket);
   void wait(Ticket ticket);
+  // True once an evaluation has failed or timed out on this program; the
+  // program is latched and every later begin() will throw. Lets the Python
+  // layer detect a wedged program at graph-construction time and fall back.
+  bool has_error();
   // Run one throwaway evaluation to pay the first-run compilation cost at
   // load time instead of inside the first user request. Input contents are
   // irrelevant; the output is discarded.

@@ -1356,6 +1356,22 @@ def _prepare_gdn_runtime_state(
     )
 
 
+def _raise_if_latched(*models: Any) -> None:
+    """Detect a wedged ANE program at graph-construction time.
+
+    A failed or timed-out evaluation latches the program in native code
+    (has_error); every later begin() would throw at evaluation time, where
+    the per-module fallback cannot catch it. Raising here instead keeps the
+    failure inside the module's existing try/except latch.
+    """
+    for model in models:
+        has_error = getattr(model, "has_error", None)
+        if has_error is not None and has_error():
+            raise RuntimeError(
+                "ANE program latched after a failed or timed-out evaluation"
+            )
+
+
 def _gdn_backend_exact(
     gdn: Any, x: mx.array, target_verify: bool = False
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
@@ -1381,6 +1397,7 @@ def _gdn_backend_exact(
         from omlx.custom_kernels.qwen35_prefill import fast
         from omlx.patches.qwen35_q4_mlp import _post_ane_qmm_or_linear
 
+        _raise_if_latched(state.model, state.model1)
         if state.cpu_weight is not None:
             if state.model1 is not None:
                 combined = fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
@@ -1546,6 +1563,7 @@ def _backend_exact(
         try:
             from omlx.custom_kernels.qwen35_prefill import fast
 
+            _raise_if_latched(fused_down_state.model, fused_down_state.model1)
             if fused_down_state.cpu_gate_up_weight is not None:
                 if fused_down_state.cpu_down_weight is None:
                     raise RuntimeError("Incomplete fused CPU MLP state")
@@ -1610,6 +1628,7 @@ def _backend_exact(
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
+        _raise_if_latched(state.model, state.model1, state.down_ane)
         if state.cpu_weight is not None:
             if state.model1 is not None and state.bits == 4:
                 activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(

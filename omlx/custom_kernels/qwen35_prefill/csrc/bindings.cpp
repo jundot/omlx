@@ -62,7 +62,10 @@ NB_MODULE(_ext, m) {
       .def(
           "warmup",
           &omlx::qwen35_prefill_kernels::AneLinearModel::warmup,
-          nb::call_guard<nb::gil_scoped_release>());
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "has_error",
+          &omlx::qwen35_prefill_kernels::AneLinearModel::has_error);
   nb::class_<omlx::qwen35_prefill_kernels::AneLinearBankBuilder>(
       m, "AneLinearBankBuilder")
       .def(nb::init<int>(), "sequence_length"_a)
