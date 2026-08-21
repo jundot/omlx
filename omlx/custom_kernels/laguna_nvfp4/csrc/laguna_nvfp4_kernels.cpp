@@ -110,6 +110,11 @@ class SharedSwiGLUQmvPrimitive : public Primitive {
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
 
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(512)}};
+    }
+
     DEFINE_NAME(SharedSwiGLUQmvPrimitive)
 };
 
@@ -156,6 +161,11 @@ class SharedDownResidualPrimitive : public Primitive {
         MTL::Size group_dims(64, 1, 1);
         MTL::Size grid_dims(256, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(2048)}};
     }
 
     DEFINE_NAME(SharedDownResidualPrimitive)
@@ -282,6 +292,12 @@ class RoutedSwiGLUQmvPrimitive : public Primitive {
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
 
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        int R = static_cast<int>(inputs[3].shape(0));
+        return {Shape{static_cast<ShapeElem>(R * 512)}};
+    }
+
     DEFINE_NAME(RoutedSwiGLUQmvPrimitive)
 };
 
@@ -360,6 +376,11 @@ class RoutedDownReducePrimitive : public Primitive {
         MTL::Size group_dims(256, 1, 1);
         MTL::Size grid_dims(512, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(2048)}};
     }
 
     DEFINE_NAME(RoutedDownReducePrimitive)
@@ -567,6 +588,12 @@ class DecodeQkvR1Primitive : public Primitive {
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
 
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        int rows = (heads_ + 2 * 8) * 128;
+        return {Shape{static_cast<ShapeElem>(rows)}};
+    }
+
     DEFINE_NAME(DecodeQkvR1Primitive)
 };
 
@@ -643,6 +670,11 @@ class OProjActPrimitive : public Primitive {
         MTL::Size group_dims(64, 1, 1);
         MTL::Size grid_dims((out_vec / 8) * 64 / 64, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(2048)}};
     }
 
     DEFINE_NAME(OProjActPrimitive)
@@ -938,6 +970,11 @@ class SlidingFusedAttnRingPrimitive : public Primitive {
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
 
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(64 * 128)}};
+    }
+
     DEFINE_NAME(SlidingFusedAttnRingPrimitive)
 };
 
@@ -1016,6 +1053,16 @@ class ResidualRmsRouterPrimitive : public Primitive {
         MTL::Size group_dims(512, 1, 1);
         MTL::Size grid_dims(32, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {
+            Shape{static_cast<ShapeElem>(2048)},
+            Shape{static_cast<ShapeElem>(2048)},
+            Shape{static_cast<ShapeElem>(256)},
+            Shape{static_cast<ShapeElem>(256)},
+        };
     }
 
     DEFINE_NAME(ResidualRmsRouterPrimitive)
@@ -1370,6 +1417,12 @@ class LmCoarsePrimitive : public Primitive {
         MTL::Size grid_dims(vocab / 16, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        int vocab = static_cast<int>(inputs[1].shape(0));
+        return {Shape{static_cast<ShapeElem>(vocab)}, Shape{static_cast<ShapeElem>(vocab)}};
+    }
+
     DEFINE_NAME(LmCoarsePrimitive)
 };
 
@@ -1396,6 +1449,13 @@ class LmArgmaxStage1Primitive : public Primitive {
         MTL::Size grid_dims(1, partials, 1);  // row = grid.y
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        int vocab = static_cast<int>(inputs[0].shape(0));
+        int partials = vocab / 784;
+        return {Shape{static_cast<ShapeElem>(partials)}, Shape{static_cast<ShapeElem>(partials)}};
+    }
+
     DEFINE_NAME(LmArgmaxStage1Primitive)
 };
 
@@ -1421,6 +1481,11 @@ class LmThresholdPrimitive : public Primitive {
         MTL::Size grid_dims(1, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(1)}};
+    }
+
     DEFINE_NAME(LmThresholdPrimitive)
 };
 
@@ -1447,6 +1512,12 @@ class LmInlineExactPrimitive : public Primitive {
         MTL::Size grid_dims(vocab / 32, 1, 1);  // 4 rows per simdgroup x 8
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        int vocab = static_cast<int>(inputs[0].shape(0));
+        return {Shape{static_cast<ShapeElem>(vocab)}};
+    }
+
     DEFINE_NAME(LmInlineExactPrimitive)
 };
 
@@ -1561,6 +1632,15 @@ class EmbeddingAtlasPrimitive : public Primitive {
         MTL::Size grid_dims(512 / 512, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {
+            Shape{static_cast<ShapeElem>(2048)},
+            Shape{static_cast<ShapeElem>(64)},
+            Shape{static_cast<ShapeElem>(128)},
+        };
+    }
+
     DEFINE_NAME(EmbeddingAtlasPrimitive)
 };
 
@@ -1618,6 +1698,11 @@ class FullFusedAttnGrowPrimitive : public Primitive {
         MTL::Size grid_dims(48 / 2, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{static_cast<ShapeElem>(48 * 128)}};
+    }
+
     DEFINE_NAME(FullFusedAttnGrowPrimitive)
 };
 
@@ -1671,6 +1756,12 @@ class LmBaseCoarsePrimitive : public Primitive {
         MTL::Size grid_dims(vocab / 16, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        int vocab = static_cast<int>(inputs[1].shape(0));
+        return {Shape{static_cast<ShapeElem>(vocab)}, Shape{static_cast<ShapeElem>(vocab)}};
+    }
+
     DEFINE_NAME(LmBaseCoarsePrimitive)
 };
 
@@ -1710,6 +1801,12 @@ class LmSparseRefinePrimitive : public Primitive {
         MTL::Size grid_dims(vocab / 32, 1, 1);
         enc.dispatch_threadgroups(grid_dims, group_dims);
     }
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        int vocab = static_cast<int>(inputs[5].shape(0));
+        return {Shape{static_cast<ShapeElem>(vocab)}};
+    }
+
     DEFINE_NAME(LmSparseRefinePrimitive)
 };
 
