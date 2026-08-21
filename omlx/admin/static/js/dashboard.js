@@ -4346,9 +4346,79 @@
                 );
             },
 
-            clusterNeuralFabricNodes() {
-                const nodes = this.clusterLogicalNodes();
+            // Normalized identity keys for one deployment host (or ring node):
+            // ssh target, node id, and known IPs, with mDNS suffixes stripped
+            // so a discovered "wnio.local" peer matches host id "wnio".
+            clusterFabricHostKeys(host) {
+                const keys = new Set();
+                const push = value => {
+                    const raw = String(value ?? '').trim().toLowerCase();
+                    if (!raw) return;
+                    keys.add(raw);
+                    const bare = raw.replace(/\.local\.?$/, '');
+                    if (bare) keys.add(bare);
+                };
+                push(host?.ssh);
+                push(host?.node_id);
+                (Array.isArray(host?.ips) ? host.ips : []).forEach(push);
+                return keys;
+            },
+
+            // Identity keys of the hosts holding ranks in the live job, or
+            // null when participation cannot be determined (no live job, or
+            // deployments not loaded). Callers treat null as "cannot tell,
+            // keep previous behavior" so a slow deployments fetch never
+            // blanks the fabric.
+            clusterLiveFabricMemberKeys() {
                 const job = this.clusterNeuralFabricJob();
+                if (!job?.live) return null;
+                const deployment = (this.clusterDeployments || [])[0] || null;
+                const hosts = Array.isArray(deployment?.hosts)
+                    ? deployment.hosts
+                    : [];
+                if (!hosts.length) return null;
+                const byNodeId = new Map(
+                    hosts.map(host => [
+                        String(host?.node_id || '').trim().toLowerCase(),
+                        host,
+                    ])
+                );
+                const assignments = Array.isArray(job.assignments)
+                    && job.assignments.length
+                    ? job.assignments
+                    : (Array.isArray(deployment?.assignments)
+                        ? deployment.assignments
+                        : []);
+                const keys = new Set();
+                assignments.forEach(item => {
+                    const host = byNodeId.get(
+                        String(item?.node_id || '').trim().toLowerCase()
+                    );
+                    if (!host) return;
+                    this.clusterFabricHostKeys(host).forEach(key => keys.add(key));
+                });
+                return keys.size ? keys : null;
+            },
+
+            clusterFabricNodeMatchesKeys(node, memberKeys) {
+                if (!memberKeys) return true;
+                for (const key of this.clusterFabricHostKeys(node)) {
+                    if (memberKeys.has(key)) return true;
+                }
+                return false;
+            },
+
+            clusterNeuralFabricNodes() {
+                const job = this.clusterNeuralFabricJob();
+                const memberKeys = this.clusterLiveFabricMemberKeys();
+                // A live deployment is the authority on who participates.
+                // Remembered Bonjour candidates that hold no rank in it — a
+                // neighbor Mac merely advertising SSH — must never render as
+                // cluster members or light up with the ranks.
+                const nodes = (job?.live && memberKeys)
+                    ? this.clusterLogicalNodes().filter(node =>
+                        this.clusterFabricNodeMatchesKeys(node, memberKeys))
+                    : this.clusterLogicalNodes();
                 const assignments = job?.assignments || [];
                 const ranks = job?.ranks || [];
                 const memoryNodes = this.clusterMemoryNodes();
@@ -4402,7 +4472,8 @@
                             + `${this.formatClusterGiB(capacity)}`;
                     }
                     const working = this.clusterNeuralFabricFiring()
-                        && Boolean(job?.live || this.clusterActivationLoading);
+                        && Boolean(job?.live || this.clusterActivationLoading)
+                        && this.clusterFabricNodeMatchesKeys(node, memberKeys);
                     return {
                         ...node,
                         ...positions[index],
