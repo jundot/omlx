@@ -285,7 +285,7 @@ def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_markitdown_non_stream_response_starts_before_conversion(monkeypatch):
+def test_markitdown_non_stream_body_is_clean_json(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
     state.global_settings = _settings_with_markitdown_model()
@@ -318,10 +318,13 @@ def test_markitdown_non_stream_response_starts_before_conversion(monkeypatch):
 
         iterator = response.body_iterator.__aiter__()
         first = await iterator.__anext__()
-        assert first == " "
-        chunk = await iterator.__anext__()
-        assert "Converted markdown" in chunk
+        # Fast path after #2066: no keepalive whitespace is prepended, so
+        # the body is a single chunk that starts with the JSON payload.
+        assert first.startswith("{")
+        assert "Converted markdown" in first
         assert started is True
+        with pytest.raises(StopAsyncIteration):
+            await iterator.__anext__()
         await iterator.aclose()
 
     asyncio.run(exercise())

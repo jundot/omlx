@@ -2322,13 +2322,14 @@ async def _with_json_keepalive(
     For non-streaming requests, the HTTP response body is buffered until
     generation finishes, causing client read timeouts on long prefills.
     This wrapper uses StreamingResponse to send space characters as
-    keepalive. JSON parsers ignore leading whitespace, so the final
-    response parses normally.
+    keepalive, deferred until a full interval of actual waiting: fast
+    responses start directly with the JSON payload (strict clients reject
+    bodies that do not start with the JSON value), while long prefills
+    still hold the connection open. JSON parsers ignore the leading
+    whitespace on the slow path, so the final response parses normally.
     """
     task = asyncio.ensure_future(coro)
     keepalive_elapsed = 0.0
-
-    yield " "
 
     try:
         while not task.done():

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +24,7 @@ from omlx.server import (
     _reject_diffusion_structured_outputs,
     _reset_boundary_snapshots_for_server,
     _resolve_metric_durations,
+    _with_json_keepalive,
     app,
     get_engine,
     get_max_context_window,
@@ -1003,3 +1006,52 @@ class TestHealthPreloadReadiness:
             assert body["status"] == "healthy"
         finally:
             server_mod._server_state.pinned_preload_complete = old
+
+
+class TestJsonKeepaliveDeferral:
+    """Tests for the deferred non-streaming JSON keepalive contract."""
+
+    class _ConnectedRequest:
+        async def is_disconnected(self):
+            return False
+
+    @pytest.mark.asyncio
+    async def test_fast_response_starts_with_json_payload(self):
+        payload = '{"object": "list", "data": []}'
+
+        async def _fast():
+            return payload
+
+        chunks = [
+            chunk
+            async for chunk in _with_json_keepalive(
+                self._ConnectedRequest(), _fast()
+            )
+        ]
+
+        assert chunks == [payload]
+
+    @pytest.mark.asyncio
+    async def test_slow_response_still_receives_keepalive(self):
+        payload = '{"object": "list", "data": []}'
+        release = asyncio.Event()
+
+        async def _slow():
+            await release.wait()
+            return payload
+
+        gen = _with_json_keepalive(
+            self._ConnectedRequest(),
+            _slow(),
+            interval=0.02,
+            disconnect_poll=0.01,
+        )
+        # The coroutine cannot finish until released, so the first chunk
+        # must be a keepalive space emitted after the interval elapses.
+        first = await gen.__anext__()
+        assert first == " "
+        release.set()
+        rest = [chunk async for chunk in gen]
+
+        assert rest[-1] == payload
+        assert json.loads(first + "".join(rest)) == json.loads(payload)
