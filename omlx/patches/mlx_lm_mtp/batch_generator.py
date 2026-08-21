@@ -404,6 +404,7 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
 
 
 _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
+_MTP_ALWAYS_ON_ENV = "OMLX_MTP_ALWAYS_ON"
 
 
 def _rowwise_batch_mtp_enabled() -> bool:
@@ -419,6 +420,16 @@ def _rowwise_batch_mtp_enabled() -> bool:
     unless explicitly requested.
     """
     return os.environ.get(_ROWWISE_BATCH_MTP_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _mtp_always_on_enabled() -> bool:
+    """Keep adaptive MTP eligible after a sustained depth-0 period."""
+    return os.environ.get(_MTP_ALWAYS_ON_ENV, "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -672,6 +683,10 @@ class _MtpState:
     # MTP state is valid only for this exact singleton uid. It must be dropped
     # across any standard batched step or batch reshape that breaks ownership.
     uid: Any = None
+
+    # Avoid repeating the operational log every depth-0 cycle when the
+    # optional always-on policy suppresses the standard-decoder handoff.
+    always_on_handoff_logged: bool = False
 
     # Pending tokens to emit in upcoming next() calls. Each entry is
     # (token_id_int, logprobs_1d, source_label). source_label is one of
@@ -2611,6 +2626,24 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     return True
 
 
+def _maybe_park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Apply the performance handoff unless always-on MTP was requested.
+
+    Always-on mode intentionally preserves the adaptive controller, including
+    depth 0 and its bidirectional probes. Correctness fallbacks and late-join
+    handoffs use separate paths and remain unaffected.
+    """
+    if not _mtp_always_on_enabled():
+        return _park_mtp_to_standard(gen_batch, state)
+    if not state.always_on_handoff_logged:
+        logger.info(
+            "MTP[%s] standard handoff suppressed: always-on mode",
+            state.uid,
+        )
+        state.always_on_handoff_logged = True
+    return False
+
+
 def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
     """Hand a singleton MTP decode to the standard step for a late join.
 
@@ -2666,7 +2699,7 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     ):
         # Emit this cycle's token either way; on a successful handoff the
         # next next() call runs the standard step with _next_tokens set.
-        _park_mtp_to_standard(gen_batch, state)
+        _maybe_park_mtp_to_standard(gen_batch, state)
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 

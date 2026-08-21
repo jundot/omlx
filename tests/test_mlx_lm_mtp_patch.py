@@ -1391,6 +1391,56 @@ class TestBatchGeneratorDispatch:
         assert batch._next_tokens.tolist() == [5]
         assert not hasattr(batch, "_omlx_mtp_state")
 
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
+    def test_always_on_env_truthy_values(self, monkeypatch, value):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._MTP_ALWAYS_ON_ENV, value)
+        assert batch_generator._mtp_always_on_enabled() is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "invalid"])
+    def test_always_on_env_false_values(self, monkeypatch, value):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._MTP_ALWAYS_ON_ENV, value)
+        assert batch_generator._mtp_always_on_enabled() is False
+
+    def test_default_depth_zero_exit_still_hands_off(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._MTP_ALWAYS_ON_ENV, raising=False)
+        state = batch_generator._MtpState(uid=7)
+        calls = []
+        monkeypatch.setattr(
+            batch_generator,
+            "_park_mtp_to_standard",
+            lambda batch, current: calls.append((batch, current)) or True,
+        )
+        batch = object()
+
+        assert batch_generator._maybe_park_mtp_to_standard(batch, state) is True
+        assert calls == [(batch, state)]
+
+    def test_always_on_suppresses_only_depth_zero_exit_once(
+        self, monkeypatch, caplog
+    ):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._MTP_ALWAYS_ON_ENV, "1")
+        monkeypatch.setattr(
+            batch_generator,
+            "_park_mtp_to_standard",
+            lambda *_: pytest.fail("always-on mode must not park the sequence"),
+        )
+        state = batch_generator._MtpState(uid=7)
+
+        with caplog.at_level("INFO"):
+            assert batch_generator._maybe_park_mtp_to_standard(object(), state) is False
+            assert batch_generator._maybe_park_mtp_to_standard(object(), state) is False
+
+        assert state.always_on_handoff_logged is True
+        assert caplog.text.count("standard handoff suppressed: always-on mode") == 1
+
     def test_rowwise_batch_eligibility_requires_safe_activation(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
