@@ -4044,8 +4044,12 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove corrupted SSD cache file %s: %s",
+                    file_path,
+                    e,
+                )
             return None, None
 
     def get_block_metadata(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
@@ -4176,8 +4180,10 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     if future.result():
                         loaded_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "SSD cache preload task failed: %s", e
+                    )
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         self._stats["preload_calls"] += 1
