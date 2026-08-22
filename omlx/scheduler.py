@@ -2937,9 +2937,10 @@ class Scheduler:
                 if sampling_params.frequency_penalty != 0.0
                 else None
             ),
-            # None keeps mlx-lm's default window (20 tokens).
-            repetition_context_size=(
-                sampling_params.repetition_context_size or 20
+            **(
+                {"repetition_context_size": sampling_params.repetition_context_size}
+                if sampling_params.repetition_context_size is not None
+                else {}
             ),
         )
 
@@ -5629,9 +5630,10 @@ class Scheduler:
                 if sampling_params.frequency_penalty != 0.0
                 else None
             ),
-            # None keeps mlx-lm's default window (20 tokens).
-            repetition_context_size=(
-                sampling_params.repetition_context_size or 20
+            **(
+                {"repetition_context_size": sampling_params.repetition_context_size}
+                if sampling_params.repetition_context_size is not None
+                else {}
             ),
         )
 

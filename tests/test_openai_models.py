@@ -744,6 +744,15 @@ class TestCompletionModels:
                 }
             )
 
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "prompt": "hello",
+                    "repetition_context_size": 0,
+                }
+            )
+
     def test_completion_request(self):
         """Test creating completion request."""
         req = CompletionRequest(
