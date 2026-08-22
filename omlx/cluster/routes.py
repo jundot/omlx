@@ -55,6 +55,7 @@ from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    RemoteAdmissionProbeResult,
     preflight_remote_hosts,
     probe_remote_admission_details,
     probe_remote_host,
@@ -83,6 +84,7 @@ from .planner import (
     PlanningError,
     ShardPlan,
     complete_model_layout,
+    normalize_memory_guard_tier,
     plan_hybrid,
     plan_unequal_pipeline,
     remote_model_layout,
@@ -2893,7 +2895,9 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                 python_executable=host.python_executable,
             )
             capacity_bytes = details.admission_ceiling_bytes
-            memory_guard_tier = details.memory_guard_tier
+            memory_guard_tier = normalize_memory_guard_tier(
+                details.memory_guard_tier
+            )
             memory_guard_custom_ceiling_gb = details.memory_guard_custom_ceiling_gb
             capacity_source = "admission_ceiling"
         budget = await asyncio.to_thread(

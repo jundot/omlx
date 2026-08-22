@@ -5618,8 +5618,9 @@
                         reserve_bytes: reserveBytes,
                         manual_memory_limit: manualAllowance !== null,
                         role: node.role || 'headless',
-                        memory_guard_tier:
-                            this.globalSettings?.memory?.memory_guard_tier || 'balanced',
+                        memory_guard_tier: node.memory_guard_tier
+                            || this.globalSettings?.memory?.memory_guard_tier
+                            || 'balanced',
                     };
                     if (node.accelerator) payload.accelerator = node.accelerator;
                     if (node.fabric_kind) payload.fabric_kind = node.fabric_kind;
@@ -5837,6 +5838,10 @@
                             && !drift(node.automatic_reserve_gib, automaticReserveGiB)
                         ) {
                             node.measured = measured.summary;
+                            if (['safe', 'balanced', 'aggressive', 'custom']
+                                .includes(measured.memory_guard_tier)) {
+                                node.memory_guard_tier = measured.memory_guard_tier;
+                            }
                             return;
                         }
                         changed = true;
@@ -5848,6 +5853,10 @@
                             measured.reserve_bytes
                         );
                         node.measured = measured.summary;
+                        if (['safe', 'balanced', 'aggressive', 'custom']
+                            .includes(measured.memory_guard_tier)) {
+                            node.memory_guard_tier = measured.memory_guard_tier;
+                        }
                     });
                     if (changed) {
                         this.clusterCatalogue = null;

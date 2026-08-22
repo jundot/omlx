@@ -230,8 +230,6 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
-        # Convenience wrapper around probe_remote_admission_details returning int ceiling.
-        ("launch.py", "probe_remote_admission_ceiling"),
     }
 
     sources = {

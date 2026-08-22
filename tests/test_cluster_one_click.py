@@ -385,6 +385,34 @@ process.stdout.write(JSON.stringify(component.clusterNodePayloads()));
     assert result[0]["reserve_bytes"] == 18 * 1024**3
 
 
+def test_measured_memory_guard_settings_reach_planner_payload():
+    result = _run_dashboard_helpers(
+        ("clusterNodePayloads",),
+        """
+component.globalSettings = { memory: { memory_guard_tier: 'balanced' } };
+component.clusterPlanNodes = [{
+  node_id: 'worker-a',
+  capacity_gib: 44,
+  reserve_gib: 0,
+  role: 'headless',
+  memory_guard_tier: 'custom',
+}];
+component.clusterWeightTargetsGiB = {};
+component.clusterSplitGiB = null;
+process.stdout.write(JSON.stringify(component.clusterNodePayloads()));
+""",
+    )
+
+    assert result == [{
+        "node_id": "worker-a",
+        "capacity_bytes": 44 * 1024**3,
+        "reserve_bytes": 0,
+        "manual_memory_limit": False,
+        "role": "headless",
+        "memory_guard_tier": "custom",
+    }]
+
+
 def test_memory_measurement_hosts_do_not_require_collective_addresses():
     result = _run_dashboard_helpers(
         ("clusterBudgetHostsPayload",),
