@@ -2864,3 +2864,16 @@ def test_compile_cache_fails_open_when_root_or_lock_is_unavailable(ane_mm):
 def test_compile_cache_telemetry_uses_native_log_prefix(ane_mm):
     for event in ("hit", "miss", "fallback"):
         assert f'@"oMLX: ANE compile cache {event}' in ane_mm
+
+def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
+    """A suspended holder must not hang later loads: non-blocking flock with a
+    deadline, failing open to the temp path on timeout."""
+    assert "LOCK_EX | LOCK_NB" in ane_mm
+    assert "kAneCacheLockTimeout" in ane_mm
+    assert "ANE compile cache lock acquisition timed out" in ane_mm
+
+
+def test_compile_cache_staging_delete_resolves_symlinks(ane_mm):
+    """The cache-root prefix check must compare resolved paths so a symlink
+    under the root cannot redirect the delete outside it."""
+    assert "stringByResolvingSymlinksInPath" in ane_mm
