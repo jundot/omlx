@@ -57,6 +57,7 @@ from .launch import (
     DistributedLaunchError,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
+    probe_remote_admission_details,
     probe_remote_host,
     run_cluster_performance_probe,
     run_cuda_fabric_probe,
@@ -2880,9 +2881,11 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     async def _for(host: Any) -> dict[str, Any]:
         capacity_bytes = 0
         capacity_source: str | None = None
+        memory_guard_tier: str | None = None
+        memory_guard_custom_ceiling_gb: float | None = None
         if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
-                probe_remote_admission_ceiling,
+            details = await asyncio.to_thread(
+                probe_remote_admission_details,
                 host.ssh,
                 # No fallback to sys.executable: inside the packaged app that
                 # is a bundled interpreter which exists on the peer but cannot
@@ -2890,10 +2893,15 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                 # probe discovers the peer's own interpreter.
                 python_executable=host.python_executable,
             )
+            capacity_bytes = details.admission_ceiling_bytes
+            memory_guard_tier = details.memory_guard_tier
+            memory_guard_custom_ceiling_gb = details.memory_guard_custom_ceiling_gb
             capacity_source = "admission_ceiling"
         budget = await asyncio.to_thread(
             suggest_budget,
             role=request.roles.get(host.node_id, "headless"),
+            memory_guard_tier=memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_guard_custom_ceiling_gb,
             ssh_target=host.ssh,
             capacity_bytes=capacity_bytes,
             capacity_source=capacity_source,

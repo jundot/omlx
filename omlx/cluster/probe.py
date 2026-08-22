@@ -555,13 +555,18 @@ def collect_cluster_status(
         )
         chip_name = accelerator.name
     ceiling_measured = True
+    memory_guard_tier = "balanced"
+    memory_guard_custom_ceiling_gb = 0.0
     try:
         # This is deliberately the same computation a distributed rank runs
         # immediately before loading. ``recommended_working_set_bytes`` is a
         # useful hardware fact, but it does not include the active oMLX memory
         # tier or current unified-memory pressure.
-        from .memory_guard import ceiling_breakdown
+        from .memory_guard import _operator_memory_settings, ceiling_breakdown
 
+        memory_guard_tier, memory_guard_custom_ceiling_gb, _ = (
+            _operator_memory_settings()
+        )
         admission_ceiling_bytes = int(ceiling_breakdown().get("hard_limit", 0))
     except Exception:
         # Capability probing must remain available on a worker-only or partly
@@ -618,6 +623,8 @@ def collect_cluster_status(
         thunderbolt_ports=ports,
         route=route,
         admission_ceiling_bytes=admission_ceiling_bytes,
+        memory_guard_tier=memory_guard_tier,
+        memory_guard_custom_ceiling_gb=memory_guard_custom_ceiling_gb,
         warnings=tuple(warnings),
         accelerator=accelerator.kind,
         accelerator_vendor=accelerator.vendor,
