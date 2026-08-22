@@ -90,6 +90,13 @@ function clusterV2Wizard() {
     // A missing v2 backend (404) flips the error state immediately; flaky
     // networks get a few grace failures first.
     const CLUSTER_V2_FAILURE_GRACE = 3;
+    const CLUSTER_V2_MEMORY_GUARD_TIERS = new Set([
+        'safe', 'balanced', 'aggressive', 'custom',
+    ]);
+
+    function memoryGuardTier(value, fallback = 'balanced') {
+        return CLUSTER_V2_MEMORY_GUARD_TIERS.has(value) ? value : fallback;
+    }
 
     const CLUSTER_V2_LINK_META = {
         tb: { label: 'Thunderbolt', icon: 'zap' },
@@ -2471,7 +2478,15 @@ function clusterV2Wizard() {
             return nodes.map((node) => {
                 const measured = this.measuredNodeBudgets[node.node_id];
                 return measured && measured.role === node.role
-                    ? {...node, capacity_bytes: measured.capacity_bytes, reserve_bytes: measured.reserve_bytes}
+                    ? {
+                        ...node,
+                        capacity_bytes: measured.capacity_bytes,
+                        reserve_bytes: measured.reserve_bytes,
+                        memory_guard_tier: memoryGuardTier(
+                            measured.memory_guard_tier,
+                            node.memory_guard_tier,
+                        ),
+                    }
                     : node;
             }).filter((node) => node.capacity_bytes > 0);
         },
@@ -2741,7 +2756,15 @@ function clusterV2Wizard() {
                 if (!budget || budget.unusable || !(Number(budget.capacity_bytes) > 0)) {
                     throw new Error(`Memory budget unavailable for ${node.node_id}.`);
                 }
-                return {...node, capacity_bytes: Number(budget.capacity_bytes), reserve_bytes: Number(budget.reserve_bytes || 0)};
+                return {
+                    ...node,
+                    capacity_bytes: Number(budget.capacity_bytes),
+                    reserve_bytes: Number(budget.reserve_bytes || 0),
+                    memory_guard_tier: memoryGuardTier(
+                        budget.memory_guard_tier,
+                        node.memory_guard_tier,
+                    ),
+                };
             });
             this.measuredNodeBudgets = Object.fromEntries(resolved.map((node) => [node.node_id, node]));
             return resolved;
@@ -3214,7 +3237,9 @@ function clusterV2Wizard() {
                         capacity_bytes: Number(node.capacity_bytes),
                         reserve_bytes: Number(node.reserve_bytes || 0),
                         role: roles[node.node_id] || 'headless',
-                        memory_guard_tier: 'balanced',
+                        memory_guard_tier: memoryGuardTier(
+                            node.memory_guard_tier,
+                        ),
                         accelerator: 'metal',
                         ...(performance ? { performance } : {}),
                     };

@@ -1517,6 +1517,39 @@ process.stdout.write(JSON.stringify({
     assert result["usableSelf"] == "128 GB usable as Workstation"
 
 
+def test_measured_memory_guard_tiers_reach_the_v2_plan_payload():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.apiFetch = async (url) => {
+  if (!url.endsWith('/node-budgets')) throw new Error('unexpected URL ' + url);
+  return {nodes: [
+    { node_id: 'node-a', capacity_bytes: 250000, reserve_bytes: 10000,
+      role: 'workstation', memory_guard_tier: 'aggressive' },
+    { node_id: 'node-b', capacity_bytes: 120000, reserve_bytes: 10000,
+      role: 'headless', memory_guard_tier: 'custom' },
+  ]};
+};
+(async () => {
+  const hosts = [
+    {node_id: 'node-a', ssh: '127.0.0.1'},
+    {node_id: 'node-b', ssh: 'node-b.local'},
+  ];
+  await component.measurePlanNodes(hosts, component.planNodes());
+  process.stdout.write(JSON.stringify(component.planNodes().map((node) => ({
+    node_id: node.node_id,
+    memory_guard_tier: node.memory_guard_tier,
+  }))));
+})();
+"""
+    )
+
+    assert result == [
+        {"node_id": "node-a", "memory_guard_tier": "aggressive"},
+        {"node_id": "node-b", "memory_guard_tier": "custom"},
+    ]
+
+
 def test_fit_failure_parses_the_shortfall_and_flips_only_on_click():
     result = _run_wizard(
         _WIZARD_TWO_MACS

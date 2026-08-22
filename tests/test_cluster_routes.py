@@ -492,6 +492,8 @@ def test_cluster_peer_probe_route(monkeypatch):
 
 
 def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
     gib = 1024**3
     asked = {}
     monkeypatch.setattr(
@@ -500,9 +502,12 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     )
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
+        "probe_remote_admission_details",
         lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 213 * gib + 123
+            asked.update(ssh=ssh, python=python_executable)
+            or RemoteAdmissionProbeResult(
+                admission_ceiling_bytes=213 * gib + 123
+            )
         ),
     )
 
@@ -539,6 +544,8 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
 def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
     monkeypatch,
 ):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
     gib = 1024**3
@@ -549,9 +556,10 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
     )
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
+        "probe_remote_admission_details",
         lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 64 * gib
+            asked.update(ssh=ssh, python=python_executable)
+            or RemoteAdmissionProbeResult(admission_ceiling_bytes=64 * gib)
         ),
     )
 
@@ -565,6 +573,27 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
 
     assert response.status_code == 200
     assert asked == {"ssh": "studio.local", "python": None}
+
+
+def test_cluster_node_budgets_rejects_invalid_remote_memory_guard_tier(monkeypatch):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_details",
+        lambda ssh, *, python_executable: RemoteAdmissionProbeResult(
+            admission_ceiling_bytes=64 * 1024**3,
+            memory_guard_tier="not-a-tier",
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={"hosts": [{"node_id": "peer", "ssh": "studio.local"}]},
+    )
+
+    assert response.status_code == 503
+    assert "unknown memory guard tier" in response.json()["detail"]
 
 
 def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):

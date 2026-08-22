@@ -61,6 +61,7 @@ from .discovery import (
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain
+from .identity import get_node_identity
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
@@ -95,6 +96,7 @@ from .planner import (
     PlanningError,
     ShardPlan,
     complete_model_layout,
+    normalize_memory_guard_tier,
     plan_hybrid,
     plan_proportional_pipeline,
     plan_unequal_pipeline,
@@ -103,7 +105,6 @@ from .planner import (
 )
 from .probe import collect_cluster_status
 from .registry import get_cluster_registry, get_device_registry
-from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -3088,7 +3089,9 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                 python_executable=host.python_executable,
             )
             capacity_bytes = details.admission_ceiling_bytes
-            memory_guard_tier = details.memory_guard_tier
+            memory_guard_tier = normalize_memory_guard_tier(
+                details.memory_guard_tier
+            )
             memory_guard_custom_ceiling_gb = details.memory_guard_custom_ceiling_gb
             capacity_source = "admission_ceiling"
         budget = await asyncio.to_thread(
