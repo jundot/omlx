@@ -438,6 +438,24 @@ class TestSanitizedFallbackReason:
         )
         assert reason == "cannot open <path>"
 
+    def test_paths_with_spaces_are_redacted(self):
+        reason = _sanitized_fallback_reason(
+            "cannot open /Users/Joshua Warren/models/draft/model.safetensors"
+        )
+        assert reason == "cannot open <path>"
+
+    def test_quoted_path_is_redacted(self):
+        reason = _sanitized_fallback_reason(
+            "DFlash start failed: FileNotFoundError: [Errno 2] "
+            "No such file or directory: '/opt/models/draft.safetensors'"
+        )
+        assert "/opt/models" not in reason
+        assert "<path>" in reason
+
+    def test_ratio_is_not_a_path(self):
+        reason = _sanitized_fallback_reason("the ratio a/b is wrong")
+        assert reason == "the ratio a/b is wrong"
+
     def test_multiline_text_collapses_to_one_line(self):
         reason = _sanitized_fallback_reason(
             'Traceback (most recent call last):\n  File "engine.py", line 4\n'

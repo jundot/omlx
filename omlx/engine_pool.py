@@ -64,7 +64,7 @@ _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
 # loader errors can embed absolute checkpoint paths and, when an inner
 # exception was formatted with its traceback, whole stack frames.
 _MAX_FALLBACK_REASON_CHARS = 200
-_PATHISH_RE = re.compile(r"~?(?:/[^\s/,;:'\"]+){2,}/?")
+_PATHISH_RE = re.compile(r"~?/(?:[^,;:'\"()\[\]{}]+/)+[^,;:'\"()\[\]{}]*")
 # Effective engine identity per engine class, for clients that must assert
 # which backend actually serves a model (issue #2896).
 _ENGINE_KIND_BY_CLASS = {
