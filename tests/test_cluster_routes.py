@@ -555,8 +555,8 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     called = []
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
-        lambda ssh: called.append(ssh),
+        "probe_remote_admission_details",
+        lambda ssh, **kw: called.append(ssh),
     )
 
     response = _client().post(

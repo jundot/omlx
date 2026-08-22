@@ -56,7 +56,6 @@ from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
     preflight_remote_hosts,
-    probe_remote_admission_ceiling,
     probe_remote_admission_details,
     probe_remote_host,
     run_cluster_performance_probe,
