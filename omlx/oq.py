@@ -3891,6 +3891,21 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"laguna patch not applied: {patch_err}")
 
+        # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
+        # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
+        # schema. Sanitizer/proxy discovery consumes this in-memory config
+        # directly (without ``mlx_lm.utils.load_config``), so register the
+        # model and normalize the schema before ``ModelArgs.from_dict``.
+        if config.get("model_type") == "hy_v3":
+            try:
+                from omlx.patches.hy_v3 import apply_hy_v3_patch
+                from omlx.utils.model_loading import normalize_hy_v3_rope_config
+
+                normalize_hy_v3_rope_config(config)
+                apply_hy_v3_patch()
+            except Exception as patch_err:
+                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+
         if config.get("model_type") == "mimo_v2":
             try:
                 from omlx.patches.mimo_v2 import apply_mimo_v2_patch

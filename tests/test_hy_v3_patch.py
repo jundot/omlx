@@ -90,3 +90,34 @@ def test_mlx_lm_load_config_patch_applies_hy_v3_normalization(monkeypatch):
         "rope_theta": 11158840.0,
         "rope_type": "default",
     }
+
+
+def test_oq_sanitizer_normalizes_legacy_hy_v3_config():
+    from omlx.oq import _build_model_sanitizer
+
+    config = {
+        "architectures": ["HYV3ForCausalLM"],
+        "model_type": "hy_v3",
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "num_experts": 2,
+        "num_experts_per_tok": 1,
+        "num_shared_experts": 1,
+        "expert_hidden_dim": 32,
+        "first_k_dense_replace": 1,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 11158840.0,
+    }
+
+    sanitizer = _build_model_sanitizer(config)
+
+    assert callable(sanitizer)
+    assert config["rope_parameters"] == {
+        "rope_theta": 11158840.0,
+        "rope_type": "default",
+    }
