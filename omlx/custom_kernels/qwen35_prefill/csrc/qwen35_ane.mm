@@ -963,6 +963,22 @@ public:
     [buffer encodeWaitForEvent:event_ value:ticket.done];
   }
 
+  void cancel_ticket(AneLinearModel::Ticket ticket) {
+    // The ticket's producer command buffer failed, so its encoded ready
+    // signal will never fire. Retire the ticket before any evaluation thread
+    // is spawned: balance the counters, publish the done value, and wake any
+    // waiter. This is a per-submission failure (typically a request abort
+    // tearing down Metal state mid-prefill), not a program fault, so
+    // completion_error_ is left clear and the next request may use this
+    // program again.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      ++completed_;
+    }
+    [event_ setSignaledValue:ticket.done];
+    completion_cv_.notify_all();
+  }
+
   void wait(AneLinearModel::Ticket) {
     std::unique_lock<std::mutex> lock(state_mutex_);
     const bool finished = completion_cv_.wait_for(
@@ -1059,6 +1075,9 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
 }
+void AneLinearModel::cancel_ticket(AneLinearModel::Ticket ticket) {
+  impl_->cancel_ticket(ticket);
+}
 void AneLinearModel::warmup() {
   @autoreleasepool {
     impl_->warmup();
@@ -1067,6 +1086,27 @@ void AneLinearModel::warmup() {
 void AneLinearModel::end(MTL::CommandBuffer *command_buffer,
                          AneLinearModel::Ticket ticket) {
   impl_->end(command_buffer, ticket);
+}
+
+// A pack-and-signal buffer that completed with an error never fired its
+// encoded ready signal, so a detached evaluation thread launched for its
+// ticket would spin on a value that never arrives (#3025: a request abort
+// mid-prefill tears down Metal state and fails the buffer). The dispatch
+// sites check this after waitUntilCompleted() and, on failure, retire the
+// tickets and fail the dispatch immediately instead of leaving the wait
+// timeout as the only backstop.
+static bool pack_buffer_failed(MTL::CommandBuffer *producer_buffer) {
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(producer_buffer));
+  return buffer.status == MTLCommandBufferStatusError;
+}
+
+static std::string pack_buffer_error(MTL::CommandBuffer *producer_buffer) {
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(producer_buffer));
+  return error_text(
+      @"ANE input pack command buffer failed; canceling this dispatch",
+      buffer.error);
 }
 
 bool qwen35_ane_available() {
@@ -2098,6 +2138,12 @@ public:
     // both devices, complete it up front; the expensive ANE and qmm stages are
     // still launched concurrently below.
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model_->cancel_ticket(ticket);
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
@@ -2398,6 +2444,13 @@ public:
     auto ticket1 = model1_->begin(producer_buffer);
     encoder.commit();
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model0_->cancel_ticket(ticket0);
+      model1_->cancel_ticket(ticket1);
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
@@ -2733,6 +2786,15 @@ public:
     }
     encoder.commit();
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model_->cancel_ticket(ticket);
+      if (model1_) {
+        model1_->cancel_ticket(ticket1);
+      }
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
