@@ -19,9 +19,17 @@ final class ModelsScreenVM {
     private var pollTask: Task<Void, Never>?
 
     var activeModels: [ModelDTO] {
-        allModels.filter { $0.loaded || $0.isLoading }
+        allModels.filter {
+            $0.virtual != true
+                && $0.removalKind != "profile"
+                && ($0.loaded || $0.isLoading)
+        }
     }
-    var libraryModels: [ModelDTO] { allModels }
+    var libraryModels: [ModelDTO] { modelLibraryRows(allModels) }
+    var pendingRemovalModel: ModelDTO? {
+        guard let pendingRemoveID else { return nil }
+        return libraryModels.first { $0.id == pendingRemoveID }
+    }
 
     func start(client: OMLXClient) async {
         self.client = client
@@ -78,13 +86,25 @@ final class ModelsScreenVM {
         }
     }
 
-    func remove(id: String, client: OMLXClient) {
+    func remove(model: ModelDTO, client: OMLXClient) {
         pendingRemoveID = nil
-        deletingID = id
+        deletingID = model.id
         Task { [weak self] in
             defer { Task { @MainActor [weak self] in self?.deletingID = nil } }
             do {
-                _ = try await client.deleteHFModel(modelName: id)
+                switch model.removalKind {
+                case "profile":
+                    guard let sourceModelID = model.sourceModelId,
+                          let profileName = model.profileName else { return }
+                    _ = try await client.deleteModelProfile(
+                        id: sourceModelID,
+                        name: profileName
+                    )
+                case "local_cache", "local_model":
+                    _ = try await client.deleteHFModel(modelName: model.id)
+                default:
+                    return
+                }
                 await self?.refresh()
                 self?.lastError = nil
             } catch {
@@ -104,4 +124,46 @@ final class ModelsScreenVM {
         }
     }
 
+}
+
+func modelLibraryRows(_ models: [ModelDTO]) -> [ModelDTO] {
+    let rows = models.flatMap { model -> [ModelDTO] in
+        let profiles = (model.exposedProfiles ?? []).map { profile in
+            ModelDTO(
+                id: profile.modelId ?? "\(model.id):\(profile.name)",
+                displayName: profile.displayName,
+                modelPath: nil,
+                loaded: false,
+                isLoading: false,
+                estimatedSize: 0,
+                estimatedSizeFormatted: "—",
+                actualSize: 0,
+                actualSizeFormatted: nil,
+                pinned: false,
+                isDefault: false,
+                isFavorite: false,
+                engineType: model.engineType,
+                modelType: model.modelType,
+                configModelType: model.configModelType,
+                modelContextLength: model.modelContextLength,
+                thinkingDefault: model.thinkingDefault,
+                dflashCompatible: model.dflashCompatible,
+                dflashCompatibilityReason: model.dflashCompatibilityReason,
+                dflashSsdCacheAvailable: model.dflashSsdCacheAvailable,
+                mtpCompatible: model.mtpCompatible,
+                mtpCompatibilityReason: model.mtpCompatibilityReason,
+                virtual: false,
+                sourceType: "profile",
+                sourceRepoId: nil,
+                deletable: true,
+                removalKind: "profile",
+                sourceModelId: model.id,
+                profileName: profile.name,
+                exposedProfiles: nil,
+                settings: nil
+            )
+        }
+        return [model] + profiles
+    }
+    return sortModelsByName(rows)
 }
