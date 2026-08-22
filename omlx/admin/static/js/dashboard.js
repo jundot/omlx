@@ -2083,10 +2083,9 @@
                 return true;
             },
 
-            // Turn every unambiguous fast-link discovery into the default
-            // cluster. A deployment remains authoritative on restart; without
-            // one, all RDMA peers are selected instead of forcing a three-Mac
-            // user to choose one and silently ignore the rest.
+            // A deployment is authoritative on restart. Otherwise discovery
+            // remains a suggestion until the operator explicitly selects a
+            // peer; an SSH advertisement alone is not enrollment.
             async initializeClusterSetup({ preview = true } = {}) {
                 const deployment = (this.clusterDeployments || [])[0] || null;
                 if (
@@ -2102,37 +2101,27 @@
                         this._clusterKnownNodesNeedsSync = false;
                     }
                 }
-                if (!this.clusterWorkerPeers().length) {
-                    const deployedPeers = (deployment?.hosts || []).filter(
-                        host => !['127.0.0.1', 'localhost', '::1'].includes(host.ssh)
-                    );
+                const deployedPeers = (deployment?.hosts || []).filter(
+                    host => !['127.0.0.1', 'localhost', '::1'].includes(host.ssh)
+                );
+                if (deployedPeers.length) {
+                    // A live deployment outranks any remembered selection. A
+                    // selected_ssh restored from cache used to survive this
+                    // branch guard, and every probe, hardware and budget call
+                    // then followed the stale host instead of the deployment.
                     const discovered = this.clusterDiscoveredPeers || [];
-                    const fastPeers = discovered.filter(
-                        peer => peer.rdma_available || peer.transport === 'rdma'
-                    );
-                    const omlxPeers = discovered.filter(
-                        peer => peer.service === 'oMLX Distributed'
-                    );
-                    const automaticPeers = fastPeers.length
-                        ? fastPeers
-                        : (omlxPeers.length
-                            ? omlxPeers
-                            : (discovered.length === 1 ? discovered : []));
-                    const preferred = deployedPeers.length
-                        ? deployedPeers.map(host =>
-                            discovered.find(peer => peer.ssh === host.ssh)
-                            || { ssh: host.ssh, name: host.node_id })
-                        : automaticPeers;
-                    if (preferred.length) {
-                        this.clusterSelectedPeers = preferred;
-                        this.clusterPeerSsh = preferred[0].ssh;
-                        this.syncClusterNodesFromPeers();
-                        if (!this.clusterProbeBackoffActive()) {
-                            await this.probeClusterPeer();
-                            await this.loadClusterTransports();
-                        }
+                    const preferred = deployedPeers.map(host =>
+                        discovered.find(peer => peer.ssh === host.ssh)
+                        || { ssh: host.ssh, name: host.node_id });
+                    this.clusterSelectedPeers = preferred;
+                    this.clusterPeerSsh = preferred[0].ssh;
+                    this.syncClusterNodesFromPeers();
+                    if (!this.clusterPeerProbe && !this.clusterProbeBackoffActive()) {
+                        await this.probeClusterPeer();
+                        await this.loadClusterTransports();
                     }
-                } else if (!this.clusterPeerProbe
+                } else if (this.clusterWorkerPeers().length
+                        && !this.clusterPeerProbe
                         && !this.clusterProbeBackoffActive()) {
                     await this.probeClusterPeer();
                     await this.loadClusterTransports();
@@ -2644,7 +2633,10 @@
                         if (peers.length) {
                             saved = {
                                 peers,
-                                selected_ssh: peers.map(peer => peer.ssh),
+                                // The lastGood fallback proves these hosts
+                                // once served, not that anybody selected
+                                // them. They stay suggestions.
+                                selected_ssh: [],
                                 hardware: {},
                             };
                         }
@@ -2656,11 +2648,17 @@
                     if (!peers.length) return;
                     this.clusterDiscoveredPeers = peers;
                     const bySsh = new Map(peers.map(peer => [peer.ssh, peer]));
-                    const selected = (saved.selected_ssh || [])
-                        .map(ssh => bySsh.get(ssh))
-                        .filter(Boolean);
-                    this.clusterSelectedPeers = selected.length ? selected : [peers[0]];
-                    this.clusterPeerSsh = this.clusterSelectedPeers[0].ssh;
+                    // Only an explicit selection survives the reload. Caches
+                    // written before the marker existed (and builds that
+                    // auto-promoted discovered peers) stored selections
+                    // nobody made; restoring them probed inactive Macs.
+                    const selected = saved.explicit_selection === true
+                        ? (saved.selected_ssh || [])
+                            .map(ssh => bySsh.get(ssh))
+                            .filter(Boolean)
+                        : [];
+                    this.clusterSelectedPeers = selected;
+                    this.clusterPeerSsh = selected[0]?.ssh || '';
                     const probes = { ...(this.clusterPeerProbes || {}) };
                     Object.entries(saved.hardware || {}).forEach(([ssh, node]) => {
                         if (!bySsh.has(ssh) || !node || typeof node !== 'object') return;
@@ -2745,6 +2743,7 @@
                             peers,
                             selected_ssh: this.clusterWorkerPeers()
                                 .map(peer => peer.ssh),
+                            explicit_selection: true,
                             hardware,
                         })
                     );
