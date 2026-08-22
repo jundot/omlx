@@ -139,6 +139,8 @@ class ClusterStatus:
     fabric_kind: str | None = None
     fabric_group_id: str | None = None
     fabric_verified: bool = False
+    memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
 
     @property
     def thunderbolt_peer_connected(self) -> bool:
@@ -155,6 +157,8 @@ class ClusterStatus:
                 "physical_memory_bytes": self.physical_memory_bytes,
                 "recommended_working_set_bytes": self.recommended_working_set_bytes,
                 "admission_ceiling_bytes": self.admission_ceiling_bytes,
+                "memory_guard_tier": self.memory_guard_tier,
+                "memory_guard_custom_ceiling_gb": self.memory_guard_custom_ceiling_gb,
                 "accelerator": self.accelerator,
                 "accelerator_vendor": self.accelerator_vendor,
                 "memory_kind": self.memory_kind,
