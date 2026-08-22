@@ -227,6 +227,13 @@ final class MenubarControllerModelsTests: XCTestCase {
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
             virtual: virtual,
+            sourceType: nil,
+            sourceRepoId: nil,
+            deletable: nil,
+            removalKind: nil,
+            sourceModelId: nil,
+            profileName: nil,
+            exposedProfiles: nil,
             settings: nil
         )
     }
