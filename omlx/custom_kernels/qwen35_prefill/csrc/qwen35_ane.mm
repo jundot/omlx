@@ -7,6 +7,7 @@
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -154,9 +155,13 @@ NSString *ane_compile_cache_directory(NSString *identifier, int ane_instance) {
 
 std::string error_text(NSString *prefix, NSError *error);
 
-// Residual risk: acquisition has no timeout, so a suspended process holding
-// this lock blocks later loads of the same entry until the holder exits.
-// Accept that for now; revisit with a bounded timeout if it hurts.
+// A suspended process holding the entry lock must not hang later loads of the
+// same identifier forever. Acquisition is bounded: the lock is taken
+// non-blocking and retried until the deadline, then the constructor throws so
+// the caller fails open to the historical temp-directory path.
+constexpr std::chrono::milliseconds kAneCacheLockTimeout{30000};
+constexpr std::chrono::milliseconds kAneCacheLockRetry{50};
+
 class ScopedAneCacheLock {
 public:
   explicit ScopedAneCacheLock(NSString *entry_directory) {
@@ -175,11 +180,22 @@ public:
     if (fd_ < 0) {
       throw std::runtime_error("ANE compile cache lock open failed.");
     }
-    if (flock(fd_, LOCK_EX) != 0) {
-      close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("ANE compile cache lock acquisition failed.");
+    const auto deadline = std::chrono::steady_clock::now() + kAneCacheLockTimeout;
+    for (;;) {
+      if (flock(fd_, LOCK_EX | LOCK_NB) == 0) {
+        return;
+      }
+      if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      std::this_thread::sleep_for(kAneCacheLockRetry);
     }
+    close(fd_);
+    fd_ = -1;
+    throw std::runtime_error("ANE compile cache lock acquisition timed out.");
   }
 
 
@@ -207,10 +223,16 @@ void remove_ane_staging_directory(NSString *directory) noexcept {
   if (directory == nil) {
     return;
   }
-  NSString *cache_prefix =
-      [ane_compile_cache_root_directory() stringByAppendingString:@"/"];
+  // Resolve before the prefix check: a symlink under the cache root could
+  // otherwise redirect the delete outside it while the textual prefix still
+  // matched. The resolved path is what removeItemAtPath: will actually touch.
+  NSString *resolved =
+      [directory stringByResolvingSymlinksInPath];
+  NSString *cache_root =
+      [ane_compile_cache_root_directory() stringByResolvingSymlinksInPath];
+  NSString *cache_prefix = [cache_root stringByAppendingString:@"/"];
   if (!ane_compile_cache_enabled() ||
-      ![directory hasPrefix:cache_prefix]) {
+      ![resolved hasPrefix:cache_prefix]) {
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
     return;
   }
