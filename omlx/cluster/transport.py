@@ -267,6 +267,9 @@ def detect_transports(
 
     transports: list[TransportInfo] = []
     physical_edges: set[tuple[int, int]] = set()
+    # A probe that raised measured nothing. Tracked separately from an empty
+    # result so a host we could not reach is never described as a slow link.
+    probe_failed = False
 
     # Try Thunderbolt connectivity
     try:
@@ -300,8 +303,10 @@ def detect_transports(
                             )
                         )
     except Exception:
-        # Thunderbolt detection failed — degrade to Ethernet
-        pass
+        # Thunderbolt detection failed. Whether this link is Ethernet is now
+        # unknown, not established: SSH that cannot authenticate raises here
+        # long before any interface is read.
+        probe_failed = True
 
     # Check RDMA
     try:
@@ -336,10 +341,15 @@ def detect_transports(
                 )
     except Exception:
         # RDMA detection failed — skip
-        pass
+        probe_failed = True
 
-    # If no transports detected, assume Ethernet
-    if not transports:
+    # A completed probe that found neither Thunderbolt nor RDMA has established
+    # an Ethernet link, and says so. A probe that could not run has established
+    # nothing, and must stay silent: callers read an empty result as "link
+    # unknown" and decline to assume the worst, but read a named Ethernet link
+    # as a measured reason to refuse tensor parallelism. Claiming the
+    # measurement we failed to take is the more damaging of the two.
+    if not transports and not probe_failed:
         for i, _host in enumerate(hosts):
             for j, peer_host in enumerate(hosts):
                 if i == j:
