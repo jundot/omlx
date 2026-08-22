@@ -696,7 +696,10 @@ class TestGetMaxContextWindow:
     @pytest.fixture(autouse=True)
     def setup_server_state(self):
         state = ServerState()
-        with patch("omlx.server._server_state", state):
+        with (
+            patch("omlx.server._server_state", state),
+            patch("omlx.server.ram_context_cap_tokens", return_value=None),
+        ):
             self._state = state
             yield
 
@@ -738,9 +741,24 @@ class TestGetMaxContextWindow:
         assert get_max_context_window("llama-3") == 32768
 
     def test_discovered_context_returned_when_no_override(self):
-        """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308)."""
+        """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308).
+
+        RAM auto-cap is patched off in this class so #1308 stays independently
+        testable; see test_ram_cap_clamps_discovered_context.
+        """
         self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
         assert get_max_context_window("qwen3-coder") == 262144
+
+    def test_ram_cap_clamps_discovered_context(self):
+        """64 GB unified memory cannot hold a 256k KV cache; advertise 64k."""
+        from omlx.server import ram_context_cap_tokens as real_ram_cap
+
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        with patch(
+            "omlx.server.ram_context_cap_tokens",
+            side_effect=lambda mem_bytes=None: real_ram_cap(64 * 1024**3),
+        ):
+            assert get_max_context_window("qwen3-coder") == 65536
 
     def test_per_model_override_wins_over_discovery(self):
         """Admin set 16384 → that wins over the model's declared 262144."""
