@@ -60,6 +60,18 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
+    /// Server-owned source classification. `hf_cache` entries live in the
+    /// shared Hugging Face cache instead of oMLX's model directory.
+    let sourceType: String?
+    let sourceRepoId: String?
+    /// Destructive capability advertised by the admin catalog. The UI must
+    /// dispatch on this value instead of inferring ownership from paths.
+    let deletable: Bool?
+    let removalKind: String?
+    /// Relationship metadata used by synthetic Profile rows in Model Library.
+    let sourceModelId: String?
+    let profileName: String?
+    let exposedProfiles: [ProfileDTO]?
     let settings: ModelSettingsDTO?
 }
 

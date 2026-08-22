@@ -45,31 +45,76 @@ struct ModelsScreen: View {
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
         .confirmationDialog(
-            String(localized: "models.delete.confirm_title",
-                   defaultValue: "Delete this model from disk?",
-                   comment: "Confirmation dialog title shown before deleting a model from disk"),
+            removalConfirmationTitle(vm.pendingRemovalModel),
             isPresented: Binding(
                 get: { vm.pendingRemoveID != nil },
                 set: { if !$0 { vm.pendingRemoveID = nil } }
             ),
             titleVisibility: .visible,
-            presenting: vm.pendingRemoveID
-        ) { id in
-            Button(String(localized: "models.delete.confirm_button",
-                          defaultValue: "Delete \(id)",
-                          comment: "Destructive button label inside the delete-model confirmation dialog; placeholder is the model id"),
+            presenting: vm.pendingRemovalModel
+        ) { model in
+            Button(removalConfirmationButton(model),
                    role: .destructive) {
-                vm.remove(id: id, client: services.client)
+                vm.remove(model: model, client: services.client)
             }
             Button(String(localized: "common.cancel",
                           defaultValue: "Cancel",
                           comment: "Generic cancel button"),
                    role: .cancel) { vm.pendingRemoveID = nil }
-        } message: { id in
-            Text(String(localized: "models.delete.confirm_message",
-                        defaultValue: "The model files will be permanently removed from disk and unloaded if currently running.",
-                        comment: "Body text inside the delete-model confirmation dialog explaining the impact"))
+        } message: { model in
+            Text(removalConfirmationMessage(model))
         }
+    }
+}
+
+private func removalConfirmationTitle(_ model: ModelDTO?) -> String {
+    switch model?.removalKind {
+    case "local_cache":
+        return String(localized: "models.remove.local_cache.title",
+                      defaultValue: "Remove this model from local cache?",
+                      comment: "Confirmation title before removing a Hugging Face cache-backed model")
+    case "profile":
+        return String(localized: "models.remove.profile.title",
+                      defaultValue: "Delete this profile?",
+                      comment: "Confirmation title before deleting an exposed model profile")
+    default:
+        return String(localized: "models.delete.confirm_title",
+                      defaultValue: "Delete this model from disk?",
+                      comment: "Confirmation dialog title shown before deleting a model from disk")
+    }
+}
+
+private func removalConfirmationButton(_ model: ModelDTO) -> String {
+    switch model.removalKind {
+    case "local_cache":
+        return String(localized: "models.remove.local_cache.button",
+                      defaultValue: "Remove from local cache",
+                      comment: "Destructive button that removes a Hugging Face repository from the local cache")
+    case "profile":
+        return String(localized: "models.remove.profile.button",
+                      defaultValue: "Delete profile",
+                      comment: "Destructive button that deletes only an exposed model profile")
+    default:
+        return String(localized: "models.delete.confirm_button",
+                      defaultValue: "Delete \(model.id)",
+                      comment: "Destructive button label inside the delete-model confirmation dialog; placeholder is the model id")
+    }
+}
+
+private func removalConfirmationMessage(_ model: ModelDTO) -> String {
+    switch model.removalKind {
+    case "local_cache":
+        return String(localized: "models.remove.local_cache.message",
+                      defaultValue: "This removes the repository's cache entry, including refs, snapshots, and blobs. Other applications using the same Hugging Face cache may be affected.",
+                      comment: "Warning that removing a shared Hugging Face cache repository may affect other apps")
+    case "profile":
+        return String(localized: "models.remove.profile.message",
+                      defaultValue: "Only this profile will be deleted. The base model and its files will be kept.",
+                      comment: "Warning that deleting an exposed profile preserves its base model files")
+    default:
+        return String(localized: "models.delete.confirm_message",
+                      defaultValue: "The model files will be permanently removed from disk and unloaded if currently running.",
+                      comment: "Body text inside the delete-model confirmation dialog explaining the impact")
     }
 }
 
@@ -165,6 +210,41 @@ private struct ActiveBadge: View {
     }
 }
 
+private struct ModelSourceBadge: View {
+    let model: ModelDTO
+    @Environment(\.omlxTheme) private var theme
+
+    @ViewBuilder
+    var body: some View {
+        if model.removalKind == "local_cache" {
+            StatusPill(status: .custom(
+                color: theme.blueDot,
+                label: String(localized: "models.badge.local_cache",
+                              defaultValue: "Local cache",
+                              comment: "Badge for a model stored in the shared Hugging Face local cache"),
+                fillBg: true
+            ))
+            .help(model.sourceRepoId ?? model.id)
+        } else if model.virtual == true {
+            StatusPill(status: .custom(
+                color: theme.textTertiary,
+                label: String(localized: "models.badge.virtual",
+                              defaultValue: "Virtual",
+                              comment: "Badge for a built-in model with no files on disk"),
+                fillBg: true
+            ))
+        } else if model.removalKind == "profile" {
+            StatusPill(status: .custom(
+                color: theme.amberDot,
+                label: String(localized: "models.badge.profile",
+                              defaultValue: "Profile",
+                              comment: "Badge for an exposed profile backed by a base model"),
+                fillBg: true
+            ))
+        }
+    }
+}
+
 // MARK: - Library section
 
 private struct LibrarySection: View {
@@ -213,21 +293,27 @@ private struct LibrarySection: View {
                 ForEach(Array(models.enumerated()), id: \.element.id) { idx, m in
                     FreeRow(isLast: idx == models.count - 1) {
                         HStack(spacing: 10) {
-                            Button {
-                                onToggleFavorite(m.id, !(m.isFavorite ?? false))
-                            } label: {
-                                Image(systemName: (m.isFavorite ?? false) ? "star.fill" : "star")
+                            if m.virtual != true && m.removalKind != "profile" {
+                                Button {
+                                    onToggleFavorite(m.id, !(m.isFavorite ?? false))
+                                } label: {
+                                    Image(systemName: (m.isFavorite ?? false) ? "star.fill" : "star")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle((m.isFavorite ?? false) ? Color.yellow : theme.textTertiary)
+                                }
+                                .buttonStyle(.plain)
+                                .help((m.isFavorite ?? false)
+                                    ? String(localized: "models.library.favorite_on.help",
+                                             defaultValue: "Favorite — click to remove",
+                                             comment: "Tooltip on the filled star that removes a model from favorites")
+                                    : String(localized: "models.library.favorite_off.help",
+                                             defaultValue: "Add to favorites",
+                                             comment: "Tooltip on the outlined star that adds a model to favorites"))
+                            } else {
+                                Image(systemName: "star")
                                     .font(.system(size: 12))
-                                    .foregroundStyle((m.isFavorite ?? false) ? Color.yellow : theme.textTertiary)
+                                    .hidden()
                             }
-                            .buttonStyle(.plain)
-                            .help((m.isFavorite ?? false)
-                                ? String(localized: "models.library.favorite_on.help",
-                                         defaultValue: "Favorite — click to remove",
-                                         comment: "Tooltip on the filled star that removes a model from favorites")
-                                : String(localized: "models.library.favorite_off.help",
-                                         defaultValue: "Add to favorites",
-                                         comment: "Tooltip on the outlined star that adds a model to favorites"))
                             Squircle(systemSymbol: iconName(for: m),
                                      size: 26,
                                      gradient: gradient(for: m))
@@ -238,6 +324,7 @@ private struct LibrarySection: View {
                                         .foregroundStyle(theme.text)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
+                                    ModelSourceBadge(model: m)
                                     CopyIconButton(value: m.id)
                                 }
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
@@ -248,57 +335,59 @@ private struct LibrarySection: View {
                             }
                             Spacer(minLength: 8)
                             HStack(spacing: 10) {
-                                if isModelLoaded(m.id) {
+                                if m.virtual != true && m.removalKind != "profile" {
+                                    if isModelLoaded(m.id) {
+                                        Button {
+                                            onUnload(m.id)
+                                        } label: {
+                                            Text(String(localized: "models.library.unload",
+                                                        defaultValue: "Unload",
+                                                        comment: "Button label that unloads a library model from memory"))
+                                                .lineLimit(1)
+                                                .frame(minWidth: 48)
+                                        }
+                                        .buttonStyle(.omlx(.plain, size: .small))
+                                    } else {
+                                        Button {
+                                            onLoad(m.id)
+                                        } label: {
+                                            Text(String(localized: "models.library.load",
+                                                        defaultValue: "Load",
+                                                        comment: "Button label that loads a library model into memory"))
+                                                .lineLimit(1)
+                                                .frame(minWidth: 48)
+                                        }
+                                        .buttonStyle(.omlx(.normal, size: .small))
+                                        .disabled(m.isLoading)
+                                    }
                                     Button {
-                                        onUnload(m.id)
+                                        onOpenSettings(m.id)
                                     } label: {
-                                        Text(String(localized: "models.library.unload",
-                                                    defaultValue: "Unload",
-                                                    comment: "Button label that unloads a library model from memory"))
-                                            .lineLimit(1)
-                                            .frame(minWidth: 48)
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: 11))
                                     }
                                     .buttonStyle(.omlx(.plain, size: .small))
-                                } else {
+                                    .help(String(localized: "models.library.settings.help",
+                                                 defaultValue: "Settings",
+                                                 comment: "Tooltip on the chevron that opens a model's settings screen"))
+                                }
+                                if m.deletable == true {
                                     Button {
-                                        onLoad(m.id)
+                                        onRequestRemove(m.id)
                                     } label: {
-                                        Text(String(localized: "models.library.load",
-                                                    defaultValue: "Load",
-                                                    comment: "Button label that loads a library model into memory"))
-                                            .lineLimit(1)
-                                            .frame(minWidth: 48)
+                                        if deletingID == m.id {
+                                            ProgressView()
+                                                .controlSize(.mini)
+                                        } else {
+                                            Image(systemName: "trash")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(theme.redDot)
+                                        }
                                     }
-                                    .buttonStyle(.omlx(.normal, size: .small))
-                                    .disabled(m.isLoading)
+                                    .buttonStyle(.omlx(.plain, size: .small))
+                                    .disabled(deletingID != nil)
+                                    .help(removalHelp(m))
                                 }
-                                Button {
-                                    onOpenSettings(m.id)
-                                } label: {
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 11))
-                                }
-                                .buttonStyle(.omlx(.plain, size: .small))
-                                .help(String(localized: "models.library.settings.help",
-                                             defaultValue: "Settings",
-                                             comment: "Tooltip on the chevron that opens a model's settings screen"))
-                                Button {
-                                    onRequestRemove(m.id)
-                                } label: {
-                                    if deletingID == m.id {
-                                        ProgressView()
-                                            .controlSize(.mini)
-                                    } else {
-                                        Image(systemName: "trash")
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(theme.redDot)
-                                    }
-                                }
-                                .buttonStyle(.omlx(.plain, size: .small))
-                                .disabled(deletingID != nil)
-                                .help(String(localized: "models.library.remove.help",
-                                             defaultValue: "Remove from disk",
-                                             comment: "Tooltip on the trash button that deletes a model from local storage"))
                             }
                             .fixedSize(horizontal: true, vertical: false)
                             .layoutPriority(1)
@@ -325,6 +414,23 @@ private struct LibrarySection: View {
         case "audio_stt", "audio_tts", "audio_sts": return "waveform"
         case "vlm":     return "eye"
         default:        return "cpu"
+        }
+    }
+
+    private func removalHelp(_ model: ModelDTO) -> String {
+        switch model.removalKind {
+        case "local_cache":
+            return String(localized: "models.remove.local_cache.button",
+                          defaultValue: "Remove from local cache",
+                          comment: "Destructive button that removes a Hugging Face repository from the local cache")
+        case "profile":
+            return String(localized: "models.remove.profile.button",
+                          defaultValue: "Delete profile",
+                          comment: "Destructive button that deletes only an exposed model profile")
+        default:
+            return String(localized: "models.library.remove.help",
+                          defaultValue: "Remove from disk",
+                          comment: "Tooltip on the trash button that deletes a model from local storage")
         }
     }
 }

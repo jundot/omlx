@@ -556,6 +556,12 @@ final class OMLXClient: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if method == "GET" {
+            // Admin resources are live server state. NSURLCache can otherwise
+            // keep a removed model visible until the app quits.
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        }
         if body != nil {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = body
