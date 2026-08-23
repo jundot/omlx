@@ -633,6 +633,106 @@ class TestQwenCpuShareMemoryEstimate:
         assert pool._entry_runtime_resident_size(entry, settings) == 2000
 
 
+class TestDeepSeekCpuShareMemoryEstimate:
+    @staticmethod
+    def _write_config(path):
+        path.mkdir()
+        (path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "deepseek_v4",
+                    "num_hidden_layers": 4,
+                    "q_lora_rank": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 128,
+                    "index_n_heads": 2,
+                    "index_head_dim": 128,
+                    "compress_ratios": [0, 4, 128, 4],
+                }
+            )
+        )
+
+    def test_estimate_covers_plain_and_stacked_query_rows(self, tmp_path):
+        from omlx.engine_pool import _deepseek_v4_cpu_share_estimated_bytes
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "deepseek"
+        self._write_config(model)
+        settings = ModelSettings(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_cpu_enabled=True,
+            deepseek_ane_prefill_cpu_fraction=0.25,
+        )
+
+        estimated = _deepseek_v4_cpu_share_estimated_bytes(str(model), settings)
+
+        # Four plain 128-row query slices, plus 64 extra rows on each of the
+        # two ratio-4 layers after stacking the indexer output.
+        rows = 4 * 128 + 2 * 64
+        assert estimated == int(rows * 128 * 2 * 1.5)
+
+    def test_smaller_tile_does_not_reserve_disabled_cpu_path(self, tmp_path):
+        from omlx.engine_pool import _deepseek_v4_cpu_share_estimated_bytes
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "deepseek"
+        self._write_config(model)
+        settings = ModelSettings(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_sequence_length=2048,
+            deepseek_ane_prefill_cpu_enabled=True,
+            deepseek_ane_prefill_cpu_fraction=0.25,
+        )
+
+        assert _deepseek_v4_cpu_share_estimated_bytes(str(model), settings) == 0
+
+    def test_runtime_estimate_includes_deepseek_cpu_rows(self, tmp_path):
+        from omlx.engine_pool import _deepseek_v4_cpu_share_estimated_bytes
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "deepseek"
+        self._write_config(model)
+        settings = ModelSettings(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_cpu_enabled=True,
+            deepseek_ane_prefill_cpu_fraction=0.25,
+        )
+        entry = EngineEntry(
+            model_id="deepseek",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+
+        extra = _deepseek_v4_cpu_share_estimated_bytes(str(model), settings)
+
+        assert extra is not None and extra > 0
+        assert pool._entry_runtime_resident_size(entry, settings) == 1000 + extra
+
+    def test_enabled_cpu_share_fails_closed_when_geometry_is_unreadable(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "deepseek"
+        model.mkdir()
+        (model / "config.json").write_text("{")
+        settings = ModelSettings(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_cpu_enabled=True,
+        )
+        entry = EngineEntry(
+            model_id="deepseek",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+
+        assert pool._entry_runtime_resident_size(entry, settings) == 2000
+
+
 class TestApplySettingsOverrides:
     """Tests for apply_settings_overrides method."""
 

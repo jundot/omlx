@@ -176,6 +176,80 @@ def _qwen35_cpu_share_estimated_bytes(
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
 
 
+def _deepseek_v4_cpu_share_estimated_bytes(
+    model_path: str,
+    settings: object | None,
+) -> int | None:
+    """Estimate eager FP16 query rows retained by DeepSeek ANE sharing.
+
+    Every layer keeps a CPU middle from attention ``wq_b``. Sparse ratio-4
+    layers stack the indexer ``wq_b`` into that projection, so their aligned
+    CPU slice can be wider. ``None`` means the feature is enabled for a
+    DeepSeek-V4 checkpoint but the required geometry is unreadable; callers
+    must fail closed instead of admitting the packed model estimate alone.
+    """
+
+    if (
+        settings is None
+        or not bool(getattr(settings, "deepseek_ane_prefill_enabled", False))
+        or not bool(getattr(settings, "deepseek_ane_prefill_cpu_enabled", True))
+        or int(getattr(settings, "deepseek_ane_prefill_sequence_length", 4096) or 0)
+        < 4096
+    ):
+        return 0
+
+    fraction = float(
+        getattr(settings, "deepseek_ane_prefill_cpu_fraction", 0.125) or 0.0
+    )
+    if fraction <= 0:
+        return 0
+
+    config_path = Path(model_path) / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        text = config
+    model_type = str(text.get("model_type") or config.get("model_type") or "")
+    if not model_type.lower().replace("-", "_").startswith("deepseek_v4"):
+        return 0
+
+    # These are the defaults of the registered DeepSeek-V4 model class, so a
+    # standard checkpoint may omit them without making its geometry unknown.
+    layer_count = _positive_int(text.get("num_hidden_layers", 43))
+    q_lora_rank = _positive_int(text.get("q_lora_rank", 1024))
+    query_outputs = _positive_int(text.get("num_attention_heads", 64)) * _positive_int(
+        text.get("head_dim", 512)
+    )
+    index_outputs = _positive_int(text.get("index_n_heads", 64)) * _positive_int(
+        text.get("index_head_dim", 128)
+    )
+    if not layer_count or not q_lora_rank or not query_outputs or not index_outputs:
+        return None
+
+    ratios = text.get("compress_ratios")
+    if isinstance(ratios, list) and len(ratios) >= layer_count:
+        sparse_layers = sum(
+            int(_positive_int(ratio) == 4) for ratio in ratios[:layer_count]
+        )
+    else:
+        # The model default alternates sparse and compressed attention, but a
+        # conservative all-sparse charge is safer when the explicit map is
+        # absent or truncated.
+        sparse_layers = layer_count
+
+    plain_rows = _aligned_share_rows(query_outputs, fraction)
+    stacked_rows = _aligned_share_rows(query_outputs + index_outputs, fraction)
+    total_rows = layer_count * plain_rows
+    total_rows += sparse_layers * max(0, stacked_rows - plain_rows)
+    extra = total_rows * q_lora_rank * _FP16_BYTES
+    return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -340,24 +414,41 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
-        if extra is None:
-            # An enabled CPU path with unreadable geometry must not silently
-            # retain the quantized estimate. One additional model-sized charge
-            # is conservative and lets normal admission produce useful errors.
-            extra = entry.estimated_size
-            logger.warning(
-                "Could not determine Qwen CPU-share geometry for %s; "
-                "reserving one additional model-sized memory allowance",
-                entry.model_id,
-            )
-        if extra > 0:
-            logger.info(
-                "Qwen CPU sharing adds %s to the projected memory for %s",
-                format_size(extra),
-                entry.model_id,
-            )
-        return base + extra
+        estimates = (
+            (
+                "Qwen",
+                _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings),
+            ),
+            (
+                "DeepSeek-V4",
+                _deepseek_v4_cpu_share_estimated_bytes(
+                    entry.model_path, runtime_settings
+                ),
+            ),
+        )
+        extra_total = 0
+        for family, extra in estimates:
+            if extra is None:
+                # An enabled CPU path with unreadable geometry must not
+                # silently retain the packed estimate. One additional
+                # model-sized charge is conservative and lets normal
+                # admission produce a useful error.
+                extra = entry.estimated_size
+                logger.warning(
+                    "Could not determine %s CPU-share geometry for %s; "
+                    "reserving one additional model-sized memory allowance",
+                    family,
+                    entry.model_id,
+                )
+            if extra > 0:
+                logger.info(
+                    "%s CPU sharing adds %s to the projected memory for %s",
+                    family,
+                    format_size(extra),
+                    entry.model_id,
+                )
+            extra_total += extra
+        return base + extra_total
 
     @property
     def current_model_memory(self) -> int:

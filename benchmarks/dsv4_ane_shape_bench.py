@@ -227,9 +227,7 @@ def bench_wo_a_grouped(sequence_length):
     # Correctness: one full-output grouped program against an fp32 reference.
     flat = mx.contiguous(w.reshape(out_total, in_per_group).astype(mx.float32))
     mx.eval(flat)
-    model = fast.qwen35_ane_compile_linear_grouped(
-        flat, sequence_length, 1, groups
-    )
+    model = fast.qwen35_ane_compile_linear_grouped(flat, sequence_length, 1, groups)
     junk = mx.random.normal((64, in_total)).astype(mx.bfloat16)
     sw, ss, sb = mx.quantize(junk, group_size=64, bits=4)
     sw, ss, sb = (
@@ -238,9 +236,7 @@ def bench_wo_a_grouped(sequence_length):
         mx.contiguous(sb.astype(x.dtype)),
     )
     mx.eval(sw, ss, sb)
-    combined = fast.qwen35_ane_affine_qmm_t(
-        x, sw, ss, sb, model, 4, 8, 64
-    )
+    combined = fast.qwen35_ane_affine_qmm_t(x, sw, ss, sb, model, 4, 8, 64)
     ane_out = combined[..., :out_total].astype(mx.float32)
     mx.eval(ane_out)
     for g in range(groups):
@@ -262,10 +258,7 @@ def bench_wo_a_grouped(sequence_length):
         prefix1 = mx.contiguous(
             mx.concatenate(
                 [
-                    w[g][
-                        rows_per_group_per_instance : 2
-                        * rows_per_group_per_instance
-                    ]
+                    w[g][rows_per_group_per_instance : 2 * rows_per_group_per_instance]
                     for g in range(groups)
                 ]
             ).astype(mx.float32)
@@ -280,8 +273,8 @@ def bench_wo_a_grouped(sequence_length):
         fast.qwen35_ane_profile_set_enabled(True)
         fast.qwen35_ane_profile_reset()
         hybrid_ms = median_ms(
-            lambda m0=model0, m1=model1: (
-                fast.qwen35_ane_dual_affine_qmm_t(x, sw, ss, sb, m0, m1, 4, 8, 64)
+            lambda m0=model0, m1=model1: fast.qwen35_ane_dual_affine_qmm_t(
+                x, sw, ss, sb, m0, m1, 4, 8, 64
             )
         )
         snapshot = fast.qwen35_ane_profile_snapshot()

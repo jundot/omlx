@@ -149,16 +149,12 @@ def _prepare_linear(
     per_instance, cpu_outputs, gpu_outputs = split
     ane_outputs = 2 * per_instance
     gpu_start = ane_outputs + cpu_outputs
-    dense0 = mx.contiguous(
-        _dequant_rows(linear, 0, per_instance).astype(mx.float32)
-    )
+    dense0 = mx.contiguous(_dequant_rows(linear, 0, per_instance).astype(mx.float32))
     dense1 = mx.contiguous(
         _dequant_rows(linear, per_instance, ane_outputs).astype(mx.float32)
     )
     cpu_weight = (
-        mx.contiguous(
-            _dequant_rows(linear, ane_outputs, gpu_start).astype(mx.float16)
-        )
+        mx.contiguous(_dequant_rows(linear, ane_outputs, gpu_start).astype(mx.float16))
         if cpu_outputs
         else None
     )
@@ -229,26 +225,18 @@ def _prepare_stacked(
             parts.append(_dequant_rows(attn_linear, start, min(stop, attn_out)))
         if stop > attn_out:
             parts.append(
-                _dequant_rows(
-                    indexer_linear, max(start - attn_out, 0), stop - attn_out
-                )
+                _dequant_rows(indexer_linear, max(start - attn_out, 0), stop - attn_out)
             )
         return parts[0] if len(parts) == 1 else mx.concatenate(parts)
 
     dense0 = mx.contiguous(stacked_rows(0, per_instance).astype(mx.float32))
-    dense1 = mx.contiguous(
-        stacked_rows(per_instance, ane_outputs).astype(mx.float32)
-    )
+    dense1 = mx.contiguous(stacked_rows(per_instance, ane_outputs).astype(mx.float32))
     cpu_weight = (
-        mx.contiguous(
-            stacked_rows(ane_outputs, gpu_start).astype(mx.float16)
-        )
+        mx.contiguous(stacked_rows(ane_outputs, gpu_start).astype(mx.float16))
         if cpu_outputs
         else None
     )
-    suffix = _requant_suffix(
-        mx.contiguous(stacked_rows(gpu_start, out_features))
-    )
+    suffix = _requant_suffix(mx.contiguous(stacked_rows(gpu_start, out_features)))
     state = _StackedState(
         None,
         None,
@@ -304,8 +292,7 @@ def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
     except Exception:
         owner._omlx_ane_failed = True
         logger.warning(
-            "Disabling ANE prefill for one DeepSeek projection after a "
-            "runtime failure",
+            "Disabling ANE prefill for one DeepSeek projection after a runtime failure",
             exc_info=True,
         )
         return None
@@ -384,6 +371,20 @@ def enable_deepseek_v4_ane_prefill(
     if not 0 <= cpu_threads <= 64:
         raise ValueError("DeepSeek CPU worker count must be between 0 and 64")
 
+    # The shared CPU middle is only competitive at the measured 4K tile.
+    # At 2K, fresh shape probes put plain wq_b at 5.41 ms with the default
+    # 12.5% CPU share versus 4.77 ms with ANE/GPU alone; stacked wq_b was
+    # effectively flat (5.90 versus 5.81 ms). Keep the ANE/GPU experiment
+    # available for smaller fixed shapes, but do not silently add a known
+    # CPU regression when a user changes the prompt block size.
+    if cpu_fraction and sequence_length < 4096:
+        logger.warning(
+            "DeepSeek query CPU offload disabled for sequence_length=%d; "
+            "shape benchmarks require at least 4096 rows",
+            sequence_length,
+        )
+        cpu_fraction = 0.0
+
     env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
     if env in ("0", "false", "off"):
         return 0
@@ -405,8 +406,7 @@ def enable_deepseek_v4_ane_prefill(
             "qwen35_ane_dual_affine_qmm_t"
         ):
             logger.warning(
-                "ANE extension predates procedure banks; DeepSeek ANE prefill "
-                "skipped"
+                "ANE extension predates procedure banks; DeepSeek ANE prefill skipped"
             )
             return 0
         if cpu_fraction and not fast.has_symbol(
@@ -485,8 +485,7 @@ def enable_deepseek_v4_ane_prefill(
                 )
             except Exception:
                 logger.warning(
-                    "Skipping one DeepSeek wq_b while preparing its ANE "
-                    "procedure",
+                    "Skipping one DeepSeek wq_b while preparing its ANE procedure",
                     exc_info=True,
                 )
                 prep = None

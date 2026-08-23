@@ -95,9 +95,7 @@ def main() -> None:
                 "cpu_threads": args.cpu_threads,
                 "cpu_shared_resource": not args.disable_cpu_shared_resource,
                 "procedures": procedures,
-                "cpu_procedures": int(
-                    getattr(model, "_omlx_ane_cpu_prefill_count", 0)
-                ),
+                "cpu_procedures": int(getattr(model, "_omlx_ane_cpu_prefill_count", 0)),
                 "compile_seconds": compile_seconds,
                 "gpu_prefill_ms": gpu_ms,
                 "hybrid_prefill_ms": hybrid_ms,

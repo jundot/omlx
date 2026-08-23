@@ -49,13 +49,28 @@ M3 Ultra. If the native shared-resource scheduling API is unavailable, the
 runtime keeps ANE/GPU offload active but disables the CPU middle instead of
 silently using a slower scheduling policy.
 
-The 4,096-token shape is the measured optimum: at 2,048 the per-operation
-host synchronization cost of the hybrid primitive exceeds the savings,
-because DeepSeek-V4 projections are five to ten times smaller than the Qwen
-MLP slices the runtime was built around. Enabling the feature also realigns
-the paged cache block size to the fixed ANE shape (pooling-cache models
-clamp prefill chunks to block boundaries), which rebuilds the model's SSD
-cache once and doubles the spacing of boundary snapshots.
+CPU sharing is also disabled automatically when the configured fixed shape is
+below 4,096 tokens. A current-revision 2,048-token recheck measured plain
+`wq_b` at 4.77 ms with ANE/GPU and 5.41 ms with the 12.5% CPU middle; stacked
+`wq_b` was 5.81 ms and 5.90 ms respectively. The smaller tile remains
+available for ANE/GPU experiments, but it no longer silently enables a CPU
+configuration that the shape probe found unprofitable.
+
+When CPU sharing is active, pre-load admission reserves its eager FP16 query
+rows from checkpoint geometry, including the wider stacked indexer slices.
+Unreadable DeepSeek geometry fails closed with a conservative extra
+model-sized reservation rather than admitting a near-limit checkpoint using
+only its packed-weight estimate.
+
+The 4,096-token shape is the measured full-model optimum. Individual ANE/GPU
+projections can still beat GPU-only at 2,048, but the extra host synchronization
+and smaller prompt chunks erase too much of that layer-level saving across the
+model; adding CPU sharing makes it worse. DeepSeek-V4 projections are five to
+ten times smaller than the Qwen MLP slices the runtime was built around.
+Enabling the feature also realigns the paged cache block size to the fixed ANE
+shape (pooling-cache models clamp prefill chunks to block boundaries), which
+rebuilds the model's SSD cache once and doubles the spacing of boundary
+snapshots.
 
 ## Measured results
 
@@ -75,6 +90,12 @@ same 50% dual-ANE split with and without a 12.5% CPU middle:
 The stacked-query result was repeated three times with shared scheduling; its
 12.5% CPU median ranged from 9.44 to 10.37 ms versus 10.97 to 11.05 ms without
 CPU sharing. Smaller 10% splits helped less, while 15% became CPU-bound.
+
+A clean-worktree recheck on the current revision produced the same decisions.
+Across four fresh processes, plain `wq_b` improved by about 1.5% at the
+aggregate median with a 12.5% CPU middle (a small, noisy win), while stacked
+`wq_b` improved by about 5.5%. The 15% share regressed both. Shared gate/up
+again slowed with any CPU middle, and remains ANE/GPU-only.
 
 Run the safe synthetic sweep with:
 
