@@ -6705,7 +6705,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune a Qwen or DeepSeek ANE split without persisting settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -6763,6 +6763,16 @@ async def start_ane_tuning(
         raise HTTPException(
             status_code=400,
             detail=f"Model {tuning_request.model_id} is not a supported language model",
+        )
+    config_type = str(getattr(entry, "config_model_type", "") or "")
+    config_type = config_type.lower().replace("-", "_")
+    if (
+        tuning_request.model_family == "deepseek_v4"
+        and not config_type.startswith("deepseek_v4")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="DeepSeek ANE tuning is available only for DeepSeek-V4 models.",
         )
 
     cleanup_old_runs()

@@ -1,4 +1,9 @@
 {
+  "modal.model_settings.deepseek_ane_tune": "Ajustar offload do DeepSeek",
+  "modal.model_settings.deepseek_ane_tune_hint": "Mede as formas exatas das projeções do DeepSeek sem carregar o checkpoint. Ajusta o compartilhamento de CPU e recomenda se o ANE vale a pena neste Mac.",
+  "modal.model_settings.deepseek_ane_tune_verify": "Carregar e verificar o modelo completo",
+  "modal.model_settings.deepseek_ane_tune_verify_hint": "Opção explícita: pode exigir mais de 96 GB e falhar por falta de memória. O ajuste normal usa menos de 1 GB.",
+  "modal.model_settings.deepseek_ane_tune_result": "Resultado das formas",
   "app.title": "oMLX Admin",
   "app.tagline": "Inferência de LLM, otimizada para o seu Mac",
   "login.title_login": "Login - oMLX Admin",

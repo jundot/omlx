@@ -1,4 +1,9 @@
 {
+  "modal.model_settings.deepseek_ane_tune": "調校 DeepSeek 卸載",
+  "modal.model_settings.deepseek_ane_tune_hint": "無需載入檢查點即可測量 DeepSeek 的精確投影形狀，調校 CPU 分工並建議此 Mac 是否值得使用 ANE。",
+  "modal.model_settings.deepseek_ane_tune_verify": "載入並驗證完整模型",
+  "modal.model_settings.deepseek_ane_tune_verify_hint": "明確選用：可能需要超過 96 GB，並可能因記憶體不足而失敗。一般調校器使用少於 1 GB。",
+  "modal.model_settings.deepseek_ane_tune_result": "形狀結果",
   "app.title": "oMLX 管理後台",
   "app.tagline": "LLM 推論，為你的 Mac 優化",
   "login.title_login": "登入 - oMLX 管理後台",

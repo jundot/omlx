@@ -1,4 +1,9 @@
 {
+  "modal.model_settings.deepseek_ane_tune": "Настроить разгрузку DeepSeek",
+  "modal.model_settings.deepseek_ane_tune_hint": "Измеряет точные формы проекций DeepSeek без загрузки чекпойнта. Настраивает долю CPU и рекомендует, стоит ли использовать ANE на этом Mac.",
+  "modal.model_settings.deepseek_ane_tune_verify": "Загрузить и проверить полную модель",
+  "modal.model_settings.deepseek_ane_tune_verify_hint": "Явная опция: может потребоваться более 96 ГБ, возможна нехватка памяти. Обычный тюнер использует менее 1 ГБ.",
+  "modal.model_settings.deepseek_ane_tune_result": "Результат форм",
   "app.title": "oMLX Админ",
   "app.tagline": "LLM-инференс, оптимизированный для вашего Mac",
   "login.title_login": "Вход - oMLX Админ",

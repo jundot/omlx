@@ -1,4 +1,9 @@
 {
+  "modal.model_settings.deepseek_ane_tune": "Tune DeepSeek Offload",
+  "modal.model_settings.deepseek_ane_tune_hint": "Benchmarks exact DeepSeek projection shapes without loading the checkpoint. It tunes CPU sharing and recommends whether ANE offload is worthwhile on this Mac.",
+  "modal.model_settings.deepseek_ane_tune_verify": "Load and verify the full model",
+  "modal.model_settings.deepseek_ane_tune_verify_hint": "Explicit opt-in: may require more than 96 GB and can fail from memory pressure. The normal tuner stays below 1 GB.",
+  "modal.model_settings.deepseek_ane_tune_result": "Shape result",
   "app.title": "oMLX Admin",
   "app.tagline": "LLM inference, optimized for your Mac",
   "login.title_login": "Login - oMLX Admin",

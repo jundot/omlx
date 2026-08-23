@@ -267,6 +267,20 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "result?.latency_ms !== null" in script
 
 
+def test_deepseek_ane_tuner_is_bounded_by_default_and_full_model_is_opt_in():
+    html = _model_settings_template()
+    script = _dashboard_script()
+
+    assert "startANETuning('deepseek_v4')" in html
+    assert 'x-model="aneTuningOverrides.verifyDeepseekFullModel"' in html
+    assert "deepseek_ane_tune_verify_hint" in html
+    assert "model_family: modelFamily" in script
+    assert "verify_full_model: deepseek" in script
+    assert "deepseek_ane_prefill_enabled: !!recommendation.enabled" in script
+    assert "deepseek_ane_prefill_cpu_fraction: Number(" in script
+    assert "recommendation.model_family === 'deepseek_v4'" in script
+
+
 def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     script = _dashboard_script()
 

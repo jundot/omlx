@@ -1,4 +1,9 @@
 {
+  "modal.model_settings.deepseek_ane_tune": "DeepSeek オフロードを調整",
+  "modal.model_settings.deepseek_ane_tune_hint": "チェックポイントを読み込まず、DeepSeek の正確な射影形状を測定します。CPU 共有を調整し、この Mac で ANE が有効かを推奨します。",
+  "modal.model_settings.deepseek_ane_tune_verify": "モデル全体を読み込んで検証",
+  "modal.model_settings.deepseek_ane_tune_verify_hint": "明示的なオプトインです。96 GB を超えるメモリが必要で失敗する場合があります。通常のチューナーは 1 GB 未満です。",
+  "modal.model_settings.deepseek_ane_tune_result": "形状の結果",
   "app.title": "oMLX 管理画面",
   "app.tagline": "Mac向けに最適化されたLLM推論",
   "login.title_login": "ログイン - oMLX 管理画面",

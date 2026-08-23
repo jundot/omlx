@@ -57,6 +57,38 @@ def test_candidate_settings_are_transient_copy():
     assert base.qwen35_ane_prefill_tail_padding_min_tokens == 1500
 
 
+def test_deepseek_candidate_settings_are_transient_and_disable_qwen():
+    base = ModelSettings(
+        qwen35_ane_prefill_enabled=True,
+        deepseek_ane_prefill_cpu_shared_resource=True,
+    )
+    request = ane_tuning.ANETuningRequest(
+        model_id="deepseek",
+        model_family="deepseek_v4",
+        sequence_length=4096,
+    )
+    candidate = ane_tuning._Candidate(
+        "shape winner",
+        True,
+        cpu_enabled=True,
+        cpu_fraction=0.125,
+        cpu_threads=12,
+    )
+
+    tuned = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert tuned is not base
+    assert tuned.deepseek_ane_prefill_enabled is True
+    assert tuned.deepseek_ane_prefill_sequence_length == 4096
+    assert tuned.deepseek_ane_prefill_cpu_enabled is True
+    assert tuned.deepseek_ane_prefill_cpu_fraction == 0.125
+    assert tuned.deepseek_ane_prefill_cpu_threads == 12
+    assert tuned.deepseek_ane_prefill_cpu_shared_resource is True
+    assert tuned.qwen35_ane_prefill_enabled is False
+    assert base.deepseek_ane_prefill_enabled is False
+    assert base.qwen35_ane_prefill_enabled is True
+
+
 def test_candidate_settings_preserve_single_ane_mode():
     base = ModelSettings(qwen35_ane_prefill_dual_ane=False)
     request = ane_tuning.ANETuningRequest(model_id="qwen")
@@ -186,6 +218,75 @@ def test_tuner_overrides_reduce_planned_search_matrix():
 
     assert constrained.total == 9
     assert constrained.total < full.total
+
+
+def test_deepseek_tuner_uses_shape_rows_and_full_model_is_opt_in():
+    bounded = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(
+            model_id="deepseek",
+            model_family="deepseek_v4",
+            sequence_length=4096,
+        )
+    )
+    verified = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(
+            model_id="deepseek-verify",
+            model_family="deepseek_v4",
+            sequence_length=4096,
+            verify_full_model=True,
+        )
+    )
+
+    assert [result["label"] for result in bounded.results] == [
+        "Projection GPU baseline",
+        "Shared expert ANE/GPU",
+        "Query ANE/GPU",
+        "Query CPU share",
+        "CPU worker calibration",
+        "Shape-model recommendation",
+    ]
+    assert len(verified.results) == 8
+    assert verified.results[-2]["label"] == "Full-model GPU baseline"
+    assert verified.results[-1]["label"] == "Full-model recommendation"
+    assert verified.total == bounded.total + 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_default_tuner_never_touches_engine_pool(monkeypatch):
+    recommendation = {
+        "model_family": "deepseek_v4",
+        "enabled": True,
+        "cpu_enabled": True,
+        "cpu_fraction": 0.125,
+        "cpu_threads": 12,
+        "cpu_shared_resource": True,
+        "processing_tps": 123.0,
+        "speedup_percent": 20.0,
+        "sequence_length": 4096,
+        "full_model_verified": False,
+        "measurement_scope": "exact_projection_shapes",
+    }
+
+    def shape_tuning(run):
+        for result in run.results:
+            result["state"] = "completed"
+        return dict(recommendation)
+
+    monkeypatch.setattr(ane_tuning, "_deepseek_shape_tuning_sync", shape_tuning)
+    pool = SimpleNamespace()
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(
+            model_id="deepseek",
+            model_family="deepseek_v4",
+            sequence_length=4096,
+        )
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+
+    assert run.status == "completed"
+    assert run.recommendation == recommendation
+    assert run.recommendation["full_model_verified"] is False
 
 
 def test_full_model_profile_rebalances_representative_prediction(monkeypatch):
