@@ -89,6 +89,13 @@ where the native q8 tile is not profitable.
 }
 ```
 
+These settings also apply when DFlash2 is enabled for the same model. oMLX
+attaches the ANE procedures to DFlash2's target model and uses the active ANE
+tile width for DFlash2 prompt chunks. Draft generation and target verification
+remain on DFlash2's normal short-shape paths; only eligible prompt-prefill MLP
+and GDN projections are offloaded. If ANE setup is unavailable or compiles no
+eligible procedures, model loading continues with ordinary DFlash2.
+
 The private runtime accepted 121 resident model handles in a focused probe.
 The current dual path packages every fixed-shape slice as a procedure inside
 one model per physical ANE instance. The measured 64 MLP and 48 GDN layout
