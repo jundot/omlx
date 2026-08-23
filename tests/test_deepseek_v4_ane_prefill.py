@@ -43,9 +43,56 @@ def _mxfp8_grouped_linear(groups, in_features, out_features):
 def _attach(owner, prep, model0=None, model1=None):
     state, _, _ = prep
     owner._omlx_ane_config = ane_patch._AneConfig(SEQ)
+    owner._omlx_ane_profile_category = (
+        ane_patch._PROFILE_MLP
+        if isinstance(state, ane_patch._MlpState)
+        else ane_patch._PROFILE_ATTENTION_INPUT
+        if isinstance(state, ane_patch._AttentionInputState)
+        else ane_patch._PROFILE_WO_A
+        if isinstance(state, ane_patch._GroupedLinearState)
+        else ane_patch._PROFILE_QUERY
+    )
     owner._omlx_ane_state = replace(
         state, model=model0 or object(), model1=model1 or object()
     )
+
+
+def test_profile_snapshot_merges_expanded_native_and_python_metrics(monkeypatch):
+    width = len(fast._ANE_PROFILE_NATIVE_KEYS)
+    values = [0.0] * (len(fast._ANE_PROFILE_CATEGORIES) * width)
+    query_offset = fast._ANE_PROFILE_CATEGORY_IDS["deepseek_query"] * width
+    values[query_offset] = 3.0
+    fake_ext = SimpleNamespace(
+        qwen35_ane_profile_set_enabled=lambda enabled: None,
+        qwen35_ane_profile_reset=lambda: None,
+        qwen35_ane_profile_snapshot=lambda: values,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_ane_profile_aux_enabled", False)
+
+    assert fast.qwen35_ane_profile_set_enabled(True)
+    fast.qwen35_ane_profile_reset()
+    fast.qwen35_ane_profile_record(
+        "deepseek_query", exact_operations=2, logical_tokens=8192
+    )
+    snapshot = fast.qwen35_ane_profile_snapshot()
+
+    assert snapshot["deepseek_query"]["operations"] == 3
+    assert snapshot["deepseek_query"]["exact_operations"] == 2
+    assert snapshot["deepseek_query"]["logical_tokens"] == 8192
+    assert snapshot["mlp"]["operations"] == 0
+
+
+def test_profile_category_falls_back_safely_for_legacy_extension(monkeypatch):
+    monkeypatch.setattr(fast, "_ext", SimpleNamespace())
+    assert fast.qwen35_ane_profile_category_id("deepseek_query") == 1
+
+    monkeypatch.setattr(
+        fast,
+        "_ext",
+        SimpleNamespace(qwen35_ane_profile_category_count=lambda: 7),
+    )
+    assert fast.qwen35_ane_profile_category_id("deepseek_query") == 5
 
 
 def test_prepare_linear_splits_mxfp8_rows():
@@ -115,8 +162,10 @@ def test_linear_backend_guards_and_dispatch(monkeypatch):
     marker = mx.zeros((1, SEQ, 512), dtype=mx.bfloat16)
     calls = []
 
-    def fake_dual(x, weight, scales, biases, model0, model1, bits, variant, gs):
-        calls.append((bits, gs, int(weight.shape[0])))
+    def fake_dual(
+        x, weight, scales, biases, model0, model1, bits, variant, gs, category
+    ):
+        calls.append((bits, gs, int(weight.shape[0]), category))
         return marker
 
     monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", fake_dual)
@@ -125,7 +174,7 @@ def test_linear_backend_guards_and_dispatch(monkeypatch):
     out = ane_patch._linear_backend(linear, x)
 
     assert out is marker
-    assert calls == [(8, 64, 256)]
+    assert calls == [(8, 64, 256, fast._ANE_PROFILE_CATEGORY_IDS["deepseek_query"])]
     # DSpark verify arming and decode shapes fall through to the GPU path.
     decode_consistency.set_armed(True)
     try:
@@ -164,12 +213,18 @@ def test_linear_backend_pads_profitable_short_tile_and_slices(monkeypatch):
         SEQ, tail_padding_min_tokens=96
     )
     seen = []
+    records = []
 
     def fake_dual(x, *args):
         seen.append(x)
         return mx.full((1, SEQ, 512), 7, dtype=x.dtype)
 
     monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", fake_dual)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_profile_record",
+        lambda category, **values: records.append((category, values)),
+    )
     x = mx.ones((1, 100, 256), dtype=mx.bfloat16)
 
     result = ane_patch._linear_backend(linear, x)
@@ -181,6 +236,16 @@ def test_linear_backend_pads_profitable_short_tile_and_slices(monkeypatch):
     assert bool(mx.all(seen[0][:, :100] == 1))
     assert bool(mx.all(seen[0][:, 100:] == 0))
     assert bool(mx.all(result == 7))
+    assert records == [
+        (
+            "deepseek_query",
+            {
+                "padded_operations": 1,
+                "logical_tokens": 100,
+                "padded_tokens": SEQ - 100,
+            },
+        )
+    ]
 
 
 def test_tail_padding_never_intercepts_native_dspark_verify(monkeypatch):
@@ -191,10 +256,16 @@ def test_tail_padding_never_intercepts_native_dspark_verify(monkeypatch):
         SEQ, tail_padding_min_tokens=2
     )
     calls = []
+    records = []
     monkeypatch.setattr(
         fast,
         "qwen35_ane_dual_affine_qmm_t",
         lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_profile_record",
+        lambda category, **values: records.append((category, values)),
     )
 
     decode_consistency.set_armed(True)
@@ -208,6 +279,12 @@ def test_tail_padding_never_intercepts_native_dspark_verify(monkeypatch):
     finally:
         decode_consistency.set_armed(False)
     assert calls == []
+    assert records == [
+        (
+            "deepseek_query",
+            {"fallback_operations": 1, "dspark_bypasses": 1},
+        )
+    ]
 
 
 def test_mlp_backend_reassembles_gate_and_up(monkeypatch):
@@ -323,7 +400,13 @@ def test_grouped_backend_dispatches_and_guards_shape(monkeypatch):
     x = mx.zeros((1, 2, SEQ, 256), dtype=mx.bfloat16)
 
     assert ane_patch._grouped_backend(linear, x) is marker
-    assert calls[0][6:] == (2, 8, 8, 64, 1)
+    assert calls[0][6:] == (
+        2,
+        8,
+        8,
+        64,
+        fast._ANE_PROFILE_CATEGORY_IDS["deepseek_wo_a"],
+    )
     assert ane_patch._grouped_backend(linear, x[:, :, :4]) is None
     decode_consistency.set_armed(True)
     try:
@@ -610,6 +693,14 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
     assert model._omlx_ane_attention_input_prefill_count == 1
     assert model._omlx_ane_down_prefill_count == 1
     assert model._omlx_ane_wo_a_prefill_count == 0
+    assert model._omlx_ane_query_prefill_count == 1
+    assert layer.ffn.shared_experts._omlx_ane_profile_category == "deepseek_mlp"
+    assert (
+        layer.ffn.shared_experts.down_proj._omlx_ane_profile_category
+        == "deepseek_down"
+    )
+    assert layer.attn._omlx_ane_profile_category == "deepseek_attention_input"
+    assert layer.attn.wq_b._omlx_ane_profile_category == "deepseek_query"
     assert model._omlx_ane_tail_padding_min_tokens == 3000
     assert model._omlx_ane_dspark_native_compatible is True
     assert layer.attn.wq_b._omlx_ane_config.tail_padding_min_tokens == 3000

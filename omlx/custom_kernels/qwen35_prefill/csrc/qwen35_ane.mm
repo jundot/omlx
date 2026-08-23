@@ -40,8 +40,14 @@ using namespace mlx::core;
 
 enum ProfileMetric : size_t {
   kOperations,
+  kSuccessfulOperations,
   kPackNs,
   kAneRegionNs,
+  kMergeEncodeNs,
+  kMergeGpuNs,
+  kMergeCompletionNs,
+  kOutputCompletionNs,
+  kOperationEncodeNs,
   kAne0EvalNs,
   kAne1EvalNs,
   kAne0LaunchNs,
@@ -52,15 +58,21 @@ enum ProfileMetric : size_t {
   kCpuCompletionNs,
   kAneLast,
   kGpuLast,
+  kCpuLast,
   kGapBeforeNs,
   kProfileMetricCount,
 };
 
+constexpr int kProfileCategoryCount = 7;
+constexpr int kDefaultProfileCategory = 1;
 using ProfileCategory =
     std::array<std::atomic<uint64_t>, kProfileMetricCount>;
-ProfileCategory g_ane_profile[2]{};
+ProfileCategory g_ane_profile[kProfileCategoryCount]{};
 std::atomic<uint64_t> g_previous_ane_done_ns{0};
 std::atomic<int> g_ane_profile_override{-1};
+std::atomic<uint64_t> g_profile_pending_completions{0};
+std::mutex g_profile_completion_mutex;
+std::condition_variable g_profile_completion_cv;
 
 bool ane_profile_enabled() {
   const int override =
@@ -83,8 +95,45 @@ uint64_t profile_now_ns() {
 }
 
 void profile_add(int category, ProfileMetric metric, uint64_t value) {
+  if (category < 0 || category >= kProfileCategoryCount) {
+    category = kDefaultProfileCategory;
+  }
   g_ane_profile[category][metric].fetch_add(value,
                                              std::memory_order_relaxed);
+}
+
+int profile_category_or_default(int category, int fallback) {
+  return category >= 0 && category < kProfileCategoryCount ? category
+                                                            : fallback;
+}
+
+void profile_merge_completion(MTL::CommandBuffer *command_buffer, int category,
+                              uint64_t operation_start,
+                              uint64_t merge_start) {
+  g_profile_pending_completions.fetch_add(1, std::memory_order_relaxed);
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(command_buffer));
+  [buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+    const double duration = completed.GPUEndTime - completed.GPUStartTime;
+    if (duration > 0) {
+      profile_add(category, kMergeGpuNs,
+                  static_cast<uint64_t>(duration * 1e9));
+    }
+    const uint64_t done = profile_now_ns();
+    profile_add(category, kMergeCompletionNs, done - merge_start);
+    profile_add(category, kOutputCompletionNs, done - operation_start);
+    if (g_profile_pending_completions.fetch_sub(1, std::memory_order_acq_rel) ==
+        1) {
+      g_profile_completion_cv.notify_all();
+    }
+  }];
+}
+
+void profile_wait_for_completions() {
+  std::unique_lock<std::mutex> lock(g_profile_completion_mutex);
+  g_profile_completion_cv.wait_for(lock, std::chrono::seconds(1), [] {
+    return g_profile_pending_completions.load(std::memory_order_acquire) == 0;
+  });
 }
 
 std::string binary_dir() {
@@ -1088,6 +1137,9 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
 }
+bool AneLinearModel::completed(AneLinearModel::Ticket ticket) const {
+  return [impl_->event_ signaledValue] >= ticket.done;
+}
 void AneLinearModel::cancel_ticket(AneLinearModel::Ticket ticket) {
   impl_->cancel_ticket(ticket);
 }
@@ -1144,7 +1196,10 @@ void qwen35_ane_profile_set_enabled(bool enabled) {
   g_ane_profile_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+int qwen35_ane_profile_category_count() { return kProfileCategoryCount; }
+
 void qwen35_ane_profile_reset() {
+  profile_wait_for_completions();
   for (auto &category : g_ane_profile) {
     for (auto &metric : category) {
       metric.store(0, std::memory_order_relaxed);
@@ -1154,8 +1209,9 @@ void qwen35_ane_profile_reset() {
 }
 
 std::vector<double> qwen35_ane_profile_snapshot() {
+  profile_wait_for_completions();
   std::vector<double> result;
-  result.reserve(2 * kProfileMetricCount);
+  result.reserve(kProfileCategoryCount * kProfileMetricCount);
   for (const auto &category : g_ane_profile) {
     for (const auto &metric : category) {
       result.push_back(static_cast<double>(
@@ -2088,8 +2144,8 @@ public:
                        bool cpu_shared_resource = false)
       : Primitive(stream), model_(std::move(model)), variant_(variant),
         bits_(bits), group_size_(group_size), fuse_swiglu_(fuse_swiglu),
-        profile_category_(profile_category >= 0 ? profile_category
-                                                : (fuse_swiglu ? 0 : 1)),
+        profile_category_(profile_category_or_default(
+            profile_category, fuse_swiglu ? 0 : kDefaultProfileCategory)),
         cpu_fp16_(cpu_fp16), cpu_threads_(cpu_threads),
         cpu_shared_resource_(cpu_shared_resource) {}
 
@@ -2258,6 +2314,8 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    bool cpu_finished_last = false;
+    bool gpu_pending_after_ane = false;
     try {
       if (cpu_weight) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -2268,6 +2326,9 @@ public:
           profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
           profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
         }
+        cpu_finished_last =
+            profiling && model_->completed(ticket) &&
+            qmm_buffer.status == MTLCommandBufferStatusCompleted;
       }
       // Do not submit a future Metal wait here: on current M3 Ultra drivers
       // it can stall the already-queued qmm behind ANE. Both devices are
@@ -2275,6 +2336,8 @@ public:
       // immediately exposes asynchronous ANE failures before the merge is
       // encoded.
       model_->wait(ticket);
+      gpu_pending_after_ane =
+          profiling && qmm_buffer.status != MTLCommandBufferStatusCompleted;
     } catch (...) {
       // The committed qmm buffer references MLX arrays owned by this frame;
       // drain it before unwinding so the allocator cannot recycle them while
@@ -2294,13 +2357,16 @@ public:
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (cpu_finished_last) {
+        profile_add(profile_category, kCpuLast, 1);
+      } else if (!gpu_pending_after_ane) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
       }
     }
 
+    const uint64_t merge_start = profiling ? profile_now_ns() : 0;
     auto merge = device.get_kernel(
         std::string(cpu_weight
                         ? (fuse_swiglu_ ? "qwen35_ane_merge_cpu_swiglu_output_"
@@ -2349,12 +2415,23 @@ public:
         encoder.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
       }
     }
+    if (profiling) {
+      profile_merge_completion(encoder.get_command_buffer(), profile_category,
+                               operation_start, merge_start);
+    }
     encoder.add_temporary(std::move(gpu_output));
     if (cpu_input) {
       encoder.add_temporary(std::move(*cpu_input));
     }
     if (cpu_output) {
       encoder.add_temporary(std::move(*cpu_output));
+    }
+    if (profiling) {
+      const uint64_t encoded = profile_now_ns();
+      profile_add(profile_category, kSuccessfulOperations, 1);
+      profile_add(profile_category, kMergeEncodeNs, encoded - merge_start);
+      profile_add(profile_category, kOperationEncodeNs,
+                  encoded - operation_start);
     }
   }
 
@@ -2400,8 +2477,8 @@ public:
       : Primitive(stream), model0_(std::move(model0)),
         model1_(std::move(model1)), variant_(variant), bits_(bits),
         group_size_(group_size), fuse_swiglu_(fuse_swiglu),
-        profile_category_(profile_category >= 0 ? profile_category
-                                                : (fuse_swiglu ? 0 : 1)),
+        profile_category_(profile_category_or_default(
+            profile_category, fuse_swiglu ? 0 : kDefaultProfileCategory)),
         cpu_fp16_(cpu_fp16), cpu_threads_(cpu_threads),
         cpu_shared_resource_(cpu_shared_resource), groups_(groups) {}
 
@@ -2585,6 +2662,8 @@ public:
         profile_add(profile_category, kAne1EvalNs, end - start);
       }
     }).detach();
+    bool cpu_finished_last = false;
+    bool gpu_pending_after_ane = false;
     try {
       if (cpu_weight) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -2595,9 +2674,15 @@ public:
           profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
           profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
         }
+        cpu_finished_last =
+            profiling && model0_->completed(ticket0) &&
+            model1_->completed(ticket1) &&
+            qmm_buffer.status == MTLCommandBufferStatusCompleted;
       }
       model0_->wait(ticket0);
       model1_->wait(ticket1);
+      gpu_pending_after_ane =
+          profiling && qmm_buffer.status != MTLCommandBufferStatusCompleted;
     } catch (...) {
       // Same unwind hazard as the single-instance path: drain the committed
       // qmm before this frame's MLX arrays can be recycled. The detached ANE
@@ -2616,13 +2701,16 @@ public:
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (cpu_finished_last) {
+        profile_add(profile_category, kCpuLast, 1);
+      } else if (!gpu_pending_after_ane) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
       }
     }
 
+    const uint64_t merge_start = profiling ? profile_now_ns() : 0;
     auto merge = device.get_kernel(
         std::string(cpu_weight
                         ? (fuse_swiglu_
@@ -2677,12 +2765,23 @@ public:
         encoder.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
       }
     }
+    if (profiling) {
+      profile_merge_completion(encoder.get_command_buffer(), profile_category,
+                               operation_start, merge_start);
+    }
     encoder.add_temporary(std::move(gpu_output));
     if (cpu_input) {
       encoder.add_temporary(std::move(*cpu_input));
     }
     if (cpu_output) {
       encoder.add_temporary(std::move(*cpu_output));
+    }
+    if (profiling) {
+      const uint64_t encoded = profile_now_ns();
+      profile_add(profile_category, kSuccessfulOperations, 1);
+      profile_add(profile_category, kMergeEncodeNs, encoded - merge_start);
+      profile_add(profile_category, kOperationEncodeNs,
+                  encoded - operation_start);
     }
   }
 
@@ -2951,6 +3050,8 @@ public:
         }
       }).detach();
     }
+    bool cpu_finished_last = false;
+    bool gpu_pending_after_ane = false;
     try {
       if (cpu_fp16_) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -2967,11 +3068,16 @@ public:
           profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
           profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
         }
+        cpu_finished_last = profiling && model_->completed(ticket) &&
+                            (!model1_ || model1_->completed(ticket1)) &&
+                            suffix_buffer.status == MTLCommandBufferStatusCompleted;
       }
       model_->wait(ticket);
       if (model1_) {
         model1_->wait(ticket1);
       }
+      gpu_pending_after_ane =
+          profiling && suffix_buffer.status != MTLCommandBufferStatusCompleted;
     } catch (...) {
       // Same unwind hazard as the shared linear paths: drain the committed
       // suffix before this frame's MLX arrays can be recycled. The detached
@@ -2986,8 +3092,16 @@ public:
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
+      if (cpu_finished_last) {
+        profile_add(profile_category, kCpuLast, 1);
+      } else if (gpu_pending_after_ane) {
+        profile_add(profile_category, kGpuLast, 1);
+      } else {
+        profile_add(profile_category, kAneLast, 1);
+      }
     }
 
+    const uint64_t merge_start = profiling ? profile_now_ns() : 0;
     auto sum = device.get_kernel(
         std::string(cpu_fp16_ ? "qwen35_ane_sum_dual_cpu_output_"
                               : model1_ ? "qwen35_ane_sum_dual_output_"
@@ -3025,6 +3139,10 @@ public:
         encoder.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
       }
     }
+    if (profiling) {
+      profile_merge_completion(encoder.get_command_buffer(), profile_category,
+                               operation_start, merge_start);
+    }
     encoder.add_temporary(std::move(gate_up));
     encoder.add_temporary(std::move(activation));
     encoder.add_temporary(std::move(gpu_output));
@@ -3035,6 +3153,13 @@ public:
       encoder.add_temporary(std::move(*cpu_gate_up));
       encoder.add_temporary(std::move(*cpu_activation));
       encoder.add_temporary(std::move(*cpu_output));
+    }
+    if (profiling) {
+      const uint64_t encoded = profile_now_ns();
+      profile_add(profile_category, kSuccessfulOperations, 1);
+      profile_add(profile_category, kMergeEncodeNs, encoded - merge_start);
+      profile_add(profile_category, kOperationEncodeNs,
+                  encoded - operation_start);
     }
   }
 

@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -359,7 +360,56 @@ def qwen35_ane_hybrid_nax_enabled() -> bool:
     )
 
 
-_ANE_PROFILE_KEYS = (
+_ANE_PROFILE_CATEGORIES = (
+    "mlp",
+    "gdn",
+    "deepseek_mlp",
+    "deepseek_down",
+    "deepseek_attention_input",
+    "deepseek_query",
+    "deepseek_wo_a",
+)
+_ANE_PROFILE_CATEGORY_IDS = {
+    name: index for index, name in enumerate(_ANE_PROFILE_CATEGORIES)
+}
+
+_ANE_PROFILE_NATIVE_KEYS = (
+    "operations",
+    "successful_operations",
+    "pack_ns",
+    "ane_region_ns",
+    "merge_encode_ns",
+    "merge_gpu_ns",
+    "merge_completion_ns",
+    "output_completion_ns",
+    "operation_encode_ns",
+    "ane0_eval_ns",
+    "ane1_eval_ns",
+    "ane0_launch_ns",
+    "ane1_launch_ns",
+    "gpu_qmm_ns",
+    "gpu_completion_ns",
+    "cpu_matmul_ns",
+    "cpu_completion_ns",
+    "ane_last",
+    "gpu_last",
+    "cpu_last",
+    "gap_before_ns",
+)
+_ANE_PROFILE_AUX_KEYS = (
+    "exact_operations",
+    "padded_operations",
+    "logical_tokens",
+    "padded_tokens",
+    "fallback_operations",
+    "dspark_bypasses",
+    "shape_rejections",
+    "dtype_rejections",
+    "state_rejections",
+    "runtime_failures",
+)
+_ANE_PROFILE_KEYS = _ANE_PROFILE_NATIVE_KEYS + _ANE_PROFILE_AUX_KEYS
+_ANE_PROFILE_LEGACY_KEYS = (
     "operations",
     "pack_ns",
     "ane_region_ns",
@@ -375,32 +425,80 @@ _ANE_PROFILE_KEYS = (
     "gpu_last",
     "gap_before_ns",
 )
+_ane_profile_aux_lock = threading.Lock()
+_ane_profile_aux_enabled = os.environ.get("OMLX_ANE_PROFILE") == "1"
+_ane_profile_aux = {
+    name: {key: 0.0 for key in _ANE_PROFILE_AUX_KEYS}
+    for name in _ANE_PROFILE_CATEGORIES
+}
+
+
+def qwen35_ane_profile_category_id(category: str) -> int:
+    """Return a category safe for both current and legacy native extensions."""
+    category_id = _ANE_PROFILE_CATEGORY_IDS.get(category, 1)
+    native_count = (
+        int(_ext.qwen35_ane_profile_category_count())
+        if _ext is not None
+        and hasattr(_ext, "qwen35_ane_profile_category_count")
+        else 2
+    )
+    return category_id if category_id < native_count else 1
 
 
 def qwen35_ane_profile_reset() -> None:
     if _ext is not None and hasattr(_ext, "qwen35_ane_profile_reset"):
         _ext.qwen35_ane_profile_reset()
+    with _ane_profile_aux_lock:
+        for values in _ane_profile_aux.values():
+            for key in values:
+                values[key] = 0.0
 
 
 def qwen35_ane_profile_set_enabled(enabled: bool) -> bool:
     """Enable native ANE phase counters for a bounded diagnostic window."""
     if _ext is None or not hasattr(_ext, "qwen35_ane_profile_set_enabled"):
         return False
+    global _ane_profile_aux_enabled
     _ext.qwen35_ane_profile_set_enabled(bool(enabled))
+    _ane_profile_aux_enabled = bool(enabled)
     return True
+
+
+def qwen35_ane_profile_record(category: str, **values: int | float) -> None:
+    """Add Python-side dispatch metadata to the native profile snapshot."""
+    if not _ane_profile_aux_enabled or category not in _ane_profile_aux:
+        return
+    unknown = values.keys() - set(_ANE_PROFILE_AUX_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown ANE profile metrics: {sorted(unknown)}")
+    with _ane_profile_aux_lock:
+        target = _ane_profile_aux[category]
+        for key, value in values.items():
+            target[key] += float(value)
 
 
 def qwen35_ane_profile_snapshot() -> dict[str, dict[str, float]]:
     if _ext is None or not hasattr(_ext, "qwen35_ane_profile_snapshot"):
         return {}
     values = list(_ext.qwen35_ane_profile_snapshot())
-    width = len(_ANE_PROFILE_KEYS)
-    if len(values) != 2 * width:
+    if len(values) == 2 * len(_ANE_PROFILE_LEGACY_KEYS):
+        native_keys = _ANE_PROFILE_LEGACY_KEYS
+        categories = _ANE_PROFILE_CATEGORIES[:2]
+    elif len(values) == len(_ANE_PROFILE_CATEGORIES) * len(_ANE_PROFILE_NATIVE_KEYS):
+        native_keys = _ANE_PROFILE_NATIVE_KEYS
+        categories = _ANE_PROFILE_CATEGORIES
+    else:
         return {}
-    return {
-        name: dict(zip(_ANE_PROFILE_KEYS, values[index * width : (index + 1) * width]))
-        for index, name in enumerate(("mlp", "gdn"))
+    width = len(native_keys)
+    result = {
+        name: dict(zip(native_keys, values[index * width : (index + 1) * width]))
+        for index, name in enumerate(categories)
     }
+    with _ane_profile_aux_lock:
+        for name in _ANE_PROFILE_CATEGORIES:
+            category = result.setdefault(name, {})
+            category.update(_ane_profile_aux[name])
+    return result
 
 
 def qwen35_ane_compile_linear_grouped(

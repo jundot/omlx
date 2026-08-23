@@ -38,6 +38,7 @@ public:
   Ticket begin(MTL::CommandBuffer *command_buffer);
   void execute(Ticket ticket);
   void wait(Ticket ticket);
+  bool completed(Ticket ticket) const;
   // Retire a ticket whose producer command buffer failed before execute()
   // was ever called: balances the submission counters and wakes waiters
   // without latching the program (the failure is per-submission, typically
@@ -125,6 +126,7 @@ private:
 bool qwen35_ane_available();
 bool qwen35_ane_hybrid_nax_enabled();
 bool qwen35_cpu_shared_resource_available();
+int qwen35_ane_profile_category_count();
 void qwen35_ane_profile_set_enabled(bool enabled);
 void qwen35_ane_profile_reset();
 std::vector<double> qwen35_ane_profile_snapshot();

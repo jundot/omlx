@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 # merge primitive can dispatch it; measured GPU time is format-neutral.
 _SUFFIX_BITS = 8
 _SUFFIX_GROUP_SIZE = 64
+_PROFILE_MLP = "deepseek_mlp"
+_PROFILE_DOWN = "deepseek_down"
+_PROFILE_ATTENTION_INPUT = "deepseek_attention_input"
+_PROFILE_QUERY = "deepseek_query"
+_PROFILE_WO_A = "deepseek_wo_a"
 # Fractions follow the Phase A shape microbench optima. The indexer wq_b
 # rides inside the attention wq_b op (same q_residual input), so it adds no
 # operations of its own. wo_b is deliberately not accelerated: its per-op
@@ -553,6 +558,34 @@ def _padded_short_input(
     return mx.pad(x, padding)
 
 
+def _profile_category(owner: Any) -> str:
+    return str(getattr(owner, "_omlx_ane_profile_category", "gdn"))
+
+
+def _profile_record(owner: Any, **values: int | float) -> None:
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        fast.qwen35_ane_profile_record(_profile_category(owner), **values)
+    except Exception:
+        logger.debug("Unable to record DeepSeek ANE dispatch metadata", exc_info=True)
+
+
+def _profile_fallback(owner: Any, x: mx.array, config: _AneConfig | None) -> None:
+    values = {"fallback_operations": 1}
+    if is_armed():
+        values["dspark_bypasses"] = 1
+    elif getattr(owner, "_omlx_ane_failed", False):
+        values["runtime_failures"] = 1
+    elif config is None or getattr(owner, "_omlx_ane_state", None) is None:
+        values["state_rejections"] = 1
+    elif x.dtype not in (mx.float16, mx.bfloat16):
+        values["dtype_rejections"] = 1
+    else:
+        values["shape_rejections"] = 1
+    _profile_record(owner, **values)
+
+
 def _hybrid_combined_exact(owner: Any, x: mx.array) -> mx.array | None:
     config = getattr(owner, "_omlx_ane_config", None)
     if config is None or getattr(owner, "_omlx_ane_failed", False):
@@ -564,6 +597,10 @@ def _hybrid_combined_exact(owner: Any, x: mx.array) -> mx.array | None:
         return None
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
+
+        profile_category = fast.qwen35_ane_profile_category_id(
+            _profile_category(owner)
+        )
 
         if state.cpu_weight is not None:
             return fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
@@ -577,7 +614,7 @@ def _hybrid_combined_exact(owner: Any, x: mx.array) -> mx.array | None:
                 _SUFFIX_BITS,
                 8,
                 _SUFFIX_GROUP_SIZE,
-                1,
+                profile_category,
                 config.cpu_threads,
                 config.cpu_shared_resource,
             )
@@ -591,6 +628,7 @@ def _hybrid_combined_exact(owner: Any, x: mx.array) -> mx.array | None:
             _SUFFIX_BITS,
             8,
             _SUFFIX_GROUP_SIZE,
+            profile_category,
         )
     except Exception:
         owner._omlx_ane_failed = True
@@ -603,18 +641,30 @@ def _hybrid_combined_exact(owner: Any, x: mx.array) -> mx.array | None:
 
 def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
     """Run an exact tile or zero-pad one configured profitable short tail."""
+    rows = int(x.shape[-2]) if x.ndim >= 2 else 0
     combined = _hybrid_combined_exact(owner, x)
     if combined is not None:
+        _profile_record(owner, exact_operations=1, logical_tokens=rows)
         return combined
     config = getattr(owner, "_omlx_ane_config", None)
     if config is None or getattr(owner, "_omlx_ane_failed", False):
+        _profile_fallback(owner, x, config)
         return None
     padded_input = _padded_short_input(x, config)
     if padded_input is None:
+        _profile_fallback(owner, x, config)
         return None
-    rows = int(x.shape[-2])
     padded = _hybrid_combined_exact(owner, padded_input)
-    return None if padded is None else padded[..., :rows, :]
+    if padded is None:
+        _profile_fallback(owner, x, config)
+        return None
+    _profile_record(
+        owner,
+        padded_operations=1,
+        logical_tokens=rows,
+        padded_tokens=config.sequence_length - rows,
+    )
+    return padded[..., :rows, :]
 
 
 def _grouped_backend_exact(linear: Any, x: mx.array) -> mx.array | None:
@@ -636,6 +686,10 @@ def _grouped_backend_exact(linear: Any, x: mx.array) -> mx.array | None:
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
+        profile_category = fast.qwen35_ane_profile_category_id(
+            _profile_category(linear)
+        )
+
         return fast.qwen35_ane_dual_grouped_affine_qmm_t(
             x,
             state.weight,
@@ -647,7 +701,7 @@ def _grouped_backend_exact(linear: Any, x: mx.array) -> mx.array | None:
             _SUFFIX_BITS,
             8,
             _SUFFIX_GROUP_SIZE,
-            1,
+            profile_category,
         )
     except Exception:
         linear._omlx_ane_failed = True
@@ -659,8 +713,10 @@ def _grouped_backend_exact(linear: Any, x: mx.array) -> mx.array | None:
 
 
 def _grouped_backend(linear: Any, x: mx.array) -> mx.array | None:
+    rows = int(x.shape[-2]) if x.ndim >= 2 else 0
     combined = _grouped_backend_exact(linear, x)
     if combined is not None:
+        _profile_record(linear, exact_operations=1, logical_tokens=rows)
         return combined
     state = getattr(linear, "_omlx_ane_state", None)
     config = getattr(linear, "_omlx_ane_config", None)
@@ -669,13 +725,23 @@ def _grouped_backend(linear: Any, x: mx.array) -> mx.array | None:
         or config is None
         or getattr(linear, "_omlx_ane_failed", False)
     ):
+        _profile_fallback(linear, x, config)
         return None
     padded_input = _padded_short_input(x, config, grouped=True)
     if padded_input is None:
+        _profile_fallback(linear, x, config)
         return None
-    rows = int(x.shape[-2])
     padded = _grouped_backend_exact(linear, padded_input)
-    return None if padded is None else padded[..., :rows, :]
+    if padded is None:
+        _profile_fallback(linear, x, config)
+        return None
+    _profile_record(
+        linear,
+        padded_operations=1,
+        logical_tokens=rows,
+        padded_tokens=config.sequence_length - rows,
+    )
+    return padded[..., :rows, :]
 
 
 def _linear_backend(linear: Any, x: mx.array) -> mx.array | None:
@@ -876,6 +942,7 @@ def enable_deepseek_v4_ane_prefill(
                 )
                 prep = None
             if prep is not None:
+                shared._omlx_ane_profile_category = _PROFILE_MLP
                 prepared.append((shared, *prep))
                 mlp_count += 1
                 try:
@@ -891,6 +958,7 @@ def enable_deepseek_v4_ane_prefill(
                     )
                     down_prep = None
                 if down_prep is not None:
+                    shared.down_proj._omlx_ane_profile_category = _PROFILE_DOWN
                     prepared.append((shared.down_proj, *down_prep))
                     down_count += 1
         if attn is not None:
@@ -903,6 +971,7 @@ def enable_deepseek_v4_ane_prefill(
                 )
                 input_prep = None
             if input_prep is not None:
+                attn._omlx_ane_profile_category = _PROFILE_ATTENTION_INPUT
                 prepared.append((attn, *input_prep))
                 attention_input_count += 1
             if grouped_available:
@@ -917,6 +986,7 @@ def enable_deepseek_v4_ane_prefill(
                     )
                     wo_a_prep = None
                 if wo_a_prep is not None:
+                    attn.wo_a._omlx_ane_profile_category = _PROFILE_WO_A
                     grouped_prepared.append((attn.wo_a, *wo_a_prep))
                     wo_a_count += 1
         linear = getattr(attn, "wq_b", None)
@@ -954,6 +1024,7 @@ def enable_deepseek_v4_ane_prefill(
                 )
                 prep = None
         if prep is not None:
+            linear._omlx_ane_profile_category = _PROFILE_QUERY
             prepared.append((linear, *prep))
     if not prepared and not grouped_prepared:
         return 0
@@ -1039,6 +1110,9 @@ def enable_deepseek_v4_ane_prefill(
     model._omlx_ane_attention_input_prefill_count = attention_input_count
     model._omlx_ane_down_prefill_count = down_count
     model._omlx_ane_wo_a_prefill_count = wo_a_count
+    model._omlx_ane_query_prefill_count = (
+        len(prepared) - mlp_count - down_count - attention_input_count
+    )
     model._omlx_ane_tail_padding_min_tokens = tail_padding_min_tokens
     model._omlx_ane_dspark_native_compatible = True
     model._omlx_ane_cpu_prefill_count = sum(

@@ -905,6 +905,7 @@ def _log_ane_benchmark_trace(
     config = config or {}
     scheduler_trace = scheduler_trace or {}
     sequence_length = int(config.get("sequence_length", 0) or 0)
+    tail_padding_min_tokens = int(config.get("tail_padding_min_tokens", 0) or 0)
     prefill_tokens = max(0, pp_len - 1)
     chunk_tokens = [
         int(value)
@@ -917,11 +918,39 @@ def _log_ane_benchmark_trace(
         if int(value) > 0
     ]
     accounting_widths = chunk_tokens or [prefill_tokens]
-    full_shapes, tail = (0, prefill_tokens)
+    full_shapes, padded_shapes, logical_padded_tokens, padded_tokens, tail = (
+        0,
+        0,
+        0,
+        0,
+        prefill_tokens,
+    )
     if sequence_length > 0:
         divisions = [divmod(width, sequence_length) for width in accounting_widths]
         full_shapes = sum(full for full, _ in divisions)
-        tail = sum(remainder for _, remainder in divisions)
+        remainders = [remainder for _, remainder in divisions]
+        padded_remainders = (
+            [
+                remainder
+                for remainder in remainders
+                if remainder
+                and tail_padding_min_tokens <= remainder < sequence_length
+            ]
+            if tail_padding_min_tokens
+            else []
+        )
+        padded_shapes = len(padded_remainders)
+        logical_padded_tokens = sum(padded_remainders)
+        padded_tokens = sum(sequence_length - value for value in padded_remainders)
+        tail = sum(
+            value
+            for value in remainders
+            if not (
+                value
+                and tail_padding_min_tokens
+                and tail_padding_min_tokens <= value < sequence_length
+            )
+        )
 
     def width_histogram(values: list[int]) -> str:
         counts: dict[int, int] = {}
@@ -935,7 +964,8 @@ def _log_ane_benchmark_trace(
         "[benchmark-ane-summary] pp=%d prefill_tokens=%d sequence_length=%d "
         "model_calls=%d model_call_widths=%s requested_steps=%s "
         "boundary_enabled=%s cache_block_size=%d accounting=%s "
-        "full_ane_tiles=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
+        "full_ane_tiles=%d padded_ane_tiles=%d logical_padded_tokens=%d "
+        "padding_tokens=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
         pp_len,
         prefill_tokens,
         sequence_length,
@@ -946,6 +976,9 @@ def _log_ane_benchmark_trace(
         int(scheduler_trace.get("cache_block_size", 0) or 0),
         "observed" if chunk_tokens else "prompt_estimate",
         full_shapes,
+        padded_shapes,
+        logical_padded_tokens,
+        padded_tokens,
         tail,
         (
             f"{prefill_duration_s * 1000.0:.3f}"
@@ -961,28 +994,44 @@ def _log_ane_benchmark_trace(
         "profiling_available": bool(profiling_available),
         "sequence_length": sequence_length,
         "expected_full_shapes": full_shapes,
+        "expected_padded_shapes": padded_shapes,
+        "expected_ane_shapes": full_shapes + padded_shapes,
+        "padded_tokens": padded_tokens,
         "gpu_tail_tokens": tail,
         "categories": {},
     }
 
-    for category, layer_key, compiled_key in (
-        ("mlp", "mlp_layers", "compiled_mlp_layers"),
-        ("gdn", "gdn_layers", "compiled_gdn_layers"),
-    ):
+    profile_layers = config.get("profile_layers")
+    if isinstance(profile_layers, dict):
+        category_specs = [
+            (str(category), None, None, int(layers or 0))
+            for category, layers in profile_layers.items()
+        ]
+    else:
+        category_specs = [
+            ("mlp", "mlp_layers", "compiled_mlp_layers", None),
+            ("gdn", "gdn_layers", "compiled_gdn_layers", None),
+        ]
+
+    for category, layer_key, compiled_key, fixed_layers in category_specs:
         values = profile.get(category, {})
         operations = int(values.get("operations", 0) or 0)
-        configured_layers = int(config.get(layer_key, 0) or 0)
-        compiled_value = config.get(compiled_key)
-        compiled_layers = (
-            None if compiled_value is None else int(compiled_value)
-        )
+        if fixed_layers is not None:
+            configured_layers = fixed_layers
+            compiled_layers = fixed_layers
+        else:
+            configured_layers = int(config.get(layer_key, 0) or 0)
+            compiled_value = config.get(compiled_key)
+            compiled_layers = (
+                None if compiled_value is None else int(compiled_value)
+            )
         # Expectations follow what the patch actually compiled; the settings
         # value is only the fallback when the runtime state is unknown.
         layers = (
             compiled_layers if compiled_layers is not None else configured_layers
         )
         observed_shapes = operations / layers if layers > 0 else 0.0
-        expected_operations = full_shapes * layers
+        expected_operations = (full_shapes + padded_shapes) * layers
         per_op = max(operations, 1)
         elapsed_ns = (
             prefill_duration_s * 1e9
@@ -995,7 +1044,15 @@ def _log_ane_benchmark_trace(
             "observed_ane_tiles_per_layer=%.3f input_ready_ms_per_op=%.3f "
             "ane_region_ms_per_op=%.3f ane0_eval_ms_per_op=%.3f "
             "ane1_eval_ms_per_op=%.3f gpu_qmm_ms_per_op=%.3f "
-            "gap_before_ms_per_op=%.3f ane0_duty=%.4f ane1_duty=%.4f",
+            "cpu_matmul_ms_per_op=%.3f merge_encode_ms_per_op=%.3f "
+            "merge_gpu_ms_per_op=%.3f output_ready_ms_per_op=%.3f "
+            "operation_encode_ms_per_op=%.3f gap_before_ms_per_op=%.3f "
+            "successful_operations=%d exact_operations=%d padded_operations=%d "
+            "logical_tokens=%d "
+            "padded_tokens=%d fallbacks=%d dspark_bypasses=%d "
+            "shape_rejections=%d dtype_rejections=%d state_rejections=%d "
+            "runtime_failures=%d ane_last=%d gpu_last=%d cpu_last=%d "
+            "ane0_duty=%.4f ane1_duty=%.4f",
             pp_len,
             category,
             operations,
@@ -1008,7 +1065,28 @@ def _log_ane_benchmark_trace(
             float(values.get("ane0_eval_ns", 0.0) or 0.0) / per_op / 1e6,
             float(values.get("ane1_eval_ns", 0.0) or 0.0) / per_op / 1e6,
             float(values.get("gpu_qmm_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("cpu_matmul_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("merge_encode_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("merge_gpu_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("output_completion_ns", 0.0) or 0.0)
+            / per_op
+            / 1e6,
+            float(values.get("operation_encode_ns", 0.0) or 0.0) / per_op / 1e6,
             float(values.get("gap_before_ns", 0.0) or 0.0) / per_op / 1e6,
+            int(values.get("successful_operations", 0) or 0),
+            int(values.get("exact_operations", 0) or 0),
+            int(values.get("padded_operations", 0) or 0),
+            int(values.get("logical_tokens", 0) or 0),
+            int(values.get("padded_tokens", 0) or 0),
+            int(values.get("fallback_operations", 0) or 0),
+            int(values.get("dspark_bypasses", 0) or 0),
+            int(values.get("shape_rejections", 0) or 0),
+            int(values.get("dtype_rejections", 0) or 0),
+            int(values.get("state_rejections", 0) or 0),
+            int(values.get("runtime_failures", 0) or 0),
+            int(values.get("ane_last", 0) or 0),
+            int(values.get("gpu_last", 0) or 0),
+            int(values.get("cpu_last", 0) or 0),
             (
                 float(values.get("ane0_eval_ns", 0.0) or 0.0) / elapsed_ns
                 if elapsed_ns
@@ -1027,6 +1105,7 @@ def _log_ane_benchmark_trace(
             "observed_shapes": observed_shapes,
             "configured_layers": configured_layers,
             "compiled_layers": compiled_layers,
+            "metrics": dict(values),
         }
 
     return summary
@@ -1908,7 +1987,53 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             model_settings, "deepseek_ane_prefill_enabled", False
         ):
             loaded_model = getattr(engine, "_model", None)
-            if not getattr(loaded_model, "_omlx_ane_procedure_count", 0):
+            deepseek_profile_layers = {
+                "deepseek_mlp": int(
+                    getattr(loaded_model, "_omlx_ane_mlp_prefill_count", 0) or 0
+                ),
+                "deepseek_down": int(
+                    getattr(loaded_model, "_omlx_ane_down_prefill_count", 0) or 0
+                ),
+                "deepseek_attention_input": int(
+                    getattr(
+                        loaded_model,
+                        "_omlx_ane_attention_input_prefill_count",
+                        0,
+                    )
+                    or 0
+                ),
+                "deepseek_query": int(
+                    getattr(loaded_model, "_omlx_ane_query_prefill_count", 0) or 0
+                ),
+                "deepseek_wo_a": int(
+                    getattr(loaded_model, "_omlx_ane_wo_a_prefill_count", 0) or 0
+                ),
+            }
+            deepseek_active = bool(sum(deepseek_profile_layers.values()))
+            ane_trace_config = {
+                "sequence_length": int(
+                    getattr(
+                        model_settings,
+                        "deepseek_ane_prefill_sequence_length",
+                        4096,
+                    )
+                ),
+                "tail_padding_min_tokens": int(
+                    getattr(
+                        loaded_model,
+                        "_omlx_ane_tail_padding_min_tokens",
+                        getattr(
+                            model_settings,
+                            "deepseek_ane_prefill_tail_padding_min_tokens",
+                            0,
+                        ),
+                    )
+                    or 0
+                ),
+                "profile_layers": deepseek_profile_layers,
+                "active": deepseek_active,
+            }
+            if not deepseek_active:
                 run.feature_flags = [
                     flag
                     for flag in run.feature_flags
