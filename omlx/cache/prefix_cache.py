@@ -29,6 +29,7 @@ from .paged_cache import (
     CacheBlock,
     PagedCacheManager,
     compute_block_hash,
+    compute_chain_hashes,
     resolve_block_extra_keys,
 )
 from .paged_ssd_cache import _PM_SLICEABLE_SUB_CLASSES, PagedSSDCacheManager
@@ -215,8 +216,11 @@ class BlockAwarePrefixCache(CacheManager):
         self.expected_num_layers = self._get_model_num_layers(model)
 
         # Hash table for quick prefix lookup
-        # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
-        self._prefix_index: dict[bytes, tuple[int, tuple[int, ...], int]] = {}
+        # Maps chain-hash(tip) -> (prefix_len, tip_block_id, num_blocks).
+        # One entry per stored chain: intermediate prefixes are served by
+        # cached_block_hash_to_block, so per-depth entries only multiplied
+        # block-id slots (a k-block chain wrote ~k^2/2 ids per store).
+        self._prefix_index: dict[bytes, tuple[int, int, int]] = {}
 
         # Tie the index lifecycle to the paged cache's hash associations.
         # Without these hooks the index only ever grew (entries were dropped
@@ -614,12 +618,26 @@ class BlockAwarePrefixCache(CacheManager):
         if not tokens:
             return None, tokens
 
+        # Hash the whole prompt once (outside the paged lock) and share the
+        # chain hashes between the two lookup phases below. Sharing is only
+        # valid when per-block key resolution reduces to extra_keys for
+        # every block.
+        precomputed_hashes: list[BlockHash] | None = None
+        if extra_key_token_start is None and extra_key_ranges is None:
+            precomputed_hashes = compute_chain_hashes(
+                tokens,
+                self.block_size,
+                extra_keys=extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+
         # Try to find shared prefix blocks
         shared_block_ids, remaining = self.paged_cache.find_shared_prefix(
             tokens,
             extra_keys=extra_keys,
             extra_key_token_start=extra_key_token_start,
             extra_key_ranges=extra_key_ranges,
+            precomputed_hashes=precomputed_hashes,
         )
 
         if shared_block_ids:
@@ -648,9 +666,11 @@ class BlockAwarePrefixCache(CacheManager):
             return block_table, remaining
 
         # Try prefix index for longer matches
-        best_match = self._find_best_prefix_match(tokens, extra_keys=extra_keys)
+        best_match = self._find_best_prefix_match(
+            tokens, extra_keys=extra_keys, precomputed_hashes=precomputed_hashes
+        )
         if best_match:
-            prefix_len, matched_block_ids, num_blocks, chain_hashes = best_match
+            prefix_len, tip_block_id, num_blocks, chain_hashes = best_match
 
             # Re-validate the stored chain before reuse: index entries can
             # outlive their blocks (eviction, reuse for other content), and
@@ -660,9 +680,17 @@ class BlockAwarePrefixCache(CacheManager):
             # correct. The old code skipped missing blocks but kept the full
             # prefix_len, leaving holes in the block table.
             acquired: list[CacheBlock] = []
-            for block_id, expected_hash in zip(
-                matched_block_ids[:num_blocks], chain_hashes
-            ):
+            for depth, expected_hash in enumerate(chain_hashes):
+                # Entries carry only the tip block id; intermediate full
+                # blocks are resolved through the hash map, which holds every
+                # registered full block keyed by this same chain hash.
+                if depth == num_blocks - 1:
+                    block_id = tip_block_id
+                else:
+                    resolved = self.paged_cache.cached_block_hash_to_block.get_block(
+                        expected_hash
+                    )
+                    block_id = resolved.block_id if resolved is not None else -1
                 block = self.paged_cache.acquire_cached_block(block_id, expected_hash)
                 if block is None:
                     # Chain broken: self-heal the stale index entry so the
@@ -967,12 +995,23 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_key_ranges=extra_key_ranges,
                 )
 
+            # Compute the chain hash once per block: the dedup probe, the
+            # block tag and the hash registration below all share it
+            # (previously each of the three re-hashed the same input).
+            block_chain_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=block_extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+
             # Check if this block already exists (deduplication)
             if len(block_tokens) == self.block_size and not is_exact_terminal:
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
                     extra_keys=block_extra_keys,
+                    precomputed_hash=block_chain_hash,
                 )
                 if existing_block:
                     if split_gdn_layout and not self._has_split_gdn_checkpoint(
@@ -1052,13 +1091,8 @@ class BlockAwarePrefixCache(CacheManager):
             block_table.block_ids.append(block.block_id)
             block_table.num_tokens += len(block_tokens)
 
-            # Compute chain hash for this block
-            block.block_hash = compute_block_hash(
-                parent_hash,
-                block_tokens,
-                extra_keys=block_extra_keys,
-                model_name=self.paged_cache.model_name,
-            )
+            # Tag the block with the chain hash computed above
+            block.block_hash = block_chain_hash
 
             # Register ordinary full blocks for general prefix matching. The
             # exact terminal uses a separate hash domain so it can carry the
@@ -1066,7 +1100,11 @@ class BlockAwarePrefixCache(CacheManager):
             # block that may contain placeholders.
             if len(block_tokens) == self.block_size and not is_exact_terminal:
                 self.paged_cache.register_block_hash(
-                    block, block_tokens, parent_hash, extra_keys=block_extra_keys
+                    block,
+                    block_tokens,
+                    parent_hash,
+                    extra_keys=block_extra_keys,
+                    precomputed_hash=block_chain_hash,
                 )
             elif is_exact_terminal and block.block_hash is not None:
                 self.paged_cache.cached_block_hash_to_block.insert(
@@ -4489,48 +4527,63 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         tokens: list[int],
         extra_keys: tuple[Any, ...] | None = None,
-    ) -> tuple[int, tuple[int, ...], int, list[bytes]] | None:
+        precomputed_hashes: list[BlockHash] | None = None,
+    ) -> tuple[int, int, int, list[bytes]] | None:
         """Find best matching prefix in the index.
 
         Returns:
-            Tuple of (prefix_len, block_ids, num_blocks, chain_hashes) where
-            chain_hashes holds the per-block chain hash for each matched
-            block, or None when nothing matched. The hashes let the caller
-            re-validate that the indexed blocks still hold the content they
-            were indexed for before reusing them.
+            Tuple of (prefix_len, tip_block_id, num_blocks, chain_hashes)
+            where chain_hashes holds the per-block chain hash for each
+            matched block, or None when nothing matched. The hashes let the
+            caller re-validate that the indexed blocks still hold the content
+            they were indexed for before reusing them; intermediate block
+            ids are resolved through cached_block_hash_to_block at that point.
         """
-        best_match = None
+        best_match: tuple[int, int, int] | None = None
         best_len = 0
+        num_blocks = 0
 
         parent_hash = b""
         prefix_len = 0
-        num_blocks = 0
         chain_hashes: list[bytes] = []
 
-        for start in range(0, len(tokens), self.block_size):
+        for i, start in enumerate(range(0, len(tokens), self.block_size)):
             end = min(start + self.block_size, len(tokens))
             block_tokens = tokens[start:end]
             if not block_tokens:
                 break
 
-            parent_hash = compute_block_hash(
-                parent_hash,
-                block_tokens,
-                extra_keys=extra_keys,
-                model_name=self.paged_cache.model_name,
-            )
+            if precomputed_hashes is not None:
+                parent_hash = precomputed_hashes[i]
+            else:
+                parent_hash = compute_block_hash(
+                    parent_hash,
+                    block_tokens,
+                    extra_keys=extra_keys,
+                    model_name=self.paged_cache.model_name,
+                )
             prefix_len += len(block_tokens)
-            num_blocks += 1
             chain_hashes.append(parent_hash)
 
             entry = self._prefix_index.get(parent_hash)
             if entry and entry[0] == prefix_len and prefix_len > best_len:
                 best_match = entry
                 best_len = prefix_len
+                num_blocks = i + 1
+            elif (
+                entry is None
+                and self.paged_cache.cached_block_hash_to_block.get_block(
+                    parent_hash
+                )
+                is None
+            ):
+                # No tip entry and no live block at this depth: each deeper
+                # chain hash mixes in this one, so no deeper match can exist.
+                break
 
         if best_match is None:
             return None
-        return (*best_match, chain_hashes[: best_match[2]])
+        return (*best_match, chain_hashes[:num_blocks])
 
     def _update_prefix_index(
         self,
@@ -4539,9 +4592,16 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
     ) -> None:
         """Update prefix index with new token sequence."""
-        # Index prefixes using chain hashes (avoid O(n^2) full-prefix hashing).
+        # Index only the chain tip, keyed by its chain hash (avoid O(n^2)
+        # block-id slots: per-depth entries cost ~k^2/2 ids for a k-block
+        # chain without adding hits). Intermediate prefixes resolve through
+        # cached_block_hash_to_block at fetch time; the tip block id is
+        # stored explicitly because a partial tip is never registered there.
         parent_hash = b""
         prefix_len = 0
+        num_blocks = 0
+        tip_block_id: int | None = None
+        tip_hash: bytes | None = None
 
         for i, block_id in enumerate(block_ids):
             start = i * self.block_size
@@ -4565,14 +4625,22 @@ class BlockAwarePrefixCache(CacheManager):
                     model_name=self.paged_cache.model_name,
                 )
                 block.block_hash = block_hash
+                # Register the association as well: the tip entry no longer
+                # carries intermediate block ids, so fetch resolves them
+                # through the hash map.
+                if len(block_tokens) == self.block_size:
+                    self.paged_cache.cached_block_hash_to_block.insert(
+                        block_hash, block
+                    )
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
-            self._prefix_index[block_hash] = (
-                prefix_len,
-                tuple(block_ids[: i + 1]),
-                i + 1,
-            )
+            num_blocks += 1
+            tip_block_id = block_id
+            tip_hash = block_hash
+
+        if tip_hash is not None:
+            self._prefix_index[tip_hash] = (prefix_len, tip_block_id, num_blocks)
 
     def _on_block_hash_dropped(self, block_hash: bytes) -> None:
         """Drop the prefix-index entry for a dead block-hash association.

@@ -119,6 +119,40 @@ def compute_block_hash(
     return BlockHash(hasher.digest())
 
 
+def compute_chain_hashes(
+    token_ids: list[int],
+    block_size: int,
+    extra_keys: tuple[Any, ...] | None = None,
+    extra_key_token_start: int | None = None,
+    extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    model_name: str | None = None,
+) -> list[BlockHash]:
+    """Compute the per-block chain hashes for a token sequence.
+
+    Pure function of the tokens and cache keys, so callers can hash a whole
+    prompt once outside the manager lock and share the result between lookup
+    phases instead of re-hashing under ``PagedCacheManager._lock``.
+    """
+    hashes: list[BlockHash] = []
+    parent_hash: BlockHash | None = None
+    for start in range(0, len(token_ids), block_size):
+        block_tokens = token_ids[start : start + block_size]
+        block_extra_keys = resolve_block_extra_keys(
+            start + len(block_tokens),
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        parent_hash = compute_block_hash(
+            parent_hash,
+            block_tokens,
+            extra_keys=block_extra_keys,
+            model_name=model_name,
+        )
+        hashes.append(parent_hash)
+    return hashes
+
+
 # =============================================================================
 # KVCacheBlock - Following vLLM's design
 # =============================================================================
@@ -1015,6 +1049,7 @@ class PagedCacheManager(CacheManager):
         extra_keys: Optional[Tuple[Any, ...]] = None,
         extra_key_token_start: Optional[int] = None,
         extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+        precomputed_hashes: list[BlockHash] | None = None,
     ) -> Tuple[List[CacheBlock], int]:
         """
         Find cached blocks for a token prefix (vLLM style).
@@ -1022,6 +1057,9 @@ class PagedCacheManager(CacheManager):
         Args:
             token_ids: Token IDs to look up
             extra_keys: Additional keys for hash (e.g., VLM image hash)
+            precomputed_hashes: Chain hashes from compute_chain_hashes(), when
+                the caller already hashed the prompt. Hashing happens outside
+                the manager lock; the lock only covers the dict probes below.
 
         Returns:
             Tuple of (cached_blocks, num_cached_tokens)
@@ -1029,30 +1067,24 @@ class PagedCacheManager(CacheManager):
         if not self.enable_caching:
             return [], 0
 
+        num_full_blocks = len(token_ids) // self.block_size
+        if precomputed_hashes is None:
+            block_hashes = compute_chain_hashes(
+                token_ids,
+                self.block_size,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+                model_name=self.model_name,
+            )[:num_full_blocks]
+        else:
+            block_hashes = precomputed_hashes[:num_full_blocks]
+
         with self._lock:
             cached_blocks = []
-            parent_hash = None
             num_cached_tokens = 0
 
-            num_full_blocks = len(token_ids) // self.block_size
-
-            for i in range(num_full_blocks):
-                start = i * self.block_size
-                end = start + self.block_size
-                block_tokens = token_ids[start:end]
-                block_extra_keys = resolve_block_extra_keys(
-                    end,
-                    extra_keys=extra_keys,
-                    extra_key_token_start=extra_key_token_start,
-                    extra_key_ranges=extra_key_ranges,
-                )
-
-                # Compute expected hash
-                block_hash = compute_block_hash(
-                    parent_hash, block_tokens,
-                    extra_keys=block_extra_keys, model_name=self.model_name,
-                )
-
+            for block_hash in block_hashes:
                 # Look up in cache
                 cached_block = self.cached_block_hash_to_block.get_block(block_hash)
 
@@ -1078,7 +1110,6 @@ class PagedCacheManager(CacheManager):
                     break  # Cache miss, stop here
 
                 cached_blocks.append(cached_block)
-                parent_hash = block_hash
                 num_cached_tokens += self.block_size
                 self.stats.hits += 1
 
@@ -1093,6 +1124,7 @@ class PagedCacheManager(CacheManager):
         tokens: List[int],
         parent_hash: Optional[BlockHash] = None,
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        precomputed_hash: BlockHash | None = None,
     ) -> Optional[CacheBlock]:
         """
         Find a cached block matching the given tokens using chain hash.
@@ -1101,6 +1133,8 @@ class PagedCacheManager(CacheManager):
             tokens: Token IDs to look up
             parent_hash: Hash of the parent block (for chain), or None for first block
             extra_keys: Additional keys for hash (e.g., VLM image hash)
+            precomputed_hash: Chain hash for these exact tokens/parent/keys
+                when the caller already computed it (skips re-hashing)
 
         Returns:
             Cached block if found, None otherwise
@@ -1109,10 +1143,12 @@ class PagedCacheManager(CacheManager):
             return None
 
         with self._lock:
-            block_hash = compute_block_hash(
-                parent_hash, tokens, extra_keys=extra_keys,
-                model_name=self.model_name,
-            )
+            block_hash = precomputed_hash
+            if block_hash is None:
+                block_hash = compute_block_hash(
+                    parent_hash, tokens, extra_keys=extra_keys,
+                    model_name=self.model_name,
+                )
             block = self.cached_block_hash_to_block.get_block(block_hash)
             if block:
                 block.touch()
@@ -1128,6 +1164,7 @@ class PagedCacheManager(CacheManager):
         tokens: List[int],
         parent_hash: Optional[BlockHash] = None,
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        precomputed_hash: BlockHash | None = None,
     ) -> None:
         """
         Register a block's hash for deduplication using chain hash.
@@ -1137,15 +1174,19 @@ class PagedCacheManager(CacheManager):
             tokens: Token IDs in this block
             parent_hash: Hash of the parent block (for chain), or None for first block
             extra_keys: Additional keys for hash (e.g., VLM image hash)
+            precomputed_hash: Chain hash for these exact tokens/parent/keys
+                when the caller already computed it (skips re-hashing)
         """
         if not self.enable_caching:
             return
 
         with self._lock:
-            block_hash = compute_block_hash(
-                parent_hash, tokens, extra_keys=extra_keys,
-                model_name=self.model_name,
-            )
+            block_hash = precomputed_hash
+            if block_hash is None:
+                block_hash = compute_block_hash(
+                    parent_hash, tokens, extra_keys=extra_keys,
+                    model_name=self.model_name,
+                )
             block.block_hash = block_hash
             self.cached_block_hash_to_block.insert(block_hash, block)
 
@@ -1203,6 +1244,7 @@ class PagedCacheManager(CacheManager):
         extra_keys: Optional[Tuple[Any, ...]] = None,
         extra_key_token_start: Optional[int] = None,
         extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+        precomputed_hashes: list[BlockHash] | None = None,
     ) -> Tuple[List[int], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
@@ -1214,6 +1256,7 @@ class PagedCacheManager(CacheManager):
             extra_keys=extra_keys,
             extra_key_token_start=extra_key_token_start,
             extra_key_ranges=extra_key_ranges,
+            precomputed_hashes=precomputed_hashes,
         )
 
         shared_block_ids = [b.block_id for b in cached_blocks]

@@ -951,15 +951,16 @@ class TestPrefixIndexOperations:
         tokens = [1, 2, 3, 4]
         block_ids = [1, 2]
 
-        # Manually add to prefix index
+        # Manually add to prefix index: (prefix_len, tip_block_id, num_blocks)
         block_hash = compute_block_hash(b"", tokens, model_name=paged_cache.model_name)
-        prefix_cache._prefix_index[block_hash] = (4, block_ids, 1)
+        prefix_cache._prefix_index[block_hash] = (4, block_ids[-1], 1)
 
         result = prefix_cache._find_best_prefix_match(tokens)
 
         assert result is not None
-        prefix_len, matched_ids, num_blocks, chain_hashes = result
+        prefix_len, tip_block_id, num_blocks, chain_hashes = result
         assert prefix_len == 4
+        assert tip_block_id == block_ids[-1]
         assert chain_hashes == [block_hash]
 
     def test_prefix_index_immutable_after_store(self, prefix_cache, paged_cache):
@@ -967,7 +968,8 @@ class TestPrefixIndexOperations:
         of the original block_ids list (e.g., from CoW or block reallocation).
 
         Regression test for: storing a mutable list reference in _prefix_index
-        allows CoW operations to silently corrupt the index.
+        allows CoW operations to silently corrupt the index. Entries now hold
+        only the tip block id (an int), so there is no list to corrupt.
         """
         tokens = [1, 2, 3, 4, 5, 6, 7, 8]  # 2 blocks (block_size=4)
 
@@ -982,11 +984,11 @@ class TestPrefixIndexOperations:
         # Simulate CoW: mutate the original list in-place
         block_ids[0] = 9999
 
-        # Verify: prefix_index must still contain the original block IDs
-        result = prefix_cache._find_best_prefix_match(tokens)
-        assert result is not None
-        _, matched_ids, num_blocks, _ = result
-        assert list(matched_ids[:num_blocks]) == original_ids[:num_blocks]
+        # Verify: fetch still resolves the original blocks
+        table, remaining = prefix_cache.fetch_cache("req-cow", tokens)
+        assert table is not None
+        assert table.block_ids == original_ids
+        assert remaining == []
 
 
 class TestPrefixIndexLifecycle:
@@ -1031,7 +1033,8 @@ class TestPrefixIndexLifecycle:
         blocks = self._indexed_blocks(
             prefix_cache, paged_cache, [1, 2, 3, 4, 5, 6, 7, 8]
         )
-        assert len(prefix_cache._prefix_index) == 2
+        # One tip entry per stored chain, not one per block.
+        assert len(prefix_cache._prefix_index) == 1
 
         for block in blocks:
             paged_cache.free_block(block.block_id)
@@ -1152,8 +1155,11 @@ class TestPrefixIndexValidation:
         stale_entry_key = blocks[1].block_hash
 
         # Simulate the tail block being reused for other content after the
-        # index was written.
+        # index was written: its hash association dies with the reuse (as in
+        # the manager's free/evict paths), which also drops the tip entry.
+        paged_cache.cached_block_hash_to_block.pop(stale_entry_key, blocks[1].block_id)
         blocks[1].block_hash = b"reassigned"
+        paged_cache._notify_hash_dropped(stale_entry_key)
 
         table, remaining = prefix_cache.fetch_cache("req-stale", tokens)
 
@@ -1164,13 +1170,17 @@ class TestPrefixIndexValidation:
         # Reference taken only on the validated block.
         assert blocks[0].ref_count == 2
         assert blocks[1].ref_count == 1
-        # The dead-chain entry self-healed out of the index.
+        # The dead-chain entry is gone from the index.
         assert stale_entry_key not in prefix_cache._prefix_index
 
     def test_fully_stale_chain_is_a_miss(self, prefix_cache, paged_cache):
         tokens = [1, 2, 3, 4, 5, 6, 7, 8]
         blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+        # Head block reused for other content: its hash association dies.
+        stale_head_hash = blocks[0].block_hash
+        paged_cache.cached_block_hash_to_block.pop(stale_head_hash, blocks[0].block_id)
         blocks[0].block_hash = b"reassigned"
+        paged_cache._notify_hash_dropped(stale_head_hash)
 
         table, remaining = prefix_cache.fetch_cache("req-miss", tokens)
 
@@ -1178,6 +1188,188 @@ class TestPrefixIndexValidation:
         assert remaining == tokens
         assert blocks[0].ref_count == 1
         assert blocks[1].ref_count == 1
+
+
+class TestTipOnlyPrefixIndex:
+    """Regression tests for the tip-only prefix index.
+
+    The index used to store tuple(block_ids[:i+1]) for every block of every
+    stored chain -- a k-block chain wrote ~k^2/2 block-id slots per store.
+    Entries are now (prefix_len, tip_block_id, num_blocks), one per chain,
+    and each block is hashed once per store pass.
+    """
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def prefix_cache(self, paged_cache):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+        )
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def _indexed_blocks(self, prefix_cache, paged_cache, tokens):
+        """Allocate blocks for tokens and index them; returns the blocks."""
+        num = len(tokens) // paged_cache.block_size
+        blocks = paged_cache.get_new_blocks(num)
+        for block in blocks:
+            block.token_count = paged_cache.block_size
+        prefix_cache._update_prefix_index(tokens, [b.block_id for b in blocks])
+        return blocks
+
+    @staticmethod
+    def _kv_cache_data(mx, num_tokens):
+        return [
+            {
+                "state": (
+                    mx.ones((1, 8, num_tokens, 64)),
+                    mx.ones((1, 8, num_tokens, 64)),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            }
+        ]
+
+    def test_index_holds_one_entry_per_chain(self, prefix_cache, paged_cache):
+        """Index slot count is O(1) per chain, not O(num_blocks)."""
+        for num_blocks in (2, 8):
+            tokens = list(range(num_blocks * 4))
+            blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+
+            assert len(prefix_cache._prefix_index) == 1
+            entry = next(iter(prefix_cache._prefix_index.values()))
+            assert entry == (len(tokens), blocks[-1].block_id, num_blocks)
+
+            prefix_cache._prefix_index.clear()
+
+    def test_store_cache_writes_one_tip_entry(self, prefix_cache, paged_cache, mx):
+        """A stored chain adds exactly one tip entry, however long it is."""
+        tokens = list(range(32))  # 8 full blocks
+        table = prefix_cache.store_cache(
+            "req-tip", tokens, self._kv_cache_data(mx, len(tokens))
+        )
+        assert table is not None and len(table.block_ids) == 8
+        assert len(prefix_cache._prefix_index) == 1
+        entry = next(iter(prefix_cache._prefix_index.values()))
+        assert entry == (32, table.block_ids[-1], 8)
+
+        # Extending the chain (next conversation turn) adds one more entry.
+        tokens_ext = tokens + list(range(32, 40))
+        table_ext = prefix_cache.store_cache(
+            "req-tip-2", tokens_ext, self._kv_cache_data(mx, len(tokens_ext))
+        )
+        assert table_ext is not None and len(table_ext.block_ids) == 10
+        assert len(prefix_cache._prefix_index) == 2
+
+    def test_store_hashes_each_block_once(
+        self, prefix_cache, paged_cache, mx, monkeypatch
+    ):
+        """A k-block store computes ~k chain hashes, not 3k.
+
+        Regression test: the dedup probe, the block tag and the hash
+        registration each re-hashed the same input (3x per block).
+        """
+        import omlx.cache.paged_cache as paged_module
+        import omlx.cache.prefix_cache as prefix_module
+
+        calls = 0
+        real_hash = paged_module.compute_block_hash
+
+        def counting_hash(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_hash(*args, **kwargs)
+
+        monkeypatch.setattr(paged_module, "compute_block_hash", counting_hash)
+        monkeypatch.setattr(prefix_module, "compute_block_hash", counting_hash)
+
+        tokens = list(range(16))  # 4 full blocks
+        table = prefix_cache.store_cache(
+            "req-hash", tokens, self._kv_cache_data(mx, len(tokens))
+        )
+
+        assert table is not None and len(table.block_ids) == 4
+        assert calls == 4
+
+    def test_fetch_partial_prefix_hit(self, prefix_cache, paged_cache, mx):
+        """A longer prompt reuses the stored full blocks and keeps the rest."""
+        tokens = list(range(8))
+        prefix_cache.store_cache("req-p", tokens, self._kv_cache_data(mx, 8))
+
+        table, remaining = prefix_cache.fetch_cache("req-p2", list(range(12)))
+
+        assert table is not None
+        assert table.num_tokens == 8
+        assert remaining == list(range(8, 12))
+
+    def test_fetch_miss_then_store_then_hit(self, prefix_cache, paged_cache, mx):
+        tokens = list(range(8))
+
+        table, remaining = prefix_cache.fetch_cache("req-m", tokens)
+        assert table is None
+        assert remaining == tokens
+
+        prefix_cache.store_cache("req-m", tokens, self._kv_cache_data(mx, 8))
+
+        table, remaining = prefix_cache.fetch_cache("req-m2", tokens)
+        assert table is not None
+        assert table.num_tokens == 8
+        assert remaining == []
+
+    def test_block_hash_drop_evicts_the_right_entries(
+        self, prefix_cache, paged_cache
+    ):
+        """Dropping an intermediate hash severs the chain; dropping the tip
+        hash evicts the chain's only index entry."""
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+        assert len(prefix_cache._prefix_index) == 1
+
+        # Head hash dropped: the chain can no longer be served, and the
+        # orphaned tip entry is left to the tip's own lifecycle hook.
+        paged_cache._maybe_evict_cached_block(blocks[0])
+        table, remaining = prefix_cache.fetch_cache("req-drop", tokens)
+        assert table is None
+        assert remaining == tokens
+        assert len(prefix_cache._prefix_index) == 1
+
+        # Tip hash dropped: the tip entry dies with it.
+        paged_cache._maybe_evict_cached_block(blocks[1])
+        assert len(prefix_cache._prefix_index) == 0
+
+    def test_stale_tip_entry_self_heals_on_fetch(self, prefix_cache, paged_cache):
+        """A tip entry whose block was reassigned is evicted on fetch."""
+        tokens = [1, 2, 3, 4]
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+        tip_hash = blocks[0].block_hash
+        assert len(prefix_cache._prefix_index) == 1
+
+        # Reassign the block out of band (no lifecycle hook fires, so the
+        # tip entry survives until fetch re-validates it).
+        paged_cache.cached_block_hash_to_block.pop(tip_hash, blocks[0].block_id)
+        blocks[0].block_hash = b"reassigned"
+
+        table, remaining = prefix_cache.fetch_cache("req-stale-tip", tokens)
+        assert table is None
+        assert remaining == tokens
+        assert tip_hash not in prefix_cache._prefix_index
 
 
 class TestValidateBlockCacheData:
@@ -2099,7 +2291,7 @@ class TestArraysCacheLastBlockOnly:
         assert reconstructed_keys.tolist() == keys.tolist()
         assert reconstructed_values.tolist() == values.tolist()
 
-        # Force prefix-index fallback by removing chain-hash index entries.
+        # Remove every hash-map association for the stored chain.
         for block_id in retry_result.block_ids:
             block = paged_cache.allocated_blocks.get(block_id)
             assert block is not None
@@ -2111,15 +2303,15 @@ class TestArraysCacheLastBlockOnly:
         shared_block_ids, _ = paged_cache.find_shared_prefix(tokens)
         assert shared_block_ids == []
 
-        expected_ids = retry_result.block_ids.copy()
-        # Public contract via prefix-index fallback: full prefix hit, no remaining tokens.
+        # The tip-only index resolves intermediate blocks through the hash
+        # map, so with the map wiped the chain is no longer fetchable and
+        # fetch misses (the pre-tip-only index stored every block id per
+        # depth and could still serve the chain from the index alone).
         fetched_table, remaining = cache.fetch_cache(
             "req-retry-prefix-index-hit", tokens
         )
-        assert fetched_table is not None
-        assert fetched_table.block_ids == expected_ids
-        assert fetched_table.num_tokens == 12
-        assert remaining == []
+        assert fetched_table is None
+        assert remaining == tokens
 
 
 class TestPrefixCacheCacheList:
