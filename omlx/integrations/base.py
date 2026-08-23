@@ -51,11 +51,11 @@ class IntegrationContext:
 class Integration:
     """Base integration definition."""
 
-    name: str
-    display_name: str
-    type: str
-    install_check: str
-    install_hint: str
+    name: str # "codex", "opencode", "openclaw", "hermes", "pi"
+    display_name: str # "Codex", "OpenCode", "OpenClaw", "Hermes Agent", "Pi"
+    type: str # "env_var" or "config_file"
+    install_check: str # binary name to check with `which`
+    install_hint: str # installation instructions
 
     def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
@@ -78,7 +78,12 @@ class Integration:
         return None
 
     def _scrubbed_env(self) -> dict[str, str]:
-        """Return an os.environ copy with bundled-Python vars removed."""
+        """Return an os.environ copy with bundled-Python vars removed.
+
+        oMLX.app sets PYTHONHOME/PYTHONPATH to its bundled cpython-3.11.
+        Launched tools spawn their own Python subprocesses; if they inherit
+        these they crash with init_fs_encoding errors.
+        """
         env = os.environ.copy()
         for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
             env.pop(key, None)
@@ -87,7 +92,14 @@ class Integration:
     def select_model(
         self, models_info: list[dict], tool_name: str | None = None
     ) -> str:
-        """Select a model interactively."""
+        """Select a model interactively.
+
+        Shows a curses arrow-key picker when running in a TTY; falls back to
+        numbered terminal selection when curses is unavailable (e.g. native
+        Windows Python) or stdout is not a TTY.
+
+        Returns the selected model id (empty string when models_info is empty).
+        """
         if not models_info:
             return ""
 
@@ -113,10 +125,14 @@ class Integration:
             try:
                 return _select_model_curses(models_info, name)
             except ImportError:
+                # Stdlib curses missing (e.g. native windows python).
                 pass
             except Exception:
+                # Curses init/runtime failure (dumb terminal, no terminfo
+                # entry, broken pipe, etc.). Fall through to numbered.
                 pass
 
+        # Fallback: numbered terminal selection
         print("Available models:")
         for i, m in enumerate(models_info, 1):
             ctx = m.get("max_context_window")
@@ -145,7 +161,7 @@ class Integration:
         *,
         backup: bool = True,
     ) -> None:
-        """Read, update, and write a JSON config file.
+        """Read, update, and write a JSON config file with optional backup.
 
         Args:
             config_path: Path to the config file.
@@ -161,6 +177,7 @@ class Integration:
                 print("Creating new config file.")
                 existing = {}
 
+            # Create timestamped backup
             if backup:
                 timestamp = int(time.time())
                 backup_path = config_path.with_suffix(f".{timestamp}.bak")
@@ -181,11 +198,22 @@ class Integration:
 
 
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
-    """Show a fullscreen curses arrow-key picker for model selection."""
+    """Show a fullscreen curses arrow-key picker for model selection.
+
+    Loaded models appear first, then unloaded models. Curses uses terminfo so
+    this works reliably across SSH/PuTTY/tmux/screen.
+
+    Raises ImportError if stdlib curses is not available.
+    Returns the selected model id, or exits with 130 on cancel.
+    """
     import curses
     import locale
 
+    # Required so curses renders unicode bullets (●○) correctly.
     locale.setlocale(locale.LC_ALL, "")
+
+    # Sort: loaded first, then unloaded. Default to False so a missing
+    # "loaded" key (e.g. status fetch failed) renders as ○ rather than ●.
     loaded = [m for m in models_info if m.get("loaded", False)]
     unloaded = [m for m in models_info if not m.get("loaded", False)]
     ordered = loaded + unloaded
@@ -201,10 +229,13 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
         warning = ""
         while True:
             max_y, max_x = stdscr.getmaxyx()
+            # Layout: row 0 title, row 1 blank, rows [items_top, items_bottom)
+            # for items, last row pinned for the hint.
             items_top = 2
             items_bottom = max(items_top + 1, max_y - 1)
             visible_count = items_bottom - items_top
 
+            # Keep the cursor visible inside the viewport.
             if idx < scroll:
                 scroll = idx
             elif idx >= scroll + visible_count:
@@ -225,11 +256,13 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
                     ctx_str = f"  {ctx // 1000}k" if ctx else ""
                     unavailable = "  unavailable" if m.get("disabled_reason") else ""
                     line = f"  {bullet}  {m['id']}{ctx_str}{unavailable}"
+                    # Leave 2 cols on the right for scroll indicators.
                     line = line[: max(0, max_x - 4)]
                     attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
                     if m.get("disabled_reason"):
                         attr |= curses.A_DIM
                     stdscr.addstr(items_top + row_offset, 1, line, attr)
+                # Scroll indicators on the right edge.
                 if scroll > 0:
                     stdscr.addstr(items_top, max_x - 2, "▲", curses.A_DIM)
                 if visible_end < len(ordered):
@@ -237,6 +270,8 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
                 footer = warning or hint
                 stdscr.addstr(max_y - 1, 1, footer[: max_x - 2], curses.A_DIM)
             except curses.error:
+                # Window too small to render the full picker; keep going so
+                # the user can resize and the next loop redraws cleanly.
                 pass
             stdscr.refresh()
 
@@ -266,15 +301,17 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
                     continue
                 selected.append(ordered[idx]["id"])
                 return
-            elif key in (ord("q"), 27):
+            elif key in (ord("q"), 27):  # q or ESC
                 return
             elif key == curses.KEY_RESIZE:
+                # Re-query getmaxyx on the next loop iteration.
                 continue
 
     curses.wrapper(_picker)
 
     if not selected:
         print("No model selected.")
+        # 130 is the conventional shell exit code for SIGINT/cancel.
         sys.exit(130)
 
     return selected[0]
