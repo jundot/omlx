@@ -44,7 +44,9 @@ class OpenCodeIntegration(Integration):
             "output": ["text"],
         }
 
-    def _configure_path(self, config_path: Path, ctx: IntegrationContext) -> None:
+    def _configure_path(
+        self, config_path: Path, ctx: IntegrationContext, *, backup: bool = True
+    ) -> None:
         def updater(config: dict) -> None:
             config.setdefault("provider", {})
             provider_config = {
@@ -75,7 +77,7 @@ class OpenCodeIntegration(Integration):
             if ctx.model:
                 config["model"] = f"omlx/{ctx.model}"
 
-        self._write_json_config(config_path, updater)
+        self._write_json_config(config_path, updater, backup=backup)
 
     def configure(self, ctx: IntegrationContext) -> None:
         self._configure_path(self.CONFIG_PATH, ctx)
@@ -95,7 +97,7 @@ class OpenCodeIntegration(Integration):
                         file=sys.stderr,
                     )
 
-            self._configure_path_without_backup(temp_config, ctx)
+            self._configure_path(temp_config, ctx, backup=False)
 
             env = self._scrubbed_env()
             env["OPENCODE_CONFIG"] = str(temp_config)
@@ -103,37 +105,3 @@ class OpenCodeIntegration(Integration):
             result = subprocess.run(args, env=env, check=False)
 
         raise SystemExit(result.returncode)
-
-    def _configure_path_without_backup(
-        self, config_path: Path, ctx: IntegrationContext
-    ) -> None:
-        def updater(config: dict) -> None:
-            config.setdefault("provider", {})
-            provider_config = {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "oMLX",
-                "options": {
-                    "baseURL": ctx.openai_base_url,
-                },
-            }
-            if ctx.api_key:
-                provider_config["options"]["apiKey"] = ctx.api_key
-            if ctx.model:
-                model_entry: dict = {
-                    "name": ctx.model,
-                    "modalities": self._modalities_for_model(ctx.model_type),
-                }
-                if ctx.supports_images:
-                    model_entry["attachment"] = True
-                if ctx.context_window:
-                    model_entry["limit"] = {
-                        "context": ctx.context_window,
-                        "output": ctx.max_tokens or ctx.context_window,
-                    }
-                provider_config["models"] = {ctx.model: model_entry}
-            config["provider"]["omlx"] = provider_config
-
-            if ctx.model:
-                config["model"] = f"omlx/{ctx.model}"
-
-        self._write_json_config(config_path, updater, backup=False)
