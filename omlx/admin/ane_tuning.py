@@ -1991,6 +1991,56 @@ def _calibrate_components_sync(
 
 
 async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
+    # The serve path skips ANE gracefully when the private runtime is
+    # missing, but the tuner used to find out only deep inside the
+    # bank-split ladder — failing the run and leaving the model unloaded
+    # (#3044, M2 Ultra). Probe up front, before anything is pinned or
+    # unloaded, and return a completed GPU-only verdict: on such a machine
+    # that IS the tuning answer, not an error.
+    try:
+        from ..custom_kernels.qwen35_prefill import fast
+
+        runtime_available = fast.qwen35_ane_available()
+        bank_available = fast.qwen35_ane_bank_compiler_available()
+    except Exception:
+        # Never let the guard itself break tuning; fail open and let the
+        # ladder report whatever is actually wrong.
+        runtime_available = True
+        bank_available = True
+    if not bank_available:
+        reason = (
+            "the private ANE runtime is unavailable on this machine"
+            if not runtime_available
+            else "the private ANE procedure-bank compiler is missing from "
+            "this build"
+        )
+        logger.warning(
+            "ANE tuning for %s skipped: %s; recommending GPU-only",
+            run.request.model_id,
+            reason,
+        )
+        for result in run.results:
+            result["state"] = "skipped"
+            result["error"] = f"ANE unavailable: {reason}"
+        run.recommendation = {
+            "enabled": False,
+            "mlp_fraction": None,
+            "gdn_enabled": False,
+            "gdn_fraction": None,
+            "fused_down": False,
+            "processing_tps": None,
+            "speedup_percent": None,
+            "sequence_length": run.request.sequence_length,
+            "tail_padding_min_tokens": 0,
+        }
+        run.status = "completed"
+        run.phase = "completed"
+        run.current = run.total
+        run.message = (
+            f"ANE prefill is not usable here ({reason}); GPU-only recommended"
+        )
+        return
+
     previous_speed_priority = _pin_speed_priority(engine_pool)
     active_slot = _GPU_SLOT
     try:
