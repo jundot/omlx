@@ -2,7 +2,7 @@
 
 This source-build experiment extends the Qwen ANE prompt-processing runtime
 to DeepSeek-V4-Flash. For prompt chunks that exactly match the configured
-fixed shape, three dense projections run as a hybrid split: an INT8 channel
+fixed shape, four dense projection groups run as a hybrid split: an INT8 channel
 prefix on both ANEs, an optional FP16 CPU middle, and an affine-q8 GPU suffix
 requantized from the mxfp8 checkpoint weights. The CPU branch uses the same
 performance-aware shared-resource scheduler as Qwen3.5.
@@ -11,13 +11,19 @@ Accelerated per layer:
 
 - The shared-expert gate/up pair (50% of channels on ANE; the rest and the
   down projection stay on GPU). CPU sharing is deliberately disabled here.
+- Every attention projection that directly consumes the residual stream is
+  stacked into one dispatch: `wq_a`, `wkv`, both compressor projections when
+  present, and the sparse indexer's compressor and weight projections when
+  present. Local and ratio-128 layers use a 50% ANE share; the wider ratio-4
+  sparse stack uses 56.25% after alignment. The remainder stays on the GPU,
+  with no CPU middle.
 - The attention `wq_b` query projection (50% on ANE, 12.5% on CPU).
 - On sparse-attention layers, the indexer `wq_b` is stacked into the same
   procedure as the attention `wq_b`, since both consume the same
   `q_residual` input. The combined projection uses the same 12.5% CPU share
   and adds no extra dispatches.
 
-Routed experts, `wo_a`/`wo_b`, the attention core, decode, and DSpark
+Routed experts, attention-output `wo_a`/`wo_b`, the attention core, decode, and DSpark
 verification keep the existing GPU path. `wo_b` was measured as a net loss
 in-model and is excluded; `wo_a` needs a grouped GPU suffix and remains a
 follow-up. The bank ladder and fixed-shape eligibility are shared with the
@@ -74,6 +80,31 @@ snapshots.
 
 ## Measured results
 
+### Attention-input stack microbench
+
+M3 Ultra, 4,096 BF16 input rows, median of 15 timed iterations after three
+warmups. These exact-shape synthetic results motivated the additional stacked
+dispatch implemented after the end-to-end baseline below:
+
+| Layer variant | Stacked output width | GPU mxfp8 | ANE/GPU | Speedup |
+|---|---:|---:|---:|---:|
+| Local | 1,536 | 3.427 ms | 2.287 ms | **1.50x** |
+| Ratio-128 compressed | 2,560 | 5.482 ms | 3.322 ms | **1.65x** |
+| Ratio-4 sparse | 4,160 | 8.617 ms | 4.621 ms | **1.86x** |
+
+The first two use a 50% requested ANE fraction. The ratio-4 result uses 60%
+requested, which becomes 56.25% after the per-instance 128-row alignment. A
+full-model run of this newer stack has not yet been performed; the later
+end-to-end tables describe the earlier 86-procedure path only.
+
+Run only these shapes with:
+
+```bash
+python benchmarks/dsv4_ane_shape_bench.py --sequence-length 4096 \
+  --shapes attention_input_local,attention_input_ratio128,attention_input_ratio4 \
+  --ane-fractions 0.5,0.6 --cpu-fractions 0
+```
+
 ### CPU-sharing microbench
 
 M3 Ultra, 4,096 BF16 input rows, affine-q8 GPU suffix, median of 15 timed
@@ -116,7 +147,7 @@ python benchmarks/dsv4_ane_model_bench.py /path/to/model \
 On a 96 GiB host, use the shape benchmark and unit tests; reserve the opt-in
 full-model run for a larger-memory system.
 
-### End-to-end ANE/GPU baseline
+### End-to-end ANE/GPU baseline (before attention-input stacking)
 
 M3 Ultra, built-in throughput benchmark (`code_python` context, TG=128,
 greedy), fresh server and cleared SSD cache per configuration.
@@ -148,10 +179,16 @@ chunk rather than from ANE execution; the ANE contributes from 16k up.
 DSpark decode throughput swings a few tokens per second run to run with
 the generated content, and repeated runs showed no systematic decode
 regression; non-speculative decode stays within about one percent. The
-smaller fp8 gains are not a coverage difference: both checkpoints engage
-the identical 86 procedures with numerically identical accelerated
+smaller fp8 gains are not a coverage difference: both checkpoints engaged
+the identical 86 procedures used by that baseline with numerically identical accelerated
 tensors, and the mxfp4 expert path simply streams about 1.6x the weight
 bytes, competing with the ANE for unified-memory bandwidth.
+
+The attention-input work adds one procedure per eligible layer (43 for the
+reference topology), taking the configured path to 129 procedures. Its
+end-to-end throughput, load-time, and memory deltas remain to be measured on
+a host that can safely load the checkpoint; the synthetic speedups above
+must not be read as an equivalent whole-model PP gain.
 
 Costs on the oQ2.5e checkpoint before CPU sharing: model memory 100.60 GB to
 101.29 GB (+0.7 GB), eager load 3.95 s to 8.7 s (+4.8 s for the procedure

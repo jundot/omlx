@@ -51,6 +51,7 @@ def set_dspark_verify_armed(flag: bool) -> None:
 # to fall through to the normal GPU path (decode, verify, non-fixed shapes).
 _ANE_LINEAR_BACKEND = None
 _ANE_MLP_BACKEND = None
+_ANE_ATTENTION_INPUT_BACKEND = None
 
 
 def register_ane_linear_backend(backend) -> None:
@@ -63,6 +64,28 @@ def register_ane_mlp_backend(backend) -> None:
     """Install the optional ANE prefill backend for the shared-expert MLP."""
     global _ANE_MLP_BACKEND
     _ANE_MLP_BACKEND = backend
+
+
+def register_ane_attention_input_backend(backend) -> None:
+    """Install the optional stacked backend for projections that consume x."""
+    global _ANE_ATTENTION_INPUT_BACKEND
+    _ANE_ATTENTION_INPUT_BACKEND = backend
+
+
+def _ane_attention_input(attn: nn.Module, x: mx.array) -> dict[str, mx.array]:
+    backend = _ANE_ATTENTION_INPUT_BACKEND
+    if backend is not None:
+        projected = backend(attn, x)
+        if projected is not None:
+            return projected
+    return {}
+
+
+def _projection_or(
+    projected: dict[str, mx.array], name: str, linear: nn.Module, x: mx.array
+) -> mx.array:
+    value = projected.get(name)
+    return linear(x) if value is None else value
 
 
 def _ane_linear(linear: nn.Module, x: mx.array) -> mx.array:
@@ -1684,13 +1707,16 @@ class LocalAttention(nn.Module):
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = _ane_linear(self.wq_b, self.q_norm(self.wq_a(x)))
+        projected = _ane_attention_input(self, x)
+        q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+        q = _ane_linear(self.wq_b, self.q_norm(q_a))
         q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
 
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+        kv = self.kv_norm(kv_raw).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
@@ -1796,17 +1822,23 @@ class CompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = _ane_linear(self.wq_b, self.q_norm(self.wq_a(x)))
+        projected = _ane_attention_input(self, x)
+        q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+        q = _ane_linear(self.wq_b, self.q_norm(q_a))
         q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
 
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+        kv = self.kv_norm(kv_raw).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
-            compressed_kv, compressed_gate = self.compressor.project(x)
+            compressed_kv = projected.get("compressor_wkv")
+            compressed_gate = projected.get("compressor_wgate")
+            if compressed_kv is None or compressed_gate is None:
+                compressed_kv, compressed_gate = self.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
                 compressed_kv,
@@ -1831,7 +1863,14 @@ class CompressedAttention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, pool_cache, offset)
+        compressed_kv = projected.get("compressor_wkv")
+        compressed_gate = projected.get("compressor_wgate")
+        if compressed_kv is not None and compressed_gate is not None:
+            pooled = self.compressor.consume(
+                compressed_kv, compressed_gate, pool_cache, offset
+            )
+        else:
+            pooled = self.compressor(x, pool_cache, offset)
         pooled_mask = None
         if pooled.shape[1] > 0:
             pooled_mask = (
@@ -1966,7 +2005,9 @@ class SparseCompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual = self.q_norm(self.wq_a(x))
+        projected = _ane_attention_input(self, x)
+        q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+        q_residual = self.q_norm(q_a)
         q_raw, indexer_q_raw = _ane_stacked_q(
             self.wq_b, getattr(self.indexer, "wq_b", None), q_residual
         )
@@ -1975,12 +2016,19 @@ class SparseCompressedAttention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
 
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+        kv = self.kv_norm(kv_raw).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and L <= 6:
-            compressed_kv, compressed_gate = self.compressor.project(x)
-            index_kv, index_gate = self.indexer.compressor.project(x)
+            compressed_kv = projected.get("compressor_wkv")
+            compressed_gate = projected.get("compressor_wgate")
+            if compressed_kv is None or compressed_gate is None:
+                compressed_kv, compressed_gate = self.compressor.project(x)
+            index_kv = projected.get("indexer_compressor_wkv")
+            index_gate = projected.get("indexer_compressor_wgate")
+            if index_kv is None or index_gate is None:
+                index_kv, index_gate = self.indexer.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
                 compressed_kv,
@@ -2024,7 +2072,12 @@ class SparseCompressedAttention(nn.Module):
                 )
                 index_q = index_q.transpose(0, 2, 1, 3)
                 index_q = self.rope(index_q, offset)
-                index_weights = self.indexer.weights_proj(x)
+                index_weights = _projection_or(
+                    projected,
+                    "indexer_weights",
+                    self.indexer.weights_proj,
+                    x,
+                )
                 topk_rows = _batch_indexer_rows(
                     self.indexer,
                     index_pooled_rows,
@@ -2093,10 +2146,29 @@ class SparseCompressedAttention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, comp_cache, offset)
+        compressed_kv = projected.get("compressor_wkv")
+        compressed_gate = projected.get("compressor_wgate")
+        if compressed_kv is not None and compressed_gate is not None:
+            pooled = self.compressor.consume(
+                compressed_kv, compressed_gate, comp_cache, offset
+            )
+        else:
+            pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
+        index_compressor_projection = None
+        index_kv = projected.get("indexer_compressor_wkv")
+        index_gate = projected.get("indexer_compressor_wgate")
+        if index_kv is not None and index_gate is not None:
+            index_compressor_projection = (index_kv, index_gate)
         if 0 < pooled.shape[1] <= self.indexer.index_topk:
-            index_pooled = self.indexer.compressor(x, idx_cache, offset)
+            if index_compressor_projection is not None:
+                index_pooled = self.indexer.compressor.consume(
+                    *index_compressor_projection,
+                    idx_cache,
+                    offset,
+                )
+            else:
+                index_pooled = self.indexer.compressor(x, idx_cache, offset)
             if index_pooled.shape[1] != pooled.shape[1]:
                 raise RuntimeError(
                     "DeepSeek V4 attention/indexer pooling caches diverged"
@@ -2120,7 +2192,9 @@ class SparseCompressedAttention(nn.Module):
                 self.rope,
                 idx_cache,
                 offset,
+                compressor_projection=index_compressor_projection,
                 projected_q=projected_q,
+                projected_weights=projected.get("indexer_weights"),
             )
         sparse_mask = None
         if pmask is not None and topk is not None:

@@ -139,7 +139,8 @@ class ModelSettings:
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
         deepseek_ane_prefill_enabled: Enable private fixed-shape DeepSeek-V4
-            hybrid ANE prefill (shared expert, wq_b, stacked indexer wq_b).
+            hybrid ANE prefill (shared expert, attention-input projections,
+            wq_b, and stacked indexer wq_b).
         deepseek_ane_prefill_sequence_length: Exact flattened token count routed
             through the DeepSeek ANE procedures; also realigns the paged cache
             block size, rebuilding this model's SSD cache once.
@@ -262,8 +263,9 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
 
-    # DeepSeek-V4 hybrid ANE prefill (shared expert + wq_b + stacked indexer
-    # wq_b). Off by default for the same reasons as the Qwen variant; also
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + attention-input stack +
+    # wq_b + stacked indexer wq_b). Off by default for the same reasons as
+    # the Qwen variant; also
     # realigns the paged cache block size to the fixed ANE shape, so enabling
     # it rebuilds this model's SSD cache once.
     deepseek_ane_prefill_enabled: bool = False

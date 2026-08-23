@@ -1564,6 +1564,91 @@ class TestDeepseekV4CompressedNativeAttention:
         assert float(max_abs.item()) <= max_tolerance
 
 
+class TestDeepseekV4AttentionInputBackend:
+    @staticmethod
+    def _config(dsv4, ratio):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[ratio],
+        )
+
+    @pytest.mark.parametrize("ratio,length", [(0, 16), (128, 129), (4, 40)])
+    def test_attention_variants_preserve_stacked_input_projection_results(
+        self, applied_patch, monkeypatch, ratio, length
+    ):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.v4_attention_factory(self._config(dsv4, ratio), 0)
+        x = mx.random.normal((1, length, 16), dtype=mx.bfloat16)
+        expected = layer(x)
+        mx.eval(expected)
+        projected = {
+            "wq_a": layer.wq_a(x),
+            "wkv": layer.wkv(x),
+        }
+        if ratio:
+            projected.update(
+                compressor_wkv=layer.compressor.wkv(x),
+                compressor_wgate=layer.compressor.wgate(x),
+            )
+        if ratio == 4:
+            projected.update(
+                indexer_compressor_wkv=layer.indexer.compressor.wkv(x),
+                indexer_compressor_wgate=layer.indexer.compressor.wgate(x),
+                indexer_weights=layer.indexer.weights_proj(x),
+            )
+        mx.eval(*projected.values())
+
+        calls = []
+
+        def backend(owner, value):
+            calls.append((owner, value.shape))
+            return projected
+
+        class FailLinear(nn.Module):
+            def __call__(self, value):
+                raise AssertionError("stacked projection fell back to its GPU linear")
+
+        monkeypatch.setattr(dsv4, "_ANE_ATTENTION_INPUT_BACKEND", backend)
+        layer.wq_a = FailLinear()
+        layer.wkv = FailLinear()
+        if ratio:
+            layer.compressor.wkv = FailLinear()
+            layer.compressor.wgate = FailLinear()
+        if ratio == 4:
+            layer.indexer.compressor.wkv = FailLinear()
+            layer.indexer.compressor.wgate = FailLinear()
+            layer.indexer.weights_proj = FailLinear()
+
+        output = layer(x)
+        mx.eval(output)
+
+        assert output.shape == (1, length, 16)
+        assert mx.array_equal(output, expected).item()
+        assert calls == [(layer, x.shape)]
+
+
 class TestPreLoadDispatch:
     """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
 

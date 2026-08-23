@@ -662,7 +662,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.deepseek_ane": "DeepSeek ANE Prompt Processing",
-  "modal.model_settings.deepseek_ane_hint": "Split the DeepSeek-V4 shared expert and query projections across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
+  "modal.model_settings.deepseek_ane_hint": "Split the DeepSeek-V4 shared expert, attention-input, and query projections across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.deepseek_ane_cache_hint": "Changing this realigns the paged cache block size, so this model's SSD cache is rebuilt once.",
   "modal.model_settings.deepseek_ane_cpu": "Shared CPU query offload",
   "modal.model_settings.deepseek_ane_cpu_hint": "Assign 12.5% of query projection rows to the CPU with performance-aware scheduling. Shape benchmarks showed a 6–9% gain; shared gate/up and wo_b stay on GPU/ANE because CPU sharing slowed them down.",

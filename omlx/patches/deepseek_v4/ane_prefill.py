@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in ANE/CPU/GPU prefill for DeepSeek-V4-Flash dense projections.
 
-Splits the mxfp8 shared-expert gate/up pair and the wq_b attention
-projection (with the sparse-layer indexer wq_b stacked into the same
-procedure) between an INT8 ANE channel prefix and an affine-q8 GPU suffix.
+Splits the mxfp8 shared-expert gate/up pair, the attention-input projections,
+and the wq_b attention projection (with the sparse-layer indexer wq_b stacked
+into the same procedure) between an INT8 ANE channel prefix and an affine-q8
+GPU suffix.
 The query projections may also place a benchmark-selected FP16 middle slice
 on the CPU using Qwen's shared-resource scheduler. Routed experts, shared
 gate/up CPU work, wo_a/wo_b, decode, and DSpark verify calls keep their
@@ -35,7 +36,16 @@ _SUFFIX_GROUP_SIZE = 64
 # rides inside the attention wq_b op (same q_residual input), so it adds no
 # operations of its own. wo_b is deliberately not accelerated: its per-op
 # host synchronization exceeded the offload savings in-model at K=8192.
-_FRACTIONS = {"mlp": 0.5, "wq_b": 0.5, "indexer_wq_b": 0.5}
+_FRACTIONS = {
+    "mlp": 0.5,
+    "wq_b": 0.5,
+    "indexer_wq_b": 0.5,
+    # Exact 4K shape probes. Local and ratio-128 stacks balance at 50%; the
+    # wider ratio-4 stack remains GPU-bound until the requested 60% point
+    # (56.25% after the 128-row per-instance alignment).
+    "attention_input": 0.5,
+    "attention_input_sparse": 0.6,
+}
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,20 @@ class _StackedState:
     cpu_outputs: int = 0
 
 
+@dataclass(frozen=True)
+class _AttentionInputState:
+    model: Any
+    model1: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+    segments: tuple[tuple[str, int], ...]
+    cpu_weight: mx.array | None = None
+    cpu_outputs: int = 0
+
+
 def _mxfp8_linear_dims(linear: Any) -> tuple[int, int] | None:
     """Return (out_features, in_features) for an eligible mxfp8 linear."""
     if getattr(linear, "mode", None) != "mxfp8":
@@ -113,6 +137,50 @@ def _dequant_rows(linear: Any, start: int, stop: int) -> mx.array:
         group_size=32,
         bits=8,
         mode="mxfp8",
+    )
+
+
+def _quantized_linear_dims(linear: Any) -> tuple[int, int] | None:
+    """Return dimensions for a 2-D MLX quantized linear.
+
+    DeepSeek attention projections are normally mxfp8, while the indexer
+    weight projection inherits the model's affine-q8 default. The combined
+    attention-input procedure requantizes one common suffix, so it can safely
+    accept either source format after dequantization.
+    """
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    group_size = int(getattr(linear, "group_size", 0) or 0)
+    bits = int(getattr(linear, "bits", 0) or 0)
+    mode = str(getattr(linear, "mode", "affine") or "affine")
+    if (
+        weight is None
+        or scales is None
+        or weight.dtype != mx.uint32
+        or weight.ndim != 2
+        or scales.ndim != 2
+        or group_size <= 0
+        or bits <= 0
+        or mode not in ("affine", "mxfp8")
+        or "bias" in linear
+    ):
+        return None
+    out_features = int(weight.shape[0])
+    in_features = int(scales.shape[1]) * group_size
+    if in_features <= 0 or in_features % _SUFFIX_GROUP_SIZE:
+        return None
+    return out_features, in_features
+
+
+def _dequant_quantized_rows(linear: Any, start: int, stop: int) -> mx.array:
+    biases = getattr(linear, "biases", None)
+    return mx.dequantize(
+        linear.weight[start:stop],
+        linear.scales[start:stop],
+        biases[start:stop] if biases is not None else None,
+        group_size=int(linear.group_size),
+        bits=int(linear.bits),
+        mode=str(getattr(linear, "mode", "affine") or "affine"),
     )
 
 
@@ -250,6 +318,104 @@ def _prepare_stacked(
     return state, dense0, dense1
 
 
+def _attention_input_linears(attn: Any) -> tuple[tuple[str, Any], ...]:
+    """The fixed set of projections that consume the same attention input."""
+    candidates: list[tuple[str, Any]] = [
+        ("wq_a", getattr(attn, "wq_a", None)),
+        ("wkv", getattr(attn, "wkv", None)),
+    ]
+    compressor = getattr(attn, "compressor", None)
+    if compressor is not None:
+        candidates.extend(
+            (
+                ("compressor_wkv", getattr(compressor, "wkv", None)),
+                ("compressor_wgate", getattr(compressor, "wgate", None)),
+            )
+        )
+    indexer = getattr(attn, "indexer", None)
+    indexer_compressor = getattr(indexer, "compressor", None)
+    if indexer_compressor is not None:
+        candidates.extend(
+            (
+                ("indexer_compressor_wkv", getattr(indexer_compressor, "wkv", None)),
+                (
+                    "indexer_compressor_wgate",
+                    getattr(indexer_compressor, "wgate", None),
+                ),
+                ("indexer_weights", getattr(indexer, "weights_proj", None)),
+            )
+        )
+    return tuple((name, linear) for name, linear in candidates if linear is not None)
+
+
+def _prepare_attention_input(
+    attn: Any,
+) -> tuple[_AttentionInputState, mx.array, mx.array] | None:
+    linears = _attention_input_linears(attn)
+    if len(linears) < 2:
+        return None
+    dimensions = [_quantized_linear_dims(linear) for _, linear in linears]
+    if any(dims is None for dims in dimensions):
+        return None
+    input_dims = {dims[1] for dims in dimensions if dims is not None}
+    if len(input_dims) != 1:
+        return None
+
+    segments = tuple(
+        (name, dims[0])
+        for (name, _), dims in zip(linears, dimensions)
+        if dims is not None
+    )
+    out_features = sum(size for _, size in segments)
+    fraction = (
+        _FRACTIONS["attention_input_sparse"]
+        if getattr(attn, "indexer", None) is not None
+        else _FRACTIONS["attention_input"]
+    )
+    split = _split_rows(out_features, fraction)
+    if split is None:
+        return None
+    per_instance, _, gpu_outputs = split
+    ane_outputs = 2 * per_instance
+
+    boundaries: list[tuple[Any, int, int]] = []
+    cursor = 0
+    for (_, linear), (_, size) in zip(linears, segments):
+        boundaries.append((linear, cursor, cursor + size))
+        cursor += size
+
+    def stacked_rows(start: int, stop: int) -> mx.array:
+        parts = []
+        for linear, lower, upper in boundaries:
+            if start >= upper or stop <= lower:
+                continue
+            parts.append(
+                _dequant_quantized_rows(
+                    linear,
+                    max(start - lower, 0),
+                    min(stop, upper) - lower,
+                )
+            )
+        return parts[0] if len(parts) == 1 else mx.concatenate(parts)
+
+    dense0 = mx.contiguous(stacked_rows(0, per_instance).astype(mx.float32))
+    dense1 = mx.contiguous(
+        stacked_rows(per_instance, ane_outputs).astype(mx.float32)
+    )
+    suffix = _requant_suffix(
+        mx.contiguous(stacked_rows(ane_outputs, out_features))
+    )
+    state = _AttentionInputState(
+        None,
+        None,
+        *suffix,
+        ane_outputs,
+        gpu_outputs,
+        segments,
+    )
+    return state, dense0, dense1
+
+
 def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
     config = getattr(owner, "_omlx_ane_config", None)
     if config is None or getattr(owner, "_omlx_ane_failed", False):
@@ -314,6 +480,21 @@ def _stacked_backend(attn_linear: Any, x: mx.array):
     if combined is None:
         return None
     return combined[..., : state.split], combined[..., state.split :]
+
+
+def _attention_input_backend(attn: Any, x: mx.array):
+    state = getattr(attn, "_omlx_ane_state", None)
+    if not isinstance(state, _AttentionInputState):
+        return None
+    combined = _hybrid_combined(attn, x)
+    if combined is None:
+        return None
+    outputs = {}
+    start = 0
+    for name, size in state.segments:
+        outputs[name] = combined[..., start : start + size]
+        start += size
+    return outputs
 
 
 def _mlp_backend(mlp: Any, x: mx.array) -> mx.array | None:
@@ -439,6 +620,7 @@ def enable_deepseek_v4_ane_prefill(
     prepared: list[tuple[Any, Any, mx.array, mx.array]] = []
     mlp_count = 0
     stacked_count = 0
+    attention_input_count = 0
     for layer in layers:
         attn = getattr(layer, "attn", None)
         shared = getattr(getattr(layer, "ffn", None), "shared_experts", None)
@@ -455,6 +637,18 @@ def enable_deepseek_v4_ane_prefill(
             if prep is not None:
                 prepared.append((shared, *prep))
                 mlp_count += 1
+        if attn is not None:
+            try:
+                input_prep = _prepare_attention_input(attn)
+            except Exception:
+                logger.warning(
+                    "Skipping one DeepSeek attention-input ANE procedure",
+                    exc_info=True,
+                )
+                input_prep = None
+            if input_prep is not None:
+                prepared.append((attn, *input_prep))
+                attention_input_count += 1
         linear = getattr(attn, "wq_b", None)
         if linear is None:
             continue
@@ -522,6 +716,11 @@ def enable_deepseek_v4_ane_prefill(
     register_stacked = getattr(module, "register_ane_stacked_q_backend", None)
     if register_stacked is not None:
         register_stacked(_stacked_backend)
+    register_attention_input = getattr(
+        module, "register_ane_attention_input_backend", None
+    )
+    if register_attention_input is not None:
+        register_attention_input(_attention_input_backend)
 
     count = len(prepared)
     model._omlx_ane_mlp_prefill_count = mlp_count
@@ -529,17 +728,20 @@ def enable_deepseek_v4_ane_prefill(
     model._omlx_ane_dual_prefill_count = count
     model._omlx_ane_resident_program_count = resident_programs
     model._omlx_ane_procedure_count = count
+    model._omlx_ane_attention_input_prefill_count = attention_input_count
     model._omlx_ane_cpu_prefill_count = sum(
         state.cpu_weight is not None for _, state, _, _ in prepared
     )
     logger.info(
         "Eagerly compiled %d DeepSeek ANE procedures (%d shared experts, "
-        "%d attention projections, %d with the indexer wq_b stacked in) "
+        "%d attention-input stacks, %d query projections, %d with the "
+        "indexer wq_b stacked in) "
         "into %d instance-pinned ANE programs (sequence_length=%d, "
         "query_cpu_fraction=%.3f, cpu_threads=%d, shared_resource=%s)",
         count,
         mlp_count,
-        count - mlp_count,
+        attention_input_count,
+        count - mlp_count - attention_input_count,
         stacked_count,
         resident_programs,
         sequence_length,

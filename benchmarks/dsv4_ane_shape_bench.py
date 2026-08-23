@@ -24,13 +24,19 @@ import mlx.core as mx
 
 from omlx.custom_kernels.qwen35_prefill import fast
 
-# [name, combined out_features, in_features] of the v1 offload candidates.
+# [name, combined out_features, in_features] of the offload candidates.
 # shared_gate_up is the stacked gate/up pair. stacked_wq_b includes the
 # attention (32768) and indexer (8192) projections that share q_residual.
+# The attention_input variants stack every projection that consumes the
+# residual stream before attention; their widths correspond to local,
+# ratio-128 compressed, and ratio-4 sparse layers respectively.
 SHAPES = (
     ("shared_gate_up", 4096, 4096),
     ("wq_b", 32768, 1024),
     ("stacked_wq_b", 40960, 1024),
+    ("attention_input_local", 1536, 4096),
+    ("attention_input_ratio128", 2560, 4096),
+    ("attention_input_ratio4", 4160, 4096),
     ("wo_b", 4096, 8192),
 )
 

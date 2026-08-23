@@ -2479,7 +2479,8 @@ async def update_model_settings(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
         )
-    # DeepSeek-V4 hybrid ANE prefill (shared expert + wq_b + stacked indexer).
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + attention-input stack +
+    # wq_b + stacked indexer).
     if "deepseek_ane_prefill_enabled" in sent:
         enabled = bool(request.deepseek_ane_prefill_enabled)
         config_type = str(getattr(entry, "config_model_type", "") or "")

@@ -21,6 +21,12 @@ def _mxfp8_linear(in_features, out_features):
     )
 
 
+def _affine_q8_linear(in_features, out_features):
+    return nn.QuantizedLinear(
+        in_features, out_features, bias=False, group_size=64, bits=8, mode="affine"
+    )
+
+
 def _attach(owner, prep, model0=None, model1=None):
     state, _, _ = prep
     owner._omlx_ane_config = ane_patch._AneConfig(SEQ)
@@ -282,12 +288,95 @@ def test_stacked_backend_splits_and_plain_backend_ignores_it(monkeypatch):
     assert ane_patch._linear_backend(attn_linear, x) is None
 
 
+def _fake_attention_inputs(*, sparse=False):
+    attn = SimpleNamespace(
+        wq_a=_mxfp8_linear(256, 512),
+        wkv=_mxfp8_linear(256, 256),
+    )
+    if sparse:
+        attn.compressor = SimpleNamespace(
+            wkv=_affine_q8_linear(256, 256),
+            wgate=_affine_q8_linear(256, 256),
+        )
+        attn.indexer = SimpleNamespace(
+            compressor=SimpleNamespace(
+                wkv=_affine_q8_linear(256, 128),
+                wgate=_affine_q8_linear(256, 128),
+            ),
+            weights_proj=_affine_q8_linear(256, 64),
+        )
+    return attn
+
+
+def test_prepare_attention_input_stacks_mixed_quantized_linears():
+    attn = _fake_attention_inputs(sparse=True)
+
+    prep = ane_patch._prepare_attention_input(attn)
+
+    assert prep is not None
+    state, dense0, dense1 = prep
+    assert isinstance(state, ane_patch._AttentionInputState)
+    assert state.segments == (
+        ("wq_a", 512),
+        ("wkv", 256),
+        ("compressor_wkv", 256),
+        ("compressor_wgate", 256),
+        ("indexer_compressor_wkv", 128),
+        ("indexer_compressor_wgate", 128),
+        ("indexer_weights", 64),
+    )
+    assert state.ane_outputs == 768
+    assert state.gpu_outputs == 832
+    assert dense0.shape == (384, 256)
+    assert dense1.shape == (384, 256)
+    assert dense0.dtype == dense1.dtype == mx.float32
+    assert state.cpu_weight is None
+
+    reference = mx.concatenate(
+        [
+            ane_patch._dequant_quantized_rows(linear, 0, size)
+            for (_, linear), (_, size) in zip(
+                ane_patch._attention_input_linears(attn), state.segments
+            )
+        ]
+    )
+    suffix = mx.dequantize(
+        state.weight,
+        state.scales,
+        state.biases,
+        group_size=64,
+        bits=8,
+    )
+    assert float(mx.abs(dense0 - reference[:384].astype(mx.float32)).max()) < 1e-3
+    assert float(mx.abs(suffix - reference[768:]).max()) < 0.05
+
+
+def test_attention_input_backend_restores_named_segments(monkeypatch):
+    attn = _fake_attention_inputs()
+    prep = ane_patch._prepare_attention_input(attn)
+    assert prep is not None
+    _attach(attn, prep)
+    total = sum(size for _, size in attn._omlx_ane_state.segments)
+    combined = mx.broadcast_to(mx.arange(total, dtype=mx.float32), (1, SEQ, total))
+    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", lambda *args: combined)
+    x = mx.zeros((1, SEQ, 256), dtype=mx.bfloat16)
+
+    outputs = ane_patch._attention_input_backend(attn, x)
+
+    assert outputs is not None
+    assert tuple(outputs) == ("wq_a", "wkv")
+    assert outputs["wq_a"].shape[-1] == 512
+    assert outputs["wkv"].shape[-1] == 256
+    assert int(outputs["wkv"][0, 0, 0]) == 512
+    assert ane_patch._attention_input_backend(attn, x[:, :4]) is None
+
+
 def _fake_layer():
+    attn = _fake_attention_inputs()
+    attn.wq_b = _mxfp8_linear(256, 512)
+    attn.wo_b = _mxfp8_linear(256, 768)
     return SimpleNamespace(
-        attn=SimpleNamespace(
-            wq_b=_mxfp8_linear(256, 512),
-            wo_b=_mxfp8_linear(256, 768),
-        ),
+        attn=attn,
         ffn=SimpleNamespace(
             shared_experts=SimpleNamespace(
                 gate_proj=_mxfp8_linear(256, 512),
@@ -324,6 +413,9 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
                 lambda fn: registered.__setitem__("linear", fn)
             ),
             register_ane_mlp_backend=(lambda fn: registered.__setitem__("mlp", fn)),
+            register_ane_attention_input_backend=(
+                lambda fn: registered.__setitem__("attention_input", fn)
+            ),
         ),
     )
     layer = _fake_layer()
@@ -331,19 +423,22 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
 
     count = ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ)
 
-    # Shared expert plus plain wq_b; wo_b is deliberately not accelerated.
-    assert count == 2
-    assert compiled == {"count": 2, "sequence_length": SEQ}
+    # Shared expert, attention-input stack, and plain wq_b; wo_b is excluded.
+    assert count == 3
+    assert compiled == {"count": 3, "sequence_length": SEQ}
     assert registered["linear"] is ane_patch._linear_backend
     assert registered["mlp"] is ane_patch._mlp_backend
+    assert registered["attention_input"] is ane_patch._attention_input_backend
+    assert isinstance(layer.attn._omlx_ane_state, ane_patch._AttentionInputState)
     assert layer.attn.wq_b._omlx_ane_state.model is not None
     assert not hasattr(layer.attn.wo_b, "_omlx_ane_state")
     assert layer.ffn.shared_experts._omlx_ane_state.ane_outputs == 256
     assert layer.ffn.shared_experts._omlx_ane_state.cpu_weight is None
     assert layer.attn.wq_b._omlx_ane_state.cpu_weight is not None
-    assert model._omlx_ane_procedure_count == 2
+    assert model._omlx_ane_procedure_count == 3
     assert model._omlx_ane_cpu_prefill_count == 1
     assert model._omlx_ane_mlp_prefill_count == 1
+    assert model._omlx_ane_attention_input_prefill_count == 1
     assert model._omlx_ane_resident_program_count == 2
 
 
@@ -373,8 +468,8 @@ def test_enable_stacks_indexer_wq_b_when_present(monkeypatch):
 
     count = ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ)
 
-    # Default targets: shared expert + stacked wq_b (wo_b excluded).
-    assert count == 2
+    # Default targets: shared expert + attention input + stacked wq_b.
+    assert count == 3
     state = layer.attn.wq_b._omlx_ane_state
     assert isinstance(state, ane_patch._StackedState)
     assert state.split == 512
@@ -404,7 +499,7 @@ def test_enable_disables_cpu_share_without_shared_scheduler(monkeypatch):
     layer = _fake_layer()
     model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
 
-    assert ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ) == 2
+    assert ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ) == 3
     assert layer.attn.wq_b._omlx_ane_state.cpu_weight is None
     assert model._omlx_ane_cpu_prefill_count == 0
 
@@ -437,7 +532,7 @@ def test_enable_disables_cpu_share_below_measured_tile(monkeypatch):
             sequence_length=2048,
             cpu_fraction=0.125,
         )
-        == 2
+        == 3
     )
     assert layer.attn.wq_b._omlx_ane_state.cpu_weight is None
     assert model._omlx_ane_cpu_prefill_count == 0
