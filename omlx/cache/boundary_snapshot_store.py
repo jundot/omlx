@@ -519,7 +519,11 @@ class BoundarySnapshotSSDStore:
             if not self._is_safe_snapshot_path(detached_path):
                 return None
             os.replace(file_path, detached_path)
-            with suppress(OSError):
+            # Another queued boundary may have created this request directory
+            # and be about to open its temp file. Serialize the best-effort
+            # rmdir with the writer so we cannot remove the directory in that
+            # mkdir-to-open window and make the later checkpoint fail.
+            with self._writer_busy, suppress(OSError):
                 file_path.parent.rmdir()
             return detached_path
         except Exception as e:
