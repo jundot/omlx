@@ -49,6 +49,18 @@ the path on for benchmarking there.
 The controls are exposed in the web per-model settings editor for detected
 DeepSeek-V4 models.
 
+When ANE prefill is active, engine startup also raises the scheduler's
+effective prefill step to at least the compiled ANE sequence length. This is
+required in addition to aligning cache-block boundaries: otherwise a smaller
+prefill step can split every nominal 4,096-token block before it reaches the
+fixed-shape ANE procedures. With the default configuration, serve logs should
+report `effective_step=4096` and `chunk_tokens=4096` for each full chunk.
+
+The per-request `ane_full_tiles` trace counter is not a reliable activation
+signal for DeepSeek yet: it reads a benchmark field currently populated only
+by the Qwen settings path and can remain zero while ANE execution is active.
+Use the serve log's `chunk_tokens` value to verify full-tile dispatch.
+
 CPU sharing is applied only to plain and stacked `wq_b`. The 12.5% share and
 12-worker setting came from repeated 4,096-token shape probes on the reference
 M3 Ultra. If the native shared-resource scheduling API is unavailable, the

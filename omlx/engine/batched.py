@@ -623,6 +623,8 @@ class BatchedEngine(BaseEngine):
             # ANE shape, or boundary clamping keeps every chunk smaller than
             # the compiled shape and the ANE ops never engage.
             scheduler_config.ane_prefill_block_size = ane_prefill_sequence_length
+            if scheduler_config.prefill_step_size < ane_prefill_sequence_length:
+                scheduler_config.prefill_step_size = ane_prefill_sequence_length
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
