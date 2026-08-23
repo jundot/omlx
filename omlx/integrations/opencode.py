@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
@@ -40,7 +44,7 @@ class OpenCodeIntegration(Integration):
             "output": ["text"],
         }
 
-    def configure(self, ctx: IntegrationContext) -> None:
+    def _configure_path(self, config_path: Path, ctx: IntegrationContext) -> None:
         def updater(config: dict) -> None:
             config.setdefault("provider", {})
             provider_config = {
@@ -71,12 +75,65 @@ class OpenCodeIntegration(Integration):
             if ctx.model:
                 config["model"] = f"omlx/{ctx.model}"
 
-        self._write_json_config(self.CONFIG_PATH, updater)
+        self._write_json_config(config_path, updater)
+
+    def configure(self, ctx: IntegrationContext) -> None:
+        self._configure_path(self.CONFIG_PATH, ctx)
 
     def launch(self, ctx: IntegrationContext) -> None:
-        self.configure(ctx)
+        # Keep the user's persistent OpenCode configuration untouched. Each
+        # launch gets its own copy, so multiple oMLX/OpenCode sessions cannot
+        # race over the same config file or restore another session's state.
+        with tempfile.TemporaryDirectory(prefix="omlx-opencode-") as temp_dir:
+            temp_config = Path(temp_dir) / "opencode.json"
+            if self.CONFIG_PATH.exists():
+                try:
+                    shutil.copy2(self.CONFIG_PATH, temp_config)
+                except OSError as e:
+                    print(
+                        f"Warning: could not copy {self.CONFIG_PATH}: {e}",
+                        file=sys.stderr,
+                    )
 
-        env = self._scrubbed_env()
-        args = ["opencode", *ctx.extra_args]
+            self._configure_path_without_backup(temp_config, ctx)
 
-        os.execvpe("opencode", args, env)
+            env = self._scrubbed_env()
+            env["OPENCODE_CONFIG"] = str(temp_config)
+            args = ["opencode", *ctx.extra_args]
+            result = subprocess.run(args, env=env, check=False)
+
+        raise SystemExit(result.returncode)
+
+    def _configure_path_without_backup(
+        self, config_path: Path, ctx: IntegrationContext
+    ) -> None:
+        def updater(config: dict) -> None:
+            config.setdefault("provider", {})
+            provider_config = {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "oMLX",
+                "options": {
+                    "baseURL": ctx.openai_base_url,
+                },
+            }
+            if ctx.api_key:
+                provider_config["options"]["apiKey"] = ctx.api_key
+            if ctx.model:
+                model_entry: dict = {
+                    "name": ctx.model,
+                    "modalities": self._modalities_for_model(ctx.model_type),
+                }
+                if ctx.supports_images:
+                    model_entry["attachment"] = True
+                if ctx.context_window:
+                    model_entry["limit"] = {
+                        "context": ctx.context_window,
+                        "output": ctx.max_tokens or ctx.context_window,
+                    }
+                provider_config["models"] = {ctx.model: model_entry}
+            config["provider"]["omlx"] = provider_config
+
+            if ctx.model:
+                config["model"] = f"omlx/{ctx.model}"
+
+        self._write_json_config(config_path, updater, backup=False)
