@@ -23,6 +23,15 @@ _MINIMAX_CLOSE_TAG = "</mm:think>"
 _HY3_OPEN_TAG = "<think:opensource>"
 _HY3_CLOSE_TAG = "</think:opensource>"
 
+# DeepSeek V4 DSML tool-call envelope markers. The ``\uff5c`` is the fullwidth
+# vertical line used by the DS4 tokenizer's DSML dialect: the rendered form is
+# ``<|DSML|tool_calls|>`` / ``</|DSML|tool_calls|>``. Detecting these lets the
+# thinking parser decide that an output is a tool invocation, in which case the
+# unclosed-thinking recovery must NOT leak reasoning into the visible body.
+_DSML_TOKEN = "\uff5cDSML\uff5c"
+_DSML_OPEN_TAG = "<" + _DSML_TOKEN + "tool_calls>"
+_DSML_CLOSE_TAG = "</" + _DSML_TOKEN + "tool_calls>"
+
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
@@ -193,13 +202,30 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         thinking = "\n".join(thinking_parts).strip()
         return (thinking, remaining.strip())
 
-    # Handle partial: content before </think> without <think> tag
+    # Handle partial: content before  thinking without  thinking tag
     if '</think>' in text and '<think>' not in text:
         match = _THINKING_TAIL_PATTERN.match(text)
         if match:
             thinking = match.group(1).strip()
             remaining = text[match.end():].strip()
             return (thinking, remaining)
+
+    # DS4 tool invocation: a DSML tool-call envelope is present. The output is
+    # a tool call, so even an unclosed thinking block must NOT leak its
+    # reasoning into the visible body — the tool-call parser owns the response
+    # and the reasoning stays in the thinking channel. This is the regression
+    # covered by TestUnclosedThinkingWithToolCall.
+    if _DSML_OPEN_TAG in text or _DSML_CLOSE_TAG in text:
+        # Reasoning is everything before the DSML open marker (open thinking tag
+        # stripped); the tool-call envelope from the open marker onward is
+        # content so the tool-call parser can extract it.
+        idx = text.find(_DSML_OPEN_TAG)
+        if idx < 0:
+            idx = text.find(_DSML_CLOSE_TAG)
+        before = text[:idx]
+        after = text[idx:]
+        thinking = _strip_leading_open_tags(before).strip()
+        return (thinking, after)
 
     # Malformed: <think> opened but never closed. Drop the open tag and
     # treat the remainder as content so the answer body is not empty.
@@ -210,6 +236,18 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         return ("", (before + after).strip())
 
     return ("", text)
+
+
+def _strip_leading_open_tags(text: str) -> str:
+    """Remove leading <think> open tags so a closed block is parseable.
+
+    Mirrors the streaming parser's tag normalisation (open tags are consumed,
+    not emitted as content).
+    """
+    while text.startswith('<think>'):
+        text = text[_OPEN_LEN:]
+    return text
+
 
 
 class ThinkingParser:
@@ -246,6 +284,14 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # Set when a DS4 DSML tool-call envelope is detected in the output. A
+        # tool invocation owns the response, so an unclosed thinking block must
+        # not be recovered to content (see finish()).
+        self._tool_block_seen: bool = False
+        # True between a DSML open and its matching close: the envelope body is
+        # routed to the content channel (the reasoning panel must not show raw
+        # tool-call XML), and a close tag switches back to normal thinking mode.
+        self._in_tool_call: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -296,20 +342,42 @@ class ThinkingParser:
                     i += len(_HY3_CLOSE_TAG)
                     continue
 
+                # DeepSeek V4 DSML tool-call envelope. Mark the output as a tool
+                # invocation so the unclosed-thinking recovery is suppressed,
+                # and route the envelope body to the content channel. The
+                # matching close returns to normal thinking detection.
+                if remaining.startswith(_DSML_OPEN_TAG):
+                    self._tool_block_seen = True
+                    self._in_tool_call = True
+                    self._content_emitted = True
+                    i += len(_DSML_OPEN_TAG)
+                    continue
+                if remaining.startswith(_DSML_CLOSE_TAG):
+                    self._in_tool_call = False
+                    self._content_emitted = True
+                    i += len(_DSML_CLOSE_TAG)
+                    continue
+
                 # Check if it could be a partial tag (not enough chars yet)
                 if self._could_be_tag(remaining):
                     # Buffer the rest and wait for more data
                     self._buffer = remaining
                     break
 
-                # Not a tag, emit the '<' as regular content
-                if self._in_thinking:
+                # Not a tag, emit the '<' as regular content. Inside a DSML
+                # tool-call envelope it always belongs to content (the reasoning
+                # panel must not show raw XML), so honour _in_tool_call first.
+                if self._in_tool_call:
+                    content_out.append('<')
+                elif self._in_thinking:
                     thinking_out.append('<')
                 else:
                     content_out.append('<')
                 i += 1
             else:
-                if self._in_thinking:
+                if self._in_tool_call:
+                    content_out.append(text[i])
+                elif self._in_thinking:
                     thinking_out.append(text[i])
                 else:
                     content_out.append(text[i])
@@ -347,8 +415,13 @@ class ThinkingParser:
         # already streamed live cannot be retracted, so the client sees
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
+        #
+        # A DS4 tool invocation disables this recovery: the output is a tool
+        # call, so reasoning must stay in the thinking channel and never leak
+        # into the visible body.
         if (
-            self._in_thinking
+            not self._tool_block_seen
+            and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
             and self._thinking_accumulated
@@ -381,7 +454,14 @@ class ThinkingParser:
             return False
 
         # Check against all recognised tags
-        for tag in (_OPEN_TAG, _CLOSE_TAG, _HY3_OPEN_TAG, _HY3_CLOSE_TAG):
+        for tag in (
+            _OPEN_TAG,
+            _CLOSE_TAG,
+            _HY3_OPEN_TAG,
+            _HY3_CLOSE_TAG,
+            _DSML_OPEN_TAG,
+            _DSML_CLOSE_TAG,
+        ):
             if length < len(tag) and tag[:length] == text:
                 return True
 
