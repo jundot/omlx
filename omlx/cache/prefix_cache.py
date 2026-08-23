@@ -348,9 +348,19 @@ class BlockAwarePrefixCache(CacheManager):
             if not isinstance(layer_state, dict):
                 return None
             state = layer_state.get("state", ())
-            if not isinstance(state, (list, tuple)) or len(state) < 2:
+            # Allow single-state ArraysCache (state_count == 1, LFM2.x) as
+            # well as the legacy 2-tuple and generic N-tuple shapes. The
+            # ``< 1`` lower bound is a sanity gate against an empty tuple
+            # that would otherwise produce an N-state marker carrying no
+            # tensors and fail reconstruction downstream.
+            if not isinstance(state, (list, tuple)) or len(state) < 1:
                 return None
-            if len(state) == 2:
+            if len(state) == 1:
+                # Single-state arrays (LFM2.x liquid-style): no conv/values
+                # pair, so route through the existing N-state marker that
+                # already round-trips arbitrary ``len(state) >= 2`` caches.
+                cache_data = ("__nstate__", type_name, list(state))
+            elif len(state) == 2:
                 cache_data = (state[0], state[1])
             else:
                 cache_data = ("__nstate__", type_name, list(state))
@@ -2325,7 +2335,15 @@ class BlockAwarePrefixCache(CacheManager):
                             state = snapshot_cache_data[layer_idx]["state"]
                         else:
                             state = layer_state["state"]
-                        if isinstance(state, (list, tuple)) and len(state) > 2:
+                        if isinstance(state, (list, tuple)) and len(state) >= 1:
+                            # Non-sliceable layouts: route through the
+                            # ``__nstate__`` marker for both single-state
+                            # ArraysCache (LFM2.x, ``state_count == 1``) and
+                            # generic N-tuple caches (``state_count > 2``).
+                            # The legacy ``state_count == 2`` Mamba/SSM pair
+                            # stays as a plain ``(conv, ssm)`` tuple because
+                            # reconstruction for that exact shape does not
+                            # consult the marker (backward compatibility).
                             cloned = [
                                 (
                                     self._clone_tensor(elem)
@@ -2334,20 +2352,28 @@ class BlockAwarePrefixCache(CacheManager):
                                 )
                                 for elem in state
                             ]
-                            block_slices.append(("__nstate__", cache_type_name, cloned))
-                        elif isinstance(state, (list, tuple)) and len(state) >= 2:
-                            conv_state = (
-                                state[0] if state[0] is not None else mx.array([])
-                            )
-                            ssm_state = (
-                                state[1] if state[1] is not None else mx.array([])
-                            )
-                            block_slices.append(
-                                (
-                                    self._clone_tensor(conv_state),
-                                    self._clone_tensor(ssm_state),
+                            if len(state) == 2:
+                                conv_state = (
+                                    state[0]
+                                    if state[0] is not None
+                                    else mx.array([])
                                 )
-                            )
+                                ssm_state = (
+                                    state[1]
+                                    if state[1] is not None
+                                    else mx.array([])
+                                )
+                                block_slices.append(
+                                    (
+                                        self._clone_tensor(conv_state),
+                                        self._clone_tensor(ssm_state),
+                                    )
+                                )
+                            else:
+                                # len(state) == 1 (LFM2.x) or > 2 (N-tuple)
+                                block_slices.append(
+                                    ("__nstate__", cache_type_name, cloned)
+                                )
                         else:
                             logger.debug(
                                 f"Layer {layer_idx}: {cache_type_name} unexpected state format"
@@ -4441,13 +4467,18 @@ class BlockAwarePrefixCache(CacheManager):
                     and layer_data[0] == "__nstate__"
                 ):
                     elements = layer_data[2]
-                    if not isinstance(elements, (list, tuple)) or len(elements) < 2:
+                    # Allow single-state N-tuple ArraysCache (LFM2.x,
+                    # ``state_count == 1``) as well as the legacy 2+ N-tuple
+                    # shape. Non-sliceable types skip the seq_len check
+                    # below so a 1-element marker is safe to accept.
+                    if not isinstance(elements, (list, tuple)) or len(elements) < 1:
                         logger.debug(
                             f"Block validation failed: layer {layer_idx} has "
                             "invalid N-tuple state"
                         )
                         return False
-                    keys, values = elements[0], elements[1]
+                    keys = elements[0] if len(elements) >= 1 else None
+                    values = elements[1] if len(elements) >= 2 else None
                 else:
                     keys, values = layer_data[0], layer_data[1]
 

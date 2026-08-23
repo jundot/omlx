@@ -490,7 +490,11 @@ def test_split_restore_walks_back_from_structurally_invalid_sidecar(tmp_path):
             assert snapshot is not None
             if path == newest_path:
                 # The container is readable, but the recurrent state is not.
-                snapshot[1]["state"] = (snapshot[1]["state"][0],)
+                # Empty state is still structurally invalid under the
+                # single-state ArraysCache relaxation: ``len(state) < 1``
+                # rejects ``()`` while ``len(state) == 1`` is the new
+                # valid case (LFM2.x).
+                snapshot[1]["state"] = ()
             return snapshot
 
         prefix.set_gdn_checkpoint_loader(load_with_invalid_newest)
@@ -508,6 +512,124 @@ def test_split_restore_walks_back_from_structurally_invalid_sidecar(tmp_path):
         assert diagnostic["chosen_endpoint_tokens"] == 8
         assert diagnostic["walkback_blocks"] == 1
         prefix.release_cache("restore-invalid-newest")
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_split_restore_accepts_single_state_arrays_cache(tmp_path):
+    """Lock the new behavior: a single-state ArraysCache sidecar is now
+    accepted (state_count == 1, LFM2.x). The previously-invalid ``len(state) == 1``
+    shape must round-trip without walk-back or fallback.
+    """
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="lfm2-hybrid",
+        initial_blocks=100,
+    )
+    # Custom LAYER_TYPES for this test: keep KVCache as a 2-tuple and use
+    # single-state for ArraysCache.
+    lfm_layer_types = ["KVCache", "ArraysCache"]
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="lfm2-hybrid",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=lfm_layer_types,
+        gdn_ssd_split_enabled=True,
+    )
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+
+    try:
+        prefix.set_gdn_checkpoint_loader(boundary.load_file)
+        request_id = "store-lfm2"
+        boundaries = [4, 8]
+        # KVCache keeps its 2-tuple (keys, values) shape. ArraysCache is the
+        # single-state LFM2.x shape: one recurrent tensor, no conv/values pair.
+        for token_count in boundaries:
+            extracted = [
+                {
+                    "state": (
+                        mx.full((1, 2, token_count, 8), float(token_count)),
+                        mx.full((1, 2, token_count, 8), float(token_count) + 1),
+                    ),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                    "meta_state": (token_count,),
+                },
+                {
+                    "state": (
+                        mx.full((1, 3, 8), float(token_count)),
+                    ),
+                    "class_name": "ArraysCache",
+                    "cache_type": "ArraysCache",
+                    "meta_state": (),
+                },
+            ]
+            assert boundary.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            boundaries,
+            {},
+            paged_ssd_manager=ssd,
+        )
+        tokens = list(range(8))
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            [
+                {
+                    "state": (
+                        mx.full((1, 2, 8, 8), 8.0),
+                        mx.full((1, 2, 8, 8), 9.0),
+                    ),
+                    "class_name": "KVCache",
+                    "cache_type": "KVCache",
+                    "meta_state": (8,),
+                },
+                {
+                    "state": (
+                        mx.full((1, 3, 8), 8.0),
+                    ),
+                    "class_name": "ArraysCache",
+                    "cache_type": "ArraysCache",
+                    "meta_state": (),
+                },
+            ],
+            boundary_snapshots=provider,
+        )
+        assert stored is not None and stored.num_tokens == 8
+
+        hit_table, remaining = prefix.fetch_cache("restore-lfm2", tokens)
+        assert hit_table is not None
+        # Full 8-token prefix must be reused (no walk-back).
+        assert hit_table.num_tokens == 8
+        assert remaining == []
+
+        restored = prefix.reconstruct_cache(hit_table)
+        assert restored is not None
+        assert restored[1].size() == 8
+        # No walk-back occurred: chosen_endpoint must equal the request length.
+        diagnostic = prefix.get_stats_dict()["gdn_last_restore"]
+        assert diagnostic["chosen_endpoint_tokens"] == 8
+        assert diagnostic["walkback_blocks"] == 0
+        prefix.release_cache("restore-lfm2")
     finally:
         boundary.shutdown()
         ssd.close()
