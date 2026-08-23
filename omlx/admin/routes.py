@@ -154,6 +154,7 @@ class ModelSettingsRequest(BaseModel):
     # DeepSeek-V4 hybrid ANE prefill
     deepseek_ane_prefill_enabled: bool | None = None
     deepseek_ane_prefill_sequence_length: int | None = None
+    deepseek_ane_prefill_tail_padding_min_tokens: int | None = None
     deepseek_ane_prefill_cpu_enabled: bool | None = None
     deepseek_ane_prefill_cpu_fraction: float | None = None
     deepseek_ane_prefill_cpu_threads: int | None = None
@@ -2502,6 +2503,23 @@ async def update_model_settings(
                 detail="ANE prompt block must be a multiple of 64 and at least 1024.",
             )
         current_settings.deepseek_ane_prefill_sequence_length = int(value)
+        if (
+            current_settings.deepseek_ane_prefill_tail_padding_min_tokens
+            >= int(value)
+        ):
+            current_settings.deepseek_ane_prefill_tail_padding_min_tokens = 0
+    if "deepseek_ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.deepseek_ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.deepseek_ane_prefill_sequence_length)
+        if value is None or not (value == 0 or 2 <= value < sequence_length):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek ANE tail padding threshold must be zero or "
+                    "between 2 and one less than the ANE prompt block."
+                ),
+            )
+        current_settings.deepseek_ane_prefill_tail_padding_min_tokens = int(value)
     if "deepseek_ane_prefill_cpu_enabled" in sent:
         current_settings.deepseek_ane_prefill_cpu_enabled = bool(
             request.deepseek_ane_prefill_cpu_enabled

@@ -547,6 +547,14 @@ class BatchedEngine(BaseEngine):
                     return enable_deepseek_v4_ane_prefill(
                         self._model,
                         sequence_length=dsv4_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
                         cpu_fraction=(
                             getattr(
                                 self._model_settings,

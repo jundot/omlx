@@ -1014,7 +1014,7 @@
                                         </div>
 
                                         <div x-show="modelSettings.deepseek_ane_prefill_enabled" x-transition class="space-y-3 pt-1">
-                                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_prompt_block') }}</label>
                                                     <select x-model.number="modelSettings.deepseek_ane_prefill_sequence_length"
@@ -1022,6 +1022,13 @@
                                                         <option value="2048">2,048 tokens</option>
                                                         <option value="4096" selected>4,096 tokens — {{ t('modal.model_settings.qwen_ane_measured') }}</option>
                                                     </select>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_tail_padding') }}</label>
+                                                    <input type="number"
+                                                           x-model.number="modelSettings.deepseek_ane_prefill_tail_padding_min_tokens"
+                                                           min="0" step="1" required placeholder="0"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 </div>
                                             </div>
                                             <div class="flex items-start justify-between gap-3 rounded-lg border border-neutral-200 bg-white p-3">

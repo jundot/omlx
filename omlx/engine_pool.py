@@ -683,6 +683,10 @@ class EnginePool:
                 "deepseek_ane_prefill_sequence_length",
                 data.get("deepseek_ane_prefill_sequence_length", 4096),
             )
+            add(
+                "deepseek_ane_prefill_tail_padding_min_tokens",
+                data.get("deepseek_ane_prefill_tail_padding_min_tokens", 0),
+            )
             cpu_active = bool(
                 data.get("deepseek_ane_prefill_cpu_enabled", True)
             )

@@ -399,6 +399,7 @@ class TestProfileFieldFiltering:
             "qwen35_ane_prefill_enabled": True,
             "deepseek_ane_prefill_enabled": True,
             "deepseek_ane_prefill_sequence_length": 4096,
+            "deepseek_ane_prefill_tail_padding_min_tokens": 3000,
             "deepseek_ane_prefill_cpu_enabled": True,
             "deepseek_ane_prefill_cpu_fraction": 0.125,
             "deepseek_ane_prefill_cpu_threads": 12,
@@ -427,6 +428,7 @@ class TestProfileFieldFiltering:
         assert applied.qwen35_ane_prefill_gdn is True
         assert applied.qwen35_ane_prefill_gdn_fraction == 0.50
         assert applied.qwen35_ane_prefill_gdn_max_layers == 48
+        assert applied.deepseek_ane_prefill_tail_padding_min_tokens == 3000
 
     def test_save_template_drops_none_and_empty_string_values(self, mgr):
         mgr.save_template(

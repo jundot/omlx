@@ -1,8 +1,9 @@
 # DeepSeek-V4 ANE/CPU/GPU Prefill (Experimental)
 
 This source-build experiment extends the Qwen ANE prompt-processing runtime
-to DeepSeek-V4-Flash. For prompt chunks that exactly match the configured
-fixed shape, six dense projection groups run as a hybrid split: an INT8 channel
+to DeepSeek-V4-Flash. Exact prompt chunks, plus configured profitable short
+tails zero-padded to the compiled shape, run six dense projection groups as a
+hybrid split: an INT8 channel
 prefix on both ANEs, an optional FP16 CPU middle, and an affine-q8 GPU suffix
 requantized from the mxfp8 checkpoint weights. The CPU branch uses the same
 performance-aware shared-resource scheduler as Qwen3.5.
@@ -27,8 +28,11 @@ Accelerated per layer:
   rows on ANE). A native grouped affine-q8 suffix preserves the compact
   per-group weights and overlaps GPU work with both ANE instances.
 
-Routed experts, attention-output `wo_b`, the attention core, decode, and DSpark
-verification keep the existing GPU path. `wo_b` was measured as a net loss
+Routed experts, attention-output `wo_b`, the attention core, and decode keep
+their existing paths. Embedded DSpark is supported natively: target prefill can
+use ANE, while the armed 2–6-row verification window remains on its bundled
+decode-consistent QMV, attention, ring, and top-k kernels and is never
+ANE-padded. `wo_b` was measured as a net loss
 in-model and is excluded. The bank ladder and fixed-shape eligibility are shared with the
 Qwen implementation. Unlike the Qwen path, which runs its GPU suffix on NAX
 qmm kernels since the split tuner landed, the DeepSeek hybrid still skips
@@ -42,6 +46,7 @@ the path on for benchmarking there.
 {
   "deepseek_ane_prefill_enabled": true,
   "deepseek_ane_prefill_sequence_length": 4096,
+  "deepseek_ane_prefill_tail_padding_min_tokens": 0,
   "deepseek_ane_prefill_cpu_enabled": true,
   "deepseek_ane_prefill_cpu_fraction": 0.125,
   "deepseek_ane_prefill_cpu_threads": 12,
@@ -58,6 +63,17 @@ required in addition to aligning cache-block boundaries: otherwise a smaller
 prefill step can split every nominal 4,096-token block before it reaches the
 fixed-shape ANE procedures. With the default configuration, serve logs should
 report `effective_step=4096` and `chunk_tokens=4096` for each full chunk.
+
+`deepseek_ane_prefill_tail_padding_min_tokens` ports Qwen's short-tail policy.
+A value from 2 through 4,095 makes a single-prompt projection block at or above
+that threshold zero-pad its token axis to 4,096, execute the compiled hybrid,
+and slice the padded rows immediately. This applies independently to shared
+gate/up and down, attention-input stacks, query projections, and grouped
+`wo_a`; attention and cache updates never see padded tokens. Zero keeps the
+feature disabled. The default remains zero until a DeepSeek full-model
+crossover is measured; setting an overly low threshold can waste substantial
+work on small non-DSpark calls, although one-token decode and armed DSpark
+verification are always excluded.
 
 The per-request `ane_full_tiles` trace counter is not a reliable activation
 signal for DeepSeek yet: it reads a benchmark field currently populated only

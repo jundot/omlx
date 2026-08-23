@@ -261,6 +261,7 @@ async def test_deepseek_ane_prefill_settings_are_persisted():
         admin_routes.ModelSettingsRequest(
             deepseek_ane_prefill_enabled=True,
             deepseek_ane_prefill_sequence_length=4096,
+            deepseek_ane_prefill_tail_padding_min_tokens=3000,
             deepseek_ane_prefill_cpu_enabled=True,
             deepseek_ane_prefill_cpu_fraction=0.125,
             deepseek_ane_prefill_cpu_threads=12,
@@ -270,6 +271,7 @@ async def test_deepseek_ane_prefill_settings_are_persisted():
 
     assert settings.deepseek_ane_prefill_enabled is True
     assert settings.deepseek_ane_prefill_sequence_length == 4096
+    assert settings.deepseek_ane_prefill_tail_padding_min_tokens == 3000
     assert settings.deepseek_ane_prefill_cpu_enabled is True
     assert settings.deepseek_ane_prefill_cpu_fraction == 0.125
     assert settings.deepseek_ane_prefill_cpu_threads == 12
@@ -301,6 +303,21 @@ async def test_deepseek_ane_prefill_rejects_invalid_block_size():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(
                 deepseek_ane_prefill_sequence_length=4000
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_tail_threshold_at_block_size():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="less than"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_tail_padding_min_tokens=4096
             ),
         )
 

@@ -144,6 +144,8 @@ class ModelSettings:
         deepseek_ane_prefill_sequence_length: Exact flattened token count routed
             through the DeepSeek ANE procedures; also realigns the paged cache
             block size, rebuilding this model's SSD cache once.
+        deepseek_ane_prefill_tail_padding_min_tokens: Smallest short token block
+            zero-padded to the compiled DeepSeek ANE shape (zero disables).
         deepseek_ane_prefill_cpu_enabled: Share benchmark-selected query
             projection rows with the CPU while both ANEs and the GPU run.
         deepseek_ane_prefill_cpu_fraction: Fraction of query projection rows
@@ -270,6 +272,7 @@ class ModelSettings:
     # it rebuilds this model's SSD cache once.
     deepseek_ane_prefill_enabled: bool = False
     deepseek_ane_prefill_sequence_length: int = 4096
+    deepseek_ane_prefill_tail_padding_min_tokens: int = 0
     deepseek_ane_prefill_cpu_enabled: bool = True
     deepseek_ane_prefill_cpu_fraction: float = 0.125
     deepseek_ane_prefill_cpu_threads: int = 12

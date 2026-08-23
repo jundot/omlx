@@ -456,6 +456,9 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     if request.model_family == "deepseek_v4":
         settings.deepseek_ane_prefill_enabled = candidate.enabled
         settings.deepseek_ane_prefill_sequence_length = request.sequence_length
+        # DeepSeek's bounded tuner measures exact shapes only. Do not carry a
+        # stale tail crossover into its candidates or recommendation.
+        settings.deepseek_ane_prefill_tail_padding_min_tokens = 0
         settings.deepseek_ane_prefill_cpu_enabled = bool(
             candidate.cpu_enabled and request.allow_cpu
         )
@@ -2460,6 +2463,7 @@ def _deepseek_shape_tuning_sync(run: ANETuningRun) -> dict[str, Any]:
         "processing_tps": round(projection_tps, 2),
         "speedup_percent": round((baseline_ms / winner_ms - 1.0) * 100.0, 2),
         "sequence_length": run.request.sequence_length,
+        "tail_padding_min_tokens": 0,
         "full_model_verified": False,
         "measurement_scope": "exact_projection_shapes",
     }

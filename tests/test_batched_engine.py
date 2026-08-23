@@ -318,8 +318,12 @@ class TestBatchedEngineInitialization:
             lambda value, settings: value,
         )
         monkeypatch.setattr(model_loading, "materialize_lazy_state", lambda value: None)
+        def fake_enable_deepseek(*args, **kwargs):
+            captured["deepseek_ane_kwargs"] = kwargs
+            return 1
+
         monkeypatch.setattr(
-            deepseek_ane, "enable_deepseek_v4_ane_prefill", lambda *a, **k: 1
+            deepseek_ane, "enable_deepseek_v4_ane_prefill", fake_enable_deepseek
         )
         monkeypatch.setattr(
             qwen35_ane_prefill,
@@ -330,6 +334,7 @@ class TestBatchedEngineInitialization:
         settings = SimpleNamespace(
             deepseek_ane_prefill_enabled=True,
             deepseek_ane_prefill_sequence_length=4096,
+            deepseek_ane_prefill_tail_padding_min_tokens=3000,
             deepseek_ane_prefill_cpu_enabled=False,
             qwen35_ane_prefill_enabled=False,
             moe_gate_up_fusion_enabled=False,
@@ -352,6 +357,7 @@ class TestBatchedEngineInitialization:
         assert effective.ane_prefill_block_size == 4096
         assert effective.prefill_step_size == expected_step
         assert original_config.prefill_step_size == requested_step
+        assert captured["deepseek_ane_kwargs"]["tail_padding_min_tokens"] == 3000
 
     def test_model_name_property(self):
         """Test model_name property."""

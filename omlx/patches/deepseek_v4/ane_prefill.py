@@ -60,6 +60,7 @@ class _AneConfig:
     sequence_length: int
     cpu_threads: int = 12
     cpu_shared_resource: bool = True
+    tail_padding_min_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -529,7 +530,30 @@ def _compile_grouped_dual_banks(
     )
 
 
-def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
+def _padded_short_input(
+    x: mx.array,
+    config: _AneConfig,
+    *,
+    grouped: bool = False,
+) -> mx.array | None:
+    """Pad one profitable token tail without catching decode or DSpark verify."""
+    if is_armed() or x.dtype not in (mx.float16, mx.bfloat16):
+        return None
+    if grouped:
+        if x.ndim not in (3, 4) or (x.ndim == 4 and int(x.shape[0]) != 1):
+            return None
+    elif x.ndim != 3 or int(x.shape[0]) != 1:
+        return None
+    rows = int(x.shape[-2])
+    threshold = int(config.tail_padding_min_tokens or 0)
+    if not 0 < threshold <= rows < config.sequence_length:
+        return None
+    padding = [(0, 0)] * x.ndim
+    padding[-2] = (0, config.sequence_length - rows)
+    return mx.pad(x, padding)
+
+
+def _hybrid_combined_exact(owner: Any, x: mx.array) -> mx.array | None:
     config = getattr(owner, "_omlx_ane_config", None)
     if config is None or getattr(owner, "_omlx_ane_failed", False):
         return None
@@ -577,7 +601,23 @@ def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
         return None
 
 
-def _grouped_backend(linear: Any, x: mx.array) -> mx.array | None:
+def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
+    """Run an exact tile or zero-pad one configured profitable short tail."""
+    combined = _hybrid_combined_exact(owner, x)
+    if combined is not None:
+        return combined
+    config = getattr(owner, "_omlx_ane_config", None)
+    if config is None or getattr(owner, "_omlx_ane_failed", False):
+        return None
+    padded_input = _padded_short_input(x, config)
+    if padded_input is None:
+        return None
+    rows = int(x.shape[-2])
+    padded = _hybrid_combined_exact(owner, padded_input)
+    return None if padded is None else padded[..., :rows, :]
+
+
+def _grouped_backend_exact(linear: Any, x: mx.array) -> mx.array | None:
     state = getattr(linear, "_omlx_ane_state", None)
     config = getattr(linear, "_omlx_ane_config", None)
     if (
@@ -616,6 +656,26 @@ def _grouped_backend(linear: Any, x: mx.array) -> mx.array | None:
             exc_info=True,
         )
         return None
+
+
+def _grouped_backend(linear: Any, x: mx.array) -> mx.array | None:
+    combined = _grouped_backend_exact(linear, x)
+    if combined is not None:
+        return combined
+    state = getattr(linear, "_omlx_ane_state", None)
+    config = getattr(linear, "_omlx_ane_config", None)
+    if (
+        not isinstance(state, _GroupedLinearState)
+        or config is None
+        or getattr(linear, "_omlx_ane_failed", False)
+    ):
+        return None
+    padded_input = _padded_short_input(x, config, grouped=True)
+    if padded_input is None:
+        return None
+    rows = int(x.shape[-2])
+    padded = _grouped_backend_exact(linear, padded_input)
+    return None if padded is None else padded[..., :rows, :]
 
 
 def _linear_backend(linear: Any, x: mx.array) -> mx.array | None:
@@ -695,6 +755,7 @@ def enable_deepseek_v4_ane_prefill(
     cpu_fraction: float = 0.125,
     cpu_threads: int = 12,
     cpu_shared_resource: bool = True,
+    tail_padding_min_tokens: int = 0,
 ) -> int:
     """Enable the hybrid ANE backend on eligible DeepSeek-V4 projections.
 
@@ -706,6 +767,14 @@ def enable_deepseek_v4_ane_prefill(
         raise ValueError("DeepSeek CPU fraction must be between 0.0 and 0.5")
     if not 0 <= cpu_threads <= 64:
         raise ValueError("DeepSeek CPU worker count must be between 0 and 64")
+    if not (
+        tail_padding_min_tokens == 0
+        or 2 <= tail_padding_min_tokens < sequence_length
+    ):
+        raise ValueError(
+            "DeepSeek ANE tail padding threshold must be zero or between 2 "
+            "and sequence_length - 1"
+        )
 
     # The shared CPU middle is only competitive at the measured 4K tile.
     # At 2K, fresh shape probes put plain wq_b at 5.41 ms with the default
@@ -780,7 +849,12 @@ def enable_deepseek_v4_ane_prefill(
     if not layers:
         return 0
 
-    config = _AneConfig(sequence_length, cpu_threads, cpu_shared_resource)
+    config = _AneConfig(
+        sequence_length,
+        cpu_threads,
+        cpu_shared_resource,
+        tail_padding_min_tokens,
+    )
     prepared: list[tuple[Any, Any, mx.array, mx.array]] = []
     grouped_prepared: list[tuple[Any, _GroupedLinearState, mx.array, mx.array]] = []
     mlp_count = 0
@@ -965,6 +1039,8 @@ def enable_deepseek_v4_ane_prefill(
     model._omlx_ane_attention_input_prefill_count = attention_input_count
     model._omlx_ane_down_prefill_count = down_count
     model._omlx_ane_wo_a_prefill_count = wo_a_count
+    model._omlx_ane_tail_padding_min_tokens = tail_padding_min_tokens
+    model._omlx_ane_dspark_native_compatible = True
     model._omlx_ane_cpu_prefill_count = sum(
         state.cpu_weight is not None for _, state, _, _ in prepared
     )
@@ -974,7 +1050,8 @@ def enable_deepseek_v4_ane_prefill(
         "%d attention-input stacks, %d query projections, %d with the "
         "indexer wq_b stacked in) "
         "into %d instance-pinned ANE programs (sequence_length=%d, "
-        "query_cpu_fraction=%.3f, cpu_threads=%d, shared_resource=%s)",
+        "query_cpu_fraction=%.3f, cpu_threads=%d, shared_resource=%s, "
+        "tail_padding_min_tokens=%d, dspark_native=true)",
         count,
         mlp_count,
         down_count,
@@ -987,5 +1064,6 @@ def enable_deepseek_v4_ane_prefill(
         cpu_fraction,
         cpu_threads,
         cpu_shared_resource,
+        tail_padding_min_tokens,
     )
     return count

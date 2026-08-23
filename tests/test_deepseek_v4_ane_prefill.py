@@ -156,6 +156,60 @@ def test_linear_backend_dispatches_shared_cpu_middle(monkeypatch):
     assert calls[0][-2:] == (12, True)
 
 
+def test_linear_backend_pads_profitable_short_tile_and_slices(monkeypatch):
+    linear = _mxfp8_linear(256, 512)
+    prep = ane_patch._prepare_linear(linear, 0.5)
+    _attach(linear, prep)
+    linear._omlx_ane_config = ane_patch._AneConfig(
+        SEQ, tail_padding_min_tokens=96
+    )
+    seen = []
+
+    def fake_dual(x, *args):
+        seen.append(x)
+        return mx.full((1, SEQ, 512), 7, dtype=x.dtype)
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", fake_dual)
+    x = mx.ones((1, 100, 256), dtype=mx.bfloat16)
+
+    result = ane_patch._linear_backend(linear, x)
+    assert result is not None
+    mx.eval(result, *seen)
+
+    assert result.shape == (1, 100, 512)
+    assert seen[0].shape == (1, SEQ, 256)
+    assert bool(mx.all(seen[0][:, :100] == 1))
+    assert bool(mx.all(seen[0][:, 100:] == 0))
+    assert bool(mx.all(result == 7))
+
+
+def test_tail_padding_never_intercepts_native_dspark_verify(monkeypatch):
+    linear = _mxfp8_linear(256, 512)
+    prep = ane_patch._prepare_linear(linear, 0.5)
+    _attach(linear, prep)
+    linear._omlx_ane_config = ane_patch._AneConfig(
+        SEQ, tail_padding_min_tokens=2
+    )
+    calls = []
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_dual_affine_qmm_t",
+        lambda *args: calls.append(args),
+    )
+
+    decode_consistency.set_armed(True)
+    try:
+        assert (
+            ane_patch._linear_backend(
+                linear, mx.ones((1, 6, 256), dtype=mx.bfloat16)
+            )
+            is None
+        )
+    finally:
+        decode_consistency.set_armed(False)
+    assert calls == []
+
+
 def test_mlp_backend_reassembles_gate_and_up(monkeypatch):
     mlp = SimpleNamespace(
         gate_proj=_mxfp8_linear(256, 512),
@@ -276,6 +330,31 @@ def test_grouped_backend_dispatches_and_guards_shape(monkeypatch):
         assert ane_patch._grouped_backend(linear, x) is None
     finally:
         decode_consistency.set_armed(False)
+
+
+def test_grouped_backend_pads_sequence_axis_only(monkeypatch):
+    linear = _mxfp8_grouped_linear(2, 256, 512)
+    prep = ane_patch._prepare_grouped_linear(linear, 0.5)
+    assert prep is not None
+    _attach(linear, prep)
+    linear._omlx_ane_config = ane_patch._AneConfig(
+        SEQ, tail_padding_min_tokens=96
+    )
+    seen = []
+
+    def fake_grouped(x, *args):
+        seen.append(x)
+        return mx.zeros((1, 2, SEQ, 512), dtype=x.dtype)
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_grouped_affine_qmm_t", fake_grouped)
+    result = ane_patch._grouped_backend(
+        linear, mx.ones((1, 2, 100, 256), dtype=mx.bfloat16)
+    )
+    assert result is not None
+    mx.eval(result, *seen)
+
+    assert seen[0].shape == (1, 2, SEQ, 256)
+    assert result.shape == (1, 2, 100, 512)
 
 
 def test_prepare_stacked_spans_both_linears():
@@ -505,7 +584,11 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
     layer = _fake_layer()
     model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
 
-    count = ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ)
+    count = ane_patch.enable_deepseek_v4_ane_prefill(
+        model,
+        sequence_length=SEQ,
+        tail_padding_min_tokens=3000,
+    )
 
     # Shared gate/up, shared down, attention-input stack, and plain wq_b;
     # wo_b is excluded.
@@ -527,6 +610,9 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
     assert model._omlx_ane_attention_input_prefill_count == 1
     assert model._omlx_ane_down_prefill_count == 1
     assert model._omlx_ane_wo_a_prefill_count == 0
+    assert model._omlx_ane_tail_padding_min_tokens == 3000
+    assert model._omlx_ane_dspark_native_compatible is True
+    assert layer.attn.wq_b._omlx_ane_config.tail_padding_min_tokens == 3000
     assert model._omlx_ane_resident_program_count == 2
 
 

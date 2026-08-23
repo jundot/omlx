@@ -47,6 +47,7 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'deepseek_ane_prefill_enabled',
         'deepseek_ane_prefill_sequence_length',
+        'deepseek_ane_prefill_tail_padding_min_tokens',
         'deepseek_ane_prefill_cpu_enabled',
         'deepseek_ane_prefill_cpu_fraction',
         'deepseek_ane_prefill_cpu_threads',
@@ -248,6 +249,7 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 deepseek_ane_prefill_enabled: false,
                 deepseek_ane_prefill_sequence_length: 4096,
+                deepseek_ane_prefill_tail_padding_min_tokens: 0,
                 deepseek_ane_prefill_cpu_enabled: true,
                 deepseek_ane_prefill_cpu_fraction: 0.125,
                 deepseek_ane_prefill_cpu_threads: 12,
@@ -7420,6 +7422,7 @@
                     qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
                     deepseek_ane_prefill_enabled: s.deepseek_ane_prefill_enabled || false,
                     deepseek_ane_prefill_sequence_length: s.deepseek_ane_prefill_sequence_length || 4096,
+                    deepseek_ane_prefill_tail_padding_min_tokens: s.deepseek_ane_prefill_tail_padding_min_tokens ?? 0,
                     deepseek_ane_prefill_cpu_enabled: s.deepseek_ane_prefill_cpu_enabled !== false,
                     deepseek_ane_prefill_cpu_fraction: s.deepseek_ane_prefill_cpu_fraction ?? 0.125,
                     deepseek_ane_prefill_cpu_threads: s.deepseek_ane_prefill_cpu_threads ?? 12,
@@ -8075,6 +8078,9 @@
                         deepseek_ane_prefill_sequence_length: Number(
                             recommendation.sequence_length
                         ),
+                        deepseek_ane_prefill_tail_padding_min_tokens: Number(
+                            recommendation.tail_padding_min_tokens || 0
+                        ),
                         deepseek_ane_prefill_cpu_enabled:
                             !!recommendation.cpu_enabled,
                         deepseek_ane_prefill_cpu_fraction: Number(
@@ -8308,12 +8314,40 @@
                 return null;
             },
 
+            validateDeepseekAneSettings() {
+                if (!this.modelSettings.deepseek_ane_prefill_enabled) return null;
+                const sequenceLength = Number(
+                    this.modelSettings.deepseek_ane_prefill_sequence_length
+                );
+                if (!Number.isInteger(sequenceLength) || sequenceLength < 1024) {
+                    return 'DeepSeek ANE prompt block must be an integer of at least 1024.';
+                }
+                if (sequenceLength % 64 !== 0) {
+                    return 'DeepSeek ANE prompt block must be a multiple of 64.';
+                }
+                const threshold = Number(
+                    this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens
+                );
+                if (!Number.isInteger(threshold) || threshold < 0) {
+                    return 'DeepSeek ANE tail padding threshold must be a non-negative integer.';
+                }
+                if (threshold === 1 || threshold >= sequenceLength) {
+                    return 'DeepSeek ANE tail padding threshold must be zero or between 2 and one less than the prompt block.';
+                }
+                return null;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
+                    return;
+                }
+                const deepseekAneValidationError = this.validateDeepseekAneSettings();
+                if (deepseekAneValidationError) {
+                    alert(deepseekAneValidationError);
                     return;
                 }
 
@@ -8419,6 +8453,9 @@
                                 qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
                                 deepseek_ane_prefill_enabled: !!this.modelSettings.deepseek_ane_prefill_enabled,
                                 deepseek_ane_prefill_sequence_length: parseInt(this.modelSettings.deepseek_ane_prefill_sequence_length) || 4096,
+                                deepseek_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens)
+                                    : 0,
                                 deepseek_ane_prefill_cpu_enabled: !!this.modelSettings.deepseek_ane_prefill_cpu_enabled,
                                 deepseek_ane_prefill_cpu_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction))
                                     ? Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction)

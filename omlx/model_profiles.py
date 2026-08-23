@@ -63,6 +63,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_shared_resource",
     "deepseek_ane_prefill_enabled",
     "deepseek_ane_prefill_sequence_length",
+    "deepseek_ane_prefill_tail_padding_min_tokens",
     "deepseek_ane_prefill_cpu_enabled",
     "deepseek_ane_prefill_cpu_fraction",
     "deepseek_ane_prefill_cpu_threads",

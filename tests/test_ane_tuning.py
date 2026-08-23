@@ -60,6 +60,7 @@ def test_candidate_settings_are_transient_copy():
 def test_deepseek_candidate_settings_are_transient_and_disable_qwen():
     base = ModelSettings(
         qwen35_ane_prefill_enabled=True,
+        deepseek_ane_prefill_tail_padding_min_tokens=3000,
         deepseek_ane_prefill_cpu_shared_resource=True,
     )
     request = ane_tuning.ANETuningRequest(
@@ -80,12 +81,14 @@ def test_deepseek_candidate_settings_are_transient_and_disable_qwen():
     assert tuned is not base
     assert tuned.deepseek_ane_prefill_enabled is True
     assert tuned.deepseek_ane_prefill_sequence_length == 4096
+    assert tuned.deepseek_ane_prefill_tail_padding_min_tokens == 0
     assert tuned.deepseek_ane_prefill_cpu_enabled is True
     assert tuned.deepseek_ane_prefill_cpu_fraction == 0.125
     assert tuned.deepseek_ane_prefill_cpu_threads == 12
     assert tuned.deepseek_ane_prefill_cpu_shared_resource is True
     assert tuned.qwen35_ane_prefill_enabled is False
     assert base.deepseek_ane_prefill_enabled is False
+    assert base.deepseek_ane_prefill_tail_padding_min_tokens == 3000
     assert base.qwen35_ane_prefill_enabled is True
 
 
