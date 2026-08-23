@@ -65,6 +65,9 @@ private:
   friend std::vector<std::shared_ptr<AneLinearModel>>
   qwen35_ane_compile_linear_bank(const std::vector<mlx::core::array> &, int,
                                  int);
+  friend std::vector<std::shared_ptr<AneLinearModel>>
+  qwen35_ane_compile_linear_grouped_bank(
+      const std::vector<mlx::core::array> &, int, int, int);
   friend std::shared_ptr<AneLinearModel>
   qwen35_ane_compile_fp16_linear(const mlx::core::array &, int);
   friend std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
@@ -90,7 +93,7 @@ public:
   AneLinearBankBuilder(const AneLinearBankBuilder &) = delete;
   AneLinearBankBuilder &operator=(const AneLinearBankBuilder &) = delete;
 
-  void add(const mlx::core::array &weight);
+  void add(const mlx::core::array &weight, int groups = 1);
   int size() const;
   std::vector<std::shared_ptr<AneLinearModel>>
   compile(int ane_instance, int start, int stop);
@@ -136,6 +139,11 @@ qwen35_ane_compile_linear(const mlx::core::array &weight, int sequence_length,
 std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
     const std::vector<mlx::core::array> &weights, int sequence_length,
     int ane_instance);
+
+std::vector<std::shared_ptr<AneLinearModel>>
+qwen35_ane_compile_linear_grouped_bank(
+    const std::vector<mlx::core::array> &weights, int sequence_length,
+    int ane_instance, int groups);
 
 mlx::core::array qwen35_cpu_fp16_affine_qmm_t(
     const mlx::core::array &x, const mlx::core::array &cpu_weight,
@@ -219,6 +227,15 @@ mlx::core::array qwen35_ane_dual_affine_qmm_t(
     const std::shared_ptr<AneLinearModel> &ane_model1, int bits,
     int variant = 8, int group_size = 128, int profile_category = 1,
     mlx::core::StreamOrDevice s = {});
+
+mlx::core::array qwen35_ane_dual_grouped_affine_qmm_t(
+    const mlx::core::array &x, const mlx::core::array &gpu_weight,
+    const mlx::core::array &gpu_scales,
+    const mlx::core::array &gpu_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int groups,
+    int bits = 8, int variant = 8, int group_size = 64,
+    int profile_category = 1, mlx::core::StreamOrDevice s = {});
 
 mlx::core::array qwen35_ane_dual_cpu_fp16_affine_qmm_t(
     const mlx::core::array &x, const mlx::core::array &cpu_weight,

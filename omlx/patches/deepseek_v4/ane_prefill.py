@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in ANE/CPU/GPU prefill for DeepSeek-V4-Flash dense projections.
 
-Splits the mxfp8 shared-expert gate/up pair, the attention-input projections,
-and the wq_b attention projection (with the sparse-layer indexer wq_b stacked
-into the same procedure) between an INT8 ANE channel prefix and an affine-q8
-GPU suffix.
+Splits the mxfp8 shared-expert gate/up and down projections, the attention-input
+projections, grouped wo_a, and the wq_b attention projection (with the
+sparse-layer indexer wq_b stacked into the same procedure) between an INT8 ANE
+channel prefix and an affine-q8 GPU suffix.
 The query projections may also place a benchmark-selected FP16 middle slice
-on the CPU using Qwen's shared-resource scheduler. Routed experts, shared
-gate/up CPU work, wo_a/wo_b, decode, and DSpark verify calls keep their
-existing paths. Enabled through the per-model
+on the CPU using Qwen's shared-resource scheduler. Routed experts, shared MLP
+CPU work, wo_b, decode, and DSpark verify calls keep their existing paths.
+Enabled through the per-model
 ``deepseek_ane_prefill_*`` settings on the batched engine.
 """
 
@@ -24,7 +24,11 @@ import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.deepseek_v4.decode_consistency import is_armed
-from omlx.patches.qwen35_ane_prefill import _compile_dual_banks, _eligible_input
+from omlx.patches.qwen35_ane_prefill import (
+    _bank_split_ladder,
+    _compile_dual_banks,
+    _eligible_input,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,9 @@ _SUFFIX_GROUP_SIZE = 64
 # host synchronization exceeded the offload savings in-model at K=8192.
 _FRACTIONS = {
     "mlp": 0.5,
+    # Requested 65% becomes 62.5% after the 128-row per-instance alignment.
+    "mlp_down": 0.65,
+    "wo_a": 0.5,
     "wq_b": 0.5,
     "indexer_wq_b": 0.5,
     # Exact 4K shape probes. Local and ratio-128 stacks balance at 50%; the
@@ -109,6 +116,18 @@ class _AttentionInputState:
     cpu_outputs: int = 0
 
 
+@dataclass(frozen=True)
+class _GroupedLinearState:
+    model: Any
+    model1: Any
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
+    ane_outputs: int
+    gpu_outputs: int
+    groups: int
+
+
 def _mxfp8_linear_dims(linear: Any) -> tuple[int, int] | None:
     """Return (out_features, in_features) for an eligible mxfp8 linear."""
     if getattr(linear, "mode", None) != "mxfp8":
@@ -137,6 +156,47 @@ def _dequant_rows(linear: Any, start: int, stop: int) -> mx.array:
         group_size=32,
         bits=8,
         mode="mxfp8",
+    )
+
+
+def _mxfp8_grouped_dims(linear: Any) -> tuple[int, int, int] | None:
+    """Return (groups, out_per_group, in_per_group) for MultiLinear."""
+    if getattr(linear, "mode", None) != "mxfp8":
+        return None
+    if getattr(linear, "bits", None) != 8 or getattr(linear, "group_size", None) != 32:
+        return None
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    if (
+        weight is None
+        or scales is None
+        or weight.dtype != mx.uint32
+        or scales.dtype != mx.uint8
+        or weight.ndim != 3
+        or scales.ndim != 3
+        or getattr(linear, "bias", None) is not None
+    ):
+        return None
+    groups = int(weight.shape[0])
+    out_features = int(weight.shape[1])
+    in_features = int(weight.shape[2]) * 4
+    if groups < 2 or in_features % _SUFFIX_GROUP_SIZE:
+        return None
+    return groups, out_features, in_features
+
+
+def _dequant_grouped_rows(linear: Any, start: int, stop: int) -> mx.array:
+    return mx.concatenate(
+        [
+            mx.dequantize(
+                linear.weight[group, start:stop],
+                linear.scales[group, start:stop],
+                group_size=32,
+                bits=8,
+                mode="mxfp8",
+            )
+            for group in range(int(linear.weight.shape[0]))
+        ]
     )
 
 
@@ -265,6 +325,38 @@ def _prepare_mlp(mlp: Any) -> tuple[_MlpState, mx.array, mx.array] | None:
     dense1 = mx.contiguous(block(per_instance, ane_outputs).astype(mx.float32))
     suffix = _requant_suffix(mx.contiguous(block(ane_outputs, out_features)))
     state = _MlpState(None, None, *suffix, ane_outputs, gpu_outputs)
+    return state, dense0, dense1
+
+
+def _prepare_grouped_linear(
+    linear: Any, ane_fraction: float
+) -> tuple[_GroupedLinearState, mx.array, mx.array] | None:
+    dims = _mxfp8_grouped_dims(linear)
+    if dims is None:
+        return None
+    groups, out_features, _ = dims
+    split = _split_rows(out_features, ane_fraction)
+    if split is None:
+        return None
+    per_instance, _, gpu_outputs = split
+    ane_outputs = 2 * per_instance
+    dense0 = mx.contiguous(
+        _dequant_grouped_rows(linear, 0, per_instance).astype(mx.float32)
+    )
+    dense1 = mx.contiguous(
+        _dequant_grouped_rows(linear, per_instance, ane_outputs).astype(mx.float32)
+    )
+    suffix = _requant_suffix(
+        mx.contiguous(_dequant_grouped_rows(linear, ane_outputs, out_features))
+    )
+    state = _GroupedLinearState(
+        None,
+        None,
+        *suffix,
+        ane_outputs,
+        gpu_outputs,
+        groups,
+    )
     return state, dense0, dense1
 
 
@@ -416,6 +508,27 @@ def _prepare_attention_input(
     return state, dense0, dense1
 
 
+def _compile_grouped_dual_banks(
+    weights0: list[mx.array],
+    weights1: list[mx.array],
+    sequence_length: int,
+    groups: int,
+) -> tuple[list[Any], list[Any], int] | None:
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    return _bank_split_ladder(
+        [int(weight.nbytes) for weight in weights0],
+        lambda start, stop: (
+            fast.qwen35_ane_compile_linear_grouped_bank(
+                weights0[start:stop], sequence_length, 1, groups
+            ),
+            fast.qwen35_ane_compile_linear_grouped_bank(
+                weights1[start:stop], sequence_length, 2, groups
+            ),
+        ),
+    )
+
+
 def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
     config = getattr(owner, "_omlx_ane_config", None)
     if config is None or getattr(owner, "_omlx_ane_failed", False):
@@ -459,6 +572,47 @@ def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
         owner._omlx_ane_failed = True
         logger.warning(
             "Disabling ANE prefill for one DeepSeek projection after a runtime failure",
+            exc_info=True,
+        )
+        return None
+
+
+def _grouped_backend(linear: Any, x: mx.array) -> mx.array | None:
+    state = getattr(linear, "_omlx_ane_state", None)
+    config = getattr(linear, "_omlx_ane_config", None)
+    if (
+        not isinstance(state, _GroupedLinearState)
+        or config is None
+        or getattr(linear, "_omlx_ane_failed", False)
+        or is_armed()
+        or x.dtype not in (mx.float16, mx.bfloat16)
+        or x.ndim not in (3, 4)
+        or (x.ndim == 4 and int(x.shape[0]) != 1)
+        or int(x.shape[-3]) != state.groups
+        or int(x.size // (int(x.shape[-1]) * state.groups)) != config.sequence_length
+        or state.scales.dtype != x.dtype
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        return fast.qwen35_ane_dual_grouped_affine_qmm_t(
+            x,
+            state.weight,
+            state.scales,
+            state.biases,
+            state.model,
+            state.model1,
+            state.groups,
+            _SUFFIX_BITS,
+            8,
+            _SUFFIX_GROUP_SIZE,
+            1,
+        )
+    except Exception:
+        linear._omlx_ane_failed = True
+        logger.warning(
+            "Disabling grouped DeepSeek ANE prefill after a runtime failure",
             exc_info=True,
         )
         return None
@@ -530,7 +684,8 @@ def _mlp_backend(mlp: Any, x: mx.array) -> mx.array | None:
         ).astype(x.dtype)
     else:
         hidden = module._limited_swiglu(gate, up, mlp.swiglu_limit)
-    return mlp.down_proj(hidden)
+    down = _linear_backend(mlp.down_proj, hidden)
+    return mlp.down_proj(hidden) if down is None else down
 
 
 def enable_deepseek_v4_ane_prefill(
@@ -590,6 +745,15 @@ def enable_deepseek_v4_ane_prefill(
                 "ANE extension predates procedure banks; DeepSeek ANE prefill skipped"
             )
             return 0
+        grouped_available = bool(
+            fast.has_symbol("qwen35_ane_compile_linear_grouped_bank")
+            and fast.has_symbol("qwen35_ane_dual_grouped_affine_qmm_t")
+        )
+        if not grouped_available:
+            logger.warning(
+                "ANE extension predates grouped hybrid qmm; DeepSeek wo_a "
+                "offload disabled"
+            )
         if cpu_fraction and not fast.has_symbol(
             "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
         ):
@@ -618,7 +782,10 @@ def enable_deepseek_v4_ane_prefill(
 
     config = _AneConfig(sequence_length, cpu_threads, cpu_shared_resource)
     prepared: list[tuple[Any, Any, mx.array, mx.array]] = []
+    grouped_prepared: list[tuple[Any, _GroupedLinearState, mx.array, mx.array]] = []
     mlp_count = 0
+    down_count = 0
+    wo_a_count = 0
     stacked_count = 0
     attention_input_count = 0
     for layer in layers:
@@ -637,6 +804,21 @@ def enable_deepseek_v4_ane_prefill(
             if prep is not None:
                 prepared.append((shared, *prep))
                 mlp_count += 1
+                try:
+                    down_prep = _prepare_linear(
+                        getattr(shared, "down_proj", None),
+                        _FRACTIONS["mlp_down"],
+                    )
+                except Exception:
+                    logger.warning(
+                        "Skipping one DeepSeek shared down projection while "
+                        "preparing its ANE procedure",
+                        exc_info=True,
+                    )
+                    down_prep = None
+                if down_prep is not None:
+                    prepared.append((shared.down_proj, *down_prep))
+                    down_count += 1
         if attn is not None:
             try:
                 input_prep = _prepare_attention_input(attn)
@@ -649,6 +831,20 @@ def enable_deepseek_v4_ane_prefill(
             if input_prep is not None:
                 prepared.append((attn, *input_prep))
                 attention_input_count += 1
+            if grouped_available:
+                try:
+                    wo_a_prep = _prepare_grouped_linear(
+                        getattr(attn, "wo_a", None), _FRACTIONS["wo_a"]
+                    )
+                except Exception:
+                    logger.warning(
+                        "Skipping one DeepSeek grouped wo_a ANE procedure",
+                        exc_info=True,
+                    )
+                    wo_a_prep = None
+                if wo_a_prep is not None:
+                    grouped_prepared.append((attn.wo_a, *wo_a_prep))
+                    wo_a_count += 1
         linear = getattr(attn, "wq_b", None)
         if linear is None:
             continue
@@ -685,7 +881,7 @@ def enable_deepseek_v4_ane_prefill(
                 prep = None
         if prep is not None:
             prepared.append((linear, *prep))
-    if not prepared:
+    if not prepared and not grouped_prepared:
         return 0
 
     weights0 = [entry[2] for entry in prepared]
@@ -698,17 +894,50 @@ def enable_deepseek_v4_ane_prefill(
         suffix_arrays.extend((state.weight, state.scales, state.biases))
         if state.cpu_weight is not None:
             suffix_arrays.append(state.cpu_weight)
-    mx.eval(*weights0, *weights1, *suffix_arrays)
-    banked = _compile_dual_banks(weights0, weights1, sequence_length)
-    if banked is None:
-        logger.warning("DeepSeek ANE prefill disabled: bank compilation failed")
-        return 0
-    models0, models1, resident_programs = banked
+    if prepared:
+        mx.eval(*weights0, *weights1, *suffix_arrays)
+        banked = _compile_dual_banks(weights0, weights1, sequence_length)
+        if banked is None:
+            logger.warning("DeepSeek ANE prefill disabled: bank compilation failed")
+            return 0
+        models0, models1, resident_programs = banked
+    else:
+        models0, models1, resident_programs = [], [], 0
     for index, (owner, state, _, _) in enumerate(prepared):
         owner._omlx_ane_config = config
         owner._omlx_ane_state = replace(
             state, model=models0[index], model1=models1[index]
         )
+
+    grouped_resident_programs = 0
+    if grouped_prepared:
+        grouped_weights0 = [entry[2] for entry in grouped_prepared]
+        grouped_weights1 = [entry[3] for entry in grouped_prepared]
+        grouped_suffixes = [
+            value
+            for _, state, _, _ in grouped_prepared
+            for value in (state.weight, state.scales, state.biases)
+        ]
+        mx.eval(*grouped_weights0, *grouped_weights1, *grouped_suffixes)
+        groups = grouped_prepared[0][1].groups
+        grouped_banks = _compile_grouped_dual_banks(
+            grouped_weights0, grouped_weights1, sequence_length, groups
+        )
+        if grouped_banks is None:
+            logger.warning(
+                "DeepSeek wo_a ANE offload disabled: grouped bank compilation failed"
+            )
+            grouped_prepared = []
+            wo_a_count = 0
+        else:
+            grouped_models0, grouped_models1, grouped_resident_programs = grouped_banks
+            for index, (owner, state, _, _) in enumerate(grouped_prepared):
+                owner._omlx_ane_config = config
+                owner._omlx_ane_state = replace(
+                    state,
+                    model=grouped_models0[index],
+                    model1=grouped_models1[index],
+                )
 
     module = importlib.import_module("mlx_lm.models.deepseek_v4")
     module.register_ane_linear_backend(_linear_backend)
@@ -721,29 +950,39 @@ def enable_deepseek_v4_ane_prefill(
     )
     if register_attention_input is not None:
         register_attention_input(_attention_input_backend)
+    register_grouped = getattr(module, "register_ane_grouped_linear_backend", None)
+    if register_grouped is not None and grouped_prepared:
+        register_grouped(_grouped_backend)
 
-    count = len(prepared)
+    count = len(prepared) + len(grouped_prepared)
     model._omlx_ane_mlp_prefill_count = mlp_count
     model._omlx_ane_gdn_prefill_count = 0
     model._omlx_ane_dual_prefill_count = count
-    model._omlx_ane_resident_program_count = resident_programs
+    model._omlx_ane_resident_program_count = (
+        resident_programs + grouped_resident_programs
+    )
     model._omlx_ane_procedure_count = count
     model._omlx_ane_attention_input_prefill_count = attention_input_count
+    model._omlx_ane_down_prefill_count = down_count
+    model._omlx_ane_wo_a_prefill_count = wo_a_count
     model._omlx_ane_cpu_prefill_count = sum(
         state.cpu_weight is not None for _, state, _, _ in prepared
     )
     logger.info(
         "Eagerly compiled %d DeepSeek ANE procedures (%d shared experts, "
+        "%d shared down projections, %d grouped wo_a projections, "
         "%d attention-input stacks, %d query projections, %d with the "
         "indexer wq_b stacked in) "
         "into %d instance-pinned ANE programs (sequence_length=%d, "
         "query_cpu_fraction=%.3f, cpu_threads=%d, shared_resource=%s)",
         count,
         mlp_count,
+        down_count,
+        wo_a_count,
         attention_input_count,
-        count - mlp_count - attention_input_count,
+        len(prepared) - mlp_count - down_count - attention_input_count,
         stacked_count,
-        resident_programs,
+        resident_programs + grouped_resident_programs,
         sequence_length,
         cpu_fraction,
         cpu_threads,

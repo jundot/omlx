@@ -73,6 +73,7 @@ NB_MODULE(_ext, m) {
           "add",
           &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::add,
           "weight"_a,
+          "groups"_a = 1,
           nb::call_guard<nb::gil_scoped_release>())
       .def_prop_ro(
           "size",
@@ -121,6 +122,14 @@ NB_MODULE(_ext, m) {
       "weights"_a,
       "sequence_length"_a,
       "ane_instance"_a,
+      nb::call_guard<nb::gil_scoped_release>());
+  m.def(
+      "qwen35_ane_compile_linear_grouped_bank",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_compile_linear_grouped_bank,
+      "weights"_a,
+      "sequence_length"_a,
+      "ane_instance"_a,
+      "groups"_a,
       nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_fp16_linear",
@@ -241,6 +250,21 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "profile_category"_a = 1,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_grouped_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_grouped_affine_qmm_t,
+      "x"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "groups"_a,
+      "bits"_a = 8,
+      "variant"_a = 8,
+      "group_size"_a = 64,
       "profile_category"_a = 1,
       "stream"_a = nb::none());
   m.def(

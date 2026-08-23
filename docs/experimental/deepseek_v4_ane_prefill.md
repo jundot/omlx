@@ -2,15 +2,16 @@
 
 This source-build experiment extends the Qwen ANE prompt-processing runtime
 to DeepSeek-V4-Flash. For prompt chunks that exactly match the configured
-fixed shape, four dense projection groups run as a hybrid split: an INT8 channel
+fixed shape, six dense projection groups run as a hybrid split: an INT8 channel
 prefix on both ANEs, an optional FP16 CPU middle, and an affine-q8 GPU suffix
 requantized from the mxfp8 checkpoint weights. The CPU branch uses the same
 performance-aware shared-resource scheduler as Qwen3.5.
 
 Accelerated per layer:
 
-- The shared-expert gate/up pair (50% of channels on ANE; the rest and the
-  down projection stay on GPU). CPU sharing is deliberately disabled here.
+- The shared-expert gate/up pair (50% of channels on ANE) and its down
+  projection (62.5% after alignment). CPU sharing is deliberately disabled
+  for both.
 - Every attention projection that directly consumes the residual stream is
   stacked into one dispatch: `wq_a`, `wkv`, both compressor projections when
   present, and the sparse indexer's compressor and weight projections when
@@ -22,11 +23,13 @@ Accelerated per layer:
   procedure as the attention `wq_b`, since both consume the same
   `q_residual` input. The combined projection uses the same 12.5% CPU share
   and adds no extra dispatches.
+- The eight-group attention-output `wo_a` projection (50% of each group's
+  rows on ANE). A native grouped affine-q8 suffix preserves the compact
+  per-group weights and overlaps GPU work with both ANE instances.
 
-Routed experts, attention-output `wo_a`/`wo_b`, the attention core, decode, and DSpark
+Routed experts, attention-output `wo_b`, the attention core, decode, and DSpark
 verification keep the existing GPU path. `wo_b` was measured as a net loss
-in-model and is excluded; `wo_a` needs a grouped GPU suffix and remains a
-follow-up. The bank ladder and fixed-shape eligibility are shared with the
+in-model and is excluded. The bank ladder and fixed-shape eligibility are shared with the
 Qwen implementation. Unlike the Qwen path, which runs its GPU suffix on NAX
 qmm kernels since the split tuner landed, the DeepSeek hybrid still skips
 itself on NAX GPUs (the M5 family): its much smaller per-operation work is
@@ -117,6 +120,29 @@ python benchmarks/dsv4_ane_shape_bench.py --sequence-length 4096 \
   --ane-fractions 0.5,0.6 --cpu-fractions 0
 ```
 
+### Shared down and grouped `wo_a` microbench
+
+M3 Ultra, 4,096 BF16 rows, production hybrid suffixes:
+
+| Projection | GPU mxfp8 | ANE/GPU | Speedup | Split |
+|---|---:|---:|---:|---:|
+| Shared-expert `down_proj` | 4.476 ms | 3.177 ms | **1.41x** | 62.5% ANE |
+| Grouped attention `wo_a` | 17.232 ms | 12.205 ms | **1.41x** | 50% ANE |
+
+The grouped suffix stores only the real per-group K-wide rows. It does not
+construct a sparse block-diagonal matrix, which would multiply suffix memory
+and GPU work. Across 43 layers these isolated timings imply approximately
+272 ms less projection time per full tile; host synchronization and whole-model
+memory contention can reduce the realized PP gain.
+
+Run the two production shapes with:
+
+```bash
+python benchmarks/dsv4_ane_shape_bench.py --sequence-length 4096 \
+  --shapes shared_down --ane-fractions 0.65 --cpu-fractions 0
+python benchmarks/dsv4_ane_shape_bench.py --sequence-length 4096 --wo-a
+```
+
 ### CPU-sharing microbench
 
 M3 Ultra, 4,096 BF16 input rows, affine-q8 GPU suffix, median of 15 timed
@@ -196,8 +222,10 @@ the identical 86 procedures used by that baseline with numerically identical acc
 tensors, and the mxfp4 expert path simply streams about 1.6x the weight
 bytes, competing with the ANE for unified-memory bandwidth.
 
-The attention-input work adds one procedure per eligible layer (43 for the
-reference topology), taking the configured path to 129 procedures. Its
+The attention-input, shared-down, and grouped-`wo_a` work each add one
+procedure per eligible layer (129 additional procedures for the reference
+topology), taking the configured path from the measured 86-procedure baseline
+to 215 procedures. Their
 end-to-end throughput, load-time, and memory deltas remain to be measured on
 a host that can safely load the checkpoint; the synthetic speedups above
 must not be read as an equivalent whole-model PP gain.

@@ -88,9 +88,11 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_cpu_fp16_swiglu_t",
     "qwen35_ane_cpu_fp16_q4_swiglu_t",
     "qwen35_ane_compile_linear_bank",
+    "qwen35_ane_compile_linear_grouped_bank",
     "qwen35_ane_compile_swiglu_down_bank",
     "qwen35_cpu_fp16_affine_qmm_t",
     "qwen35_ane_dual_affine_qmm_t",
+    "qwen35_ane_dual_grouped_affine_qmm_t",
     "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
     "qwen35_ane_dual_cpu_fp16_swiglu_t",
     "qwen35_ane_dual_q4_swiglu_t",
@@ -443,6 +445,20 @@ def qwen35_ane_compile_linear_bank(
     )
 
 
+def qwen35_ane_compile_linear_grouped_bank(
+    weights: list[mx.array], sequence_length: int, ane_instance: int, groups: int
+):
+    if (
+        not qwen35_ane_available()
+        or _ext is None
+        or not hasattr(_ext, "qwen35_ane_compile_linear_grouped_bank")
+    ):
+        raise RuntimeError("Private ANE grouped procedure-bank compiler is unavailable")
+    return _ext.qwen35_ane_compile_linear_grouped_bank(
+        weights, sequence_length, ane_instance, groups
+    )
+
+
 def qwen35_ane_linear_bank_builder(sequence_length: int):
     """Incremental bank builder: add() converts one fp32 slice at a time so
     the caller can release each staging array immediately (issue #2781)."""
@@ -627,6 +643,36 @@ def qwen35_ane_dual_affine_qmm_t(
         gpu_biases,
         ane_model0,
         ane_model1,
+        bits,
+        variant,
+        group_size,
+        profile_category,
+    )
+
+
+def qwen35_ane_dual_grouped_affine_qmm_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    groups: int,
+    bits: int = 8,
+    variant: int = 8,
+    group_size: int = 64,
+    profile_category: int = 1,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_grouped_affine_qmm_t"):
+        raise RuntimeError("Dual ANE grouped hybrid affine qmm is unavailable")
+    return _ext.qwen35_ane_dual_grouped_affine_qmm_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        groups,
         bits,
         variant,
         group_size,

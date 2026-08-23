@@ -33,6 +33,26 @@ template <typename T>
 }
 
 template <typename T>
+[[kernel]] void qwen35_ane_pack_input_dual_grouped(
+    const device T *x [[buffer(0)]], device float16_t *planar0 [[buffer(1)]],
+    device float16_t *planar1 [[buffer(2)]],
+    constant int &M [[buffer(3)]], constant int &K [[buffer(4)]],
+    constant int &groups [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  const uint k = gid.x;
+  const uint m = gid.y;
+  const uint group = gid.z;
+  if (group < static_cast<uint>(groups) && m < static_cast<uint>(M) &&
+      k < static_cast<uint>(K)) {
+    const uint input_index = (group * M + m) * K + k;
+    const uint planar_index = (group * K + k) * M + m;
+    const float16_t value = static_cast<float16_t>(x[input_index]);
+    planar0[planar_index] = value;
+    planar1[planar_index] = value;
+  }
+}
+
+template <typename T>
 [[kernel]] void qwen35_cpu_pack_input(
     const device T *x [[buffer(0)]], device float16_t *rows [[buffer(1)]],
     constant int &M [[buffer(2)]], constant int &K [[buffer(3)]],
@@ -165,6 +185,37 @@ template <typename T>
     output[m * total_n + n] = static_cast<T>(ane1_planar[local * M + m]);
   } else {
     output[m * total_n + n] = gpu_rows[m * gpu_n + n - ane_n];
+  }
+}
+
+template <typename T>
+[[kernel]] void qwen35_ane_merge_dual_grouped_output(
+    const device float16_t *ane0_planar [[buffer(0)]],
+    const device float16_t *ane1_planar [[buffer(1)]],
+    const device T *gpu_rows [[buffer(2)]], device T *output [[buffer(3)]],
+    constant int &M [[buffer(4)]], constant int &ane0_n [[buffer(5)]],
+    constant int &ane1_n [[buffer(6)]], constant int &gpu_n [[buffer(7)]],
+    constant int &groups [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  const uint n = gid.x;
+  const uint m = gid.y;
+  const uint group = gid.z;
+  const uint total_n = static_cast<uint>(ane0_n + ane1_n + gpu_n);
+  if (group >= static_cast<uint>(groups) || m >= static_cast<uint>(M) ||
+      n >= total_n) {
+    return;
+  }
+  const uint output_index = (group * M + m) * total_n + n;
+  if (n < static_cast<uint>(ane0_n)) {
+    const uint row = group * static_cast<uint>(ane0_n) + n;
+    output[output_index] = static_cast<T>(ane0_planar[row * M + m]);
+  } else if (n < static_cast<uint>(ane0_n + ane1_n)) {
+    const uint local = n - static_cast<uint>(ane0_n);
+    const uint row = group * static_cast<uint>(ane1_n) + local;
+    output[output_index] = static_cast<T>(ane1_planar[row * M + m]);
+  } else {
+    const uint local = n - static_cast<uint>(ane0_n + ane1_n);
+    output[output_index] = gpu_rows[(group * M + m) * gpu_n + local];
   }
 }
 
@@ -428,6 +479,8 @@ template <typename T>
                      type);                                                    \
   instantiate_kernel("qwen35_ane_pack_input_dual_" #type,                     \
                      qwen35_ane_pack_input_dual, type);                        \
+  instantiate_kernel("qwen35_ane_pack_input_dual_grouped_" #type,             \
+                     qwen35_ane_pack_input_dual_grouped, type);                \
   instantiate_kernel("qwen35_cpu_pack_input_" #type, qwen35_cpu_pack_input,   \
                      type);                                                    \
   instantiate_kernel("qwen35_ane_pack_input_dual_cpu_" #type,                \
@@ -442,6 +495,8 @@ template <typename T>
                      qwen35_ane_merge_swiglu_output, type);                     \
   instantiate_kernel("qwen35_ane_merge_dual_output_" #type,                   \
                      qwen35_ane_merge_dual_output, type);                      \
+  instantiate_kernel("qwen35_ane_merge_dual_grouped_output_" #type,           \
+                     qwen35_ane_merge_dual_grouped_output, type);              \
   instantiate_kernel("qwen35_ane_merge_dual_swiglu_output_" #type,            \
                      qwen35_ane_merge_dual_swiglu_output, type);               \
   instantiate_kernel("qwen35_ane_merge_dual_cpu_swiglu_output_" #type,        \

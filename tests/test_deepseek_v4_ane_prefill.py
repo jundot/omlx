@@ -27,6 +27,19 @@ def _affine_q8_linear(in_features, out_features):
     )
 
 
+def _mxfp8_grouped_linear(groups, in_features, out_features):
+    dense = mx.random.normal((groups, out_features, in_features)).astype(mx.bfloat16)
+    weight, scales = mx.quantize(dense, group_size=32, bits=8, mode="mxfp8")
+    return SimpleNamespace(
+        weight=weight,
+        scales=scales,
+        group_size=32,
+        bits=8,
+        mode="mxfp8",
+        bias=None,
+    )
+
+
 def _attach(owner, prep, model0=None, model1=None):
     state, _, _ = prep
     owner._omlx_ane_config = ane_patch._AneConfig(SEQ)
@@ -193,6 +206,76 @@ def test_mlp_backend_reassembles_gate_and_up(monkeypatch):
     assert [int(v) for v in captured["gate"].tolist()] == expected_gate
     assert [int(v) for v in captured["up"].tolist()] == expected_up
     assert captured["limit"] == 10.0
+
+
+def test_mlp_backend_routes_activation_through_prepared_down(monkeypatch):
+    mlp = SimpleNamespace(
+        gate_proj=_mxfp8_linear(256, 512),
+        up_proj=_mxfp8_linear(256, 512),
+        down_proj=_mxfp8_linear(512, 512),
+        swiglu_limit=10.0,
+        fp32_swiglu=False,
+    )
+    prep = ane_patch._prepare_mlp(mlp)
+    assert prep is not None
+    _attach(mlp, prep)
+    state = mlp._omlx_ane_state
+    total = 2 * state.ane_outputs + 2 * state.gpu_outputs
+    combined = mx.ones((1, SEQ, total), dtype=mx.bfloat16)
+    down_marker = mx.zeros((1, SEQ, 512), dtype=mx.bfloat16)
+    monkeypatch.setattr(fast, "qwen35_ane_dual_affine_qmm_t", lambda *args: combined)
+    monkeypatch.setattr(ane_patch, "_linear_backend", lambda linear, x: down_marker)
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.deepseek_v4",
+        SimpleNamespace(_limited_swiglu=lambda gate, up, limit: gate),
+    )
+
+    assert (
+        ane_patch._mlp_backend(mlp, mx.zeros((1, SEQ, 256), dtype=mx.bfloat16))
+        is down_marker
+    )
+
+
+def test_prepare_grouped_linear_keeps_group_blocks_compact():
+    linear = _mxfp8_grouped_linear(2, 256, 512)
+
+    prep = ane_patch._prepare_grouped_linear(linear, 0.5)
+
+    assert prep is not None
+    state, dense0, dense1 = prep
+    assert state.groups == 2
+    assert state.ane_outputs == 256
+    assert state.gpu_outputs == 256
+    assert dense0.shape == dense1.shape == (256, 256)
+    # The suffix stores only each group's real K-wide block, not a sparse
+    # block-diagonal [groups*K] expansion.
+    assert state.weight.shape == (2 * 256, 256 // 4)
+
+
+def test_grouped_backend_dispatches_and_guards_shape(monkeypatch):
+    linear = _mxfp8_grouped_linear(2, 256, 512)
+    prep = ane_patch._prepare_grouped_linear(linear, 0.5)
+    assert prep is not None
+    _attach(linear, prep)
+    marker = mx.zeros((1, 2, SEQ, 512), dtype=mx.bfloat16)
+    calls = []
+
+    def fake_grouped(*args):
+        calls.append(args)
+        return marker
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_grouped_affine_qmm_t", fake_grouped)
+    x = mx.zeros((1, 2, SEQ, 256), dtype=mx.bfloat16)
+
+    assert ane_patch._grouped_backend(linear, x) is marker
+    assert calls[0][6:] == (2, 8, 8, 64, 1)
+    assert ane_patch._grouped_backend(linear, x[:, :, :4]) is None
+    decode_consistency.set_armed(True)
+    try:
+        assert ane_patch._grouped_backend(linear, x) is None
+    finally:
+        decode_consistency.set_armed(False)
 
 
 def test_prepare_stacked_spans_both_linears():
@@ -381,6 +464,7 @@ def _fake_layer():
             shared_experts=SimpleNamespace(
                 gate_proj=_mxfp8_linear(256, 512),
                 up_proj=_mxfp8_linear(256, 512),
+                down_proj=_mxfp8_linear(512, 512),
             )
         ),
     )
@@ -423,9 +507,10 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
 
     count = ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ)
 
-    # Shared expert, attention-input stack, and plain wq_b; wo_b is excluded.
-    assert count == 3
-    assert compiled == {"count": 3, "sequence_length": SEQ}
+    # Shared gate/up, shared down, attention-input stack, and plain wq_b;
+    # wo_b is excluded.
+    assert count == 4
+    assert compiled == {"count": 4, "sequence_length": SEQ}
     assert registered["linear"] is ane_patch._linear_backend
     assert registered["mlp"] is ane_patch._mlp_backend
     assert registered["attention_input"] is ane_patch._attention_input_backend
@@ -433,13 +518,60 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
     assert layer.attn.wq_b._omlx_ane_state.model is not None
     assert not hasattr(layer.attn.wo_b, "_omlx_ane_state")
     assert layer.ffn.shared_experts._omlx_ane_state.ane_outputs == 256
+    assert layer.ffn.shared_experts.down_proj._omlx_ane_state.ane_outputs == 256
     assert layer.ffn.shared_experts._omlx_ane_state.cpu_weight is None
     assert layer.attn.wq_b._omlx_ane_state.cpu_weight is not None
-    assert model._omlx_ane_procedure_count == 3
+    assert model._omlx_ane_procedure_count == 4
     assert model._omlx_ane_cpu_prefill_count == 1
     assert model._omlx_ane_mlp_prefill_count == 1
     assert model._omlx_ane_attention_input_prefill_count == 1
+    assert model._omlx_ane_down_prefill_count == 1
+    assert model._omlx_ane_wo_a_prefill_count == 0
     assert model._omlx_ane_resident_program_count == 2
+
+
+def test_enable_compiles_grouped_wo_a_bank_and_registers_backend(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "qwen35_cpu_shared_resource_available", lambda: True)
+    monkeypatch.setattr(
+        ane_patch,
+        "_compile_dual_banks",
+        lambda w0, w1, seq: ([object() for _ in w0], [object() for _ in w1], 2),
+    )
+    grouped_compile = {}
+
+    def fake_grouped(w0, w1, seq, groups):
+        grouped_compile.update(count=len(w0), sequence_length=seq, groups=groups)
+        return [object() for _ in w0], [object() for _ in w1], 2
+
+    monkeypatch.setattr(ane_patch, "_compile_grouped_dual_banks", fake_grouped)
+    registered = {}
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.deepseek_v4",
+        SimpleNamespace(
+            register_ane_linear_backend=lambda fn: None,
+            register_ane_mlp_backend=lambda fn: None,
+            register_ane_grouped_linear_backend=(
+                lambda fn: registered.__setitem__("grouped", fn)
+            ),
+        ),
+    )
+    layer = _fake_layer()
+    layer.attn.wo_a = _mxfp8_grouped_linear(2, 256, 512)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    count = ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ)
+
+    assert count == 5
+    assert grouped_compile == {"count": 1, "sequence_length": SEQ, "groups": 2}
+    assert registered["grouped"] is ane_patch._grouped_backend
+    assert isinstance(layer.attn.wo_a._omlx_ane_state, ane_patch._GroupedLinearState)
+    assert model._omlx_ane_wo_a_prefill_count == 1
+    assert model._omlx_ane_resident_program_count == 4
 
 
 def test_enable_stacks_indexer_wq_b_when_present(monkeypatch):
@@ -468,8 +600,8 @@ def test_enable_stacks_indexer_wq_b_when_present(monkeypatch):
 
     count = ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ)
 
-    # Default targets: shared expert + attention input + stacked wq_b.
-    assert count == 3
+    # Default targets: shared gate/up + down + attention input + stacked wq_b.
+    assert count == 4
     state = layer.attn.wq_b._omlx_ane_state
     assert isinstance(state, ane_patch._StackedState)
     assert state.split == 512
@@ -499,7 +631,7 @@ def test_enable_disables_cpu_share_without_shared_scheduler(monkeypatch):
     layer = _fake_layer()
     model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
 
-    assert ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ) == 3
+    assert ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ) == 4
     assert layer.attn.wq_b._omlx_ane_state.cpu_weight is None
     assert model._omlx_ane_cpu_prefill_count == 0
 
@@ -532,7 +664,7 @@ def test_enable_disables_cpu_share_below_measured_tile(monkeypatch):
             sequence_length=2048,
             cpu_fraction=0.125,
         )
-        == 3
+        == 4
     )
     assert layer.attn.wq_b._omlx_ane_state.cpu_weight is None
     assert model._omlx_ane_cpu_prefill_count == 0

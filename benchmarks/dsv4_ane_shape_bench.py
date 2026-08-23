@@ -32,6 +32,7 @@ from omlx.custom_kernels.qwen35_prefill import fast
 # ratio-128 compressed, and ratio-4 sparse layers respectively.
 SHAPES = (
     ("shared_gate_up", 4096, 4096),
+    ("shared_down", 4096, 2048),
     ("wq_b", 32768, 1024),
     ("stacked_wq_b", 40960, 1024),
     ("attention_input_local", 1536, 4096),
@@ -200,7 +201,8 @@ def bench_wo_a_grouped(sequence_length):
         mx.contiguous(x[..., g * in_per_group : (g + 1) * in_per_group])
         for g in range(groups)
     ]
-    mx.eval(*x_groups)
+    x_grouped = mx.stack(x_groups, axis=1)
+    mx.eval(*x_groups, x_grouped)
 
     quantized = [
         mx.quantize(w[g], group_size=32, bits=8, mode="mxfp8") for g in range(groups)
@@ -253,8 +255,8 @@ def bench_wo_a_grouped(sequence_length):
         )
         print(f"[wo_a_grouped]   group{g} cosine={float(cosine):.5f}")
 
-    # Timing: dual grouped prefix with a tiny junk suffix; read the ANE
-    # counters since the suffix here is not fraction-realistic.
+    # Timing: the production dual-grouped primitive keeps the compact GPU
+    # suffix grouped and overlaps it with both ANE instances.
     for rows_per_group_per_instance in (256, 128):
         prefix0 = mx.contiguous(
             mx.concatenate(
@@ -276,11 +278,24 @@ def bench_wo_a_grouped(sequence_length):
         model1 = fast.qwen35_ane_compile_linear_grouped(
             prefix1, sequence_length, 2, groups
         )
+        ane_rows = 2 * rows_per_group_per_instance
+        suffix = mx.contiguous(
+            mx.concatenate([w[g][ane_rows:] for g in range(groups)])
+        )
+        sw, ss, sb = mx.quantize(suffix, group_size=64, bits=8)
+        sw, ss, sb = (
+            mx.contiguous(sw),
+            mx.contiguous(ss.astype(x.dtype)),
+            mx.contiguous(sb.astype(x.dtype)),
+        )
+        mx.eval(sw, ss, sb)
         fast.qwen35_ane_profile_set_enabled(True)
         fast.qwen35_ane_profile_reset()
         hybrid_ms = median_ms(
-            lambda m0=model0, m1=model1: fast.qwen35_ane_dual_affine_qmm_t(
-                x, sw, ss, sb, m0, m1, 4, 8, 64
+            lambda m0=model0, m1=model1, qw=sw, qs=ss, qb=sb: (
+                fast.qwen35_ane_dual_grouped_affine_qmm_t(
+                    x_grouped, qw, qs, qb, m0, m1, groups, 8, 8, 64
+                )
             )
         )
         snapshot = fast.qwen35_ane_profile_snapshot()
@@ -289,10 +304,11 @@ def bench_wo_a_grouped(sequence_length):
         pack = snapshot["gdn"]["pack_ns"] / ops / 1e6
         fast.qwen35_ane_profile_set_enabled(False)
         fraction = 2 * rows_per_group_per_instance / out_per_group
+        speedup = gpu_ms / hybrid_ms if hybrid_ms else 0.0
         print(
             f"[wo_a_grouped]   fraction={fraction:.2f} "
             f"ane_rows/inst={groups * rows_per_group_per_instance} "
-            f"wall_with_junk_suffix={hybrid_ms:.3f}ms "
+            f"hybrid={hybrid_ms:.3f}ms (vs gpu {speedup:.2f}x) "
             f"ane_eval/op={ane_eval:.3f}ms pack/op={pack:.3f}ms"
         )
 

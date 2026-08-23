@@ -197,6 +197,7 @@ NSString *int8_linear_mil(int input_dim, int output_dim, int sequence_length,
 
 NSString *int8_linear_bank_mil(
     const std::vector<std::pair<int, int>> &shapes,
+    const std::vector<int> &groups,
     const std::vector<std::pair<uint64_t, uint64_t>> &weight_offsets,
     int sequence_length) {
   NSMutableString *mil = [NSMutableString
@@ -207,6 +208,8 @@ NSString *int8_linear_bank_mil(
   for (size_t index = 0; index < shapes.size(); ++index) {
     const int input_dim = shapes[index].first;
     const int output_dim = shapes[index].second;
+    const int group_count = groups[index];
+    const int group_input_dim = input_dim / group_count;
     [mil appendFormat:
              @"  func procedure%03zu<ios18>(tensor<fp16, [1, %d, 1, %d]> "
               "x) {\n"
@@ -226,17 +229,17 @@ NSString *int8_linear_bank_mil(
               "val=tensor<int32, [4]>([0,0,0,0])];\n"
               "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), "
               "val=tensor<int32, [2]>([1,1])];\n"
-              "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+              "    int32 gr = const()[name=string(\"gr\"), val=int32(%d)];\n"
               "    tensor<fp16, [1, %d, 1, %d]> y = "
               "conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, "
               "strides=st, weight=w, x=x)[name=string(\"conv\")];\n"
               "  } -> (y);\n",
-         index, input_dim, sequence_length, output_dim, input_dim, output_dim,
-         input_dim,
+         index, input_dim, sequence_length, output_dim, group_input_dim,
+         output_dim, group_input_dim,
          static_cast<unsigned long long>(weight_offsets[index].first),
          output_dim,
          static_cast<unsigned long long>(weight_offsets[index].second),
-         output_dim, sequence_length];
+         group_count, output_dim, sequence_length];
   }
   [mil appendString:@"}\n"];
   return mil;
@@ -1195,6 +1198,7 @@ struct AneLinearBankBuilder::Impl {
     QuantizedMatrix quantized;
     int input_dim;
     int output_dim;
+    int groups;
   };
   int sequence_length = 0;
   std::vector<Chunk> chunks;
@@ -1213,10 +1217,10 @@ AneLinearBankBuilder::AneLinearBankBuilder(int sequence_length)
 
 AneLinearBankBuilder::~AneLinearBankBuilder() = default;
 
-void AneLinearBankBuilder::add(const array &weight) {
+void AneLinearBankBuilder::add(const array &weight, int groups) {
   if (weight.dtype() != float32 || weight.ndim() != 2 ||
       !row_contiguous(weight) || weight.shape(0) <= 0 ||
-      weight.shape(1) <= 0) {
+      weight.shape(1) <= 0 || groups < 1 || weight.shape(0) % groups) {
     throw std::invalid_argument(
         "ANE bank weights must be contiguous rank-2 float32 MLX arrays.");
   }
@@ -1225,8 +1229,9 @@ void AneLinearBankBuilder::add(const array &weight) {
   Impl::Chunk chunk{
       quantize_rows(weight.data<float>(), static_cast<int>(weight.shape(0)),
                     static_cast<int>(weight.shape(1))),
-      static_cast<int>(weight.shape(1)),
+      static_cast<int>(weight.shape(1)) * groups,
       static_cast<int>(weight.shape(0)),
+      groups,
   };
   impl_->chunks.emplace_back(std::move(chunk));
 }
@@ -1244,10 +1249,13 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
   const int sequence_length = impl_->sequence_length;
   const int span = stop - start;
   std::vector<std::pair<int, int>> shapes;
+  std::vector<int> groups;
   shapes.reserve(span);
+  groups.reserve(span);
   for (int index = start; index < stop; ++index) {
     const auto &chunk = impl_->chunks[index];
     shapes.emplace_back(chunk.input_dim, chunk.output_dim);
+    groups.push_back(chunk.groups);
   }
 
   @autoreleasepool {
@@ -1272,7 +1280,7 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
     weight_header[0] = static_cast<uint32_t>(span * 2);
     weight_header[1] = 2;
     NSData *mil =
-        [int8_linear_bank_mil(shapes, weight_offsets, sequence_length)
+        [int8_linear_bank_mil(shapes, groups, weight_offsets, sequence_length)
             dataUsingEncoding:NSUTF8StringEncoding];
     NSDictionary *weight_map = @{
       @"@model_path/weights/weight.bin" :
@@ -1353,6 +1361,20 @@ std::vector<std::shared_ptr<AneLinearModel>> qwen35_ane_compile_linear_bank(
   }
   for (const auto &weight : weights) {
     builder.add(weight);
+  }
+  return builder.compile(ane_instance, 0, builder.size());
+}
+
+std::vector<std::shared_ptr<AneLinearModel>>
+qwen35_ane_compile_linear_grouped_bank(
+    const std::vector<array> &weights, int sequence_length, int ane_instance,
+    int groups) {
+  AneLinearBankBuilder builder(sequence_length);
+  if (weights.empty() || weights.size() > 256 || groups < 2) {
+    throw std::invalid_argument("Invalid grouped ANE procedure bank shape.");
+  }
+  for (const auto &weight : weights) {
+    builder.add(weight, groups);
   }
   return builder.compile(ane_instance, 0, builder.size());
 }
@@ -2374,14 +2396,14 @@ public:
                          int variant, int group_size, bool fuse_swiglu = false,
                          int profile_category = -1, bool cpu_fp16 = false,
                          int cpu_threads = 0,
-                         bool cpu_shared_resource = false)
+                         bool cpu_shared_resource = false, int groups = 1)
       : Primitive(stream), model0_(std::move(model0)),
         model1_(std::move(model1)), variant_(variant), bits_(bits),
         group_size_(group_size), fuse_swiglu_(fuse_swiglu),
         profile_category_(profile_category >= 0 ? profile_category
                                                 : (fuse_swiglu ? 0 : 1)),
         cpu_fp16_(cpu_fp16), cpu_threads_(cpu_threads),
-        cpu_shared_resource_(cpu_shared_resource) {}
+        cpu_shared_resource_(cpu_shared_resource), groups_(groups) {}
 
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error("Dual ANE hybrid qmm has no CPU implementation.");
@@ -2400,10 +2422,13 @@ public:
     auto &output = outputs[0];
 
     const int K = static_cast<int>(x.shape(-1));
-    const int M = static_cast<int>(x.size() / K);
-    const int gpu_n = static_cast<int>(weight.shape(0));
-    const int ane0_n = model0_->output_dim();
-    const int ane1_n = model1_->output_dim();
+    const int M = static_cast<int>(x.size() / (K * groups_));
+    const int gpu_total_n = static_cast<int>(weight.shape(0));
+    const int gpu_n = gpu_total_n / groups_;
+    const int ane0_total_n = model0_->output_dim();
+    const int ane1_total_n = model1_->output_dim();
+    const int ane0_n = ane0_total_n / groups_;
+    const int ane1_n = ane1_total_n / groups_;
     const int cpu_n = cpu_weight ? static_cast<int>(cpu_weight->shape(0)) : 0;
     const bool profiling = ane_profile_enabled();
     const int profile_category = profile_category_;
@@ -2418,7 +2443,8 @@ public:
       }
     }
     output.set_data(allocator::malloc(output.nbytes()));
-    array gpu_output({M, gpu_n}, x.dtype(), nullptr, {});
+    Shape gpu_shape = groups_ > 1 ? Shape{groups_, M, gpu_n} : Shape{M, gpu_n};
+    array gpu_output(std::move(gpu_shape), x.dtype(), nullptr, {});
     gpu_output.set_data(allocator::malloc(gpu_output.nbytes()));
     std::unique_ptr<array> cpu_input;
     std::unique_ptr<array> cpu_output;
@@ -2436,15 +2462,21 @@ public:
     auto library =
         device.get_library("omlx_qwen35_prefill_kernels", binary_dir());
     auto pack = device.get_kernel(
-        std::string(cpu_input ? "qwen35_ane_pack_input_dual_cpu_"
-                              : "qwen35_ane_pack_input_dual_") +
+        std::string(groups_ > 1
+                        ? "qwen35_ane_pack_input_dual_grouped_"
+                        : (cpu_input ? "qwen35_ane_pack_input_dual_cpu_"
+                                     : "qwen35_ane_pack_input_dual_")) +
             metal_type_name(x.dtype()),
         library);
     encoder.set_compute_pipeline_state(pack);
     encoder.set_input_array(x, 0);
     encoder.set_buffer(model0_->input_buffer(), 1);
     encoder.set_buffer(model1_->input_buffer(), 2);
-    if (cpu_input) {
+    if (groups_ > 1) {
+      encoder.set_bytes(M, 3);
+      encoder.set_bytes(K, 4);
+      encoder.set_bytes(groups_, 5);
+    } else if (cpu_input) {
       encoder.set_output_array(*cpu_input, 3);
       encoder.set_bytes(M, 4);
       encoder.set_bytes(K, 5);
@@ -2452,7 +2484,7 @@ public:
       encoder.set_bytes(M, 3);
       encoder.set_bytes(K, 4);
     }
-    encoder.dispatch_threads(MTL::Size(K, M, 1), MTL::Size(16, 16, 1));
+    encoder.dispatch_threads(MTL::Size(K, M, groups_), MTL::Size(16, 16, 1));
     encoder.end_encoding();
 
     auto *producer_buffer = encoder.get_command_buffer();
@@ -2476,6 +2508,12 @@ public:
 
     const std::string qmm_type = metal_type_name(x.dtype());
     auto qmm = [&] {
+      if (groups_ > 1) {
+        return device.get_kernel(
+            "qwen35_q8_affine_grouped_qmm_t_" + qmm_type +
+                "_bm_64_bk_32_bn_64",
+            library);
+      }
       if (hybrid_nax_enabled()) {
         try {
           auto nax_library = device.get_library(
@@ -2498,8 +2536,12 @@ public:
     encoder.set_bytes(K, 5);
     encoder.set_bytes(gpu_n, 6);
     encoder.set_bytes(M, 7);
+    if (groups_ > 1) {
+      encoder.set_bytes(groups_, 8);
+    }
     encoder.dispatch_threadgroups(
-        MTL::Size((gpu_n + 63) / 64, (M + 63) / 64, 1), MTL::Size(32, 2, 2));
+        MTL::Size((gpu_n + 63) / 64, (M + 63) / 64, groups_),
+        MTL::Size(32, 2, 2));
     encoder.end_encoding();
     const uint64_t launch = profiling ? profile_now_ns() : 0;
     id<MTLCommandBuffer> qmm_buffer =
@@ -2586,9 +2628,11 @@ public:
                         ? (fuse_swiglu_
                                ? "qwen35_ane_merge_dual_cpu_swiglu_output_"
                                : "qwen35_ane_merge_dual_cpu_output_")
-                        : (fuse_swiglu_
+                        : (groups_ > 1
+                               ? "qwen35_ane_merge_dual_grouped_output_"
+                               : (fuse_swiglu_
                                ? "qwen35_ane_merge_dual_swiglu_output_"
-                               : "qwen35_ane_merge_dual_output_")) +
+                               : "qwen35_ane_merge_dual_output_"))) +
             metal_type_name(x.dtype()),
         library);
     encoder.set_compute_pipeline_state(merge);
@@ -2619,8 +2663,11 @@ public:
       encoder.set_bytes(merge_ane0_n, 5);
       encoder.set_bytes(merge_ane1_n, 6);
       encoder.set_bytes(merge_gpu_n, 7);
+      if (groups_ > 1) {
+        encoder.set_bytes(groups_, 8);
+      }
     }
-    encoder.dispatch_threads(MTL::Size(output_n, M, 1),
+    encoder.dispatch_threads(MTL::Size(output_n, M, groups_),
                              MTL::Size(16, 16, 1));
 
     if (!encoder.needs_commit()) {
@@ -2649,14 +2696,15 @@ public:
            fuse_swiglu_ == rhs.fuse_swiglu_ &&
            profile_category_ == rhs.profile_category_ &&
            cpu_fp16_ == rhs.cpu_fp16_ && cpu_threads_ == rhs.cpu_threads_ &&
-           cpu_shared_resource_ == rhs.cpu_shared_resource_;
+           cpu_shared_resource_ == rhs.cpu_shared_resource_ &&
+           groups_ == rhs.groups_;
   }
   auto state() const {
     return std::make_tuple(reinterpret_cast<uintptr_t>(model0_.get()),
                            reinterpret_cast<uintptr_t>(model1_.get()), bits_,
                            variant_, group_size_, fuse_swiglu_,
                            profile_category_, cpu_fp16_, cpu_threads_,
-                           cpu_shared_resource_);
+                           cpu_shared_resource_, groups_);
   }
 
 private:
@@ -2670,6 +2718,7 @@ private:
   bool cpu_fp16_;
   int cpu_threads_;
   bool cpu_shared_resource_;
+  int groups_;
 };
 
 class AneHybridQ4SwiGLUDownPrimitive : public Primitive {
@@ -3289,6 +3338,54 @@ array qwen35_ane_dual_affine_qmm_t(
       std::make_shared<DualAneHybridPrimitive>(
           stream, ane_model0, ane_model1, bits, variant, group_size,
           /* fuse_swiglu */ false, profile_category),
+      std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
+}
+
+array qwen35_ane_dual_grouped_affine_qmm_t(
+    const array &x, const array &gpu_weight, const array &gpu_scales,
+    const array &gpu_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int groups, int bits,
+    int variant, int group_size, int profile_category, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (!ane_model0 || !ane_model1 || stream.device == Device::cpu ||
+      (x.dtype() != float16 && x.dtype() != bfloat16) ||
+      (x.ndim() != 3 && x.ndim() != 4) ||
+      (x.ndim() == 4 && x.shape(0) != 1) ||
+      !row_contiguous(x) || gpu_weight.dtype() != mlx::core::uint32 ||
+      gpu_scales.dtype() != x.dtype() || gpu_biases.dtype() != x.dtype() ||
+      gpu_weight.ndim() != 2 || gpu_scales.ndim() != 2 ||
+      gpu_biases.shape() != gpu_scales.shape() || !row_contiguous(gpu_weight) ||
+      !row_contiguous(gpu_scales) || !row_contiguous(gpu_biases) ||
+      groups < 2 || bits != 8 || group_size != 64 || variant != 8) {
+    throw std::invalid_argument(
+        "Unsupported dual ANE grouped hybrid qmm configuration.");
+  }
+  const int K = static_cast<int>(x.shape(-1));
+  const int M = static_cast<int>(x.size() / (K * groups));
+  const int gpu_total_n = static_cast<int>(gpu_weight.shape(0));
+  const int ane0_total_n = ane_model0->output_dim();
+  const int ane1_total_n = ane_model1->output_dim();
+  if (x.shape(-3) != groups || K * groups != ane_model0->input_dim() ||
+      K * groups != ane_model1->input_dim() ||
+      M != ane_model0->sequence_length() || M != ane_model1->sequence_length() ||
+      gpu_total_n <= 0 || gpu_total_n % groups ||
+      (gpu_total_n / groups) % 64 || ane0_total_n <= 0 ||
+      ane1_total_n <= 0 || ane0_total_n % groups || ane1_total_n % groups ||
+      K % group_size || gpu_weight.shape(1) * 32 != K * bits ||
+      gpu_scales.shape(0) != gpu_total_n ||
+      gpu_scales.shape(1) != K / group_size) {
+    throw std::invalid_argument("Dual ANE grouped hybrid qmm shape mismatch.");
+  }
+  Shape shape = x.shape();
+  shape.back() = (ane0_total_n + ane1_total_n + gpu_total_n) / groups;
+  return array(
+      std::move(shape), x.dtype(),
+      std::make_shared<DualAneHybridPrimitive>(
+          stream, ane_model0, ane_model1, bits, variant, group_size,
+          /* fuse_swiglu */ false, profile_category,
+          /* cpu_fp16 */ false, /* cpu_threads */ 0,
+          /* cpu_shared_resource */ false, groups),
       std::vector<array>{x, gpu_weight, gpu_scales, gpu_biases});
 }
 

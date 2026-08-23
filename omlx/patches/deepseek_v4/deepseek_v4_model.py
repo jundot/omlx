@@ -50,6 +50,7 @@ def set_dspark_verify_armed(flag: bool) -> None:
 # Optional ANE prefill backends. They see every eligible call and return None
 # to fall through to the normal GPU path (decode, verify, non-fixed shapes).
 _ANE_LINEAR_BACKEND = None
+_ANE_GROUPED_LINEAR_BACKEND = None
 _ANE_MLP_BACKEND = None
 _ANE_ATTENTION_INPUT_BACKEND = None
 
@@ -58,6 +59,12 @@ def register_ane_linear_backend(backend) -> None:
     """Install the optional ANE prefill backend for eligible plain linears."""
     global _ANE_LINEAR_BACKEND
     _ANE_LINEAR_BACKEND = backend
+
+
+def register_ane_grouped_linear_backend(backend) -> None:
+    """Install the optional ANE prefill backend for grouped linears."""
+    global _ANE_GROUPED_LINEAR_BACKEND
+    _ANE_GROUPED_LINEAR_BACKEND = backend
 
 
 def register_ane_mlp_backend(backend) -> None:
@@ -90,6 +97,15 @@ def _projection_or(
 
 def _ane_linear(linear: nn.Module, x: mx.array) -> mx.array:
     backend = _ANE_LINEAR_BACKEND
+    if backend is not None:
+        out = backend(linear, x)
+        if out is not None:
+            return out
+    return linear(x)
+
+
+def _ane_grouped_linear(linear: nn.Module, x: mx.array) -> mx.array:
+    backend = _ANE_GROUPED_LINEAR_BACKEND
     if backend is not None:
         out = backend(linear, x)
         if out is not None:
@@ -135,7 +151,7 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
         return row.transpose(0, 2, 1, 3).flatten(-2)
 
     def project_a(row: mx.array) -> mx.array:
-        return finish(attn.wo_a(prepare(row)))
+        return finish(_ane_grouped_linear(attn.wo_a, prepare(row)))
 
     if is_dspark_verify_armed():
         prepared = mx.concatenate(
