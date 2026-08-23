@@ -865,6 +865,23 @@ def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
     )
 
 
+def _streaming_error_payload(e: Exception, context: str) -> dict:
+    """Error body for a failure inside an OpenAI SSE generator.
+
+    A prefill-guard rejection raised during streaming must keep its
+    structured body (root ``type``, ``omlx_code``, byte fields) — the
+    blanket ``except`` in the generators would otherwise flatten it to a
+    generic ``server_error`` that clients cannot classify, and the correct
+    handler in ``_with_sse_keepalive`` never sees the exception because the
+    generator's own handler is the innermost one (#3036).
+    """
+    if isinstance(e, PrefillMemoryExceededError):
+        logger.warning(f"{context} prefill rejected: {e}")
+        return _prefill_memory_openai_error_body(e)
+    logger.error(f"Error during {context}: {e}")
+    return {"error": {"message": str(e), "type": "server_error"}}
+
+
 def _prefill_memory_openai_error_body(
     exc: PrefillMemoryExceededError,
     *,
@@ -4488,8 +4505,7 @@ async def stream_completion(
             }
             yield f"data: {json.dumps(data)}\n\n"
     except Exception as e:
-        logger.error(f"Error during completion streaming: {e}")
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
+        error_data = _streaming_error_payload(e, "completion streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -4765,8 +4781,7 @@ async def stream_chat_completion(
                         )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
-        logger.error(f"Error during chat streaming: {e}")
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
+        error_data = _streaming_error_payload(e, "chat streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -5253,8 +5268,18 @@ async def stream_anthropic_messages(
             if output.finished:
                 break
     except Exception as e:
-        logger.error(f"Error during Anthropic streaming: {e}")
-        yield create_error_event("api_error", str(e))
+        if isinstance(e, PrefillMemoryExceededError):
+            # Same shadowing as the OpenAI generators (#3036): keep the
+            # rejection classifiable. invalid_request_error is the Anthropic
+            # terminal request-error type — a retry without shrinking the
+            # prompt cannot succeed.
+            logger.warning(f"Anthropic streaming prefill rejected: {e}")
+            yield create_error_event(
+                "invalid_request_error", _prefill_memory_error_detail(e)
+            )
+        else:
+            logger.error(f"Error during Anthropic streaming: {e}")
+            yield create_error_event("api_error", str(e))
         yield create_message_stop_event()
         return
 
@@ -6773,13 +6798,29 @@ async def stream_responses_api(
                             },
                         )
     except Exception as e:
-        logger.error(f"Error during Responses API streaming: {e}")
+        if isinstance(e, PrefillMemoryExceededError):
+            # Same shadowing as the chat generator (#3036): surface the
+            # guard's code and message in the response.failed error object
+            # instead of failing with no error at all.
+            logger.warning(f"Responses API streaming prefill rejected: {e}")
+            guard_body = _prefill_memory_openai_error_body(e)["error"]
+            failure_error = {
+                "code": guard_body.get("omlx_code", "prefill_memory_exceeded"),
+                "message": guard_body["message"],
+            }
+        else:
+            logger.error(f"Error during Responses API streaming: {e}")
+            failure_error = {"code": "server_error", "message": str(e)}
         seq += 1
         yield format_sse_event(
             "response.failed",
             {
                 "type": "response.failed",
-                "response": {**initial_data, "status": "failed"},
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "error": failure_error,
+                },
                 "sequence_number": seq,
             },
         )

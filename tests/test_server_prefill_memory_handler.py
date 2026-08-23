@@ -293,3 +293,54 @@ class TestResponsesEndpointReaches400:
             srv._server_state.engine_pool = original_engine_pool
             srv.app.dependency_overrides.clear()
             srv.app.dependency_overrides.update(original_overrides)
+
+
+class TestStreamingErrorPayload:
+    """#3036: a prefill-guard rejection raised inside a streaming generator
+    must keep its structured body. The generators' blanket except is the
+    innermost handler, so the classification has to happen there — these
+    tests pin the payload the SSE error frame carries."""
+
+    def _exceeded(self):
+        return PrefillMemoryExceededError(
+            message=(
+                "Prefill context too large for available memory "
+                "(pre-chunk guard at 48000 tokens, kv_len=48000)"
+            ),
+            request_id="req-stream",
+            estimated_bytes=46_775_000_000,
+            limit_bytes=42_949_672_960,
+        )
+
+    def test_prefill_exceeded_keeps_structured_body(self):
+        import omlx.server as srv
+
+        body = srv._streaming_error_payload(self._exceeded(), "chat streaming")
+        assert body["type"] == "error"
+        assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
+        assert body["error"]["estimated_bytes"] == 46_775_000_000
+        assert body["error"]["limit_bytes"] == 42_949_672_960
+        assert "prefill memory guard rejected" in body["error"]["message"]
+
+    def test_prefill_aborted_keeps_aborted_code(self):
+        import omlx.server as srv
+
+        e = PrefillMemoryAbortedError(
+            message=(
+                "Request aborted: process memory limit exceeded "
+                "(usage 4.4 GB, abort threshold (hard watermark) 4.1 GB, "
+                "dynamic ceiling 4.3 GB)."
+            ),
+            request_id="req-abort-stream",
+            limit_bytes=4_100_000_000,
+        )
+        body = srv._streaming_error_payload(e, "chat streaming")
+        assert body["type"] == "error"
+        assert body["error"]["omlx_code"] == "prefill_memory_aborted"
+        assert "aborted this request mid-prefill" in body["error"]["message"]
+
+    def test_generic_exception_stays_flat_server_error(self):
+        import omlx.server as srv
+
+        body = srv._streaming_error_payload(ValueError("boom"), "chat streaming")
+        assert body == {"error": {"message": "boom", "type": "server_error"}}
