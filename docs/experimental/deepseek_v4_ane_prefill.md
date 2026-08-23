@@ -47,6 +47,10 @@ the path on for benchmarking there.
   "deepseek_ane_prefill_enabled": true,
   "deepseek_ane_prefill_sequence_length": 4096,
   "deepseek_ane_prefill_tail_padding_min_tokens": 0,
+  "deepseek_ane_prefill_down_enabled": true,
+  "deepseek_ane_prefill_down_fraction": 0.65,
+  "deepseek_ane_prefill_wo_a_enabled": true,
+  "deepseek_ane_prefill_wo_a_fraction": 0.5,
   "deepseek_ane_prefill_cpu_enabled": true,
   "deepseek_ane_prefill_cpu_fraction": 0.125,
   "deepseek_ane_prefill_cpu_threads": 12,
@@ -55,7 +59,20 @@ the path on for benchmarking there.
 ```
 
 The controls are exposed in the web per-model settings editor for detected
-DeepSeek-V4 models.
+DeepSeek-V4 models. The projection-specific fields are also persisted when a
+tuner recommendation is applied, allowing shared-down and grouped `wo_a` to
+be retained, resized, or disabled without switching off the other projections.
+
+The bounded tuner now includes the production shared-down shape and compact
+eight-group `wo_a` shape in its synthetic search. Synthetic timing still
+cannot reproduce contention with the full model. When full-model verification
+is explicitly enabled, the tuner compares each projection's profiled output
+completion time—including input packing and queue barriers—with its isolated
+GPU baseline. It runs one profile-refined candidate, rebalances query CPU
+sharing and surviving ANE splits, and disables a projection that no longer
+clears the 1% threshold. The final recommendation is still selected by direct
+end-to-end prompt throughput; if neither accelerated candidate clears 1%, the
+tuner returns GPU-only.
 
 When ANE prefill is active, engine startup also raises the scheduler's
 effective prefill step to at least the compiled ANE sequence length. This is

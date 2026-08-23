@@ -555,6 +555,34 @@ class BatchedEngine(BaseEngine):
                             )
                             or 0
                         ),
+                        down_enabled=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_down_enabled",
+                                True,
+                            )
+                        ),
+                        down_fraction=float(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_down_fraction",
+                                0.65,
+                            )
+                        ),
+                        wo_a_enabled=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_wo_a_enabled",
+                                True,
+                            )
+                        ),
+                        wo_a_fraction=float(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_wo_a_fraction",
+                                0.5,
+                            )
+                        ),
                         cpu_fraction=(
                             getattr(
                                 self._model_settings,

@@ -48,6 +48,10 @@
         'deepseek_ane_prefill_enabled',
         'deepseek_ane_prefill_sequence_length',
         'deepseek_ane_prefill_tail_padding_min_tokens',
+        'deepseek_ane_prefill_down_enabled',
+        'deepseek_ane_prefill_down_fraction',
+        'deepseek_ane_prefill_wo_a_enabled',
+        'deepseek_ane_prefill_wo_a_fraction',
         'deepseek_ane_prefill_cpu_enabled',
         'deepseek_ane_prefill_cpu_fraction',
         'deepseek_ane_prefill_cpu_threads',
@@ -250,6 +254,10 @@
                 deepseek_ane_prefill_enabled: false,
                 deepseek_ane_prefill_sequence_length: 4096,
                 deepseek_ane_prefill_tail_padding_min_tokens: 0,
+                deepseek_ane_prefill_down_enabled: true,
+                deepseek_ane_prefill_down_fraction: 0.65,
+                deepseek_ane_prefill_wo_a_enabled: true,
+                deepseek_ane_prefill_wo_a_fraction: 0.5,
                 deepseek_ane_prefill_cpu_enabled: true,
                 deepseek_ane_prefill_cpu_fraction: 0.125,
                 deepseek_ane_prefill_cpu_threads: 12,
@@ -7423,6 +7431,10 @@
                     deepseek_ane_prefill_enabled: s.deepseek_ane_prefill_enabled || false,
                     deepseek_ane_prefill_sequence_length: s.deepseek_ane_prefill_sequence_length || 4096,
                     deepseek_ane_prefill_tail_padding_min_tokens: s.deepseek_ane_prefill_tail_padding_min_tokens ?? 0,
+                    deepseek_ane_prefill_down_enabled: s.deepseek_ane_prefill_down_enabled !== false,
+                    deepseek_ane_prefill_down_fraction: s.deepseek_ane_prefill_down_fraction ?? 0.65,
+                    deepseek_ane_prefill_wo_a_enabled: s.deepseek_ane_prefill_wo_a_enabled !== false,
+                    deepseek_ane_prefill_wo_a_fraction: s.deepseek_ane_prefill_wo_a_fraction ?? 0.5,
                     deepseek_ane_prefill_cpu_enabled: s.deepseek_ane_prefill_cpu_enabled !== false,
                     deepseek_ane_prefill_cpu_fraction: s.deepseek_ane_prefill_cpu_fraction ?? 0.125,
                     deepseek_ane_prefill_cpu_threads: s.deepseek_ane_prefill_cpu_threads ?? 12,
@@ -8081,6 +8093,16 @@
                         deepseek_ane_prefill_tail_padding_min_tokens: Number(
                             recommendation.tail_padding_min_tokens || 0
                         ),
+                        deepseek_ane_prefill_down_enabled:
+                            recommendation.down_enabled !== false,
+                        deepseek_ane_prefill_down_fraction: Number(
+                            recommendation.down_fraction || 0.65
+                        ),
+                        deepseek_ane_prefill_wo_a_enabled:
+                            recommendation.wo_a_enabled !== false,
+                        deepseek_ane_prefill_wo_a_fraction: Number(
+                            recommendation.wo_a_fraction || 0.5
+                        ),
                         deepseek_ane_prefill_cpu_enabled:
                             !!recommendation.cpu_enabled,
                         deepseek_ane_prefill_cpu_fraction: Number(
@@ -8456,6 +8478,14 @@
                                 deepseek_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens))
                                     ? Number(this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens)
                                     : 0,
+                                deepseek_ane_prefill_down_enabled: !!this.modelSettings.deepseek_ane_prefill_down_enabled,
+                                deepseek_ane_prefill_down_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_down_fraction))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_down_fraction)
+                                    : 0.65,
+                                deepseek_ane_prefill_wo_a_enabled: !!this.modelSettings.deepseek_ane_prefill_wo_a_enabled,
+                                deepseek_ane_prefill_wo_a_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_wo_a_fraction))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_wo_a_fraction)
+                                    : 0.5,
                                 deepseek_ane_prefill_cpu_enabled: !!this.modelSettings.deepseek_ane_prefill_cpu_enabled,
                                 deepseek_ane_prefill_cpu_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction))
                                     ? Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction)

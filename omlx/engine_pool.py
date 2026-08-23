@@ -687,6 +687,22 @@ class EnginePool:
                 "deepseek_ane_prefill_tail_padding_min_tokens",
                 data.get("deepseek_ane_prefill_tail_padding_min_tokens", 0),
             )
+            add(
+                "deepseek_ane_prefill_down_enabled",
+                data.get("deepseek_ane_prefill_down_enabled", True),
+            )
+            add(
+                "deepseek_ane_prefill_down_fraction",
+                data.get("deepseek_ane_prefill_down_fraction", 0.65),
+            )
+            add(
+                "deepseek_ane_prefill_wo_a_enabled",
+                data.get("deepseek_ane_prefill_wo_a_enabled", True),
+            )
+            add(
+                "deepseek_ane_prefill_wo_a_fraction",
+                data.get("deepseek_ane_prefill_wo_a_fraction", 0.5),
+            )
             cpu_active = bool(
                 data.get("deepseek_ane_prefill_cpu_enabled", True)
             )

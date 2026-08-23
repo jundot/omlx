@@ -751,6 +751,90 @@ def test_enable_compiles_grouped_wo_a_bank_and_registers_backend(monkeypatch):
     assert model._omlx_ane_resident_program_count == 4
 
 
+def test_enable_can_disable_down_and_grouped_wo_a_independently(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "qwen35_cpu_shared_resource_available", lambda: True)
+    monkeypatch.setattr(
+        ane_patch,
+        "_compile_dual_banks",
+        lambda w0, w1, seq: ([object() for _ in w0], [object() for _ in w1], 2),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.deepseek_v4",
+        SimpleNamespace(
+            register_ane_linear_backend=lambda fn: None,
+            register_ane_mlp_backend=lambda fn: None,
+            register_ane_attention_input_backend=lambda fn: None,
+        ),
+    )
+    layer = _fake_layer()
+    layer.attn.wo_a = _mxfp8_grouped_linear(2, 256, 512)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    count = ane_patch.enable_deepseek_v4_ane_prefill(
+        model,
+        sequence_length=SEQ,
+        down_enabled=False,
+        wo_a_enabled=False,
+    )
+
+    assert count == 3
+    assert model._omlx_ane_down_prefill_count == 0
+    assert model._omlx_ane_wo_a_prefill_count == 0
+    assert not hasattr(layer.ffn.shared_experts.down_proj, "_omlx_ane_state")
+    assert not hasattr(layer.attn.wo_a, "_omlx_ane_state")
+
+
+def test_enable_applies_tuned_down_and_grouped_wo_a_fractions(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "qwen35_cpu_shared_resource_available", lambda: True)
+    monkeypatch.setattr(
+        ane_patch,
+        "_compile_dual_banks",
+        lambda w0, w1, seq: ([object() for _ in w0], [object() for _ in w1], 2),
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_compile_grouped_dual_banks",
+        lambda w0, w1, seq, groups: (
+            [object() for _ in w0],
+            [object() for _ in w1],
+            2,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.deepseek_v4",
+        SimpleNamespace(
+            register_ane_linear_backend=lambda fn: None,
+            register_ane_mlp_backend=lambda fn: None,
+            register_ane_attention_input_backend=lambda fn: None,
+            register_ane_grouped_linear_backend=lambda fn: None,
+        ),
+    )
+    layer = _fake_layer()
+    layer.ffn.shared_experts.down_proj = _mxfp8_linear(512, 1024)
+    layer.attn.wo_a = _mxfp8_grouped_linear(2, 256, 1024)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    ane_patch.enable_deepseek_v4_ane_prefill(
+        model,
+        sequence_length=SEQ,
+        down_fraction=0.75,
+        wo_a_fraction=0.75,
+    )
+
+    assert layer.ffn.shared_experts.down_proj._omlx_ane_state.ane_outputs == 768
+    assert layer.attn.wo_a._omlx_ane_state.ane_outputs == 768
+
+
 def test_enable_stacks_indexer_wq_b_when_present(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
     monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)

@@ -818,6 +818,10 @@ def enable_deepseek_v4_ane_prefill(
     model: Any,
     *,
     sequence_length: int = 2048,
+    down_enabled: bool = True,
+    down_fraction: float = _FRACTIONS["mlp_down"],
+    wo_a_enabled: bool = True,
+    wo_a_fraction: float = _FRACTIONS["wo_a"],
     cpu_fraction: float = 0.125,
     cpu_threads: int = 12,
     cpu_shared_resource: bool = True,
@@ -831,6 +835,12 @@ def enable_deepseek_v4_ane_prefill(
         raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
     if not 0.0 <= cpu_fraction < 0.5:
         raise ValueError("DeepSeek CPU fraction must be between 0.0 and 0.5")
+    if not 0.0 < down_fraction < 1.0:
+        raise ValueError(
+            "DeepSeek shared-down ANE fraction must be between 0.0 and 1.0"
+        )
+    if not 0.0 < wo_a_fraction < 1.0:
+        raise ValueError("DeepSeek wo_a ANE fraction must be between 0.0 and 1.0")
     if not 0 <= cpu_threads <= 64:
         raise ValueError("DeepSeek CPU worker count must be between 0 and 64")
     if not (
@@ -945,18 +955,19 @@ def enable_deepseek_v4_ane_prefill(
                 shared._omlx_ane_profile_category = _PROFILE_MLP
                 prepared.append((shared, *prep))
                 mlp_count += 1
-                try:
-                    down_prep = _prepare_linear(
-                        getattr(shared, "down_proj", None),
-                        _FRACTIONS["mlp_down"],
-                    )
-                except Exception:
-                    logger.warning(
-                        "Skipping one DeepSeek shared down projection while "
-                        "preparing its ANE procedure",
-                        exc_info=True,
-                    )
-                    down_prep = None
+                down_prep = None
+                if down_enabled:
+                    try:
+                        down_prep = _prepare_linear(
+                            getattr(shared, "down_proj", None),
+                            down_fraction,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Skipping one DeepSeek shared down projection while "
+                            "preparing its ANE procedure",
+                            exc_info=True,
+                        )
                 if down_prep is not None:
                     shared.down_proj._omlx_ane_profile_category = _PROFILE_DOWN
                     prepared.append((shared.down_proj, *down_prep))
@@ -974,10 +985,10 @@ def enable_deepseek_v4_ane_prefill(
                 attn._omlx_ane_profile_category = _PROFILE_ATTENTION_INPUT
                 prepared.append((attn, *input_prep))
                 attention_input_count += 1
-            if grouped_available:
+            if grouped_available and wo_a_enabled:
                 try:
                     wo_a_prep = _prepare_grouped_linear(
-                        getattr(attn, "wo_a", None), _FRACTIONS["wo_a"]
+                        getattr(attn, "wo_a", None), wo_a_fraction
                     )
                 except Exception:
                     logger.warning(
@@ -1124,7 +1135,8 @@ def enable_deepseek_v4_ane_prefill(
         "%d attention-input stacks, %d query projections, %d with the "
         "indexer wq_b stacked in) "
         "into %d instance-pinned ANE programs (sequence_length=%d, "
-        "query_cpu_fraction=%.3f, cpu_threads=%d, shared_resource=%s, "
+        "down=%s/%.3f, wo_a=%s/%.3f, query_cpu_fraction=%.3f, "
+        "cpu_threads=%d, shared_resource=%s, "
         "tail_padding_min_tokens=%d, dspark_native=true)",
         count,
         mlp_count,
@@ -1135,6 +1147,10 @@ def enable_deepseek_v4_ane_prefill(
         stacked_count,
         resident_programs + grouped_resident_programs,
         sequence_length,
+        down_enabled,
+        down_fraction,
+        wo_a_enabled,
+        wo_a_fraction,
         cpu_fraction,
         cpu_threads,
         cpu_shared_resource,

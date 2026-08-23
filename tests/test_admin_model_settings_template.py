@@ -282,6 +282,10 @@ def test_deepseek_ane_tuner_is_bounded_by_default_and_full_model_is_opt_in():
     assert "validateDeepseekAneSettings()" in script
     assert "DeepSeek ANE tail padding threshold must be zero" in script
     assert "deepseek_ane_prefill_cpu_fraction: Number(" in script
+    assert "deepseek_ane_prefill_down_enabled:" in script
+    assert "deepseek_ane_prefill_down_fraction: Number(" in script
+    assert "deepseek_ane_prefill_wo_a_enabled:" in script
+    assert "deepseek_ane_prefill_wo_a_fraction: Number(" in script
     assert "recommendation.model_family === 'deepseek_v4'" in script
 
 

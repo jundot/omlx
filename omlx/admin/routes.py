@@ -155,6 +155,10 @@ class ModelSettingsRequest(BaseModel):
     deepseek_ane_prefill_enabled: bool | None = None
     deepseek_ane_prefill_sequence_length: int | None = None
     deepseek_ane_prefill_tail_padding_min_tokens: int | None = None
+    deepseek_ane_prefill_down_enabled: bool | None = None
+    deepseek_ane_prefill_down_fraction: float | None = None
+    deepseek_ane_prefill_wo_a_enabled: bool | None = None
+    deepseek_ane_prefill_wo_a_fraction: float | None = None
     deepseek_ane_prefill_cpu_enabled: bool | None = None
     deepseek_ane_prefill_cpu_fraction: float | None = None
     deepseek_ane_prefill_cpu_threads: int | None = None
@@ -2520,6 +2524,30 @@ async def update_model_settings(
                 ),
             )
         current_settings.deepseek_ane_prefill_tail_padding_min_tokens = int(value)
+    if "deepseek_ane_prefill_down_enabled" in sent:
+        current_settings.deepseek_ane_prefill_down_enabled = bool(
+            request.deepseek_ane_prefill_down_enabled
+        )
+    if "deepseek_ane_prefill_down_fraction" in sent:
+        value = request.deepseek_ane_prefill_down_fraction
+        if value is None or not 0.0 < value < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek shared-down ANE fraction must be between 0 and 1.",
+            )
+        current_settings.deepseek_ane_prefill_down_fraction = float(value)
+    if "deepseek_ane_prefill_wo_a_enabled" in sent:
+        current_settings.deepseek_ane_prefill_wo_a_enabled = bool(
+            request.deepseek_ane_prefill_wo_a_enabled
+        )
+    if "deepseek_ane_prefill_wo_a_fraction" in sent:
+        value = request.deepseek_ane_prefill_wo_a_fraction
+        if value is None or not 0.0 < value < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek wo_a ANE fraction must be between 0 and 1.",
+            )
+        current_settings.deepseek_ane_prefill_wo_a_fraction = float(value)
     if "deepseek_ane_prefill_cpu_enabled" in sent:
         current_settings.deepseek_ane_prefill_cpu_enabled = bool(
             request.deepseek_ane_prefill_cpu_enabled

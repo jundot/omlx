@@ -146,6 +146,14 @@ class ModelSettings:
             block size, rebuilding this model's SSD cache once.
         deepseek_ane_prefill_tail_padding_min_tokens: Smallest short token block
             zero-padded to the compiled DeepSeek ANE shape (zero disables).
+        deepseek_ane_prefill_down_enabled: Accelerate the shared-expert down
+            projection independently of the other DeepSeek projections.
+        deepseek_ane_prefill_down_fraction: Fraction of shared-expert down
+            projection rows assigned across both ANE instances.
+        deepseek_ane_prefill_wo_a_enabled: Accelerate grouped attention-output
+            wo_a independently of the other DeepSeek projections.
+        deepseek_ane_prefill_wo_a_fraction: Fraction of each wo_a group's rows
+            assigned across both ANE instances.
         deepseek_ane_prefill_cpu_enabled: Share benchmark-selected query
             projection rows with the CPU while both ANEs and the GPU run.
         deepseek_ane_prefill_cpu_fraction: Fraction of query projection rows
@@ -273,6 +281,10 @@ class ModelSettings:
     deepseek_ane_prefill_enabled: bool = False
     deepseek_ane_prefill_sequence_length: int = 4096
     deepseek_ane_prefill_tail_padding_min_tokens: int = 0
+    deepseek_ane_prefill_down_enabled: bool = True
+    deepseek_ane_prefill_down_fraction: float = 0.65
+    deepseek_ane_prefill_wo_a_enabled: bool = True
+    deepseek_ane_prefill_wo_a_fraction: float = 0.5
     deepseek_ane_prefill_cpu_enabled: bool = True
     deepseek_ane_prefill_cpu_fraction: float = 0.125
     deepseek_ane_prefill_cpu_threads: int = 12
