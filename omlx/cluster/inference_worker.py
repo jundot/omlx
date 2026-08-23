@@ -20,6 +20,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from ..utils.metal_sync import _sync_and_clear_cache
+from ..utils.proc_memory import get_phys_footprint
 from .deployment import decode_worker_contract
 from .liveness import PeerWatchdog
 from .memory_guard import (
@@ -48,6 +50,32 @@ def _emit_event(payload: dict[str, Any]) -> None:
         _EVENT_PREFIX + json.dumps(payload, sort_keys=True, separators=(",", ":")),
         flush=True,
     )
+
+
+def _release_metal_memory() -> None:
+    """Return the rank's Metal buffer pool to the OS on clean shutdown.
+
+    Standalone model unloads run ``_sync_and_clear_cache`` explicitly, but a
+    rank process historically just exited — leaving MLX's allocator cache
+    (gigabytes for large models) wired at the driver. On Thunderbolt/RDMA
+    worker nodes those pinned pages have repeatedly survived process death
+    and only cleared on reboot. Best effort by design: cleanup runs on clean
+    exits only (never on failure or watchdog paths), and any error here must
+    not mask the real exit status.
+    """
+
+    try:
+        before = get_phys_footprint()
+        _sync_and_clear_cache()
+        after = get_phys_footprint()
+        released = max(0, before - after)
+        print(
+            f"rank metal release: {released / 1048576:.1f} MiB returned to "
+            f"the OS ({before / 1048576:.1f} -> {after / 1048576:.1f} MiB)",
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 def _cross_thread_generation_stream(mx: Any) -> Any:
@@ -1237,6 +1265,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     # than "nobody has asked anything for 45 seconds".
                     run("127.0.0.1", args.port, provider)
     except KeyboardInterrupt:
+        _release_metal_memory()
         return 0
     except Exception as exc:
         # An ordinary exception is the most useful evidence a failed remote
@@ -1253,6 +1282,7 @@ def run_worker(args: argparse.Namespace) -> int:
         marker.stop_heartbeat()
         if not preserve_failure_marker:
             marker.remove()
+    _release_metal_memory()
     return 0
 
 
