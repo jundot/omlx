@@ -592,6 +592,23 @@ class EnginePool:
                 "deepseek_ane_prefill_sequence_length",
                 data.get("deepseek_ane_prefill_sequence_length", 4096),
             )
+            cpu_active = bool(
+                data.get("deepseek_ane_prefill_cpu_enabled", True)
+            )
+            add("deepseek_ane_prefill_cpu_enabled", cpu_active)
+            if cpu_active:
+                add(
+                    "deepseek_ane_prefill_cpu_fraction",
+                    data.get("deepseek_ane_prefill_cpu_fraction", 0.125),
+                )
+                add(
+                    "deepseek_ane_prefill_cpu_threads",
+                    data.get("deepseek_ane_prefill_cpu_threads", 12),
+                )
+                add(
+                    "deepseek_ane_prefill_cpu_shared_resource",
+                    data.get("deepseek_ane_prefill_cpu_shared_resource", True),
+                )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"

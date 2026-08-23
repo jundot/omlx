@@ -143,6 +143,13 @@ class ModelSettings:
         deepseek_ane_prefill_sequence_length: Exact flattened token count routed
             through the DeepSeek ANE procedures; also realigns the paged cache
             block size, rebuilding this model's SSD cache once.
+        deepseek_ane_prefill_cpu_enabled: Share benchmark-selected query
+            projection rows with the CPU while both ANEs and the GPU run.
+        deepseek_ane_prefill_cpu_fraction: Fraction of query projection rows
+            assigned to the CPU after the dual-ANE prefix.
+        deepseek_ane_prefill_cpu_threads: Requested Accelerate worker count.
+        deepseek_ane_prefill_cpu_shared_resource: Use Qwen's shared-resource
+            CPU scheduling policy; unavailable runtimes disable CPU offload.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -261,6 +268,10 @@ class ModelSettings:
     # it rebuilds this model's SSD cache once.
     deepseek_ane_prefill_enabled: bool = False
     deepseek_ane_prefill_sequence_length: int = 4096
+    deepseek_ane_prefill_cpu_enabled: bool = True
+    deepseek_ane_prefill_cpu_fraction: float = 0.125
+    deepseek_ane_prefill_cpu_threads: int = 12
+    deepseek_ane_prefill_cpu_shared_resource: bool = True
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

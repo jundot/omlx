@@ -1024,6 +1024,19 @@
                                                     </select>
                                                 </div>
                                             </div>
+                                            <div class="flex items-start justify-between gap-3 rounded-lg border border-neutral-200 bg-white p-3">
+                                                <div class="min-w-0">
+                                                    <span class="text-xs font-medium text-neutral-700">{{ t('modal.model_settings.deepseek_ane_cpu') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.deepseek_ane_cpu_hint') }}</p>
+                                                </div>
+                                                <button type="button"
+                                                        @click="modelSettings.deepseek_ane_prefill_cpu_enabled = !modelSettings.deepseek_ane_prefill_cpu_enabled"
+                                                        :class="modelSettings.deepseek_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    <span :class="modelSettings.deepseek_ane_prefill_cpu_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                </button>
+                                            </div>
                                             <p class="text-xs text-neutral-500">{{ t('modal.model_settings.deepseek_ane_cache_hint') }}</p>
                                         </div>
                                     </div>

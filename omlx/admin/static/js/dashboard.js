@@ -47,6 +47,10 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'deepseek_ane_prefill_enabled',
         'deepseek_ane_prefill_sequence_length',
+        'deepseek_ane_prefill_cpu_enabled',
+        'deepseek_ane_prefill_cpu_fraction',
+        'deepseek_ane_prefill_cpu_threads',
+        'deepseek_ane_prefill_cpu_shared_resource',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -244,6 +248,10 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 deepseek_ane_prefill_enabled: false,
                 deepseek_ane_prefill_sequence_length: 4096,
+                deepseek_ane_prefill_cpu_enabled: true,
+                deepseek_ane_prefill_cpu_fraction: 0.125,
+                deepseek_ane_prefill_cpu_threads: 12,
+                deepseek_ane_prefill_cpu_shared_resource: true,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -7410,6 +7418,10 @@
                     qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
                     deepseek_ane_prefill_enabled: s.deepseek_ane_prefill_enabled || false,
                     deepseek_ane_prefill_sequence_length: s.deepseek_ane_prefill_sequence_length || 4096,
+                    deepseek_ane_prefill_cpu_enabled: s.deepseek_ane_prefill_cpu_enabled !== false,
+                    deepseek_ane_prefill_cpu_fraction: s.deepseek_ane_prefill_cpu_fraction ?? 0.125,
+                    deepseek_ane_prefill_cpu_threads: s.deepseek_ane_prefill_cpu_threads ?? 12,
+                    deepseek_ane_prefill_cpu_shared_resource: s.deepseek_ane_prefill_cpu_shared_resource !== false,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -8346,6 +8358,14 @@
                                 qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
                                 deepseek_ane_prefill_enabled: !!this.modelSettings.deepseek_ane_prefill_enabled,
                                 deepseek_ane_prefill_sequence_length: parseInt(this.modelSettings.deepseek_ane_prefill_sequence_length) || 4096,
+                                deepseek_ane_prefill_cpu_enabled: !!this.modelSettings.deepseek_ane_prefill_cpu_enabled,
+                                deepseek_ane_prefill_cpu_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction)
+                                    : 0.125,
+                                deepseek_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_cpu_threads))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_cpu_threads)
+                                    : 12,
+                                deepseek_ane_prefill_cpu_shared_resource: !!this.modelSettings.deepseek_ane_prefill_cpu_shared_resource,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled

@@ -54,6 +54,33 @@ def test_prepare_linear_splits_mxfp8_rows():
     assert float(mx.abs(suffix - reference[256:]).max()) < 0.05
 
 
+def test_prepare_linear_adds_fp16_cpu_middle_rows():
+    linear = _mxfp8_linear(256, 1024)
+
+    prep = ane_patch._prepare_linear(linear, 0.5, 0.125)
+
+    assert prep is not None
+    state, _, _ = prep
+    assert state.ane_outputs == 512
+    assert state.cpu_outputs == 128
+    assert state.gpu_outputs == 384
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (128, 256)
+    assert state.cpu_weight.dtype == mx.float16
+    reference = mx.dequantize(
+        linear.weight, linear.scales, group_size=32, bits=8, mode="mxfp8"
+    )
+    assert (
+        float(
+            mx.abs(
+                state.cpu_weight.astype(mx.float32)
+                - reference[512:640].astype(mx.float32)
+            ).max()
+        )
+        < 0.01
+    )
+
+
 def test_prepare_rejects_affine_and_undersized_linears():
     affine = nn.QuantizedLinear(256, 512, bias=False, group_size=64, bits=4)
     assert ane_patch._prepare_linear(affine, 0.5) is None
@@ -90,6 +117,28 @@ def test_linear_backend_guards_and_dispatch(monkeypatch):
     assert (
         ane_patch._linear_backend(linear, x.astype(mx.float32)) is None
     )
+
+
+def test_linear_backend_dispatches_shared_cpu_middle(monkeypatch):
+    linear = _mxfp8_linear(256, 1024)
+    prep = ane_patch._prepare_linear(linear, 0.5, 0.125)
+    _attach(linear, prep)
+    marker = mx.zeros((1, SEQ, 1024), dtype=mx.bfloat16)
+    calls = []
+
+    def fake_hybrid(*args):
+        calls.append(args)
+        return marker
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_affine_qmm_t", fake_hybrid
+    )
+    x = mx.zeros((1, SEQ, 256), dtype=mx.bfloat16)
+
+    assert ane_patch._linear_backend(linear, x) is marker
+    assert len(calls) == 1
+    assert calls[0][1].shape == (128, 256)
+    assert calls[0][-2:] == (12, True)
 
 
 def test_mlp_backend_reassembles_gate_and_up(monkeypatch):
@@ -176,6 +225,49 @@ def test_prepare_stacked_spans_both_linears():
     assert float(mx.abs(suffix - stacked_ref).max()) < 0.05
 
 
+def test_prepare_stacked_cpu_rows_preserve_combined_order():
+    attn_linear = _mxfp8_linear(256, 1024)
+    indexer_linear = _mxfp8_linear(256, 1024)
+
+    prep = ane_patch._prepare_stacked(
+        attn_linear, indexer_linear, 0.5, 0.125
+    )
+
+    assert prep is not None
+    state, _, _ = prep
+    assert state.ane_outputs == 1024
+    assert state.cpu_outputs == 256
+    assert state.gpu_outputs == 768
+    assert state.cpu_weight is not None
+    stacked_ref = mx.concatenate(
+        (
+            mx.dequantize(
+                attn_linear.weight,
+                attn_linear.scales,
+                group_size=32,
+                bits=8,
+                mode="mxfp8",
+            ),
+            mx.dequantize(
+                indexer_linear.weight,
+                indexer_linear.scales,
+                group_size=32,
+                bits=8,
+                mode="mxfp8",
+            ),
+        )
+    )
+    assert (
+        float(
+            mx.abs(
+                state.cpu_weight.astype(mx.float32)
+                - stacked_ref[1024:1280].astype(mx.float32)
+            ).max()
+        )
+        < 0.01
+    )
+
+
 def test_stacked_backend_splits_and_plain_backend_ignores_it(monkeypatch):
     attn_linear = _mxfp8_linear(256, 512)
     indexer_linear = _mxfp8_linear(256, 256)
@@ -220,6 +312,9 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
     monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_cpu_shared_resource_available", lambda: True
+    )
     compiled = {}
 
     def fake_banks(weights0, weights1, sequence_length):
@@ -258,7 +353,10 @@ def test_enable_compiles_banks_and_registers_backends(monkeypatch):
     assert layer.attn.wq_b._omlx_ane_state.model is not None
     assert not hasattr(layer.attn.wo_b, "_omlx_ane_state")
     assert layer.ffn.shared_experts._omlx_ane_state.ane_outputs == 256
+    assert layer.ffn.shared_experts._omlx_ane_state.cpu_weight is None
+    assert layer.attn.wq_b._omlx_ane_state.cpu_weight is not None
     assert model._omlx_ane_procedure_count == 2
+    assert model._omlx_ane_cpu_prefill_count == 1
     assert model._omlx_ane_mlp_prefill_count == 1
     assert model._omlx_ane_resident_program_count == 2
 
@@ -268,6 +366,9 @@ def test_enable_stacks_indexer_wq_b_when_present(monkeypatch):
     monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_cpu_shared_resource_available", lambda: True
+    )
     monkeypatch.setattr(
         ane_patch,
         "_compile_dual_banks",
@@ -293,7 +394,37 @@ def test_enable_stacks_indexer_wq_b_when_present(monkeypatch):
     state = layer.attn.wq_b._omlx_ane_state
     assert isinstance(state, ane_patch._StackedState)
     assert state.split == 512
+    assert state.cpu_weight is not None
     assert not hasattr(layer.attn.wo_b, "_omlx_ane_state")
+
+
+def test_enable_disables_cpu_share_without_shared_scheduler(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+    monkeypatch.setattr(ane_patch, "is_nax_available", lambda: False)
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_cpu_shared_resource_available", lambda: False
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_compile_dual_banks",
+        lambda w0, w1, seq: ([object() for _ in w0], [object() for _ in w1], 2),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.deepseek_v4",
+        SimpleNamespace(
+            register_ane_linear_backend=lambda fn: None,
+            register_ane_mlp_backend=lambda fn: None,
+        ),
+    )
+    layer = _fake_layer()
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    assert ane_patch.enable_deepseek_v4_ane_prefill(model, sequence_length=SEQ) == 2
+    assert layer.attn.wq_b._omlx_ane_state.cpu_weight is None
+    assert model._omlx_ane_cpu_prefill_count == 0
 
 
 def test_enable_skips_on_nax_gpu(monkeypatch):

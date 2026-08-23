@@ -154,6 +154,10 @@ class ModelSettingsRequest(BaseModel):
     # DeepSeek-V4 hybrid ANE prefill
     deepseek_ane_prefill_enabled: bool | None = None
     deepseek_ane_prefill_sequence_length: int | None = None
+    deepseek_ane_prefill_cpu_enabled: bool | None = None
+    deepseek_ane_prefill_cpu_fraction: float | None = None
+    deepseek_ane_prefill_cpu_threads: int | None = None
+    deepseek_ane_prefill_cpu_shared_resource: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2497,6 +2501,30 @@ async def update_model_settings(
                 detail="ANE prompt block must be a multiple of 64 and at least 1024.",
             )
         current_settings.deepseek_ane_prefill_sequence_length = int(value)
+    if "deepseek_ane_prefill_cpu_enabled" in sent:
+        current_settings.deepseek_ane_prefill_cpu_enabled = bool(
+            request.deepseek_ane_prefill_cpu_enabled
+        )
+    if "deepseek_ane_prefill_cpu_fraction" in sent:
+        value = request.deepseek_ane_prefill_cpu_fraction
+        if value is None or not 0.0 <= value < 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek CPU fraction must be between 0.0 and 0.5.",
+            )
+        current_settings.deepseek_ane_prefill_cpu_fraction = float(value)
+    if "deepseek_ane_prefill_cpu_threads" in sent:
+        value = request.deepseek_ane_prefill_cpu_threads
+        if value is None or not 0 <= value <= 64:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek CPU worker count must be between 0 and 64.",
+            )
+        current_settings.deepseek_ane_prefill_cpu_threads = int(value)
+    if "deepseek_ane_prefill_cpu_shared_resource" in sent:
+        current_settings.deepseek_ane_prefill_cpu_shared_resource = bool(
+            request.deepseek_ane_prefill_cpu_shared_resource
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

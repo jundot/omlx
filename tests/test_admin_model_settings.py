@@ -261,11 +261,19 @@ async def test_deepseek_ane_prefill_settings_are_persisted():
         admin_routes.ModelSettingsRequest(
             deepseek_ane_prefill_enabled=True,
             deepseek_ane_prefill_sequence_length=4096,
+            deepseek_ane_prefill_cpu_enabled=True,
+            deepseek_ane_prefill_cpu_fraction=0.125,
+            deepseek_ane_prefill_cpu_threads=12,
+            deepseek_ane_prefill_cpu_shared_resource=True,
         ),
     )
 
     assert settings.deepseek_ane_prefill_enabled is True
     assert settings.deepseek_ane_prefill_sequence_length == 4096
+    assert settings.deepseek_ane_prefill_cpu_enabled is True
+    assert settings.deepseek_ane_prefill_cpu_fraction == 0.125
+    assert settings.deepseek_ane_prefill_cpu_threads == 12
+    assert settings.deepseek_ane_prefill_cpu_shared_resource is True
     assert result["requires_reload"] is False
 
 
@@ -293,5 +301,28 @@ async def test_deepseek_ane_prefill_rejects_invalid_block_size():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(
                 deepseek_ane_prefill_sequence_length=4000
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_invalid_cpu_settings():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="CPU fraction"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_cpu_fraction=0.5
+            ),
+        )
+    with pytest.raises(admin_routes.HTTPException, match="worker count"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_cpu_threads=65
             ),
         )

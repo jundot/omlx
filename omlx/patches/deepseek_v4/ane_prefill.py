@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in ANE/GPU hybrid prefill for DeepSeek-V4-Flash dense projections.
+"""Opt-in ANE/CPU/GPU prefill for DeepSeek-V4-Flash dense projections.
 
 Splits the mxfp8 shared-expert gate/up pair and the wq_b attention
 projection (with the sparse-layer indexer wq_b stacked into the same
-procedure) between an INT8 ANE channel prefix and an affine-q8 GPU suffix,
-reusing the Qwen ANE runtime (procedure banks, split ladder, fixed-shape
-eligibility). Routed experts, wo_a/wo_b, decode, and DSpark verify calls
-keep the existing GPU path. Enabled through the per-model
+procedure) between an INT8 ANE channel prefix and an affine-q8 GPU suffix.
+The query projections may also place a benchmark-selected FP16 middle slice
+on the CPU using Qwen's shared-resource scheduler. Routed experts, shared
+gate/up CPU work, wo_a/wo_b, decode, and DSpark verify calls keep their
+existing paths. Enabled through the per-model
 ``deepseek_ane_prefill_*`` settings on the batched engine.
 """
 
@@ -40,6 +41,8 @@ _FRACTIONS = {"mlp": 0.5, "wq_b": 0.5, "indexer_wq_b": 0.5}
 @dataclass(frozen=True)
 class _AneConfig:
     sequence_length: int
+    cpu_threads: int = 12
+    cpu_shared_resource: bool = True
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class _LinearState:
     biases: mx.array
     ane_outputs: int
     gpu_outputs: int
+    cpu_weight: mx.array | None = None
+    cpu_outputs: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,8 @@ class _MlpState:
     biases: mx.array
     ane_outputs: int
     gpu_outputs: int
+    cpu_weight: mx.array | None = None
+    cpu_outputs: int = 0
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,8 @@ class _StackedState:
     ane_outputs: int
     gpu_outputs: int
     split: int
+    cpu_weight: mx.array | None = None
+    cpu_outputs: int = 0
 
 
 def _mxfp8_linear_dims(linear: Any) -> tuple[int, int] | None:
@@ -114,35 +123,57 @@ def _requant_suffix(rows: mx.array) -> tuple[mx.array, mx.array, mx.array]:
     return mx.contiguous(weight), mx.contiguous(scales), mx.contiguous(biases)
 
 
-def _split_rows(out_features: int, fraction: float) -> tuple[int, int] | None:
-    per_instance = int(out_features * fraction / 2 // 128) * 128
-    gpu_outputs = out_features - 2 * per_instance
+def _split_rows(
+    out_features: int,
+    ane_fraction: float,
+    cpu_fraction: float = 0.0,
+) -> tuple[int, int, int] | None:
+    per_instance = int(out_features * ane_fraction / 2 // 128) * 128
+    cpu_outputs = int(out_features * cpu_fraction // 64) * 64
+    gpu_outputs = out_features - 2 * per_instance - cpu_outputs
     if per_instance < 128 or gpu_outputs < 64 or gpu_outputs % 64:
         return None
-    return per_instance, gpu_outputs
+    return per_instance, cpu_outputs, gpu_outputs
 
 
 def _prepare_linear(
-    linear: Any, fraction: float
+    linear: Any, ane_fraction: float, cpu_fraction: float = 0.0
 ) -> tuple[_LinearState, mx.array, mx.array] | None:
     dims = _mxfp8_linear_dims(linear)
     if dims is None:
         return None
     out_features, _ = dims
-    split = _split_rows(out_features, fraction)
+    split = _split_rows(out_features, ane_fraction, cpu_fraction)
     if split is None:
         return None
-    per_instance, gpu_outputs = split
+    per_instance, cpu_outputs, gpu_outputs = split
+    ane_outputs = 2 * per_instance
+    gpu_start = ane_outputs + cpu_outputs
     dense0 = mx.contiguous(
         _dequant_rows(linear, 0, per_instance).astype(mx.float32)
     )
     dense1 = mx.contiguous(
-        _dequant_rows(linear, per_instance, 2 * per_instance).astype(mx.float32)
+        _dequant_rows(linear, per_instance, ane_outputs).astype(mx.float32)
+    )
+    cpu_weight = (
+        mx.contiguous(
+            _dequant_rows(linear, ane_outputs, gpu_start).astype(mx.float16)
+        )
+        if cpu_outputs
+        else None
     )
     suffix = _requant_suffix(
-        mx.contiguous(_dequant_rows(linear, 2 * per_instance, out_features))
+        mx.contiguous(_dequant_rows(linear, gpu_start, out_features))
     )
-    state = _LinearState(None, None, *suffix, 2 * per_instance, gpu_outputs)
+    state = _LinearState(
+        None,
+        None,
+        *suffix,
+        ane_outputs,
+        gpu_outputs,
+        cpu_weight,
+        cpu_outputs,
+    )
     return state, dense0, dense1
 
 
@@ -155,7 +186,7 @@ def _prepare_mlp(mlp: Any) -> tuple[_MlpState, mx.array, mx.array] | None:
     split = _split_rows(out_features, _FRACTIONS["mlp"])
     if split is None:
         return None
-    per_instance, gpu_outputs = split
+    per_instance, _, gpu_outputs = split
     ane_outputs = 2 * per_instance
 
     def block(start: int, stop: int) -> mx.array:
@@ -174,7 +205,10 @@ def _prepare_mlp(mlp: Any) -> tuple[_MlpState, mx.array, mx.array] | None:
 
 
 def _prepare_stacked(
-    attn_linear: Any, indexer_linear: Any, fraction: float
+    attn_linear: Any,
+    indexer_linear: Any,
+    ane_fraction: float,
+    cpu_fraction: float = 0.0,
 ) -> tuple[_StackedState, mx.array, mx.array] | None:
     attn_dims = _mxfp8_linear_dims(attn_linear)
     indexer_dims = _mxfp8_linear_dims(indexer_linear)
@@ -182,10 +216,12 @@ def _prepare_stacked(
         return None
     attn_out = attn_dims[0]
     out_features = attn_out + indexer_dims[0]
-    split = _split_rows(out_features, fraction)
+    split = _split_rows(out_features, ane_fraction, cpu_fraction)
     if split is None:
         return None
-    per_instance, gpu_outputs = split
+    per_instance, cpu_outputs, gpu_outputs = split
+    ane_outputs = 2 * per_instance
+    gpu_start = ane_outputs + cpu_outputs
 
     def stacked_rows(start: int, stop: int) -> mx.array:
         parts = []
@@ -201,13 +237,27 @@ def _prepare_stacked(
 
     dense0 = mx.contiguous(stacked_rows(0, per_instance).astype(mx.float32))
     dense1 = mx.contiguous(
-        stacked_rows(per_instance, 2 * per_instance).astype(mx.float32)
+        stacked_rows(per_instance, ane_outputs).astype(mx.float32)
+    )
+    cpu_weight = (
+        mx.contiguous(
+            stacked_rows(ane_outputs, gpu_start).astype(mx.float16)
+        )
+        if cpu_outputs
+        else None
     )
     suffix = _requant_suffix(
-        mx.contiguous(stacked_rows(2 * per_instance, out_features))
+        mx.contiguous(stacked_rows(gpu_start, out_features))
     )
     state = _StackedState(
-        None, None, *suffix, 2 * per_instance, gpu_outputs, attn_out
+        None,
+        None,
+        *suffix,
+        ane_outputs,
+        gpu_outputs,
+        attn_out,
+        cpu_weight,
+        cpu_outputs,
     )
     return state, dense0, dense1
 
@@ -224,6 +274,22 @@ def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
+        if state.cpu_weight is not None:
+            return fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+                x,
+                state.cpu_weight,
+                state.weight,
+                state.scales,
+                state.biases,
+                state.model,
+                state.model1,
+                _SUFFIX_BITS,
+                8,
+                _SUFFIX_GROUP_SIZE,
+                1,
+                config.cpu_threads,
+                config.cpu_shared_resource,
+            )
         return fast.qwen35_ane_dual_affine_qmm_t(
             x,
             state.weight,
@@ -246,8 +312,8 @@ def _hybrid_combined(owner: Any, x: mx.array) -> mx.array | None:
 
 
 def _linear_backend(linear: Any, x: mx.array) -> mx.array | None:
-    # The dual raw merge emits [instance0 rows, instance1 rows, gpu rows],
-    # which is the original channel order for a contiguous row split.
+    # The raw merge emits [instance0, instance1, CPU, GPU], which is the
+    # original channel order for this contiguous row split.
     if not isinstance(getattr(linear, "_omlx_ane_state", None), _LinearState):
         return None
     return _hybrid_combined(linear, x)
@@ -300,7 +366,12 @@ def _mlp_backend(mlp: Any, x: mx.array) -> mx.array | None:
 
 
 def enable_deepseek_v4_ane_prefill(
-    model: Any, *, sequence_length: int = 2048
+    model: Any,
+    *,
+    sequence_length: int = 2048,
+    cpu_fraction: float = 0.125,
+    cpu_threads: int = 12,
+    cpu_shared_resource: bool = True,
 ) -> int:
     """Enable the hybrid ANE backend on eligible DeepSeek-V4 projections.
 
@@ -308,6 +379,10 @@ def enable_deepseek_v4_ane_prefill(
     """
     if sequence_length < 1024 or sequence_length % 64:
         raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
+    if not 0.0 <= cpu_fraction < 0.5:
+        raise ValueError("DeepSeek CPU fraction must be between 0.0 and 0.5")
+    if not 0 <= cpu_threads <= 64:
+        raise ValueError("DeepSeek CPU worker count must be between 0 and 64")
 
     env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
     if env in ("0", "false", "off"):
@@ -334,6 +409,24 @@ def enable_deepseek_v4_ane_prefill(
                 "skipped"
             )
             return 0
+        if cpu_fraction and not fast.has_symbol(
+            "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
+        ):
+            logger.warning(
+                "ANE extension predates CPU sharing; DeepSeek query CPU "
+                "offload disabled"
+            )
+            cpu_fraction = 0.0
+        if (
+            cpu_fraction
+            and cpu_shared_resource
+            and not fast.qwen35_cpu_shared_resource_available()
+        ):
+            logger.warning(
+                "Shared-resource CPU scheduling is unavailable; DeepSeek "
+                "query CPU offload disabled"
+            )
+            cpu_fraction = 0.0
     except Exception:
         logger.warning("ANE native extension unavailable; DeepSeek ANE prefill skipped")
         return 0
@@ -342,7 +435,7 @@ def enable_deepseek_v4_ane_prefill(
     if not layers:
         return 0
 
-    config = _AneConfig(sequence_length)
+    config = _AneConfig(sequence_length, cpu_threads, cpu_shared_resource)
     prepared: list[tuple[Any, Any, mx.array, mx.array]] = []
     mlp_count = 0
     stacked_count = 0
@@ -370,7 +463,10 @@ def enable_deepseek_v4_ane_prefill(
         if indexer_linear is not None:
             try:
                 prep = _prepare_stacked(
-                    linear, indexer_linear, _FRACTIONS["wq_b"]
+                    linear,
+                    indexer_linear,
+                    _FRACTIONS["wq_b"],
+                    cpu_fraction,
                 )
             except Exception:
                 logger.warning(
@@ -382,7 +478,11 @@ def enable_deepseek_v4_ane_prefill(
                 stacked_count += 1
         if prep is None:
             try:
-                prep = _prepare_linear(linear, _FRACTIONS["wq_b"])
+                prep = _prepare_linear(
+                    linear,
+                    _FRACTIONS["wq_b"],
+                    cpu_fraction,
+                )
             except Exception:
                 logger.warning(
                     "Skipping one DeepSeek wq_b while preparing its ANE "
@@ -400,11 +500,11 @@ def enable_deepseek_v4_ane_prefill(
     # Evaluate the requantized suffixes here as well: leaving them lazy would
     # replay their dequant/quantize chains on whichever thread first evaluates
     # a prefill chunk, with stream state from this loader thread.
-    suffix_arrays = [
-        tensor
-        for entry in prepared
-        for tensor in (entry[1].weight, entry[1].scales, entry[1].biases)
-    ]
+    suffix_arrays = []
+    for _, state, _, _ in prepared:
+        suffix_arrays.extend((state.weight, state.scales, state.biases))
+        if state.cpu_weight is not None:
+            suffix_arrays.append(state.cpu_weight)
     mx.eval(*weights0, *weights1, *suffix_arrays)
     banked = _compile_dual_banks(weights0, weights1, sequence_length)
     if banked is None:
@@ -430,15 +530,22 @@ def enable_deepseek_v4_ane_prefill(
     model._omlx_ane_dual_prefill_count = count
     model._omlx_ane_resident_program_count = resident_programs
     model._omlx_ane_procedure_count = count
+    model._omlx_ane_cpu_prefill_count = sum(
+        state.cpu_weight is not None for _, state, _, _ in prepared
+    )
     logger.info(
         "Eagerly compiled %d DeepSeek ANE procedures (%d shared experts, "
         "%d attention projections, %d with the indexer wq_b stacked in) "
-        "into %d instance-pinned ANE programs (sequence_length=%d)",
+        "into %d instance-pinned ANE programs (sequence_length=%d, "
+        "query_cpu_fraction=%.3f, cpu_threads=%d, shared_resource=%s)",
         count,
         mlp_count,
         count - mlp_count,
         stacked_count,
         resident_programs,
         sequence_length,
+        cpu_fraction,
+        cpu_threads,
+        cpu_shared_resource,
     )
     return count

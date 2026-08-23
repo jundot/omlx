@@ -547,6 +547,29 @@ class BatchedEngine(BaseEngine):
                     return enable_deepseek_v4_ane_prefill(
                         self._model,
                         sequence_length=dsv4_sequence_length,
+                        cpu_fraction=(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_cpu_fraction",
+                                0.125,
+                            )
+                            if getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_cpu_enabled",
+                                True,
+                            )
+                            else 0.0
+                        ),
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "deepseek_ane_prefill_cpu_threads",
+                            12,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "deepseek_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
                     )
 
                 dsv4_count = await loop.run_in_executor(
