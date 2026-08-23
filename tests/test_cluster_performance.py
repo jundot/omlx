@@ -13,6 +13,7 @@ import pytest
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import run_cluster_performance_probe
 from omlx.cluster.performance import (
+    ExecutionSettings,
     NodePerformanceProfile,
     execution_profile,
     performance_profiles_from_records,
@@ -120,7 +121,7 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.prompt_cache_bytes is None
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "synchronized 1-slot prompt cache" in tuned.tuning_reason
 
 
 def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
@@ -142,7 +143,115 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     assert tuned.decode_concurrency == settings.decode_concurrency
     assert tuned.prompt_cache_size == 1
     assert tuned.prompt_cache_bytes is None
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "synchronized single-slot prompt cache" in tuned.tuning_reason
+
+
+def test_tuner_tiers_slot_count_by_headroom():
+    base = execution_profile("balanced")
+
+    def tuned_for(gib):
+        return tune_execution_settings(
+            base,
+            [SimpleNamespace(headroom_bytes=gib * 1024**3) for _ in range(2)],
+            backend="jaccl",
+        )
+
+    assert tuned_for(3).prompt_cache_size == 1
+    assert tuned_for(7).prompt_cache_size == 1
+    assert tuned_for(10).prompt_cache_size == 2
+    assert tuned_for(20).prompt_cache_size == 4
+    for tuned, expected_slots in (
+        (tuned_for(3), 1),
+        (tuned_for(7), 1),
+        (tuned_for(10), 2),
+        (tuned_for(20), 4),
+    ):
+        assert tuned.prompt_cache_bytes is None
+        assert f"synchronized {expected_slots}-slot prompt cache" in (
+            tuned.tuning_reason
+        )
+
+
+def test_retune_after_probe_restores_measured_tier_slot_count():
+    base = execution_profile("balanced")
+
+    planned = tune_execution_settings(
+        base,
+        [SimpleNamespace(headroom_bytes=3 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert planned.prompt_cache_size == 1
+
+    # Activation retunes against measured rank profiles. The second pass must
+    # clamp from the requested slot count, not the first pass's output, or a
+    # deployment planned at tight headroom could never reach the slot count
+    # the measured placement supports.
+    measured = tune_execution_settings(
+        planned,
+        [SimpleNamespace(headroom_bytes=20 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert measured.prompt_cache_size == 4
+    assert measured.requested_prompt_cache_size == base.prompt_cache_size
+    assert "synchronized 4-slot prompt cache" in measured.tuning_reason
+
+    # The clamp must still lower the count when headroom collapses.
+    degraded = tune_execution_settings(
+        measured,
+        [SimpleNamespace(headroom_bytes=3 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert degraded.prompt_cache_size == 1
+
+
+def test_requested_prompt_cache_size_survives_serialization_round_trip():
+    base = execution_profile("balanced")
+    assert base.requested_prompt_cache_size is None
+
+    tuned = tune_execution_settings(
+        base,
+        [SimpleNamespace(headroom_bytes=20 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert tuned.requested_prompt_cache_size == base.prompt_cache_size
+
+    restored = ExecutionSettings.from_dict(tuned.to_dict())
+    assert restored.requested_prompt_cache_size == base.prompt_cache_size
+    assert restored.prompt_cache_size == tuned.prompt_cache_size
+
+    # Payloads written before the field existed retune from the resolved
+    # slot count, exactly as they did before.
+    legacy = dict(tuned.to_dict())
+    del legacy["requested_prompt_cache_size"]
+    assert ExecutionSettings.from_dict(legacy).requested_prompt_cache_size is None
+
+
+def test_tuner_honors_user_slot_count_below_tier_cap():
+    base = execution_profile("balanced")
+
+    reduced = replace(base, prompt_cache_size=2)
+    tuned = tune_execution_settings(
+        reduced,
+        [SimpleNamespace(headroom_bytes=20 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert tuned.prompt_cache_size == 2
+
+    floor = replace(base, prompt_cache_size=1)
+    tuned = tune_execution_settings(
+        floor,
+        [SimpleNamespace(headroom_bytes=20 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert tuned.prompt_cache_size == 1
+
+    clamped = replace(base, prompt_cache_size=16)
+    tuned = tune_execution_settings(
+        clamped,
+        [SimpleNamespace(headroom_bytes=20 * 1024**3)] * 2,
+        backend="jaccl",
+    )
+    assert tuned.prompt_cache_size == 4
 
 
 def test_performance_profiles_reject_nonfinite_measurements():
