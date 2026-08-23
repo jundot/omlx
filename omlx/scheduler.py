@@ -1711,6 +1711,12 @@ class Scheduler:
         # sampling path. Gemma 4 uses this to suppress multimodal close markers.
         self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
 
+        # Compute model-specific prefill geometry before aligning paged-cache
+        # boundaries. ArraysCache snapshots materialize recurrent GDN state at
+        # every block boundary, so a boundary narrower than the effective
+        # prefill step changes cache-ON from one forward into multiple forwards.
+        self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
+
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
@@ -1742,27 +1748,6 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
-        # Qwen3.5/3.6 hybrid (GatedDeltaNet + hd-256 full attention): the
-        # fused prefill routes favor wider chunks. Measured on the 27B
-        # (M3 Ultra, 2026-08-17): chunk 4096 beats the 2048 default +3.2%
-        # at 4k prompts / +1.0% at 16k, 8192 flat vs 4096. Floor the chunk
-        # at 4096 when the machine has headroom; the prefill memory guard
-        # still shrinks chunks under pressure, so small Macs are unchanged.
-        self._qwen35_prefill_floor = 0
-        try:
-            _mt = str(getattr(model, "model_type", "") or "")
-            if not _mt:
-                _mt = str(
-                    getattr(getattr(model, "config", None), "model_type", "") or ""
-                )
-            if _mt.startswith("qwen3_5"):
-                from .settings import get_system_memory
-
-                if get_system_memory() >= 64 * 1024**3:
-                    self._qwen35_prefill_floor = 4096
-        except Exception:
-            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
-
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -2650,10 +2635,34 @@ class Scheduler:
             )
             self.config.paged_cache_block_size = target_block_size
 
-    # Default block size for ArraysCache-only hybrid models.
-    # Match prefill_step_size (2048) so that boundary caching ON/OFF
-    # produces identical prefill chunk sizes, eliminating float32↔dtype
-    # roundtrip differences in GatedDeltaNet recurrent state.
+    def _detect_qwen35_prefill_floor(self) -> int:
+        """Return the wide-prefill floor for the Qwen3.5 architecture family."""
+        try:
+            model_type = str(getattr(self.model, "model_type", "") or "")
+            if not model_type:
+                model_type = str(
+                    getattr(getattr(self.model, "config", None), "model_type", "") or ""
+                )
+            if model_type.startswith("qwen3_5"):
+                from .custom_kernels.nax import is_nax_available
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
+                    # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
+                    # beats the 2048 default +3.2% at 4k prompts / +1.0% at
+                    # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
+                    # where wider prefill regresses throughput (#2880).
+                    return 4096
+        except Exception:
+            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+        return 0
+
+    # Default block size for ArraysCache-only hybrid models. Raise the effective
+    # target to the configured/model-specific prefill step so cache ON/OFF use
+    # identical forward boundaries, avoiding GatedDeltaNet recurrent-state
+    # materialization differences. Larger blocks coarsen cache-hit granularity:
+    # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
+    # also leaves old SSD blocks cold until normal eviction removes them.
     _ARRAYS_CACHE_BLOCK_SIZE = 2048
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
@@ -2664,8 +2673,8 @@ class Scheduler:
         prefill while still storing valid per-block recurrent state.
 
         This is skipped if RotatingKVCache was already detected (block size was
-        aligned to its window size) or if the user explicitly set a block size
-        larger than the default.
+        aligned to its window size) or if the configured block size already
+        meets the effective model-specific target.
         """
         if not self.config.paged_ssd_cache_dir:
             return
@@ -2693,7 +2702,11 @@ class Scheduler:
         if not has_arrays_cache:
             return
 
-        target = self._ARRAYS_CACHE_BLOCK_SIZE
+        target = max(
+            self._ARRAYS_CACHE_BLOCK_SIZE,
+            int(self.config.prefill_step_size or 0),
+            self._qwen35_prefill_floor,
+        )
         if self.config.paged_cache_block_size >= target:
             return
 
