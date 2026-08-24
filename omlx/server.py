@@ -5130,6 +5130,8 @@ async def stream_anthropic_messages(
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
+    # Filter tool-call markup from streamed content when tools are present.
+    has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser(
         start_in_thinking=start_in_thinking,
         guard_second_reasoning=bool(has_tools),
@@ -5139,8 +5141,6 @@ async def stream_anthropic_messages(
     block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
-    # Filter tool-call markup from streamed content when tools are present.
-    has_tools = bool(kwargs.get("tools"))
     tool_filter = None
     thinking_filter = None
     if has_tools:
