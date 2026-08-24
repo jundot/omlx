@@ -96,6 +96,40 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
 
     lang.gated_delta_update = gated_delta_update_metal
     gd.gated_delta_update = gated_delta_update_metal
+
+    # SpecPrefill loads its small draft scorer through mlx-lm rather than
+    # mlx-vlm. Both implementations use the same Qwen scalar-gated recurrence
+    # and tensor layout, but rebinding only mlx-vlm silently leaves the dominant
+    # full-context draft phase on mlx-lm's one-SIMD-group sequential kernel.
+    try:
+        from mlx_lm.models import gated_delta as lm_gd
+        from mlx_lm.models import qwen3_5 as lm_lang
+
+        original_lm = lm_gd.gated_delta_update
+
+        def gated_delta_update_metal_lm(
+            q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True
+        ):
+            if (
+                use_kernel
+                and mask is None
+                and q.shape[1] >= min_t
+                and q.shape[-1] % 16 == 0
+                and v.shape[-1] % 32 == 0
+                and a.ndim == 3
+            ):
+                g = lm_gd.compute_g(A_log, a, dt_bias)
+                beta = mx.sigmoid(b)
+                return fast_prefill(q, k, v, g, beta, state)
+            return original_lm(
+                q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=use_kernel
+            )
+
+        lm_lang.gated_delta_update = gated_delta_update_metal_lm
+        lm_gd.gated_delta_update = gated_delta_update_metal_lm
+    except ImportError:
+        logger.debug("mlx-lm Qwen GDN prefill patch not applied", exc_info=True)
+
     _PATCHED = True
     logger.info(
         "Qwen3.5/3.6 GDN prefill kernel patch applied (Metal, impl=%s, min_t=%d)",
