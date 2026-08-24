@@ -167,8 +167,10 @@ def capture_prompt(
         ctx.expected_target_offset != start_offset
     ):
         drop_primed(host)
+        from . import make_mtp_cache
+
         ctx = _DSparkPrimeContext(
-            caches=host.make_mtp_cache(),
+            caches=make_mtp_cache(host, target_cache),
             expected_target_offset=start_offset,
         )
         setattr(host, _PRIME_CTX_ATTR, ctx)

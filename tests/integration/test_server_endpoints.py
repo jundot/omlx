@@ -528,6 +528,28 @@ class TestResponsesEndpoint:
         ct_kwargs = recorded_chat_kwargs[0].get("chat_template_kwargs") or {}
         assert ct_kwargs["enable_thinking"] is False
 
+    @pytest.mark.parametrize(
+        ("request_max_tokens", "expected_default"),
+        [(None, True), (64, False)],
+    )
+    def test_responses_marks_inherited_max_tokens(
+        self, client, mock_llm_engine, request_max_tokens, expected_default
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(text="Response")
+        )
+        payload = {"model": "test-model", "input": "Hello", "store": False}
+        if request_max_tokens is not None:
+            payload["max_output_tokens"] = request_max_tokens
+
+        response = client.post("/v1/responses", json=payload)
+
+        assert response.status_code == 200
+        assert (
+            mock_llm_engine.chat.call_args.kwargs["max_tokens_is_default"]
+            is expected_default
+        )
+
     def test_response_stream_includes_reasoning_item_for_think_blocks(
         self, client, mock_llm_engine
     ):
@@ -907,6 +929,34 @@ class TestCompletionEndpoint:
         assert "choices" in data
         assert "usage" in data
 
+    @pytest.mark.parametrize(
+        ("request_max_tokens", "expected_default"),
+        [(None, True), (100, False)],
+    )
+    def test_completion_marks_inherited_max_tokens(
+        self, client, mock_llm_engine, request_max_tokens, expected_default
+    ):
+        mock_llm_engine.generate = AsyncMock(
+            return_value=MockGenerationOutput(text="Generated response.")
+        )
+        mock_llm_engine.preflight_completion = AsyncMock()
+        payload = {"model": "test-model", "prompt": "Hello"}
+        if request_max_tokens is not None:
+            payload["max_tokens"] = request_max_tokens
+
+        response = client.post("/v1/completions", json=payload)
+
+        assert response.status_code == 200
+        assert (
+            mock_llm_engine.generate.call_args.kwargs["max_tokens_is_default"]
+            is expected_default
+        )
+        preflight_kwargs = mock_llm_engine.preflight_completion.call_args.kwargs
+        assert preflight_kwargs["max_tokens"] == (
+            request_max_tokens if request_max_tokens is not None else 32768
+        )
+        assert preflight_kwargs["max_tokens_is_default"] is expected_default
+
     def test_completion_with_list_prompt(self, client):
         """Test completion with list of prompts."""
         response = client.post(
@@ -998,6 +1048,7 @@ class TestCompletionEndpoint:
 
         assert response.status_code == 200
         assert captured.get("thinking_budget") == 300
+        assert captured.get("max_tokens_is_default") is True
 
     def test_completion_thinking_budget_from_model_settings(
         self, client, mock_llm_engine
@@ -1173,6 +1224,31 @@ class TestChatCompletionEndpoint:
         )
 
         assert response.status_code == 200
+
+    @pytest.mark.parametrize(
+        ("request_max_tokens", "expected_default"),
+        [(None, True), (256, False)],
+    )
+    def test_chat_completion_marks_inherited_max_tokens(
+        self, client, mock_llm_engine, request_max_tokens, expected_default
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(text="Chat response.")
+        )
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if request_max_tokens is not None:
+            payload["max_tokens"] = request_max_tokens
+
+        response = client.post("/v1/chat/completions", json=payload)
+
+        assert response.status_code == 200
+        assert (
+            mock_llm_engine.chat.call_args.kwargs["max_tokens_is_default"]
+            is expected_default
+        )
 
     def test_chat_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine

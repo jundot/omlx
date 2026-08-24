@@ -195,6 +195,12 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
 
+### Fixed KV-cache reservation
+
+On-demand KV-cache growth can make a model appear to fit at launch, then exhaust unified memory later as contexts accumulate or concurrent sessions expand. That late out-of-memory failure is disruptive and makes a long-running server difficult to budget reliably.
+
+Before a model starts, oMLX therefore shows and commits the full serving KV-cache pool for its configured context window and feasible session slots. Requests reuse that fixed pool, and excess concurrent requests queue instead of growing cache memory. Built-in native MTP caches, including DeepSeek V4 DSpark rings, are part of the same reservation. A per-model setting can restore the original growing cache when fixed allocation is not wanted. A model whose live cache layout cannot match an exact preflight plan is refused instead of falling back silently. See [Fixed KV-cache memory](docs/fixed-kv-cache.md) for the allocation lifecycle, architecture-specific calculation basis, opt-out behavior, limits, and a DeepSeek V3 200k example.
+
 ### Continuous Batching
 
 Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.

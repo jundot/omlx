@@ -67,6 +67,17 @@ struct AppView: View {
             )
                 .environment(\.omlxTheme, theme)
         }
+        .sheet(item: Binding(
+            get: { services.modelLaunchTarget },
+            set: { services.modelLaunchTarget = $0 }
+        )) { target in
+            ModelMemoryLaunchSheet(
+                target: target,
+                client: services.client,
+                onFinished: { services.modelLaunchTarget = nil }
+            )
+            .environment(\.omlxTheme, theme)
+        }
     }
 
     /// Drilling out of ModelSettingsScreen via the sidebar (changing section)

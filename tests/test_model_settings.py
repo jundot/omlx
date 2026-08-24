@@ -27,11 +27,21 @@ class TestModelSettings:
         assert settings.top_k is None
         assert settings.repetition_penalty is None
         assert settings.force_sampling is False
+        assert settings.fixed_kv_cache_enabled is None
         assert settings.is_pinned is False
         assert settings.is_default is False
         assert settings.is_favorite is False
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
+
+    def test_fixed_kv_cache_override_roundtrip_and_profile_exclusion(self):
+        original = ModelSettings(fixed_kv_cache_enabled=False)
+        restored = ModelSettings.from_dict(original.to_dict())
+
+        assert restored.fixed_kv_cache_enabled is False
+        from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+
+        assert "fixed_kv_cache_enabled" in EXCLUDED_FROM_PROFILES
 
     def test_trust_remote_code_roundtrip(self):
         """Test trust_remote_code field survives to_dict -> from_dict roundtrip."""

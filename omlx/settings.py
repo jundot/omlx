@@ -1664,6 +1664,9 @@ class GlobalSettings:
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
+            fixed_kv_cache_enabled=True,
+            default_context_window=self.sampling.max_context_window,
+            default_context_window_policy=self.sampling.max_context_window_policy,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),

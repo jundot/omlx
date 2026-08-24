@@ -207,10 +207,31 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            modelMemoryEstimate: null,
+            modelMemoryEstimateLoading: false,
+            modelMemoryEstimateError: '',
+            modelMemoryEstimateInput: null,
+            _modelMemoryEstimateTimer: null,
+            _modelMemoryEstimateRevision: 0,
+            // Manual loads go through a memory preflight. The regular load
+            // endpoint remains body-less for compatibility; this state only
+            // drives the first-party confirmation dialog.
+            showModelLaunchModal: false,
+            launchModel: null,
+            launchContextWindow: null,
+            launchMemoryEstimate: null,
+            launchMemoryEstimateLoading: false,
+            launchMemoryEstimateError: '',
+            launchMemoryEstimateInput: null,
+            launchModelLoading: false,
+            launchModelComplete: false,
+            _launchMemoryEstimateTimer: null,
+            _launchMemoryEstimateRevision: 0,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
                 max_context_window: null,
+                fixed_kv_cache_enabled: true,
                 max_tokens: null,
                 temperature: null,
                 top_p: null,
@@ -6915,26 +6936,245 @@
                 }
             },
 
+            modelSupportsFixedKVCache(model) {
+                const engineType = String(model?.engine_type || '').toLowerCase();
+                const configType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replaceAll('-', '_');
+                return (engineType === 'batched' || engineType === 'vlm')
+                    && configType !== 'diffusion_gemma';
+            },
+
+            modelUsesFixedKVLaunchPreflight(model) {
+                return this.modelSupportsFixedKVCache(model)
+                    && model?.settings?.fixed_kv_cache_enabled !== false;
+            },
+
             async loadModel(modelId) {
                 const model = this.models.find(m => m.id === modelId);
-                if (model) model.is_loading = true;
-                try {
-                    const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/load`, {
-                        method: 'POST',
-                    });
-                    if (response.ok) {
-                        await this.loadModels();
-                    } else if (response.status === 401) {
-                        window.location.href = '/admin';
-                    } else {
-                        const data = await response.json();
-                        alert(data.detail || window.t('js.error.load_model_failed'));
+                if (!model || model.loaded || model.is_loading) return;
+                if (!this.modelUsesFixedKVLaunchPreflight(model)) {
+                    try {
+                        await this.performConfirmedModelLoad(modelId);
+                    } catch (error) {
+                        console.error('Failed to load model:', error);
+                        alert(error.message || window.t('js.error.load_model_failed'));
+                    } finally {
                         await this.loadModels();
                     }
-                } catch (err) {
-                    console.error('Failed to load model:', err);
-                    alert(window.t('js.error.load_model_failed'));
+                    return;
+                }
+                await this.openModelLaunch(model);
+            },
+
+            async fetchModelMemoryEstimate(modelId, maxContextWindow) {
+                const params = new URLSearchParams();
+                const context = Number(maxContextWindow);
+                if (Number.isInteger(context) && context > 0) {
+                    params.set('max_context_window', String(context));
+                }
+                const suffix = params.size ? `?${params.toString()}` : '';
+                const response = await fetch(
+                    `/admin/api/models/${encodeURIComponent(modelId)}/memory-estimate${suffix}`,
+                );
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return null;
+                }
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    throw new Error(
+                        data.detail || window.t('memory.preview.error'),
+                    );
+                }
+                return data;
+            },
+
+            queueModelMemoryEstimate() {
+                clearTimeout(this._modelMemoryEstimateTimer);
+                this._modelMemoryEstimateTimer = setTimeout(() => {
+                    this.refreshModelMemoryEstimate();
+                }, 300);
+            },
+
+            async refreshModelMemoryEstimate() {
+                if (!this.selectedModel || !this.showModelSettingsModal) return;
+                if (!this.modelSupportsFixedKVCache(this.selectedModel)
+                    || this.modelSettings.fixed_kv_cache_enabled === false) {
+                    this.modelMemoryEstimate = null;
+                    this.modelMemoryEstimateError = '';
+                    this.modelMemoryEstimateLoading = false;
+                    return;
+                }
+                const revision = ++this._modelMemoryEstimateRevision;
+                const context = Number(this.modelSettings.max_context_window);
+                const input = Number.isInteger(context) && context > 0 ? context : null;
+                this.modelMemoryEstimateLoading = true;
+                this.modelMemoryEstimateError = '';
+                try {
+                    const estimate = await this.fetchModelMemoryEstimate(
+                        this.selectedModel.id,
+                        input,
+                    );
+                    if (revision !== this._modelMemoryEstimateRevision || !estimate) return;
+                    this.modelMemoryEstimate = estimate;
+                    this.modelMemoryEstimateInput = input;
+                } catch (error) {
+                    if (revision !== this._modelMemoryEstimateRevision) return;
+                    this.modelMemoryEstimate = null;
+                    this.modelMemoryEstimateInput = input;
+                    this.modelMemoryEstimateError = error.message || String(error);
+                } finally {
+                    if (revision === this._modelMemoryEstimateRevision) {
+                        this.modelMemoryEstimateLoading = false;
+                    }
+                }
+            },
+
+            toggleModelFixedKVCache() {
+                this.modelSettings.fixed_kv_cache_enabled =
+                    !this.modelSettings.fixed_kv_cache_enabled;
+                if (this.modelSettings.fixed_kv_cache_enabled) {
+                    this.queueModelMemoryEstimate();
+                    return;
+                }
+                clearTimeout(this._modelMemoryEstimateTimer);
+                this._modelMemoryEstimateRevision += 1;
+                this.modelMemoryEstimate = null;
+                this.modelMemoryEstimateError = '';
+                this.modelMemoryEstimateLoading = false;
+            },
+
+            async openModelLaunch(model) {
+                clearTimeout(this._launchMemoryEstimateTimer);
+                this.launchModel = model;
+                this.launchContextWindow = model.settings?.max_context_window
+                    || model.model_context_length
+                    || null;
+                this.launchMemoryEstimate = null;
+                this.launchMemoryEstimateError = '';
+                this.launchMemoryEstimateInput = null;
+                this.launchModelLoading = false;
+                this.launchModelComplete = false;
+                this.showModelLaunchModal = true;
+                await this.refreshLaunchMemoryEstimate();
+                if (!this.launchContextWindow && this.launchMemoryEstimate?.context_window) {
+                    this.launchContextWindow = this.launchMemoryEstimate.context_window;
+                    await this.refreshLaunchMemoryEstimate();
+                }
+            },
+
+            closeModelLaunch() {
+                clearTimeout(this._launchMemoryEstimateTimer);
+                this._launchMemoryEstimateRevision += 1;
+                this.showModelLaunchModal = false;
+                this.launchModel = null;
+            },
+
+            queueLaunchMemoryEstimate() {
+                clearTimeout(this._launchMemoryEstimateTimer);
+                this._launchMemoryEstimateTimer = setTimeout(() => {
+                    this.refreshLaunchMemoryEstimate();
+                }, 300);
+            },
+
+            async refreshLaunchMemoryEstimate() {
+                if (!this.launchModel || !this.showModelLaunchModal) return;
+                const revision = ++this._launchMemoryEstimateRevision;
+                const context = Number(this.launchContextWindow);
+                const input = Number.isInteger(context) && context > 0 ? context : null;
+                this.launchMemoryEstimateLoading = true;
+                this.launchMemoryEstimateError = '';
+                try {
+                    const estimate = await this.fetchModelMemoryEstimate(
+                        this.launchModel.id,
+                        input,
+                    );
+                    if (revision !== this._launchMemoryEstimateRevision || !estimate) return;
+                    this.launchMemoryEstimate = estimate;
+                    this.launchMemoryEstimateInput = input;
+                } catch (error) {
+                    if (revision !== this._launchMemoryEstimateRevision) return;
+                    this.launchMemoryEstimate = null;
+                    this.launchMemoryEstimateInput = input;
+                    this.launchMemoryEstimateError = error.message || String(error);
+                } finally {
+                    if (revision === this._launchMemoryEstimateRevision) {
+                        this.launchMemoryEstimateLoading = false;
+                    }
+                }
+            },
+
+            canConfirmModelLaunch() {
+                const context = Number(this.launchContextWindow);
+                return !this.launchModelLoading
+                    && !this.launchMemoryEstimateLoading
+                    && Number.isInteger(context)
+                    && context > 0
+                    && this.launchMemoryEstimateInput === context
+                    && this.launchMemoryEstimate?.fits === true;
+            },
+
+            async performConfirmedModelLoad(modelId) {
+                const model = this.models.find(m => m.id === modelId);
+                if (model) model.is_loading = true;
+                const response = await fetch(
+                    `/admin/api/models/${encodeURIComponent(modelId)}/load`,
+                    { method: 'POST' },
+                );
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return false;
+                }
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    throw new Error(
+                        data.detail || window.t('js.error.load_model_failed'),
+                    );
+                }
+                return true;
+            },
+
+            async confirmModelLaunch() {
+                if (!this.launchModel || !this.canConfirmModelLaunch()) return;
+                const modelId = this.launchModel.id;
+                const context = Number(this.launchContextWindow);
+                this.launchModelLoading = true;
+                this.launchMemoryEstimateError = '';
+                try {
+                    const settingsResponse = await fetch(
+                        `/admin/api/models/${encodeURIComponent(modelId)}/settings`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ max_context_window: context }),
+                        },
+                    );
+                    if (settingsResponse.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const settingsData = await settingsResponse.json().catch(() => ({}));
+                    if (!settingsResponse.ok) {
+                        throw new Error(
+                            settingsData.detail || window.t('js.error.save_model_settings_failed'),
+                        );
+                    }
+                    if (this.launchModel.settings) {
+                        this.launchModel.settings.max_context_window = context;
+                    } else {
+                        this.launchModel.settings = { max_context_window: context };
+                    }
+                    await this.performConfirmedModelLoad(modelId);
                     await this.loadModels();
+                    this.launchModelComplete = true;
+                    await this.refreshLaunchMemoryEstimate();
+                } catch (error) {
+                    console.error('Failed to launch model:', error);
+                    this.launchMemoryEstimateError = error.message || String(error);
+                    await this.loadModels();
+                } finally {
+                    this.launchModelLoading = false;
                 }
             },
 
@@ -7358,6 +7598,7 @@
                     model_alias: s.model_alias || '',
                     model_type_override: s.model_type_override || '',
                     max_context_window: s.max_context_window || null,
+                    fixed_kv_cache_enabled: s.fixed_kv_cache_enabled !== false,
                     max_tokens: s.max_tokens || null,
                     temperature: isOcr ? 0.0 : (s.temperature ?? null),
                     top_p: s.top_p ?? null,
@@ -7497,6 +7738,7 @@
                 }
                 this.activeProfileName = null;
                 this.profilesDrift = false;
+                this.queueModelMemoryEstimate();
             },
 
             setScope(scope) {
@@ -7591,6 +7833,7 @@
                         }
                         this.activeProfileName = activeName;
                         this.profilesDrift = false;
+                        this.queueModelMemoryEstimate();
                         // Update the models list so the profile badge reflects the change
                         const m = this.models.find(m => m.id === this.selectedModel.id);
                         if (m) m.settings = { ...settings };
@@ -8074,6 +8317,11 @@
             },
 
             async openModelSettings(model) {
+                clearTimeout(this._modelMemoryEstimateTimer);
+                this._modelMemoryEstimateRevision += 1;
+                this.modelMemoryEstimate = null;
+                this.modelMemoryEstimateError = '';
+                this.modelMemoryEstimateInput = null;
                 this.profileError = '';
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
@@ -8119,6 +8367,7 @@
                     this.computeDrift();
                 }
                 this.showModelSettingsModal = true;
+                await this.refreshModelMemoryEstimate();
             },
 
             async importMtplxSidecar() {
@@ -8269,6 +8518,7 @@
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
+                                fixed_kv_cache_enabled: this.modelSettings.fixed_kv_cache_enabled !== false,
                                 max_tokens: this.modelSettings.max_tokens || null,
                                 temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
                                 top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
@@ -8557,6 +8807,7 @@
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
+                        this.queueModelMemoryEstimate();
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
                     } else if (response.status === 401) {
@@ -9097,6 +9348,50 @@
                 if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
                 if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
                 return Math.max(0, Math.round(bytes)) + ' B';
+            },
+
+            memoryBytes(bytes) {
+                if (bytes == null || !Number.isFinite(Number(bytes))) {
+                    return window.t('memory.preview.unavailable');
+                }
+                const value = Math.max(0, Number(bytes));
+                const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+                let scaled = value;
+                let unit = 0;
+                while (scaled >= 1024 && unit < units.length - 1) {
+                    scaled /= 1024;
+                    unit += 1;
+                }
+                const digits = unit === 0 ? 0 : (scaled < 10 ? 2 : 1);
+                return `${scaled.toFixed(digits)} ${units[unit]}`;
+            },
+
+            memorySegmentPercent(estimate, field) {
+                const total = Number(estimate?.estimated_total_bytes || 0);
+                const value = Number(estimate?.[field] || 0);
+                if (!(total > 0) || !(value > 0)) return 0;
+                return Math.max(0, Math.min(100, value / total * 100));
+            },
+
+            memorySessionPoolLabel(estimate) {
+                return window.t('memory.preview.session_pool_value')
+                    .replace('{requested}', String(estimate?.requested_session_slots ?? 0))
+                    .replace('{reserved}', String(estimate?.reserved_session_slots ?? 0));
+            },
+
+            memoryLifecycleLabel(estimate) {
+                return estimate?.lifecycle === 'committed'
+                    ? window.t('memory.preview.committed')
+                    : window.t('memory.preview.estimated');
+            },
+
+            memoryKnownComponents(estimate) {
+                return Array.isArray(estimate?.components)
+                    ? estimate.components.filter(component =>
+                        component
+                        && (component.name || component.label || component.path)
+                        && Number.isFinite(Number(component.bytes)))
+                    : [];
             },
 
             formatTokenCount(n) {

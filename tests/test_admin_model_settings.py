@@ -101,6 +101,41 @@ async def test_sampling_setting_change_keeps_cached_failure():
 
 
 @pytest.mark.asyncio
+async def test_fixed_kv_override_is_persisted_and_clears_cached_failure():
+    pool, entry = _failed_pool()
+    pool._scheduler_config.fixed_kv_cache_enabled = True
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(fixed_kv_cache_enabled=False),
+    )
+
+    assert settings.fixed_kv_cache_enabled is False
+    assert entry.load_failed is False
+
+
+@pytest.mark.asyncio
+async def test_fixed_kv_override_change_unloads_loaded_engine():
+    pool, entry = _failed_pool()
+    pool._scheduler_config.fixed_kv_cache_enabled = True
+    entry.engine = MagicMock()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(),
+        admin_routes.ModelSettingsRequest(fixed_kv_cache_enabled=False),
+    )
+
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is True
+    pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_settings_are_persisted():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"

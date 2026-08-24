@@ -2952,7 +2952,18 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    unloaded = await _server_state.engine_pool.request_unload(
+        model_id, reason="public API unload"
+    )
+    if not unloaded:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
     return {"status": "ok", "model_id": model_id}
 
 
@@ -3264,6 +3275,13 @@ async def create_completion(
             prompt_token_ids_by_prompt.append(prompt_token_ids)
             validate_context_window(len(prompt_token_ids), request.model)
 
+        preflight_max_tokens = get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_max_tokens=request.max_tokens,
+        )[7]
+
         # Pre-flight prefill memory guard — see create_chat_completion for
         # the reason this must precede any StreamingResponse return.
         # Thread the client-provided X-Request-ID when present so the 400
@@ -3272,7 +3290,12 @@ async def create_completion(
         upstream_request_id = http_request.headers.get("x-request-id")
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            await engine.preflight_completion(
+                prompt,
+                request_id=upstream_request_id,
+                max_tokens=preflight_max_tokens,
+                max_tokens_is_default=request.max_tokens is None,
+            )
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -3336,6 +3359,7 @@ async def create_completion(
             )
 
             gen_kwargs = {}
+            gen_kwargs["max_tokens_is_default"] = request.max_tokens is None
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
@@ -3711,6 +3735,7 @@ async def create_chat_completion(
         )
         chat_kwargs = {
             "max_tokens": max_tokens,
+            "max_tokens_is_default": request.max_tokens is None,
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
@@ -4435,6 +4460,7 @@ async def stream_completion(
         req_xtc_threshold=getattr(request, "xtc_threshold", None),
     )
     gen_kwargs = {}
+    gen_kwargs["max_tokens_is_default"] = request.max_tokens is None
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
@@ -6206,6 +6232,7 @@ async def create_response(
         )
         chat_kwargs = {
             "max_tokens": max_tokens,
+            "max_tokens_is_default": request.max_output_tokens is None,
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,

@@ -336,7 +336,7 @@
                                          x-show="!modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
-                                            <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
+                                            <input type="number" x-model.number="modelSettings.max_context_window" @input="queueModelMemoryEstimate()" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div>
@@ -348,6 +348,92 @@
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.temperature') }}</label>
                                             <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                    </div>
+
+                                    <div class="p-4 rounded-xl border border-neutral-200 bg-neutral-50"
+                                         x-show="modelSupportsFixedKVCache(selectedModel)" x-cloak>
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.fixed_kv_cache') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.fixed_kv_cache_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="toggleModelFixedKVCache()"
+                                                    :class="modelSettings.fixed_kv_cache_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.fixed_kv_cache_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <p x-show="!modelSettings.fixed_kv_cache_enabled" x-cloak
+                                           class="text-xs text-amber-700 mt-2">{{ t('modal.model_settings.fixed_kv_cache_disabled') }}</p>
+                                    </div>
+
+                                    <!-- Fixed KV-cache memory preview. All byte values come
+                                         from the server's exact allocation descriptors. -->
+                                    <div class="p-4 rounded-xl border border-neutral-200 bg-neutral-50 space-y-3"
+                                         x-show="!modelSettings.is_diffusion_model && modelSettings.fixed_kv_cache_enabled" x-cloak>
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div>
+                                                <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('memory.preview.section_label') }}</h4>
+                                                <p class="text-xs text-neutral-500 mt-1">{{ t('memory.preview.settings_hint') }}</p>
+                                            </div>
+                                            <span x-show="modelMemoryEstimate"
+                                                  class="px-2 py-0.5 rounded-full text-[10px] font-semibold border"
+                                                  :class="modelMemoryEstimate?.lifecycle === 'committed'
+                                                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                                      : 'bg-blue-50 border-blue-200 text-blue-700'"
+                                                  x-text="memoryLifecycleLabel(modelMemoryEstimate)"></span>
+                                        </div>
+
+                                        <div x-show="modelMemoryEstimateLoading" class="flex items-center gap-2 text-xs text-neutral-500">
+                                            <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                            {{ t('memory.preview.loading') }}
+                                        </div>
+                                        <p x-show="modelMemoryEstimateError" x-text="modelMemoryEstimateError"
+                                           class="text-xs text-red-600"></p>
+
+                                        <div x-show="modelMemoryEstimate && !modelMemoryEstimateLoading" x-cloak class="space-y-3">
+                                            <div class="h-2.5 rounded-full bg-neutral-200 overflow-hidden flex"
+                                                 role="img" :aria-label="window.t('memory.preview.bar_label')">
+                                                <span class="h-full bg-blue-500"
+                                                      :style="`width:${memorySegmentPercent(modelMemoryEstimate, 'weights_bytes')}%`"></span>
+                                                <span class="h-full bg-amber-500"
+                                                      :style="`width:${memorySegmentPercent(modelMemoryEstimate, 'fixed_kv_cache_bytes')}%`"></span>
+                                                <span class="h-full bg-purple-500"
+                                                      :style="`width:${memorySegmentPercent(modelMemoryEstimate, 'other_fixed_bytes')}%`"></span>
+                                            </div>
+                                            <div class="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-500">
+                                                <span class="inline-flex items-center gap-1"><i class="w-2 h-2 rounded-full bg-blue-500"></i>{{ t('memory.preview.weights') }}</span>
+                                                <span class="inline-flex items-center gap-1"><i class="w-2 h-2 rounded-full bg-amber-500"></i>{{ t('memory.preview.fixed_kv') }}</span>
+                                                <span class="inline-flex items-center gap-1"><i class="w-2 h-2 rounded-full bg-purple-500"></i>{{ t('memory.preview.other_fixed') }}</span>
+                                            </div>
+                                            <dl class="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-3 text-xs">
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.weights') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.weights_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.fixed_kv') }}</dt><dd class="font-mono font-medium text-amber-700 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.fixed_kv_cache_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.other_fixed') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.other_fixed_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.estimated_total') }}</dt><dd class="font-mono font-semibold text-neutral-900 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.estimated_total_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.per_session_kv') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.per_session_kv_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.session_pool') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memorySessionPoolLabel(modelMemoryEstimate)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.unified_memory') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.unified_memory_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.available_now') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(modelMemoryEstimate?.available_memory_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.projected_remaining') }}</dt><dd class="font-mono font-semibold mt-0.5" :class="modelMemoryEstimate?.fits ? 'text-emerald-700' : 'text-red-700'" x-text="memoryBytes(modelMemoryEstimate?.projected_remaining_bytes)"></dd></div>
+                                                <div><dt class="text-neutral-500">{{ t('memory.preview.context_limit') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="modelMemoryEstimate?.model_context_limit ? formatTokenCount(modelMemoryEstimate.model_context_limit) : window.t('memory.preview.unavailable')"></dd></div>
+                                            </dl>
+                                            <template x-if="memoryKnownComponents(modelMemoryEstimate).length > 0">
+                                                <div class="pt-2 border-t border-neutral-200 space-y-1">
+                                                    <template x-for="(component, index) in memoryKnownComponents(modelMemoryEstimate)" :key="component.name || component.label || component.path || index">
+                                                        <div class="flex items-center justify-between gap-3 text-[11px] text-neutral-500">
+                                                            <span class="truncate" x-text="component.label || component.name || component.path"></span>
+                                                            <code class="text-neutral-700" x-text="memoryBytes(Number(component.bytes))"></code>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                            </template>
+                                            <p x-show="modelMemoryEstimate?.fit_reason"
+                                               :class="modelMemoryEstimate?.fits ? 'text-neutral-500' : 'text-red-700 font-medium'"
+                                               class="text-xs" x-text="modelMemoryEstimate?.fit_reason"></p>
                                         </div>
                                     </div>
 

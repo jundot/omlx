@@ -2475,6 +2475,22 @@ class TestVLMEngineFrequencyPenalty:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
+    async def test_generate_marks_inherited_max_tokens(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", max_tokens=32768, max_tokens_is_default=True)
+
+        params = engine._engine.generate.call_args.kwargs["sampling_params"]
+        assert params.max_tokens == 32768
+        assert params.max_tokens_is_default is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
     async def test_stream_generate_forwards_frequency_penalty(self):
         engine = _make_loaded_engine(model_type="test-vlm")
         engine._engine = MagicMock()

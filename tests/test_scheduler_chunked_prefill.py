@@ -746,6 +746,36 @@ class TestScheduleWaitingChunkedFork:
         assert queued in sched.waiting
         assert inflight in sched.prefilling
 
+    def test_fixed_pool_serializes_prefill_row_ownership(self):
+        """A later short prefill must not overwrite an earlier fixed row."""
+        sched = _make_scheduler(chunked_prefill=True, step_size=4)
+        sched._fixed_kv_pool = SimpleNamespace(slots=8, context_window=128)
+        first = _make_request("long-first", n_tokens=20)
+        second = _make_request("short-second", n_tokens=10)
+        sched.add_request(first)
+        sched.add_request(second)
+
+        first_state = _make_prefill_state(sched, first, n_remaining=20)
+        with patch.object(
+            sched,
+            "_begin_prefill",
+            return_value=first_state,
+        ) as mock_begin:
+            with patch.object(
+                sched,
+                "_step_prefill_chunk",
+                return_value=False,
+            ) as mock_step:
+                scheduled, rejected = sched._schedule_waiting()
+
+        mock_begin.assert_called_once_with(first, first.prompt_token_ids, None)
+        mock_step.assert_called_once_with(first_state)
+        assert scheduled == []
+        assert rejected == []
+        assert list(sched.prefilling) == [first]
+        assert list(sched.waiting) == [second]
+        assert second.request_id in sched.requests
+
     def test_long_prompt_completes_in_first_chunk_goes_to_running(self):
         """If the first chunk happens to finish the prefill, request goes to running."""
         sched, req = self._setup(n_tokens=10, step_size=4)

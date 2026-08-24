@@ -1,0 +1,126 @@
+    <!-- Model launch memory preflight -->
+    <div x-show="showModelLaunchModal" x-cloak
+         class="fixed inset-0 z-50 overflow-y-auto"
+         @keydown.escape.window="if (!launchModelLoading) closeModelLaunch()">
+        <div class="fixed inset-0 bg-black/50"
+             @click="if (!launchModelLoading) closeModelLaunch()"></div>
+
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-2xl p-5 sm:p-8"
+                 @click.stop>
+                <div class="flex items-start justify-between gap-4 mb-6">
+                    <div class="min-w-0">
+                        <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('model_launch.section_label') }}</h3>
+                        <h4 class="text-xl font-bold tracking-tight text-neutral-900 truncate"
+                            x-text="launchModel?.display_name || launchModel?.id"></h4>
+                        <p class="text-sm text-neutral-500 mt-1">{{ t('model_launch.description') }}</p>
+                    </div>
+                    <button @click="closeModelLaunch()" :disabled="launchModelLoading"
+                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all disabled:opacity-40">
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+
+                <div x-show="launchModelComplete" x-cloak
+                     class="mb-5 p-3 rounded-xl border border-emerald-200 bg-emerald-50 text-sm text-emerald-700">
+                    {{ t('model_launch.success') }}
+                </div>
+
+                <div class="mb-5">
+                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('model_launch.context_window') }}</label>
+                    <input type="number" min="1"
+                           :max="launchMemoryEstimate?.model_context_limit || null"
+                           x-model.number="launchContextWindow"
+                           @input="queueLaunchMemoryEstimate()"
+                           :disabled="launchModelLoading || launchModelComplete"
+                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all disabled:opacity-50">
+                    <p class="text-xs text-neutral-500 mt-1.5">{{ t('model_launch.context_hint') }}</p>
+                </div>
+
+                <div class="p-4 rounded-xl border border-neutral-200 bg-neutral-50 space-y-3">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <h5 class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('memory.preview.section_label') }}</h5>
+                            <p class="text-xs text-neutral-500 mt-1">{{ t('memory.preview.launch_hint') }}</p>
+                        </div>
+                        <span x-show="launchMemoryEstimate"
+                              class="px-2 py-0.5 rounded-full text-[10px] font-semibold border"
+                              :class="launchMemoryEstimate?.lifecycle === 'committed'
+                                  ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                  : 'bg-blue-50 border-blue-200 text-blue-700'"
+                              x-text="memoryLifecycleLabel(launchMemoryEstimate)"></span>
+                    </div>
+
+                    <div x-show="launchMemoryEstimateLoading" class="flex items-center gap-2 py-4 text-sm text-neutral-500">
+                        <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        {{ t('memory.preview.loading') }}
+                    </div>
+
+                    <div x-show="launchMemoryEstimate && !launchMemoryEstimateLoading" x-cloak class="space-y-3">
+                        <div class="h-3 rounded-full bg-neutral-200 overflow-hidden flex"
+                             role="img" :aria-label="window.t('memory.preview.bar_label')">
+                            <span class="h-full bg-blue-500"
+                                  :style="`width:${memorySegmentPercent(launchMemoryEstimate, 'weights_bytes')}%`"></span>
+                            <span class="h-full bg-amber-500"
+                                  :style="`width:${memorySegmentPercent(launchMemoryEstimate, 'fixed_kv_cache_bytes')}%`"></span>
+                            <span class="h-full bg-purple-500"
+                                  :style="`width:${memorySegmentPercent(launchMemoryEstimate, 'other_fixed_bytes')}%`"></span>
+                        </div>
+                        <div class="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-500">
+                            <span class="inline-flex items-center gap-1"><i class="w-2 h-2 rounded-full bg-blue-500"></i>{{ t('memory.preview.weights') }}</span>
+                            <span class="inline-flex items-center gap-1"><i class="w-2 h-2 rounded-full bg-amber-500"></i>{{ t('memory.preview.fixed_kv') }}</span>
+                            <span class="inline-flex items-center gap-1"><i class="w-2 h-2 rounded-full bg-purple-500"></i>{{ t('memory.preview.other_fixed') }}</span>
+                        </div>
+
+                        <dl class="grid grid-cols-2 sm:grid-cols-3 gap-x-5 gap-y-3 text-xs">
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.weights') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.weights_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.fixed_kv') }}</dt><dd class="font-mono font-semibold text-amber-700 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.fixed_kv_cache_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.other_fixed') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.other_fixed_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.estimated_total') }}</dt><dd class="font-mono font-semibold text-neutral-900 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.estimated_total_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.per_session_kv') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.per_session_kv_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.session_pool') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memorySessionPoolLabel(launchMemoryEstimate)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.unified_memory') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.unified_memory_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.available_now') }}</dt><dd class="font-mono font-medium text-neutral-800 mt-0.5" x-text="memoryBytes(launchMemoryEstimate?.available_memory_bytes)"></dd></div>
+                            <div><dt class="text-neutral-500">{{ t('memory.preview.projected_remaining') }}</dt><dd class="font-mono font-semibold mt-0.5" :class="launchMemoryEstimate?.fits ? 'text-emerald-700' : 'text-red-700'" x-text="memoryBytes(launchMemoryEstimate?.projected_remaining_bytes)"></dd></div>
+                        </dl>
+
+                        <template x-if="memoryKnownComponents(launchMemoryEstimate).length > 0">
+                            <div class="pt-2 border-t border-neutral-200 space-y-1">
+                                <template x-for="(component, index) in memoryKnownComponents(launchMemoryEstimate)" :key="component.name || component.label || component.path || index">
+                                    <div class="flex items-center justify-between gap-3 text-[11px] text-neutral-500">
+                                        <span class="truncate" x-text="component.label || component.name || component.path"></span>
+                                        <code class="text-neutral-700" x-text="memoryBytes(Number(component.bytes))"></code>
+                                    </div>
+                                </template>
+                            </div>
+                        </template>
+
+                        <p x-show="launchMemoryEstimate?.fit_reason"
+                           class="text-xs p-2.5 rounded-lg"
+                           :class="launchMemoryEstimate?.fits
+                               ? 'bg-emerald-50 text-emerald-800'
+                               : 'bg-red-50 text-red-800 font-medium'"
+                           x-text="launchMemoryEstimate?.fit_reason"></p>
+                    </div>
+
+                    <p x-show="launchMemoryEstimateError" x-text="launchMemoryEstimateError"
+                       class="text-xs p-2.5 rounded-lg bg-red-50 text-red-800"></p>
+                </div>
+
+                <div class="flex items-center justify-end gap-3 mt-6">
+                    <button @click="closeModelLaunch()" :disabled="launchModelLoading"
+                            class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all disabled:opacity-40"
+                            x-text="launchModelComplete ? window.t('model_launch.close') : window.t('model_launch.cancel')"></button>
+                    <button x-show="!launchModelComplete" @click="confirmModelLaunch()"
+                            :disabled="!canConfirmModelLaunch()"
+                            class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:ring-offset-2 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                        <span x-show="!launchModelLoading">{{ t('model_launch.confirm') }}</span>
+                        <span x-show="launchModelLoading" class="inline-flex items-center gap-2">
+                            <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                            {{ t('model_launch.launching') }}
+                        </span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>

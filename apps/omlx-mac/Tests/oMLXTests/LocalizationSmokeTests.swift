@@ -72,7 +72,8 @@ final class LocalizationSmokeTests: XCTestCase {
         "bench.throughput.header.title", "bench.throughput.section.configuration",
         "bench.context.header.title", "bench.context.section.configuration",
         // Settings + helpers
-        "settings.section.basic", "settings.advanced.experimental.section",
+        "settings.section.basic", "settings.basic.fixed_kv_cache.label",
+        "settings.advanced.experimental.section",
         "appearance.row.menubar_icon", "appearance.row.menubar_icon.restore",
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",

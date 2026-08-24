@@ -25,7 +25,7 @@ final class ModelSettingsScreenVM {
     }
 
     enum Field: Sendable {
-        case alias, modelType, contextLength, maxTokens
+        case alias, modelType, contextLength, fixedKvCacheEnabled, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, thinkingBudgetEnabled, thinkingBudgetTokens
@@ -226,6 +226,7 @@ final class ModelSettingsScreenVM {
     var alias: String = ""
     var modelTypeOverride: String = ""
     var contextLength: String = ""
+    var fixedKvCacheEnabled: Bool = true
     var maxTokens: String = ""
     var temperature: String = ""
     var topP: String = ""
@@ -418,7 +419,7 @@ final class ModelSettingsScreenVM {
             return true
         case .vlmMtpDraftBlockSize:
             return true
-        case .alias, .modelType, .contextLength, .maxTokens:
+        case .alias, .modelType, .contextLength, .fixedKvCacheEnabled, .maxTokens:
             return false
         case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
             return false
@@ -490,6 +491,7 @@ final class ModelSettingsScreenVM {
                 self.alias = s?.modelAlias ?? ""
                 self.modelTypeOverride = s?.modelTypeOverride ?? ""
                 self.contextLength = s?.maxContextWindow.map(String.init) ?? ""
+                self.fixedKvCacheEnabled = s?.fixedKvCacheEnabled ?? true
                 self.maxTokens = s?.maxTokens.map(String.init) ?? ""
                 self.temperature = s?.temperature.map { String($0) } ?? ""
                 self.topP = s?.topP.map { String($0) } ?? ""
@@ -600,6 +602,7 @@ final class ModelSettingsScreenVM {
         case .alias:                   patch.modelAlias = alias.isEmpty ? nil : alias
         case .modelType:               patch.modelTypeOverride = modelTypeOverride.isEmpty ? nil : modelTypeOverride
         case .contextLength:           patch.maxContextWindow = Int(contextLength)
+        case .fixedKvCacheEnabled:     patch.fixedKvCacheEnabled = fixedKvCacheEnabled
         case .maxTokens:               patch.maxTokens = Int(maxTokens)
         case .temperature:
             switch SamplingValidator.temperature(temperature) {

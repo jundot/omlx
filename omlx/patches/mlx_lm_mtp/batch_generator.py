@@ -1617,6 +1617,10 @@ def _clone_mtp_head_cache(mtp_cache: List[Any]) -> List[Any]:
     persistent cache still references; list attributes are shallow-copied.
     Container caches (``CacheList``-style, exposing ``.caches``) recurse.
     """
+    fixed_clone = getattr(mtp_cache, "_omlx_fixed_clone_factory", None)
+    if callable(fixed_clone):
+        return fixed_clone()
+
     import copy
 
     import mlx.core as mx
@@ -2496,7 +2500,12 @@ def _post_init_mtp(gen_batch: Any) -> None:
         if primed is not None:
             state.mtp_cache, state.hist_offset = primed
         else:
-            state.mtp_cache = gen_batch.model.make_mtp_cache()
+            from . import make_mtp_cache
+
+            state.mtp_cache = make_mtp_cache(
+                gen_batch.model,
+                gen_batch.prompt_cache,
+            )
         state.next_main = _ensure_uint32(next_main_tok)
         state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
         state.queue.append(
@@ -2517,7 +2526,9 @@ def _post_init_mtp(gen_batch: Any) -> None:
     # The legacy depth-1 cycle rebuilds head history per cycle and never
     # consumes a primed cache; release any capture leftovers.
     _prompt_priming.drop_ctx(gen_batch.model)
-    mtp_cache = gen_batch.model.make_mtp_cache()
+    from . import make_mtp_cache
+
+    mtp_cache = make_mtp_cache(gen_batch.model, gen_batch.prompt_cache)
     hidden_at_main = hidden[:, -1:, :]  # (1, 1, H)
     next_ids = next_main_tok.reshape(1, 1)
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)

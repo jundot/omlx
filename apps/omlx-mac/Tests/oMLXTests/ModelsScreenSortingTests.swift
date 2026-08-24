@@ -65,7 +65,8 @@ final class ModelsScreenSortingTests: XCTestCase {
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
             virtual: nil,
-            settings: nil
+            settings: nil,
+            memory: nil
         )
     }
 }

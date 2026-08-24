@@ -187,6 +187,29 @@ final class MenubarControllerModelsTests: XCTestCase {
         XCTAssertEqual(makeModel("a", loaded: true).sizeLabel, "")
     }
 
+    // MARK: - Fixed KV launch preflight
+
+    func testGenerativeEnginesUseFixedKVLaunchPreflight() {
+        XCTAssertTrue(makeModel("llm", engineType: "batched").usesFixedKVLaunchPreflight)
+        XCTAssertTrue(makeModel("vlm", engineType: "vlm").usesFixedKVLaunchPreflight)
+    }
+
+    func testNonTextAndDiffusionEnginesKeepDirectLoadPath() {
+        for engineType in ["embedding", "reranker", "audio_stt", "audio_tts"] {
+            XCTAssertFalse(
+                makeModel(engineType, engineType: engineType).usesFixedKVLaunchPreflight
+            )
+        }
+        XCTAssertFalse(
+            makeModel(
+                "diffusion",
+                engineType: "vlm",
+                configModelType: "diffusion_gemma"
+            ).usesFixedKVLaunchPreflight
+        )
+        XCTAssertFalse(makeModel("legacy").usesFixedKVLaunchPreflight)
+    }
+
     // MARK: - Helpers
 
     private func makeModel(
@@ -197,7 +220,9 @@ final class MenubarControllerModelsTests: XCTestCase {
         isFavorite: Bool = false,
         virtual: Bool = false,
         estimatedSizeFormatted: String? = nil,
-        actualSizeFormatted: String? = nil
+        actualSizeFormatted: String? = nil,
+        engineType: String? = nil,
+        configModelType: String? = nil
     ) -> ModelDTO {
         ModelDTO(
             id: id,
@@ -212,9 +237,9 @@ final class MenubarControllerModelsTests: XCTestCase {
             pinned: nil,
             isDefault: nil,
             isFavorite: isFavorite,
-            engineType: nil,
+            engineType: engineType,
             modelType: nil,
-            configModelType: nil,
+            configModelType: configModelType,
             modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,
@@ -223,7 +248,8 @@ final class MenubarControllerModelsTests: XCTestCase {
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
             virtual: virtual,
-            settings: nil
+            settings: nil,
+            memory: nil
         )
     }
 }
