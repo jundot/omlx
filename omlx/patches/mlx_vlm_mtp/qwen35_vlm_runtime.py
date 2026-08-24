@@ -37,6 +37,7 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 from typing import Any
 
@@ -300,6 +301,10 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_fixed_depth = True
+            self._omlx_mtp_exact_verify = (
+                os.environ.get("OMLX_QWEN35_EXACT_VERIFY") == "1"
+            )
             # Prompt-priming capture runs inside the inner Qwen3_5Model
             # forward, which has no reference back to this LanguageModel
             # (the mtp module / make_mtp_cache live here). A weakref avoids

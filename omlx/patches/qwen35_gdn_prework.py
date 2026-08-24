@@ -156,6 +156,8 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         return False
 
     try:
+        from mlx_lm.models import gated_delta as lm_gd
+        from mlx_vlm.models.qwen3_5 import gated_delta as q35_gd
         from mlx_vlm.models.qwen3_5 import language as q35
     except ImportError:
         return False
@@ -164,7 +166,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         "Qwen3_5GatedDeltaNet",
         "_target_verify_linears",
         "_target_verify_linear",
-        "_gated_delta_update_verify_decode",
+        "gated_delta_update",
         "_qwen3_5_advance_left_padding_info",
         "_qwen3_5_advance_lengths_info",
     )
@@ -179,6 +181,34 @@ def apply_qwen35_gdn_prework_patch() -> bool:
 
     orig_call = cls.__call__
     disabled = {"flag": False}
+
+    def _gated_delta_update_2(q, k, v, a, b, A_log, dt_bias, state):
+        kernel = lm_gd._gated_delta_kernel
+        if kernel is None:
+            return q35.gated_delta_update(
+                q, k, v, a, b, A_log, dt_bias, state, None,
+                use_kernel=True,
+            )
+        g, beta = q35_gd._compute_g_beta(A_log, a, b, dt_bias)
+        B, T, Hk, Dk = k.shape
+        Hv, Dv = v.shape[2:]
+        if state is None:
+            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        return kernel(
+            inputs=[q, k, v, g, beta, state, T],
+            template=[
+                ("InT", q.dtype),
+                ("StT", state.dtype),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid=(32, Dv, B * Hv),
+            threadgroup=(32, 2, 1),
+            output_shapes=[(B, T, Hv, Dv), state.shape],
+            output_dtypes=[q.dtype, state.dtype],
+        )
 
     def _eligible(self, inputs, mask, cache, gdn_sink, s_len):
         if gdn_sink is None or cache is None:
@@ -246,12 +276,18 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             if state is not None and state.shape[0] != B:
                 state = None
             initial_state = state
-            out, state, intermediate_states = (
-                q35._gated_delta_update_verify_decode(
+            if self.training:
+                out, state = q35.gated_delta_update(
                     q, k, v, a, b, self.A_log, self.dt_bias, state, None,
-                    use_kernel=not self.training,
+                    use_kernel=False,
                 )
-            )
+            else:
+                out, state = _gated_delta_update_2(
+                    q, k, v, a, b, self.A_log, self.dt_bias, state
+                )
+            # Stock rollback detects the absent intermediate states and uses
+            # its batched state-only replay kernel only when drafts reject.
+            intermediate_states = None
             # The rollback capture wants the conv INPUT window; build it
             # lazily — it is only evaluated on a partial accept.
             conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
