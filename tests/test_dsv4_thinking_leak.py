@@ -234,3 +234,241 @@ class TestStreamingToolCallRouting:
         assert "reasoning first" in "".join(tacc)
         assert "final text" in "".join(cacc)
         assert parser._tool_block_seen
+
+
+class TestRecoveryGating:
+    """The unclosed-thinking recovery is gated by finish_reason, has_tools and
+    tool-block detection so reasoning never leaks into content on a tool-call
+    or truncated turn."""
+
+    def _feed_plain_thinking(self, text="deep unclosed reasoning body"):
+        p = ThinkingParser(start_in_thinking=True)
+        t, c = p.feed(text)
+        assert c == ""
+        return p
+
+    def test_normal_stop_recovery_preserved(self):
+        # Back-compat: a normal stop with unclosed thinking still recovers to
+        # a non-empty answer body.
+        p = self._feed_plain_thinking()
+        tf, cf = p.finish(finish_reason="stop", has_tools=False)
+        assert cf == "deep unclosed reasoning body"
+
+    def test_unknown_finish_reason_recovery_preserved(self):
+        p = self._feed_plain_thinking()
+        tf, cf = p.finish(finish_reason=None, has_tools=False)
+        assert cf == "deep unclosed reasoning body"
+
+    def test_length_truncation_does_not_recover(self):
+        # A truncated turn (max_tokens hit) is never an answer: the reasoning
+        # stays in the thinking channel instead of leaking into content.
+        p = self._feed_plain_thinking()
+        tf, cf = p.finish(finish_reason="length", has_tools=False)
+        assert cf == ""
+
+    def test_aborted_turn_does_not_recover(self):
+        p = self._feed_plain_thinking()
+        tf, cf = p.finish(finish_reason="abort", has_tools=False)
+        assert cf == ""
+
+    def test_has_tools_does_not_recover(self):
+        # A request that supplied tools is a tool-call turn; its reasoning must
+        # not be re-emitted as content even on a normal stop.
+        p = self._feed_plain_thinking()
+        tf, cf = p.finish(finish_reason="stop", has_tools=True)
+        assert cf == ""
+
+    def test_tool_block_seen_does_not_recover(self):
+        # Even without a tools request, a DSML envelope means tool invocation.
+        p = ThinkingParser(start_in_thinking=True)
+        p.feed("reasoning " + TC_OPEN + "\n<invoke name=\"x\"/>\n" + TC_CLOSE)
+        tf, cf = p.finish(finish_reason="stop", has_tools=False)
+        assert cf == ""
+
+    def test_length_truncation_with_tools_does_not_recover(self):
+        p = self._feed_plain_thinking()
+        tf, cf = p.finish(finish_reason="length", has_tools=True)
+        assert cf == ""
+
+
+class TestPrematureCloseSecondReasoningGuard:
+    """DS4 second-reasoning guard: premature close must not leak reasoning.
+
+    DeepSeek V4 sometimes emits the close tag BEFORE opening thinking (long
+    multi-turn tool histories). The parser, starting in thinking mode, sees the
+    premature close and must NOT flip to content mode — the reasoning that
+    follows would leak into the visible content channel. With tools, the guard
+    holds the text until a tool call or a second close decides the channel.
+    """
+
+    def test_premature_close_reasoning_tool_no_leak(self):
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        tacc, cacc = [], []
+        for chunk in [
+            CLOSE,  # premature close
+            "Let me trace carefully, step by step... ",
+            TC_OPEN + "\n<invoke name=\"x\">",
+        ]:
+            t, c = parser.feed(chunk)
+            if t:
+                tacc.append(t)
+            if c:
+                cacc.append(c)
+        t, c = parser.finish(finish_reason="stop", has_tools=True)
+        if t:
+            tacc.append(t)
+        if c:
+            cacc.append(c)
+        assert "".join(tacc) == "Let me trace carefully, step by step... "
+        assert "".join(cacc) == TC_OPEN + "\n<invoke name=\"x\">"
+        assert "trace" in "".join(tacc)  # reasoning stayed in the thinking channel
+
+    def test_premature_close_reasoning_no_tool_holds_until_finish(self):
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        t, c = parser.feed(CLOSE)
+        t2, c2 = parser.feed("reasoning text")
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        assert t2 == ""  # held
+        assert "".join((t, t2, tf)) == "reasoning text"  # stays in thinking
+        assert cf == ""
+
+    def test_normal_sequence_guard_off_still_separates(self):
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=False)
+        t, c = parser.feed(OPEN + "reasoning")
+        t2, c2 = parser.feed(CLOSE + "answer")
+        assert "".join((t, t2)) == "reasoning"
+        assert "".join((c, c2)) == "answer"
+
+    def test_normal_sequence_guard_on_still_separates(self):
+        # With the guard enabled the answer after a legitimate close is held
+        # until the stream ends (ds4-server behaviour) and is then routed to the
+        # content channel — it must never be re-classified as reasoning.
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        t, c = parser.feed(OPEN + "reasoning")
+        t2, c2 = parser.feed(CLOSE + "answer")
+        assert "".join((t, t2)) == "reasoning"
+        assert "".join((c, c2)) == ""  # answer held by the guard
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        assert tf == ""  # held answer is content, not reasoning
+        assert "".join((c, c2, cf)) == "answer"
+
+    def test_second_reasoning_after_legitimate_close_stays_thinking(self):
+        # DeepSeek V4 often emits a SECOND reasoning pass after the close tag
+        # without re-opening thinking: open-reasoning-close-pass2-close-tool.
+        # The second pass must stay in the thinking channel, never leak into the
+        # visible content channel. Mirrors ds4-server's reroutes_second_reasoning.
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        tacc, cacc = [], []
+        for chunk in [
+            OPEN + "first pass",
+            CLOSE,
+            "second pass draft ",
+            CLOSE,
+            TC_OPEN + "\n<invoke name=\"x\">",
+        ]:
+            t, c = parser.feed(chunk)
+            if t:
+                tacc.append(t)
+            if c:
+                cacc.append(c)
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        if tf:
+            tacc.append(tf)
+        if cf:
+            cacc.append(cf)
+        thinking = "".join(tacc)
+        content = "".join(cacc)
+        assert "first pass" in thinking
+        assert "second pass draft" in thinking  # second reasoning stayed thinking
+        assert "second pass draft" not in content  # no leak
+        assert "invoke" in content  # tool envelope is content
+
+    def test_second_reasoning_without_second_close_stays_thinking(self):
+        # Same second-pass pattern but the model jumps straight to the tool call
+        # (no second close). The held reasoning must still stay in the thinking
+        # channel when the tool call resolves the guard.
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        tacc, cacc = [], []
+        for chunk in [
+            OPEN + "first pass",
+            CLOSE,
+            "second pass draft ",
+            TC_OPEN + "\n<invoke name=\"y\">",
+        ]:
+            t, c = parser.feed(chunk)
+            if t:
+                tacc.append(t)
+            if c:
+                cacc.append(c)
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        if tf:
+            tacc.append(tf)
+        if cf:
+            cacc.append(cf)
+        thinking = "".join(tacc)
+        content = "".join(cacc)
+        assert "first pass" in thinking
+        assert "second pass draft" in thinking
+        assert "second pass draft" not in content
+        assert "invoke" in content
+
+    def test_answer_before_tool_after_legitimate_close_never_leaks(self):
+        # A text passage between a legitimate close and a tool call is held by
+        # the guard. The no-leak rule routes it to the thinking channel (never
+        # to content), so no reasoning can ever leak into the visible body. The
+        # tradeoff: a rare genuine answer-before-tool is surfaced in the thinking
+        # panel instead of the content panel.
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        tacc, cacc = [], []
+        for chunk in [
+            OPEN + "reasoning",
+            CLOSE,
+            "Here is the answer: 42",
+            TC_OPEN + "\n<invoke name=\"z\">",
+        ]:
+            t, c = parser.feed(chunk)
+            if t:
+                tacc.append(t)
+            if c:
+                cacc.append(c)
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        if tf:
+            tacc.append(tf)
+        if cf:
+            cacc.append(cf)
+        content = "".join(cacc)
+        thinking = "".join(tacc)
+        assert "reasoning" in thinking
+        assert "answer: 42" in thinking  # held text stays out of content
+        assert "reasoning" not in content  # no thinking leak
+        assert "invoke" in content
+
+    def test_premature_close_second_close_answer_tool(self):
+        # Premature close -> reasoning -> second close -> answer -> tool. The
+        # untagged reasoning ends at the second close and stays in thinking; the
+        # answer and tool after it are content.
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        tacc, cacc = [], []
+        for chunk in [
+            CLOSE,
+            "untagged reasoning ",
+            CLOSE,
+            "answer text ",
+            TC_OPEN + "\n<invoke name=\"w\">",
+        ]:
+            t, c = parser.feed(chunk)
+            if t:
+                tacc.append(t)
+            if c:
+                cacc.append(c)
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        if tf:
+            tacc.append(tf)
+        if cf:
+            cacc.append(cf)
+        thinking = "".join(tacc)
+        content = "".join(cacc)
+        assert "untagged reasoning" in thinking
+        assert "untagged reasoning" not in content
+        assert "answer text" in content
+        assert "invoke" in content
