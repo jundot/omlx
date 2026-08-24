@@ -6,8 +6,8 @@ pinned to physical ANE instances 1 and 2, compute disjoint output-channel
 slices while Metal computes the remaining quantized channels. It is disabled
 by default.
 
-At the default 53% MLP request, alignment gives the two ANEs 26.5% of gate and
-up channels each (52.9% total) and leaves 47.1% on GPU. A native merge applies
+At the default 50% MLP request, the two ANEs receive 25% of gate and up
+channels each and the GPU retains the other 50%. A native merge applies
 SwiGLU without materializing the full gate/up result. The GDN z+qkv input
 projection is split 50/50 between the ANEs and GPU by default. Optional FP16
 CPU sharing can take independent gate/up, down-projection, and residual GDN
@@ -74,7 +74,7 @@ where the native q8 tile is not profitable.
   "qwen35_ane_prefill_enabled": true,
   "qwen35_ane_prefill_sequence_length": 2048,
   "qwen35_ane_prefill_tail_padding_min_tokens": 0,
-  "qwen35_ane_prefill_fraction": 0.53,
+  "qwen35_ane_prefill_fraction": 0.50,
   "qwen35_ane_prefill_max_layers": 64,
   "qwen35_ane_prefill_dual_ane": true,
   "qwen35_ane_prefill_gdn": true,
@@ -99,7 +99,7 @@ compiled fixed-shape banks and should be benchmarked before use.
 
 Loading a bank maps its entire weight blob into the owning ANE's device
 address window at program-create. That window is about 4 GiB per ANE
-instance, so the dual 53%/50% Qwen3.8-27B layout at roughly 3.75 GiB per
+instance, so the dual 50%/50% Qwen3.8-27B layout at roughly 3.75 GiB per
 bank fits one bank per die on M3 Ultra but cannot host both banks on a
 single-die chip such as M3 Max, where the load fails with 0x20004. When a
 bank fails to load, oMLX first retries with two near-half banks per
@@ -120,7 +120,7 @@ The macOS app exposes the same controls under **Models → model settings →
 Advanced → Experimental → Qwen ANE Prefill** for detected Qwen3.5/3.6/3.8
 models. Enabling or changing a control reloads a resident model when the
 working profile is applied. The editor starts from the measured 2,048-token,
-53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
+50% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
 The split tuner calibrates five workload controls: MLP gate/up work on ANE,

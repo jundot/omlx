@@ -544,7 +544,7 @@ class EnginePool:
                 "qwen35_ane_prefill_tail_padding_min_tokens",
                 data.get("qwen35_ane_prefill_tail_padding_min_tokens", 0),
             )
-            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
+            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.50))
             add(
                 "qwen35_ane_prefill_fused_down",
                 data.get("qwen35_ane_prefill_fused_down", False),

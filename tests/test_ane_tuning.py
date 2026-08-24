@@ -53,7 +53,7 @@ def test_candidate_settings_are_transient_copy():
     assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.10
     assert tuned.qwen35_ane_prefill_tail_padding_min_tokens == 0
     assert base.qwen35_ane_prefill_enabled is False
-    assert base.qwen35_ane_prefill_fraction == 0.53
+    assert base.qwen35_ane_prefill_fraction == 0.50
     assert base.qwen35_ane_prefill_tail_padding_min_tokens == 1500
 
 

@@ -421,7 +421,7 @@ class BatchedEngine(BaseEngine):
                         fraction=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_fraction",
-                            0.53,
+                            0.50,
                         ),
                         max_layers=getattr(
                             self._model_settings,
@@ -452,7 +452,7 @@ class BatchedEngine(BaseEngine):
                             getattr(
                                 self._model_settings,
                                 "qwen35_ane_prefill_fraction",
-                                0.53,
+                                0.50,
                             )
                             if getattr(
                                 self._model_settings,

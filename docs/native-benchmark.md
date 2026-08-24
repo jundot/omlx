@@ -25,3 +25,17 @@ python scripts/bench.py MODEL --repeats 3 --context-profile novel_en
 
 Available profiles are shown by `scripts/bench.py --help`. Prefill length,
 generation length, and metric accounting are unchanged by these controls.
+
+## Native-kernel parity for source checkouts
+
+Release wheels build the optional native extensions. A source checkout must do
+so explicitly before comparing Qwen long-context performance; otherwise it
+silently uses materially slower generic prefill paths:
+
+```bash
+OMLX_WITH_CUSTOM_KERNEL=1 python setup.py build_ext --inplace
+```
+
+Confirm `qwen35_prefill` is available through `GET /api/status` before treating
+a source benchmark as release-representative. The Qwen ANE prefill route is
+also opt-in per model; the validated M3 Ultra split is 50% MLP / 50% GDN.

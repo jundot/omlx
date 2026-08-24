@@ -2869,7 +2869,7 @@ def enable_qwen35_ane_prefill(
     model: Any,
     *,
     sequence_length: int = 2048,
-    fraction: float = 0.53,
+    fraction: float = 0.50,
     variant: int = 8,
     max_layers: int = 64,
     gdn: bool = False,
