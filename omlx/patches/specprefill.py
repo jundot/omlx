@@ -162,6 +162,40 @@ def _nemotron_h_extract_queries(attn, x, cache=None, **kwargs):
     return queries
 
 
+def _mla_extract_queries(attn, x, cache=None, **kwargs):
+    """DeepSeek/GLM MLA: (optionally low-rank) q projection + partial RoPE.
+
+    MLA caches store keys in a split layout, so queries are built in the
+    matching layout. Absorbed variants (``embed_q``, e.g. glm4_moe_lite)
+    cache the compressed latent as keys and the roped positional slice as
+    values; queries are q_nope absorbed into latent space, concatenated
+    with the roped q_pe. Expanded variants (``kv_b_proj``) cache full
+    per-head keys; queries are concat(q_nope, roped q_pe) directly.
+    Queries are pre-scaled so the scorer's generic 1/sqrt(d) recovers the
+    module's true attention scale (including any yarn mscale correction).
+    """
+    B, L, D = x.shape
+    n_heads = getattr(
+        attn,
+        "num_heads",
+        getattr(attn, "num_attention_heads", getattr(attn, "n_heads", None)),
+    )
+    if getattr(attn, "q_proj", None) is not None:
+        q = attn.q_proj(x)
+    else:
+        q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(x)))
+    q = q.reshape(B, L, n_heads, attn.q_head_dim).transpose(0, 2, 1, 3)
+    q_nope, q_pe = mx.split(q, [attn.qk_nope_head_dim], axis=-1)
+    # DSA layers hand a CacheList here (latent MLA at 0, indexer at 1),
+    # which exposes no ``.offset`` of its own — descend instead of crashing.
+    offset = _cache_offset(cache)
+    q_pe = attn.rope(q_pe, offset)
+    if getattr(attn, "embed_q", None) is not None:
+        q_nope = attn.embed_q(q_nope)
+    queries = mx.concatenate([q_nope, q_pe], axis=-1)
+    return queries * (attn.scale * queries.shape[-1] ** 0.5)
+
+
 # ---------------------------------------------------------------------------
 # Model topology helpers
 # ---------------------------------------------------------------------------
@@ -300,9 +334,21 @@ def _is_gemma4_attention(attn_obj) -> bool:
     return "shared_kv" in params and "offset" in params
 
 
+def _is_mla_attention(attn_obj) -> bool:
+    """Detect DeepSeek/GLM-style Multi-head Latent Attention.
+
+    The shared latent KV projection (kv_a_proj_with_mqa) is the definitive
+    MLA marker; it is present in both the low-rank-q (q_a_proj/q_b_proj)
+    and full-q (plain q_proj) variants.
+    """
+    return hasattr(attn_obj, "kv_a_proj_with_mqa")
+
+
 def _detect_query_extractor(attn_obj) -> Callable:
     """Auto-detect the appropriate query extractor for the model architecture."""
-    if _uses_gated_q_proj(attn_obj):
+    if _is_mla_attention(attn_obj):
+        return _mla_extract_queries
+    elif _uses_gated_q_proj(attn_obj):
         return _qwen35_extract_queries
     elif _is_gemma4_attention(attn_obj):
         return _gemma4_extract_queries
@@ -414,12 +460,27 @@ def _compute_importance(
         if not captures:
             continue
         cache = attn_caches[layer_i]
+        # DSA layers store a CacheList (latent MLA at 0, indexer at 1); the
+        # scoreable keys live in the attention slot. A bare ``.keys`` access
+        # crashes on exactly those models.
+        inner = getattr(cache, "caches", None)
+        if inner:
+            cache = inner[_ROPE_SLOT_ATTENTION]
         prompt_keys = cache.keys[..., :n_prompt, :]
         # Skip windowed/rotating caches that don't span the full prompt
         if prompt_keys.shape[-2] < n_prompt:
             continue
         head_dim = prompt_keys.shape[-1]
         q_stack = mx.concatenate(captures, axis=2)
+        if q_stack.shape[-1] > head_dim and getattr(cache, "values", None) is not None:
+            # Absorbed-MLA caches store the roped positional key slice in
+            # cache.values; concatenate it back so scoring sees the full
+            # split layout the queries were built in. Dim-driven, so
+            # non-MLA architectures never take this branch.
+            prompt_keys = mx.concatenate(
+                [prompt_keys, cache.values[..., :n_prompt, :]], axis=-1
+            )
+            head_dim = prompt_keys.shape[-1]
         if heads_per_group > 1:
             expanded_keys = mx.repeat(prompt_keys, heads_per_group, axis=1)
         else:
@@ -498,6 +559,12 @@ def score_tokens(
     n_kv_heads = getattr(
         attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
     )
+    if n_kv_heads is None and _is_mla_attention(attn_obj):
+        # Absorbed-latent MLA caches store a single shared latent head;
+        # expanded variants store all heads.
+        n_kv_heads = (
+            1 if getattr(attn_obj, "embed_q", None) is not None else n_attn_heads
+        )
 
     if query_extractor is None:
         query_extractor = _detect_query_extractor(attn_obj)
@@ -505,7 +572,7 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
+        cached_len = _cache_offset(cache[0])
         suffix = tokens[cached_len:]
         if suffix:
             logits = _prefill_draft(
@@ -540,7 +607,7 @@ def score_tokens(
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
     # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    pre_lookahead_offset = _cache_offset(cache[0], default=n_prompt)
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -573,13 +640,15 @@ def score_tokens(
     # Trim lookahead tokens from cache before returning.
     # KVCache stores keys/values as contiguous tensors; slicing back
     # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    # DSA CacheList entries expose no ``.offset``: descend into their
+    # children, otherwise lookahead KV silently persists to stored caches.
+    for entry in cache:
+        for c in getattr(entry, "caches", None) or (entry,):
+            if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
+                if hasattr(c, "keys") and c.keys is not None:
+                    c.keys = c.keys[..., :pre_lookahead_offset, :]
+                    c.values = c.values[..., :pre_lookahead_offset, :]
+                c.offset = pre_lookahead_offset
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()
@@ -677,7 +746,12 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
     rotated = mx.concatenate(
         [x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a], axis=-1
     )
-    return mx.concatenate([rotated, x_pass], axis=-1)
+    # Angles are computed in float32 for precision, but the output must
+    # keep the input dtype like native mx RoPE does: a float32 leak here
+    # becomes float32 roped K in the cache, and on mask-fused MLA targets
+    # (GLM DSA passes pe_scores as the sdpa mask) a float32 mask that
+    # cannot promote to the model's bfloat16 output.
+    return mx.concatenate([rotated, x_pass], axis=-1).astype(x.dtype)
 
 
 def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
@@ -721,7 +795,12 @@ def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     rotated = mx.concatenate(
         [x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a], axis=-1
     )
-    return mx.concatenate([rotated, x_pass], axis=-1)
+    # Angles are computed in float32 for precision, but the output must
+    # keep the input dtype like native mx RoPE does: a float32 leak here
+    # becomes float32 roped K in the cache, and on mask-fused MLA targets
+    # (GLM DSA passes pe_scores as the sdpa mask) a float32 mask that
+    # cannot promote to the model's bfloat16 output.
+    return mx.concatenate([rotated, x_pass], axis=-1).astype(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +813,61 @@ def _scalar_offset(offset) -> int:
     if isinstance(offset, mx.array):
         return int(offset.item())
     return int(offset)
+
+
+def _cache_offset(cache_entry, default: int = 0) -> int:
+    """Token offset of a per-layer cache entry, descending into CacheList.
+
+    DSA layers (GLM-5.2, DeepSeek V3.2/V4) wrap several caches in a
+    ``CacheList``: the latent MLA cache at index 0 and the indexer cache at
+    index 1. ``CacheList`` deliberately exposes no ``offset`` of its own, so a
+    bare ``hasattr(entry, "offset")`` check reports False and silently yields
+    0 (or the fallback) on exactly those models. Everything keyed off that
+    number — position mapping, draft scoring, lookahead trimming — then works
+    from a wrong base as soon as a system prompt's KV has been restored.
+    """
+    if cache_entry is None:
+        return default
+    if hasattr(cache_entry, "offset"):
+        return _scalar_offset(cache_entry.offset)
+    inner = getattr(cache_entry, "caches", None)
+    if inner:
+        return _cache_offset(inner[0], default)
+    return default
+
+
+# Slot of each RoPE owner inside a DSA layer's CacheList: the attention itself
+# reads cache[0] (latent MLA), the indexer reads cache[1].
+_ROPE_SLOT_ATTENTION = 0
+_ROPE_SLOT_INDEXER = 1
+
+
+def _rope_owners(attn):
+    """Yield ``(slot, module)`` for every module whose RoPE tracks positions.
+
+    A DSA layer rotates twice: once in the attention, and once in the indexer
+    that picks the sparse top-k. The indexer owns a separate ``rope`` instance
+    and a separate cache, so leaving it on raw contiguous offsets makes it
+    score mis-rotated keys — the top-k selection is then wrong on every DSA
+    layer, which corrupts generation after an otherwise correct sparse
+    prefill.
+    """
+    if attn is None:
+        return
+    if hasattr(attn, "rope"):
+        yield _ROPE_SLOT_ATTENTION, attn
+    indexer = getattr(attn, "indexer", None)
+    # Shared DSA layers carry indexer=None and reuse the previous full layer.
+    if indexer is not None and hasattr(indexer, "rope"):
+        yield _ROPE_SLOT_INDEXER, indexer
+
+
+def _slot_cache_offset(cache_entry, slot: int, default: int = 0) -> int:
+    """Cache offset for one RoPE owner's own cache within a CacheList."""
+    inner = getattr(cache_entry, "caches", None)
+    if inner is not None and slot < len(inner):
+        return _cache_offset(inner[slot], default)
+    return _cache_offset(cache_entry, default)
 
 
 class _PositionMappedRoPE:
@@ -886,11 +1020,7 @@ def sparse_prefill(
     layer_to_cache = _build_layer_to_cache_map(model)
     first_attn_layer_idx = attn_layers[0][0]
     first_attn_cache_idx = layer_to_cache[first_attn_layer_idx]
-    cache_start = (
-        cache[first_attn_cache_idx].offset
-        if hasattr(cache[first_attn_cache_idx], "offset")
-        else 0
-    )
+    cache_start = _cache_offset(cache[first_attn_cache_idx])
 
     # Check if model has RoPE (Nemotron-H doesn't)
     first_attn = _get_attn_module(attn_layers[0][1])
@@ -901,14 +1031,21 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            # Start from the genuine rope: a prior sparse_prefill may have left
-            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
-            # (multi-turn + partial cache hit). See #766.
-            genuine = _unwrap_rope(attn.rope)
-            original_ropes[layer_idx] = genuine
-            attn.rope = _PositionMappedRoPE(
-                genuine, selected_positions, cache_start=cache_start
-            )
+            layer_cache = cache[layer_to_cache[layer_idx]]
+            # A DSA layer has two RoPE owners (attention + indexer); every
+            # other architecture yields just the attention. Each reads its own
+            # cache slot, so each gets its own start offset.
+            for slot, owner in _rope_owners(attn):
+                # Start from the genuine rope: a prior sparse_prefill may have
+                # left an _OffsetAdjustedRoPE installed if cleanup_rope wasn't
+                # called (multi-turn + partial cache hit). See #766.
+                genuine = _unwrap_rope(owner.rope)
+                original_ropes[(layer_idx, slot)] = (owner, genuine)
+                owner.rope = _PositionMappedRoPE(
+                    genuine,
+                    selected_positions,
+                    cache_start=_slot_cache_offset(layer_cache, slot, cache_start),
+                )
 
     try:
         prompt = selected_tokens
@@ -941,13 +1078,14 @@ def sparse_prefill(
             total_prompt_len = position_offset + M
             final_cache_offset = cache_start + N
             adjustment = int(total_prompt_len) - int(final_cache_offset)
-            for layer_idx, layer in attn_layers:
-                attn = _get_attn_module(layer)
-                original = original_ropes[layer_idx]
+            # Restore every owner we wrapped — the indexer included, otherwise
+            # it keeps decoding at compacted positions while the attention has
+            # moved to the true ones.
+            for owner, original in original_ropes.values():
                 if adjustment > 0:
-                    attn.rope = _OffsetAdjustedRoPE(original, adjustment)
+                    owner.rope = _OffsetAdjustedRoPE(original, adjustment)
                 else:
-                    attn.rope = original
+                    owner.rope = original
 
     return logits
 
@@ -960,11 +1098,10 @@ def cleanup_rope(model):
     """
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
-        if attn is None or not hasattr(attn, "rope"):
-            continue
-        genuine = _unwrap_rope(attn.rope)
-        if genuine is not attn.rope:
-            attn.rope = genuine
+        for _slot, owner in _rope_owners(attn):
+            genuine = _unwrap_rope(owner.rope)
+            if genuine is not owner.rope:
+                owner.rope = genuine
 
 
 # ===========================================================================

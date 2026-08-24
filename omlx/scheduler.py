@@ -1711,6 +1711,24 @@ class Scheduler:
         # sampling path. Gemma 4 uses this to suppress multimodal close markers.
         self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
 
+        # 2026-08-19 (omer) — OMLX_PAGED_CACHE_BLOCK_SIZE: explicit paged cache
+        # block size. Both aligners honor it (the rotating aligner still rounds
+        # it to a multiple of window_size to preserve strict reuse). Measured
+        # trade-off: smaller blocks = more prefix reuse recovered (granularity
+        # + trailing walk-back), larger blocks = fewer prefill boundary stops.
+        self._explicit_block_size: int | None = None
+        _env_bs = os.getenv("OMLX_PAGED_CACHE_BLOCK_SIZE")
+        if _env_bs:
+            try:
+                self._explicit_block_size = max(64, int(_env_bs))
+                self.config.paged_cache_block_size = self._explicit_block_size
+                logger.info(
+                    "Paged cache block_size=%s (explicit via "
+                    "OMLX_PAGED_CACHE_BLOCK_SIZE)", self._explicit_block_size)
+            except ValueError:
+                logger.warning(
+                    "Invalid OMLX_PAGED_CACHE_BLOCK_SIZE: %r (ignored)", _env_bs)
+
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
@@ -2626,6 +2644,10 @@ class Scheduler:
         hi = self._ROTATING_BLOCK_SIZE_MAX
         if self._detect_pooling_cache():
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+        if getattr(self, "_explicit_block_size", None):
+            # Explicit user choice wins over family defaults; window-multiple
+            # rounding below still applies for strict rotating reuse.
+            lo = hi = self._explicit_block_size
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -2668,6 +2690,10 @@ class Scheduler:
         larger than the default.
         """
         if not self.config.paged_ssd_cache_dir:
+            return
+
+        # Explicit block size via OMLX_PAGED_CACHE_BLOCK_SIZE wins.
+        if getattr(self, "_explicit_block_size", None):
             return
 
         # Skip if RotatingKVCache already adjusted block size.
