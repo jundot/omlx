@@ -124,6 +124,11 @@ def test_should_route_gate():
 def test_patch_routes_256_and_passes_through_others(monkeypatch):
     from mlx_lm.models import base as mlx_base
 
+    # Runtime startup intentionally defaults this to ``0`` on ultra-memory
+    # hosts. This unit exercises the tiled dispatcher itself, independent of
+    # host policy inherited from the full test process.
+    monkeypatch.delenv("OMLX_SDPA256_TILED", raising=False)
+
     import omlx.patches.sdpa256_attention as sdpa256
 
     # Force a fresh install regardless of prior test state.
@@ -249,6 +254,7 @@ def _sdpa256_provider_reset(monkeypatch):
     """Isolate the module-level provider/override state and restore it."""
     from omlx.patches import sdpa256_attention as sdpa256
 
+    monkeypatch.delenv("OMLX_SDPA256_TILED", raising=False)
     monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
     monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
