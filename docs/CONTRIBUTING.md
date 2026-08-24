@@ -18,7 +18,7 @@ cd omlx
 pip install -e ".[dev]"
 ```
 
-> **Note**: oMLX requires Apple Silicon (M1/M2/M3/M4) and Python 3.10+.
+> **Note**: oMLX requires Apple Silicon (M1/M2/M3/M4/M5) and Python 3.11–3.13.
 
 ## Development Workflow
 

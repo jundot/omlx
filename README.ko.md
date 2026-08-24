@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11–3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -72,7 +72,7 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-선택사항인 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널은 현재 HEAD 빌드가 필요합니다:
+선택사항인 GLM-5.2 / MiniMax M3 / Qwen3.5 네이티브 커스텀 커널은 현재 HEAD 빌드가 필요합니다:
 
 ```bash
 brew install omlx --HEAD --with-custom-kernel
@@ -86,11 +86,11 @@ cd omlx
 pip install -e .          # 코어만
 pip install -e ".[mcp]"   # MCP (Model Context Protocol) 포함
 
-# 선택사항: GLM-5.2 / MiniMax M3 네이티브 커스텀 커널
+# 선택사항: GLM-5.2 / MiniMax M3 / Qwen3.5 네이티브 커스텀 커널
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+와 Apple Silicon (M1/M2/M3/M4/M5)이 필요합니다.
+Python 3.11–3.13과 Apple Silicon (M1/M2/M3/M4/M5)이 필요합니다.
 
 ## 빠른 시작
 
@@ -372,7 +372,7 @@ open apps/omlx-mac/build/Stage/oMLX.app
 # venvstacks 강제 재빌드 (그 외에는 fingerprint 로 캐시됨)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# 선택 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널을 포함해 스테이징
+# 선택 GLM-5.2 / MiniMax M3 / Qwen3.5 네이티브 커스텀 커널을 포함해 스테이징
 apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 

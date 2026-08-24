@@ -31,7 +31,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -42,7 +41,7 @@ dependencies = [
     # Vanilla MLX v0.32.0; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
-    # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
+    # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 pip wheel .).
     "mlx==0.32.0",
     # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
@@ -261,6 +260,7 @@ include = ["omlx*"]
     "bench_corpora/*",
 ]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.custom_kernels.bonsai" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
