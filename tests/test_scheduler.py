@@ -5460,6 +5460,189 @@ class TestOutputParserSmoke:
         assert "<｜DSML｜parameter" not in full_stream
 
 
+class TestSchedulerGrammarMustEnd:
+    """Scheduler behavior for grammar rows that must end before physical EOS."""
+
+    @staticmethod
+    def _run_grammar_response(
+        scheduler,
+        *,
+        grammar,
+        generated,
+        vocabulary,
+        request_id,
+        uid,
+        response_token,
+        finish_reason,
+        prompt_cache=None,
+        max_tokens=4,
+    ):
+        """Run a real grammar row through the scheduler response boundary.
+
+        Use to share xgrammar, request, registry, and response setup.
+        Do not use for multi-row or persistent-registry scenarios.
+
+        Args:
+            scheduler: Scheduler under test.
+            grammar: EBNF grammar to compile.
+            generated: Characters accepted before the response.
+            vocabulary: Characters available as token ids.
+            request_id: Request id for the generated row.
+            uid: Registered batch row id.
+            response_token: Token emitted by the scheduler response.
+            finish_reason: Upstream response finish reason.
+            prompt_cache: Optional cache returned with the response.
+            max_tokens: Request output limit.
+
+        Returns:
+            Processor, request, outputs, and finished request ids.
+        """
+        xgr = pytest.importorskip("xgrammar")
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        vocab = [f"<tok_{index}>" for index in range(256)]
+        vocab[0] = "<unk>"
+        vocab[1] = "<s>"
+        vocab[2] = "</s>"
+        for token in vocabulary:
+            vocab[ord(token)] = token
+        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab))
+        processor = GrammarConstraintProcessor(
+            compiler.compile_grammar(grammar), len(vocab)
+        )
+        logits = mx.zeros((1, len(vocab)))
+        processor(mx.array([]), logits)
+        for token in generated:
+            token_id = ord(token)
+            processor.accept_token(token_id)
+            processor(mx.array([token_id]), logits)
+
+        request = Request(
+            request_id=request_id,
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=max_tokens),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+        scheduler.running[request_id] = request
+        scheduler.requests[request_id] = request
+        scheduler.uid_to_request_id[uid] = request_id
+        scheduler.request_id_to_uid[request_id] = uid
+        scheduler_module._register_uid_rows(
+            scheduler.model, [uid], [None], [[processor]]
+        )
+        try:
+            outputs, finished_ids = scheduler._process_batch_responses(
+                [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=response_token,
+                        finish_reason=finish_reason,
+                        logprobs=None,
+                        prompt_cache=prompt_cache,
+                    )
+                ]
+            )
+        finally:
+            scheduler_module._unregister_uid_row(scheduler.model, uid)
+        return processor, request, outputs, finished_ids
+
+    def test_must_end_retains_parser_token_and_stops_row(self, mock_model):
+        """A parser default keeps an accepted logical-final token."""
+        token = ord("a")
+        mock_model.config.model_type = "gemma4"
+        tokenizer = TestOutputParserSmoke._GemmaTokenizer({token: "a"})
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+        assert scheduler._output_parser_kind == "gemma4"
+        parser_result = scheduler._output_parser_factory.create_session(
+            tokenizer
+        ).process_token(token)
+        assert parser_result.record_token is None
+
+        cache = object()
+        processor, request, outputs, finished_ids = self._run_grammar_response(
+            scheduler,
+            grammar='root ::= "a"',
+            generated="a",
+            vocabulary="a",
+            request_id="grammar-must-end",
+            uid=71,
+            response_token=token,
+            finish_reason="length",
+            prompt_cache=cache,
+            max_tokens=1,
+        )
+
+        assert processor.must_end is True
+        output = outputs[-1]
+        assert finished_ids == {request.request_id}
+        assert output.finished is True
+        assert output.finish_reason == "stop"
+        assert output.new_token_ids == [token]
+        assert output.new_text == "a"
+        assert output.output_text == "a"
+        assert output.output_token_ids == [token]
+        assert output.completion_tokens == 1
+        assert request.output_token_ids == [token]
+        assert request.num_computed_tokens == 1
+        assert request.status == RequestStatus.FINISHED_STOPPED
+        assert scheduler.total_completion_tokens == 1
+        assert request._extracted_cache is cache
+
+    def test_must_end_keeps_physical_upstream_stop_suppressed(
+        self, mock_model, mock_tokenizer
+    ):
+        """A physical EOS remains absent from output at a grammar boundary."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        processor, request, outputs, finished_ids = self._run_grammar_response(
+            scheduler,
+            grammar='root ::= "a"',
+            generated="a",
+            vocabulary="a",
+            request_id="grammar-upstream-stop",
+            uid=72,
+            response_token=mock_tokenizer.eos_token_id,
+            finish_reason="stop",
+        )
+
+        assert processor.must_end is True
+        output = outputs[-1]
+        assert finished_ids == {request.request_id}
+        assert output.finish_reason == "stop"
+        assert output.new_token_ids == []
+        assert output.output_token_ids == []
+        assert request.output_token_ids == []
+
+    def test_extendable_grammar_prefix_remains_running(
+        self, mock_model, mock_tokenizer
+    ):
+        """An ambiguous EBNF prefix must not be translated into a scheduler stop."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        processor, request, outputs, finished_ids = self._run_grammar_response(
+            scheduler,
+            grammar='root ::= "a" | "ab"',
+            generated="a",
+            vocabulary="ab",
+            request_id="grammar-ambiguous-prefix",
+            uid=73,
+            response_token=ord("a"),
+            finish_reason=None,
+        )
+
+        assert processor.must_end is False
+        output = outputs[-1]
+        assert finished_ids == set()
+        assert output.finished is False
+        assert output.new_token_ids == [ord("a")]
+        assert request.status == RequestStatus.RUNNING
+
+
 class TestVLMPositionStateClearing:
     """Tests for conditional mRoPE position state clearing (#531).
 

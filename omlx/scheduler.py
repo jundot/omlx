@@ -10375,9 +10375,31 @@ class Scheduler:
 
             # Check finish reason first - don't include EOS token in output
             # (following mlx-lm's batch_generate behavior)
-            is_stop = response.finish_reason == "stop"
+            upstream_stop = response.finish_reason == "stop"
+            is_stop = upstream_stop
             is_length = response.finish_reason == "length"
             is_finished = response.finish_reason is not None
+            suppress_output_token = upstream_stop
+
+            # GenerationBatch updates grammar processors before yielding the
+            # accepted token. A completed row can stop here without waiting
+            # for an upstream EOS, while still retaining that normal token.
+            grammar_must_end = False
+            with _uid_row_registry_lock:
+                registry_row = _uid_row_registry.get((id(self.model), response.uid))
+            if registry_row is not None:
+                from .api.grammar import GrammarConstraintProcessor
+
+                grammar_must_end = any(
+                    isinstance(processor, GrammarConstraintProcessor)
+                    and processor.must_end
+                    for processor in registry_row.logits_processors
+                )
+            if grammar_must_end and response.finish_reason in (None, "length"):
+                response.finish_reason = "stop"
+                is_stop = True
+                is_length = False
+                is_finished = True
 
             # Only append token if not stopping due to EOS token
             new_text = ""
@@ -10385,7 +10407,7 @@ class Scheduler:
             # Check if this request uses a protocol-specific output parser
             parser_session = self._get_output_parser_session(request_id)
 
-            if parser_session is not None and not is_stop:
+            if parser_session is not None and not suppress_output_token:
                 parser_result = parser_session.process_token(response.token)
                 new_text = parser_result.stream_text
                 if parser_result.visible_text:
@@ -10396,16 +10418,17 @@ class Scheduler:
                     is_finished = True
                     is_stop = True
                     response.finish_reason = "stop"
+                    suppress_output_token = True
 
                 should_record_token = (
                     parser_result.record_token
                     if parser_result.record_token is not None
-                    else not is_stop
+                    else not suppress_output_token
                 )
                 if should_record_token:
                     request.append_output_token(response.token)
 
-            elif not is_stop:
+            elif not suppress_output_token:
                 # Standard processing without a protocol parser
                 request.append_output_token(response.token)
 
@@ -10436,6 +10459,7 @@ class Scheduler:
                         is_finished = True
                         is_stop = True
                         response.finish_reason = "stop"
+                        suppress_output_token = True
                         if idx_in_tail >= prev_len:
                             new_text = new_text[: idx_in_tail - prev_len]
                         else:
@@ -10477,7 +10501,7 @@ class Scheduler:
             )
             output = RequestOutput(
                 request_id=request_id,
-                new_token_ids=[response.token] if not is_stop else [],
+                new_token_ids=[response.token] if not suppress_output_token else [],
                 new_text=new_text,
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
