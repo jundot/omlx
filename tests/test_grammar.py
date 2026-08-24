@@ -804,6 +804,8 @@ class TestGrammarConstraintProcessor:
         vocab[ord('"')] = '"'
         vocab[ord(":")] = ":"
         vocab[ord(",")] = ","
+        for token in "ab0123456789":
+            vocab[ord(token)] = token
         ti = xgr.TokenizerInfo(vocab)
         return xgr.GrammarCompiler(ti), len(vocab)
 
@@ -863,6 +865,83 @@ class TestGrammarConstraintProcessor:
         cg = comp.compile_grammar('root ::= ""')
         proc = GrammarConstraintProcessor(cg, vocab_size)
         assert proc.is_terminated is False
+
+    def test_must_end_is_false_for_bare_processor(self):
+        """Manual processor fixtures without __init__ stay non-terminal."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        proc = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+
+        assert proc.must_end is False
+
+    def test_must_end_after_self_delimiting_output(self, compiler):
+        """A completed literal with only EOS available must end logically."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        proc = GrammarConstraintProcessor(
+            comp.compile_grammar('root ::= "a"'), vocab_size
+        )
+
+        logits = mx.zeros((1, vocab_size))
+        proc(mx.array([]), logits)
+        proc.accept_token(ord("a"))
+        proc(mx.array([ord("a")]), logits)
+
+        assert proc.matcher.is_completed()
+        assert proc.is_terminated is False
+        assert proc.must_end is True
+
+    def test_must_end_stays_false_for_extendable_regex_prefix(self, compiler):
+        """The `[0-9]+` prefix `1` may still grow with another digit."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        proc = GrammarConstraintProcessor(comp.compile_regex(r"[0-9]+"), vocab_size)
+
+        logits = mx.zeros((1, vocab_size))
+        proc(mx.array([]), logits)
+        proc.accept_token(ord("1"))
+        proc(mx.array([ord("1")]), logits)
+
+        assert proc.matcher.is_completed()
+        assert proc.must_end is False
+
+    def test_must_end_stays_false_for_ambiguous_ebnf_prefix(self, compiler):
+        """`a` remains running when `ab` is another valid EBNF branch."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        proc = GrammarConstraintProcessor(
+            comp.compile_grammar('root ::= "a" | "ab"'), vocab_size
+        )
+
+        logits = mx.zeros((1, vocab_size))
+        proc(mx.array([]), logits)
+        proc.accept_token(ord("a"))
+        proc(mx.array([ord("a")]), logits)
+
+        assert proc.matcher.is_completed()
+        assert proc.must_end is False
+        proc.accept_token(ord("b"))
+        assert proc.matcher.is_completed()
+
+    def test_must_end_stays_false_for_extendable_integer_prefix(self, compiler):
+        """The JSON integer prefix `1` may still grow with another digit."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        comp, vocab_size = compiler
+        proc = GrammarConstraintProcessor(
+            comp.compile_json_schema({"type": "integer"}), vocab_size
+        )
+
+        logits = mx.zeros((1, vocab_size))
+        proc(mx.array([]), logits)
+        proc.accept_token(ord("1"))
+        proc(mx.array([ord("1")]), logits)
+
+        assert proc.matcher.is_completed()
+        assert proc.must_end is False
 
     def test_call_marks_the_row_pending(self, compiler):
         """The scheduler accepts at the top of the *next* step, so the

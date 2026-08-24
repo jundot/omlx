@@ -77,6 +77,7 @@ class GrammarConstraintProcessor:
         bitmask_width = (vocab_size + 31) // 32
         self._bitmask = np.full((1, bitmask_width), -1, dtype=np.int32)
         self._terminated = False
+        self._must_end = False
         self._first_call = True
         self._pending = False
 
@@ -99,6 +100,25 @@ class GrammarConstraintProcessor:
         self._pending = True
         self._bitmask.fill(-1)
         self._matcher.fill_next_token_bitmask(self._bitmask)
+        self._must_end = False
+        if self._matcher.is_completed():
+            valid_mask = self._bitmask.view(np.uint32).copy()
+            trailing_bits = self._vocab_size % 32
+            if trailing_bits:
+                valid_mask[0, -1] &= np.uint32((1 << trailing_bits) - 1)
+
+            stop_token_ids = np.asarray(self._matcher.stop_token_ids, dtype=np.intp)
+            stop_token_ids = stop_token_ids[
+                (stop_token_ids >= 0) & (stop_token_ids < self._vocab_size)
+            ]
+            if stop_token_ids.size:
+                stop_words = stop_token_ids // 32
+                stop_bits = np.left_shift(np.uint32(1), stop_token_ids % 32)
+                if np.any(valid_mask[0, stop_words] & stop_bits):
+                    np.bitwise_and.at(
+                        valid_mask[0], stop_words, np.bitwise_not(stop_bits)
+                    )
+                    self._must_end = not np.any(valid_mask)
 
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)
@@ -136,6 +156,19 @@ class GrammarConstraintProcessor:
     @property
     def is_terminated(self) -> bool:
         return self._terminated
+
+    @property
+    def must_end(self) -> bool:
+        """Return whether the just-filled mask permits only matcher stop tokens.
+
+        Use when turning completed grammar output into a logical scheduler stop.
+        Do not use for token admission; xgrammar's bitmask remains authoritative.
+
+        Returns:
+            True when completed output has at least one allowed matcher stop
+            token and no allowed non-stop token in the model vocabulary.
+        """
+        return getattr(self, "_must_end", False)
 
     def advance(self, tokens: mx.array) -> bool:
         """Accept the previous token and advance grammar state.
