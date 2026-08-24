@@ -498,6 +498,8 @@
   "settings.advanced.cache": "Cache",
   "settings.advanced.initial_cache_blocks": "Initial Cache Blocks",
   "settings.advanced.initial_cache_blocks_hint": "Blocks pre-allocated at startup. Higher values reduce dynamic allocation overhead.",
+  "settings.advanced.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.advanced.hot_cache_write_through_hint": "Keep blocks in RAM AND write them to SSD immediately. Old sessions survive restarts and crashes; recent sessions resume at RAM speed.",
   "settings.advanced.gdn_cache_policy": "GDN Cache Policy",
   "settings.advanced.gdn_cache_policy_hint": "Some models use Gated DeltaNet (GDN) recurrent layers whose state cannot be reconstructed from KV cache blocks alone. An extra state snapshot lets oMLX resume cached prompts without recomputing them.",
   "settings.advanced.gdn_snapshot_storage": "Snapshot Storage",

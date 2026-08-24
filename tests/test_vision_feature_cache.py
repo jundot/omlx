@@ -3,11 +3,12 @@
 
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
 
+import omlx.cache.vision_feature_cache as vfc_mod
 from omlx.cache.vision_feature_cache import (
     VisionFeatureSSDCache,
     _composite_hash,
@@ -164,6 +165,27 @@ class TestSSDCache:
         # Check safetensors file exists
         safetensors_files = list(tmp_cache_dir.rglob("*.safetensors"))
         assert len(safetensors_files) == 1
+
+    def test_ssd_write_fsyncs_parent_dir_after_rename(self, ssd_cache, tmp_cache_dir):
+        """The background writer must fsync the containing directory after
+        renaming the temp file into place, same as the paged SSD cache
+        writers. Data fsync already happens inside _write_safetensors_no_mx."""
+        calls = []
+        real = vfc_mod._fsync_parent_dir
+
+        def spy(path):
+            calls.append(str(path))
+            return real(path)
+
+        with patch.object(vfc_mod, "_fsync_parent_dir", spy):
+            features = mx.ones((4, 8))
+            mx.eval(features)
+            ssd_cache.put("img_hash", "model_a", features)
+            time.sleep(0.5)
+
+        safetensors_files = list(tmp_cache_dir.rglob("*.safetensors"))
+        assert len(safetensors_files) == 1
+        assert calls == [str(safetensors_files[0])]
 
     def test_ssd_startup_scan(self, tmp_cache_dir):
         # Phase 1: create cache and store features

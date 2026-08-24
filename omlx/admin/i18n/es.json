@@ -498,6 +498,8 @@
   "settings.advanced.cache": "Caché",
   "settings.advanced.initial_cache_blocks": "Bloques Iniciales de Caché",
   "settings.advanced.initial_cache_blocks_hint": "Bloques pre-asignados al inicio. Valores más altos reducen la sobrecarga de asignación dinámica.",
+  "settings.advanced.hot_cache_write_through": "Caché Activa Write-Through",
+  "settings.advanced.hot_cache_write_through_hint": "Mantener los bloques en RAM y escribirlos en SSD de inmediato. Las sesiones antiguas sobreviven a reinicios y fallos; las recientes se reanudan a velocidad de RAM.",
   "settings.advanced.gdn_cache_policy": "GDN Cache Policy",
   "settings.advanced.gdn_cache_policy_hint": "Some models use Gated DeltaNet (GDN) recurrent layers whose state cannot be reconstructed from KV cache blocks alone. An extra state snapshot lets oMLX resume cached prompts without recomputing them.",
   "settings.advanced.gdn_snapshot_storage": "Snapshot Storage",

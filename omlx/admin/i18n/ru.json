@@ -498,6 +498,8 @@
   "settings.advanced.cache": "Кэш",
   "settings.advanced.initial_cache_blocks": "Начальные блоки кэша",
   "settings.advanced.initial_cache_blocks_hint": "Блоки предварительно выделяются при запуске. Более высокие значения уменьшают накладные расходы на динамическое выделение.",
+  "settings.advanced.hot_cache_write_through": "Сквозная запись горячего кэша",
+  "settings.advanced.hot_cache_write_through_hint": "Блоки остаются в RAM и сразу записываются на SSD. Старые сессии переживают перезапуски и сбои, недавние возобновляются со скоростью RAM.",
   "settings.advanced.gdn_cache_policy": "GDN Cache Policy",
   "settings.advanced.gdn_cache_policy_hint": "Some models use Gated DeltaNet (GDN) recurrent layers whose state cannot be reconstructed from KV cache blocks alone. An extra state snapshot lets oMLX resume cached prompts without recomputing them.",
   "settings.advanced.gdn_snapshot_storage": "Snapshot Storage",

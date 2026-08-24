@@ -498,6 +498,8 @@
   "settings.advanced.cache": "キャッシュ",
   "settings.advanced.initial_cache_blocks": "初期キャッシュブロック数",
   "settings.advanced.initial_cache_blocks_hint": "起動時に事前割り当てするブロック数。大きいほど動的割り当てのオーバーヘッドが減少。",
+  "settings.advanced.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.advanced.hot_cache_write_through_hint": "ブロックを RAM に保持しつつ、SSD へも即時書き込みます。過去のセッションは再起動やクラッシュ後も保持され、最近のセッションは RAM 速度で復元されます。",
   "settings.advanced.gdn_cache_policy": "GDN Cache Policy",
   "settings.advanced.gdn_cache_policy_hint": "Some models use Gated DeltaNet (GDN) recurrent layers whose state cannot be reconstructed from KV cache blocks alone. An extra state snapshot lets oMLX resume cached prompts without recomputing them.",
   "settings.advanced.gdn_snapshot_storage": "Snapshot Storage",

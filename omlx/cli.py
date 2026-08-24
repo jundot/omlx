@@ -61,6 +61,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_dir",
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
+        "hot_cache_write_through",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -304,6 +305,13 @@ def serve_command(args):
             scheduler_config.hot_cache_max_size = hot_cache_max_bytes
         else:
             scheduler_config.hot_cache_max_size = 0
+
+        # Write-through: explicit CLI flag > settings file (already mapped by
+        # settings.to_scheduler_config()).
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            scheduler_config.hot_cache_write_through = bool(
+                args.hot_cache_write_through
+            )
 
         if args.no_cache:
             print(
@@ -1104,6 +1112,13 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
+    )
+    serve_parser.add_argument(
+        "--hot-cache-write-through",
+        action="store_true",
+        default=None,
+        help="Persist every hot-cache block to SSD immediately (write-through). "
+        "Keeps RAM-speed resume while retaining SSD durability for all sessions.",
     )
     serve_parser.add_argument(
         "--no-cache",

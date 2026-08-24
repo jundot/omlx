@@ -323,6 +323,10 @@ class CacheSettings:
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    # When True (and the hot cache is enabled), every saved block is kept in
+    # RAM AND persisted to SSD immediately — RAM-speed resume for recent
+    # sessions without losing SSD durability for old ones.
+    hot_cache_write_through: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
@@ -418,6 +422,7 @@ class CacheSettings:
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
+            "hot_cache_write_through": self.hot_cache_write_through,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
 
@@ -464,6 +469,9 @@ class CacheSettings:
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
+            hot_cache_write_through=bool(
+                data.get("hot_cache_write_through", False)
+            ),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -1107,6 +1115,12 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
+        if hot_cache_wt := os.getenv("OMLX_HOT_CACHE_WRITE_THROUGH"):
+            self.cache.hot_cache_write_through = hot_cache_wt.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
         if gdn_storage := os.getenv("OMLX_GDN_SNAPSHOT_STORAGE"):
             try:
                 self.cache.set_gdn_snapshot_storage(gdn_storage)
@@ -1260,6 +1274,8 @@ class GlobalSettings:
 
         if hasattr(args, "hot_cache_max_size") and args.hot_cache_max_size is not None:
             self.cache.hot_cache_max_size = args.hot_cache_max_size
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            self.cache.hot_cache_write_through = bool(args.hot_cache_write_through)
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
@@ -1675,6 +1691,7 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size

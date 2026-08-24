@@ -7,6 +7,7 @@ token counts, dtypes, and decode/verify calls fall through unchanged.
 
 from __future__ import annotations
 
+import gc
 import importlib
 import logging
 import os
@@ -20,6 +21,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
+
+from omlx.utils import hardware, proc_memory
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,47 @@ _ANE_RESIDENT_PROGRAM_LIMIT = 120
 # ~4 GiB device address window, so single-die chips reject two monolithic
 # dual banks; 1 GiB spans keep every create well under the window.
 _ANE_BANK_RETRY_MAX_BYTES = 1 << 30
+# A failed compile attempt's already-loaded partial banks are dropped
+# (models cleared to []), but the ANE driver's own device-mapping release
+# is asynchronous and sometimes lags the retry (observed directly: kernel
+# log lines "ReleaseProgramResource: WARN: waitForPendingUpdate failed").
+# Retrying immediately races that cleanup, so a machine with tight headroom
+# can climb across attempts even though each individual attempt drops its
+# references correctly. Gate every attempt (including the first) on real
+# phys_footprint headroom against total system memory -- the same ledger
+# the kernel's jetsam killer uses -- and give the driver a moment to catch
+# up between attempts, instead of shrinking-and-retrying blind. Confirmed
+# necessary live: a 4-attempt retry ladder (each individually bounded)
+# still grew process RSS to 48.3GB on a 48GB machine and was jetsam-killed
+# mid-retry.
+_ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
+_ANE_BANK_RETRY_SETTLE_SECONDS = 0.5
+
+
+def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
+    """``(current phys_footprint, total system memory)`` in bytes for the
+    headroom gate and its skip-warning log, so "why did ANE bank compile
+    stop retrying on this box" is answerable from one log line instead of
+    just the fixed 70% threshold. Best-effort: returns ``(0, 0)`` if either
+    measurement is unavailable."""
+    try:
+        return proc_memory.get_phys_footprint(), hardware.get_total_memory_bytes()
+    except Exception:
+        return 0, 0
+
+
+def _ane_bank_memory_headroom_ok() -> bool:
+    """True if phys_footprint has enough room left for another ANE procedure
+    bank compile attempt. Defaults to allowing the attempt (returns True) if
+    the measurement is unavailable, so a query failure never blocks the fast
+    path -- this is a circuit breaker for a known failure mode, not a new
+    hard dependency."""
+    current, total = _ane_bank_memory_footprint_snapshot()
+    if total <= 0:
+        return True
+    return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+
+
 @dataclass(frozen=True)
 class _AnePrefillConfig:
     sequence_length: int
@@ -2016,7 +2060,20 @@ def _bank_split_ladder(
     total_bytes = sum(source_bytes)
     largest_bytes = max(source_bytes, default=0)
 
-    for _ in range(4):
+    for attempt in range(4):
+        if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
+            logger.warning(
+                "Skipping ANE procedure bank compile attempt %d/4: phys "
+                "footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
+                attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
+                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+            )
+            return None
         spans = (
             [(0, len(source_bytes))]
             if cap <= 0
@@ -2031,8 +2088,16 @@ def _bank_split_ladder(
                 models1.extend(span1)
         except Exception:
             # Drop banks that loaded before the failure so their device
-            # mappings are released before the smaller retry.
+            # mappings are released before the smaller retry. The ANE
+            # driver's own release is asynchronous, so force a GC pass and
+            # give it a moment to actually land before the next attempt's
+            # headroom check measures phys_footprint -- otherwise the check
+            # can see this attempt's not-yet-reclaimed memory and either
+            # falsely block the next attempt or (worse) not yet reflect it
+            # and let the next attempt pile on top.
             models0 = models1 = []
+            gc.collect()
+            time.sleep(_ANE_BANK_RETRY_SETTLE_SECONDS)
             logger.warning(
                 "ANE procedure bank compilation failed (%d banks per "
                 "instance, %d procedures, %.2f GiB per instance)",
@@ -2118,7 +2183,20 @@ def _compile_single_banks(
     total_bytes = sum(weight.nbytes for weight in weights)
     largest_bytes = max((weight.nbytes for weight in weights), default=0)
 
-    for _ in range(4):
+    for attempt in range(4):
+        if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
+            logger.warning(
+                "Skipping single-ANE procedure bank compile attempt %d/4: "
+                "phys footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
+                attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
+                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+            )
+            return None
         spans = (
             [(0, len(weights))] if cap <= 0 else _bank_chunk_spans(weights, cap)
         )
@@ -2132,6 +2210,8 @@ def _compile_single_banks(
                 )
         except Exception:
             models = []
+            gc.collect()
+            time.sleep(_ANE_BANK_RETRY_SETTLE_SECONDS)
             logger.warning(
                 "Single-ANE procedure bank compilation failed (%d banks, "
                 "%d procedures, %.2f GiB)",
@@ -2746,10 +2826,21 @@ def _prepare_fused_down_for_bank(
             ).astype(mx.float32)
         )
 
+    # Only columns [0:gpu_start] of the down matrix are ever consumed below
+    # (down0/down1/cpu_down_weight); the GPU portion reads down.weight
+    # directly, still quantized, at gate_up_weight/down_weight below.
+    # Dequantizing the full matrix wasted a ~(hidden - gpu_start)-column
+    # fp32 transient (~0.5GB/layer) that was computed and immediately
+    # discarded. gpu_start is a multiple of 128 (per_ane/cpu_hidden are
+    # both rounded down to 128 above), so slicing the packed axis at
+    # gpu_start // 8 (4-bit: 8 values/int32) and gpu_start // 128 (the
+    # quantization group_size) yields exactly the first gpu_start
+    # unpacked columns -- same values as before, just without the wasted
+    # suffix. See docs/qwen35-hardening-and-optimization.md C3.
     dense_down = mx.dequantize(
-        down.weight,
-        down.scales,
-        down.biases,
+        down.weight[:, : gpu_start // 8],
+        down.scales[:, : gpu_start // 128],
+        down.biases[:, : gpu_start // 128],
         group_size=128,
         bits=4,
     ).astype(mx.float32)
@@ -2917,6 +3008,9 @@ def enable_qwen35_ane_prefill(
         raise ValueError("ANE prefill max_layers must be positive")
     if not 0.05 <= gdn_fraction <= 0.90:
         raise ValueError("ANE GDN prefill fraction must be between 0.05 and 0.90")
+    if getattr(model, "_omlx_ane_prefill_shed", False):
+        # A fresh enable supersedes a runtime shed on this object.
+        model._omlx_ane_prefill_shed = False
     if gdn_max_layers < 0:
         raise ValueError("ANE GDN prefill max_layers must be non-negative")
     if not 0.0 <= cpu_fraction <= 0.25:
@@ -3293,6 +3387,7 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
     return {
         "attempted": attempted,
         "configured": bool(mlp or gdn),
+        "shed": bool(getattr(model, "_omlx_ane_prefill_shed", False)),
         "mlp_layers": mlp,
         "gdn_layers": gdn,
         "dual_ane_layers": int(
@@ -3305,3 +3400,54 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
             getattr(model, "_omlx_ane_tail_padding_min_tokens", 0) or 0
         ),
     }
+
+
+def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
+    """Drop every compiled ANE prefill slice on ``model``; GPU-only from here.
+
+    The compiled procedure banks keep the packed weight blobs they were built
+    from mapped for the lifetime of the native programs (roughly 13 GB for a
+    27B at mlp 0.35 / gdn 0.45) — exactly the resident memory a long-context
+    prefill needs back once the KV cache has grown into the guard's sizing
+    target. Latches every sliced module through the existing per-module
+    failure flags first (so the dispatch sites fall back to stock GPU compute
+    and never lazily recompile), then drops the state references; the native
+    models free their programs and mapped blobs when the last reference dies.
+    Idempotent, and scoped to this engine instance: the next load of the
+    model rebuilds the banks from its settings.
+
+    Returns ``(modules_released, resident_programs_before)``.
+    """
+    modules_released = 0
+    programs_before = int(
+        getattr(model, "_omlx_ane_resident_program_count", 0) or 0
+    )
+    for module in model.modules() if hasattr(model, "modules") else ():
+        for state_attr, failed_attr in (
+            ("_omlx_ane_prefill_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_fused_down_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_gdn_state", "_omlx_ane_gdn_failed"),
+        ):
+            if getattr(module, state_attr, None) is None:
+                continue
+            # Latch BEFORE dropping the state: the fetch sites lazily
+            # recompile a missing state, and the failure flag is the one
+            # switch they all check first.
+            setattr(module, failed_attr, True)
+            setattr(module, state_attr, None)
+            modules_released += 1
+    if modules_released:
+        # Zero (not delete) the status counters and set the shed marker:
+        # attempted=True/configured=False alone is indistinguishable from a
+        # load-time compile failure, and a shed changes serving behavior
+        # until the next load.
+        model._omlx_ane_prefill_shed = True
+        for counter in (
+            "_omlx_ane_mlp_prefill_count",
+            "_omlx_ane_gdn_prefill_count",
+            "_omlx_ane_dual_prefill_count",
+            "_omlx_ane_resident_program_count",
+        ):
+            if hasattr(model, counter):
+                setattr(model, counter, 0)
+    return modules_released, programs_before

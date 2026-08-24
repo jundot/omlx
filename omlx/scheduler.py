@@ -1504,6 +1504,10 @@ class SchedulerConfig:
         None  # Path for paged SSD cache storage (None = disabled)
     )
     hot_cache_only: bool = False
+    # When True (and the hot cache is enabled), every saved block is kept in
+    # RAM *and* persisted to SSD immediately, instead of deferring the SSD
+    # write to hot-cache eviction or shutdown.
+    hot_cache_write_through: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
@@ -1711,6 +1715,12 @@ class Scheduler:
         # sampling path. Gemma 4 uses this to suppress multimodal close markers.
         self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
 
+        # Compute model-specific prefill geometry before aligning paged-cache
+        # boundaries. ArraysCache snapshots materialize recurrent GDN state at
+        # every block boundary, so a boundary narrower than the effective
+        # prefill step changes cache-ON from one forward into multiple forwards.
+        self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
+
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
@@ -1742,27 +1752,6 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
-        # Qwen3.5/3.6 hybrid (GatedDeltaNet + hd-256 full attention): the
-        # fused prefill routes favor wider chunks. Measured on the 27B
-        # (M3 Ultra, 2026-08-17): chunk 4096 beats the 2048 default +3.2%
-        # at 4k prompts / +1.0% at 16k, 8192 flat vs 4096. Floor the chunk
-        # at 4096 when the machine has headroom; the prefill memory guard
-        # still shrinks chunks under pressure, so small Macs are unchanged.
-        self._qwen35_prefill_floor = 0
-        try:
-            _mt = str(getattr(model, "model_type", "") or "")
-            if not _mt:
-                _mt = str(
-                    getattr(getattr(model, "config", None), "model_type", "") or ""
-                )
-            if _mt.startswith("qwen3_5"):
-                from .settings import get_system_memory
-
-                if get_system_memory() >= 64 * 1024**3:
-                    self._qwen35_prefill_floor = 4096
-        except Exception:
-            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
-
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -2650,10 +2639,34 @@ class Scheduler:
             )
             self.config.paged_cache_block_size = target_block_size
 
-    # Default block size for ArraysCache-only hybrid models.
-    # Match prefill_step_size (2048) so that boundary caching ON/OFF
-    # produces identical prefill chunk sizes, eliminating float32↔dtype
-    # roundtrip differences in GatedDeltaNet recurrent state.
+    def _detect_qwen35_prefill_floor(self) -> int:
+        """Return the wide-prefill floor for the Qwen3.5 architecture family."""
+        try:
+            model_type = str(getattr(self.model, "model_type", "") or "")
+            if not model_type:
+                model_type = str(
+                    getattr(getattr(self.model, "config", None), "model_type", "") or ""
+                )
+            if model_type.startswith("qwen3_5"):
+                from .custom_kernels.nax import is_nax_available
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
+                    # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
+                    # beats the 2048 default +3.2% at 4k prompts / +1.0% at
+                    # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
+                    # where wider prefill regresses throughput (#2880).
+                    return 4096
+        except Exception:
+            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+        return 0
+
+    # Default block size for ArraysCache-only hybrid models. Raise the effective
+    # target to the configured/model-specific prefill step so cache ON/OFF use
+    # identical forward boundaries, avoiding GatedDeltaNet recurrent-state
+    # materialization differences. Larger blocks coarsen cache-hit granularity:
+    # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
+    # also leaves old SSD blocks cold until normal eviction removes them.
     _ARRAYS_CACHE_BLOCK_SIZE = 2048
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
@@ -2664,8 +2677,8 @@ class Scheduler:
         prefill while still storing valid per-block recurrent state.
 
         This is skipped if RotatingKVCache was already detected (block size was
-        aligned to its window size) or if the user explicitly set a block size
-        larger than the default.
+        aligned to its window size) or if the configured block size already
+        meets the effective model-specific target.
         """
         if not self.config.paged_ssd_cache_dir:
             return
@@ -2693,7 +2706,11 @@ class Scheduler:
         if not has_arrays_cache:
             return
 
-        target = self._ARRAYS_CACHE_BLOCK_SIZE
+        target = max(
+            self._ARRAYS_CACHE_BLOCK_SIZE,
+            int(self.config.prefill_step_size or 0),
+            self._qwen35_prefill_floor,
+        )
         if self.config.paged_cache_block_size >= target:
             return
 
@@ -3867,7 +3884,16 @@ class Scheduler:
             target = min(target, abort_cap)
         return target - self._current_usage_bytes()
 
-    _MAX_PREFILL_EVICTION_RETRIES = 1
+    # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
+    # first pass's target check while buying only a couple of minutes of KV
+    # growth on a long prompt — and the durable rung behind it (shedding the
+    # requesting model's ANE prefill banks) is then unreachable when the
+    # pressure returns, because the request has spent its only retry. The
+    # second pause is bounded the same way the first is: every rung in
+    # EnginePool's ladder is attempt-once per call, idle victims are
+    # naturally exhausted, and a pass with nothing left to give costs one
+    # ~100ms pause before the guard falls back to throttling as before.
+    _MAX_PREFILL_EVICTION_RETRIES = 2
 
     def _raise_prefill_eviction_if_available(
         self,
@@ -3975,6 +4001,30 @@ class Scheduler:
                 cap / 1024**3,
                 round(margin * 100),
                 base_cap / 1024**3,
+            )
+            # Instrumentation for the qwen35 memory-guard investigation
+            # (docs/qwen35-hardening-and-optimization.md Phase 0.1): the
+            # admission bound is dominated near the ceiling by terms that
+            # don't shrink with KV bit-depth, but which term actually binds
+            # is unconfirmed. Log each contributor separately so a rejection
+            # is diagnosable from one log line instead of re-deriving it.
+            tracker = self._prefill_transient_tracker
+            observed_max = (
+                float(tracker.observed_max_bytes) if tracker is not None else 0.0
+            )
+            ane_reservation = (
+                float(getattr(self.memory_monitor, "_ane_prefill_transient_bytes", 0))
+                if self.memory_monitor is not None
+                else 0.0
+            )
+            logger.warning(
+                "[guard:%s] admission terms: current=%.2fGB predicted_transient=%.2fGB "
+                "observed_max_bytes=%.2fGB ane_prefill_transient_bytes=%.2fGB",
+                loop_label,
+                current / 1024**3,
+                min_transient / 1024**3,
+                observed_max / 1024**3,
+                ane_reservation / 1024**3,
             )
             binding_str, advice = describe_ceiling_binding(
                 static=self._memory_static_ceiling_bytes,
@@ -8020,6 +8070,7 @@ class Scheduler:
                     max_size_bytes=self.config.paged_ssd_cache_max_size,
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
+                    hot_cache_write_through=self.config.hot_cache_write_through,
                     hot_cache_budget=self.config.hot_cache_budget,
                     expected_model_name=name,
                     expected_num_layers=len(draft_cache_list),
@@ -12462,6 +12513,7 @@ class Scheduler:
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
+                hot_cache_write_through=self.config.hot_cache_write_through,
                 hot_cache_budget=self.config.hot_cache_budget,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
                 expected_model_name=self.config.model_name or "",

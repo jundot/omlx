@@ -498,6 +498,8 @@
   "settings.advanced.cache": "快取",
   "settings.advanced.initial_cache_blocks": "初始快取區塊數",
   "settings.advanced.initial_cache_blocks_hint": "啟動時預先分配的區塊數。數值越高，動態分配的開銷越小。",
+  "settings.advanced.hot_cache_write_through": "寫透 Hot Cache",
+  "settings.advanced.hot_cache_write_through_hint": "區塊保留在 RAM 中的同時立即寫入 SSD。舊工作階段在重新啟動和當機後仍然保留，最近的工作階段以 RAM 速度恢復。",
   "settings.advanced.gdn_cache_policy": "GDN Cache Policy",
   "settings.advanced.gdn_cache_policy_hint": "Some models use Gated DeltaNet (GDN) recurrent layers whose state cannot be reconstructed from KV cache blocks alone. An extra state snapshot lets oMLX resume cached prompts without recomputing them.",
   "settings.advanced.gdn_snapshot_storage": "Snapshot Storage",

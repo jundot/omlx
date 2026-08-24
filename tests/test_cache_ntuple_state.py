@@ -383,8 +383,26 @@ class TestPrefixCacheNTupleSubState:
             }
         ]
 
+        # A1 fix: is_last_block alone no longer justifies using live state
+        # for non-sliceable sub-caches -- a matching boundary snapshot is
+        # required (docs/qwen35-hardening-and-optimization.md A1). This test
+        # is about the CacheList slicing/marker path itself, not about
+        # boundary-snapshot sourcing, so provide a snapshot mirroring the
+        # live state to keep exercising that path.
+        snapshot_cache_data = [
+            {
+                "state": [
+                    (rot_keys, rot_values),
+                    (buf_kv, buf_gate, pooled),
+                ],
+            }
+        ]
         block_slices = prefix_cache._extract_block_tensor_slice(
-            cache_data, start_idx=0, end_idx=16, is_last_block=True
+            cache_data,
+            start_idx=0,
+            end_idx=16,
+            is_last_block=True,
+            snapshot_cache_data=snapshot_cache_data,
         )
         assert block_slices is not None
         assert len(block_slices) == 1

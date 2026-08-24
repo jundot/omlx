@@ -276,8 +276,10 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let fusedDown: Bool?
     let cpuThreads: Int?
     let cpuSharedResource: Bool?
-    let processingTps: Double
-    let speedupPercent: Double
+    // Null when the tuner returned a verdict without measuring, e.g. the
+    // GPU-only preflight on machines without the ANE compiler (#3067).
+    let processingTps: Double?
+    let speedupPercent: Double?
     let sequenceLength: Int
     let tailPaddingMinTokens: Int?
 }

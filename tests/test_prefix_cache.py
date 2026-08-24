@@ -6,11 +6,12 @@ This module tests the block-aware prefix caching system that uses
 PagedCacheManager for block-based storage with SSD persistence.
 """
 
+import logging
 import sys
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -193,6 +194,51 @@ class TestBlockAwarePrefixCache:
         """Test store_cache with empty tokens returns None."""
         result = prefix_cache.store_cache("req-001", [], [])
         assert result is None
+
+    def test_shared_prefix_hit_rejects_reassigned_block(self, prefix_cache):
+        """A2 regression: a block reassigned to different content between
+        find_shared_prefix's lookup and the caller acquiring it must not be
+        spliced into the returned chain. The race is injected at
+        acquire_cached_block itself -- the one point genuinely between the
+        two steps -- by mutating the block's hash there, as a concurrent
+        eviction + reallocation would, before delegating to the real
+        implementation."""
+        import mlx.core as mx
+
+        tokens = list(range(8))  # 2 full blocks at block_size=4
+        keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        values = (keys + 100).astype(mx.float32)
+        cache_data = [{"state": (keys, values), "cache_type": "KVCache",
+                       "class_name": "KVCache"}]
+
+        table = prefix_cache.store_cache("req-store", tokens, cache_data)
+        assert table is not None
+        assert len(table.block_ids) == 2
+        prefix_cache.clear_request_entry("req-store")
+
+        second_block_id = table.block_ids[1]
+        second_block = prefix_cache.paged_cache.allocated_blocks[second_block_id]
+        paged_cache = prefix_cache.paged_cache
+        real_acquire = paged_cache.acquire_cached_block
+
+        def racy_acquire(block_id, expected_hash):
+            if block_id == second_block_id:
+                # Concurrent eviction + reallocation lands here, between
+                # find_shared_prefix's lookup and this acquire.
+                second_block.block_hash = b"reassigned-to-other-content__"
+            return real_acquire(block_id, expected_hash)
+
+        paged_cache.acquire_cached_block = racy_acquire
+        try:
+            hit_table, remaining = prefix_cache.fetch_cache("req-fetch", tokens)
+        finally:
+            paged_cache.acquire_cached_block = real_acquire
+
+        # Chain stops at the first mismatch: only the still-valid first
+        # block is returned, never the reassigned second block.
+        assert hit_table is not None
+        assert hit_table.block_ids == [table.block_ids[0]]
+        assert remaining == tokens[4:]
 
     def test_exact_prefix_survives_ssd_manager_restart(self, tmp_path):
         """An exact static prefix includes its partial terminal block on SSD."""
@@ -1283,10 +1329,15 @@ class TestArraysCacheLastBlockOnly:
             paged_cache_manager=paged_cache,
         )
 
-    def test_extract_block_arrays_cache_last_block_stores_full_state(
+    def test_extract_block_arrays_cache_last_block_without_snapshot_is_placeholder(
         self, prefix_cache, mx
     ):
-        """Last block should store the full ArraysCache state."""
+        """A1 fix: is_last_block alone no longer justifies storing live
+        ArraysCache state -- store_cache's last FULL block may sit behind
+        trailing tokens the live state has already ingested (skipped
+        partial block), so a missing boundary snapshot falls to the
+        placeholder even on the last block. See
+        docs/qwen35-hardening-and-optimization.md A1."""
         conv_state = mx.ones((1, 3, 64))
         ssm_state = mx.ones((1, 32, 128, 128))
         cache_data = [
@@ -1308,9 +1359,43 @@ class TestArraysCacheLastBlockOnly:
         assert result is not None
         assert len(result) == 1
         keys, values = result[0]
-        # Should be full state, not placeholder
+        assert keys.shape == (1,)
+        assert values.shape == (1,)
+
+    def test_extract_block_arrays_cache_last_block_with_snapshot_stores_it(
+        self, prefix_cache, mx
+    ):
+        """With a matching boundary snapshot, the last block stores real
+        state -- sourced from the snapshot, never from live cache_data."""
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        cache_data = [
+            {
+                "state": (conv_state, ssm_state),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+        snapshot_conv_state = mx.zeros((1, 3, 64))
+        snapshot_ssm_state = mx.zeros((1, 32, 128, 128))
+        snapshot_cache_data = [
+            {"state": (snapshot_conv_state, snapshot_ssm_state)},
+        ]
+
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data,
+            0,
+            4,
+            model_cache_config=None,
+            is_last_block=True,
+            snapshot_cache_data=snapshot_cache_data,
+        )
+
+        assert result is not None
+        keys, values = result[0]
         assert keys.shape == (1, 3, 64)
         assert values.shape == (1, 32, 128, 128)
+        assert bool((keys == snapshot_conv_state).all().item())
 
     def test_extract_block_arrays_cache_non_last_block_stores_placeholder(
         self, prefix_cache, mx
@@ -1396,8 +1481,9 @@ class TestArraysCacheLastBlockOnly:
         assert len(result) == 2
         # KVCache layer should be sliced
         assert result[0][0].shape[2] == 4
-        # ArraysCache layer should have full state
-        assert result[1][0].shape == (1, 3, 64)
+        # ArraysCache layer: placeholder, no snapshot provided (A1 fix --
+        # is_last_block alone is not enough, see the test above)
+        assert result[1][0].shape == (1,)
 
     def test_reconstruct_arrays_cache_partial_match_returns_none(
         self, prefix_cache, mx
@@ -1582,10 +1668,17 @@ class TestArraysCacheLastBlockOnly:
         assert stats.last_partial_tokens_skipped == 2
         assert stats.last_tokens_to_next_block == 2
 
-    def test_store_cache_arrayscache_partial_trailing_uses_last_full_block_state(
+    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(
         self, mx
     ):
-        """ArraysCache with trailing partial tokens stores only full blocks safely."""
+        """A1 regression: 7 tokens / block_size=4 stores 1 full block (4
+        tokens) and skips 3 trailing partial tokens -- but the ArraysCache
+        conv/ssm state passed in is the LIVE state after all 7 tokens, not
+        just the first 4. Storing it as this block's boundary state would
+        make a later restore replay tokens 4-6 against a state that has
+        already seen them (silent GDN corruption). Without a boundary
+        snapshot, this must store a placeholder instead.
+        See docs/qwen35-hardening-and-optimization.md A1."""
         from omlx.cache.hybrid_cache import ModelCacheConfig
 
         block_size = 4
@@ -1634,6 +1727,69 @@ class TestArraysCacheLastBlockOnly:
 
         saved_data = mock_ssd.save_block.call_args.kwargs["cache_data"]
         saved_conv_state, saved_ssm_state = saved_data[0]
+        assert saved_conv_state.shape == (1,)  # placeholder, not live state
+        assert saved_ssm_state.shape == (1,)
+
+    def test_store_cache_arrayscache_exact_multiple_stores_live_state(self, mx):
+        """A1 companion case: 8 tokens / block_size=4 has NO trailing
+        partial tokens skipped -- the live ArraysCache state genuinely IS
+        this (only, last) block's boundary state, so live_state_at_true_end
+        lets it be stored directly instead of a placeholder. Distinguishes
+        this safe case from the unsafe partial-trailing case above.
+        See docs/qwen35-hardening-and-optimization.md A1."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # 8 tokens = 2 full blocks (4+4), no trailing partial.
+        tokens = list(range(8))
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        cache_data = [
+            {
+                "state": (conv_state, ssm_state),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            }
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["ArraysCache"], model_name="test-model"
+        )
+
+        result = cache.store_cache(
+            "req-002",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+        )
+
+        assert result is not None
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 8
+        assert mock_ssd.save_block.call_count == 2
+
+        # Block 0 (non-last): placeholder regardless.
+        block0_data = mock_ssd.save_block.call_args_list[0].kwargs["cache_data"]
+        assert block0_data[0][0].shape == (1,)
+
+        # Block 1 (last, no trailing partial skipped): live state stored.
+        block1_data = mock_ssd.save_block.call_args_list[1].kwargs["cache_data"]
+        saved_conv_state, saved_ssm_state = block1_data[0]
         assert saved_conv_state.shape == conv_state.shape
         assert saved_ssm_state.shape == ssm_state.shape
 
@@ -1673,6 +1829,58 @@ class TestArraysCacheLastBlockOnly:
         assert stats.partial_tokens_skipped == 3
         assert stats.last_partial_tokens_skipped == 3
         assert stats.last_tokens_to_next_block == 1
+
+    def test_store_cache_degrades_gracefully_when_out_of_blocks(self, mx, caplog):
+        """F3: handle_memory_pressure/evict_lru_blocks were removed --
+        they only ever recycled blocks already in the free queue (ref_count
+        == 0), never anything held by a live request, so they could never
+        gain capacity beyond what a bare retry already sees. Confirm the
+        simplified retry-once-then-give-up path still degrades gracefully
+        (keeps the valid prefix, logs a warning, doesn't raise) when
+        allocation genuinely has nothing left to give.
+        See docs/qwen35-hardening-and-optimization.md F3."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+        )
+
+        # 8 tokens = 2 full blocks; force the underlying allocator to
+        # simulate genuinely running out of blocks after the first one.
+        tokens = list(range(8))
+        keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        values = (keys + 100).astype(mx.float32)
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        real_allocate = paged_cache.allocate_block
+        call_index = {"n": 0}
+
+        def flaky_allocate():
+            call_index["n"] += 1
+            if call_index["n"] > 1:
+                return None
+            return real_allocate()
+
+        with patch.object(paged_cache, "allocate_block", flaky_allocate):
+            with caplog.at_level(logging.WARNING):
+                result = cache.store_cache("req-out-of-blocks", tokens, cache_data)
+
+        assert result is not None
+        assert len(result.block_ids) == 1
+        assert result.num_tokens == 4
+        assert any(
+            "Cannot allocate block for req-out-of-blocks" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_store_cache_exact_multiple_creates_all_blocks(self, mx):
         """Tokens exactly divisible by block_size should create all blocks."""
@@ -1976,6 +2184,140 @@ class TestArraysCacheLastBlockOnly:
         assert fetched_partial.num_tokens == 8
         assert remaining_partial == tokens[8:12]
 
+    def test_store_cache_rejects_block_whose_slice_length_disagrees_with_token_count(
+        self, mx
+    ):
+        """A3: a bug anywhere upstream of _extract_block_tensor_slice (wrong
+        start/end indices, a stale cache_data snapshot, etc.) could silently
+        produce a sliced tensor whose sequence length doesn't match the
+        block's own token_count -- persisting that would corrupt a later
+        restore with no error until it's replayed. Simulate such a bug by
+        monkeypatching _extract_block_tensor_slice to return a 3-token
+        slice for what store_cache believes is a 4-token block, and confirm
+        the block is rejected (not persisted) while the valid prefix before
+        it survives -- the same discipline test_store_cache_keeps_valid_
+        prefix_when_later_ssd_save_fails already establishes for SSD
+        write failures.
+        See docs/qwen35-hardening-and-optimization.md A3."""
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        tokens = list(range(8))  # 2 full blocks
+        keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        values = (keys + 100).astype(mx.float32)
+        cache_data = [
+            {"state": (keys, values), "cache_type": "KVCache", "class_name": "KVCache"}
+        ]
+
+        original_extract = cache._extract_block_tensor_slice
+        call_index = {"n": 0}
+
+        def buggy_extract(*args, **kwargs):
+            call_index["n"] += 1
+            result = original_extract(*args, **kwargs)
+            if call_index["n"] == 2:
+                # Simulate an upstream indexing bug on the second block:
+                # truncate to 3 tokens instead of the real 4.
+                bad_keys, bad_values = result[0]
+                result = [(bad_keys[:, :, :3, :], bad_values[:, :, :3, :])]
+            return result
+
+        with patch.object(cache, "_extract_block_tensor_slice", buggy_extract):
+            result = cache.store_cache("req-mismatch", tokens, cache_data)
+
+        assert result is not None
+        # Only the first (correct) block is kept; the mismatched second
+        # block is rejected, not persisted.
+        assert len(result.block_ids) == 1
+        assert result.num_tokens == 4
+        assert mock_ssd.save_block.call_count == 1
+        saved_keys, saved_values = mock_ssd.save_block.call_args.kwargs["cache_data"][0]
+        assert saved_keys.tolist() == keys[:, :, 0:4, :].tolist()
+        assert saved_values.tolist() == values[:, :, 0:4, :].tolist()
+
+        # The rejected block must not linger as an allocated/hashed block.
+        allocated_non_null_ids = {
+            block.block_id
+            for block in paged_cache.allocated_blocks.values()
+            if not block.is_null
+        }
+        assert allocated_non_null_ids == set(result.block_ids)
+
+    def test_store_cache_rotating_window_state_passes_token_count_check(self, mx):
+        """The A3 length check must not reject non-sliceable layers whose
+        real state length is legitimately unrelated to token_count: the
+        aligned block size is a MULTIPLE of the rotating window (e.g.
+        window 128 -> block 512), so a rotating layer's last-block window
+        state is shorter than the block's token span by design."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        # 8 tokens = 2 full blocks, no trailing partial (live state at true
+        # end). Window 2, block 4 = 2x window, as production alignment
+        # produces.
+        tokens = list(range(8))
+        window = 2
+        rot_keys = mx.ones((1, 8, window, 64))
+        rot_values = mx.ones((1, 8, window, 64))
+        cache_data = [
+            {
+                "state": (rot_keys, rot_values),
+                "cache_type": "RotatingKVCache",
+                "class_name": "RotatingKVCache",
+                "meta_state": (0, window, 8, 0),
+            }
+        ]
+        model_cache_config = ModelCacheConfig.from_type_list(
+            ["RotatingKVCache"], model_name="test-model"
+        )
+
+        result = cache.store_cache(
+            "req-rot",
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+        )
+
+        assert result is not None
+        # Both blocks survive: block 0 = placeholder, block 1 (last) = the
+        # real rotating window state, its window-length shape intact.
+        assert len(result.block_ids) == 2
+        assert result.num_tokens == 8
+        assert mock_ssd.save_block.call_count == 2
+        block1_data = mock_ssd.save_block.call_args_list[1].kwargs["cache_data"]
+        saved_keys, _saved_values = block1_data[0]
+        assert saved_keys.shape == (1, 8, window, 64)
+
     def test_store_cache_retry_after_partial_failure_saves_only_missing_tail(self, mx):
         """Retry should preserve valid prefix and only save the missing tail block."""
         block_size = 4
@@ -2108,7 +2450,7 @@ class TestArraysCacheLastBlockOnly:
 
         # Explicitly prove shared-hash path cannot succeed in this fixture.
         assert paged_cache._paged_ssd_cache_manager is None
-        shared_block_ids, _ = paged_cache.find_shared_prefix(tokens)
+        shared_block_ids, _, _ = paged_cache.find_shared_prefix(tokens)
         assert shared_block_ids == []
 
         expected_ids = retry_result.block_ids.copy()

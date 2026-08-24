@@ -498,6 +498,8 @@
   "settings.advanced.cache": "缓存",
   "settings.advanced.initial_cache_blocks": "初始缓存块数",
   "settings.advanced.initial_cache_blocks_hint": "启动时预分配的块数。值越大，动态分配开销越小。",
+  "settings.advanced.hot_cache_write_through": "写透 Hot Cache",
+  "settings.advanced.hot_cache_write_through_hint": "块保留在 RAM 中的同时立即写入 SSD。旧会话在重启和崩溃后仍然保留，最近的会话以 RAM 速度恢复。",
   "settings.advanced.gdn_cache_policy": "GDN Cache Policy",
   "settings.advanced.gdn_cache_policy_hint": "Some models use Gated DeltaNet (GDN) recurrent layers whose state cannot be reconstructed from KV cache blocks alone. An extra state snapshot lets oMLX resume cached prompts without recomputing them.",
   "settings.advanced.gdn_snapshot_storage": "Snapshot Storage",

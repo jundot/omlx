@@ -2171,6 +2171,137 @@ class TestEnginePoolPrefillEviction:
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_prefill_releases_ane_banks_when_reclaim_is_not_enough(self):
+        """No idle victim and the pooled reclaim frees nothing, but the
+        requesting model carries ANE prefill banks -> shed them on the
+        engine thread (latching GPU fallback), then admit."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        # 45GB resident against a 40GB target with a 10GB transient: the
+        # pooled reclaim frees nothing, then shedding the banks drops the
+        # footprint to 29GB and 29 + 10 fits under the cap.
+        phys = [45 * gb]
+        scheduler = self._reclaim_scheduler(lambda: None)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="adaptive_prefill_throttle",
+        )
+
+        target_model = object()
+        released_on = []
+
+        def release(model):
+            released_on.append(model)
+            phys[0] = 29 * gb
+            return 96, 2
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            entry = self._entry(
+                "target", 25 * gb, scheduler=scheduler, executor=executor
+            )
+            entry.engine._model = target_model
+            pool._entries = {"target": entry}
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+                patch(
+                    "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+                    side_effect=release,
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        # The ladder ran in order: reclaim first, then the bank release on
+        # the requesting model itself; no model was unloaded.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        assert released_on == [target_model]
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recurring_headroom_pressure_escalates_to_bank_release(self):
+        """A long prompt refills the buffer cache continuously, so the
+        pooled reclaim can 'succeed' marginally on every pass and starve
+        the durable rung. The second pass for the same request must go
+        straight to the bank release instead of reclaiming again first."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        phys = [45 * gb]
+
+        def reclaim():
+            phys[0] = 38 * gb  # marginal: 38 + 10 fits the 49GB target
+
+        scheduler = self._reclaim_scheduler(reclaim)
+
+        def make_req():
+            return PrefillEvictionRequest(
+                request_id="req-long",
+                model_id="target",
+                current_bytes=phys[0],
+                target_cap_bytes=49 * gb,
+                predicted_transient_bytes=10 * gb,
+                requested_tokens=2048,
+                reason="adaptive_prefill_throttle",
+            )
+
+        target_model = object()
+        released_on = []
+
+        def release(model):
+            released_on.append(model)
+            phys[0] -= 13 * gb  # the banks
+            return 96, 2
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            entry = self._entry(
+                "target", 25 * gb, scheduler=scheduler, executor=executor
+            )
+            entry.engine._model = target_model
+            pool._entries = {"target": entry}
+            pool._current_model_memory = 20 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+                patch(
+                    "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+                    side_effect=release,
+                ),
+            ):
+                # Pass 1: the marginal reclaim satisfies the target check.
+                first = await pool._evict_idle_lru_for_prefill(
+                    "target", make_req()
+                )
+                # KV growth brings the pressure back on the same request.
+                phys[0] = 45 * gb
+                second = await pool._evict_idle_lru_for_prefill(
+                    "target", make_req()
+                )
+
+        assert first is True and second is True
+        # One reclaim (pass 1 only); pass 2 escalated straight to release.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        assert released_on == [target_model]
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_prefill_admits_when_reclaim_delta_is_masked(self):
         """A reclaim whose footprint delta is masked by concurrent allocation
         must not be treated as a failed reclaim: the loop re-measures with a

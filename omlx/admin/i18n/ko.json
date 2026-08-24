@@ -498,6 +498,8 @@
   "settings.advanced.cache": "캐시",
   "settings.advanced.initial_cache_blocks": "초기 캐시 블록 수",
   "settings.advanced.initial_cache_blocks_hint": "시작 시 미리 할당할 블록 수. 높을수록 동적 할당 오버헤드 감소.",
+  "settings.advanced.hot_cache_write_through": "Write-Through Hot Cache",
+  "settings.advanced.hot_cache_write_through_hint": "블록을 RAM에 유지하면서 동시에 SSD에도 즉시 기록합니다. 이전 세션은 재시작과 크래시 후에도 유지되고, 최근 세션은 RAM 속도로 복원됩니다.",
   "settings.advanced.gdn_cache_policy": "GDN 캐시 정책",
   "settings.advanced.gdn_cache_policy_hint": "일부 모델은 Gated DeltaNet(GDN) 순환 레이어를 사용하며, 이 레이어의 상태는 KV 캐시 블록만으로 복원할 수 없습니다. oMLX는 캐시된 프롬프트를 다시 계산하지 않고 이어서 처리하도록 별도의 상태 스냅샷을 저장합니다.",
   "settings.advanced.gdn_snapshot_storage": "스냅샷 저장 위치",

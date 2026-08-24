@@ -398,6 +398,16 @@ class MemoryMonitor:
         # In paged SSD-only mode, no memory to free from KV cache
         return 0
 
+    def clear_ane_prefill_transient(self) -> None:
+        """Stop reserving ANE prefill I/O surfaces after the banks are shed.
+
+        The reservation is snapshotted at load; once the runtime headroom
+        rung releases the banks the surfaces are gone, so keeping the term
+        would make every later admission pass pause for memory that can no
+        longer be reclaimed. The next load re-prices it via set_model_info.
+        """
+        self._ane_prefill_transient_bytes = 0
+
     def set_model_info(
         self,
         num_layers: int,
