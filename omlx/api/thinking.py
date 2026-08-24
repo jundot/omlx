@@ -294,11 +294,15 @@ class ThinkingParser:
         # routed to the content channel (the reasoning panel must not show raw
         # tool-call XML), and a close tag switches back to normal thinking mode.
         self._in_tool_call: bool = False
-        # Whether an open thinking tag was seen in the OUTPUT stream. A close tag
-        # seen while this is False is a premature close — the model never opened
-        # thinking — so the text that follows is still reasoning and must not
-        # leak into the content channel.
-        self._open_seen: bool = False
+        # Whether an open thinking tag was seen in the OUTPUT stream. Starts
+        # True when the prompt itself opened the thinking block
+        # (start_in_thinking): DS4 Flash prepends the open tag in the prompt, so
+        # the model never re-emits it and a later close tag is a LEGITIMATE close
+        # ending that block — the text that follows is the answer, not reasoning.
+        # A close tag seen while this is False means the model never opened
+        # thinking (a true premature close), so the text that follows is still
+        # untagged reasoning and must not leak into the content channel.
+        self._open_seen: bool = start_in_thinking
         # DS4-style second-reasoning guard. When thinking mode is expected and
         # tools are present, text that arrives after the close tag is held until
         # a tool call or a second close tag decides the channel. DeepSeek V4
@@ -402,6 +406,12 @@ class ThinkingParser:
                         # (DeepSeek V4 often emits reasoning after the close
                         # without re-opening thinking) or the answer. Hold it
                         # until a tool call or a second close decides the channel.
+                        #
+                        # ``_open_seen`` already accounts for a block opened by
+                        # the prompt (start_in_thinking), so a close after real
+                        # reasoning is legitimate: the held text resolves to the
+                        # answer at finish(). Only a close with no open tag and
+                        # no prompt-side thinking is a true premature close.
                         self._in_thinking = False
                         self._close_seen = True
                         self._in_guard = True

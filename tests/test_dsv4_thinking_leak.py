@@ -324,13 +324,40 @@ class TestPrematureCloseSecondReasoningGuard:
         assert "trace" in "".join(tacc)  # reasoning stayed in the thinking channel
 
     def test_premature_close_reasoning_no_tool_holds_until_finish(self):
-        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        # A TRUE premature close — the model closes with no thinking block open
+        # (start_in_thinking=False and no open tag in the output). The held text
+        # is untagged reasoning and must stay in the thinking channel.
+        parser = ThinkingParser(start_in_thinking=False, guard_second_reasoning=True)
         t, c = parser.feed(CLOSE)
         t2, c2 = parser.feed("reasoning text")
         tf, cf = parser.finish(finish_reason="stop", has_tools=True)
         assert t2 == ""  # held
         assert "".join((t, t2, tf)) == "reasoning text"  # stays in thinking
         assert cf == ""
+
+    def test_start_in_thinking_answer_after_close_is_content(self):
+        # Regression (PR#3048-style agent turn): DS4 Flash prepends <thinking>
+        # in the prompt (start_in_thinking=True) and does NOT re-emit the open
+        # tag in the output. After real reasoning the model closes the block and
+        # then answers. The close is LEGITIMATE — the answer that follows must be
+        # content, never swallowed into the thinking panel. Without this guard
+        # the close was mislabelled premature and the answer was dumped into
+        # thinking, leaving an empty visible body (session appeared interrupted).
+        parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=True)
+        tacc, cacc = [], []
+        for chunk in ["deep reasoning body", CLOSE, "the final answer"]:
+            td, cd = parser.feed(chunk)
+            if td:
+                tacc.append(td)
+            if cd:
+                cacc.append(cd)
+        tf, cf = parser.finish(finish_reason="stop", has_tools=True)
+        if tf:
+            tacc.append(tf)
+        if cf:
+            cacc.append(cf)
+        assert "".join(tacc) == "deep reasoning body"
+        assert "".join(cacc) == "the final answer"
 
     def test_normal_sequence_guard_off_still_separates(self):
         parser = ThinkingParser(start_in_thinking=True, guard_second_reasoning=False)
