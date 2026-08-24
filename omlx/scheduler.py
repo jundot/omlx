@@ -6086,14 +6086,7 @@ class Scheduler:
             logits_processors.append(suppress_processor)
 
         # Add thinking budget processor for reasoning models
-        if (
-            sampling_params.thinking_budget is not None
-            and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
-        ):
+        if sampling_params.thinking_budget is not None and request is not None:
             think_end_ids = self._resolve_think_end_token_ids()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
