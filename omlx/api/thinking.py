@@ -272,7 +272,9 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self, start_in_thinking: bool = False):
+    def __init__(
+        self, start_in_thinking: bool = False, guard_second_reasoning: bool = False
+    ):
         self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
         # Recovery state for malformed thinking: when the prompt prepends
@@ -292,6 +294,29 @@ class ThinkingParser:
         # routed to the content channel (the reasoning panel must not show raw
         # tool-call XML), and a close tag switches back to normal thinking mode.
         self._in_tool_call: bool = False
+        # Whether an open thinking tag was seen in the OUTPUT stream. A close tag
+        # seen while this is False is a premature close — the model never opened
+        # thinking — so the text that follows is still reasoning and must not
+        # leak into the content channel.
+        self._open_seen: bool = False
+        # DS4-style second-reasoning guard. When thinking mode is expected and
+        # tools are present, text that arrives after the close tag is held until
+        # a tool call or a second close tag decides the channel. DeepSeek V4
+        # often emits a SECOND reasoning pass after the close tag without
+        # re-opening thinking, so the held text is reasoning in both resolutions:
+        # a second close ends that second pass (reasoning), and a tool call
+        # starting before a second close means the held text is the reasoning
+        # that preceded it. This mirrors ds4-server's ``guard_second_reasoning``
+        # and prevents the intermittent "reasoning leaked into visible content"
+        # regression.
+        self._guard_second_reasoning: bool = guard_second_reasoning
+        self._held_text: List[str] = []
+        self._in_guard: bool = False
+        # Whether the guard was entered from a PREMATURE close (no open tag was
+        # seen before the close). A premature close means the held text is always
+        # untagged reasoning; a legitimate close means it is a second reasoning
+        # pass or the answer. Only the end-of-stream case needs the distinction.
+        self._guard_from_premature_close: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -309,6 +334,43 @@ class ThinkingParser:
         text = self._buffer + text
         self._buffer = ""
 
+        # In DS4 second-reasoning guard mode: hold text until a tool call or a
+        # second close tag decides the channel. After the close tag DeepSeek V4
+        # sometimes emits ANOTHER reasoning pass ("second reasoning" behaviour):
+        # the text between the first and the second close is reasoning and must
+        # stay in the thinking channel. A tool call starting before the second
+        # close means the held text is the reasoning that preceded it — a
+        # premature close never opens thinking, and the model's untagged second
+        # pass always precedes its tool calls, so it can never be the answer.
+        # Mirrors ds4-server's guard_second_reasoning.
+        resolved_reasoning = ""
+        if self._in_guard:
+            self._held_text.append(text)
+            combined = "".join(self._held_text)
+            tool_idx = self._find_tool_start(combined)
+            close_idx = combined.find(_CLOSE_TAG)
+            if close_idx >= 0 and (tool_idx < 0 or close_idx < tool_idx):
+                # A second close appears before a tool call: the held text is
+                # the second reasoning pass. Emit it as thinking, then continue
+                # processing whatever follows the second close normally (the
+                # answer, or a tool envelope).
+                resolved_reasoning = combined[:close_idx]
+                text = combined[close_idx + _CLOSE_LEN :]
+                self._held_text = []
+                self._in_guard = False
+            elif tool_idx >= 0 and (close_idx < 0 or tool_idx < close_idx):
+                # A tool call starts before a second close: the held text is
+                # reasoning (whether the guard came from a premature close or a
+                # legitimate close). Route it to the thinking channel and leave
+                # the tool envelope for the content channel.
+                reasoning = combined[:tool_idx]
+                self._held_text = []
+                self._in_guard = False
+                return (reasoning, combined[tool_idx:])
+            else:
+                # Neither a tool start nor a second close yet: keep holding.
+                return ("", "")
+
         thinking_out = []
         content_out = []
 
@@ -321,16 +383,32 @@ class ThinkingParser:
                 # Try to match <think>
                 if remaining.startswith(_OPEN_TAG):
                     self._in_thinking = True
+                    self._open_seen = True
                     i += _OPEN_LEN
                     continue
 
                 if remaining.startswith(_HY3_OPEN_TAG):
                     self._in_thinking = True
+                    self._open_seen = True
                     i += len(_HY3_OPEN_TAG)
                     continue
 
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
+                    if self._guard_second_reasoning:
+                        # Enter the DS4 second-reasoning guard after ANY close tag
+                        # (premature or legitimate). The close ends thinking; the
+                        # text that follows may be a second reasoning pass
+                        # (DeepSeek V4 often emits reasoning after the close
+                        # without re-opening thinking) or the answer. Hold it
+                        # until a tool call or a second close decides the channel.
+                        self._in_thinking = False
+                        self._close_seen = True
+                        self._in_guard = True
+                        self._guard_from_premature_close = not self._open_seen
+                        self._held_text.append(text[i + _CLOSE_LEN :])
+                        i = len(text)
+                        break
                     self._in_thinking = False
                     self._close_seen = True
                     i += _CLOSE_LEN
@@ -385,21 +463,43 @@ class ThinkingParser:
 
         thinking_delta = "".join(thinking_out)
         content_delta = "".join(content_out)
+        if resolved_reasoning:
+            self._thinking_accumulated.append(resolved_reasoning)
         if thinking_delta:
             self._thinking_accumulated.append(thinking_delta)
         if content_delta:
             self._content_emitted = True
-        return (thinking_delta, content_delta)
+        return (resolved_reasoning + thinking_delta, content_delta)
 
-    def finish(self) -> Tuple[str, str]:
+    def finish(
+        self,
+        finish_reason: str | None = None,
+        has_tools: bool = False,
+    ) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
         Also recovers from malformed thinking — when the model never
-        emitted ``</think>`` and no content was ever produced, returns
+        emitted the close tag and no content was ever produced, returns
         the accumulated thinking text as content so the client surfaces
         a non-empty answer body.
+
+        The recovery is gated by three independent signals so that a chain of
+        thought can never leak into the visible body when the turn is a tool
+        invocation or was truncated:
+
+        * ``finish_reason`` — only a normal stop (or unknown) may recover; a
+          ``length``/truncated or aborted turn is never an answer and stays
+          in the thinking channel.
+        * ``has_tools`` — a request that supplied tools is a tool-call turn; its
+          reasoning must not be re-emitted as content.
+        * ``_tool_block_seen`` — a DSML tool-call envelope was emitted, so the
+          output is a tool invocation regardless of the request shape.
+
+        Args:
+            finish_reason: The engine stop reason ("stop", "length", "abort", ...).
+            has_tools: Whether the request carried tool definitions.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -408,19 +508,55 @@ class ThinkingParser:
         partial = self._buffer
         self._buffer = ""
 
+        # DS4 second-reasoning guard still holding at end of stream. A second
+        # close tag or a tool call in the held text decides the split: reasoning
+        # before the second close (or before the tool start) stays in the
+        # thinking channel. With no tool and no second close, a premature-close
+        # guard's held text is untagged reasoning (never an answer) and must not
+        # leak into the content channel; a legitimate-close guard's held text is
+        # the final answer (content).
+        if self._in_guard:
+            combined = "".join(self._held_text) + partial
+            self._held_text = []
+            self._in_guard = False
+            tool_idx = self._find_tool_start(combined)
+            close_idx = combined.find(_CLOSE_TAG)
+            if close_idx >= 0 and (tool_idx < 0 or close_idx < tool_idx):
+                # A second close appears before a tool call: the held text is the
+                # second reasoning pass, and whatever follows the second close is
+                # the answer (content).
+                reasoning = combined[:close_idx]
+                rest = combined[close_idx + _CLOSE_LEN :]
+                self._content_emitted = True
+                return (reasoning, rest)
+            if tool_idx >= 0 and (close_idx < 0 or tool_idx < close_idx):
+                # A tool call before a second close: held text is reasoning.
+                return (combined[:tool_idx], combined[tool_idx:])
+            if self._guard_from_premature_close:
+                # Premature close: the held text is untagged reasoning, never an
+                # answer — keep it in the thinking channel.
+                return (combined, "")
+            # Legitimate close with no tool and no second close: the held text is
+            # the final answer.
+            self._content_emitted = True
+            return ("", combined)
+
         # Recovery: prompt opened a thinking block (or model echoed
-        # ``<think>`` itself), the close tag never arrived, and nothing
+        # the open tag itself), the close tag never arrived, and nothing
         # ever streamed as content. Re-emit the accumulated thinking text
         # as content so the answer body is not empty. The thinking events
         # already streamed live cannot be retracted, so the client sees
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
         #
-        # A DS4 tool invocation disables this recovery: the output is a tool
-        # call, so reasoning must stay in the thinking channel and never leak
-        # into the visible body.
+        # A tool invocation disables this recovery: the output is a tool call,
+        # so reasoning must stay in the thinking channel and never leak into
+        # the visible body. A truncated or aborted turn is likewise never a
+        # finished answer.
         if (
-            not self._tool_block_seen
+            finish_reason in (None, "stop")
+            and not has_tools
+            and not self._tool_block_seen
             and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
@@ -440,6 +576,20 @@ class ThinkingParser:
         else:
             self._content_emitted = True
             return ("", partial)
+
+    @staticmethod
+    def _find_tool_start(text: str) -> int:
+        """Find the start index of the first DS4 DSML tool-call envelope.
+
+        Used by the second-reasoning guard to split held text between the
+        thinking channel (reasoning before the tool start) and the content
+        channel (the tool invocation itself).
+        """
+        idx = text.find(_DSML_OPEN_TAG)
+        if idx >= 0:
+            return idx
+        idx = text.find("<invoke name=")
+        return idx if idx >= 0 else -1
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:
