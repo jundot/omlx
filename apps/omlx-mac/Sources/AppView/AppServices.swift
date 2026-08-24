@@ -19,6 +19,9 @@ final class AppServices: NSObject {
     /// PR 8 — when non-nil, the AppView swaps the Models screen for the
     /// per-model ModelSettingsScreen drilled to this id.
     var modelDetailID: String?
+    /// Drives the app-wide fixed-memory launch sheet. Menubar and Models use
+    /// this same route, so neither can start a model without preflight.
+    var modelLaunchTarget: ModelLaunchTarget?
     /// When set, AppView pulls the sidebar selection to this section on
     /// the next runloop tick and clears the request. Lets a screen
     /// imperatively navigate the user (e.g. the Profiles tab's

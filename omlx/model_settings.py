@@ -85,6 +85,8 @@ class ModelSettings:
 
     Attributes:
         max_context_window: Maximum prompt token count before rejection (None = use global default).
+        fixed_kv_cache_enabled: Reserve the full configured KV cache when this
+            model loads. None inherits the server default, which is enabled.
         max_tokens: Maximum number of tokens to generate (None = use global default).
         temperature: Sampling temperature (None = use global default).
         top_p: Nucleus sampling probability (None = use global default).
@@ -186,6 +188,10 @@ class ModelSettings:
 
     # Sampling parameters (None means use global default)
     max_context_window: Optional[int] = None
+    # Per-model override for launch-time fixed KV allocation. None preserves
+    # compatibility with settings files written before this option existed and
+    # inherits the enabled server default.
+    fixed_kv_cache_enabled: Optional[bool] = None
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None

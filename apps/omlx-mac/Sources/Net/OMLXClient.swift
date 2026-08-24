@@ -128,6 +128,13 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.models)
     }
 
+    func getModelMemoryEstimate(id: String, contextWindow: Int? = nil) async throws -> ModelMemoryDTO {
+        let query = contextWindow.map {
+            [URLQueryItem(name: "max_context_window", value: String($0))]
+        } ?? []
+        return try await get(AdminAPI.modelMemoryEstimate(id), query: query)
+    }
+
     @discardableResult
     func loadModel(id: String) async throws -> SimpleStatusResponse {
         try await postEmpty(AdminAPI.loadModel(id))
@@ -554,6 +561,11 @@ final class OMLXClient: ObservableObject {
         guard let url = components.url else { throw OMLXClientError.invalidURL }
 
         var req = URLRequest(url: url)
+        if method == "POST", path.hasSuffix("/load") {
+            // Loading weights and materializing a large fixed KV pool can take
+            // longer than the ordinary admin request timeout.
+            req.timeoutInterval = 600
+        }
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil {

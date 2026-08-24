@@ -302,7 +302,9 @@ def maybe_capture(
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return
-        ctx = _PrimeCtx(mtp_cache=host.make_mtp_cache())
+        from . import make_mtp_cache
+
+        ctx = _PrimeCtx(mtp_cache=make_mtp_cache(host, cache))
         if not ctx.mtp_cache:
             return
         setattr(host, _CTX_ATTR, ctx)

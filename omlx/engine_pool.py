@@ -18,7 +18,8 @@ import gc
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from collections.abc import Mapping
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -48,9 +49,15 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
+from .fixed_kv_memory import (
+    ModelMemoryPlan,
+    estimate_model_memory,
+    validate_fixed_kv_runtime_features,
+)
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
+from .utils.psutil_compat import virtual_memory
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +206,9 @@ class EngineEntry:
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
+    # Additive launch/committed breakdown. Kept out of legacy estimated_size
+    # and actual_size so existing API consumers retain their old meanings.
+    memory: ModelMemoryPlan | dict | None = None
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -358,6 +368,177 @@ class EnginePool:
                 entry.model_id,
             )
         return base + extra
+
+    def _fixed_kv_allocation_sizes(
+        self,
+        entry: EngineEntry,
+        runtime_settings: object | None,
+        *,
+        force_lm: bool = False,
+    ) -> tuple[int, int]:
+        """Return the weight and other-fixed charges used by fixed planning.
+
+        The admin preview calls this same helper, so CPU-share storage and the
+        text-only VLM weight path cannot diverge between preview and launch.
+        """
+
+        deployment = self._distributed_deployment_for_entry(entry)
+        weights_bytes = self._entry_resident_size(entry)
+        if (
+            deployment is None
+            and entry.text_only_size
+            and (force_lm or entry.engine_type == "batched")
+        ):
+            weights_bytes = entry.text_only_size
+        resident_bytes = self._entry_runtime_resident_size(
+            entry,
+            runtime_settings,
+            base_size=weights_bytes,
+        )
+        return weights_bytes, max(0, resident_bytes - weights_bytes)
+
+    def _fixed_kv_context_window(
+        self,
+        entry: EngineEntry,
+        runtime_settings: object | None,
+    ) -> int:
+        """Resolve the same launch context precedence used by the server."""
+        explicit = (
+            runtime_settings.get("max_context_window")
+            if isinstance(runtime_settings, Mapping)
+            else getattr(runtime_settings, "max_context_window", None)
+        )
+        native = _positive_int(entry.model_context_length)
+        if explicit is not None:
+            context = _positive_int(explicit)
+            if context <= 0:
+                raise ModelUnavailableError(
+                    entry.model_id,
+                    "max_context_window must be a positive token count",
+                )
+            if native and context > native:
+                raise ModelUnavailableError(
+                    entry.model_id,
+                    f"configured context {context:,} exceeds the model limit "
+                    f"of {native:,} tokens; choose {native:,} or fewer",
+                )
+            return context
+
+        if native:
+            policy = _positive_int(
+                getattr(self._scheduler_config, "default_context_window_policy", 0)
+            )
+            return min(native, policy) if policy else native
+
+        fallback = _positive_int(
+            getattr(self._scheduler_config, "default_context_window", 32768)
+        )
+        if fallback <= 0:
+            raise ModelUnavailableError(
+                entry.model_id,
+                "no positive context window is configured for fixed KV allocation",
+            )
+        return fallback
+
+    def _fixed_kv_launch_budget(
+        self, entry: EngineEntry
+    ) -> tuple[int | None, int | None]:
+        """Return available-memory snapshot and remaining process ceiling."""
+        reclaimable = sum(
+            self._entry_resident_size(candidate)
+            for candidate in self._entries.values()
+            if candidate is not entry
+            and candidate.engine is not None
+            and not candidate.is_pinned
+            and candidate.in_use <= 0
+            and not self._entry_has_active_requests(candidate)
+        )
+        try:
+            available = int(virtual_memory().available)
+            if available <= 0:
+                available = None
+            else:
+                available += reclaimable
+        except Exception:
+            available = None
+
+        ceiling = self._current_ceiling()
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+        if ceiling > 0:
+            current = max(
+                int(mx.get_active_memory()),
+                int(get_phys_footprint()),
+                int(self._current_model_memory),
+            )
+            ceiling_budget = max(0, int(ceiling) - current + reclaimable)
+        else:
+            ceiling_budget = None
+        return available, ceiling_budget
+
+    def _plan_fixed_kv_memory(
+        self,
+        entry: EngineEntry,
+        runtime_settings: object | None,
+        *,
+        weights_bytes: int,
+        other_fixed_bytes: int,
+    ) -> ModelMemoryPlan:
+        """Build the immutable launch plan used by admission and allocation."""
+        try:
+            validate_fixed_kv_runtime_features(
+                runtime_settings,
+                distributed=(
+                    self._distributed_deployment_for_entry(entry) is not None
+                ),
+            )
+        except ValueError as exc:
+            raise ModelUnavailableError(entry.model_id, str(exc)) from exc
+
+        context = self._fixed_kv_context_window(entry, runtime_settings)
+        available, ceiling_budget = self._fixed_kv_launch_budget(entry)
+        native_mtp_enabled = bool(
+            runtime_settings.get("mtp_enabled", False)
+            if isinstance(runtime_settings, dict)
+            else getattr(runtime_settings, "mtp_enabled", False)
+        )
+        try:
+            plan = estimate_model_memory(
+                entry.model_path,
+                context,
+                weights_bytes=weights_bytes,
+                other_fixed_bytes=other_fixed_bytes,
+                requested_session_slots=max(1, int(self._scheduler_config.max_num_seqs)),
+                available_memory_bytes=available,
+                memory_ceiling_bytes=ceiling_budget,
+                prefill_step_size=max(
+                    1,
+                    int(self._scheduler_config.prefill_step_size),
+                ),
+                native_mtp_enabled=native_mtp_enabled,
+            )
+        except ValueError as exc:
+            raise ModelUnavailableError(entry.model_id, str(exc)) from exc
+
+        native_limit = _positive_int(entry.model_context_length)
+        if native_limit and plan.model_context_limit != native_limit:
+            plan = replace(plan, model_context_limit=native_limit)
+
+        if plan.reserved_session_slots <= 0:
+            binding = plan.binding_memory_bytes or 0
+            raise InsufficientMemoryError(
+                required=weights_bytes + other_fixed_bytes + plan.per_session_kv_bytes,
+                current=max(mx.get_active_memory(), get_phys_footprint()),
+                message=(
+                    f"Cannot launch {entry.model_id} with a {context:,}-token fixed "
+                    f"KV slot: weights use {format_size(weights_bytes)}, other fixed "
+                    f"allocations use {format_size(other_fixed_bytes)}, and one cache "
+                    f"slot needs {format_size(plan.per_session_kv_bytes)}, but the "
+                    f"current launch budget is {format_size(binding)}. Free memory, "
+                    "lower the context window, or choose a smaller model."
+                ),
+            )
+        return plan
 
     @property
     def current_model_memory(self) -> int:
@@ -647,6 +828,19 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
+        fixed_kv_active = self._fixed_kv_cache_enabled(settings)
+        add("fixed_kv_cache_enabled", fixed_kv_active)
+
+        # A context edit changes the physical fixed pool and must never reuse
+        # an engine whose rows were reserved for a different capacity.
+        if fixed_kv_active and entry is not None and not is_diffusion:
+            try:
+                effective_context = self._fixed_kv_context_window(entry, settings)
+            except ModelUnavailableError:
+                effective_context = data.get("max_context_window")
+            add("fixed_kv_context_window", effective_context)
+            add("fixed_kv_requested_session_slots", self._scheduler_config.max_num_seqs)
+
         return tuple(signature)
 
     @property
@@ -767,6 +961,21 @@ class EnginePool:
     def _entry_is_diffusion_model(entry: EngineEntry) -> bool:
         model_type = (entry.config_model_type or "").lower().replace("-", "_")
         return model_type == "diffusion_gemma"
+
+    def _fixed_kv_cache_enabled(self, settings: object | None) -> bool:
+        """Resolve the global fixed-cache switch plus one model override.
+
+        Older settings records have no per-model field. Missing or null values
+        therefore inherit the server default instead of disabling the feature.
+        """
+
+        if not bool(self._scheduler_config.fixed_kv_cache_enabled):
+            return False
+        if isinstance(settings, dict):
+            override = settings.get("fixed_kv_cache_enabled")
+        else:
+            override = getattr(settings, "fixed_kv_cache_enabled", None)
+        return True if override is None else bool(override)
 
     def apply_settings_overrides(
         self, settings_manager: "ModelSettingsManager"
@@ -1488,23 +1697,63 @@ class EnginePool:
             # admit that path by the text-only estimate instead of the
             # vision-inclusive file size (#2385).
             deployment = self._distributed_deployment_for_entry(entry)
-            admission_size = self._entry_resident_size(entry)
-            if (
-                deployment is None
-                and entry.text_only_size
-                and (force_lm or entry.engine_type == "batched")
-            ):
-                admission_size = entry.text_only_size
             admission_settings = runtime_settings
             if admission_settings is None and self._settings_manager is not None:
                 get_settings = getattr(self._settings_manager, "get_settings", None)
                 if callable(get_settings):
                     admission_settings = get_settings(model_id)
-            admission_size = self._entry_runtime_resident_size(
-                entry,
-                admission_settings,
-                base_size=admission_size,
+            base_resident_size, other_fixed_bytes = (
+                self._fixed_kv_allocation_sizes(
+                    entry,
+                    admission_settings,
+                    force_lm=force_lm,
+                )
             )
+            admission_size = base_resident_size + other_fixed_bytes
+            fixed_plan: ModelMemoryPlan | None = None
+            uses_text_cache = (
+                self._fixed_kv_cache_enabled(admission_settings)
+                and (force_lm or entry.engine_type in {"batched", "vlm"})
+                and not (
+                    entry.engine_type == "vlm"
+                    and not force_lm
+                    and self._entry_is_diffusion_model(entry)
+                )
+            )
+            if uses_text_cache:
+                fixed_plan = self._plan_fixed_kv_memory(
+                    entry,
+                    admission_settings,
+                    weights_bytes=base_resident_size,
+                    other_fixed_bytes=other_fixed_bytes,
+                )
+                admission_size = fixed_plan.estimated_total_bytes
+                entry.memory = fixed_plan
+                self._scheduler_config.fixed_kv_cache_context_window = (
+                    fixed_plan.context_window
+                )
+                self._scheduler_config.fixed_kv_cache_session_slots = (
+                    fixed_plan.reserved_session_slots
+                )
+                self._scheduler_config.fixed_kv_cache_native_mtp = bool(
+                    admission_settings.get("mtp_enabled", False)
+                    if isinstance(admission_settings, dict)
+                    else getattr(admission_settings, "mtp_enabled", False)
+                )
+                if fixed_plan.configured_concurrency_capped:
+                    logger.warning(
+                        "Fixed KV concurrency for %s capped from %d to %d "
+                        "session slots at %s per slot",
+                        model_id,
+                        fixed_plan.requested_session_slots,
+                        fixed_plan.reserved_session_slots,
+                        format_size(fixed_plan.per_session_kv_bytes),
+                    )
+            else:
+                entry.memory = None
+                self._scheduler_config.fixed_kv_cache_context_window = 0
+                self._scheduler_config.fixed_kv_cache_session_slots = 0
+                self._scheduler_config.fixed_kv_cache_native_mtp = False
             admission_kind = "local shard" if deployment is not None else "model"
             ceiling = self._current_ceiling()
             best_effort = False
@@ -2096,6 +2345,7 @@ class EnginePool:
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
+        entry.memory = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2316,18 +2566,49 @@ class EnginePool:
                 model_settings = self._settings_manager.get_settings(model_id)
 
             deployment = self._distributed_deployment_for_entry(entry)
-            base_resident_size = self._entry_resident_size(entry)
-            if (
-                deployment is None
-                and entry.text_only_size
-                and (force_lm or entry.engine_type == "batched")
-            ):
-                base_resident_size = entry.text_only_size
-            resident_size = self._entry_runtime_resident_size(
+            base_resident_size, other_fixed_bytes = self._fixed_kv_allocation_sizes(
                 entry,
                 model_settings,
-                base_size=base_resident_size,
+                force_lm=force_lm,
             )
+            resident_size = base_resident_size + other_fixed_bytes
+            plan = entry.memory if isinstance(entry.memory, ModelMemoryPlan) else None
+            uses_text_cache = (
+                self._fixed_kv_cache_enabled(model_settings)
+                and (force_lm or effective_type in {"batched", "vlm"})
+                and not (
+                    effective_type == "vlm"
+                    and not force_lm
+                    and self._entry_is_diffusion_model(entry)
+                )
+            )
+            if uses_text_cache:
+                if plan is None:
+                    plan = self._plan_fixed_kv_memory(
+                        entry,
+                        model_settings,
+                        weights_bytes=base_resident_size,
+                        other_fixed_bytes=other_fixed_bytes,
+                    )
+                    entry.memory = plan
+                resident_size = plan.estimated_total_bytes
+                self._scheduler_config.fixed_kv_cache_context_window = (
+                    plan.context_window
+                )
+                self._scheduler_config.fixed_kv_cache_session_slots = (
+                    plan.reserved_session_slots
+                )
+                self._scheduler_config.fixed_kv_cache_native_mtp = bool(
+                    model_settings.get("mtp_enabled", False)
+                    if isinstance(model_settings, dict)
+                    else getattr(model_settings, "mtp_enabled", False)
+                )
+            else:
+                plan = None
+                entry.memory = None
+                self._scheduler_config.fixed_kv_cache_context_window = 0
+                self._scheduler_config.fixed_kv_cache_session_slots = 0
+                self._scheduler_config.fixed_kv_cache_native_mtp = False
             entry.runtime_estimated_size = resident_size
 
             # Wire the correct model_id / model_path into the shared scheduler
@@ -2531,6 +2812,8 @@ class EnginePool:
                     try:
                         await engine.start()
                     except Exception as fallback_error:
+                        with suppress(Exception):
+                            await engine.stop()
                         raise RuntimeError(
                             f"DFlash load failed: {start_error}; "
                             f"{effective_type} fallback also failed: {fallback_error}"
@@ -2569,6 +2852,8 @@ class EnginePool:
                     try:
                         await engine.start()
                     except Exception as fallback_error:
+                        with suppress(Exception):
+                            await engine.stop()
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
                             f"VLM fallback also failed: {fallback_error}"
@@ -2605,6 +2890,8 @@ class EnginePool:
                     try:
                         await engine.start()
                     except Exception as fallback_error:
+                        with suppress(Exception):
+                            await engine.stop()
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
                             f"LLM fallback also failed: {fallback_error}"
@@ -2616,6 +2903,14 @@ class EnginePool:
                         f"Successfully loaded {model_id} as LLM (fallback from VLM)"
                     )
                 else:
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        logger.warning(
+                            "Failed to release partially started engine %s",
+                            model_id,
+                            exc_info=True,
+                        )
                     raise
 
             # Check if memory enforcer requested abort during loading
@@ -2637,6 +2932,70 @@ class EnginePool:
                 )
 
             self._validate_llm_engine_ready(model_id, engine)
+            if plan is not None:
+                committed_getter = getattr(engine, "get_fixed_kv_memory", None)
+                committed = committed_getter() if callable(committed_getter) else None
+                if not isinstance(committed, dict):
+                    await engine.stop()
+                    raise RuntimeError(
+                        f"Model '{model_id}' loaded without the required fixed KV "
+                        "reservation; launch was aborted before serving requests."
+                    )
+                committed_bytes = int(committed.get("committed_pool_bytes", 0) or 0)
+                planned_pool_bytes = (
+                    plan.fixed_kv_cache_bytes + plan.pool_scratch_bytes
+                )
+                if committed_bytes != planned_pool_bytes:
+                    await engine.stop()
+                    raise RuntimeError(
+                        f"Model '{model_id}' cache layout did not match its launch "
+                        f"plan: planned {format_size(planned_pool_bytes)}, "
+                        f"materialized {format_size(committed_bytes)}. No requests "
+                        "were admitted; update the cache-layout adapter or choose a "
+                        "supported checkpoint."
+                    )
+                memory_payload = plan.to_dict()
+                memory_payload.update(committed)
+                memory_payload["lifecycle"] = "committed"
+                headroom_candidates: list[tuple[int, str]] = []
+                try:
+                    available_after = int(virtual_memory().available)
+                except Exception:
+                    available_after = 0
+                if available_after > 0:
+                    memory_payload["available_memory_bytes"] = available_after
+                    memory_payload["available_memory_source"] = (
+                        "psutil available-memory snapshot after fixed KV "
+                        "materialization"
+                    )
+                    headroom_candidates.append(
+                        (available_after, "post-launch available-memory snapshot")
+                    )
+                committed_ceiling = self._current_ceiling()
+                if committed_ceiling <= 0:
+                    committed_ceiling = self._fallback_admission_ceiling()
+                if committed_ceiling > 0:
+                    committed_usage = max(
+                        int(mx.get_active_memory()),
+                        int(get_phys_footprint()),
+                        int(self._current_model_memory + resident_size),
+                    )
+                    headroom_candidates.append(
+                        (
+                            max(0, committed_ceiling - committed_usage),
+                            "post-launch process/Metal ceiling headroom",
+                        )
+                    )
+                if headroom_candidates:
+                    committed_headroom, committed_headroom_source = min(
+                        headroom_candidates, key=lambda item: item[0]
+                    )
+                    memory_payload["remaining_memory_bytes"] = committed_headroom
+                    memory_payload["projected_remaining_bytes"] = committed_headroom
+                    memory_payload["remaining_memory_source"] = (
+                        committed_headroom_source
+                    )
+                entry.memory = memory_payload
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += resident_size
@@ -2798,6 +3157,10 @@ class EnginePool:
             entry.abort_loading = False
             if not load_completed:
                 entry.runtime_estimated_size = None
+                entry.memory = None
+                self._scheduler_config.fixed_kv_cache_context_window = 0
+                self._scheduler_config.fixed_kv_cache_session_slots = 0
+                self._scheduler_config.fixed_kv_cache_native_mtp = False
             self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:
@@ -2864,6 +3227,13 @@ class EnginePool:
                         self._distributed_deployment_for_entry(e) is not None
                     ),
                     "actual_size": e.actual_size,
+                    "memory": (
+                        e.memory.to_dict()
+                        if hasattr(e.memory, "to_dict")
+                        else dict(e.memory)
+                        if isinstance(e.memory, dict)
+                        else None
+                    ),
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,

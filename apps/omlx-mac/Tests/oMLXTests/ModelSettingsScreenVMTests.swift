@@ -265,6 +265,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         patch.qwen35AnePrefillCpuGdnFraction = 0.05
         patch.qwen35AnePrefillCpuThreads = 8
         patch.qwen35AnePrefillCpuSharedResource = true
+        patch.fixedKvCacheEnabled = false
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
@@ -276,6 +277,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_gdn_fraction"] as? Double, 0.05)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_threads"] as? Int, 8)
         XCTAssertEqual(object?["qwen35_ane_prefill_cpu_shared_resource"] as? Bool, true)
+        XCTAssertEqual(object?["fixed_kv_cache_enabled"] as? Bool, false)
     }
 
     func testANETunerOverridesEncodeForStartRequest() throws {
@@ -329,7 +331,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
             virtual: nil,
-            settings: nil
+            settings: nil,
+            memory: nil
         )
     }
 }

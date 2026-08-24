@@ -258,6 +258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.services.requestedSection = .models
                 self.presentAppView()
             },
+            openModelLaunch: { [weak self] model in
+                guard let self else { return }
+                self.services.modelLaunchTarget = ModelLaunchTarget(model: model)
+                self.presentAppView()
+            },
             openAppView: { [weak self] in self?.presentAppView() },
             openAppearanceSettings: { [weak self] in
                 guard let self else { return }

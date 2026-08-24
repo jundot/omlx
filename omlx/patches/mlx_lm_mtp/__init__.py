@@ -77,6 +77,25 @@ def get_mtp_depth() -> int:
     return _MTP_DEPTH
 
 
+def make_mtp_cache(
+    model,
+    target_cache=None,
+    *,
+    scratch: bool = False,
+):
+    """Return a fixed MTP row when the loaded engine installed a provider."""
+
+    for candidate in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        provider = getattr(candidate, "_omlx_fixed_mtp_cache_provider", None)
+        if callable(provider):
+            return provider(target_cache, scratch=scratch)
+    return model.make_mtp_cache()
+
+
 def apply_mlx_lm_mtp_patch() -> bool:
     """Apply the model-side and BatchGenerator monkey-patches.
 

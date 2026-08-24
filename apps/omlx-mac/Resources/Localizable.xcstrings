@@ -20447,6 +20447,90 @@
         }
       }
     },
+    "settings.basic.fixed_kv_cache.label" : {
+      "comment" : "Row label for the per-model fixed KV cache toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fixed KV Cache"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "固定 KV キャッシュ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "고정 KV 캐시"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Фиксированный KV-кэш"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "固定 KV 缓存"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "固定 KV 快取"
+          }
+        }
+      }
+    },
+    "settings.basic.fixed_kv_cache.sub" : {
+      "comment" : "Sublabel for the per-model fixed KV cache toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reserve the full context cache at launch. Turn off to let it grow during inference."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "起動時にコンテキスト全体のキャッシュを予約します。推論中に動的に増やす場合はオフにします。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시작할 때 전체 컨텍스트 캐시를 예약합니다. 추론 중 동적으로 늘리려면 끄세요."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Резервировать весь кэш контекста при запуске. Отключите, чтобы кэш рос во время инференса."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启动时预留完整上下文缓存。关闭后，缓存在推理期间按需增长。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "啟動時預留完整上下文快取。關閉後，快取會在推論期間按需增長。"
+          }
+        }
+      }
+    },
     "settings.basic.max_tokens.label" : {
       "comment" : "Row label for the max generated tokens field",
       "extractionState" : "manual",

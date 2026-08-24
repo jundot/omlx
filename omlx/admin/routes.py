@@ -33,6 +33,13 @@ from pydantic import BaseModel, Field, field_validator
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..exceptions import (
+    InsufficientMemoryError,
+    ModelBusyError,
+    ModelLoadingError,
+    ModelTooLargeError,
+    ModelUnavailableError,
+)
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
@@ -115,6 +122,7 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
+    fixed_kv_cache_enabled: bool | None = None
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -1847,6 +1855,123 @@ def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
         return []
 
 
+def _positive_int(value: Any) -> int | None:
+    """Return a positive integer value, excluding booleans and test doubles."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _resolve_memory_estimate_context(
+    *,
+    model_id: str,
+    entry: Any,
+    settings: Any | None,
+    global_settings: Any | None,
+    server_state: Any | None,
+    requested_context: int | None,
+) -> int:
+    """Resolve the fixed-cache context without hiding invalid explicit values."""
+    native_context = _positive_int(getattr(entry, "model_context_length", None))
+
+    if requested_context is not None:
+        context_window = requested_context
+    else:
+        configured_model_context = (
+            settings.get("max_context_window")
+            if isinstance(settings, dict)
+            else getattr(settings, "max_context_window", None)
+            if settings is not None
+            else None
+        )
+        if configured_model_context is not None:
+            context_window = configured_model_context
+        elif native_context is not None:
+            context_window = native_context
+            sampling = getattr(global_settings, "sampling", None)
+            policy = _positive_int(getattr(sampling, "max_context_window_policy", None))
+            if policy is not None:
+                context_window = min(context_window, policy)
+        else:
+            sampling = getattr(global_settings, "sampling", None)
+            if sampling is None:
+                sampling = getattr(server_state, "sampling", None)
+            context_window = getattr(sampling, "max_context_window", None)
+
+    if not isinstance(context_window, int) or isinstance(context_window, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot estimate memory for '{model_id}': no valid context window "
+                "is configured. Set max_context_window to a positive token count."
+            ),
+        )
+    if context_window <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot estimate memory for '{model_id}': context window must be "
+                f"positive, got {context_window}. Choose at least 1 token."
+            ),
+        )
+    if native_context is not None and context_window > native_context:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot estimate memory for '{model_id}': requested context window "
+                f"of {context_window} tokens exceeds the model's native limit of "
+                f"{native_context} tokens. Choose {native_context} tokens or fewer."
+            ),
+        )
+    return context_window
+
+
+def _memory_estimate_ceiling(server_state: Any | None) -> int | None:
+    """Return the tightest exposed admission or Metal ceiling."""
+    enforcer = getattr(server_state, "process_memory_enforcer", None)
+    if enforcer is None:
+        return None
+
+    candidates: list[int] = []
+    admission_getter = getattr(enforcer, "get_admission_ceiling", None)
+    if callable(admission_getter):
+        try:
+            admission = _positive_int(admission_getter())
+            if admission is not None:
+                candidates.append(admission)
+        except Exception:
+            pass
+
+    breakdown_getter = getattr(enforcer, "get_ceiling_breakdown", None)
+    if callable(breakdown_getter):
+        try:
+            breakdown = breakdown_getter()
+            metal_cap = _positive_int(breakdown.get("metal_cap"))
+            if metal_cap is not None:
+                candidates.append(metal_cap)
+        except Exception:
+            pass
+
+    return min(candidates) if candidates else None
+
+
+def _serialize_entry_memory(entry: Any | None) -> dict[str, Any] | None:
+    """Serialize an optional committed-memory record without changing old rows."""
+    memory = getattr(entry, "memory", None) if entry is not None else None
+    if memory is None:
+        return None
+    to_dict = getattr(memory, "to_dict", None)
+    if callable(to_dict):
+        value = to_dict()
+    elif isinstance(memory, dict):
+        value = dict(memory)
+    elif is_dataclass(memory):
+        value = asdict(memory)
+    else:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -1961,6 +2086,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "paroquant_reason": paroquant_reason,
         }
 
+        committed_memory = _serialize_entry_memory(engine_pool.get_entry(model_id))
+        if committed_memory is not None:
+            model_data["memory"] = committed_memory
+
         # Add settings if available
         if settings:
             model_data["settings"] = asdict(settings)
@@ -2009,6 +2138,188 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         )
 
     return {"models": models}
+
+
+@router.get("/api/models/{model_id}/memory-estimate")
+async def get_model_memory_estimate(
+    model_id: str,
+    max_context_window: int | None = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Estimate fixed launch memory for a model and context window."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    settings_manager = _get_settings_manager()
+    settings = (
+        settings_manager.get_settings(model_id)
+        if settings_manager is not None
+        else None
+    )
+    fixed_kv_enabled_getter = getattr(
+        engine_pool, "_fixed_kv_cache_enabled", None
+    )
+    fixed_kv_enabled = (
+        bool(fixed_kv_enabled_getter(settings))
+        if callable(fixed_kv_enabled_getter)
+        else (
+            settings.get("fixed_kv_cache_enabled") is not False
+            if isinstance(settings, dict)
+            else getattr(settings, "fixed_kv_cache_enabled", None) is not False
+        )
+    )
+    global_settings = _get_global_settings() if _get_global_settings else None
+    server_state = _get_server_state() if _get_server_state else None
+    context_window = _resolve_memory_estimate_context(
+        model_id=model_id,
+        entry=entry,
+        settings=settings,
+        global_settings=global_settings,
+        server_state=server_state,
+        requested_context=max_context_window,
+    )
+
+    committed = _serialize_entry_memory(entry)
+    if (
+        fixed_kv_enabled
+        and
+        committed is not None
+        and committed.get("lifecycle") == "committed"
+        and committed.get("context_window") == context_window
+    ):
+        return committed
+
+    memory_info = get_system_memory_info()
+    available_memory_bytes = _positive_int(memory_info.get("available_bytes"))
+    memory_ceiling_bytes = _memory_estimate_ceiling(server_state)
+    launch_budget_getter = getattr(engine_pool, "_fixed_kv_launch_budget", None)
+    if callable(launch_budget_getter):
+        available_memory_bytes, memory_ceiling_bytes = launch_budget_getter(entry)
+    scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+    requested_session_slots = (
+        _positive_int(getattr(scheduler_config, "max_num_seqs", None)) or 1
+    )
+
+    from ..fixed_kv_memory import (
+        estimate_model_memory,
+        validate_fixed_kv_runtime_features,
+    )
+
+    deployment_getter = getattr(
+        engine_pool, "_distributed_deployment_for_entry", None
+    )
+    distributed = bool(
+        callable(deployment_getter) and deployment_getter(entry) is not None
+    )
+    weights_bytes = entry.estimated_size
+    other_fixed_bytes = 0
+    allocation_sizes_getter = getattr(
+        engine_pool, "_fixed_kv_allocation_sizes", None
+    )
+    if callable(allocation_sizes_getter):
+        weights_bytes, other_fixed_bytes = allocation_sizes_getter(entry, settings)
+
+    if not fixed_kv_enabled:
+        binding_candidates = [
+            value
+            for value in (available_memory_bytes, memory_ceiling_bytes)
+            if value is not None and value > 0
+        ]
+        binding_memory_bytes = min(binding_candidates) if binding_candidates else None
+        estimated_total_bytes = weights_bytes + other_fixed_bytes
+        fits = (
+            estimated_total_bytes <= binding_memory_bytes
+            if binding_memory_bytes is not None
+            else None
+        )
+        return {
+            "schema_version": 1,
+            "model_path": entry.model_path,
+            "model_type": getattr(entry, "config_model_type", "") or "",
+            "model_context_limit": _positive_int(
+                getattr(entry, "model_context_length", None)
+            ),
+            "context_window": context_window,
+            "fixed_kv_cache_enabled": False,
+            "weights_bytes": weights_bytes,
+            "other_fixed_bytes": other_fixed_bytes,
+            "per_session_kv_bytes": 0,
+            "pool_scratch_bytes": 0,
+            "requested_session_slots": requested_session_slots,
+            "reserved_session_slots": 0,
+            "max_feasible_session_slots": None,
+            "cache_layout_max_session_slots": None,
+            "fixed_kv_cache_bytes": 0,
+            "estimated_total_bytes": estimated_total_bytes,
+            "detected_unified_memory_bytes": _positive_int(
+                memory_info.get("total_bytes")
+            ),
+            "unified_memory_bytes": _positive_int(memory_info.get("total_bytes")),
+            "available_memory_bytes": available_memory_bytes,
+            "memory_ceiling_bytes": memory_ceiling_bytes,
+            "binding_memory_bytes": binding_memory_bytes,
+            "remaining_memory_bytes": (
+                binding_memory_bytes - estimated_total_bytes
+                if binding_memory_bytes is not None
+                else None
+            ),
+            "projected_remaining_bytes": (
+                binding_memory_bytes - estimated_total_bytes
+                if binding_memory_bytes is not None
+                else None
+            ),
+            "fits": fits,
+            "requested_configuration_fits": None,
+            "configured_concurrency_capped": False,
+            "fit_reason": (
+                "Fixed KV reservation is disabled for this model. KV memory "
+                "will grow during inference and is not included in this total."
+            ),
+            "cache_tensors": [],
+            "components": [],
+            "lifecycle": "disabled",
+            "provenance": [
+                "weights: model discovery estimate",
+                "KV cache: dynamic growth, excluded from this estimate",
+            ],
+        }
+
+    try:
+        validate_fixed_kv_runtime_features(settings, distributed=distributed)
+        plan = estimate_model_memory(
+            entry.model_path,
+            context_window,
+            weights_bytes=weights_bytes,
+            other_fixed_bytes=other_fixed_bytes,
+            requested_session_slots=requested_session_slots,
+            available_memory_bytes=available_memory_bytes,
+            memory_ceiling_bytes=memory_ceiling_bytes,
+            prefill_step_size=(
+                _positive_int(getattr(scheduler_config, "prefill_step_size", None))
+                or 2048
+            ),
+            native_mtp_enabled=bool(
+                settings.get("mtp_enabled", False)
+                if isinstance(settings, dict)
+                else getattr(settings, "mtp_enabled", False)
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot estimate memory for '{model_id}': {exc}",
+        ) from exc
+    payload = plan.to_dict()
+    payload["fixed_kv_cache_enabled"] = True
+    native_limit = _positive_int(getattr(entry, "model_context_length", None))
+    if native_limit is not None:
+        payload["model_context_limit"] = native_limit
+    return payload
 
 
 @router.post("/api/models/{model_id}/unload")
@@ -2102,8 +2413,12 @@ async def load_model(
 
     try:
         await engine_pool.get_engine(model_id)
+    except (ModelTooLargeError, InsufficientMemoryError) as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except (ModelBusyError, ModelLoadingError, ModelUnavailableError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
@@ -2256,6 +2571,8 @@ async def update_model_settings(
             entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
+    if "fixed_kv_cache_enabled" in sent:
+        current_settings.fixed_kv_cache_enabled = request.fixed_kv_cache_enabled
     if "max_tokens" in sent:
         current_settings.max_tokens = request.max_tokens
     if "temperature" in sent:
@@ -2849,7 +3166,7 @@ async def update_model_settings(
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
         if auto_unloaded and was_pinned:
             try:
-                await engine_pool._load_engine(model_id)
+                await engine_pool.get_engine(model_id)
                 auto_reloaded = True
                 logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
             except Exception as e:

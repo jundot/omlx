@@ -56,9 +56,27 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
     let settings: ModelSettingsDTO?
+    /// Present for a committed fixed-cache reservation. Older servers omit it.
+    let memory: ModelMemoryDTO?
 }
 
 extension ModelDTO {
+    var supportsFixedKVCache: Bool {
+        let engine = engineType?.lowercased()
+        guard engine == "batched" || engine == "vlm" else { return false }
+        let configType = configModelType?
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        return configType != "diffusion_gemma"
+    }
+
+    /// Only generative local text engines own an MLX prompt-cache tree.
+    /// Embedding, reranker, audio, diffusion, and older unknown engine types
+    /// keep their existing direct-load path.
+    var usesFixedKVLaunchPreflight: Bool {
+        supportsFixedKVCache && settings?.fixedKvCacheEnabled != false
+    }
+
     /// Single size figure for compact UI: the observed footprint once the
     /// model has settled, the estimate while loading or before one exists.
     var sizeLabel: String {
@@ -69,10 +87,41 @@ extension ModelDTO {
     }
 }
 
+/// Server-calculated fixed-cache launch plan. The app deliberately performs no
+/// KV shape arithmetic, so architecture-specific cache layouts stay owned by
+/// the server allocator.
+struct ModelMemoryDTO: Codable, Equatable, Sendable {
+    let contextWindow: Int
+    let fixedKvCacheEnabled: Bool?
+    let modelContextLimit: Int?
+    let weightsBytes: Int64
+    let fixedKvCacheBytes: Int64
+    let otherFixedBytes: Int64
+    let perSessionKvBytes: Int64
+    let requestedSessionSlots: Int
+    let reservedSessionSlots: Int
+    let maxFeasibleSessionSlots: Int?
+    let estimatedTotalBytes: Int64
+    let unifiedMemoryBytes: Int64?
+    let availableMemoryBytes: Int64?
+    let projectedRemainingBytes: Int64?
+    let fits: Bool?
+    let requestedConfigurationFits: Bool?
+    let configuredConcurrencyCapped: Bool
+    let fitReason: String?
+    let lifecycle: String
+    let committedKvCacheBytes: Int64?
+    let materializedDeltaBytes: Int64?
+
+    var isCommitted: Bool { lifecycle == "committed" }
+    var canLaunch: Bool { fits == true }
+}
+
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let modelAlias: String?
     let modelTypeOverride: String?
     let maxContextWindow: Int?
+    let fixedKvCacheEnabled: Bool?
     let maxTokens: Int?
     let temperature: Double?
     let topP: Double?
@@ -160,6 +209,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var modelAlias: String? = nil
     var modelTypeOverride: String? = nil
     var maxContextWindow: Int? = nil
+    var fixedKvCacheEnabled: Bool? = nil
     var maxTokens: Int? = nil
     var temperature: Double? = nil
     var topP: Double? = nil

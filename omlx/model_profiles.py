@@ -102,6 +102,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "model_type_override",
         "active_profile_name",
         "ttl_seconds",
+        # Cache ownership changes the loaded engine and must stay an explicit
+        # per-model choice rather than following a sampling profile.
+        "fixed_kv_cache_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

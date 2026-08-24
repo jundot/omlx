@@ -40,6 +40,7 @@ final class MenubarController: NSObject {
     private let bootstrapError: Error?
     private let client: OMLXClient?
     private let openModelSettings: (String) -> Void
+    private let openModelLaunch: (ModelDTO) -> Void
     private let openAppView: () -> Void
     private let openAppearanceSettings: () -> Void
     private let requestQuit: () -> Void
@@ -108,6 +109,7 @@ final class MenubarController: NSObject {
         lastError: Error? = nil,
         client: OMLXClient? = nil,
         openModelSettings: @escaping (String) -> Void = { _ in },
+        openModelLaunch: @escaping (ModelDTO) -> Void = { _ in },
         openAppView: @escaping () -> Void = {},
         openAppearanceSettings: @escaping () -> Void = {},
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
@@ -118,6 +120,7 @@ final class MenubarController: NSObject {
         self.bootstrapError = lastError
         self.client = client
         self.openModelSettings = openModelSettings
+        self.openModelLaunch = openModelLaunch
         self.openAppView = openAppView
         self.openAppearanceSettings = openAppearanceSettings
         self.requestQuit = requestQuit
@@ -1213,13 +1216,14 @@ final class MenubarController: NSObject {
 
     @objc private func loadModelAction(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
+        guard let model = models.first(where: { $0.id == id }) else { return }
+        if model.usesFixedKVLaunchPreflight {
+            openModelLaunch(model)
+            return
+        }
         loadingIDs.insert(id)
         rebuildModelsSubmenu()
-        // The load POST runs in its own task so it isn't cancelled when the menu
-        // closes; only the trailing list refresh routes through the scheduler.
         Task {
-            // A failed load must drop the pending id so the entry falls back
-            // to "Load model" instead of sticking on the in-progress state.
             do { _ = try await client?.loadModel(id: id) }
             catch { loadingIDs.remove(id) }
             scheduleModelsRefresh()

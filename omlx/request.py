@@ -84,6 +84,12 @@ class SamplingParams:
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
 
+    # True when max_tokens came from model/global defaults rather than the
+    # request. Kept last to preserve the positional constructor API. A fixed
+    # cache may clamp an inherited cap to the room remaining after the prompt;
+    # an explicit client cap must still fail if it cannot fit.
+    max_tokens_is_default: bool = False
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []

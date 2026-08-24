@@ -534,6 +534,20 @@ private struct BasicTab: View {
                                  comment: "Sublabel for the context window field")) {
                 TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: 110)
             }
+            if vm.model?.supportsFixedKVCache == true {
+                Row(label: String(localized: "settings.basic.fixed_kv_cache.label",
+                                  defaultValue: "Fixed KV Cache",
+                                  comment: "Row label for the per-model fixed KV cache toggle"),
+                    sublabel: String(localized: "settings.basic.fixed_kv_cache.sub",
+                                     defaultValue: "Reserve the full context cache at launch. Turn off to let it grow during inference.",
+                                     comment: "Sublabel for the per-model fixed KV cache toggle")) {
+                    Toggle("", isOn: vm.bind($vm.fixedKvCacheEnabled, save: {
+                        Task { await vm.save(.fixedKvCacheEnabled, client: client) }
+                    }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
             Row(label: String(localized: "settings.basic.max_tokens.label",
                               defaultValue: "Max Tokens",
                               comment: "Row label for the max generated tokens field"),

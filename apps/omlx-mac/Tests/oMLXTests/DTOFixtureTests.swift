@@ -125,7 +125,37 @@ final class DTOFixtureTests: XCTestCase {
         if let first = list.models.first {
             XCTAssertFalse(first.id.isEmpty, "ModelDTO.id must be non-empty.")
             XCTAssertEqual(first.displayName, "deepsweet/Qwen3.6-27B-UD-MLX-4bit")
+            XCTAssertEqual(first.memory?.fixedKvCacheBytes, 8_589_934_592)
+            XCTAssertEqual(first.memory?.fixedKvCacheEnabled, true)
+            XCTAssertEqual(first.settings?.fixedKvCacheEnabled, true)
+            XCTAssertEqual(first.memory?.reservedSessionSlots, 4)
+            XCTAssertEqual(first.memory?.requestedSessionSlots, 8)
+            XCTAssertEqual(first.memory?.configuredConcurrencyCapped, true)
+            XCTAssertEqual(first.memory?.lifecycle, "committed")
         }
+    }
+
+    func testModelMemoryRemainsBackwardCompatibleWithOlderServers() throws {
+        let data = Data("""
+        {"models":[{"id":"legacy","loaded":false,"is_loading":false,"estimated_size":1}]}
+        """.utf8)
+        let list = try Self.makeDecoder().decode(ListModelsResponse.self, from: data)
+        XCTAssertNil(list.models.first?.memory)
+    }
+
+    func testPerModelFixedKVOverrideControlsLaunchPreflight() throws {
+        let data = Data("""
+        {"models":[
+          {"id":"default","loaded":false,"is_loading":false,"estimated_size":1,"engine_type":"batched","memory":{"context_window":2048,"fixed_kv_cache_enabled":true,"weights_bytes":1,"fixed_kv_cache_bytes":1024,"other_fixed_bytes":0,"per_session_kv_bytes":1024,"requested_session_slots":1,"reserved_session_slots":1,"estimated_total_bytes":1025,"configured_concurrency_capped":false,"lifecycle":"estimated"}},
+          {"id":"dynamic","loaded":false,"is_loading":false,"estimated_size":1,"engine_type":"batched","settings":{"fixed_kv_cache_enabled":false}}
+        ]}
+        """.utf8)
+        let list = try Self.makeDecoder().decode(ListModelsResponse.self, from: data)
+        XCTAssertTrue(list.models[0].usesFixedKVLaunchPreflight)
+        XCTAssertEqual(list.models[0].memory?.fixedKvCacheEnabled, true)
+        XCTAssertEqual(list.models[0].memory?.fixedKvCacheBytes, 1_024)
+        XCTAssertFalse(list.models[1].usesFixedKVLaunchPreflight)
+        XCTAssertTrue(list.models[1].supportsFixedKVCache)
     }
 
     // MARK: - Profile list (per-model)

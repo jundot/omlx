@@ -52,6 +52,7 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .exceptions import (
+    InvalidRequestError,
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
@@ -806,6 +807,39 @@ def _patched_generation_batch_filter(self, keep):
 GenerationBatch.filter = _patched_generation_batch_filter
 
 
+def _compact_fixed_cache_layers(cache_list: list[Any]) -> None:
+    """Move a batch entering an empty decode lane to physical row zero."""
+
+    def compact(cache_obj: Any) -> None:
+        children = getattr(cache_obj, "caches", None)
+        if isinstance(children, (list, tuple)):
+            for child in children:
+                compact(child)
+            return
+        compact_to = getattr(cache_obj, "compact_to", None)
+        if callable(compact_to):
+            compact_to(0)
+
+    for layer_cache in cache_list or []:
+        compact(layer_cache)
+
+
+_original_generation_batch_extend = GenerationBatch.extend
+
+
+def _patched_generation_batch_extend(self, batch):
+    # Chunked prefills lease a row when they start. Decode rows may compact
+    # while that prefill is in flight, so the first completed prefill can
+    # arrive at an empty generation batch carrying a high physical row. Move
+    # it to row zero before mlx-lm adopts the cache list by reference.
+    if not self.uids and getattr(batch, "uids", None):
+        _compact_fixed_cache_layers(getattr(batch, "prompt_cache", []))
+    return _original_generation_batch_extend(self, batch)
+
+
+GenerationBatch.extend = _patched_generation_batch_extend
+
+
 _TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
 
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
@@ -1471,6 +1505,16 @@ class SchedulerConfig:
     policy: SchedulingPolicy = SchedulingPolicy.FCFS
     # BatchGenerator settings (passed directly to mlx-lm)
     completion_batch_size: int = 32
+    # Fixed KV cache allocation chosen during launch admission. A zero value
+    # keeps construction compatible with callers that do not use EnginePool.
+    fixed_kv_cache_enabled: bool = False
+    fixed_kv_cache_context_window: int = 0
+    fixed_kv_cache_session_slots: int = 0
+    fixed_kv_cache_native_mtp: bool = False
+    # Global fallback used by EnginePool when neither model settings nor the
+    # checkpoint declares a context limit.
+    default_context_window: int = 32768
+    default_context_window_policy: int | None = None
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
     prefill_step_size: int = 2048
@@ -1693,6 +1737,7 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
+        self._fixed_kv_pool = None
         self._serialize_llama4_requests = _model_declares_llama4(model)
         if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
             logger.info(
@@ -2212,6 +2257,76 @@ class Scheduler:
         # close()/deep_reset() clear those fields during teardown.
         model = None
         tokenizer = None
+
+    def initialize_fixed_kv_cache(self) -> dict[str, Any] | None:
+        """Materialize the launch-time cache reservation on this engine stream."""
+        context_window = int(
+            getattr(self.config, "fixed_kv_cache_context_window", 0) or 0
+        )
+        session_slots = int(
+            getattr(self.config, "fixed_kv_cache_session_slots", 0) or 0
+        )
+        if context_window <= 0 or session_slots <= 0:
+            return None
+        if self._turboquant_kv_bits is not None:
+            raise RuntimeError(
+                "Fixed KV allocation is not compatible with TurboQuant KV cache. "
+                "Disable TurboQuant or use the ordinary FP16/BF16 cache."
+            )
+
+        from .fixed_kv_pool import FixedKVCachePool
+
+        probe_token = getattr(self.tokenizer, "bos_token_id", None)
+        if probe_token is None:
+            probe_token = getattr(self.tokenizer, "eos_token_id", 0)
+        if isinstance(probe_token, (list, tuple)):
+            probe_token = probe_token[0] if probe_token else 0
+        with mx.stream(self._stream):
+            self._fixed_kv_pool = FixedKVCachePool.create(
+                self.model,
+                context_window=context_window,
+                slots=session_slots,
+                probe_token_id=int(probe_token or 0),
+                prefill_step_size=max(1, int(self.config.prefill_step_size)),
+                native_mtp_enabled=bool(
+                    getattr(self.config, "fixed_kv_cache_native_mtp", False)
+                ),
+            )
+        return self._fixed_kv_pool.to_dict()
+
+    def get_fixed_kv_memory(self) -> dict[str, Any] | None:
+        """Return committed reservation measurements for status APIs."""
+        pool = self._fixed_kv_pool
+        return pool.to_dict() if pool is not None else None
+
+    def _fixed_prompt_cache(
+        self, existing_cache: list[Any] | None = None
+    ) -> list[Any]:
+        """Assign the next compact pool row, importing a prefix hit in-place."""
+        pool = self._fixed_kv_pool
+        if pool is None:
+            return existing_cache or make_prompt_cache(self.model)
+        slot = self._num_admitted_requests()
+        if existing_cache is None:
+            return pool.make_cache(slot)
+        return pool.load_cache(slot, existing_cache)
+
+    def _prefill_boundary_snapshots_enabled(
+        self, prompt_cache: list[Any], block_size: int
+    ) -> bool:
+        """Return whether prefill may retain cache boundary copies.
+
+        Fixed-pool requests deliberately bypass tiered prefix reuse. Capturing
+        their recurrent or rotating state would create unused cache copies
+        outside the committed launch allocation.
+        """
+
+        return (
+            self._fixed_kv_pool is None
+            and block_size > 0
+            and self.block_aware_cache is not None
+            and _prompt_cache_needs_snapshots(prompt_cache)
+        )
 
     @contextmanager
     def _phase_timer(self, phase: str):
@@ -3307,7 +3422,7 @@ class Scheduler:
         n_tokens = len(tokens)
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is.
-            cache = existing_cache or make_prompt_cache(self.model)
+            cache = self._fixed_prompt_cache(existing_cache)
             # TurboQuant: a TQ cache here makes _merge_caches() build a
             # BatchTurboQuantKVCache (via the monkey-patched merge), so the
             # one decode token quantizes against TQ history. An empty fresh
@@ -3322,10 +3437,7 @@ class Scheduler:
             return cache, tokens
 
         # Create or reuse cache
-        if existing_cache is not None:
-            prompt_cache = existing_cache
-        else:
-            prompt_cache = make_prompt_cache(self.model)
+        prompt_cache = self._fixed_prompt_cache(existing_cache)
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
@@ -3340,10 +3452,8 @@ class Scheduler:
 
         # Boundary snapshot setup
         block_size = self.config.paged_cache_block_size
-        boundary_enabled = (
-            block_size > 0
-            and self.block_aware_cache is not None
-            and _prompt_cache_needs_snapshots(prompt_cache)
+        boundary_enabled = self._prefill_boundary_snapshots_enabled(
+            prompt_cache, block_size
         )
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
@@ -4900,17 +5010,11 @@ class Scheduler:
             self.model.clear_vlm_position_state()
             _seed_text_only_mrope_delta_for_cached_prefill(self.model, request)
 
-        prompt_cache = (
-            existing_cache
-            if existing_cache is not None
-            else make_prompt_cache(self.model)
-        )
+        prompt_cache = self._fixed_prompt_cache(existing_cache)
 
         block_size = self.config.paged_cache_block_size
-        boundary_enabled = (
-            block_size > 0
-            and self.block_aware_cache is not None
-            and _prompt_cache_needs_snapshots(prompt_cache)
+        boundary_enabled = self._prefill_boundary_snapshots_enabled(
+            prompt_cache, block_size
         )
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
@@ -5585,6 +5689,8 @@ class Scheduler:
         next identical-prompt request rejected the cache and re-
         prefilled from scratch.
         """
+        if self._fixed_kv_pool is not None:
+            return
         snapshot_cache = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
@@ -6115,6 +6221,8 @@ class Scheduler:
         ``BatchGenerator`` yet and the uid mapping does not exist —
         routing through it dropped every snapshot silently (#TBD).
         """
+        if getattr(self, "_fixed_kv_pool", None) is not None:
+            return
         if self.block_aware_cache is None:
             return
 
@@ -6469,6 +6577,8 @@ class Scheduler:
 
     def _maybe_capture_boundary_snapshot(self, request: Request, uid: int) -> None:
         """Capture cache snapshot exactly at block boundaries for safe reuse."""
+        if getattr(self, "_fixed_kv_pool", None) is not None:
+            return
         if self.block_aware_cache is None:
             return
 
@@ -7746,6 +7856,21 @@ class Scheduler:
         if request.request_id in self._prefix_cache_prepared:
             return
 
+        # A dense fixed row cannot outlive its active batch position: mlx-lm
+        # compacts survivor rows as requests finish. Persisting an extracted
+        # view would either race that compaction or require another full
+        # per-request KV allocation, defeating the fixed-memory contract.
+        # Until prefix blocks can address the fixed pool directly, fixed mode
+        # deliberately recomputes prompts and skips tiered cache reads/writes.
+        if getattr(self, "_fixed_kv_pool", None) is not None:
+            request.prompt_cache = None
+            request.block_table = None
+            request.cached_tokens = 0
+            request.shared_prefix_blocks = 0
+            request.remaining_tokens = request.prompt_token_ids
+            self._prefix_cache_prepared.add(request.request_id)
+            return
+
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
@@ -7907,6 +8032,55 @@ class Scheduler:
         self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
+    def _resolve_fixed_kv_max_tokens(
+        self,
+        *,
+        num_prompt_tokens: int,
+        max_tokens: int,
+        max_tokens_is_default: bool,
+    ) -> int:
+        """Fit an inherited output cap or reject an explicit oversized cap."""
+        pool = self._fixed_kv_pool
+        if pool is None:
+            return int(max_tokens)
+
+        prompt_tokens = int(num_prompt_tokens)
+        output_tokens = int(max_tokens)
+        capacity = int(pool.context_window)
+        requested_total = prompt_tokens + output_tokens
+        if requested_total <= capacity:
+            return output_tokens
+
+        remaining = capacity - prompt_tokens
+        if max_tokens_is_default and remaining > 0:
+            return remaining
+
+        raise InvalidRequestError(
+            "Request exceeds the fixed KV session capacity: "
+            f"{prompt_tokens:,} prompt tokens + "
+            f"{output_tokens:,} maximum output tokens "
+            f"= {requested_total:,}, but this model was launched with "
+            f"a {capacity:,}-token cache slot. Reduce max_tokens or relaunch "
+            "the model with a larger context window.",
+            field="max_tokens",
+        )
+
+    def validate_fixed_kv_request_capacity(
+        self,
+        *,
+        num_prompt_tokens: int,
+        max_tokens: int | None,
+        max_tokens_is_default: bool,
+    ) -> None:
+        """Raise capacity errors early enough for HTTP error serialization."""
+        if max_tokens is None:
+            return
+        self._resolve_fixed_kv_max_tokens(
+            num_prompt_tokens=num_prompt_tokens,
+            max_tokens=max_tokens,
+            max_tokens_is_default=max_tokens_is_default,
+        )
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -7939,6 +8113,23 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        if self._fixed_kv_pool is not None:
+            original_max_tokens = int(request.sampling_params.max_tokens)
+            resolved_max_tokens = self._resolve_fixed_kv_max_tokens(
+                num_prompt_tokens=request.num_prompt_tokens,
+                max_tokens=original_max_tokens,
+                max_tokens_is_default=request.sampling_params.max_tokens_is_default,
+            )
+            if resolved_max_tokens != original_max_tokens:
+                logger.debug(
+                    "Clamping inherited max_tokens from %s to %s for fixed "
+                    "KV request %s",
+                    original_max_tokens,
+                    resolved_max_tokens,
+                    request.request_id,
+                )
+                request.sampling_params.max_tokens = resolved_max_tokens
 
         # Prefix-cache lookup is intentionally delayed until admission. That
         # lets a same-prefix request wait for a relevant in-flight store_cache
@@ -9027,7 +9218,18 @@ class Scheduler:
         self._refresh_generation_overflow_recovery_ids()
         if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
             return 1
-        return max(1, self.config.max_num_seqs)
+        # VLM MTP owns its target cache outside BatchGenerator. In fixed mode
+        # that cache still occupies physical row zero, while an empty
+        # BatchGenerator would compact a late fallback request onto row zero as
+        # it enters decode. Keep the fixed pool serial until the MTP generator
+        # releases its row; ordinary fixed-pool batching resumes immediately
+        # afterwards.
+        if self._fixed_kv_pool is not None and self._vlm_mtp_active:
+            return 1
+        configured = max(1, self.config.max_num_seqs)
+        if self._fixed_kv_pool is not None:
+            configured = min(configured, self._fixed_kv_pool.slots)
+        return configured
 
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -9104,6 +9306,15 @@ class Scheduler:
             uid = self.request_id_to_uid.pop(rid, None)
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
+        # VLM MTP generators live outside BatchGenerator. Clearing only the
+        # normal request maps leaves their cache owners orphaned, pins fixed
+        # admission to one slot, and retains the generator after fatal
+        # scheduler recovery.
+        for state in self._vlm_mtp_active.values():
+            close = getattr(state.generator, "close", None)
+            if callable(close):
+                close()
+        self._vlm_mtp_active.clear()
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
         # Reset batch generator only (cache is not corrupted). Every row dies
         # with it; survivors re-register at re-insert.
@@ -9583,6 +9794,13 @@ class Scheduler:
         while (
             self.waiting
             and self._num_admitted_requests() < self._effective_max_num_seqs()
+            # Fixed rows can be compacted only after their owner reaches the
+            # decode batch.  If multiple chunked prefills were in flight, a
+            # later short prompt could finish first and be moved onto a lower
+            # row still owned by an earlier long prompt.  Keep one prefill in
+            # flight while fixed mode is active; decode remains concurrent
+            # and the next queued prompt starts as soon as this one joins it.
+            and (self._fixed_kv_pool is None or not self.prefilling)
         ):
             # Admission pause: set by ProcessMemoryEnforcer when phys
             # crosses soft_threshold. New prefills wait; in-flight requests
@@ -10562,7 +10780,11 @@ class Scheduler:
 
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
-                raw_cache = getattr(response, "prompt_cache", None)
+                raw_cache = (
+                    None
+                    if self._fixed_kv_pool is not None
+                    else getattr(response, "prompt_cache", None)
+                )
                 if raw_cache is not None:
                     try:
                         # SpecPrefill: sparse KV data can't be stored in
@@ -10680,7 +10902,9 @@ class Scheduler:
                     # prep, no host memcpy, no SSD write. They still take
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
-                    skip_store = getattr(request, "skip_cache_store", False)
+                    skip_store = self._fixed_kv_pool is not None or getattr(
+                        request, "skip_cache_store", False
+                    )
                     if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
@@ -11879,6 +12103,13 @@ class Scheduler:
         """
         # Standard reset first
         self.reset()
+
+        # The scheduler is the sole owner of the fixed reservation. Dropping
+        # it here gives unload, failed-load cleanup, and shutdown one explicit
+        # release boundary.
+        if self._fixed_kv_pool is not None:
+            self._fixed_kv_pool.close()
+            self._fixed_kv_pool = None
 
         # Clear any model-level cache state
         # MLX models may have internal cache references

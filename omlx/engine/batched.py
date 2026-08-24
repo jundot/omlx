@@ -573,6 +573,17 @@ class BatchedEngine(BaseEngine):
             config=engine_config,
         )
 
+        if scheduler_config.fixed_kv_cache_context_window > 0:
+            if getattr(self._model_settings, "turboquant_kv_enabled", False):
+                raise RuntimeError(
+                    "Fixed KV allocation cannot be combined with TurboQuant KV. "
+                    "Disable TurboQuant and launch again."
+                )
+            await loop.run_in_executor(
+                self._engine.engine._mlx_executor,
+                self._engine.engine.scheduler.initialize_fixed_kv_cache,
+            )
+
         await self._engine.engine.start()
 
         # TurboQuant KV cache: propagate bits to scheduler
@@ -657,6 +668,13 @@ class BatchedEngine(BaseEngine):
 
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")
+
+    def get_fixed_kv_memory(self) -> dict[str, Any] | None:
+        """Return the scheduler-owned committed cache reservation."""
+        if self._engine is None:
+            return None
+        scheduler = getattr(self._engine.engine, "scheduler", None)
+        return scheduler.get_fixed_kv_memory() if scheduler is not None else None
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -874,6 +892,7 @@ class BatchedEngine(BaseEngine):
 
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
+            max_tokens_is_default=bool(kwargs.get("max_tokens_is_default", False)),
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -952,6 +971,7 @@ class BatchedEngine(BaseEngine):
 
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
+            max_tokens_is_default=bool(kwargs.get("max_tokens_is_default", False)),
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -1165,6 +1185,13 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
+        scheduler.validate_fixed_kv_request_capacity(
+            num_prompt_tokens=num_tokens,
+            max_tokens=kwargs.get("max_tokens"),
+            max_tokens_is_default=bool(
+                kwargs.get("max_tokens_is_default", False)
+            ),
+        )
         await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
@@ -1195,6 +1222,13 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
+        scheduler.validate_fixed_kv_request_capacity(
+            num_prompt_tokens=num_tokens,
+            max_tokens=kwargs.get("max_tokens"),
+            max_tokens_is_default=bool(
+                kwargs.get("max_tokens_is_default", False)
+            ),
+        )
         await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )

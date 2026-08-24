@@ -311,6 +311,25 @@ class TestSchedulerInitialization:
 
         assert scheduler._effective_max_num_seqs() == 1
 
+    def test_fixed_pool_serializes_while_vlm_mtp_owns_row_zero(
+        self, mock_model, mock_tokenizer
+    ):
+        """A late fallback request must not overwrite VLM MTP's detached row."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=8),
+        )
+        scheduler._fixed_kv_pool = MagicMock(slots=8)
+
+        assert scheduler._effective_max_num_seqs() == 8
+
+        scheduler._vlm_mtp_active[-1] = MagicMock()
+        assert scheduler._effective_max_num_seqs() == 1
+
+        scheduler._vlm_mtp_active.clear()
+        assert scheduler._effective_max_num_seqs() == 8
+
     def test_init_falls_back_when_paged_ssd_cache_unavailable(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
     ):
@@ -470,6 +489,69 @@ class TestSchedulerAddRequest:
         assert len(scheduler.requests) == 5
         assert len(scheduler.waiting) == 5
 
+    def test_fixed_pool_clamps_inherited_output_limit(self, mock_model, mock_tokenizer):
+        """An API default must use the room left after the prompt."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._fixed_kv_pool = SimpleNamespace(context_window=8)
+        params = SamplingParams(max_tokens=8, max_tokens_is_default=True)
+        request = Request(
+            request_id="fixed-default-limit",
+            prompt=[11, 12, 13],
+            sampling_params=params,
+        )
+
+        scheduler.add_request(request)
+
+        assert request.sampling_params.max_tokens == 5
+        assert request in scheduler.waiting
+
+    def test_fixed_pool_rejects_explicit_oversized_output_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """An explicit output cap must not be silently changed."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._fixed_kv_pool = SimpleNamespace(context_window=8)
+        request = Request(
+            request_id="fixed-explicit-limit",
+            prompt=[11, 12, 13],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+
+        with pytest.raises(
+            scheduler_module.InvalidRequestError,
+            match="Request exceeds the fixed KV session capacity",
+        ):
+            scheduler.add_request(request)
+
+    def test_fixed_pool_preflight_rejects_explicit_oversized_output_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """Capacity errors must be raised before an HTTP response starts."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._fixed_kv_pool = SimpleNamespace(context_window=8)
+
+        with pytest.raises(
+            scheduler_module.InvalidRequestError,
+            match="Request exceeds the fixed KV session capacity",
+        ):
+            scheduler.validate_fixed_kv_request_capacity(
+                num_prompt_tokens=3,
+                max_tokens=8,
+                max_tokens_is_default=False,
+            )
+
+    def test_fixed_pool_preflight_allows_clampable_inherited_output_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._fixed_kv_pool = SimpleNamespace(context_window=8)
+
+        scheduler.validate_fixed_kv_request_capacity(
+            num_prompt_tokens=3,
+            max_tokens=8,
+            max_tokens_is_default=True,
+        )
+
     def test_add_request_exact_cache_hit_trims_one_token(
         self, mock_model, mock_tokenizer
     ):
@@ -512,6 +594,29 @@ class TestSchedulerAddRequest:
         assert request.prompt_cache is not None
         assert trim_cache_a.trim_calls == 1
         assert trim_cache_b.trim_calls == 1
+
+    def test_fixed_pool_bypasses_tiered_prefix_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._fixed_kv_pool = MagicMock()
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="fixed-no-prefix",
+            prompt=[11, 12, 13],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13]
+        request.prompt_cache = [object()]
+        request.cached_tokens = 2
+
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert request.prompt_cache is None
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [11, 12, 13]
+        assert request.request_id in scheduler._prefix_cache_prepared
 
     def test_add_request_exact_cache_hit_falls_back_if_not_trimmable(
         self, mock_model, mock_tokenizer
@@ -2930,6 +3035,36 @@ class TestSchedulerBoundarySnapshots:
         assert request.request_id in scheduler._boundary_cache_snapshots
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
 
+    def test_fixed_pool_disables_prefill_boundary_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        """Fixed mode must not retain unused cache copies during prefill."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        stateful_cache_type = type("ArraysCache", (), {})
+        prompt_cache = [stateful_cache_type()]
+
+        assert scheduler._prefill_boundary_snapshots_enabled(prompt_cache, 4)
+
+        scheduler._fixed_kv_pool = MagicMock(slots=1)
+        assert not scheduler._prefill_boundary_snapshots_enabled(prompt_cache, 4)
+        request = Request(
+            request_id="fixed-no-prefill-snapshot",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+
+        scheduler._emit_prefill_boundary_snapshot(request, prompt_cache, 4)
+        scheduler._on_prefill_boundary_snapshot(request.request_id, prompt_cache, 4)
+
+        assert request.request_id not in scheduler._boundary_cache_snapshots
+
 
 class TestSchedulerRotatingBlockAlignment:
     """Tests for rotating window/block-size alignment."""
@@ -4178,6 +4313,46 @@ class TestCacheCorruptionRecovery:
         # Verify requests dict is also cleaned up (no memory leak)
         for rid in failed_ids:
             assert rid not in scheduler.requests
+
+    def test_fail_all_requests_closes_vlm_mtp_generator(
+        self, mock_model, mock_tokenizer
+    ):
+        """Fatal recovery must release VLM MTP cache owners and its serial cap."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=8),
+        )
+        scheduler._fixed_kv_pool = MagicMock(slots=8)
+        request = Request(
+            request_id="req-vlm-mtp-fatal",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+        generator = MagicMock()
+        uid = -1
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+        scheduler._vlm_mtp_active[uid] = _VLMMTPDecodeState(
+            generator=generator,
+            request=request,
+            prompt_cache=[],
+            sampler=MagicMock(),
+            state_machine=MagicMock(),
+            max_tokens=16,
+        )
+
+        assert scheduler._effective_max_num_seqs() == 1
+        assert scheduler.fail_all_requests() == [request.request_id]
+
+        generator.close.assert_called_once_with()
+        assert scheduler._vlm_mtp_active == {}
+        assert scheduler._effective_max_num_seqs() == 8
 
     def test_fail_all_requests_republishes_admin_snapshot(
         self, mock_model, mock_tokenizer

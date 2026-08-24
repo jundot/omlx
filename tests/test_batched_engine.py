@@ -917,6 +917,50 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert engine._engine.generate.call_args.kwargs["tools"] == tools
 
     @pytest.mark.asyncio
+    async def test_generate_marks_inherited_max_tokens(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", max_tokens=32768, max_tokens_is_default=True)
+
+        params = engine._engine.generate.call_args.kwargs["sampling_params"]
+        assert params.max_tokens == 32768
+        assert params.max_tokens_is_default is True
+
+    @pytest.mark.asyncio
+    async def test_preflight_chat_checks_fixed_session_capacity(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._preprocess_messages = lambda messages: messages
+        engine._apply_chat_template = lambda *args, **kwargs: "three token prompt"
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.encode.return_value = [1, 2, 3]
+        scheduler = MagicMock()
+        engine._engine = SimpleNamespace(
+            engine=SimpleNamespace(scheduler=scheduler)
+        )
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+
+        await engine.preflight_chat(
+            [{"role": "user", "content": "Hello"}],
+            max_tokens=8,
+            max_tokens_is_default=False,
+        )
+
+        scheduler.validate_fixed_kv_request_capacity.assert_called_once_with(
+            num_prompt_tokens=3,
+            max_tokens=8,
+            max_tokens_is_default=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_generate_omits_specprefill_when_absent(self):
         from omlx.engine.batched import BatchedEngine
 
