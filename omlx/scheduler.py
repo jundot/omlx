@@ -6221,7 +6221,7 @@ class Scheduler:
         ``BatchGenerator`` yet and the uid mapping does not exist —
         routing through it dropped every snapshot silently (#TBD).
         """
-        if self._fixed_kv_pool is not None:
+        if getattr(self, "_fixed_kv_pool", None) is not None:
             return
         if self.block_aware_cache is None:
             return
