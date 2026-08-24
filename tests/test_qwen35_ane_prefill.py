@@ -2791,3 +2791,58 @@ def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
     ane_patch._warm_cpu_sharing_path(64, [mlp], [gdn])
 
     assert calls == [("mlp", (1, 64, 32)), ("gdn", (1, 64, 32))]
+
+
+class _ReleasableModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Linear(4, 4)
+        self.gdn = nn.Linear(4, 4)
+
+
+class _NativeHandle:
+    """Weakref-able stand-in for a compiled AneLinearModel."""
+
+
+def test_release_latches_modules_drops_states_and_zeroes_counters():
+    import gc
+    from types import SimpleNamespace as NS
+
+    model = _ReleasableModel()
+    handle = _NativeHandle()
+    ref = weakref.ref(handle)
+    model.mlp._omlx_ane_prefill_state = NS(model=handle)
+    model.gdn._omlx_ane_gdn_state = NS(model=_NativeHandle())
+    model._omlx_ane_mlp_prefill_count = 1
+    model._omlx_ane_gdn_prefill_count = 1
+    model._omlx_ane_dual_prefill_count = 1
+    model._omlx_ane_resident_program_count = 2
+
+    released, programs = ane_patch.release_qwen35_ane_prefill(model)
+    del handle
+    gc.collect()
+
+    assert (released, programs) == (2, 2)
+    assert model.mlp._omlx_ane_prefill_state is None
+    assert model.gdn._omlx_ane_gdn_state is None
+    # The latch is what stops the dispatch sites from lazily recompiling a
+    # missing state -- without it the release would be a slow no-op.
+    assert model.mlp._omlx_ane_prefill_failed is True
+    assert model.gdn._omlx_ane_gdn_failed is True
+    # The dropped state held the last reference: the native handle dies with
+    # it, which is what actually returns the mapped bank memory.
+    assert ref() is None
+    status = ane_patch.qwen35_ane_prefill_status(model)
+    assert status["attempted"] is True
+    assert status["configured"] is False
+    assert status["resident_programs"] == 0
+
+
+def test_release_is_idempotent_and_noop_without_slices():
+    from types import SimpleNamespace as NS
+
+    model = _ReleasableModel()
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+    model.mlp._omlx_ane_prefill_state = NS(model=_NativeHandle())
+    ane_patch.release_qwen35_ane_prefill(model)
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)

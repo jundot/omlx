@@ -185,7 +185,15 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
     assert exc.value.request.requested_tokens == 2048
     assert exc.value.request.reason == "adaptive_prefill_throttle"
 
-    # The same request does not loop on eviction; it falls back to throttling.
+    # A second pause is allowed: the first pass can be satisfied by a
+    # marginal transient reclaim without ever reaching the durable rungs
+    # (ANE bank release), so recurring pressure earns one more shot at the
+    # ladder before the guard falls back to throttling for good.
+    with pytest.raises(_PrefillEvictionNeeded):
+        _call(ns, 2048)
+    assert request.prefill_eviction_retries == 2
+
+    # The third time the request does not loop on eviction; it throttles.
     result = _call(ns, 2048)
     assert result < 2048
 

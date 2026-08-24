@@ -3305,3 +3305,51 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
             getattr(model, "_omlx_ane_tail_padding_min_tokens", 0) or 0
         ),
     }
+
+
+def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
+    """Drop every compiled ANE prefill slice on ``model``; GPU-only from here.
+
+    The compiled procedure banks keep the packed weight blobs they were built
+    from mapped for the lifetime of the native programs (roughly 13 GB for a
+    27B at mlp 0.35 / gdn 0.45) — exactly the resident memory a long-context
+    prefill needs back once the KV cache has grown into the guard's sizing
+    target. Latches every sliced module through the existing per-module
+    failure flags first (so the dispatch sites fall back to stock GPU compute
+    and never lazily recompile), then drops the state references; the native
+    models free their programs and mapped blobs when the last reference dies.
+    Idempotent, and scoped to this engine instance: the next load of the
+    model rebuilds the banks from its settings.
+
+    Returns ``(modules_released, resident_programs_before)``.
+    """
+    modules_released = 0
+    programs_before = int(
+        getattr(model, "_omlx_ane_resident_program_count", 0) or 0
+    )
+    for module in model.modules() if hasattr(model, "modules") else ():
+        for state_attr, failed_attr in (
+            ("_omlx_ane_prefill_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_fused_down_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_gdn_state", "_omlx_ane_gdn_failed"),
+        ):
+            if getattr(module, state_attr, None) is None:
+                continue
+            # Latch BEFORE dropping the state: the fetch sites lazily
+            # recompile a missing state, and the failure flag is the one
+            # switch they all check first.
+            setattr(module, failed_attr, True)
+            setattr(module, state_attr, None)
+            modules_released += 1
+    if modules_released:
+        # Zero (not delete) the status counters so /api/status keeps
+        # reporting attempted=True but configured=False — "was on, shed".
+        for counter in (
+            "_omlx_ane_mlp_prefill_count",
+            "_omlx_ane_gdn_prefill_count",
+            "_omlx_ane_dual_prefill_count",
+            "_omlx_ane_resident_program_count",
+        ):
+            if hasattr(model, counter):
+                setattr(model, counter, 0)
+    return modules_released, programs_before

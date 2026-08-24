@@ -3867,7 +3867,16 @@ class Scheduler:
             target = min(target, abort_cap)
         return target - self._current_usage_bytes()
 
-    _MAX_PREFILL_EVICTION_RETRIES = 1
+    # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
+    # first pass's target check while buying only a couple of minutes of KV
+    # growth on a long prompt — and the durable rung behind it (shedding the
+    # requesting model's ANE prefill banks) is then unreachable when the
+    # pressure returns, because the request has spent its only retry. The
+    # second pause is bounded the same way the first is: every rung in
+    # EnginePool's ladder is attempt-once per call, idle victims are
+    # naturally exhausted, and a pass with nothing left to give costs one
+    # ~100ms pause before the guard falls back to throttling as before.
+    _MAX_PREFILL_EVICTION_RETRIES = 2
 
     def _raise_prefill_eviction_if_available(
         self,
