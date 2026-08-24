@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from omlx.admin import ane_tuning
+from omlx.custom_kernels.qwen35_prefill import fast
 from omlx.model_settings import ModelSettings
+
+_REAL_BANK_COMPILER_AVAILABLE = fast.qwen35_ane_bank_compiler_available
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +20,11 @@ def _clear_runs(monkeypatch):
     monkeypatch.setattr(
         ane_tuning, "_restore_speed_priority", lambda pool, previous: None
     )
+    # run_tuning preflights the compiler probes; the pipeline tests here drive
+    # a mocked measurement stack on runners without the extension, so pretend
+    # the compiler exists. Unavailable-path tests re-stub the probes.
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "qwen35_ane_bank_compiler_available", lambda: True)
     yield
     ane_tuning._runs.clear()
 
@@ -971,9 +979,10 @@ def test_bank_compiler_available_matches_serving_probe(monkeypatch):
     """The tuner guard and qwen35_ane_compile_linear_bank's own gate must
     agree: a False probe is exactly the condition under which the compile
     call raises."""
-    from omlx.custom_kernels.qwen35_prefill import fast
-
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: False)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_bank_compiler_available", _REAL_BANK_COMPILER_AVAILABLE
+    )
     assert fast.qwen35_ane_bank_compiler_available() is False
     with pytest.raises(RuntimeError, match="procedure-bank compiler"):
         fast.qwen35_ane_compile_linear_bank([], 2048, 0)
