@@ -73,3 +73,39 @@ final class ModelsScreenSortingTests: XCTestCase {
         )
     }
 }
+
+final class DownloadsScreenSortingTests: XCTestCase {
+
+    func testHuggingFaceSortOptionsMatchHubOrderAndQueryValues() {
+        XCTAssertEqual(
+            SuggestedSort.allCases,
+            [.trending, .likes, .downloads, .created, .updated,
+             .mostParams, .leastParams, .size]
+        )
+        XCTAssertEqual(
+            SuggestedSort.allCases.map(\.apiValue),
+            ["trending", "likes", "downloads", "created", "updated",
+             "most_params", "least_params", "largest"]
+        )
+    }
+
+    func testModelScopeKeepsOnlyItsSupportedSortOptions() {
+        XCTAssertEqual(
+            SuggestedSort.modelScopeCases,
+            [.downloads, .mostParams, .leastParams, .size]
+        )
+    }
+
+    @MainActor
+    func testDownloadsDefaultsToTrendingAndResetsUnsupportedModelScopeSort() {
+        let viewModel = DownloadsScreenVM()
+
+        XCTAssertEqual(viewModel.recommendedSort, .trending)
+        XCTAssertEqual(viewModel.suggestedSortOptions, SuggestedSort.allCases)
+
+        viewModel.source = .ms
+
+        XCTAssertEqual(viewModel.recommendedSort, .downloads)
+        XCTAssertEqual(viewModel.suggestedSortOptions, SuggestedSort.modelScopeCases)
+    }
+}

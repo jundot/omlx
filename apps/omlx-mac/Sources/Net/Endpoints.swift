@@ -49,6 +49,7 @@ enum AdminAPI {
     static func hfRetry(_ taskId: String) -> String  { "\(prefix)/hf/retry/\(taskId)" }
     static func hfTask(_ taskId: String) -> String   { "\(prefix)/hf/task/\(taskId)" }
     static let hfRecommended   = "\(prefix)/hf/recommended"
+    static let hfBrowse        = "\(prefix)/hf/browse"
     static let hfSearch        = "\(prefix)/hf/search"
     static let hfModelInfo     = "\(prefix)/hf/model-info"
     static func hfModel(_ name: String) -> String { "\(prefix)/hf/models/\(name)" }

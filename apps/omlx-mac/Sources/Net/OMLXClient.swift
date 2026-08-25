@@ -225,6 +225,24 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// Browse RAM-compatible Hub models using the same sort and quick-filter
+    /// semantics as huggingface.co/models.
+    func browseHFModels(
+        sort: String = "trending",
+        limit: Int = 50,
+        mlxOnly: Bool = true,
+        baseOnly: Bool = false,
+        inferenceAvailable: Bool = false
+    ) async throws -> HFSearchResponse {
+        try await get(AdminAPI.hfBrowse, query: [
+            URLQueryItem(name: "sort", value: sort),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "base_only", value: baseOnly ? "true" : "false"),
+            URLQueryItem(name: "inference_available", value: inferenceAvailable ? "true" : "false"),
+        ])
+    }
+
     /// Search HF Hub for repos matching a free-text query. Same endpoint the
     /// browser admin panel uses for its model picker (dashboard.js:3879).
     /// Defaults match the JS caller: trending sort, MLX-only filter, cap 20

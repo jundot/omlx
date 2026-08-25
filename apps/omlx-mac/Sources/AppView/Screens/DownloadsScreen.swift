@@ -100,7 +100,11 @@ struct DownloadsScreen: View {
 
             SuggestedSection(
                 models: vm.sortedRecommended,
+                isHuggingFace: vm.source == .hf,
                 sort: $vm.recommendedSort,
+                sortOptions: vm.suggestedSortOptions,
+                baseOnly: $vm.hfBaseOnly,
+                inferenceAvailable: $vm.hfInferenceAvailable,
                 isLoading: vm.recommendedLoading,
                 onGet: { repo in vm.startDownload(repo: repo, client: services.client) },
                 onRefresh: { Task { await vm.loadRecommended(client: services.client) } },
@@ -785,7 +789,11 @@ private struct CompletedTasksSection: View {
 
 private struct SuggestedSection: View {
     let models: [HFModelInfo]
+    let isHuggingFace: Bool
     @Binding var sort: SuggestedSort
+    let sortOptions: [SuggestedSort]
+    @Binding var baseOnly: Bool
+    @Binding var inferenceAvailable: Bool
     let isLoading: Bool
     let onGet: (String) -> Void
     let onRefresh: () -> Void
@@ -801,10 +809,40 @@ private struct SuggestedSection: View {
                               comment: "Section heading for the recommended-models section"),
                       subtitle: hint) {
             HStack(spacing: 6) {
+                if isHuggingFace {
+                    Toggle(isOn: $baseOnly) {
+                        Text(String(localized: "downloads.suggested.filter.base_only",
+                                    defaultValue: "Base only",
+                                    comment: "Filter suggested Hugging Face models to base models only"))
+                            .font(.omlxText(11))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help(String(localized: "downloads.suggested.filter.base_only.help",
+                                 defaultValue: "Hide quantizations, fine-tunes, adapters, and merges.",
+                                 comment: "Tooltip explaining the Base only Hugging Face filter"))
+
+                    Toggle(isOn: $inferenceAvailable) {
+                        Text(String(localized: "downloads.suggested.filter.inference_available",
+                                    defaultValue: "Inference available",
+                                    comment: "Filter suggested models to those served by a Hugging Face inference provider"))
+                            .font(.omlxText(11))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help(String(localized: "downloads.suggested.filter.inference_available.help",
+                                 defaultValue: "Show models served by at least one remote Hugging Face inference provider.",
+                                 comment: "Tooltip explaining that inference availability refers to remote Hugging Face providers"))
+                }
                 Popup(
+                    "downloads.suggested.sort.accessibility",
                     selection: $sort,
                     width: 170,
-                    options: SuggestedSort.allCases.map { ($0, $0.label) }
+                    options: sortOptions.map { ($0, $0.label) }
                 )
                 Button {
                     onRefresh()
@@ -813,6 +851,12 @@ private struct SuggestedSection: View {
                 }
                 .buttonStyle(.omlx(.normal, size: .small))
                 .disabled(isLoading)
+                .help(String(localized: "downloads.suggested.refresh.help",
+                             defaultValue: "Refresh suggested models",
+                             comment: "Tooltip for the Suggested Models refresh button"))
+                .accessibilityLabel(String(localized: "downloads.suggested.refresh.help",
+                                           defaultValue: "Refresh suggested models",
+                                           comment: "Accessibility label for the Suggested Models refresh button"))
             }
         }
 
@@ -832,9 +876,7 @@ private struct SuggestedSection: View {
                 }
             } else if models.isEmpty {
                 FreeRow(isLast: true) {
-                    Text(String(localized: "downloads.suggested.empty",
-                                defaultValue: "No suggestions available right now.",
-                                comment: "Empty-state message for the Suggested Models section"))
+                    Text(emptyMessage)
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -896,6 +938,17 @@ private struct SuggestedSection: View {
                      comment: "Subtitle hint on the Suggested Models header explaining the filter")
     }
 
+    private var emptyMessage: String {
+        if isHuggingFace && (baseOnly || inferenceAvailable) {
+            return String(localized: "downloads.suggested.empty.filtered",
+                          defaultValue: "No models match the selected filters.",
+                          comment: "Empty state when Hugging Face quick filters exclude every suggested model")
+        }
+        return String(localized: "downloads.suggested.empty",
+                      defaultValue: "No suggestions available right now.",
+                      comment: "Empty-state message for the Suggested Models section")
+    }
+
     private func secondaryLine(for m: HFModelInfo) -> String {
         var bits: [String] = []
         if let p = m.paramsFormatted { bits.append(p) }
@@ -908,16 +961,55 @@ private struct SuggestedSection: View {
 // MARK: - Sort
 
 enum SuggestedSort: String, Hashable, CaseIterable {
-    case downloads, params, size
+    case trending
+    case likes
+    case downloads
+    case created
+    case updated
+    case mostParams
+    case leastParams
+    case size
+
+    static let modelScopeCases: [SuggestedSort] = [
+        .downloads, .mostParams, .leastParams, .size,
+    ]
+
+    var apiValue: String {
+        switch self {
+        case .trending: return "trending"
+        case .likes: return "likes"
+        case .downloads: return "downloads"
+        case .created: return "created"
+        case .updated: return "updated"
+        case .mostParams: return "most_params"
+        case .leastParams: return "least_params"
+        case .size: return "largest"
+        }
+    }
 
     var label: String {
         switch self {
+        case .trending: return String(localized: "downloads.suggested.sort.trending",
+                                      defaultValue: "Trending",
+                                      comment: "Sort option: rank suggested models by Hugging Face trending score")
+        case .likes:     return String(localized: "downloads.suggested.sort.likes",
+                                      defaultValue: "Most likes",
+                                      comment: "Sort option: rank suggested models by likes")
         case .downloads: return String(localized: "downloads.suggested.sort.downloads",
                                        defaultValue: "Most downloaded",
                                        comment: "Sort option: rank suggested models by download count")
-        case .params:    return String(localized: "downloads.suggested.sort.params",
-                                       defaultValue: "Parameters: high to low",
+        case .created:   return String(localized: "downloads.suggested.sort.created",
+                                      defaultValue: "Recently created",
+                                      comment: "Sort option: rank suggested models by creation date")
+        case .updated:   return String(localized: "downloads.suggested.sort.updated",
+                                      defaultValue: "Recently updated",
+                                      comment: "Sort option: rank suggested models by last update date")
+        case .mostParams: return String(localized: "downloads.suggested.sort.most_params",
+                                       defaultValue: "Most parameters",
                                        comment: "Sort option: rank suggested models by parameter count, descending")
+        case .leastParams: return String(localized: "downloads.suggested.sort.least_params",
+                                        defaultValue: "Least parameters",
+                                        comment: "Sort option: rank suggested models by parameter count, ascending")
         case .size:      return String(localized: "downloads.suggested.sort.size",
                                        defaultValue: "Size: high to low",
                                        comment: "Sort option: rank suggested models by on-disk size, descending")

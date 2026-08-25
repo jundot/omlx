@@ -68,7 +68,21 @@ final class DownloadsScreenVM {
 
     private(set) var isStarting: Bool = false
     private(set) var recommendedLoading: Bool = false
-    var recommendedSort: SuggestedSort = .downloads
+    var recommendedSort: SuggestedSort = .trending {
+        didSet {
+            if oldValue != recommendedSort { recommendedOptionsDidChange() }
+        }
+    }
+    var hfBaseOnly: Bool = false {
+        didSet {
+            if oldValue != hfBaseOnly { recommendedOptionsDidChange() }
+        }
+    }
+    var hfInferenceAvailable: Bool = false {
+        didSet {
+            if oldValue != hfInferenceAvailable { recommendedOptionsDidChange() }
+        }
+    }
     var lastError: String?
 
     /// Target for the model-card sheet. Non-nil while the sheet is open;
@@ -103,19 +117,33 @@ final class DownloadsScreenVM {
         return trimmed
     }
 
-    /// Re-sorted view of the active source's recommended list. Always
-    /// descending; entries missing the sort key fall to the bottom so
-    /// they don't shove valid models out of the top 15 the section shows.
+    /// Hugging Face results arrive in Hub order. ModelScope still uses the
+    /// local ordering that predated the Hub browse endpoint.
     var sortedRecommended: [HFModelInfo] {
-        let pool = (source == .hf) ? recommended : msRecommended
+        if source == .hf { return recommended }
+
+        let pool = msRecommended
         switch recommendedSort {
-        case .downloads:
+        case .trending, .likes, .downloads, .created, .updated:
             return pool.sorted { ($0.downloads ?? -1) > ($1.downloads ?? -1) }
-        case .params:
+        case .mostParams:
             return pool.sorted { ($0.params ?? -1) > ($1.params ?? -1) }
+        case .leastParams:
+            return pool.sorted {
+                switch ($0.params, $1.params) {
+                case let (lhs?, rhs?): return lhs < rhs
+                case (.some, .none): return true
+                case (.none, .some): return false
+                case (.none, .none): return false
+                }
+            }
         case .size:
             return pool.sorted { ($0.size ?? -1) > ($1.size ?? -1) }
         }
+    }
+
+    var suggestedSortOptions: [SuggestedSort] {
+        source == .hf ? SuggestedSort.allCases : SuggestedSort.modelScopeCases
     }
 
     @ObservationIgnored
@@ -126,6 +154,10 @@ final class DownloadsScreenVM {
     private var hasLoadedHFRecommended = false
     @ObservationIgnored
     private var hasLoadedMSRecommended = false
+    @ObservationIgnored
+    private var recommendedTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var recommendedRequestID = UUID()
 
     var activeTasks: [HFTaskDTO] {
         (source == .hf ? tasks : msTasks).filter { $0.isActive }
@@ -154,10 +186,22 @@ final class DownloadsScreenVM {
     /// already lives in the VM, so the new form's preview values are ready
     /// instantly.
     private func sourceDidChange() {
+        recommendedTask?.cancel()
+        if source == .ms && !SuggestedSort.modelScopeCases.contains(recommendedSort) {
+            recommendedSort = .downloads
+        }
         guard let client else { return }
         Task { [weak self] in
             await self?.refreshTasks()
             await self?.loadActiveRecommendedIfNeeded(client: client)
+        }
+    }
+
+    private func recommendedOptionsDidChange() {
+        guard source == .hf, let client else { return }
+        recommendedTask?.cancel()
+        recommendedTask = Task { [weak self] in
+            await self?.loadRecommended(client: client)
         }
     }
 
@@ -365,6 +409,8 @@ final class DownloadsScreenVM {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+        recommendedTask?.cancel()
+        recommendedTask = nil
     }
 
     // MARK: - Source-routed CRUD
@@ -446,21 +492,43 @@ final class DownloadsScreenVM {
     }
 
     func loadRecommended(client: OMLXClient) async {
+        let requestID = UUID()
+        recommendedRequestID = requestID
+        let activeSource = source
+        let activeSort = recommendedSort
+        let activeBaseOnly = hfBaseOnly
+        let activeInferenceAvailable = hfInferenceAvailable
         self.recommendedLoading = true
-        defer { self.recommendedLoading = false }
+        defer {
+            if recommendedRequestID == requestID {
+                self.recommendedLoading = false
+            }
+        }
         do {
-            // Trending-first, then popular, deduped by repoId. Mirrors how
-            // the original dashboard surfaces both lists side-by-side.
-            switch source {
+            switch activeSource {
             case .hf:
-                let resp = try await client.getHFRecommended()
-                self.recommended = Self.merge(trending: resp.trending, popular: resp.popular)
+                let resp = try await client.browseHFModels(
+                    sort: activeSort.apiValue,
+                    limit: 50,
+                    baseOnly: activeBaseOnly,
+                    inferenceAvailable: activeInferenceAvailable
+                )
+                guard !Task.isCancelled,
+                      recommendedRequestID == requestID,
+                      source == .hf else { return }
+                self.recommended = resp.models
             case .ms:
                 let resp = try await client.getMSRecommended()
+                guard !Task.isCancelled,
+                      recommendedRequestID == requestID,
+                      source == .ms else { return }
                 self.msRecommended = Self.merge(trending: resp.trending, popular: resp.popular)
             }
             self.lastError = nil
+        } catch is CancellationError {
+            return
         } catch {
+            guard !Task.isCancelled, recommendedRequestID == requestID else { return }
             // 502/504 are common (mirror unreachable, dev offline). Surface
             // but keep UI usable.
             self.lastError = error.omlxDescription

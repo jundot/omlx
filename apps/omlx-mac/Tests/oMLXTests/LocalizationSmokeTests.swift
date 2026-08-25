@@ -65,6 +65,7 @@ final class LocalizationSmokeTests: XCTestCase {
         // High-density screens
         "models.active.title", "models.library.title",
         "downloads.hf.section.title", "downloads.active.title",
+        "downloads.suggested.sort.trending", "downloads.suggested.filter.base_only",
         "quant.header.title", "quant.about.title",
         // Profile + bench
         "profile.scope.preset", "profile.detail.section.sampling",
