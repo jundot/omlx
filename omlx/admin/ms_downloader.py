@@ -48,6 +48,35 @@ _DEFAULT_MS_ENDPOINT = "https://modelscope.cn"
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 50
 
+# ModelScope's public OpenAPI names and current web UI sort values.
+_MS_OPENAPI_SORT_MAP = {
+    "trending": "default",
+    "downloads": "downloads",
+    "likes": "likes",
+}
+_MS_WEB_SORT_MAP = {
+    "trending": "Default",
+    "downloads": "DownloadsCount",
+    "likes": "StarsCount",
+}
+_MS_EXPERIENCE_FILTERS = frozenset(
+    {"api_inference", "model_demo", "restful_inference"}
+)
+
+_MS_DOMAIN_LABELS = {
+    "cv": "Computer Vision",
+    "nlp": "Natural Language Processing",
+    "audio": "Audio",
+    "multi-modal": "Multimodal",
+    "scientific-computing": "Scientific Computing",
+}
+_MS_DOMAIN_ORDER = tuple(_MS_DOMAIN_LABELS)
+_MS_POPULAR_TASKS = (
+    "text-generation",
+    "text-to-image-synthesis",
+    "text-to-speech",
+)
+
 
 def _get_ms_endpoint() -> str:
     """Get the configured ModelScope endpoint URL."""
@@ -321,7 +350,7 @@ def _parse_ms_model_entry(entry: dict) -> dict:
         model_id = name
     else:
         model_id = path
-    
+
     downloads = entry.get("Downloads") or 0
     likes = entry.get("Likes") or entry.get("Stars") or 0
     # StorageSize is the total size in bytes
@@ -338,6 +367,230 @@ def _parse_ms_model_entry(entry: dict) -> dict:
         "params": None,
         "params_formatted": None,
     }
+
+
+def _parse_ms_openapi_entry(entry: dict) -> dict:
+    """Normalize one model from ModelScope's public OpenAPI."""
+    model_id = entry.get("id") or ""
+    name = entry.get("display_name") or model_id.split("/")[-1]
+    size = entry.get("file_size") or 0
+    params = entry.get("params") or 0
+
+    return {
+        "repo_id": model_id,
+        "name": name,
+        "downloads": entry.get("downloads") or 0,
+        "likes": entry.get("likes") or 0,
+        "trending_score": 0,
+        "size": size,
+        "size_formatted": _format_model_size(size) if size > 0 else "",
+        "params": params if params > 0 else None,
+        "params_formatted": (
+            _format_param_count(params) if params > 0 else None
+        ),
+    }
+
+
+def _build_ms_web_browse_payload(
+    sort: str,
+    page_size: int,
+    mlx_only: bool,
+    experiences: tuple[str, ...] = (),
+    task: str = "",
+) -> dict:
+    """Build the request body used by ModelScope's current model browser."""
+    criterion: list[dict] = []
+    single_criterion: list[dict] = []
+
+    if mlx_only:
+        criterion.append(
+            {
+                "category": "organizations",
+                "predicate": "contains",
+                "values": ["mlx-community"],
+            }
+        )
+
+    if task:
+        parent, separator, child = task.partition(":")
+        criterion.append(
+            {
+                "category": "tasks",
+                "predicate": "contains",
+                "values": [parent] if parent else [],
+                "sub_values": [child] if separator and child else [],
+            }
+        )
+
+    selected = set(experiences) & _MS_EXPERIENCE_FILTERS
+    if "api_inference" in selected:
+        single_criterion.append(
+            {
+                "category": "inference_type",
+                "DateType": "int",
+                "predicate": "equal",
+                "IntValue": 1,
+            }
+        )
+    if "model_demo" in selected:
+        criterion.append(
+            {
+                "category": "demo_service",
+                "predicate": "contains",
+                "values": ['{"enabled":true}'],
+            }
+        )
+        single_criterion.append(
+            {
+                "category": "support_experience",
+                "DateType": "int",
+                "predicate": "equal",
+                "IntValue": 1,
+            }
+        )
+    if "restful_inference" in selected:
+        single_criterion.append(
+            {
+                "category": "support_api_inference",
+                "DateType": "int",
+                "predicate": "equal",
+                "IntValue": 1,
+            }
+        )
+
+    return {
+        "PageSize": min(max(page_size, 1), 50),
+        "PageNumber": 1,
+        "SortBy": _MS_WEB_SORT_MAP.get(sort, "Default"),
+        "Criterion": criterion,
+        "SingleCriterion": single_criterion,
+    }
+
+
+async def _fetch_ms_models_openapi(
+    sort: str,
+    page_size: int,
+    mlx_only: bool,
+    task: str = "",
+) -> tuple[list[dict], int]:
+    """Fetch a sorted ModelScope page through the documented OpenAPI."""
+    endpoint = _get_ms_endpoint()
+    url = f"{endpoint}/openapi/v1/models"
+    params: dict[str, object] = {
+        "sort": _MS_OPENAPI_SORT_MAP.get(sort, "default"),
+        "page_number": 1,
+        "page_size": min(max(page_size, 1), 50),
+    }
+    if mlx_only:
+        params["owner"] = "mlx-community"
+    if task:
+        params["filter.task"] = task.split(":")[-1]
+
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                requests.get, url, params=params, timeout=_MS_API_TIMEOUT
+            ),
+            timeout=_MS_API_TIMEOUT + 5,
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("data") or {}
+            models = data.get("models") or []
+            return models, int(data.get("total_count") or len(models))
+        logger.warning(
+            "ModelScope OpenAPI browse failed with status %s", resp.status_code
+        )
+    except Exception as e:
+        logger.warning(f"ModelScope OpenAPI browse failed: {e}")
+    return [], 0
+
+
+async def _fetch_ms_models_web(payload: dict) -> tuple[list[dict], int]:
+    """Fetch a page through the endpoint used by ModelScope's web browser."""
+    endpoint = _get_ms_endpoint()
+    url = f"{endpoint}/api/v1/dolphin/models"
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                requests.put, url, json=payload, timeout=_MS_API_TIMEOUT
+            ),
+            timeout=_MS_API_TIMEOUT + 5,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            if body.get("Code", 200) != 200:
+                logger.warning(
+                    "ModelScope web browse failed: %s", body.get("Message", "")
+                )
+                return [], 0
+            data = ((body.get("Data") or {}).get("Model") or {})
+            models = data.get("Models") or []
+            return models, int(data.get("TotalCount") or len(models))
+        logger.warning(
+            "ModelScope web browse failed with status %s", resp.status_code
+        )
+    except Exception as e:
+        logger.warning(f"ModelScope web browse failed: {e}")
+    return [], 0
+
+
+def _format_ms_task_label(value: str) -> str:
+    """Turn a ModelScope task identifier into a compact English label."""
+    special = {
+        "3d": "3D",
+        "nlp": "NLP",
+        "nli": "NLI",
+        "ocr": "OCR",
+    }
+    words = value.replace("_", "-").split("-")
+    return " ".join(special.get(word.lower(), word.capitalize()) for word in words)
+
+
+async def _fetch_ms_task_groups() -> list[dict]:
+    """Fetch ModelScope's current top-level task taxonomy."""
+    endpoint = _get_ms_endpoint()
+    url = f"{endpoint}/api/v1/tasks"
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(requests.get, url, timeout=_MS_API_TIMEOUT),
+            timeout=_MS_API_TIMEOUT + 5,
+        )
+        if resp.status_code != 200:
+            return []
+        domains = (resp.json().get("Data") or {}).get("Domains") or []
+    except Exception as e:
+        logger.warning(f"ModelScope task taxonomy fetch failed: {e}")
+        return []
+
+    groups = []
+    task_lookup: dict[str, dict] = {}
+    for domain in domains:
+        domain_id = domain.get("DomainName") or ""
+        tasks = []
+        for task in domain.get("Tasks") or []:
+            value = task.get("Name") or ""
+            if not value or task.get("IsRetrieval") is False:
+                continue
+            item = {"value": value, "label": _format_ms_task_label(value)}
+            tasks.append(item)
+            task_lookup[value] = item
+        if tasks:
+            groups.append(
+                {
+                    "id": domain_id,
+                    "label": _MS_DOMAIN_LABELS.get(
+                        domain_id, _format_ms_task_label(domain_id)
+                    ),
+                    "tasks": tasks,
+                }
+            )
+
+    order = {domain_id: index for index, domain_id in enumerate(_MS_DOMAIN_ORDER)}
+    groups.sort(key=lambda group: order.get(group["id"], len(order)))
+    popular = [task_lookup[value] for value in _MS_POPULAR_TASKS if value in task_lookup]
+    if popular:
+        groups.insert(0, {"id": "popular", "label": "Popular", "tasks": popular})
+    return groups
 
 
 async def _fetch_ms_models_rest(
@@ -385,6 +638,83 @@ class MSDownloader:
         model_dir: Directory where downloaded models are stored.
         on_complete: Async callback invoked when a download completes successfully.
     """
+
+    @staticmethod
+    async def browse_models(
+        max_memory_bytes: int,
+        sort: str = "trending",
+        limit: int = 50,
+        mlx_only: bool = True,
+        experiences: tuple[str, ...] = (),
+        task: str = "",
+    ) -> dict:
+        """Browse ModelScope models with native sorting and filters.
+
+        The documented OpenAPI handles the normal sort, owner, and task path.
+        ModelScope's three Experience controls are only implemented by the
+        endpoint used by the current web app, so filtered requests use that
+        endpoint and retain its server ordering.
+        """
+        result_limit = min(max(limit, 1), 50)
+        selected_experiences = tuple(
+            value for value in experiences if value in _MS_EXPERIENCE_FILTERS
+        )
+
+        if selected_experiences:
+            payload = _build_ms_web_browse_payload(
+                sort=sort,
+                page_size=50,
+                mlx_only=mlx_only,
+                experiences=selected_experiences,
+                task=task,
+            )
+            raw_models, upstream_total = await _fetch_ms_models_web(payload)
+            models = [_parse_ms_model_entry(entry) for entry in raw_models]
+            needs_enrichment = True
+        else:
+            raw_models, upstream_total = await _fetch_ms_models_openapi(
+                sort=sort,
+                page_size=50,
+                mlx_only=mlx_only,
+                task=task,
+            )
+            models = [_parse_ms_openapi_entry(entry) for entry in raw_models]
+            needs_enrichment = False
+
+        models = [
+            model
+            for model in models
+            if model.get("repo_id")
+            and model.get("downloads", 0) >= _MIN_DOWNLOADS
+            and (
+                model.get("size", 0) == 0
+                or model.get("size", 0) <= max_memory_bytes
+            )
+        ]
+
+        if needs_enrichment and models:
+            sem = asyncio.Semaphore(_ENRICH_CONCURRENCY)
+            enriched = await asyncio.gather(
+                *(_enrich_ms_entry(model, sem) for model in models),
+                return_exceptions=True,
+            )
+            models = [model for model in enriched if isinstance(model, dict)]
+            models = [
+                model
+                for model in models
+                if model.get("size", 0) == 0
+                or model.get("size", 0) <= max_memory_bytes
+            ]
+
+        return {
+            "models": models[:result_limit],
+            "total": upstream_total,
+        }
+
+    @staticmethod
+    async def get_filter_options() -> dict:
+        """Return the current ModelScope top-level task taxonomy."""
+        return {"task_groups": await _fetch_ms_task_groups()}
 
     @staticmethod
     async def get_recommended_models(

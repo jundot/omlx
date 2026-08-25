@@ -100,12 +100,18 @@ struct DownloadsScreen: View {
 
             SuggestedSection(
                 models: vm.sortedRecommended,
-                isHuggingFace: vm.source == .hf,
+                source: vm.source,
                 sort: $vm.recommendedSort,
                 sortOptions: vm.suggestedSortOptions,
                 baseOnly: $vm.hfBaseOnly,
                 inferenceAvailable: $vm.hfInferenceAvailable,
+                msMLXOnly: $vm.msMLXOnly,
+                msExperiences: $vm.msExperienceFilters,
+                msSelectedTask: $vm.msSelectedTask,
+                msTaskGroups: vm.msTaskGroups,
+                activeFilterCount: vm.activeSuggestedFilterCount,
                 isLoading: vm.recommendedLoading,
+                onClearFilters: { vm.clearSuggestedFilters() },
                 onGet: { repo in vm.startDownload(repo: repo, client: services.client) },
                 onRefresh: { Task { await vm.loadRecommended(client: services.client) } },
                 onShowCard: { repo in vm.showModelCard(repoId: repo) }
@@ -789,12 +795,18 @@ private struct CompletedTasksSection: View {
 
 private struct SuggestedSection: View {
     let models: [HFModelInfo]
-    let isHuggingFace: Bool
+    let source: DownloadSource
     @Binding var sort: SuggestedSort
     let sortOptions: [SuggestedSort]
     @Binding var baseOnly: Bool
     @Binding var inferenceAvailable: Bool
+    @Binding var msMLXOnly: Bool
+    @Binding var msExperiences: Set<MSExperienceFilter>
+    @Binding var msSelectedTask: MSTaskOption?
+    let msTaskGroups: [MSTaskGroup]
+    let activeFilterCount: Int
     let isLoading: Bool
+    let onClearFilters: () -> Void
     let onGet: (String) -> Void
     let onRefresh: () -> Void
     /// Open the model-card sheet for a row. Same intent as the equivalent
@@ -809,40 +821,22 @@ private struct SuggestedSection: View {
                               comment: "Section heading for the recommended-models section"),
                       subtitle: hint) {
             HStack(spacing: 6) {
-                if isHuggingFace {
-                    Toggle(isOn: $baseOnly) {
-                        Text(String(localized: "downloads.suggested.filter.base_only",
-                                    defaultValue: "Base only",
-                                    comment: "Filter suggested Hugging Face models to base models only"))
-                            .font(.omlxText(11))
-                            .foregroundStyle(theme.textSecondary)
-                    }
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help(String(localized: "downloads.suggested.filter.base_only.help",
-                                 defaultValue: "Hide quantizations, fine-tunes, adapters, and merges.",
-                                 comment: "Tooltip explaining the Base only Hugging Face filter"))
-
-                    Toggle(isOn: $inferenceAvailable) {
-                        Text(String(localized: "downloads.suggested.filter.inference_available",
-                                    defaultValue: "Inference available",
-                                    comment: "Filter suggested models to those served by a Hugging Face inference provider"))
-                            .font(.omlxText(11))
-                            .foregroundStyle(theme.textSecondary)
-                    }
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help(String(localized: "downloads.suggested.filter.inference_available.help",
-                                 defaultValue: "Show models served by at least one remote Hugging Face inference provider.",
-                                 comment: "Tooltip explaining that inference availability refers to remote Hugging Face providers"))
-                }
+                SuggestedFiltersMenu(
+                    source: source,
+                    baseOnly: $baseOnly,
+                    inferenceAvailable: $inferenceAvailable,
+                    msMLXOnly: $msMLXOnly,
+                    msExperiences: $msExperiences,
+                    msSelectedTask: $msSelectedTask,
+                    msTaskGroups: msTaskGroups,
+                    activeFilterCount: activeFilterCount,
+                    onClear: onClearFilters
+                )
                 Popup(
                     "downloads.suggested.sort.accessibility",
                     selection: $sort,
                     width: 170,
-                    options: sortOptions.map { ($0, $0.label) }
+                    options: sortOptions.map { ($0, $0.label(for: source)) }
                 )
                 Button {
                     onRefresh()
@@ -939,10 +933,10 @@ private struct SuggestedSection: View {
     }
 
     private var emptyMessage: String {
-        if isHuggingFace && (baseOnly || inferenceAvailable) {
+        if activeFilterCount > 0 {
             return String(localized: "downloads.suggested.empty.filtered",
                           defaultValue: "No models match the selected filters.",
-                          comment: "Empty state when Hugging Face quick filters exclude every suggested model")
+                          comment: "Empty state when provider filters exclude every suggested model")
         }
         return String(localized: "downloads.suggested.empty",
                       defaultValue: "No suggestions available right now.",
@@ -955,6 +949,122 @@ private struct SuggestedSection: View {
         if let s = m.sizeFormatted { bits.append(s) }
         if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
+    }
+}
+
+private struct SuggestedFiltersMenu: View {
+    let source: DownloadSource
+    @Binding var baseOnly: Bool
+    @Binding var inferenceAvailable: Bool
+    @Binding var msMLXOnly: Bool
+    @Binding var msExperiences: Set<MSExperienceFilter>
+    @Binding var msSelectedTask: MSTaskOption?
+    let msTaskGroups: [MSTaskGroup]
+    let activeFilterCount: Int
+    let onClear: () -> Void
+
+    var body: some View {
+        Menu {
+            if source == .hf {
+                Toggle(String(localized: "downloads.suggested.filter.base_only",
+                              defaultValue: "Base only",
+                              comment: "Filter suggested Hugging Face models to base models only"),
+                       isOn: $baseOnly)
+                Toggle(String(localized: "downloads.suggested.filter.inference_available",
+                              defaultValue: "Inference available",
+                              comment: "Filter suggested models to those served by a Hugging Face inference provider"),
+                       isOn: $inferenceAvailable)
+            } else {
+                Toggle(String(localized: "downloads.suggested.filter.ms.mlx_only",
+                              defaultValue: "MLX community only",
+                              comment: "Filter suggested ModelScope models to the mlx-community organization"),
+                       isOn: $msMLXOnly)
+
+                Section(String(localized: "downloads.suggested.filters.experience",
+                               defaultValue: "Experience",
+                               comment: "Heading for ModelScope experience filters")) {
+                    ForEach(MSExperienceFilter.allCases) { filter in
+                        Toggle(filter.label, isOn: experienceBinding(filter))
+                    }
+                }
+
+                Menu(String(localized: "downloads.suggested.filters.task",
+                            defaultValue: "Task",
+                            comment: "Submenu label for ModelScope task filters")) {
+                    selectionButton(
+                        String(localized: "downloads.suggested.filters.all_tasks",
+                               defaultValue: "All tasks",
+                               comment: "Menu item that clears the ModelScope task filter"),
+                        task: nil
+                    )
+                    Divider()
+                    ForEach(msTaskGroups) { group in
+                        Menu(group.label) {
+                            ForEach(group.tasks) { task in
+                                selectionButton(task.label, task: task)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if activeFilterCount > 0 {
+                Divider()
+                Button(String(localized: "downloads.suggested.filters.clear",
+                              defaultValue: "Clear filters",
+                              comment: "Menu command that clears suggested-model filters"),
+                       action: onClear)
+            }
+        } label: {
+            Label(filterMenuLabel, systemImage: "line.3.horizontal.decrease.circle")
+                .labelStyle(.titleAndIcon)
+                .font(.omlxText(11))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(String(localized: "downloads.suggested.filters.help",
+                     defaultValue: "Filter suggested models",
+                     comment: "Tooltip for the suggested-model filters menu"))
+    }
+
+    private var filterMenuLabel: String {
+        if activeFilterCount == 0 {
+            return String(localized: "downloads.suggested.filters.title",
+                          defaultValue: "Filters",
+                          comment: "Button label for suggested-model filters")
+        }
+        return String(
+            format: String(localized: "downloads.suggested.filters.active_count",
+                           defaultValue: "Filters (%lld)",
+                           comment: "Suggested-model filter button with active filter count"),
+            activeFilterCount
+        )
+    }
+
+    private func experienceBinding(_ filter: MSExperienceFilter) -> Binding<Bool> {
+        Binding(
+            get: { msExperiences.contains(filter) },
+            set: { enabled in
+                if enabled {
+                    msExperiences.insert(filter)
+                } else {
+                    msExperiences.remove(filter)
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func selectionButton(_ label: String, task: MSTaskOption?) -> some View {
+        Button {
+            msSelectedTask = task
+        } label: {
+            if msSelectedTask == task {
+                Label(label, systemImage: "checkmark")
+            } else {
+                Text(label)
+            }
+        }
     }
 }
 
@@ -971,7 +1081,7 @@ enum SuggestedSort: String, Hashable, CaseIterable {
     case size
 
     static let modelScopeCases: [SuggestedSort] = [
-        .downloads, .mostParams, .leastParams, .size,
+        .trending, .downloads, .likes,
     ]
 
     var apiValue: String {
@@ -987,17 +1097,38 @@ enum SuggestedSort: String, Hashable, CaseIterable {
         }
     }
 
-    var label: String {
+    var modelScopeAPIValue: String {
+        switch self {
+        case .trending: return "trending"
+        case .downloads: return "downloads"
+        case .likes: return "likes"
+        default: return "trending"
+        }
+    }
+
+    func label(for source: DownloadSource) -> String {
         switch self {
         case .trending: return String(localized: "downloads.suggested.sort.trending",
                                       defaultValue: "Trending",
                                       comment: "Sort option: rank suggested models by Hugging Face trending score")
-        case .likes:     return String(localized: "downloads.suggested.sort.likes",
-                                      defaultValue: "Most likes",
-                                      comment: "Sort option: rank suggested models by likes")
-        case .downloads: return String(localized: "downloads.suggested.sort.downloads",
-                                       defaultValue: "Most downloaded",
-                                       comment: "Sort option: rank suggested models by download count")
+        case .likes:
+            if source == .ms {
+                return String(localized: "downloads.suggested.sort.ms.likes",
+                              defaultValue: "Likes",
+                              comment: "ModelScope sort option for likes")
+            }
+            return String(localized: "downloads.suggested.sort.likes",
+                          defaultValue: "Most likes",
+                          comment: "Sort option: rank suggested models by likes")
+        case .downloads:
+            if source == .ms {
+                return String(localized: "downloads.suggested.sort.ms.downloads",
+                              defaultValue: "Downloads",
+                              comment: "ModelScope sort option for downloads")
+            }
+            return String(localized: "downloads.suggested.sort.downloads",
+                          defaultValue: "Most downloaded",
+                          comment: "Sort option: rank suggested models by download count")
         case .created:   return String(localized: "downloads.suggested.sort.created",
                                       defaultValue: "Recently created",
                                       comment: "Sort option: rank suggested models by creation date")
@@ -1013,6 +1144,25 @@ enum SuggestedSort: String, Hashable, CaseIterable {
         case .size:      return String(localized: "downloads.suggested.sort.size",
                                        defaultValue: "Size: high to low",
                                        comment: "Sort option: rank suggested models by on-disk size, descending")
+        }
+    }
+}
+
+extension MSExperienceFilter {
+    var label: String {
+        switch self {
+        case .apiInference:
+            return String(localized: "downloads.suggested.filter.ms.api_inference",
+                          defaultValue: "API-Inference",
+                          comment: "ModelScope Experience filter for API inference")
+        case .modelDemo:
+            return String(localized: "downloads.suggested.filter.ms.model_demo",
+                          defaultValue: "Model Demo",
+                          comment: "ModelScope Experience filter for interactive demos")
+        case .restfulInference:
+            return String(localized: "downloads.suggested.filter.ms.inference_api_restful",
+                          defaultValue: "Inference API RESTful",
+                          comment: "ModelScope Experience filter for RESTful inference")
         }
     }
 }

@@ -92,7 +92,11 @@ final class DownloadsScreenSortingTests: XCTestCase {
     func testModelScopeKeepsOnlyItsSupportedSortOptions() {
         XCTAssertEqual(
             SuggestedSort.modelScopeCases,
-            [.downloads, .mostParams, .leastParams, .size]
+            [.trending, .downloads, .likes]
+        )
+        XCTAssertEqual(
+            SuggestedSort.modelScopeCases.map(\.modelScopeAPIValue),
+            ["trending", "downloads", "likes"]
         )
     }
 
@@ -105,7 +109,27 @@ final class DownloadsScreenSortingTests: XCTestCase {
 
         viewModel.source = .ms
 
-        XCTAssertEqual(viewModel.recommendedSort, .downloads)
+        XCTAssertEqual(viewModel.recommendedSort, .trending)
         XCTAssertEqual(viewModel.suggestedSortOptions, SuggestedSort.modelScopeCases)
+    }
+
+    @MainActor
+    func testModelScopeFilterCountAndClear() {
+        let viewModel = DownloadsScreenVM()
+        viewModel.source = .ms
+        viewModel.msExperienceFilters = [.apiInference, .modelDemo]
+        viewModel.msSelectedTask = MSTaskOption(
+            value: "text-generation",
+            label: "Text Generation"
+        )
+
+        XCTAssertEqual(viewModel.activeSuggestedFilterCount, 3)
+
+        viewModel.clearSuggestedFilters()
+
+        XCTAssertTrue(viewModel.msExperienceFilters.isEmpty)
+        XCTAssertNil(viewModel.msSelectedTask)
+        XCTAssertEqual(viewModel.activeSuggestedFilterCount, 0)
+        XCTAssertTrue(viewModel.msMLXOnly)
     }
 }

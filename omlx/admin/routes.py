@@ -6573,6 +6573,68 @@ async def get_ms_recommended_models(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/api/ms/browse")
+async def browse_ms_models(
+    sort: str = "trending",
+    limit: int = 50,
+    mlx_only: bool = True,
+    experience: str = "",
+    task: str = "",
+    is_admin: bool = Depends(require_admin),
+):
+    """Browse ModelScope models with native sorting and filters."""
+    if _ms_downloader is None:
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
+
+    memory_info = get_system_memory_info()
+    max_memory = memory_info["total_bytes"] or 16 * 1024**3
+
+    from .ms_downloader import MSDownloader
+
+    experiences = tuple(
+        value.strip() for value in experience.split(",") if value.strip()
+    )
+    try:
+        return await MSDownloader.browse_models(
+            max_memory_bytes=max_memory,
+            sort=sort,
+            limit=min(max(limit, 1), 50),
+            mlx_only=mlx_only,
+            experiences=experiences,
+            task=task.strip(),
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/filter-options")
+async def get_ms_filter_options(is_admin: bool = Depends(require_admin)):
+    """Get ModelScope task groups for the suggested-model filters."""
+    if _ms_downloader is None:
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        return await MSDownloader.get_filter_options()
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.get("/api/ms/search")
 async def search_ms_models(
     q: str = "",

@@ -19,6 +19,31 @@ typealias MSModelInfo            = HFModelInfo
 typealias MSSearchResponse       = HFSearchResponse
 typealias MSRecommendedResponse  = HFRecommendedResponse
 
+struct MSFilterOptionsResponse: Decodable, Sendable {
+    let taskGroups: [MSTaskGroup]
+}
+
+struct MSTaskGroup: Decodable, Hashable, Sendable, Identifiable {
+    let id: String
+    let label: String
+    let tasks: [MSTaskOption]
+}
+
+struct MSTaskOption: Decodable, Hashable, Sendable, Identifiable {
+    let value: String
+    let label: String
+
+    var id: String { value }
+}
+
+enum MSExperienceFilter: String, CaseIterable, Hashable, Sendable, Identifiable {
+    case apiInference = "api_inference"
+    case modelDemo = "model_demo"
+    case restfulInference = "restful_inference"
+
+    var id: String { rawValue }
+}
+
 struct StartMSDownloadRequest: Encodable, Sendable {
     let modelId: String
     let msToken: String

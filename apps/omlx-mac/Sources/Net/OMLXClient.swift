@@ -319,6 +319,31 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    func browseMSModels(
+        sort: String = "trending",
+        limit: Int = 50,
+        mlxOnly: Bool = true,
+        experiences: [String] = [],
+        task: String? = nil
+    ) async throws -> MSSearchResponse {
+        var query = [
+            URLQueryItem(name: "sort", value: sort),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ]
+        if !experiences.isEmpty {
+            query.append(URLQueryItem(name: "experience", value: experiences.joined(separator: ",")))
+        }
+        if let task, !task.isEmpty {
+            query.append(URLQueryItem(name: "task", value: task))
+        }
+        return try await get(AdminAPI.msBrowse, query: query)
+    }
+
+    func getMSFilterOptions() async throws -> MSFilterOptionsResponse {
+        try await get(AdminAPI.msFilterOptions)
+    }
+
     func searchMSModels(
         query: String,
         sort: String = "trending",

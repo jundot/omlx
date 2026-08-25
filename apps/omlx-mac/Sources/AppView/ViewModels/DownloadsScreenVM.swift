@@ -59,6 +59,22 @@ final class DownloadsScreenVM {
     private(set) var msSearchResults: [MSModelInfo] = []
     private(set) var msSearchLoading: Bool = false
     var msSearchDismissed: Bool = false
+    private(set) var msTaskGroups: [MSTaskGroup] = []
+    var msSelectedTask: MSTaskOption? {
+        didSet {
+            if oldValue != msSelectedTask { recommendedOptionsDidChange() }
+        }
+    }
+    var msExperienceFilters: Set<MSExperienceFilter> = [] {
+        didSet {
+            if oldValue != msExperienceFilters { recommendedOptionsDidChange() }
+        }
+    }
+    var msMLXOnly: Bool = true {
+        didSet {
+            if oldValue != msMLXOnly { recommendedOptionsDidChange() }
+        }
+    }
     @ObservationIgnored
     private var msSearchTask: Task<Void, Never>?
     @ObservationIgnored
@@ -117,29 +133,9 @@ final class DownloadsScreenVM {
         return trimmed
     }
 
-    /// Hugging Face results arrive in Hub order. ModelScope still uses the
-    /// local ordering that predated the Hub browse endpoint.
+    /// Both providers return models in the selected upstream order.
     var sortedRecommended: [HFModelInfo] {
-        if source == .hf { return recommended }
-
-        let pool = msRecommended
-        switch recommendedSort {
-        case .trending, .likes, .downloads, .created, .updated:
-            return pool.sorted { ($0.downloads ?? -1) > ($1.downloads ?? -1) }
-        case .mostParams:
-            return pool.sorted { ($0.params ?? -1) > ($1.params ?? -1) }
-        case .leastParams:
-            return pool.sorted {
-                switch ($0.params, $1.params) {
-                case let (lhs?, rhs?): return lhs < rhs
-                case (.some, .none): return true
-                case (.none, .some): return false
-                case (.none, .none): return false
-                }
-            }
-        case .size:
-            return pool.sorted { ($0.size ?? -1) > ($1.size ?? -1) }
-        }
+        source == .hf ? recommended : msRecommended
     }
 
     var suggestedSortOptions: [SuggestedSort] {
@@ -154,6 +150,8 @@ final class DownloadsScreenVM {
     private var hasLoadedHFRecommended = false
     @ObservationIgnored
     private var hasLoadedMSRecommended = false
+    @ObservationIgnored
+    private var hasLoadedMSFilterOptions = false
     @ObservationIgnored
     private var recommendedTask: Task<Void, Never>?
     @ObservationIgnored
@@ -178,6 +176,7 @@ final class DownloadsScreenVM {
         }
         await refreshMirrors(client: client)
         await refreshMsAvailability(client: client)
+        await loadMSFilterOptionsIfNeeded(client: client)
         await loadActiveRecommendedIfNeeded(client: client)
     }
 
@@ -188,17 +187,18 @@ final class DownloadsScreenVM {
     private func sourceDidChange() {
         recommendedTask?.cancel()
         if source == .ms && !SuggestedSort.modelScopeCases.contains(recommendedSort) {
-            recommendedSort = .downloads
+            recommendedSort = .trending
         }
         guard let client else { return }
         Task { [weak self] in
             await self?.refreshTasks()
+            await self?.loadMSFilterOptionsIfNeeded(client: client)
             await self?.loadActiveRecommendedIfNeeded(client: client)
         }
     }
 
     private func recommendedOptionsDidChange() {
-        guard source == .hf, let client else { return }
+        guard let client else { return }
         recommendedTask?.cancel()
         recommendedTask = Task { [weak self] in
             await self?.loadRecommended(client: client)
@@ -498,6 +498,11 @@ final class DownloadsScreenVM {
         let activeSort = recommendedSort
         let activeBaseOnly = hfBaseOnly
         let activeInferenceAvailable = hfInferenceAvailable
+        let activeMSMLXOnly = msMLXOnly
+        let activeMSExperiences = msExperienceFilters
+            .map(\.rawValue)
+            .sorted()
+        let activeMSTask = msSelectedTask?.value
         self.recommendedLoading = true
         defer {
             if recommendedRequestID == requestID {
@@ -518,11 +523,17 @@ final class DownloadsScreenVM {
                       source == .hf else { return }
                 self.recommended = resp.models
             case .ms:
-                let resp = try await client.getMSRecommended()
+                let resp = try await client.browseMSModels(
+                    sort: activeSort.modelScopeAPIValue,
+                    limit: 50,
+                    mlxOnly: activeMSMLXOnly,
+                    experiences: activeMSExperiences,
+                    task: activeMSTask
+                )
                 guard !Task.isCancelled,
                       recommendedRequestID == requestID,
                       source == .ms else { return }
-                self.msRecommended = Self.merge(trending: resp.trending, popular: resp.popular)
+                self.msRecommended = resp.models
             }
             self.lastError = nil
         } catch is CancellationError {
@@ -535,13 +546,35 @@ final class DownloadsScreenVM {
         }
     }
 
-    private static func merge(trending: [HFModelInfo], popular: [HFModelInfo]) -> [HFModelInfo] {
-        var seen = Set<String>()
-        var merged: [HFModelInfo] = []
-        for m in trending + popular where seen.insert(m.repoId).inserted {
-            merged.append(m)
+    private func loadMSFilterOptionsIfNeeded(client: OMLXClient) async {
+        guard source == .ms, !hasLoadedMSFilterOptions else { return }
+        hasLoadedMSFilterOptions = true
+        do {
+            msTaskGroups = try await client.getMSFilterOptions().taskGroups
+        } catch {
+            hasLoadedMSFilterOptions = false
         }
-        return merged
+    }
+
+    var activeSuggestedFilterCount: Int {
+        switch source {
+        case .hf:
+            return (hfBaseOnly ? 1 : 0) + (hfInferenceAvailable ? 1 : 0)
+        case .ms:
+            return msExperienceFilters.count
+                + (msSelectedTask == nil ? 0 : 1)
+        }
+    }
+
+    func clearSuggestedFilters() {
+        switch source {
+        case .hf:
+            hfBaseOnly = false
+            hfInferenceAvailable = false
+        case .ms:
+            msExperienceFilters = []
+            msSelectedTask = nil
+        }
     }
 
     private func refreshTasks() async {

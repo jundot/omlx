@@ -6513,7 +6513,7 @@
       }
     },
     "downloads.suggested.empty.filtered" : {
-      "comment" : "Empty state when Hugging Face quick filters exclude every suggested model",
+      "comment" : "Empty state when provider filters exclude every suggested model",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -6628,6 +6628,270 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "显示至少由一个远程 Hugging Face 推理提供商托管的模型。"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filter.ms.api_inference" : {
+      "comment" : "ModelScope Experience filter for API inference",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Inference"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-инференс"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 推理"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filter.ms.inference_api_restful" : {
+      "comment" : "ModelScope Experience filter for RESTful inference",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inference API RESTful"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RESTful API инференса"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "RESTful 推理 API"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filter.ms.mlx_only" : {
+      "comment" : "Filter suggested ModelScope models to the mlx-community organization",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MLX community only"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Только сообщество MLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅 MLX 社区"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filter.ms.model_demo" : {
+      "comment" : "ModelScope Experience filter for interactive demos",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model Demo"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Демо модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型演示"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.active_count" : {
+      "comment" : "Suggested-model filter button with active filter count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Filters (%lld)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Фильтры (%lld)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "筛选（%lld）"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.all_tasks" : {
+      "comment" : "Menu item that clears the ModelScope task filter",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All tasks"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все задачи"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "所有任务"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.clear" : {
+      "comment" : "Menu command that clears suggested-model filters",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clear filters"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сбросить фильтры"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清除筛选"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.experience" : {
+      "comment" : "Heading for ModelScope experience filters",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Experience"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Возможности"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "体验"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.help" : {
+      "comment" : "Tooltip for the suggested-model filters menu",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Filter suggested models"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Фильтровать рекомендуемые модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "筛选推荐模型"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.task" : {
+      "comment" : "Submenu label for ModelScope task filters",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Task"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Задача"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "任务"
+          }
+        }
+      }
+    },
+    "downloads.suggested.filters.title" : {
+      "comment" : "Button label for suggested-model filters",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Filters"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Фильтры"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "筛选"
           }
         }
       }
@@ -6844,6 +7108,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "获赞最多"
+          }
+        }
+      }
+    },
+    "downloads.suggested.sort.ms.downloads" : {
+      "comment" : "ModelScope sort option for downloads",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloads"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скачивания"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下载量"
+          }
+        }
+      }
+    },
+    "downloads.suggested.sort.ms.likes" : {
+      "comment" : "ModelScope sort option for likes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Likes"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отметки Нравится"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点赞数"
           }
         }
       }

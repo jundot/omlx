@@ -63,6 +63,8 @@ enum AdminAPI {
     static func msRetry(_ taskId: String) -> String  { "\(prefix)/ms/retry/\(taskId)" }
     static func msTask(_ taskId: String) -> String   { "\(prefix)/ms/task/\(taskId)" }
     static let msRecommended   = "\(prefix)/ms/recommended"
+    static let msBrowse        = "\(prefix)/ms/browse"
+    static let msFilterOptions = "\(prefix)/ms/filter-options"
     static let msSearch        = "\(prefix)/ms/search"
     static let msModelInfo     = "\(prefix)/ms/model-info"
 
